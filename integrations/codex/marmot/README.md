@@ -145,7 +145,7 @@ wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.us.whitenoise.chat
 ```
 
-Codex receives one connector-minted, turn-scoped capability only through `WN_ARTIFACT_AUTHORIZATION_ID`; the private completion-manifest path and authorized export root are supplied in the turn prompt. The harness never scans assistant prose for paths. Each declaration uses a relative path to a regular non-symlink file beneath the authorized root. The harness copies accepted bytes into its private staging root, persists the pending send before calling `send_media`, and replays that idempotent send after restart until `wn-agent` confirms it.
+Codex receives one connector-minted, turn-scoped capability only through `WN_ARTIFACT_AUTHORIZATION_ID`. The authorized export location is supplied as a workdir-relative path when it sits under the working directory; otherwise Codex sees `$WN_ARTIFACT_EXPORT_ROOT` and the path stays in that process-local environment variable. The private completion-manifest path is never written into the prompt: when it cannot be expressed relative to the workdir, Codex receives it only as `$WN_ARTIFACT_MANIFEST`. The harness never scans assistant prose for paths. Each declaration uses a relative path to a regular non-symlink file beneath the authorized root. The harness copies accepted bytes into its private staging root, persists the pending send before calling `send_media`, and replays that idempotent send after restart until `wn-agent` confirms it.
 
 Codex credentials, model, config, and project trust remain authoritative.
 `autonomous` overrides only `approval_policy` to `never`, preserving configured

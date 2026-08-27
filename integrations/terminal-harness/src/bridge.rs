@@ -576,25 +576,14 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             if !artifact_delivery_attempted
                 || matches!(artifact_delivery, ArtifactDeliveryOutcome::FallbackAllowed)
             {
-                'messages: for text in &buffered_text {
-                    for chunk in split_reply_chunks(text, ctx.cfg.max_reply_bytes) {
-                        delivered_chunks += 1;
-                        if send_reply(
-                            &ctx,
-                            &inbound.account_ref,
-                            &inbound.group_ref,
-                            &inbound.message_ref,
-                            chunk,
-                            delivered_chunks,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            delivery_failed = true;
-                            break 'messages;
-                        }
-                    }
-                }
+                deliver_buffered_text(
+                    &ctx,
+                    &inbound,
+                    &buffered_text,
+                    &mut delivered_chunks,
+                    &mut delivery_failed,
+                )
+                .await;
             }
             let terminal_delivery_count = if artifact_delivery_attempted {
                 // Preflight failures may fall back to completed text. Once a durable media
@@ -628,6 +617,14 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 error_kind = failure.error.privacy_safe_kind(),
                 "backend invocation failed"
             );
+            deliver_buffered_text(
+                &ctx,
+                &inbound,
+                &buffered_text,
+                &mut delivered_chunks,
+                &mut delivery_failed,
+            )
+            .await;
             let text = handle_backend_run_failure(
                 &ctx.cfg,
                 &ctx.sessions,
@@ -656,6 +653,14 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 error_kind = err.privacy_safe_kind(),
                 "backend task join failed"
             );
+            deliver_buffered_text(
+                &ctx,
+                &inbound,
+                &buffered_text,
+                &mut delivered_chunks,
+                &mut delivery_failed,
+            )
+            .await;
             let _ = send_reply(
                 &ctx,
                 &inbound.account_ref,
@@ -1270,6 +1275,37 @@ async fn install_allowlist(
     Ok(())
 }
 
+async fn deliver_buffered_text(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    buffered_text: &[String],
+    delivered_chunks: &mut usize,
+    delivery_failed: &mut bool,
+) {
+    if *delivery_failed {
+        return;
+    }
+    'messages: for text in buffered_text {
+        for chunk in split_reply_chunks(text, ctx.cfg.max_reply_bytes) {
+            *delivered_chunks += 1;
+            if send_reply(
+                ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                chunk,
+                *delivered_chunks,
+            )
+            .await
+            .is_err()
+            {
+                *delivery_failed = true;
+                break 'messages;
+            }
+        }
+    }
+}
+
 async fn send_reply(
     ctx: &BridgeContext,
     account_ref: &str,
@@ -1494,6 +1530,33 @@ mod tests {
         }
     }
 
+    struct FailingTextBackend {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FailingTextBackend {
+        fn artifact_support(&self) -> ArtifactSupport {
+            ArtifactSupport::CompletionFile
+        }
+
+        async fn run(
+            &self,
+            invocation: Invocation,
+            tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            assert!(
+                invocation.artifact_output.is_some(),
+                "grant must be live so completed text is buffered"
+            );
+            tx.send(RunnerEvent::Text(self.text.clone())).await.unwrap();
+            Err(RunFailure {
+                error: HarnessError::BackendTimedOut,
+                observed_session: None,
+            })
+        }
+    }
+
     async fn run_artifact_delivery_case(
         text: Option<&str>,
         invented_authorization: bool,
@@ -1681,6 +1744,126 @@ mod tests {
             artifact_only_failure[0],
             agent_control::AgentControlRequest::SendAgentActivity { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn backend_failure_flushes_buffered_text_once_without_send_media() {
+        let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let export_root = root.path().join("exports");
+        std::fs::create_dir(&export_root).unwrap();
+
+        let socket = root.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let request: agent_control::AgentControlEnvelope<
+                    agent_control::AgentControlRequest,
+                > = agent_control::read_envelope(&mut reader)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response = match &request.payload {
+                    agent_control::AgentControlRequest::SendFinal { .. } => {
+                        agent_control::AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["sent".to_owned()],
+                            maintenance_disposition: Default::default(),
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                agent_control::write_frame(
+                    &mut write_half,
+                    &agent_control::AgentControlEnvelope::request(request.id.clone(), response),
+                )
+                .await
+                .unwrap();
+                requests.push(request.payload);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected extra terminal control request"
+            );
+            requests
+        });
+
+        let mut config = test_config(root.path());
+        config.socket = socket.clone();
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            vec![crate::ArtifactExportGrant {
+                group_id_hex: "group".to_owned(),
+                export_root: export_root.clone(),
+                ttl_seconds: 300,
+            }],
+            root.path().join("staging"),
+            root.path().join("outbox.json"),
+        );
+        let sessions = SessionStore::load(config.state_path.clone(), root.path()).unwrap();
+        let ctx = Arc::new(BridgeContext {
+            cfg: Arc::new(config),
+            client: ControlClient::new(socket, None, Duration::from_secs(2), "wn-test"),
+            account_ref: "account".to_owned(),
+            sessions: Arc::new(sessions),
+            queues: Arc::new(GroupQueues::new(1)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: Arc::new(FailingTextBackend {
+                text: "completed text".to_owned(),
+            }),
+            outbox: Arc::new(Mutex::new(
+                ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
+            )),
+            home: root.path().to_path_buf(),
+        });
+        let permit = ctx.queues.try_enter("group").await.unwrap();
+        handle_message(
+            ctx,
+            InboundPrompt {
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                message_ref: "message".to_owned(),
+                text: "complete then fail".to_owned(),
+            },
+            permit,
+        )
+        .await;
+
+        let requests = server.await.unwrap();
+        assert!(
+            requests.iter().all(|request| !matches!(
+                request,
+                agent_control::AgentControlRequest::SendMedia { .. }
+            )),
+            "backend failure must not attempt send_media"
+        );
+        let finals: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| match request {
+                agent_control::AgentControlRequest::SendFinal { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finals
+                .iter()
+                .filter(|text| **text == "completed text")
+                .count(),
+            1,
+            "completed assistant text must be delivered exactly once"
+        );
+        assert_eq!(finals[0], "completed text");
+        assert!(
+            finals[1].contains("timed out before producing a complete response"),
+            "failure reply must follow the flushed text"
+        );
     }
 
     #[tokio::test]

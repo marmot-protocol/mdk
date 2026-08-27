@@ -1,7 +1,10 @@
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    ApprovalSupport, ArtifactSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError,
-    Invocation, IsolationSupport, Outcome, ParsedEvent, PromptTransport, RunFailure, RunnerEvent,
+    ApprovalSupport, ArtifactOutputRequest, ArtifactSupport, Backend, ExecutionProfile,
+    ExecutionSupport, HarnessError, Invocation, IsolationSupport, Outcome, ParsedEvent,
+    PromptTransport, RunFailure, RunnerEvent,
     process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
     read_artifact_output_manifest,
 };
@@ -70,15 +73,9 @@ async fn run_with_bin(
     } = invocation;
     let mut environment = Vec::new();
     if let Some(request) = &artifact_output {
-        environment.push(EnvironmentChange::Set {
-            name: "WN_ARTIFACT_AUTHORIZATION_ID",
-            value: request.authorization_id().to_owned(),
-        });
-        prompt.push_str(&format!(
-            "\n\nIf this task produces files for the requester, place them beneath {} and write exactly one JSON object to {} using this schema: {{\"artifacts\":[{{\"authorization_id\":\"value from $WN_ARTIFACT_AUTHORIZATION_ID\",\"path\":\"relative/path\",\"media_type\":\"application/octet-stream\",\"file_name\":\"name.ext\"}}]}}. Paths must be relative to the export root. Use an empty artifacts array when there are no files. This structured file is the only artifact-delivery signal; do not rely on mentioning paths in chat text.",
-            request.export_root().display(),
-            request.manifest_path().display(),
-        ));
+        let (suffix, artifact_env) = artifact_delivery_instructions(request, &cwd);
+        environment.extend(artifact_env);
+        prompt.push_str(&suffix);
     }
     let process_result = run_jsonl_process(
         ProcessSpec {
@@ -120,6 +117,67 @@ async fn run_with_bin(
         }
     }
     Ok(outcome)
+}
+
+fn artifact_delivery_instructions(
+    request: &ArtifactOutputRequest,
+    cwd: &Path,
+) -> (String, Vec<EnvironmentChange>) {
+    let mut environment = vec![EnvironmentChange::Set {
+        name: "WN_ARTIFACT_AUTHORIZATION_ID",
+        value: request.authorization_id().to_owned(),
+    }];
+    let export_coord = prompt_path_coordinate(
+        request.export_root(),
+        cwd,
+        "WN_ARTIFACT_EXPORT_ROOT",
+        &mut environment,
+    );
+    let manifest_coord = prompt_path_coordinate(
+        request.manifest_path(),
+        cwd,
+        "WN_ARTIFACT_MANIFEST",
+        &mut environment,
+    );
+    (
+        format!(
+            "\n\nIf this task produces files for the requester, place them beneath {export_coord} and write exactly one JSON object to {manifest_coord} using this schema: {{\"artifacts\":[{{\"authorization_id\":\"value from $WN_ARTIFACT_AUTHORIZATION_ID\",\"path\":\"relative/path\",\"media_type\":\"application/octet-stream\",\"file_name\":\"name.ext\"}}]}}. Paths must be relative to the export root. Use an empty artifacts array when there are no files. This structured file is the only artifact-delivery signal; do not rely on mentioning paths in chat text."
+        ),
+        environment,
+    )
+}
+
+fn prompt_path_coordinate(
+    path: &Path,
+    cwd: &Path,
+    env_name: &'static str,
+    environment: &mut Vec<EnvironmentChange>,
+) -> String {
+    if let Some(relative) = workdir_relative(path, cwd) {
+        relative.display().to_string()
+    } else {
+        environment.push(EnvironmentChange::Set {
+            name: env_name,
+            value: path.display().to_string(),
+        });
+        format!("${env_name}")
+    }
+}
+
+fn workdir_relative(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    let canonical = match (std::fs::canonicalize(path), std::fs::canonicalize(cwd)) {
+        (Ok(path), Ok(cwd)) => path.strip_prefix(cwd).ok().map(PathBuf::from),
+        _ => None,
+    };
+    canonical
+        .or_else(|| path.strip_prefix(cwd).ok().map(PathBuf::from))
+        .map(|relative| {
+            if relative.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                relative
+            }
+        })
 }
 
 fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<String> {
@@ -190,6 +248,70 @@ mod tests {
 
     use super::*;
     use marmot_terminal_harness::ExecutionProfile;
+
+    fn environment_value<'a>(environment: &'a [EnvironmentChange], name: &str) -> Option<&'a str> {
+        environment.iter().find_map(|change| match change {
+            EnvironmentChange::Set {
+                name: set_name,
+                value,
+            } if *set_name == name => Some(value.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn artifact_prompt_uses_workdir_relative_paths_when_possible() {
+        let cwd = PathBuf::from("project");
+        let request = ArtifactOutputRequest::new(
+            cwd.join("manifest.json"),
+            "auth-secret".to_owned(),
+            cwd.join("output"),
+        );
+        let (suffix, environment) = artifact_delivery_instructions(&request, &cwd);
+        assert!(suffix.contains("beneath output "));
+        assert!(suffix.contains("to manifest.json "));
+        assert!(!suffix.contains("project"));
+        assert!(!suffix.contains("auth-secret"));
+        assert_eq!(
+            environment_value(&environment, "WN_ARTIFACT_AUTHORIZATION_ID"),
+            Some("auth-secret")
+        );
+        assert!(environment_value(&environment, "WN_ARTIFACT_EXPORT_ROOT").is_none());
+        assert!(environment_value(&environment, "WN_ARTIFACT_MANIFEST").is_none());
+    }
+
+    #[test]
+    fn artifact_prompt_hides_private_manifest_behind_env_coordinates() {
+        let cwd = PathBuf::from("project");
+        let request = ArtifactOutputRequest::new(
+            PathBuf::from("private")
+                .join("outbox.manifests")
+                .join("abc.json"),
+            "auth-secret".to_owned(),
+            PathBuf::from("other").join("exports"),
+        );
+        let (suffix, environment) = artifact_delivery_instructions(&request, &cwd);
+        assert!(suffix.contains("beneath $WN_ARTIFACT_EXPORT_ROOT "));
+        assert!(suffix.contains("to $WN_ARTIFACT_MANIFEST "));
+        assert!(!suffix.contains("private"));
+        assert!(!suffix.contains("other"));
+        assert!(!suffix.contains("auth-secret"));
+        assert!(!suffix.contains("outbox.manifests"));
+        assert_eq!(
+            environment_value(&environment, "WN_ARTIFACT_EXPORT_ROOT"),
+            Some(PathBuf::from("other").join("exports").to_str().unwrap())
+        );
+        assert_eq!(
+            environment_value(&environment, "WN_ARTIFACT_MANIFEST"),
+            Some(
+                PathBuf::from("private")
+                    .join("outbox.manifests")
+                    .join("abc.json")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+    }
 
     #[test]
     fn args_select_json_stdin_and_optional_resume() {
@@ -354,7 +476,11 @@ test -z "${MARMOT_ARTIFACT_AUTHORIZATION_ID+x}"
 test -z "${MARMOT_ARTIFACT_OUTPUT_FILE+x}"
 test -z "${MARMOT_ARTIFACT_EXPORT_ROOT+x}"
 prompt="$(cat)"
-manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+if [ -n "${WN_ARTIFACT_MANIFEST:-}" ]; then
+  manifest="$WN_ARTIFACT_MANIFEST"
+else
+  manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+fi
 printf '{"artifacts":[{"authorization_id":"%s","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf"}]}' "$WN_ARTIFACT_AUTHORIZATION_ID" >"$manifest"
 printf '%s\n' '{"type":"thread.started","thread_id":"codex-artifact"}'
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Created report.pdf at /not/a/delivery/signal"}}'
@@ -400,6 +526,69 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn runner_keeps_private_manifest_out_of_the_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path().join("workdir");
+        let private = root.path().join("private");
+        fs::create_dir(&workdir).unwrap();
+        fs::create_dir(&private).unwrap();
+        let script = workdir.join("artifact-codex");
+        fs::write(workdir.join("report.pdf"), b"pdf").unwrap();
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test -n "$WN_ARTIFACT_AUTHORIZATION_ID"
+test -n "$WN_ARTIFACT_MANIFEST"
+test -z "${WN_ARTIFACT_EXPORT_ROOT+x}"
+prompt="$(cat)"
+printf '%s' "$prompt" | grep -F -q 'beneath .'
+printf '%s' "$prompt" | grep -F -q '$WN_ARTIFACT_MANIFEST'
+if printf '%s' "$prompt" | grep -F -q "$WN_ARTIFACT_MANIFEST"; then
+  exit 64
+fi
+printf '{"artifacts":[{"authorization_id":"%s","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf"}]}' "$WN_ARTIFACT_AUTHORIZATION_ID" >"$WN_ARTIFACT_MANIFEST"
+printf '%s\n' '{"type":"thread.started","thread_id":"codex-private-manifest"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Created report.pdf"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let manifest = private.join("manifest.json");
+        fs::write(&manifest, br#"{"artifacts":[]}"#).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: workdir.clone(),
+                session_id: None,
+                prompt: "create the report".to_owned(),
+                artifact_output: Some(ArtifactOutputRequest::new(
+                    manifest,
+                    "auth".to_owned(),
+                    workdir,
+                )),
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.recv().await, Some(RunnerEvent::Text(_))));
+        let Some(RunnerEvent::Artifacts(artifacts)) = rx.recv().await else {
+            panic!("missing typed artifact event");
+        };
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].file_name, "report.pdf");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn unreadable_artifact_manifest_does_not_turn_text_success_into_backend_failure() {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("malformed-artifact-codex");
@@ -408,7 +597,11 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
             r#"#!/usr/bin/env bash
 set -euo pipefail
 prompt="$(cat)"
-manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+if [ -n "${WN_ARTIFACT_MANIFEST:-}" ]; then
+  manifest="$WN_ARTIFACT_MANIFEST"
+else
+  manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+fi
 printf '%s' '{not-json' >"$manifest"
 printf '%s\n' '{"type":"thread.started","thread_id":"codex-text"}'
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"text still succeeds"}}'
