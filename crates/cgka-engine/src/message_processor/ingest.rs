@@ -1486,6 +1486,7 @@ impl<S: StorageProvider> Engine<S> {
                 let after_avatar = avatar_component_snapshot(&mls_group);
 
                 // Update our per-group state machine.
+                self.invalidate_deferred_peel_candidate_cache(&group_id);
                 self.epoch_manager.set_stable(group_id.clone(), after);
                 self.drop_self_remove_auto_commit_schedules_for_group(&group_id);
                 // Proposal-arrival schedule signals are source-epoch
@@ -2022,6 +2023,7 @@ impl<S: StorageProvider> Engine<S> {
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             pre_commit_epoch,
@@ -2863,6 +2865,7 @@ mod tests {
         let halted = CandidateBranchPeel {
             contested: true,
             contexts: Vec::new(),
+            replay_probe_count: 0,
         };
 
         let sweep = DeferredPeelSweep::over_branches(&halted);
@@ -2886,6 +2889,7 @@ mod tests {
         let uncontested = CandidateBranchPeel {
             contested: false,
             contexts: Vec::new(),
+            replay_probe_count: 0,
         };
 
         for sweep in [

@@ -271,6 +271,7 @@ impl<S: StorageProvider> Engine<S> {
         // backend) plus best-effort cleanup. Kind discriminates create (always
         // `GroupCreated`) from evolution (always `EpochChanged`).
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         if let (Some(fanout), Some(confirmed)) = (fanout.take(), confirmed_fanout) {
             *fanout = confirmed;
         }
@@ -491,6 +492,7 @@ impl<S: StorageProvider> Engine<S> {
         let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.audit_with_context(
             Some(&group_id),
             audit_context.clone(),

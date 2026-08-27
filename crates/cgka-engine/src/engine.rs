@@ -180,6 +180,10 @@ pub struct Engine<S: StorageProvider> {
     /// `do_ingest` epilogue must not promote that retryable id into the
     /// terminal `seen_message_ids` cache.
     pub(crate) retryable_unpersisted_ingest_id: Option<MessageId>,
+    /// Whether the last completed `ingest` left its transport object with no
+    /// durable trace, so only relay redelivery can present it again. See
+    /// [`Engine::last_ingest_left_object_unpersisted`].
+    pub(crate) last_ingest_left_object_unpersisted: bool,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs the typed own-echo exclusion when a message we produced
@@ -558,6 +562,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
+            last_ingest_left_object_unpersisted: false,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
@@ -819,6 +824,28 @@ impl<S: StorageProvider> Engine<S> {
 
     pub fn drain_valid_proposal_groups(&mut self) -> Vec<GroupId> {
         self.valid_proposal_groups.drain().collect()
+    }
+
+    /// Whether the last completed [`CgkaEngine::ingest`] left its transport
+    /// object unpersisted, so relay redelivery is the only path back to it.
+    ///
+    /// This is the same fact that suppresses the engine's own seen-cache
+    /// insertion (`retryable_unpersisted_ingest_id`), reported instead of left
+    /// implicit. Callers that maintain their own dedup index must skip it for
+    /// exactly these objects: an index entry with no durable object behind it
+    /// makes the object permanently unfetchable, which is the opposite of the
+    /// retry the engine deliberately left available.
+    ///
+    /// It is not recoverable from [`IngestOutcome`]. `ResourceRefused` is
+    /// always unpersisted, but `Ignored { UnknownGroup }` is returned both for
+    /// input the engine dropped without a trace (no group row: #740 forbids
+    /// retaining unknown-route floods) and for input it durably dedup-marked
+    /// (the disband-tombstone path). The two are indistinguishable in the
+    /// outcome and must be treated differently, so the engine reports the
+    /// disposition rather than making every caller re-derive a rule only it can
+    /// know.
+    pub fn last_ingest_left_object_unpersisted(&self) -> bool {
+        self.last_ingest_left_object_unpersisted
     }
 
     pub async fn ingest_with_audit_context(
@@ -1483,6 +1510,10 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
+        // Hydration and repair replace the live OpenMLS projection. Any
+        // exporter-bearing candidate contexts from the prior projection are
+        // stale even when the durable fingerprint later compares equal.
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         // A convergence rewind probe — the pass's, or the deferred-peel sweep's
         // candidate-branch enumeration — durably rewinds the group while it
         // explores historical candidates. Process termination cannot run the
@@ -2214,6 +2245,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         reason: GroupHydrationQuarantineReason,
     ) {
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         let reason_tag = hydration_quarantine_reason_tag(reason);
         let group_digest = hydration_quarantine_group_digest(group_id);
         tracing::warn!(
