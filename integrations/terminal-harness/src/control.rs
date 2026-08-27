@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_control::{
-    AgentControlEnvelope, AgentControlEvent, AgentControlMediaRef, AgentControlRequest,
-    AgentControlResponse, read_envelope, write_frame,
+    AgentControlEnvelope, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
+    AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
@@ -175,6 +175,78 @@ impl ControlClient {
                 code,
             }),
             other => Err(unexpected_response("download_media", &other)),
+        }
+    }
+
+    pub(crate) async fn send_agent_activity_error(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        reply_to_ref: &str,
+        text: String,
+    ) -> Result<()> {
+        match self
+            .call(
+                "send_agent_activity",
+                AgentControlRequest::SendAgentActivity {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    status: "error".to_owned(),
+                    text,
+                    reply_to_message_id_hex: Some(reply_to_ref.to_owned()),
+                    extra: None,
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::AppEventSent {
+                message_ids_hex, ..
+            } if !message_ids_hex.is_empty() => Ok(()),
+            AgentControlResponse::AppEventSent { .. } => Err(HarnessError::UnexpectedResponse {
+                method: "send_agent_activity",
+                response: "empty_app_event_sent",
+            }),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "send_agent_activity",
+                code,
+            }),
+            other => Err(unexpected_response("send_agent_activity", &other)),
+        }
+    }
+
+    pub(crate) async fn send_artifacts(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        attachments: Vec<AgentControlMediaUpload>,
+        caption: Option<String>,
+        idempotency_key: String,
+    ) -> Result<()> {
+        match self
+            .call(
+                "send_media",
+                AgentControlRequest::SendMedia {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    attachments,
+                    caption,
+                    idempotency_key: Some(idempotency_key),
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::FinalSent {
+                message_ids_hex, ..
+            } if !message_ids_hex.is_empty() => Ok(()),
+            AgentControlResponse::FinalSent { .. } => Err(HarnessError::UnexpectedResponse {
+                method: "send_media",
+                response: "empty_final_sent",
+            }),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "send_media",
+                code,
+            }),
+            other => Err(unexpected_response("send_media", &other)),
         }
     }
 
@@ -434,5 +506,133 @@ mod tests {
             .unwrap_err();
         server.await.unwrap();
         assert_eq!(err.privacy_safe_kind(), "response_id_mismatch");
+    }
+
+    #[tokio::test]
+    async fn send_artifacts_uses_the_existing_send_media_control_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = StdUnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = UnixListener::from_std(listener).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let request: AgentControlEnvelope<AgentControlRequest> =
+                read_envelope(&mut reader).await.unwrap().unwrap();
+            let request_id = request.id.clone();
+            match request.payload {
+                AgentControlRequest::SendMedia {
+                    account_id_hex,
+                    group_id_hex,
+                    attachments,
+                    caption,
+                    idempotency_key,
+                } => {
+                    assert_eq!(account_id_hex, "account");
+                    assert_eq!(group_id_hex, "group");
+                    assert_eq!(attachments.len(), 2);
+                    assert_eq!(attachments[0].file_name, "report.pdf");
+                    assert_eq!(attachments[1].file_name, "chart.png");
+                    assert_eq!(caption.as_deref(), Some("caption"));
+                    assert_eq!(idempotency_key.as_deref(), Some("stable-key"));
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+            let response = AgentControlEnvelope::request(
+                request_id,
+                AgentControlResponse::FinalSent {
+                    message_ids_hex: vec!["message".to_owned()],
+                    maintenance_disposition: Default::default(),
+                },
+            );
+            write_frame(&mut write_half, &response).await.unwrap();
+        });
+
+        let client = ControlClient::new(socket, None, Duration::from_secs(5), "wn-test");
+        client
+            .send_artifacts(
+                "account",
+                "group",
+                vec![
+                    AgentControlMediaUpload {
+                        path: "/private/report.pdf".to_owned(),
+                        media_type: "application/pdf".to_owned(),
+                        file_name: "report.pdf".to_owned(),
+                        dim: None,
+                        thumbhash: None,
+                    },
+                    AgentControlMediaUpload {
+                        path: "/private/chart.png".to_owned(),
+                        media_type: "image/png".to_owned(),
+                        file_name: "chart.png".to_owned(),
+                        dim: None,
+                        thumbhash: None,
+                    },
+                ],
+                Some("caption".to_owned()),
+                "stable-key".to_owned(),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_failure_uses_existing_agent_activity_error_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = StdUnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = UnixListener::from_std(listener).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let request: AgentControlEnvelope<AgentControlRequest> =
+                read_envelope(&mut reader).await.unwrap().unwrap();
+            let request_id = request.id.clone();
+            match request.payload {
+                AgentControlRequest::SendAgentActivity {
+                    account_id_hex,
+                    group_id_hex,
+                    status,
+                    text,
+                    reply_to_message_id_hex,
+                    extra,
+                } => {
+                    assert_eq!(account_id_hex, "account");
+                    assert_eq!(group_id_hex, "group");
+                    assert_eq!(status, "error");
+                    assert_eq!(text, "attachments withheld");
+                    assert_eq!(reply_to_message_id_hex.as_deref(), Some("message"));
+                    assert!(extra.is_none());
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+            let response = AgentControlEnvelope::request(
+                request_id,
+                AgentControlResponse::AppEventSent {
+                    message_ids_hex: vec!["activity".to_owned()],
+                    maintenance_disposition: Default::default(),
+                },
+            );
+            write_frame(&mut write_half, &response).await.unwrap();
+        });
+
+        let client = ControlClient::new(socket, None, Duration::from_secs(5), "wn-test");
+        client
+            .send_agent_activity_error(
+                "account",
+                "group",
+                "message",
+                "attachments withheld".to_owned(),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 }

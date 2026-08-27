@@ -22,7 +22,10 @@ pub(crate) const DEFAULT_OPEN_RANKING_PROFILE_RELAY: &str = "wss://relay.vertexl
 ///
 /// * [`Advance`](Self::Advance) — the default, normal posture: every ingested
 ///   kind-445 advances the in-memory cursor (clamp-then-monotonic-max, see
-///   `client/sync.rs`) and `save_state` persists the advance.
+///   `client/sync.rs`). A completed transport drain promotes that candidate to
+///   the durable floor; isolated live-delivery projection saves retain the last
+///   drain checkpoint so a later bounded-queue overflow cannot strand an older
+///   delivery below an already-persisted newest-first cursor.
 /// * [`Frozen`](Self::Frozen) — the wake-collection posture (iOS NSE,
 ///   notification reply/mark-read actions: full runtimes with a sub-second
 ///   drain budget on cold sockets). A `Frozen` pass still ingests, decrypts,

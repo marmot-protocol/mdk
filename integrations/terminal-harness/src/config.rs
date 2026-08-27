@@ -6,8 +6,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::{
-    Config, DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_REPLY_BYTES,
-    HarnessError, MARMOT_MESSAGE_BYTES_CEILING, Result,
+    ArtifactExportConfig, ArtifactExportGrant, Config, DEFAULT_MAX_ATTACHMENT_BYTES,
+    DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING,
+    Result,
 };
 
 const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 3600;
@@ -242,6 +243,44 @@ pub fn load_config_with(
             .join(spec.reply_prefix)
             .join("sessions.json")
     });
+    let artifact_enabled_name = env_name("ARTIFACT_EXPORTS_ENABLED");
+    let artifact_enabled = parse_bool(
+        lookup(&artifact_enabled_name),
+        false,
+        &artifact_enabled_name,
+    )?;
+    let artifact_grants_name = env_name("ARTIFACT_GRANTS_JSON");
+    let artifact_grants = lookup(&artifact_grants_name)
+        .map(|raw| parse_artifact_grants(&artifact_grants_name, &raw))
+        .transpose()?
+        .unwrap_or_default();
+    if artifact_enabled && artifact_grants.is_empty() {
+        return Err(config_error(format!(
+            "{artifact_grants_name} must contain at least one exact group/root grant when artifact exports are enabled"
+        )));
+    }
+    let artifact_max_count_name = env_name("ARTIFACT_MAX_COUNT");
+    let artifact_max_count = parse_usize(
+        lookup(&artifact_max_count_name),
+        crate::artifacts::MAX_ARTIFACTS_PER_RESULT,
+        &artifact_max_count_name,
+    )?;
+    if !(1..=crate::artifacts::MAX_ARTIFACTS_PER_RESULT).contains(&artifact_max_count) {
+        return Err(config_error(format!(
+            "{artifact_max_count_name} must be between 1 and {}",
+            crate::artifacts::MAX_ARTIFACTS_PER_RESULT
+        )));
+    }
+    let artifact_staging_root = lookup(&env_name("ARTIFACT_STAGING_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("media-uploads"));
+    let artifact_exports = ArtifactExportConfig::new(
+        artifact_enabled,
+        artifact_grants,
+        artifact_staging_root,
+        state_path.with_extension("artifact-outbox.json"),
+    )
+    .with_max_count(artifact_max_count);
 
     Ok(LoadedConfig {
         harness: Config {
@@ -261,6 +300,7 @@ pub fn load_config_with(
             backend_timeout,
             backend_idle_timeout,
             execution_profile,
+            artifact_exports,
             spec,
         },
         home,
@@ -319,6 +359,41 @@ fn parse_usize(raw: Option<String>, default: usize, name: &str) -> Result<usize>
     })
 }
 
+fn parse_bool(raw: Option<String>, default: bool, name: &str) -> Result<bool> {
+    raw.map_or(Ok(default), |value| match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(config_error(format!("{name} must be `true` or `false`"))),
+    })
+}
+
+fn parse_artifact_grants(name: &str, raw: &str) -> Result<Vec<ArtifactExportGrant>> {
+    let mut grants: Vec<ArtifactExportGrant> = serde_json::from_str(raw)
+        .map_err(|_| config_error(format!("{name} must be a JSON array of artifact grants")))?;
+    let mut groups = HashSet::new();
+    for grant in &mut grants {
+        let normalized = grant.group_id_hex.trim().to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized.len() % 2 != 0
+            || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(config_error(format!(
+                "{name} grants require non-empty opaque hex group ids"
+            )));
+        }
+        grant.group_id_hex = normalized;
+        if !grant.export_root.is_absolute()
+            || !(1..=crate::artifacts::MAX_ARTIFACT_GRANT_TTL_SECONDS).contains(&grant.ttl_seconds)
+            || !groups.insert(grant.group_id_hex.clone())
+        {
+            return Err(config_error(format!(
+                "{name} grants require a unique opaque hex group id, absolute export_root, and ttl_seconds between 1 and 86400"
+            )));
+        }
+    }
+    Ok(grants)
+}
+
 fn config_error(message: impl Into<String>) -> HarnessError {
     HarnessError::Config(message.into())
 }
@@ -369,6 +444,119 @@ mod tests {
             PathBuf::from("/home/test/.marmot-agents/test/tmp/wn-test-inbound-attachments")
         );
         assert_eq!(loaded.harness.execution_profile, ExecutionProfile::Inherit);
+        assert!(!loaded.harness.artifact_exports.enabled());
+        assert_eq!(
+            loaded.harness.artifact_exports.max_count(),
+            crate::artifacts::MAX_ARTIFACTS_PER_RESULT
+        );
+    }
+
+    #[test]
+    fn artifact_max_count_is_operator_configurable_within_transport_bound() {
+        let base = [
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+        ];
+        let mut configured = base.to_vec();
+        configured.push(("WN_TEST_ARTIFACT_MAX_COUNT", "4"));
+        assert_eq!(
+            load(&configured)
+                .unwrap()
+                .harness
+                .artifact_exports
+                .max_count(),
+            4
+        );
+
+        for invalid in ["0", "11"] {
+            let mut values = base.to_vec();
+            values.push(("WN_TEST_ARTIFACT_MAX_COUNT", invalid));
+            let error = load(&values).unwrap_err();
+            assert!(error.to_string().contains("ARTIFACT_MAX_COUNT"));
+        }
+    }
+
+    #[test]
+    fn artifact_exports_require_explicit_enablement_and_roots() {
+        let base = [
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+        ];
+        assert!(load(&base).is_err());
+
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+            (
+                "WN_TEST_ARTIFACT_GRANTS_JSON",
+                r#"[{"group_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","export_root":"/home/test/output","ttl_seconds":300}]"#,
+            ),
+        ])
+        .unwrap();
+        assert!(loaded.harness.artifact_exports.enabled());
+        assert_eq!(loaded.harness.artifact_exports.grants().len(), 1);
+    }
+
+    #[test]
+    fn artifact_exports_accept_16_byte_opaque_group_ids() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+            (
+                "WN_TEST_ARTIFACT_GRANTS_JSON",
+                r#"[{"group_id_hex":"AABBCCDDEEFF00112233445566778899","export_root":"/home/test/output","ttl_seconds":300}]"#,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            loaded.harness.artifact_exports.grants()[0].group_id_hex,
+            "aabbccddeeff00112233445566778899"
+        );
+    }
+
+    #[test]
+    fn artifact_grant_ttl_defaults_to_one_hour_and_rejects_values_above_one_day() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+            (
+                "WN_TEST_ARTIFACT_GRANTS_JSON",
+                r#"[{"group_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","export_root":"/home/test/output"}]"#,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            loaded.harness.artifact_exports.grants()[0].ttl_seconds,
+            crate::artifacts::DEFAULT_ARTIFACT_GRANT_TTL_SECONDS
+        );
+
+        assert!(
+            load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+                (
+                    "WN_TEST_ARTIFACT_GRANTS_JSON",
+                    r#"[{"group_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","export_root":"/home/test/output","ttl_seconds":86401}]"#,
+                ),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_exports_reject_ambiguous_boolean_values() {
+        let error = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "yes"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("ARTIFACT_EXPORTS_ENABLED"));
     }
 
     #[test]

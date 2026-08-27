@@ -42,6 +42,20 @@ pub enum HarnessError {
     AttachmentInvalid,
     #[error("backend does not support this attachment type")]
     AttachmentUnsupported,
+    #[error("artifact exports are disabled")]
+    ArtifactExportsDisabled,
+    #[error("artifact authorization is missing, expired, or does not match this turn")]
+    ArtifactAuthorizationInvalid,
+    #[error("artifact output is outside the configured roots")]
+    ArtifactOutsideAllowedRoots,
+    #[error("artifact source must be a regular non-symlink file")]
+    ArtifactUnsafeSource,
+    #[error("artifact metadata is invalid")]
+    ArtifactInvalidMetadata,
+    #[error("artifact result exceeds configured limits")]
+    ArtifactLimitsExceeded,
+    #[error("artifact idempotency key conflicts with durable state")]
+    ArtifactIdempotencyConflict,
     #[error("task join error")]
     Join,
 }
@@ -65,6 +79,13 @@ impl HarnessError {
             Self::AttachmentBytesLimit => "attachment_bytes_limit",
             Self::AttachmentInvalid => "attachment_invalid",
             Self::AttachmentUnsupported => "attachment_unsupported",
+            Self::ArtifactExportsDisabled => "artifact_exports_disabled",
+            Self::ArtifactAuthorizationInvalid => "artifact_authorization_invalid",
+            Self::ArtifactOutsideAllowedRoots => "artifact_outside_allowed_roots",
+            Self::ArtifactUnsafeSource => "artifact_unsafe_source",
+            Self::ArtifactInvalidMetadata => "artifact_invalid_metadata",
+            Self::ArtifactLimitsExceeded => "artifact_limits_exceeded",
+            Self::ArtifactIdempotencyConflict => "artifact_idempotency_conflict",
             Self::Join => "join",
         }
     }
@@ -76,6 +97,18 @@ impl HarnessError {
                 | Self::AgentControl
                 | Self::ControlClosed
                 | Self::ControlTimedOut { .. }
+        )
+    }
+
+    pub(crate) fn artifact_validation_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::ArtifactOutsideAllowedRoots
+                | Self::ArtifactAuthorizationInvalid
+                | Self::ArtifactUnsafeSource
+                | Self::ArtifactInvalidMetadata
+                | Self::ArtifactLimitsExceeded
+                | Self::ArtifactIdempotencyConflict
         )
     }
 }
