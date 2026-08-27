@@ -19,6 +19,7 @@ mod prepared_group_image_upload;
 mod shared;
 mod storage;
 mod timeline;
+mod transport_reconciliation;
 
 pub use account_projection::{
     AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushToken,
@@ -64,6 +65,7 @@ pub use timeline::{
     TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason,
     TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
+pub use transport_reconciliation::{TransportReconciliationItem, TransportReconciliationRoute};
 
 pub use agent_stream_sequences::{
     AgentStreamPublisherReservation, AgentStreamPublisherReservationRequest,

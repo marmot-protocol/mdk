@@ -685,6 +685,57 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
 }
 
 #[tokio::test]
+async fn reconciled_group_event_routes_only_to_the_compared_account() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xC3; 32]);
+    let transport_group_id = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let subscription = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+
+    for account_id in [alice, bob.clone()] {
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id,
+                inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+                group_subscriptions: vec![subscription.clone()],
+                since: None,
+            })
+            .await
+            .expect("account activation succeeds");
+    }
+
+    let delivered = adapter
+        .handle_reconciled_event(
+            &bob,
+            NostrRelayEvent {
+                endpoint,
+                subscription_id: None,
+                event: group_event("reconciled", &transport_group_id),
+            },
+        )
+        .await
+        .expect("reconciled event handled");
+
+    assert_eq!(delivered, 1);
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.account_id, bob);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), adapter.receive())
+            .await
+            .is_err(),
+        "another account sharing the route must not receive this account's reconciliation replay"
+    );
+}
+
+#[tokio::test]
 async fn activate_account_issues_inbox_and_group_subscriptions_concurrently() {
     let relay = Arc::new(ConcurrentSubscribeRelayClient::default());
     relay.expect_concurrent_subscribes(2);

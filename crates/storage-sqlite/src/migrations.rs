@@ -104,6 +104,8 @@ mod migration_0051_prepared_group_image_uploads;
 mod migration_0052_epoch_backfill_intents;
 #[path = "migrations/0053_account_delivery_recovery.rs"]
 mod migration_0053_account_delivery_recovery;
+#[path = "migrations/0054_transport_reconciliation_items.rs"]
+mod migration_0054_transport_reconciliation_items;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -383,6 +385,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 53,
         name: "0053_account_delivery_recovery",
         apply: migration_0053_account_delivery_recovery::apply,
+    },
+    Migration {
+        version: 54,
+        name: "0054_transport_reconciliation_items",
+        apply: migration_0054_transport_reconciliation_items::apply,
     },
 ];
 
@@ -911,7 +918,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 53,
+                found: 54,
                 latest_supported: 46,
             }
         ));
@@ -967,7 +974,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 53,
+                found: 54,
                 latest_supported: 46,
             }
         ));
@@ -1271,7 +1278,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 53,
+                found: 54,
                 latest_supported: 46,
             }
         ));

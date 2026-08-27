@@ -1,20 +1,22 @@
-//! Characterization tests for transport-cursor floor safety and epoch-gap
-//! recovery.
+//! Regression coverage for the since-floor defect and its set-reconciliation
+//! correctness backstop.
 //!
-//! `last_transport_timestamp` has two stages: every retained kind-445 may
-//! advance an in-memory candidate, but only a completed transport drain
-//! promotes that candidate to the durable subscription floor. Isolated live
-//! delivery saves retain the previous drain checkpoint. That separation keeps
-//! a later bounded-queue overflow from stranding an older newest-first event
-//! below a cursor committed by the retained prefix.
+//! Retained kind-445 events may advance an in-memory cursor candidate, but only
+//! a completed transport drain promotes that candidate to the durable
+//! subscription floor. Once such a drain establishes a floor, an event that is
+//! authored earlier but replicated later can still fall below
+//! `since = checkpoint − 120s`. A NIP-77 pass therefore reconciles each
+//! inbox/group route by event id against a durable per-route set, making that
+//! late event discoverable without discarding the cheap timestamp fast path.
 //!
-//! This file pins both consequences. The first test proves that an isolated
-//! live delivery cannot make below-candidate backlog permanently unfetchable:
-//! the first cold restart receives both probes, then its completed drain safely
-//! promotes the cursor, so the second restart may floor the older probe only
-//! after it is already durable. The second test independently pins unfloored
-//! epoch-gap recovery when a previously completed drain really did establish a
-//! floor below which new backlog appears.
+//! The first test explicitly completes a checkpointing cold boot, then proves
+//! reconciliation downloads a below-floor sibling on the next boot and records
+//! it in the exact route inventory. A later boot has no set difference for that
+//! sibling, so it avoids replaying the payload again.
+//!
+//! The second test retains the independent epoch-stall arm coverage: a burst of
+//! undecryptable traffic still arms its full-history recovery path even though
+//! route reconciliation now supplies timestamp-independent discovery first.
 //!
 //! # Why one account per store
 //!
@@ -53,10 +55,9 @@
 //! runtime down for good, publishes the probe events while `bob` has no
 //! store-side app instance running at all, then opens a *brand new*
 //! `MarmotApp`/`MarmotAppRuntime` pair against the same on-disk store. That
-//! new pair's first subscription rebuild is a genuine cold boot. Doing it
-//! twice demonstrates the cursor transition: the first drain recovers and
-//! checkpoints the older probe; only the later rebuild applies the newly safe
-//! floor.
+//! new pair's first subscription rebuild is a genuine cold boot. The tests use
+//! one clean boot to promote a completed-drain checkpoint, then separate boots
+//! to demonstrate reconciliation and its durable no-redownload property.
 //!
 //! # Delivery observable
 //!
@@ -79,11 +80,10 @@
 //! Because a cold boot's *first* catch-up also naturally re-delivers the
 //! group's real history (the welcome and the one ordinary message this test
 //! sends to advance the cursor), the test measures that legitimate count on
-//! the very first (still-live) boot rather than assuming it, then asserts
-//! the first subsequent cold boot's delivered count is exactly
-//! `legitimate_count + 2` (both probes), while the following cold boot is
-//! exactly `legitimate_count + 1`: its newly promoted floor may exclude the
-//! older probe because the previous drain already retained it durably.
+//! the very first (still-live) boot rather than assuming it, then asserts boot
+//! 2 delivers `legitimate_count + 2` (both siblings) and boot 3 returns to
+//! `legitimate_count + 1` because the below-floor event is already present in
+//! the exact reconciliation set.
 
 use std::time::{Duration, Instant};
 
@@ -273,7 +273,7 @@ async fn publish_garbage_group_message_at(
 }
 
 #[tokio::test]
-async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor() {
+async fn cold_restart_reconciles_backlog_below_since_floor() {
     let (_relay, url) = mock_relay().await;
 
     // --- bob's store: the account whose since-floor we are pinning ---
@@ -343,7 +343,29 @@ async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor()
     // boot will legitimately re-fetch: the welcome and this one message. This
     // is exactly what boot 1's own live subscription needed to receive to
     // reach this point.
-    let legitimate_delivery_count = inbound_events_delivered(&app_bob_boot1).await;
+    let initial_delivery_count = inbound_events_delivered(&app_bob_boot1).await;
+
+    // PR #1567 deliberately keeps isolated live-delivery candidates out of the
+    // durable subscription floor. Complete one clean cold-boot drain before
+    // publishing the probes so this test exercises the remaining #1579 case:
+    // late relay history below a floor that was legitimately checkpointed.
+    runtime_bob_boot1.shutdown().await;
+    alice_client
+        .send(&group_id, b"offline checkpoint anchor")
+        .await
+        .unwrap();
+    let app_bob_checkpoint = open_store(&dir_bob, &url);
+    let runtime_bob_checkpoint = MarmotAppRuntime::new(app_bob_checkpoint.clone());
+    start_with_maintenance_paused(&runtime_bob_checkpoint, "bob").await;
+    wait_for_first_catch_up(&runtime_bob_checkpoint).await;
+    sleep(TELEMETRY_SETTLE_GRACE).await;
+    let legitimate_delivery_count = inbound_events_delivered(&app_bob_checkpoint).await;
+    assert_eq!(
+        legitimate_delivery_count,
+        initial_delivery_count + 1,
+        "the checkpointing boot must drain the established history plus the new offline anchor",
+    );
+    runtime_bob_checkpoint.shutdown().await;
 
     // Reference wall-clock used to place the two probe events relative to
     // the floor. `reference_now` is captured after the message is confirmed
@@ -356,18 +378,17 @@ async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor()
     let above_floor_created_at = floor_estimate.saturating_add(60);
     assert!(above_floor_created_at < reference_now);
 
-    // bob must be fully offline before the probes are published: a still-open
+    // bob is fully offline while the probes are published: a still-open
     // subscription would deliver them live regardless of `created_at` (see
-    // the module doc comment). This is boot 1's last use — never reopened.
-    runtime_bob_boot1.shutdown().await;
+    // the module doc comment).
 
     publish_garbage_group_message_at(&url, &nostr_group_id_hex, below_floor_created_at, "below")
         .await;
     publish_garbage_group_message_at(&url, &nostr_group_id_hex, above_floor_created_at, "above")
         .await;
 
-    // --- boot 2: cold restart, first subscription rebuild since the probes
-    // landed ---
+    // --- boot 2: cold restart, first subscription rebuild and route-set
+    // reconciliation since the probes landed ---
     let app_bob_boot2 = open_store(&dir_bob, &url);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
     start_with_maintenance_paused(&runtime_bob_boot2, "bob").await;
@@ -377,14 +398,26 @@ async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor()
     assert_eq!(
         delivered_after_boot2,
         legitimate_delivery_count + 2,
-        "an isolated live-delivery cursor candidate must not become the durable \
-         floor: the first cold boot must still fetch both probe siblings",
+        "normal cold-boot catch-up must reconcile both the above-floor sibling \
+         and the below-floor probe without an independently armed backfill",
+    );
+    let boot2_reconciliation = app_bob_boot2.relay_telemetry().await.metrics;
+    assert!(boot2_reconciliation.reconciliation_attempts >= 1);
+    assert!(
+        boot2_reconciliation.reconciliation_remote_items >= 1,
+        "the route set difference must identify the below-floor probe \
+         independently of the subscription timestamp floor"
+    );
+    assert!(
+        boot2_reconciliation.reconciliation_received_items >= 1,
+        "the below-floor route difference must download while the ordinary \
+         subscription owns the above-floor sibling"
     );
     runtime_bob_boot2.shutdown().await;
 
-    // --- boot 3: boot 2's completed drain has now durably retained both
-    // probes and promoted its cursor candidate. A later rebuild can safely
-    // floor the older probe without making it unfetchable. ---
+    // --- boot 3: a second independent cold restart. The durable inventory
+    // makes the route set equal, so reconciliation downloads no payload for the
+    // already-observed below-floor event. ---
     let app_bob_boot3 = open_store(&dir_bob, &url);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
     start_with_maintenance_paused(&runtime_bob_boot3, "bob").await;
@@ -394,16 +427,24 @@ async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor()
     assert_eq!(
         delivered_after_boot3,
         legitimate_delivery_count + 1,
-        "after the first cold boot retained both probes, its completed drain \
-         may promote the cursor so the next rebuild delivers only the \
-         above-floor sibling",
+        "the reconciled below-floor event must remain in the durable route set, \
+         so a second cold boot has no set difference to download and only the \
+         ordinary above-floor sibling is redelivered",
+    );
+    let boot3_reconciliation = app_bob_boot3.relay_telemetry().await.metrics;
+    assert!(boot3_reconciliation.reconciliation_attempts >= 1);
+    assert_eq!(
+        boot3_reconciliation.reconciliation_remote_items, 0,
+        "the durable route inventory must make the next reconciliation a \
+         set-equal exchange rather than another full-history payload replay"
     );
     runtime_bob_boot3.shutdown().await;
 }
 
-/// Separate armed-recovery characterization: with enough undecryptable traffic
-/// at a stalled epoch, epoch-gap backfill recovers backlog below a floor already
-/// established by a completed drain.
+/// The armed counterpart to [`cold_restart_reconciles_backlog_below_since_floor`]:
+/// enough undecryptable traffic at a stalled epoch still arms epoch-gap
+/// backfill after route reconciliation has supplied timestamp-independent
+/// discovery.
 ///
 /// The probes play two distinct roles on either side of the floor:
 ///
@@ -412,16 +453,16 @@ async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor()
 ///   event ids — each counts as a distinct undecryptable message at bob's
 ///   stalled epoch. The eighth crosses `EPOCH_STALL_BACKFILL_THRESHOLD` and
 ///   arms a full-history transport replay (`since = None`).
-/// - **Recovery target** (`below-target`, below the floor): the floored
-///   catch-up can never deliver it; the only path to ingest is the unfloored
-///   backfill replay the arming probes trigger.
+/// - **Reconciliation target** (`below-target`, below the floor): the floored
+///   catch-up cannot deliver it, so the route-set pass discovers it before the
+///   drain that observes the stalled epoch.
 ///
-/// Boot 2 pins the heal itself. Boot 3 pins that the heal is *durable and
-/// debounced*: ingested event ids persist in the account's seen-event state,
-/// so a later cold boot neither re-arms the detector nor replays full history
-/// again — recovery costs one backfill, not one per boot.
+/// Boot 2 pins that discovery and epoch-stall arming coexist. Boot 3 pins that
+/// reconciliation is durable and the epoch detector remains debounced:
+/// ingested event ids persist, so a later cold boot does not trigger another
+/// full-history replay.
 #[tokio::test]
-async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
+async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
     let (_relay, url) = mock_relay().await;
 
     // Same one-account-per-store split as the floor-drop test above.
@@ -485,7 +526,29 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     // Measured, not assumed, exactly as in the floor-drop test: how many
     // deliveries a fresh cold boot legitimately re-fetches (the welcome and
     // the one ordinary message).
-    let legitimate_delivery_count = inbound_events_delivered(&app_bob_boot1).await;
+    let initial_delivery_count = inbound_events_delivered(&app_bob_boot1).await;
+
+    // Establish a completed-drain checkpoint before placing the epoch-stall
+    // probes around its floor. This keeps the test independent from overflow
+    // recovery's newer rule that isolated live deliveries do not advance the
+    // durable subscription cursor.
+    runtime_bob_boot1.shutdown().await;
+    alice_client
+        .send(&group_id, b"offline checkpoint anchor")
+        .await
+        .unwrap();
+    let app_bob_checkpoint = open_store(&dir_bob, &url);
+    let runtime_bob_checkpoint = MarmotAppRuntime::new(app_bob_checkpoint.clone());
+    start_with_maintenance_paused(&runtime_bob_checkpoint, "bob").await;
+    wait_for_first_catch_up(&runtime_bob_checkpoint).await;
+    sleep(TELEMETRY_SETTLE_GRACE).await;
+    let legitimate_delivery_count = inbound_events_delivered(&app_bob_checkpoint).await;
+    assert_eq!(
+        legitimate_delivery_count,
+        initial_delivery_count + 1,
+        "the checkpointing boot must drain the established history plus the new offline anchor",
+    );
+    runtime_bob_checkpoint.shutdown().await;
 
     // Same floor placement as the floor-drop test above.
     let reference_now = test_unix_now_seconds();
@@ -494,12 +557,11 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     let above_floor_created_at = floor_estimate.saturating_add(60);
     assert!(above_floor_created_at < reference_now);
 
-    // bob must be fully offline before any probe is published (see the module
-    // doc comment on live subscriptions ignoring `since`).
-    runtime_bob_boot1.shutdown().await;
+    // bob remains fully offline while probes are published (see the module doc
+    // comment on live subscriptions ignoring `since`).
 
-    // The recovery target: below the floor, unreachable by any floored
-    // catch-up — only an unfloored backfill replay can deliver it.
+    // The reconciliation target: below the floor and therefore unreachable by
+    // the ordinary catch-up, but discoverable by the route-set pass.
     publish_garbage_group_message_at(
         &url,
         &nostr_group_id_hex,
@@ -526,8 +588,8 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     // + BACKFILL_THRESHOLD        — the above-floor arming probes arrive
     //                               through the floored catch-up and arm the
     //                               detector at bob's stalled epoch;
-    // + 1                         — the armed backfill's `since = None` replay
-    //                               recovers the below-floor probe.
+    // + 1                         — route reconciliation discovers the
+    //                               below-floor probe.
     // The unfloored replay re-serves every already-seen event too, but
     // nostr-sdk emits an `Event` notification only for events new to its
     // database, so re-fetches are not re-counted and the total is exact — a
@@ -535,7 +597,8 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
     // probe.
     let expected_healed = legitimate_delivery_count + BACKFILL_THRESHOLD + 1;
 
-    // --- boot 2: cold restart; catch-up arms the detector, backfill heals ---
+    // --- boot 2: reconciliation discovers the target and the same drain's
+    // above-floor probes still arm the epoch-stall detector. ---
     let app_bob_boot2 = open_store(&dir_bob, &url);
     let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
     start_with_maintenance_paused(&runtime_bob_boot2, "bob").await;
@@ -548,18 +611,18 @@ async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
         inbound_events_delivered(&app_bob_boot2).await,
         expected_healed,
         "an armed cold boot must deliver exactly the legitimate re-fetches, \
-         the arming probes, and — via the epoch-gap backfill replay — the \
-         below-floor probe, with no replayed duplicate re-counted",
+         the arming probes, and the reconciled below-floor probe, with no \
+         replayed duplicate re-counted",
     );
     runtime_bob_boot2.shutdown().await;
 
-    // --- boot 3: the heal is durable, not a per-boot replay storm. Boot 2
-    // consumed the arming evidence (ingested event ids persist in the
+    // --- boot 3: reconciliation is durable, not a per-boot replay storm.
+    // Boot 2 consumed the arming evidence (ingested event ids persist in the
     // account's seen-event state and are skipped before ingest), so this
     // independent cold boot re-fetches the above-floor history at the
     // transport layer without re-arming the per-boot, in-memory detector: no
     // second full-history replay fires, and the below-floor probe — already
-    // recovered once — stays below the rebuilt floor without being
+    // reconciled once — stays below the rebuilt floor without being
     // re-delivered. Exactly the legitimate re-fetches plus the eight
     // above-floor probes arrive, and nothing else. ---
     let expected_after_heal = legitimate_delivery_count + BACKFILL_THRESHOLD;

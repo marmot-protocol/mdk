@@ -9,9 +9,9 @@ use cgka_traits::{
     TransportPublishFailure, collapse_publish_failure_summaries,
 };
 use nostr_sdk::prelude::{
-    Alphabet, Client, Event, EventBuilder, Filter, Kind, PublicKey, RelayMessage,
-    RelayPoolNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, Tag, TagKind,
-    Timestamp as NostrTimestamp,
+    Alphabet, Client, Event, EventBuilder, EventId, Filter, Kind, PublicKey, RelayMessage,
+    RelayPoolNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, SyncDirection,
+    SyncOptions, Tag, TagKind, Timestamp as NostrTimestamp,
 };
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
@@ -50,6 +50,27 @@ const SDK_RELAY_BATCH_OVERALL_WAIT: Duration = Duration::from_secs(60);
 /// fan-outs. Four covers the generated-account bootstrap cohort while keeping
 /// larger batches backpressured.
 const SDK_RELAY_BATCH_MAX_IN_FLIGHT: usize = 4;
+/// A reconciliation pass is a correctness backstop, but it must not own the
+/// serial account worker indefinitely when a relay is slow or advertises a
+/// large first-run difference. Partial downloads remain in the SDK database
+/// and the durable app inventory records them as they ingest, so a later pass
+/// resumes with a smaller set difference.
+const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(10);
+const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrReconciliationItem {
+    pub event_id: [u8; 32],
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NostrReconciliationSummary {
+    pub relays_succeeded: usize,
+    pub relays_failed: usize,
+    pub remote_items: usize,
+    pub received_items: usize,
+}
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
 #[derive(Clone, Debug)]
@@ -193,6 +214,116 @@ impl NostrSdkRelayClient {
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Reconcile the content-addressed event set in one route's gap below the
+    /// ordinary subscription floor. NIP-77 compares event ids, so a
+    /// late-published event is discoverable regardless of its authored
+    /// timestamp without replaying current MLS traffic through a second path.
+    pub async fn reconcile_subscription(
+        &self,
+        subscription: NostrSubscription,
+        local_items: &[NostrReconciliationItem],
+        reconcile_until: u64,
+    ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
+        let mut plan = Self::plan_subscription(&subscription)?;
+        // The ordinary subscription owns its inclusive timestamp window. The
+        // correctness pass compares only the older gap, avoiding a second,
+        // unordered delivery path for current MLS traffic while still finding
+        // events that a fixed `since` floor can never see.
+        plan.filter = plan
+            .filter
+            .until(NostrTimestamp::from_secs(reconcile_until));
+        let replay_endpoint = plan.endpoints.first().cloned().ok_or_else(|| {
+            TransportAdapterError::Subscription(
+                "NIP-77 reconciliation requires at least one relay".to_owned(),
+            )
+        })?;
+        let subscription_id = plan.subscription_id.to_string();
+        let items = local_items
+            .iter()
+            .filter(|item| item.created_at <= reconcile_until)
+            .map(|item| {
+                (
+                    EventId::from_byte_array(item.event_id),
+                    NostrTimestamp::from_secs(item.created_at),
+                )
+            })
+            .collect::<Vec<_>>();
+        let targets = plan
+            .endpoints
+            .iter()
+            .cloned()
+            .map(|endpoint| (endpoint, (plan.filter.clone(), items.clone())))
+            .collect::<Vec<_>>();
+        let options = SyncOptions::new()
+            .initial_timeout(SDK_RECONCILIATION_NEGOTIATION_WAIT)
+            .direction(SyncDirection::Down);
+        let output = timeout(
+            SDK_RECONCILIATION_WAIT,
+            self.client.pool().sync_targeted(targets, &options),
+        )
+        .await
+        .map_err(|_| {
+            TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
+        })?
+        .map_err(|error| {
+            TransportAdapterError::Subscription(format!("NIP-77 reconciliation failed: {error}"))
+        })?;
+        // `nostr-sdk` stores one shared event database for the whole relay
+        // client. An event may therefore already be cached because another
+        // local account published or received it, in which case the SDK does
+        // not emit another pool notification even though this account's exact
+        // set correctly reported it missing. Materialize every remote-only id
+        // from the verified SDK database so the caller can route it through
+        // this account's subscription explicitly.
+        let mut remote_ids = output.val.remote.iter().copied().collect::<Vec<_>>();
+        remote_ids.sort_unstable();
+        let mut sdk_events = Vec::with_capacity(remote_ids.len());
+        for event_id in remote_ids {
+            let Some(event) = self
+                .client
+                .database()
+                .event_by_id(&event_id)
+                .await
+                .map_err(|error| {
+                    TransportAdapterError::Subscription(format!(
+                        "read reconciled event from SDK database: {error}"
+                    ))
+                })?
+            else {
+                continue;
+            };
+            sdk_events.push(event);
+        }
+        // Negentropy reports a set. MLS input is sequential, so replay the
+        // materialized difference in the same authored-time/id order used by
+        // stored-event catch-up instead of HashSet iteration order.
+        sdk_events.sort_unstable_by_key(|event| (event.created_at, event.id));
+        let mut received_ids = output.val.received.clone();
+        let mut remote_events = Vec::with_capacity(sdk_events.len());
+        for event in sdk_events {
+            received_ids.insert(event.id);
+            remote_events.push(NostrRelayEvent {
+                endpoint: TransportEndpoint(replay_endpoint.to_string()),
+                subscription_id: Some(subscription_id.clone()),
+                event: NostrTransportEvent::from_nostr_event(&event).map_err(|error| {
+                    TransportAdapterError::Subscription(format!(
+                        "decode reconciled SDK event: {error}"
+                    ))
+                })?,
+            });
+        }
+        let summary = NostrReconciliationSummary {
+            relays_succeeded: output.success.len(),
+            relays_failed: output.failed.len(),
+            remote_items: output.val.remote.len(),
+            // Fresh downloads are reported by the SDK even when its configured
+            // database does not retain full event bodies; shared-cache hits are
+            // represented by the explicit materialization path above.
+            received_items: received_ids.len(),
+        };
+        Ok((summary, remote_events))
     }
 
     /// Summarize SDK-owned relay health without exposing relay URLs.

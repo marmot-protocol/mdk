@@ -4,9 +4,14 @@ use std::time::{Duration, Instant};
 use cgka_traits::GroupId;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
-use storage_sqlite::clamp_to_max_future_skew;
+use cgka_traits::transport::TransportEnvelope;
+use storage_sqlite::{
+    TransportReconciliationItem, TransportReconciliationRoute, clamp_to_max_future_skew,
+};
 use tokio::time::timeout;
-use transport_nostr_adapter::AccountSubscriptionEose;
+use transport_nostr_adapter::{
+    AccountSubscriptionEose, NostrReconciliationItem as AdapterReconciliationItem,
+};
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
@@ -35,6 +40,19 @@ use super::epoch_stall::{
     PendingEpochBackfillGroup,
 };
 use crate::config::CursorPersistence;
+
+/// Account-wide startup budget for the timestamp-independent correctness pass.
+/// Partial progress is durable, so a slow or non-NIP-77 relay cannot hold the
+/// account worker indefinitely and the next sync can resume from a smaller
+/// difference.
+const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
+
+fn nostr_reconciliation_item(item: TransportReconciliationItem) -> AdapterReconciliationItem {
+    AdapterReconciliationItem {
+        event_id: item.event_id,
+        created_at: item.created_at,
+    }
+}
 
 /// In-flight epoch-gap replay bookkeeping shared by begin/finish helpers.
 pub(crate) struct EpochBackfillExecution {
@@ -522,6 +540,86 @@ impl AppClient {
         Ok(())
     }
 
+    /// Run the timestamp-independent correctness backstop after the ordinary
+    /// floored subscriptions are installed and before their deliveries drain.
+    /// Each route reconciles against the exact event-id set retained in this
+    /// account's SQLCipher database, so traffic in one busy group cannot move
+    /// or evict another route's completeness state.
+    async fn reconcile_transport_history(&self, reconcile_until: u64) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let routing = self.routing.snapshot();
+        let inbox_items = storage
+            .transport_reconciliation_items(&TransportReconciliationRoute::Inbox)?
+            .into_iter()
+            .map(nostr_reconciliation_item)
+            .collect::<Vec<_>>();
+        let mut attempted_routes = 0usize;
+        let mut relays_succeeded = 0usize;
+        let mut relays_failed = 0usize;
+        let mut remote_items = 0usize;
+        let mut received_items = 0usize;
+
+        if !routing.local_inbox_endpoints.is_empty() {
+            attempted_routes += 1;
+            match self
+                .adapter
+                .reconcile_inbox_history(
+                    routing.local_inbox_endpoints,
+                    &inbox_items,
+                    reconcile_until,
+                )
+                .await
+            {
+                Ok(Some(summary)) => {
+                    relays_succeeded += summary.relays_succeeded;
+                    relays_failed += summary.relays_failed;
+                    remote_items += summary.remote_items;
+                    received_items += summary.received_items;
+                }
+                Ok(None) => {}
+                Err(_) => relays_failed += 1,
+            }
+        }
+
+        for route in routing.group_routes {
+            let Ok(route_id) = <[u8; 32]>::try_from(route.transport_group_id.as_slice()) else {
+                continue;
+            };
+            let local_items = storage
+                .transport_reconciliation_items(&TransportReconciliationRoute::Group(route_id))?
+                .into_iter()
+                .map(nostr_reconciliation_item)
+                .collect::<Vec<_>>();
+            attempted_routes += 1;
+            match self
+                .adapter
+                .reconcile_group_history(route, &local_items, reconcile_until)
+                .await
+            {
+                Ok(Some(summary)) => {
+                    relays_succeeded += summary.relays_succeeded;
+                    relays_failed += summary.relays_failed;
+                    remote_items += summary.remote_items;
+                    received_items += summary.received_items;
+                }
+                Ok(None) => {}
+                Err(_) => relays_failed += 1,
+            }
+        }
+
+        tracing::info!(
+            target: "marmot_app::relay_plane",
+            method = "reconcile_transport_history",
+            attempted_routes,
+            relays_succeeded,
+            relays_failed,
+            remote_items,
+            received_items,
+            "completed transport set reconciliation"
+        );
+        Ok(())
+    }
+
     fn clear_delivery_overflow_recovery(&mut self, marker_token: u64) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let cleared = storage.clear_account_delivery_recovery(&self.state.label, marker_token)?;
@@ -721,6 +819,31 @@ impl AppClient {
             .map_err(|(stage, error)| {
                 ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
             })?;
+        if let Some(reconcile_until) = rebuild_since_secs {
+            match timeout(
+                TRANSPORT_RECONCILIATION_QUANTUM,
+                self.reconcile_transport_history(reconcile_until),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        error,
+                        SyncFailureStage::TransportActivation,
+                    ));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::relay_plane",
+                        method = "sync_inner",
+                        quantum_ms = TRANSPORT_RECONCILIATION_QUANTUM.as_millis() as u64,
+                        "transport set reconciliation exceeded its bounded startup quantum; retaining partial progress"
+                    );
+                }
+            }
+        }
         // A complete startup/catch-up rebuild satisfies any older deferred
         // refresh intent before this pass starts ingesting new deliveries.
         self.pending_runtime_group_subscription_refresh = false;
@@ -1833,9 +1956,49 @@ impl AppClient {
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
+        let reconciliation_route = match &delivery.message.envelope {
+            TransportEnvelope::Welcome { recipient } if recipient == self.adapter.account_id() => {
+                Some(TransportReconciliationRoute::Inbox)
+            }
+            TransportEnvelope::GroupMessage { transport_group_id } if group_id_hint.is_some() => {
+                <[u8; 32]>::try_from(transport_group_id.as_slice())
+                    .ok()
+                    .map(TransportReconciliationRoute::Group)
+            }
+            _ => None,
+        };
+        let reconciliation_item = <[u8; 32]>::try_from(delivery.message.id.as_slice())
+            .ok()
+            .map(|event_id| TransportReconciliationItem {
+                event_id,
+                created_at: outer_transport_at,
+            });
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         let must_stay_fetchable = effects.left_object_unpersisted;
+        if !must_stay_fetchable
+            && let (Some(route), Some(item)) = (&reconciliation_route, &reconciliation_item)
+        {
+            let recorded = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    storage
+                        .record_transport_reconciliation_item(route, item)
+                        .map_err(AppError::from)
+                });
+            if recorded.is_err() {
+                // The event remains absent from the advertised local set, so a
+                // later reconciliation safely re-fetches it. Do not fail an
+                // ingest the engine already retained merely because this
+                // optimization checkpoint failed.
+                tracing::warn!(
+                    target: "marmot_app::relay_plane",
+                    method = "record_transport_reconciliation_item",
+                    "could not persist transport reconciliation item"
+                );
+            }
+        }
         let refused_group = match &effects.outcome {
             IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
             _ => None,
