@@ -1041,7 +1041,7 @@ fn rotate_failure_keeps_recording_to_original_file() {
     assert_eq!(events[2].seq, 2);
 }
 
-/// Minimal recursive JSON-Schema/// Minimal recursive JSON-Schema conformance check for the subset our schema
+/// Minimal recursive JSON-Schema conformance check for the subset our schema
 /// uses ($ref, properties, additionalProperties:false, items, and oneOf
 /// discriminated by a `type` const). It does not validate value patterns; its
 /// job is to prove every key we serialize is a key the schema allows — i.e. that

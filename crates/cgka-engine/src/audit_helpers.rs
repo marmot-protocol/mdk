@@ -716,3 +716,58 @@ fn convergence_app_witness(witness: &AppWitness) -> ConvergenceAppWitness {
         sender_ref: committer_ref(&witness.sender),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn group_state_change_kind_strings_match_v3_schema() {
+        let member = MemberId::new(vec![0; 32]);
+        let changes = [
+            GroupStateChange::MemberAdded {
+                member: member.clone(),
+            },
+            GroupStateChange::MemberRemoved {
+                member: member.clone(),
+            },
+            GroupStateChange::MemberLeft {
+                member: member.clone(),
+            },
+            GroupStateChange::AdminAdded {
+                member: member.clone(),
+            },
+            GroupStateChange::AdminRemoved { member },
+            GroupStateChange::GroupRenamed {
+                name: "renamed".into(),
+                previous_name: None,
+            },
+            GroupStateChange::GroupAvatarChanged,
+            GroupStateChange::MessageRetentionChanged {
+                old_seconds: 0,
+                new_seconds: 60,
+            },
+            GroupStateChange::GroupDisbanded,
+        ];
+        let emitted = changes
+            .iter()
+            .map(group_state_change_kind_str)
+            .collect::<BTreeSet<_>>();
+
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../marmot-forensics/schema/audit-log-event.v3.schema.json"
+        ))
+        .expect("v3 schema parses");
+        let defined = schema
+            .pointer("/$defs/groupStateChangeKind/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("groupStateChangeKind enum")
+            .iter()
+            .map(|value| value.as_str().expect("change kind string"))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(emitted, defined);
+    }
+}

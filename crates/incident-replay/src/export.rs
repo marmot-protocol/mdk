@@ -153,6 +153,9 @@ pub enum EventKind {
     ConvergenceDecision {
         #[serde(default)]
         selected_branch_id: Option<String>,
+        /// Safe-only v3 records the decisive selector outcome as a scalar.
+        #[serde(default)]
+        decisive_rule: Option<String>,
         #[serde(default)]
         candidates: Vec<ConvergenceCandidate>,
         #[serde(default)]

@@ -364,9 +364,9 @@
         "admin_added",
         "admin_removed",
         "group_renamed",
-        "topic_changed",
         "group_avatar_changed",
-        "message_retention_changed"
+        "message_retention_changed",
+        "group_disbanded"
       ]
     },
     "membershipChangeSource": {
@@ -537,31 +537,6 @@
     },
     "epochBackfillDeferredReason": {
       "enum": ["group_epoch_unavailable"]
-    },
-    "jsonScalar": {
-      "type": ["string", "number", "integer", "boolean", "null"]
-    },
-    "jsonValue": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/jsonScalar"
-        },
-        {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/jsonValue"
-          }
-        },
-        {
-          "$ref": "#/$defs/jsonObject"
-        }
-      ]
-    },
-    "jsonObject": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/$defs/jsonValue"
-      }
     },
     "auditEventKind": {
       "oneOf": [
