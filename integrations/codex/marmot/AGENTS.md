@@ -32,6 +32,9 @@ Rust Codex harness for Marmot through the local `wn-agent` control socket. Read
 ## Rules
 
 - Keep prompts on stdin; do not move prompt text into process arguments.
+- `codex exec` does not expand Codex's interactive slash commands; that parsing
+  lives only in `codex-rs/tui`. Do not claim Codex TUI command support here.
+  Chat-facing commands belong to the shared harness command router.
 - Keep permission argv derived from the shared typed execution profile. Do not
   add free-form backend argument configuration or mutate global Codex config.
 - Split completed assistant text into byte-budgeted Marmot messages. Keep

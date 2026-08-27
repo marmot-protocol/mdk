@@ -104,11 +104,21 @@ starting Codex. Subsequent prompts resume that group's Codex thread. Without a
 picker, the shared harness uses `$HOME`; Codex rejects a non-Git working
 directory by default, so select a repository before sending the first prompt.
 
-Send exactly `/reset-session` to clear the current group's Codex thread id while
+## Chat Commands
+
+`codex exec` does not expand Codex's interactive TUI slash commands, so Codex's
+own `/goal`, `/plan`, `/review`, and the rest of that TUI set never run here.
+The shared harness intercepts its reserved chat commands — including `/goal` —
+before Codex is invoked. Send `/help` in a chat to list them; the full table and
+the `//` literal escape are documented in the
+[shared chat-command reference](../../terminal-harness/README.md#chat-commands).
+
+`/new` and `/reset-session` clear the current group's Codex thread id while
 preserving its selected workdir and Codex-owned transcript files. The next
 normal prompt starts and records a new Codex thread; a failed resumed prompt is
-never retried automatically. Send `//reset-session` to pass the literal
-`/reset-session` text to Codex instead of invoking the harness command.
+never retried automatically. `/goal <text>` stores a standing instruction that
+the harness prepends to every later prompt in that chat, which keeps the
+instruction alive across thread resets and Codex-side context compaction.
 
 ## Configuration
 

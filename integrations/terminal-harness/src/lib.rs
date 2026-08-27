@@ -1,5 +1,6 @@
 mod bridge;
 mod chunking;
+mod commands;
 mod config;
 mod control;
 mod error;
