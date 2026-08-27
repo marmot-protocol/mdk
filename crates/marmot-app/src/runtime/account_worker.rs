@@ -1231,22 +1231,34 @@ async fn run_app_runtime_account_worker(
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
                 // commands remain queued until that durable sequence lands.
-                let result = match received {
+                let (result, overflow_recovery_incomplete) = match received {
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
-                        client.ingest_received_delivery(*delivery).await
+                        (client.ingest_received_delivery(*delivery).await, false)
                     }
                     Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
                         match client.recover_delivery_overflow().await {
-                            Ok(summary) => Ok(summary),
+                            Ok(summary) => (Ok(summary), false),
                             Err(failure) => {
+                                publish_app_runtime_account_error(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    account_error_message(
+                                        "account delivery overflow recovery incomplete",
+                                        &failure.source,
+                                    ),
+                                );
                                 client
                                     .pending_failed_sync_summary
                                     .merge(failure.partial_summary);
-                                Err(failure.source)
+                                // The durable marker remains armed. Keep the
+                                // account session available and let the next
+                                // receive/catch-up seam retry the replay.
+                                (Ok(SyncSummary::default()), true)
                             }
                         }
                     }
-                    Err(err) => Err(err),
+                    Err(err) => (Err(err), false),
                 };
                 match result {
                     Ok(summary) => {
@@ -1268,15 +1280,17 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                             &mut client,
                         );
-                        let _ = run_pending_epoch_backfill_reporting_arm(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            &shared,
-                            EpochBackfillExecutionSeam::Receive,
-                        )
-                        .await;
+                        if !overflow_recovery_incomplete {
+                            let _ = run_pending_epoch_backfill_reporting_arm(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &shared,
+                                EpochBackfillExecutionSeam::Receive,
+                            )
+                            .await;
+                        }
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }

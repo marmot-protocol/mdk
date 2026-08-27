@@ -460,7 +460,7 @@ impl AppClient {
             None
         } else {
             self.relay_plane
-                .subscription_rebuild_since(self.state.last_transport_timestamp)
+                .subscription_rebuild_since(self.checkpointed_transport_timestamp)
         }
     }
 
@@ -468,9 +468,9 @@ impl AppClient {
         &mut self,
         overflow: crate::relay_plane::AccountDeliveryOverflow,
     ) -> Result<(), AppError> {
-        // This write precedes any checkpoint of the already-drained prefix.
-        // A crash can therefore leave a conservative recovery marker with an
-        // older cursor, but never a newer cursor without the marker.
+        // The router's process-local fence already froze cursor advancement at
+        // the omission. Re-observe the same token here so the queued signal is
+        // also an idempotent storage boundary before recovery starts.
         self.app
             .account_storage(&self.state.label)?
             .mark_account_delivery_recovery(
@@ -700,13 +700,8 @@ impl AppClient {
         let mut counts = DrainCounts::default();
         let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
         if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
-            match self.recover_delivery_overflow().await {
-                Ok(recovered) => summary.merge(recovered),
-                Err(mut failure) => {
-                    failure.partial_summary.merge(summary);
-                    return Err(failure);
-                }
-            }
+            self.recover_delivery_overflow_and_merge(&mut summary)
+                .await?;
         }
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
@@ -1019,8 +1014,9 @@ impl AppClient {
                     self.ingest_received_delivery(*delivery).await?
                 }
                 crate::relay_plane::AccountDeliveryReceive::Overflow(_) => {
-                    match self.recover_delivery_overflow().await {
-                        Ok(summary) => summary,
+                    let mut summary = SyncSummary::default();
+                    match self.recover_delivery_overflow_and_merge(&mut summary).await {
+                        Ok(()) => summary,
                         Err(failure) => {
                             self.pending_failed_sync_summary
                                 .merge(failure.partial_summary);
@@ -1097,12 +1093,21 @@ impl AppClient {
         &mut self,
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, AppError> {
+        let cursor_before_secs = self.state.last_transport_timestamp;
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
         let ingested = self
             .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
+        if self.adapter.pending_delivery_overflow().is_some() {
+            // `record_drop` publishes this process-local fence at the exact
+            // omission, before marker I/O or the reserved control record can
+            // complete. Keep this per-delivery checkpoint on its pre-ingest
+            // floor so slow SQLite cannot commit the newest-first prefix ahead
+            // of the marker that represents the omitted older delivery.
+            self.state.last_transport_timestamp = cursor_before_secs;
+        }
         // Mark the delivery seen only after durable ingest succeeds, matching
         // the catch-up drain below. Marking at receive time would let a failed
         // ingest poison the index, so a reused client would silently skip the
@@ -1223,7 +1228,7 @@ impl AppClient {
             .drain_sdk_relay(
                 &mut counts,
                 DrainCompletion::EndOfStoredEvents {
-                    silence_budget: self.epoch_backfill_eose_wait(),
+                    silence_budget: self.delivery_overflow_eose_wait(),
                     execution_quantum: self.epoch_backfill_execution_quantum(),
                 },
             )
@@ -1272,6 +1277,8 @@ impl AppClient {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "account delivery overflow recovery completed",
             );
+            let mut summary = summary;
+            self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
 
@@ -1297,6 +1304,22 @@ impl AppClient {
             )),
             SyncFailureStage::RelayReceive,
         ))
+    }
+
+    async fn recover_delivery_overflow_and_merge(
+        &mut self,
+        summary: &mut SyncSummary,
+    ) -> Result<(), ClassifiedSyncFailure> {
+        match self.recover_delivery_overflow().await {
+            Ok(recovered) => {
+                summary.merge(recovered);
+                Ok(())
+            }
+            Err(mut failure) => {
+                failure.partial_summary.merge(std::mem::take(summary));
+                Err(failure)
+            }
+        }
     }
 
     /// How long an unconfirmed replay must wait before an automatic seam may
@@ -1338,6 +1361,13 @@ impl AppClient {
             return Duration::from_millis(ms);
         }
         EPOCH_BACKFILL_EOSE_WAIT
+    }
+
+    /// The EOSE budget for durable account-delivery overflow repair. It shares
+    /// today's configured value with epoch backfill, but remains a distinct
+    /// policy seam so either recovery mechanism can be tuned independently.
+    fn delivery_overflow_eose_wait(&self) -> Duration {
+        self.epoch_backfill_eose_wait()
     }
 
     /// Maximum wall-clock quantum one backfill drain owns the account worker.
@@ -1435,7 +1465,7 @@ impl AppClient {
         // `SDK_DRAIN_WAIT`. Held at the same interval as that timeout.
         let mut gate_polled_at = silence_started;
 
-        let verdict = loop {
+        let mut verdict = loop {
             if completion
                 .execution_quantum()
                 .is_some_and(|quantum| drain_started.elapsed() >= quantum)
@@ -1600,6 +1630,28 @@ impl AppClient {
             routes_dirty |= ingested.routes_dirty;
         };
 
+        if verdict != DrainVerdict::Overflow
+            && let Some(overflow) = self.adapter.pending_delivery_overflow()
+        {
+            // The queue signal intentionally trails marker persistence, so a
+            // quiescence timeout can win while that signal is still pending.
+            // Consult the immediate process-local fence before checkpointing.
+            self.state.last_transport_timestamp = cursor_before_secs;
+            if let Err(error) = self.observe_delivery_overflow(overflow) {
+                return Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        *counts,
+                        StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await);
+            }
+            verdict = DrainVerdict::Overflow;
+        }
+
         if let Err(error) = self
             .checkpoint_sync_prefix(&mut summary, routes_dirty, counts.deliveries)
             .await
@@ -1682,6 +1734,10 @@ impl AppClient {
         } else {
             false
         };
+        let checkpointed_before = self.checkpointed_transport_timestamp;
+        if self.adapter.pending_delivery_overflow().is_none() {
+            self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
+        }
         let checkpoint = if cfg!(feature = "test-policy-overrides")
             && self
                 .app
@@ -1696,6 +1752,7 @@ impl AppClient {
             self.save_state_with_pending_local_group_deletion_frontier_clears()
         };
         if let Err(error) = checkpoint {
+            self.checkpointed_transport_timestamp = checkpointed_before;
             return Err(SyncCheckpointError::BeforePersistence(error));
         }
 
@@ -2673,13 +2730,8 @@ impl AppClient {
         let mut counts = DrainCounts::default();
         let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
         if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
-            match self.recover_delivery_overflow().await {
-                Ok(recovered) => summary.merge(recovered),
-                Err(mut failure) => {
-                    failure.partial_summary.merge(summary);
-                    return Err(failure);
-                }
-            }
+            self.recover_delivery_overflow_and_merge(&mut summary)
+                .await?;
         }
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
@@ -3005,7 +3057,7 @@ impl AppClient {
         let delta = AccountState {
             label: self.state.label.clone(),
             seen_events: self.state.seen_events[seen_start..].to_vec(),
-            last_transport_timestamp: self.state.last_transport_timestamp,
+            last_transport_timestamp: self.checkpointed_transport_timestamp,
             groups: self
                 .state
                 .groups
@@ -3318,10 +3370,11 @@ impl AppClient {
         Ok(routes_dirty)
     }
 
-    /// Advance the persisted transport cursor from an inbound message —
-    /// unless this runtime was constructed with
+    /// Advance the persisted transport cursor from an inbound message unless
+    /// this runtime was constructed with
     /// [`CursorPersistence::Frozen`](crate::CursorPersistence), in which case
-    /// this is a no-op and the cursor stays at the value loaded from the store.
+    /// this is a no-op, or the account route has already recorded a queue
+    /// omission whose marker/control record is still in flight.
     ///
     /// `timestamp` is the sender-controlled Nostr `created_at` of the outer
     /// kind-445 event and is never validated upstream. The cursor is a
@@ -3332,6 +3385,9 @@ impl AppClient {
     /// wall-clock plus a bounded skew so a hostile or clock-skewed sender can
     /// move the cursor no further than `now + TRANSPORT_CURSOR_MAX_FUTURE_SKEW`.
     fn remember_transport_cursor(&mut self, timestamp: u64) {
+        if self.adapter.pending_delivery_overflow().is_some() {
+            return;
+        }
         self.state.last_transport_timestamp = next_transport_cursor(
             self.app.cursor_persistence(),
             self.state.last_transport_timestamp,

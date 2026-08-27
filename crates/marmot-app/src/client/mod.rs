@@ -349,6 +349,11 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// Last transport cursor promoted by a completed drain checkpoint. Live
+    /// one-at-a-time worker ingests may advance `state` for diagnostics, but
+    /// they persist this older safe floor until a drain has observed any
+    /// process-local overflow fence/control record.
+    pub(crate) checkpointed_transport_timestamp: Option<u64>,
     /// Durable account-wide marker set when the bounded relay-plane queue
     /// omits a delivery. While true, every subscription rebuild is unfloored
     /// and EOSE-gated recovery must complete before the cursor is trusted.

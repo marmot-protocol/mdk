@@ -157,6 +157,37 @@ fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
     assert_eq!(overflow.metrics.dropped.load(Ordering::Relaxed), 3);
 }
 
+#[tokio::test]
+async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
+    let overflow = AccountDeliveryOverflowState::default();
+    assert!(overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).is_some());
+    assert!(overflow.start_marker_persistence());
+    assert!(
+        !overflow.start_marker_persistence(),
+        "one generation must never own more than one marker worker"
+    );
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = attempts.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+        observed_attempts.fetch_add(1, Ordering::SeqCst);
+        Err(AccountDeliveryRecoveryMarkerError::Closed)
+    });
+    timeout(
+        Duration::from_secs(1),
+        overflow.persist_marker_before_drop(marker),
+    )
+    .await
+    .expect("terminal storage closure must release the marker worker");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(overflow.marker_barrier_complete());
+    assert!(
+        !overflow.start_marker_persistence(),
+        "closed storage must not arm an immortal retry task"
+    );
+}
+
 #[test]
 fn notification_restart_backoff_caps_and_resets_after_healthy_runtime() {
     let mut backoff = RelayNotificationRestartBackoff::default();
@@ -1231,7 +1262,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     let attempts = marker_attempts.clone();
     let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Err(());
+            return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
         marker_flag.store(true, Ordering::SeqCst);
         Ok(())
@@ -1372,7 +1403,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     );
     assert!(
         marker_attempts.load(Ordering::SeqCst) >= 2,
-        "a failed marker write must retry while holding the omitted delivery"
+        "the single marker worker must retry without retaining omitted deliveries"
     );
     assert!(overflow.dropped >= 1);
     assert!(overflow.queue_depth >= ACCOUNT_DELIVERY_BUFFER);

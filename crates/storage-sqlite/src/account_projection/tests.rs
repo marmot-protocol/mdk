@@ -55,6 +55,21 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
         let updated = store.account_delivery_recovery("alice").unwrap().unwrap();
         assert_eq!(updated.pending_since, first.pending_since);
         assert_eq!(updated.dropped_count, 7);
+
+        store
+            .mark_account_delivery_recovery("alice", 12, 1)
+            .unwrap();
+        let replaced = store.account_delivery_recovery("alice").unwrap().unwrap();
+        assert_eq!(replaced.marker_token, 12);
+        assert_eq!(replaced.dropped_count, 1);
+        assert_ne!(replaced.pending_since, 0);
+        assert!(!store.clear_account_delivery_recovery("alice", 11).unwrap());
+
+        // Restore the original token so the reopen half below still exercises
+        // its explicit compare-and-clear assertions.
+        store
+            .mark_account_delivery_recovery("alice", 11, 7)
+            .unwrap();
     }
 
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();

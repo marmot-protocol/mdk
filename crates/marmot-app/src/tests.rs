@@ -9294,11 +9294,35 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
             "account reopen must issue no cursor floor while overflow recovery is pending"
         );
 
+        let group_id = client
+            .create_group("overflow recovery target", &[])
+            .await
+            .unwrap();
+        let group = reopened
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("recovery target group projection");
+        let omitted = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            cursor.saturating_sub(600),
+            "overflow-redelivery",
+        );
+        let omitted_id = omitted.id.clone();
+        inject_epoch_gap_probe(&reopened, omitted).await;
+
         let _eose = scripted_eose_pump(reopened.relay_plane.clone(), relay, every_subscription);
         client
             .sync()
             .await
             .expect("an EOSE-confirmed unfloored replay resolves the durable gap");
+        assert!(
+            reopened
+                .load_state("alice")
+                .unwrap()
+                .seen_events
+                .contains(&omitted_id),
+            "the unfloored recovery must ingest the older event omitted below the ordinary cursor floor"
+        );
         assert!(!client.delivery_overflow_recovery_pending);
         assert!(
             reopened
@@ -9313,6 +9337,172 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
         assert_eq!(health.account_delivery_recovery_attempts, 1);
         assert_eq!(health.account_delivery_recovery_successes, 1);
         assert_eq!(health.account_delivery_recovery_failures, 0);
+    });
+}
+
+#[test]
+fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
+    run_composed_app_runtime_test("delivery-overflow-cursor-fence", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let cursor_before = crate::unix_now_seconds().saturating_sub(10_000);
+        app.ensure_account_state("alice").unwrap();
+        let mut seeded = app.load_state("alice").unwrap();
+        seeded.last_transport_timestamp = Some(cursor_before);
+        app.save_state(&seeded).unwrap();
+
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client
+            .create_group("overflow cursor fence", &[])
+            .await
+            .unwrap();
+        let nostr_group_id_hex = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection")
+            .nostr_routing
+            .nostr_group_id_hex;
+
+        let release_marker = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = release_marker.clone();
+        let attempts = marker_attempts.clone();
+        let storage = app.account_storage("alice").unwrap();
+        let marker: crate::relay_plane::AccountDeliveryRecoveryMarker =
+            Arc::new(move |marker_token, dropped| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable);
+                }
+                storage
+                    .mark_account_delivery_recovery("alice", marker_token, dropped)
+                    .map_err(|error| {
+                        if error.is_closed() {
+                            crate::relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                        } else {
+                            crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                        }
+                    })
+            });
+        assert!(
+            app.relay_plane
+                .set_account_delivery_recovery_marker_for_test(
+                    &MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                    marker,
+                )
+        );
+
+        // Model the dangerous lead-in: several newest events are processed by
+        // the live one-at-a-time worker seam before the later burst finally
+        // fills its queue. Their in-memory max is above the older event that
+        // will be omitted, but they must not promote the durable drain floor.
+        for index in 0..3_u64 {
+            inject_epoch_gap_probe(
+                &app,
+                epoch_gap_probe(
+                    &nostr_group_id_hex,
+                    cursor_before + 4_000 - index,
+                    &format!("pre-overflow-cursor-{index}"),
+                ),
+            )
+            .await;
+            let received = client.receive_next_delivery().await.unwrap();
+            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+                panic!("the pre-overflow delivery must not produce a control record");
+            };
+            client
+                .ingest_received_delivery(*delivery)
+                .await
+                .expect("the pre-overflow delivery must checkpoint its projection");
+        }
+        assert!(
+            client.state.last_transport_timestamp > Some(cursor_before + 3_000),
+            "the regression needs a processed in-memory cursor above the later omitted event"
+        );
+
+        let newest = cursor_before + 2_000;
+        let mut omitted_timestamp = 0;
+        for index in 0..=crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+            let created_at = newest.saturating_sub(index as u64);
+            if index == crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+                omitted_timestamp = created_at;
+            }
+            inject_epoch_gap_probe(
+                &app,
+                epoch_gap_probe(
+                    &nostr_group_id_hex,
+                    created_at,
+                    &format!("overflow-cursor-{index}"),
+                ),
+            )
+            .await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while marker_attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("overflow must start its one marker worker");
+
+        let received = client.receive_next_delivery().await.unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            panic!("the retained newest-first prefix must precede the overflow signal");
+        };
+        client
+            .ingest_received_delivery(*delivery)
+            .await
+            .expect("the retained prefix delivery must checkpoint");
+
+        let persisted = app
+            .account_storage("alice")
+            .unwrap()
+            .load_account_projection_state("alice", MAX_SEEN_EVENT_IDS)
+            .unwrap();
+        assert_eq!(
+            persisted.last_transport_timestamp,
+            Some(cursor_before),
+            "the process-local overflow fence must freeze the durable cursor before marker I/O completes"
+        );
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none(),
+            "the regression must inspect the pre-marker crash window"
+        );
+        assert!(
+            app.relay_plane
+                .subscription_rebuild_since(persisted.last_transport_timestamp)
+                .is_some_and(|since| since.0 <= omitted_timestamp),
+            "without a marker, the frozen cursor must still request a range containing the omitted older event"
+        );
+
+        release_marker.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if app
+                    .account_storage("alice")
+                    .unwrap()
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the single marker worker must persist after the retry clears");
     });
 }
 

@@ -1667,6 +1667,7 @@ impl MarmotApp {
             .iter()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
+        let checkpointed_transport_timestamp = open.state.last_transport_timestamp;
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
@@ -1687,6 +1688,7 @@ impl MarmotApp {
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
             pending_runtime_group_subscription_refresh: false,
+            checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
             #[cfg(test)]
@@ -3533,7 +3535,13 @@ impl MarmotApp {
             Arc::new(move |marker_token, dropped| {
                 recovery_storage
                     .mark_account_delivery_recovery(&recovery_label, marker_token, dropped)
-                    .map_err(|_| ())
+                    .map_err(|error| {
+                        if error.is_closed() {
+                            relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                        } else {
+                            relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                        }
+                    })
             });
         let adapter = relay_plane.account_adapter_with_recovery_marker(
             account_id.clone(),
