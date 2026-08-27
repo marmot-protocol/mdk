@@ -221,6 +221,11 @@ struct DeliveryIngest {
 pub(crate) struct DrainCounts {
     pub(crate) deliveries: u64,
     pub(crate) skipped: u64,
+    /// The subset of `deliveries` for which the engine kept no durable trace.
+    /// These objects stay fetchable and cannot count as recovery progress.
+    /// Includes `refused`, but is deliberately not an audit field: `refused`
+    /// retains its narrower resource-bound meaning on the forensic wire.
+    pub(crate) unpersisted: u64,
     /// The subset of `deliveries` the engine refused unpersisted. Nested inside
     /// `deliveries` rather than beside it: the receive really was ingested, and
     /// `deliveries` keeps the audit meaning the field exports already depend
@@ -237,11 +242,10 @@ pub(crate) struct DrainCounts {
 
 impl DrainCounts {
     /// Deliveries this drain ingested *and* the engine kept. A drain whose
-    /// every delivery was refused fetched history it could not retain, which is
-    /// no recovery at all — the objects stay fetchable (they are neither marked
-    /// seen nor allowed past the cursor) but nothing durably landed.
+    /// every delivery stayed fetchable recovered nothing, whether a local
+    /// resource bound refused it or an unknown-group path kept no trace.
     fn durable_deliveries(&self) -> u64 {
-        self.deliveries.saturating_sub(self.refused)
+        self.deliveries.saturating_sub(self.unpersisted)
     }
 }
 
@@ -1360,10 +1364,14 @@ impl AppClient {
                         .await);
                 }
             };
+            if ingested.must_stay_fetchable {
+                counts.unpersisted = counts.unpersisted.saturating_add(1);
+            }
             // The refusal count is keyed on the refusal itself, so the audit
             // row keeps meaning "a local resource bound rejected this" and not
             // the wider "left no durable trace".
             if let Some(group_id) = ingested.refused_group {
+                debug_assert!(ingested.must_stay_fetchable);
                 counts.refused = counts.refused.saturating_add(1);
                 counts.refused_groups.insert(group_id);
             }
@@ -2093,10 +2101,10 @@ impl AppClient {
     ///   deliveries and moved its epoch a second *after* the terminal row was
     ///   written — so `epochs_after`, read the moment the drain ends, must never
     ///   second-guess a delivery count. Deliveries parked awaiting convergence
-    ///   are recovery in flight. Refused ones are not: the engine dropped them
-    ///   unpersisted, so a drain that refused everything it fetched recovered
-    ///   nothing and must not disarm anything. A mixed drain still counts —
-    ///   one kept delivery is progress.
+    ///   are recovery in flight. Objects left fetchable are not: the engine
+    ///   kept no durable trace, so a drain made entirely of resource refusals
+    ///   or unknown-group drops recovered nothing and must not disarm anything.
+    ///   A mixed drain still counts — one kept delivery is progress.
     /// - a tracked group's local epoch advanced across the run, which is what a
     ///   zero-delivery replay whose value was letting already-deferred rows
     ///   converge looks like.

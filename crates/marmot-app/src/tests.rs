@@ -1381,6 +1381,43 @@ fn redelivery_pump(
     (stop, handle)
 }
 
+/// Repeatedly enqueue one already-peeled delivery directly onto an account's
+/// test transport channel. This models the reachable adapter/engine route-index
+/// disagreement that cannot be produced through the relay plane's outer route
+/// gate.
+#[cfg(feature = "test-policy-overrides")]
+fn transport_delivery_redelivery_pump(
+    app: &MarmotApp,
+    delivery: cgka_traits::TransportDelivery,
+    interval: Duration,
+    deadline: Duration,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<u64>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let app = app.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let expires_at = std::time::Instant::now() + deadline;
+            let mut sent = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < expires_at
+                && app
+                    .relay_plane
+                    .inject_delivery_for_test(delivery.clone())
+                    .await
+            {
+                sent += 1;
+                tokio::time::sleep(interval).await;
+            }
+            sent
+        })
+    };
+    (stop, handle)
+}
+
 /// The end-of-stored-events gate must be reachable from the delivery path.
 ///
 /// A relay redelivering faster than [`SDK_DRAIN_WAIT`] never lets the receive
@@ -1524,6 +1561,92 @@ fn epoch_backfill_drain_yields_when_duplicates_stream_without_eose() {
         assert_eq!(failed[0]["kind"]["deliveries"], 0);
         assert!(failed[0]["kind"]["skipped"].as_u64().unwrap() > 0);
         assert!(failed[0]["kind"]["completion_kind"].is_null());
+    });
+}
+
+/// An unknown-group object that the engine leaves entirely unpersisted is no
+/// more recovery progress than a duplicate. Re-serving it must yield into the
+/// no-progress cooldown rather than keeping the account worker in immediate
+/// back-to-back quanta.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn unpersisted_unknown_group_stream_is_no_progress_and_paced() {
+    run_composed_app_runtime_test("backfill-unpersisted-unknown-group", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_eose_wait_ms(30_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(400)
+                .with_dev_epoch_backfill_retry_backoff_ms(60_000),
+        )
+        .await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+        let account_id_hex = AccountHome::open(dir.path())
+            .account("alice")
+            .unwrap()
+            .account_id_hex;
+        let unknown = unknown_route_delivery(
+            &account_id_hex,
+            crate::unix_now_seconds(),
+            "unpersisted-backfill-prefix",
+        );
+        let event_id = hex::encode(unknown.message.id.as_slice());
+        let (stop, pump) = transport_delivery_redelivery_pump(
+            &app,
+            unknown,
+            Duration::from_millis(50),
+            Duration::from_secs(3),
+        );
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("unpersisted stream must yield without a transport error");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sent = pump.await.expect("redelivery pump must not panic");
+
+        assert!(sent > 1, "the test must exercise same-id redelivery");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        assert!(
+            !client.seen_events_index.contains(&event_id),
+            "an unpersisted object must remain fetchable"
+        );
+        assert!(
+            client.epoch_backfill_retry_not_before.is_some(),
+            "an unproductive quantum must earn the retry cooldown"
+        );
+        assert!(matches!(
+            client
+                .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+                .await
+                .expect("a paced seam is not a failure"),
+            crate::EpochBackfillRunOutcome::Deferred
+        ));
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Arm,
+            "an unpersisted-only quantum must not disarm tracked recovery"
+        );
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["error_kind"].as_str(),
+            Some("backfill_drain_no_progress_quantum_yield")
+        );
+        assert!(failed[0]["kind"]["deliveries"].as_u64().unwrap() > 0);
+        assert_eq!(
+            failed[0]["kind"]["refused"], 0,
+            "unknown-group drops remain distinct from resource refusals"
+        );
     });
 }
 
@@ -2240,7 +2363,8 @@ fn a_completed_backfill_that_recovered_nothing_does_not_disarm_the_detector() {
 /// object is dropped unpersisted. `deliveries` counts them (a receive really was
 /// ingested, and #1553 pinned that meaning for the field exports), so keying the
 /// disarm on `deliveries` alone read a total loss as a productive replay.
-/// `deliveries - refused` is the count that answers "did anything land".
+/// `deliveries - unpersisted` is the internal count that answers "did anything
+/// land"; `refused` remains the narrower audit evidence for cap saturation.
 #[test]
 fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
     run_composed_app_runtime_test("backfill-all-refusals", || async {
