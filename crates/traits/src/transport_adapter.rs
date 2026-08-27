@@ -223,6 +223,7 @@ pub enum FanoutMlsState {
 pub enum FanoutPendingKind {
     GroupEvolution,
     CreateGroup,
+    Disband,
 }
 
 /// One durable transport fanout frozen before its first external side effect.
@@ -305,7 +306,7 @@ impl OutboundFanout {
             ));
         }
         match (pending_kind, pending_origin_message_id.as_ref()) {
-            (Some(FanoutPendingKind::GroupEvolution), None) => {
+            (Some(FanoutPendingKind::GroupEvolution | FanoutPendingKind::Disband), None) => {
                 return Err(TransportAdapterError::Other(
                     "group evolution fanout requires its stored origin commit".into(),
                 ));

@@ -632,6 +632,96 @@ async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
     assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
 }
 
+#[tokio::test]
+async fn ambiguous_disband_recovery_preserves_terminal_pending_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-disband-unknown.sqlite");
+    let key_text = "marmot unknown disband key";
+    let key = SqlCipherKey::new(key_text).unwrap();
+    let mut alice = current_session(&alice_path, &key, b"alice-disband-unknown");
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "unknown disband".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let endpoint = TransportEndpoint("wss://disband-unknown.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![endpoint.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
+    let policy = StaticTransportRouting::new(Vec::new()).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint.clone()],
+    );
+    let wall = Arc::new(TestWallClock::new(400_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let unresolved = runtime.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(unresolved.unresolved_publishes.len(), 1);
+    assert!(unresolved.pending.is_empty());
+    let original_commit = adapter.publishes()[0].message.clone();
+    drop(runtime);
+
+    adapter.fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
+    adapter.accept_only_endpoints(vec![endpoint]);
+    let reopened = current_session(
+        &alice_path,
+        &SqlCipherKey::new(key_text).unwrap(),
+        b"alice-disband-unknown",
+    );
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    wall.set(400_030);
+
+    let recovered = restarted.resume_outbound_fanouts().await.unwrap();
+    assert!(matches!(
+        recovered.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert!(
+        recovered.pending_convergence.contains(&group_id),
+        "disband confirmation must schedule its terminal convergence pass"
+    );
+    let attempts = adapter.publishes();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].message, original_commit);
+}
+
 /// The production-adapter partial-accept shape: one relay accepts while its
 /// siblings surface whole-call `Err`s. The accepted endpoint must stay
 /// accepted and confirm pending MLS state — sibling errors must never read as

@@ -2761,7 +2761,7 @@ where
             commit,
             Some(PendingFanoutContinuation {
                 pending,
-                kind: FanoutPendingKind::GroupEvolution,
+                kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: welcomes,
             }),
             output,
@@ -2994,13 +2994,17 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
-        self.publish_one_with_post_confirmation_welcomes(
-            message,
-            pending.map(|pending| PendingFanoutContinuation {
+        let continuation = match pending {
+            Some(pending) => Some(PendingFanoutContinuation {
                 pending,
-                kind: FanoutPendingKind::GroupEvolution,
+                kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: Vec::new(),
             }),
+            None => None,
+        };
+        self.publish_one_with_post_confirmation_welcomes(
+            message,
+            continuation,
             output,
             queue,
             context,
@@ -3235,21 +3239,27 @@ where
             possible_ambiguous_exposure,
             retry_deferred: fanout_outcome.outstanding_targets > 0,
         };
-        if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
-            output.unresolved_publishes.push(UnresolvedPublish {
-                message_id: report.message_id.clone(),
-                reason: if possible_ambiguous_exposure {
-                    UnresolvedPublishReason::AcknowledgementUnknown
-                } else {
-                    UnresolvedPublishReason::RetryableUnavailable
-                },
-            });
-        } else if !status.met_required_acks {
-            output.failures.push(PublishFailure {
-                message_id: report.message_id.clone(),
-                reason: "insufficient publish acknowledgements".into(),
-            });
-        }
+        let publish_failure_reason =
+            if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
+                output.unresolved_publishes.push(UnresolvedPublish {
+                    message_id: report.message_id.clone(),
+                    reason: if possible_ambiguous_exposure {
+                        UnresolvedPublishReason::AcknowledgementUnknown
+                    } else {
+                        UnresolvedPublishReason::RetryableUnavailable
+                    },
+                });
+                None
+            } else if !status.met_required_acks {
+                let reason = "insufficient publish acknowledgements".to_owned();
+                output.failures.push(PublishFailure {
+                    message_id: report.message_id.clone(),
+                    reason: reason.clone(),
+                });
+                Some(reason)
+            } else {
+                None
+            };
         if matches!(
             fanout.request().message.envelope,
             TransportEnvelope::Welcome { .. }
@@ -3260,14 +3270,14 @@ where
                 && matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
                 && let Some(recipient) = welcome_recipient(&fanout.request().message)
             {
-                let failure = self.welcome_delivery_failure(
-                    fanout.message_id().clone(),
+                output.welcome_failures.push(WelcomeDeliveryFailure {
+                    message_id: fanout.message_id().clone(),
                     recipient,
-                    fanout.group_id().cloned(),
-                    output,
-                    output.failures.len().saturating_sub(1),
-                );
-                output.welcome_failures.push(failure);
+                    group_id: fanout.group_id().cloned(),
+                    reason: publish_failure_reason
+                        .clone()
+                        .unwrap_or_else(|| "welcome publish failed".into()),
+                });
             }
         }
         output.fanout.push(fanout_outcome.clone());

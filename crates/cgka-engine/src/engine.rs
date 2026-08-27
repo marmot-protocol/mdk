@@ -797,8 +797,29 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         pending: PendingStateRef,
     ) -> Result<MessageId, EngineError> {
+        self.pending_group_id(pending)?;
         self.peek_pending_origin_commit(pending)
             .ok_or(EngineError::UnknownPending)
+    }
+
+    /// Durable fanout discriminator for a live pending publication.
+    pub fn pending_fanout_kind(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<cgka_traits::FanoutPendingKind, EngineError> {
+        self.pending_group_id(pending)?;
+        match self.epoch_manager.kind_for_pending(pending) {
+            Some(crate::epoch_manager::PendingKind::CreateGroup) => {
+                Ok(cgka_traits::FanoutPendingKind::CreateGroup)
+            }
+            Some(crate::epoch_manager::PendingKind::GroupEvolution) => {
+                Ok(cgka_traits::FanoutPendingKind::GroupEvolution)
+            }
+            Some(crate::epoch_manager::PendingKind::Disband) => {
+                Ok(cgka_traits::FanoutPendingKind::Disband)
+            }
+            None => Err(EngineError::UnknownPending),
+        }
     }
 
     /// Confirm MLS and persist the matching fanout's terminal MLS edge in the
@@ -1849,6 +1870,9 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 cgka_traits::FanoutPendingKind::CreateGroup => {
                     crate::epoch_manager::PendingKind::CreateGroup
+                }
+                cgka_traits::FanoutPendingKind::Disband => {
+                    crate::epoch_manager::PendingKind::Disband
                 }
             };
             self.epoch_manager
