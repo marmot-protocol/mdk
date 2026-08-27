@@ -705,7 +705,11 @@ impl MarmotRelayPlane {
             .get(&delivery.account_id)
             .cloned();
         match sender {
-            Some(sender) => sender.send(delivery).await.is_ok(),
+            Some(route) => route
+                .sender
+                .send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
+                .await
+                .is_ok(),
             None => false,
         }
     }
