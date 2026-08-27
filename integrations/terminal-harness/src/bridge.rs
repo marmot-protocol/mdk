@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::artifacts::{
     ArtifactDeliveryContext, ArtifactOutbox, PendingArtifactBatch, prepare_manifest_path,
-    remove_staged_files, stage_artifacts, validate_staged_batch,
+    remove_staged_files, remove_unreferenced_staged_files, stage_artifacts, validate_staged_batch,
 };
 use crate::chunking::split_reply_chunks;
 use crate::commands::{self, ChatCommand, Routed};
@@ -73,7 +73,19 @@ pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
     let outbox_path = config.artifact_exports.outbox_path().to_path_buf();
     let outbox = if config.artifact_exports.enabled() {
         match ArtifactOutbox::load(outbox_path.clone()) {
-            Ok(outbox) => outbox,
+            Ok(outbox) => {
+                if let Err(err) =
+                    remove_unreferenced_staged_files(&config.artifact_exports, &outbox.pending())
+                {
+                    warn!(
+                        target: TRACE_TARGET,
+                        method = "artifact_staging_reconcile",
+                        error_kind = err.privacy_safe_kind(),
+                        "failed to reconcile staged artifact files"
+                    );
+                }
+                outbox
+            }
             Err(err) => {
                 warn!(
                     target: TRACE_TARGET,
@@ -1058,6 +1070,17 @@ enum ArtifactDeliveryOutcome {
     Pending,
 }
 
+fn failed_artifact_delivery_outcome(
+    error: &HarnessError,
+    invalid_batch_discarded: bool,
+) -> ArtifactDeliveryOutcome {
+    if error.artifact_validation_failed() && invalid_batch_discarded {
+        ArtifactDeliveryOutcome::FallbackAllowed
+    } else {
+        ArtifactDeliveryOutcome::Pending
+    }
+}
+
 async fn deliver_artifact_outputs(
     ctx: &Arc<BridgeContext>,
     inbound: &InboundPrompt,
@@ -1150,23 +1173,25 @@ async fn deliver_artifact_outputs(
             ArtifactDeliveryOutcome::Delivered
         }
         Err(err) => {
-            if err.artifact_validation_failed() {
-                discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
-            }
+            let validation_failed = err.artifact_validation_failed();
+            let invalid_batch_discarded = validation_failed
+                && discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
+            let outcome = failed_artifact_delivery_outcome(&err, invalid_batch_discarded);
             warn!(
                 target: TRACE_TARGET,
                 method = "send_media",
                 error_kind = err.privacy_safe_kind(),
                 artifact_count = outputs.len(),
-                "artifact delivery remains pending"
+                fallback_allowed = matches!(outcome, ArtifactDeliveryOutcome::FallbackAllowed),
+                "artifact delivery failed"
             );
-            let reason = if err.artifact_validation_failed() {
+            let reason = if validation_failed {
                 "was rejected because the staged bytes no longer match durable delivery state"
             } else {
                 "is pending automatic retry after a delivery failure"
             };
             let _ = send_artifact_failure_activity(ctx, inbound, outputs.len(), reason).await;
-            ArtifactDeliveryOutcome::Pending
+            outcome
         }
     }
 }
@@ -1181,7 +1206,8 @@ async fn retry_pending_artifacts(ctx: &Arc<BridgeContext>) {
             Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await,
             Err(err) => {
                 if err.artifact_validation_failed() {
-                    discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
+                    let _ =
+                        discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
                 }
                 warn!(
                     target: TRACE_TARGET,
@@ -1297,11 +1323,12 @@ async fn remove_artifact_batch(ctx: &BridgeContext, key: &str) -> Result<Vec<Pat
         .map_err(HarnessError::from)?
 }
 
-async fn discard_artifact_batch(ctx: &BridgeContext, key: &str, group_ref: &str) {
+async fn discard_artifact_batch(ctx: &BridgeContext, key: &str, group_ref: &str) -> bool {
     match remove_artifact_batch(ctx, key).await {
         Ok(paths) => {
             remove_staged_files(&ctx.cfg.artifact_exports, paths);
             ctx.queues.signal_group_changed(group_ref).await;
+            true
         }
         Err(err) => {
             warn!(
@@ -1310,6 +1337,7 @@ async fn discard_artifact_batch(ctx: &BridgeContext, key: &str, group_ref: &str)
                 error_kind = err.privacy_safe_kind(),
                 "failed to discard invalid artifact delivery intent"
             );
+            false
         }
     }
 }
@@ -2401,6 +2429,22 @@ mod tests {
     }
 
     static ARTIFACT_DELIVERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn artifact_validation_failure_allows_text_fallback_after_durable_discard() {
+        assert_eq!(
+            failed_artifact_delivery_outcome(&HarnessError::ArtifactUnsafeSource, true),
+            ArtifactDeliveryOutcome::FallbackAllowed
+        );
+        assert_eq!(
+            failed_artifact_delivery_outcome(&HarnessError::ArtifactUnsafeSource, false),
+            ArtifactDeliveryOutcome::Pending
+        );
+        assert_eq!(
+            failed_artifact_delivery_outcome(&HarnessError::ControlClosed, false),
+            ArtifactDeliveryOutcome::Pending
+        );
+    }
 
     #[async_trait::async_trait]
     impl Backend for NoopBackend {

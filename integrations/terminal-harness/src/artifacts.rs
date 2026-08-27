@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -7,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_control::{
     MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS, MAX_MEDIA_UPLOAD_BATCH_BYTES,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -99,6 +101,8 @@ impl ArtifactExportConfig {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(HarnessError::ArtifactAuthorizationInvalid);
         }
+        validate_export_directory(&metadata)
+            .map_err(|_| HarnessError::ArtifactAuthorizationInvalid)?;
         let root = std::fs::canonicalize(&grant.export_root)
             .map_err(|_| HarnessError::ArtifactAuthorizationInvalid)?;
         let now = SystemTime::now()
@@ -109,7 +113,7 @@ impl ArtifactExportConfig {
             .checked_add(grant.ttl_seconds)
             .ok_or(HarnessError::ArtifactAuthorizationInvalid)?;
         let mut nonce = [0_u8; 32];
-        File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        fill_random(&mut nonce)?;
         let mut hasher = Sha256::new();
         hasher.update(nonce);
         hasher.update(group_ref.as_bytes());
@@ -571,6 +575,7 @@ fn load_or_create_outbox_key(outbox_path: &Path) -> Result<[u8; 32]> {
         .ok_or_else(|| HarnessError::Config("artifact outbox path has no parent".to_owned()))?;
     fs_private::create_dir_all_private(parent)?;
     let key_path = outbox_path.with_extension("key");
+    remove_stale_key_temps(&key_path)?;
     match read_regular_file_limited(&key_path, 32) {
         Ok(bytes) if bytes.len() == 32 => return Ok(bytes.try_into().unwrap()),
         Ok(_) => {
@@ -593,10 +598,11 @@ fn load_or_create_outbox_key(outbox_path: &Path) -> Result<[u8; 32]> {
         Err(error) => return Err(error),
     }
 
-    let mut random = File::open("/dev/urandom")?;
     let mut key = [0_u8; 32];
-    random.read_exact(&mut key)?;
-    let temp = key_path.with_extension(format!("key.{}.tmp", hex::encode(&key[..8])));
+    fill_random(&mut key)?;
+    let mut temp_nonce = [0_u8; 8];
+    fill_random(&mut temp_nonce)?;
+    let temp = key_path.with_extension(format!("key.{}.tmp", hex::encode(temp_nonce)));
     let mut key_file = fs_private::create_new_private(&temp)?;
     key_file.write_all(&key)?;
     key_file.sync_all()?;
@@ -620,44 +626,53 @@ fn load_or_create_outbox_key(outbox_path: &Path) -> Result<[u8; 32]> {
     }
 }
 
-fn outbox_mac(key: &[u8; 32], batches: &[PendingArtifactBatch]) -> Result<String> {
-    let bytes = serde_json::to_vec(batches)?;
-    Ok(hex::encode(hmac_sha256(key, &bytes)))
+fn fill_random(bytes: &mut [u8]) -> Result<()> {
+    getrandom::fill(bytes).map_err(|_| HarnessError::Io {
+        kind: std::io::ErrorKind::Other,
+    })
 }
 
-fn verify_outbox_mac(key: &[u8; 32], persisted: &PersistedOutbox) -> Result<()> {
-    let expected = outbox_mac(key, &persisted.batches)?;
-    let actual = persisted.mac.as_bytes();
-    let expected = expected.as_bytes();
-    if actual.len() != expected.len() {
-        return Err(HarnessError::ArtifactIdempotencyConflict);
-    }
-    let different = actual
-        .iter()
-        .zip(expected)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        });
-    if different != 0 {
-        return Err(HarnessError::ArtifactIdempotencyConflict);
+fn remove_stale_key_temps(key_path: &Path) -> Result<()> {
+    let parent = key_path
+        .parent()
+        .ok_or_else(|| HarnessError::Config("artifact key path has no parent".to_owned()))?;
+    let key_name = key_path
+        .file_name()
+        .ok_or_else(|| HarnessError::Config("artifact key path has no file name".to_owned()))?
+        .to_string_lossy();
+    let prefix = format!("{key_name}.");
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }
 
-fn hmac_sha256(key: &[u8; 32], bytes: &[u8]) -> [u8; 32] {
-    let mut inner_key = [0x36_u8; 64];
-    let mut outer_key = [0x5c_u8; 64];
-    for (index, value) in key.iter().enumerate() {
-        inner_key[index] ^= value;
-        outer_key[index] ^= value;
-    }
-    let mut inner = Sha256::new();
-    inner.update(inner_key);
-    inner.update(bytes);
-    let mut outer = Sha256::new();
-    outer.update(outer_key);
-    outer.update(inner.finalize());
-    outer.finalize().into()
+fn outbox_mac(key: &[u8; 32], batches: &[PendingArtifactBatch]) -> Result<String> {
+    let bytes = serde_json::to_vec(batches)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| HarnessError::ArtifactIdempotencyConflict)?;
+    mac.update(&bytes);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_outbox_mac(key: &[u8; 32], persisted: &PersistedOutbox) -> Result<()> {
+    let bytes = serde_json::to_vec(&persisted.batches)?;
+    let actual =
+        hex::decode(&persisted.mac).map_err(|_| HarnessError::ArtifactIdempotencyConflict)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| HarnessError::ArtifactIdempotencyConflict)?;
+    mac.update(&bytes);
+    mac.verify_slice(&actual)
+        .map_err(|_| HarnessError::ArtifactIdempotencyConflict)
 }
 
 pub(crate) fn artifact_idempotency_key(
@@ -758,6 +773,28 @@ fn validate_private_single_link(metadata: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+fn validate_export_directory(metadata: &std::fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            return Err(HarnessError::ArtifactUnsafeSource);
+        }
+    }
+    Ok(())
+}
+
+fn validate_export_file(metadata: &std::fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            return Err(HarnessError::ArtifactUnsafeSource);
+        }
+    }
+    Ok(())
+}
+
 fn digest_exact(file: &mut File, expected: u64) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
@@ -831,6 +868,41 @@ pub(crate) fn remove_staged_files(config: &ArtifactExportConfig, paths: Vec<Path
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+pub(crate) fn remove_unreferenced_staged_files(
+    config: &ArtifactExportConfig,
+    batches: &[PendingArtifactBatch],
+) -> Result<usize> {
+    let root = match canonical_private_staging_root(config.staging_root()) {
+        Ok(root) => root,
+        Err(HarnessError::Io {
+            kind: std::io::ErrorKind::NotFound,
+        }) => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let referenced = batches
+        .iter()
+        .flat_map(|batch| &batch.artifacts)
+        .filter_map(|artifact| std::fs::canonicalize(&artifact.path).ok())
+        .collect::<HashSet<_>>();
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || validate_private_single_link(&metadata).is_err()
+        {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(entry.path())?;
+        if canonical.starts_with(&root) && !referenced.contains(&canonical) {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 pub(crate) fn validate_staged_batch(
@@ -959,6 +1031,7 @@ fn open_authorized_source(relative_path: &Path, root: &Path) -> Result<File> {
     let mut directory = root_options
         .open(root)
         .map_err(|_| HarnessError::ArtifactUnsafeSource)?;
+    validate_export_directory(&directory.metadata()?)?;
 
     for (index, component) in components.iter().enumerate() {
         let std::path::Component::Normal(name) = component else {
@@ -981,15 +1054,18 @@ fn open_authorized_source(relative_path: &Path, root: &Path) -> Result<File> {
         }
         let opened = unsafe { File::from_raw_fd(fd) };
         if final_component {
-            if !opened.metadata()?.is_file() {
+            let metadata = opened.metadata()?;
+            if !metadata.is_file() {
                 return Err(HarnessError::ArtifactUnsafeSource);
             }
+            validate_export_file(&metadata)?;
             let opened_path = opened_file_path(&opened, &root.join(relative_path))?;
             if !opened_path.starts_with(root) {
                 return Err(HarnessError::ArtifactOutsideAllowedRoots);
             }
             return Ok(opened);
         }
+        validate_export_directory(&opened.metadata()?)?;
         directory = opened;
     }
     Err(HarnessError::ArtifactUnsafeSource)
@@ -1013,6 +1089,11 @@ fn open_authorized_source(relative_path: &Path, root: &Path) -> Result<File> {
             || (index + 1 < components.len() && !metadata.is_dir())
         {
             return Err(HarnessError::ArtifactUnsafeSource);
+        }
+        if index + 1 == components.len() {
+            validate_export_file(&metadata)?;
+        } else {
+            validate_export_directory(&metadata)?;
         }
     }
     let file = File::open(&path)?;
@@ -1295,6 +1376,29 @@ mod tests {
     }
 
     #[test]
+    fn outbox_recovers_a_key_hard_link_left_by_an_interrupted_create() {
+        let temp = tempfile::tempdir().unwrap();
+        let outbox_path = temp.path().join("state/outbox.json");
+        ArtifactOutbox::load(outbox_path.clone()).unwrap();
+        let key_path = outbox_path.with_extension("key");
+        let stale_temp = outbox_path.with_extension("key.interrupted.tmp");
+        std::fs::hard_link(&key_path, &stale_temp).unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::nlink(&std::fs::metadata(&key_path).unwrap()),
+            2
+        );
+
+        let outbox = ArtifactOutbox::load(outbox_path).unwrap();
+
+        assert!(outbox.pending().is_empty());
+        assert!(!stale_temp.exists());
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::nlink(&std::fs::metadata(&key_path).unwrap()),
+            1
+        );
+    }
+
+    #[test]
     fn manifest_path_is_scoped_to_the_private_outbox_state() {
         let temp = tempfile::tempdir().unwrap();
         let outbox_path = temp.path().join("state/outbox.json");
@@ -1388,6 +1492,102 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn startup_reclaims_only_unreferenced_staged_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        let staging = temp.path().join("staging");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("report.pdf");
+        std::fs::write(&source, b"report").unwrap();
+        let cfg = config(&root, &staging, &temp.path().join("outbox.json"));
+        let output = ArtifactOutput {
+            authorization_id: "auth".to_owned(),
+            path: source,
+            media_type: "application/pdf".to_owned(),
+            file_name: "report.pdf".to_owned(),
+        };
+        let batch = stage_artifacts(
+            &cfg,
+            "wn-test",
+            "account",
+            "group",
+            "message",
+            std::slice::from_ref(&output),
+        )
+        .unwrap();
+        let staged_path = batch.artifacts[0].path.clone();
+
+        assert_eq!(
+            remove_unreferenced_staged_files(&cfg, std::slice::from_ref(&batch)).unwrap(),
+            0
+        );
+        assert!(staged_path.exists());
+        assert_eq!(remove_unreferenced_staged_files(&cfg, &[]).unwrap(), 1);
+        assert!(!staged_path.exists());
+
+        assert!(
+            stage_artifacts(
+                &cfg,
+                "wn-test",
+                "account",
+                "group",
+                "message",
+                std::slice::from_ref(&output),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_export_paths_writable_by_other_users() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        let staging = temp.path().join("staging");
+        std::fs::create_dir(&root).unwrap();
+        let cfg = config(&root, &staging, &temp.path().join("outbox.json"));
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            cfg.authorize("group", "message"),
+            Err(HarnessError::ArtifactAuthorizationInvalid)
+        ));
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("report.pdf"), b"report").unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let output = ArtifactOutput {
+            authorization_id: "auth".to_owned(),
+            path: PathBuf::from("nested/report.pdf"),
+            media_type: "application/pdf".to_owned(),
+            file_name: "report.pdf".to_owned(),
+        };
+        assert!(matches!(
+            stage_artifacts(
+                &cfg,
+                "wn-test",
+                "account",
+                "group",
+                "message",
+                std::slice::from_ref(&output),
+            ),
+            Err(HarnessError::ArtifactUnsafeSource)
+        ));
+
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            nested.join("report.pdf"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        assert!(matches!(
+            stage_artifacts(&cfg, "wn-test", "account", "group", "message", &[output],),
+            Err(HarnessError::ArtifactUnsafeSource)
+        ));
     }
 
     #[test]
