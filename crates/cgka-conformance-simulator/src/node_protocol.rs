@@ -776,6 +776,7 @@ async fn observe_node(state: &mut NodeRuntimeState) -> Result<NodeObservationV1,
             &state.account_id,
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex),
+                kinds: None,
                 limit: None,
             },
         )

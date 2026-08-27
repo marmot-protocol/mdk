@@ -128,6 +128,48 @@ pub(crate) async fn message_command_with_runtime(
                 }),
             })
         }
+        MessageCommand::SendEvent {
+            group_id,
+            kind,
+            tags,
+            content,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            if marmot_app::is_reserved_app_event_kind(kind) {
+                return Err(WnError::ReservedAppEventKind(kind));
+            }
+            let mut parsed_tags = Vec::with_capacity(tags.len());
+            for tag in &tags {
+                parsed_tags.push(parse_event_tag(tag)?);
+            }
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let summary = runtime
+                .send_custom_event(
+                    &account.label,
+                    &group_id,
+                    kind,
+                    parsed_tags,
+                    content.join(" "),
+                )
+                .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "sent custom event kind={kind} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "kind": kind,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
+                }),
+            })
+        }
         MessageCommand::Delete {
             group_id,
             message_id,
@@ -244,6 +286,7 @@ pub(crate) async fn message_command_with_runtime(
         MessageCommand::List {
             group_id,
             group,
+            kinds,
             before,
             before_message_id,
             after,
@@ -270,6 +313,7 @@ pub(crate) async fn message_command_with_runtime(
                     group_id_hex: group
                         .map(|group| normalize_group_id_hex(&group))
                         .transpose()?,
+                    kinds: (!kinds.is_empty()).then_some(kinds),
                     limit: if uses_cursor { None } else { limit },
                 },
             )?;
@@ -331,6 +375,19 @@ pub(crate) async fn message_command_with_runtime(
         }
         MessageCommand::Subscribe { .. } => Err(WnError::MessagesSubscribeRequiresDaemon),
     }
+}
+
+/// Parse one `--tag` value: a JSON array of strings with at least the tag
+/// name element (e.g. `["e","<id>"]`).
+fn parse_event_tag(raw: &str) -> Result<Vec<String>, WnError> {
+    let tag: Vec<String> = serde_json::from_str(raw)
+        .map_err(|err| WnError::InvalidEventTag(format!("{raw}: {err}")))?;
+    if tag.is_empty() {
+        return Err(WnError::InvalidEventTag(format!(
+            "{raw}: a tag needs at least a name element"
+        )));
+    }
+    Ok(tag)
 }
 
 fn handle_message_timeline_command(
@@ -416,6 +473,7 @@ fn search_messages(
             label,
             AppMessageQuery {
                 group_id_hex,
+                kinds: None,
                 limit: None,
             },
         )?
@@ -807,6 +865,25 @@ pub(crate) fn message_record_json(
 mod tests {
     use super::*;
     use marmot_app::TimelineReactionSummary;
+
+    #[test]
+    fn parse_event_tag_accepts_json_string_arrays() {
+        assert_eq!(
+            parse_event_tag("[\"d\",\"game-1\"]").unwrap(),
+            vec!["d".to_owned(), "game-1".to_owned()]
+        );
+        assert_eq!(
+            parse_event_tag("[\"name\"]").unwrap(),
+            vec!["name".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_event_tag_rejects_malformed_values() {
+        for raw in ["not json", "[1,2]", "[]", "{\"a\":1}"] {
+            assert!(parse_event_tag(raw).is_err(), "must reject: {raw}");
+        }
+    }
 
     #[test]
     fn timeline_message_record_json_summarizes_self_removal() {

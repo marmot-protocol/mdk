@@ -52,6 +52,10 @@ pub(crate) enum WnError {
     MissingGroupId,
     #[error("--reply-to must come before the message text; it was read as literal text here")]
     ReplyToAfterMessageText,
+    #[error("custom event kind {0} is reserved for Marmot protocol use")]
+    ReservedAppEventKind(u64),
+    #[error("invalid --tag value (expected a JSON array of strings): {0}")]
+    InvalidEventTag(String),
     #[error("relay URL cannot be empty")]
     EmptyRelayUrl,
     #[error("invalid relay URL: {0}")]
@@ -265,6 +269,15 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
         }),
         WnError::EmptyMessage => json!({
             "code": "empty_message",
+            "message": err.to_string(),
+        }),
+        WnError::ReservedAppEventKind(kind) => json!({
+            "code": "reserved_app_event_kind",
+            "message": err.to_string(),
+            "kind": kind,
+        }),
+        WnError::InvalidEventTag(_) => json!({
+            "code": "invalid_event_tag",
             "message": err.to_string(),
         }),
         WnError::EmptyStreamText => json!({

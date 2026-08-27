@@ -1114,6 +1114,71 @@ fn chat_event_returns_new_message_change() {
 }
 
 #[test]
+fn custom_kind_event_projects_as_standalone_row_with_custom_trigger() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut event = chat("custom", "alice", 1, "{\"move\":\"e4\"}");
+    event.kind = 30078;
+    event.tags = vec![vec!["d".to_owned(), "game-1".to_owned()]];
+
+    let update = store.record_app_event(&event).unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::CustomEvent,
+            message,
+        }] if message.message_id_hex == "custom"
+            && message.kind == 30078
+            && message.plaintext == "{\"move\":\"e4\"}"
+            && message.tags == vec![vec!["d".to_owned(), "game-1".to_owned()]]
+    ));
+    assert_eq!(
+        list(&store)
+            .iter()
+            .map(|message| (message.message_id_hex.as_str(), message.kind))
+            .collect::<Vec<_>>(),
+        vec![("custom", 30078)]
+    );
+}
+
+#[test]
+fn custom_kind_event_with_e_tag_still_projects_as_standalone_row() {
+    // An app-defined kind may carry `e` tags for its own semantics; unlike a
+    // kind-7 reaction or kind-5 delete it must not fold onto the referenced
+    // message — it stays a standalone timeline row.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    let mut event = chat("custom", "bob", 2, "payload");
+    event.kind = 30078;
+    event.tags = vec![vec!["e".to_owned(), "target".to_owned()]];
+
+    let update = store.record_app_event(&event).unwrap();
+
+    assert!(matches!(
+        update.changes.as_slice(),
+        [TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::CustomEvent,
+            message,
+        }] if message.message_id_hex == "custom"
+    ));
+    let messages = list(&store);
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec!["target", "custom"]
+    );
+    // The `e` tag is app-owned semantics, not an MDK reply: no reply linkage,
+    // no hydrated preview.
+    let custom = &messages[1];
+    assert_eq!(custom.reply_to_message_id_hex, None);
+    assert!(custom.reply_preview.is_none());
+}
+
+#[test]
 fn recording_new_message_does_not_delete_existing_timeline_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

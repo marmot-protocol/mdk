@@ -294,6 +294,7 @@ async fn frozen_wake_collection_body() {
             "bob",
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
                 limit: None,
             },
         )
@@ -396,6 +397,7 @@ async fn frozen_wake_collection_body() {
             "bob",
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex),
+                kinds: None,
                 limit: None,
             },
         )

@@ -13,7 +13,7 @@ pub(crate) async fn handle_messages_subscription(
     if is_timeline_messages_subscribe(&cli) {
         return handle_timeline_messages_subscription(stream, defaults, runtime, cli).await;
     }
-    let (group_id, limit) = match messages_subscribe_args(&cli) {
+    let (group_id, kinds, limit) = match messages_subscribe_args(&cli) {
         Ok(args) => args,
         Err(message) => {
             let _ = write_stream_response(stream, &DaemonStreamResponse::err(message)).await;
@@ -44,6 +44,7 @@ pub(crate) async fn handle_messages_subscription(
             &account_ref,
             marmot_app::AppMessageQuery {
                 group_id_hex: group_id.clone(),
+                kinds: kinds.clone(),
                 limit,
             },
         )
@@ -99,6 +100,7 @@ pub(crate) async fn handle_messages_subscription(
             stream,
             response,
             group_id.as_deref(),
+            kinds.as_deref(),
             &account_ref,
             &mut seen_messages,
             &mut seen_stream_previews,
@@ -115,6 +117,7 @@ pub(crate) async fn handle_messages_subscription(
             stream,
             response,
             group_id.as_deref(),
+            kinds.as_deref(),
             &account_ref,
             &mut seen_messages,
             &mut seen_stream_previews,
@@ -155,6 +158,7 @@ pub(crate) async fn handle_messages_subscription(
                     stream,
                     response,
                     group_id.as_deref(),
+                    kinds.as_deref(),
                     &account_ref,
                     &mut seen_messages,
                     &mut seen_stream_previews,
@@ -171,6 +175,7 @@ pub(crate) async fn handle_messages_subscription(
                             stream,
                             response,
                             group_id.as_deref(),
+                            kinds.as_deref(),
                             &account_ref,
                             &mut seen_messages,
                             &mut seen_stream_previews,
@@ -199,6 +204,7 @@ pub(crate) async fn handle_messages_subscription(
                             stream,
                             response,
                             group_id.as_deref(),
+                            kinds.as_deref(),
                             &account_ref,
                             &mut seen_messages,
                             &mut seen_stream_previews,
@@ -336,6 +342,7 @@ pub(crate) async fn write_message_subscription_event(
     stream: &mut UnixStream,
     response: DaemonStreamResponse,
     group_id: Option<&str>,
+    kinds: Option<&[u64]>,
     account_id: &str,
     seen_messages: &mut BoundedMessageSubscriptionIds,
     seen_stream_previews: &mut BoundedMessageSubscriptionIds,
@@ -343,10 +350,38 @@ pub(crate) async fn write_message_subscription_event(
     if !stream_response_matches_subscription(&response, group_id, account_id) {
         return true;
     }
+    if !stream_response_matches_kinds(&response, kinds) {
+        return true;
+    }
     if mark_stream_response_seen(&response, seen_messages, seen_stream_previews) {
         write_stream_response(stream, &response).await
     } else {
         true
+    }
+}
+
+/// The daemon merges the kind-filtered runtime subscription with the shared
+/// broadcast hub; apply the subscriber's kind filter to the hub side too, so
+/// `messages subscribe --kind …` never surfaces other kinds. Payloads that
+/// carry no app-event kind (stream previews/deltas, control rows) pass
+/// through — only `message` payloads with a parseable kind are constrained.
+pub(crate) fn stream_response_matches_kinds(
+    response: &DaemonStreamResponse,
+    kinds: Option<&[u64]>,
+) -> bool {
+    let Some(kinds) = kinds else {
+        return true;
+    };
+    let Some(result) = &response.result else {
+        return true;
+    };
+    match result
+        .get("message")
+        .and_then(|message| message.get("kind"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(kind) => kinds.contains(&kind),
+        None => true,
     }
 }
 
@@ -608,16 +643,28 @@ pub(crate) fn chats_subscribe_args(cli: &Cli) -> Result<bool, String> {
     }
 }
 
-pub(crate) fn messages_subscribe_args(
-    cli: &Cli,
-) -> Result<(Option<String>, Option<usize>), String> {
-    let (group, limit) = match &cli.command {
+/// Parsed `messages subscribe` arguments: group scope, inner-kind filter,
+/// replay limit.
+pub(crate) type MessagesSubscribeArgs = (Option<String>, Option<Vec<u64>>, Option<usize>);
+
+pub(crate) fn messages_subscribe_args(cli: &Cli) -> Result<MessagesSubscribeArgs, String> {
+    let (group, kinds, limit) = match &cli.command {
         crate::Command::Message {
-            command: crate::MessageCommand::Subscribe { group, limit },
+            command:
+                crate::MessageCommand::Subscribe {
+                    group,
+                    kinds,
+                    limit,
+                },
         }
         | crate::Command::Messages {
-            command: crate::MessageCommand::Subscribe { group, limit },
-        } => (group, *limit),
+            command:
+                crate::MessageCommand::Subscribe {
+                    group,
+                    kinds,
+                    limit,
+                },
+        } => (group, kinds, *limit),
         _ => return Err("messages subscribe requires wn messages subscribe".to_owned()),
     };
     let group_id = group
@@ -625,7 +672,8 @@ pub(crate) fn messages_subscribe_args(
         .map(crate::normalize_group_id_hex)
         .transpose()
         .map_err(|err| err.to_string())?;
-    Ok((group_id, Some(limit.unwrap_or(50).min(200))))
+    let kinds = (!kinds.is_empty()).then_some(kinds.clone());
+    Ok((group_id, kinds, Some(limit.unwrap_or(50).min(200))))
 }
 
 pub(crate) fn notifications_subscribe_args(cli: &Cli) -> Result<(), String> {

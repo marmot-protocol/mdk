@@ -9506,6 +9506,79 @@ fn group_system_intent_builds_kind_1210_json_payload() {
 }
 
 #[test]
+fn custom_intent_passes_kind_tags_and_content_through_verbatim() {
+    let event = build(AppMessageIntent::Custom {
+        kind: 30078,
+        tags: vec![
+            vec!["d".to_owned(), "game-1".to_owned()],
+            vec!["move".to_owned(), "e4".to_owned()],
+        ],
+        content: "{\"move\":\"e4\"}".to_owned(),
+    });
+    assert_eq!(event.kind, 30078);
+    assert_eq!(
+        event.tags,
+        vec![
+            vec!["d".to_owned(), "game-1".to_owned()],
+            vec!["move".to_owned(), "e4".to_owned()]
+        ]
+    );
+    assert_eq!(event.content, "{\"move\":\"e4\"}");
+    assert_eq!(event.pubkey, SENDER_HEX);
+}
+
+#[test]
+fn custom_intent_rejects_every_reserved_kind() {
+    use cgka_traits::app_event as kinds;
+    for kind in [
+        kinds::MARMOT_APP_EVENT_KIND_DELETE,
+        kinds::MARMOT_APP_EVENT_KIND_REACTION,
+        kinds::MARMOT_APP_EVENT_KIND_CHAT,
+        kinds::MARMOT_APP_EVENT_KIND_EDIT,
+        kinds::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+        kinds::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+        kinds::MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+        kinds::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+    ] {
+        assert!(crate::is_reserved_app_event_kind(kind));
+        let result = build_inner_event(
+            &AppMessageIntent::Custom {
+                kind,
+                tags: Vec::new(),
+                content: String::new(),
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(
+            matches!(result, Err(AppError::InvalidAppMessagePayload(_))),
+            "reserved kind {kind} must be rejected"
+        );
+    }
+    assert!(!crate::is_reserved_app_event_kind(30078));
+}
+
+#[test]
+fn custom_intent_audit_action_is_send_custom_event() {
+    let context = AppClient::message_human_action_context(&AppMessageIntent::Custom {
+        kind: 30078,
+        tags: Vec::new(),
+        content: String::new(),
+    })
+    .expect("custom events are user-authored actions");
+    assert_eq!(
+        context
+            .human_action
+            .as_ref()
+            .map(|action| action.action.as_str()),
+        Some("send_custom_event")
+    );
+}
+
+#[test]
 fn received_event_decodes_when_id_and_sender_match() {
     let event = build(AppMessageIntent::Chat {
         content: "hi".to_owned(),

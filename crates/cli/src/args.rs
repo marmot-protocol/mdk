@@ -726,12 +726,40 @@ pub(crate) enum MessageCommand {
         #[arg(help = "Message id to unreact from")]
         message_id: String,
     },
+    #[command(
+        name = "send-event",
+        about = "Send an app-defined custom event with an arbitrary non-reserved kind"
+    )]
+    SendEvent {
+        #[arg(help = "Group id to send to")]
+        group_id: String,
+        #[arg(help = "Inner app-event kind; MDK-reserved kinds are rejected")]
+        kind: u64,
+        #[arg(
+            long = "tag",
+            value_name = "TAG_JSON",
+            help = "Event tag as a JSON array of strings (repeatable), e.g. '[\"e\",\"<id>\"]'"
+        )]
+        tags: Vec<String>,
+        #[arg(
+            value_name = "CONTENT",
+            allow_hyphen_values = true,
+            help = "Event content"
+        )]
+        content: Vec<String>,
+    },
     #[command(about = "List messages from one group")]
     List {
         #[arg(value_name = "GROUP", help = "Group id to list")]
         group_id: Option<String>,
         #[arg(long, help = "Group id to list")]
         group: Option<String>,
+        #[arg(
+            long = "kind",
+            value_name = "KIND",
+            help = "Restrict to this inner app-event kind (repeatable)"
+        )]
+        kinds: Vec<u64>,
         #[arg(long, help = "Before-cursor timestamp; requires --before-message-id")]
         before: Option<u64>,
         #[arg(long, help = "Before-cursor message id; requires --before")]
@@ -768,6 +796,12 @@ pub(crate) enum MessageCommand {
     Subscribe {
         #[arg(help = "Group id to watch; omit to watch all local groups")]
         group: Option<String>,
+        #[arg(
+            long = "kind",
+            value_name = "KIND",
+            help = "Restrict to this inner app-event kind (repeatable)"
+        )]
+        kinds: Vec<u64>,
         #[arg(long, help = "Initial replay limit")]
         limit: Option<usize>,
     },
