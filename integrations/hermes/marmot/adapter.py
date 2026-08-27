@@ -1975,6 +1975,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # message (rapid catch-up after subscribe, or across a reconnect); drop
         # ids already seen so the same user message is not dispatched twice.
         self._recent_inbound_ids = _RecentKeys(DEFAULT_INBOUND_DEDUPE_WINDOW)
+        # Reserve ids while admission is being decided. A reservation prevents
+        # concurrent duplicates without making a shed message terminally seen.
+        self._pending_inbound_ids: set[str] = set()
         # Dedupe repeated ambient surfacings (deletion / group-state change) by a
         # context key (mirror inbound.ts contextKeys).
         self._recent_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
@@ -2058,6 +2061,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 task.cancel()
         self._debounce_tasks.clear()
         self._debounce_pending.clear()
+        self._pending_inbound_ids.clear()
 
     async def send(
         self,
@@ -3317,25 +3321,37 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         message_id_hex = event["message_id_hex"]
         # Client-side dedupe: the connector can re-emit the same inbound message
         # (rapid catch-up after subscribe, or across a reconnect). Drop a repeat
-        # silently so the same user message is not dispatched twice. Record the id
-        # BEFORE dispatching (an agent turn takes long enough that record-after
-        # would let a duplicate start a second concurrent turn). Dedupe the id
-        # once regardless of whether onboarding intercepts the message.
-        if message_id_hex in self._recent_inbound_ids:
+        # silently so the same user message is not dispatched twice. Reserve the
+        # id before queue admission so concurrent duplicates cannot race, but do
+        # not commit it to terminal dedupe until admission succeeds: a shed turn
+        # must remain replayable from connector storage.
+        if (
+            message_id_hex in self._recent_inbound_ids
+            or message_id_hex in self._pending_inbound_ids
+        ):
             return
-        self._recent_inbound_ids.add(message_id_hex)
+        self._pending_inbound_ids.add(message_id_hex)
 
         if self.debounce_ms > 0:
-            self._enqueue_debounced(event)
+            try:
+                self._enqueue_debounced(event)
+            except BaseException:
+                self._pending_inbound_ids.discard(message_id_hex)
+                raise
             return
 
         # Hand the turn off to the per-group queue and return immediately so the consume loop
         # keeps pulling events. Distinct groups dispatch concurrently; each group stays FIFO.
         group_id_hex = event["group_id_hex"]
-        self._inbound_queue.enqueue(
-            group_id_hex,
-            lambda evt=event: self._dispatch_inbound_message(evt),
-        )
+        try:
+            task = self._inbound_queue.enqueue(
+                group_id_hex,
+                lambda evt=event: self._dispatch_inbound_message(evt),
+            )
+            if task is not None:
+                self._recent_inbound_ids.add(message_id_hex)
+        finally:
+            self._pending_inbound_ids.discard(message_id_hex)
 
     async def _handle_group_invite(self, event: Dict[str, Any]) -> None:
         if not self.profile_name_onboarding_enabled or self.profile_name_onboarding is None:
@@ -3578,16 +3594,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._debounce_tasks.pop(key, None)
         if not items:
             return
+        message_ids = [str(item.get("message_id_hex") or "") for item in items]
         # Route the coalesced turn through the per-group queue too, so a debounced
         # batch stays FIFO-ordered with non-debounced messages in the same group
         # and a slow turn does not block the debounce-flush task (mirrors the
         # direct-dispatch path's per-group serialization).
-        merged = _coalesce_inbound_events(items)
-        group_id_hex = merged["group_id_hex"]
-        self._inbound_queue.enqueue(
-            group_id_hex,
-            lambda evt=merged: self._dispatch_inbound_message(evt),
-        )
+        try:
+            merged = _coalesce_inbound_events(items)
+            group_id_hex = merged["group_id_hex"]
+            task = self._inbound_queue.enqueue(
+                group_id_hex,
+                lambda evt=merged: self._dispatch_inbound_message(evt),
+            )
+            if task is not None:
+                for message_id_hex in message_ids:
+                    self._recent_inbound_ids.add(message_id_hex)
+        finally:
+            for message_id_hex in message_ids:
+                self._pending_inbound_ids.discard(message_id_hex)
 
     async def _handle_mutation(self, event: Dict[str, Any]) -> None:
         # Mutations are quiet next-turn context and never trigger an agent turn.
