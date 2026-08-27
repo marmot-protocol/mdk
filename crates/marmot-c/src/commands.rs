@@ -946,7 +946,7 @@ pub unsafe extern "C" fn marmot_set_audit_log_settings(
         try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let settings = try_arg!(unsafe { borrowed(settings) });
-        let settings = try_arg!(settings.to_ffi());
+        let settings = settings.to_ffi();
         unsafe {
             deliver(
                 client.block_on(client.marmot.set_audit_log_settings(settings)),

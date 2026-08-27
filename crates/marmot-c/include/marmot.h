@@ -420,21 +420,6 @@ typedef enum MarmotChatListUpdateTrigger {
 } MarmotChatListUpdateTrigger;
 
 /**
- * Audit-log content posture.
- */
-typedef enum MarmotAuditDataMode {
-  /**
-   * Default safety posture: obfuscated/hashed identifiers, no
-   * plaintext.
-   */
-  MARMOT_AUDIT_DATA_MODE_OBFUSCATED_SENSITIVE_DATA,
-  /**
-   * Explicit opt-in: decrypted content and full identifiers.
-   */
-  MARMOT_AUDIT_DATA_MODE_FULL_DATA,
-} MarmotAuditDataMode;
-
-/**
  * What woke the background collection.
  */
 typedef enum MarmotNotificationWakeSource {
@@ -1098,10 +1083,6 @@ typedef struct MarmotAuditLogSettings {
    * Boolean as `uint8_t`: nonzero is enabled.
    */
   uint8_t enabled;
-  /**
-   * `MarmotAuditDataMode` discriminant.
-   */
-  uint32_t data_mode;
 } MarmotAuditLogSettings;
 
 /**

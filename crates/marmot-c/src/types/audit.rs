@@ -1,34 +1,13 @@
 //! C mirrors of the forensic audit-log conversions.
 
 use marmot_uniffi::conversions::{
-    AuditDataModeFfi, AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi,
-    AuditLogTrackerConfigFfi, AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi,
-    AuditLogUploadSourceFfi,
+    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
+    AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceFfi,
 };
 
 use crate::MarmotStatus;
-use crate::macros::{c_enum, c_mirror};
+use crate::macros::c_mirror;
 use crate::memory::{c_bool, optional_str};
-
-c_enum! {
-    /// Audit-log content posture.
-    MarmotAuditDataMode from AuditDataModeFfi {
-        /// Default safety posture: obfuscated/hashed identifiers, no
-        /// plaintext.
-        ObfuscatedSensitiveData,
-        /// Explicit opt-in: decrypted content and full identifiers.
-        FullData,
-    }
-}
-
-impl From<MarmotAuditDataMode> for AuditDataModeFfi {
-    fn from(value: MarmotAuditDataMode) -> Self {
-        match value {
-            MarmotAuditDataMode::ObfuscatedSensitiveData => Self::ObfuscatedSensitiveData,
-            MarmotAuditDataMode::FullData => Self::FullData,
-        }
-    }
-}
 
 c_mirror! {
     /// Audit-log recorder settings. Also a borrowed input to
@@ -37,17 +16,14 @@ c_mirror! {
     free marmot_audit_log_settings_free {
         /// Boolean as `uint8_t`: nonzero is enabled.
         copy enabled: u8,
-        /// `MarmotAuditDataMode` discriminant.
-        enum_val data_mode: MarmotAuditDataMode,
     }
 }
 
 impl MarmotAuditLogSettings {
-    pub(crate) fn to_ffi(&self) -> Result<AuditLogSettingsFfi, MarmotStatus> {
-        Ok(AuditLogSettingsFfi {
+    pub(crate) fn to_ffi(&self) -> AuditLogSettingsFfi {
+        AuditLogSettingsFfi {
             enabled: c_bool(self.enabled),
-            data_mode: MarmotAuditDataMode::from_c(self.data_mode)?.into(),
-        })
+        }
     }
 }
 
