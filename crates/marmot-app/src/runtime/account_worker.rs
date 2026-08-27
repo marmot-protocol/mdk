@@ -689,7 +689,7 @@ async fn run_app_runtime_account_worker(
     let startup_sync_result = {
         let mut initial_sync = std::pin::pin!(async {
             let summary = client
-                .sync_with_startup_stage_telemetry(&startup_stage_telemetry)
+                .sync_with_stage_telemetry(&startup_stage_telemetry)
                 .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
@@ -1327,6 +1327,7 @@ async fn run_app_runtime_account_worker(
                         // prolonged transport outage.
                         drop(client);
                         client = loop {
+                            let retry_started_at = Instant::now();
                             let mut retry_delay =
                                 std::pin::pin!(sleep(reconnect_backoff.next_delay()));
                             loop {
@@ -1336,6 +1337,27 @@ async fn run_app_runtime_account_worker(
                                     _ = &mut retry_delay => break,
                                     command = commands.recv() => {
                                         match command {
+                                            Some(command @ AccountWorkerCommand::CatchUp { .. }) => {
+                                                // A host connectivity-restored edge is the one
+                                                // command that is meaningful without an engine
+                                                // session: retain its response and use it to end
+                                                // only this stale sleep. If the network is still
+                                                // unavailable, the failed reopen below advances
+                                                // the same bounded backoff instead of spinning.
+                                                pending.push_back(command);
+                                                tracing::debug!(
+                                                    target: "marmot_app::runtime",
+                                                    method = "account_worker_reconnect",
+                                                    phase = "backoff_wait",
+                                                    outcome = "interrupted",
+                                                    elapsed_ms = u64::try_from(
+                                                        retry_started_at.elapsed().as_millis()
+                                                    )
+                                                    .unwrap_or(u64::MAX),
+                                                    "host recovery interrupted account worker reconnect backoff",
+                                                );
+                                                break;
+                                            }
                                             // There is deliberately no engine
                                             // session during this backoff.
                                             // Poll the bounded channel and
@@ -1381,10 +1403,11 @@ async fn run_app_runtime_account_worker(
                                     // loop on a full catch-up; the maintenance
                                     // path performs bounded repair syncs when
                                     // required.
+                                    let telemetry = shared.app_performance_telemetry();
                                     let prepare_transport = tokio::select! {
                                         _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
                                         _ = &mut shutdown => return,
-                                        result = reopened.prepare_transport() => result,
+                                        result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
                                     };
                                     if let Err(transport_err) = prepare_transport {
                                         publish_app_runtime_account_error(
@@ -1643,8 +1666,9 @@ async fn handle_account_worker_catch_up(
     let mut deferred = VecDeque::new();
     let mut commands_open = true;
     let sync_started_at = Instant::now();
+    let stage_telemetry = context.shared.app_performance_telemetry();
     let sync_result = {
-        let mut sync = std::pin::pin!(client.sync_with_classified_partial_progress());
+        let mut sync = std::pin::pin!(client.sync_with_stage_telemetry(&stage_telemetry));
         loop {
             let command = if let Some(command) = pending.pop_front() {
                 Some(command)
