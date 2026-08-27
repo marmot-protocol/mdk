@@ -118,6 +118,16 @@ pub struct StoredEpochBackfillIntent {
     pub stalled_epoch: u64,
 }
 
+/// Durable evidence that the app relay plane omitted at least one delivery
+/// from a bounded per-account queue and must complete an unfloored replay
+/// before trusting the account's transport cursor again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountDeliveryRecovery {
+    pub marker_token: u64,
+    pub pending_since: u64,
+    pub dropped_count: u64,
+}
+
 /// Minimal outline of a group still pending the local device's join
 /// confirmation, for invite-policy reconciliation. Deliberately carries no
 /// profile/component payload: the policy decision needs only the group id and
@@ -525,6 +535,83 @@ impl SqliteAccountStorage {
             }
             Ok(())
         })
+    }
+
+    pub fn account_delivery_recovery(
+        &self,
+        label: &str,
+    ) -> StorageResult<Option<AccountDeliveryRecovery>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT marker_token, pending_since, dropped_count
+             FROM account_delivery_recovery
+             WHERE account_label = ?1",
+            params![label],
+            |row| {
+                let marker_token = row.get::<_, i64>(0)?;
+                let pending_since = row.get::<_, i64>(1)?;
+                let dropped_count = row.get::<_, i64>(2)?;
+                Ok(AccountDeliveryRecovery {
+                    marker_token: u64::try_from(marker_token).unwrap_or_default(),
+                    pending_since: u64::try_from(pending_since).unwrap_or_default(),
+                    dropped_count: u64::try_from(dropped_count).unwrap_or_default(),
+                })
+            },
+        )
+        .optional()
+        .storage()
+    }
+
+    /// Persist incomplete recovery before the account may checkpoint a newer
+    /// cursor. Re-observing the same process-local generation raises the count
+    /// monotonically without moving its original detection time.
+    pub fn mark_account_delivery_recovery(
+        &self,
+        label: &str,
+        marker_token: u64,
+        dropped_count: u64,
+    ) -> StorageResult<()> {
+        let now = unix_now_seconds_i64();
+        let marker_token = i64::try_from(marker_token).unwrap_or(i64::MAX);
+        let dropped_count = i64::try_from(dropped_count).unwrap_or(i64::MAX);
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO account_delivery_recovery (
+                account_label, marker_token, pending_since, dropped_count
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_label) DO UPDATE SET
+                marker_token = excluded.marker_token,
+                pending_since = CASE
+                    WHEN account_delivery_recovery.marker_token = excluded.marker_token
+                    THEN account_delivery_recovery.pending_since
+                    ELSE excluded.pending_since
+                END,
+                dropped_count = CASE
+                    WHEN account_delivery_recovery.marker_token = excluded.marker_token
+                    THEN max(account_delivery_recovery.dropped_count, excluded.dropped_count)
+                    ELSE excluded.dropped_count
+                END",
+            params![label, marker_token, now, dropped_count],
+        )
+        .storage()?;
+        Ok(())
+    }
+
+    pub fn clear_account_delivery_recovery(
+        &self,
+        label: &str,
+        marker_token: u64,
+    ) -> StorageResult<bool> {
+        let marker_token = i64::try_from(marker_token).unwrap_or(i64::MAX);
+        let conn = self.lock()?;
+        let cleared = conn
+            .execute(
+                "DELETE FROM account_delivery_recovery
+                 WHERE account_label = ?1 AND marker_token = ?2",
+                params![label, marker_token],
+            )
+            .storage()?;
+        Ok(cleared > 0)
     }
 
     /// Read only the pending-confirmation, non-archived group outlines.

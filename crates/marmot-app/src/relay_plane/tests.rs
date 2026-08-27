@@ -113,9 +113,147 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
     }));
 
     let (delivery_tx, _delivery_rx) = mpsc::channel(1);
-    account_deliveries_write(&deliveries).insert(MemberId::new(vec![0x01; 32]), delivery_tx);
+    account_deliveries_write(&deliveries).insert(
+        MemberId::new(vec![0x01; 32]),
+        AccountDeliveryRoute {
+            sender: delivery_tx,
+            overflow: Arc::new(AccountDeliveryOverflowState::default()),
+            recovery_marker: None,
+        },
+    );
 
     assert_eq!(account_deliveries_read(&deliveries).len(), 1);
+}
+
+#[test]
+fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
+    let overflow = AccountDeliveryOverflowState::default();
+    let generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    overflow.consume_signal(generation);
+    let first = overflow.start_recovery(1);
+    let elapsed_ms = overflow.finish_recovery(first).unwrap();
+    overflow.record_recovery_success(elapsed_ms);
+
+    let generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    overflow.consume_signal(generation);
+    let second = overflow.start_recovery(2);
+    // A new omission during the replay invalidates this attempt.
+    assert!(overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).is_some());
+    assert!(overflow.finish_recovery(second).is_none());
+    overflow.fail_recovery();
+
+    assert_eq!(
+        overflow.metrics.recovery_attempts.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        overflow.metrics.recovery_successes.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        overflow.metrics.recovery_failures.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(overflow.metrics.dropped.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
+    let overflow = AccountDeliveryOverflowState::default();
+    assert!(overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).is_some());
+    assert!(overflow.start_marker_persistence());
+    assert!(
+        !overflow.start_marker_persistence(),
+        "one generation must never own more than one marker worker"
+    );
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = attempts.clone();
+    let marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+        observed_attempts.fetch_add(1, Ordering::SeqCst);
+        Err(AccountDeliveryRecoveryMarkerError::Closed)
+    });
+    timeout(
+        Duration::from_secs(1),
+        overflow.persist_marker_before_drop(marker),
+    )
+    .await
+    .expect("terminal storage closure must release the marker worker");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(overflow.marker_barrier_complete());
+    assert!(
+        !overflow.start_marker_persistence(),
+        "closed storage must not arm an immortal retry task"
+    );
+}
+
+async fn assert_stale_marker_worker_preserves_new_generation(
+    result: Result<(), AccountDeliveryRecoveryMarkerError>,
+) {
+    let overflow = Arc::new(AccountDeliveryOverflowState::default());
+    let old_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    overflow.consume_signal(old_generation);
+    assert!(overflow.start_marker_persistence());
+    let old_attempt = overflow.start_recovery(1);
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let marker: AccountDeliveryRecoveryMarker = {
+        let entered = entered.clone();
+        let release = release.clone();
+        Arc::new(move |_, _| {
+            entered.store(true, Ordering::SeqCst);
+            while !release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            result
+        })
+    };
+    let worker = {
+        let overflow = overflow.clone();
+        tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old generation marker worker must start");
+
+    assert!(overflow.finish_recovery(old_attempt).is_some());
+    let new_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    overflow.consume_signal(new_generation);
+    assert!(overflow.start_marker_persistence());
+
+    release.store(true, Ordering::SeqCst);
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("the stale marker worker must stop")
+        .unwrap();
+
+    assert!(
+        !overflow.start_marker_persistence(),
+        "a stale worker must not release the newer generation's worker claim"
+    );
+    assert!(
+        !overflow.marker_barrier_complete(),
+        "a stale worker must not publish its outcome into the newer generation"
+    );
+}
+
+#[tokio::test]
+async fn stale_overflow_marker_workers_preserve_new_generation_claim() {
+    assert_stale_marker_worker_preserves_new_generation(Ok(())).await;
+    assert_stale_marker_worker_preserves_new_generation(Err(
+        AccountDeliveryRecoveryMarkerError::Closed,
+    ))
+    .await;
+    assert_stale_marker_worker_preserves_new_generation(Err(
+        AccountDeliveryRecoveryMarkerError::Retryable,
+    ))
+    .await;
 }
 
 #[test]
@@ -1173,6 +1311,170 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
     assert_eq!(bob_delivery.group_id_hint, Some(group_id));
     assert_eq!(alice_delivery.source.plane, TransportDeliveryPlane::Group);
     assert_eq!(bob_delivery.source.plane, TransportDeliveryPlane::Group);
+}
+
+#[tokio::test]
+async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let alice_group_id = GroupId::new(vec![0xC3; 32]);
+    let bob_group_id = GroupId::new(vec![0xC4; 32]);
+    let alice_transport_group_id = vec![0xD3; 32];
+    let bob_transport_group_id = vec![0xD4; 32];
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let marker_persisted = Arc::new(AtomicBool::new(false));
+    let marker_attempts = Arc::new(AtomicUsize::new(0));
+    let marker_flag = marker_persisted.clone();
+    let attempts = marker_attempts.clone();
+    let recovery_marker: AccountDeliveryRecoveryMarker = Arc::new(move |_, _| {
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(AccountDeliveryRecoveryMarkerError::Retryable);
+        }
+        marker_flag.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    let alice_adapter = relay_plane.account_adapter_with_recovery_marker(
+        alice.clone(),
+        relay.clone(),
+        Some(recovery_marker),
+    );
+    let bob_adapter = relay_plane.account_adapter(bob.clone(), relay.clone());
+
+    for (adapter, account_id, group_id, transport_group_id) in [
+        (
+            &alice_adapter,
+            alice.clone(),
+            alice_group_id,
+            alice_transport_group_id.clone(),
+        ),
+        (
+            &bob_adapter,
+            bob.clone(),
+            bob_group_id.clone(),
+            bob_transport_group_id.clone(),
+        ),
+    ] {
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id,
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id,
+                    transport_group_id,
+                    endpoints: vec![endpoint.clone()],
+                }],
+                since: Some(Timestamp(1_699_999_900)),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Newest-first stored history fills Alice's deliberately undrained queue.
+    // At least one older delivery is then omitted from that queue while the
+    // shared router must remain available to Bob.
+    for index in 0..=ACCOUNT_DELIVERY_BUFFER {
+        let mut event = group_event(&format!("alice-{index}"), &alice_transport_group_id);
+        event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
+        event.id = event.computed_id();
+        relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some("alice-group".into()),
+                event,
+            })
+            .await
+            .unwrap();
+    }
+
+    relay_plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("bob-group".into()),
+            event: group_event("bob-after-alice-overflow", &bob_transport_group_id),
+        })
+        .await
+        .unwrap();
+    let bob_delivery = timeout(Duration::from_secs(1), bob_adapter.receive())
+        .await
+        .expect("Alice's full queue must not block Bob")
+        .unwrap()
+        .unwrap();
+    assert_eq!(bob_delivery.account_id, bob);
+    assert_eq!(bob_delivery.group_id_hint, Some(bob_group_id));
+
+    let bob_subscription_ids = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|subscription| subscription.account_id() == &bob)
+        .map(NostrSubscription::subscription_id)
+        .collect::<Vec<_>>();
+    assert!(!bob_subscription_ids.is_empty());
+    for subscription_id in bob_subscription_ids {
+        relay_plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription_id)
+            .await;
+    }
+    assert!(
+        bob_adapter.account_subscription_eose().await.complete(),
+        "Alice's full queue must not block Bob's EOSE"
+    );
+
+    let alice_subscription_ids = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|subscription| subscription.account_id() == &alice)
+        .map(NostrSubscription::subscription_id)
+        .collect::<Vec<_>>();
+    assert!(!alice_subscription_ids.is_empty());
+    for subscription_id in alice_subscription_ids {
+        relay_plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription_id)
+            .await;
+    }
+
+    assert!(
+        !alice_adapter.account_subscription_eose().await.complete(),
+        "EOSE must stay incomplete while Alice has an unresolved delivery gap"
+    );
+    let health = relay_plane.relay_health().await;
+    assert!(health.account_delivery_queue_depth >= ACCOUNT_DELIVERY_BUFFER);
+    assert!(health.account_delivery_max_queue_depth >= ACCOUNT_DELIVERY_BUFFER as u64);
+    assert!(health.account_delivery_dropped >= 1);
+    assert_eq!(health.account_delivery_recovery_attempts, 0);
+
+    let (retained, overflow) = timeout(Duration::from_secs(1), async {
+        let mut retained = 0_usize;
+        loop {
+            match alice_adapter
+                .receive_account_delivery()
+                .await
+                .unwrap()
+                .expect("Alice's route stays open")
+            {
+                AccountDeliveryReceive::Delivery(_) => retained += 1,
+                AccountDeliveryReceive::Overflow(overflow) => break (retained, overflow),
+            }
+        }
+    })
+    .await
+    .expect("the reserved overflow record must follow the retained prefix");
+    assert_eq!(retained, ACCOUNT_DELIVERY_BUFFER);
+    assert!(
+        marker_persisted.load(Ordering::SeqCst),
+        "the overflow control record is released only after durable marking"
+    );
+    assert!(
+        marker_attempts.load(Ordering::SeqCst) >= 2,
+        "the single marker worker must retry without retaining omitted deliveries"
+    );
+    assert!(overflow.dropped >= 1);
+    assert!(overflow.queue_depth >= ACCOUNT_DELIVERY_BUFFER);
 }
 
 #[tokio::test]

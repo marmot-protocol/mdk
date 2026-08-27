@@ -72,7 +72,9 @@ use push::notification_trigger_for_intent;
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
 #[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
-pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
+pub(crate) use sync::{
+    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
+};
 
 #[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
@@ -349,6 +351,16 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// Last transport cursor promoted by a completed drain checkpoint. Live
+    /// one-at-a-time worker ingests may advance `state` for diagnostics, but
+    /// they persist this older safe floor until a drain has observed any
+    /// process-local overflow fence/control record.
+    pub(crate) checkpointed_transport_timestamp: Option<u64>,
+    /// Durable account-wide marker set when the bounded relay-plane queue
+    /// omits a delivery. While true, every subscription rebuild is unfloored
+    /// and EOSE-gated recovery must complete before the cursor is trusted.
+    pub(crate) delivery_overflow_recovery_pending: bool,
+    pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
     /// Unit-test fault injection for the account-open replay path. This keeps
     /// the live protocol group intact while exercising a missing best-effort
     /// app projection.

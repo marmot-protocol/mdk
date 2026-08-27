@@ -136,7 +136,9 @@ pub use audit_log::{
     AuditLogUploadResult,
 };
 pub use client::AppClient;
-pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
+pub(crate) use client::{
+    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
+};
 pub use config::{
     AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
     MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
@@ -1266,6 +1268,8 @@ struct OpenAppAccount {
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
     state: AccountState,
+    delivery_overflow_recovery_pending: bool,
+    delivery_overflow_recovery_marker_token: Option<u64>,
     signer: Arc<dyn nostr::NostrSigner>,
 }
 
@@ -1665,6 +1669,7 @@ impl MarmotApp {
             .iter()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
+        let checkpointed_transport_timestamp = open.state.last_transport_timestamp;
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
@@ -1685,6 +1690,9 @@ impl MarmotApp {
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
             pending_runtime_group_subscription_refresh: false,
+            checkpointed_transport_timestamp,
+            delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
+            delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
@@ -3447,6 +3455,12 @@ impl MarmotApp {
         let label = account.label.as_str();
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
+        let delivery_overflow_recovery = self
+            .account_storage(label)?
+            .account_delivery_recovery(label)?;
+        let delivery_overflow_recovery_pending = delivery_overflow_recovery.is_some();
+        let delivery_overflow_recovery_marker_token =
+            delivery_overflow_recovery.map(|recovery| recovery.marker_token);
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
@@ -3517,7 +3531,25 @@ impl MarmotApp {
 
         let publish_client =
             self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
-        let adapter = relay_plane.account_adapter(account_id.clone(), publish_client);
+        let recovery_storage = self.account_storage(label)?;
+        let recovery_label = label.to_owned();
+        let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
+            Arc::new(move |marker_token, dropped| {
+                recovery_storage
+                    .mark_account_delivery_recovery(&recovery_label, marker_token, dropped)
+                    .map_err(|error| {
+                        if error.is_closed() {
+                            relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                        } else {
+                            relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                        }
+                    })
+            });
+        let adapter = relay_plane.account_adapter_with_recovery_marker(
+            account_id.clone(),
+            publish_client,
+            Some(recovery_marker),
+        );
 
         let key_packages = AppKeyPackagePublisher {
             app: self.clone(),
@@ -3533,6 +3565,8 @@ impl MarmotApp {
             adapter,
             routing,
             state,
+            delivery_overflow_recovery_pending,
+            delivery_overflow_recovery_marker_token,
             signer: nostr_signer,
         })
     }

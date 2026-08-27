@@ -16,6 +16,7 @@ use nostr_sdk::prelude::{
     Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
     RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -58,7 +59,7 @@ pub(crate) use transport_nostr_adapter::{
     DurationHistogramSnapshot, NostrAdapterMetrics, RelayDeliverySpread, RelaySyncSnapshot,
 };
 
-const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
+pub(crate) const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const DIRECTORY_EVENT_BUFFER: usize = 1024;
 pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -84,7 +85,8 @@ struct RelayPlaneTransport {
     adapter: NostrTransportAdapter,
     sdk_relay_client: Option<NostrSdkRelayClient>,
     directory_events: broadcast::Sender<DirectoryRelayPlaneEvent>,
-    account_deliveries: RwLock<HashMap<MemberId, mpsc::Sender<TransportDelivery>>>,
+    account_deliveries: RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+    account_delivery_metrics: Arc<AccountDeliveryMetrics>,
     router: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder: Mutex<Option<JoinHandle<()>>>,
     notification_forwarder_health: Arc<RelayNotificationForwarderHealth>,
@@ -122,7 +124,371 @@ pub struct MarmotRelayPlaneAccountAdapter {
     account_id: MemberId,
     relay_plane: MarmotRelayPlane,
     publish_client: Arc<dyn NostrRelayClient>,
-    delivery_rx: Arc<Mutex<mpsc::Receiver<TransportDelivery>>>,
+    delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
+    delivery_overflow: Arc<AccountDeliveryOverflowState>,
+}
+
+#[derive(Clone)]
+struct AccountDeliveryRoute {
+    sender: mpsc::Sender<AccountDeliveryEvent>,
+    overflow: Arc<AccountDeliveryOverflowState>,
+    recovery_marker: Option<AccountDeliveryRecoveryMarker>,
+}
+
+pub(crate) type AccountDeliveryRecoveryMarker =
+    Arc<dyn Fn(u64, u64) -> Result<(), AccountDeliveryRecoveryMarkerError> + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountDeliveryRecoveryMarkerError {
+    Retryable,
+    Closed,
+}
+
+#[derive(Debug)]
+enum AccountDeliveryEvent {
+    Delivery(Box<TransportDelivery>),
+    Overflow { generation: u64 },
+}
+
+/// Aggregate, privacy-safe description of one unresolved per-account queue
+/// overflow generation. The account identity never leaves the private route
+/// registry; callers see only counts, queue depth, and elapsed time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountDeliveryOverflow {
+    pub(crate) generation: u64,
+    pub(crate) marker_token: u64,
+    pub(crate) dropped: u64,
+    pub(crate) queue_depth: usize,
+    pub(crate) elapsed_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum AccountDeliveryReceive {
+    Delivery(Box<TransportDelivery>),
+    Overflow(AccountDeliveryOverflow),
+}
+
+#[derive(Default)]
+struct AccountDeliveryOverflowState {
+    inner: std::sync::Mutex<AccountDeliveryOverflowInner>,
+    metrics: Arc<AccountDeliveryMetrics>,
+}
+
+#[derive(Default)]
+struct AccountDeliveryOverflowInner {
+    generation: u64,
+    pending: bool,
+    signal_queued: bool,
+    recovery_in_progress: bool,
+    dropped: u64,
+    queue_depth: usize,
+    started_at: Option<Instant>,
+    recovery_started_at: Option<Instant>,
+    marker_token: u64,
+    marker_in_progress: bool,
+    marker_durable: bool,
+    marker_closed: bool,
+}
+
+#[derive(Default)]
+struct AccountDeliveryMetrics {
+    max_queue_depth: AtomicU64,
+    dropped: AtomicU64,
+    recovery_attempts: AtomicU64,
+    recovery_successes: AtomicU64,
+    recovery_failures: AtomicU64,
+    recovery_elapsed_ms: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AccountDeliveryMetricsSnapshot {
+    queue_depth: usize,
+    max_queue_depth: u64,
+    dropped: u64,
+    recovery_attempts: u64,
+    recovery_successes: u64,
+    recovery_failures: u64,
+    recovery_elapsed_ms: u64,
+}
+
+impl AccountDeliveryMetrics {
+    fn snapshot(
+        &self,
+        routes: &RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+    ) -> AccountDeliveryMetricsSnapshot {
+        let queue_depth = account_deliveries_read(routes)
+            .values()
+            .map(|route| {
+                route
+                    .sender
+                    .max_capacity()
+                    .saturating_sub(route.sender.capacity())
+            })
+            .fold(0_usize, usize::saturating_add);
+        AccountDeliveryMetricsSnapshot {
+            queue_depth,
+            max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
+            recovery_successes: self.recovery_successes.load(Ordering::Relaxed),
+            recovery_failures: self.recovery_failures.load(Ordering::Relaxed),
+            recovery_elapsed_ms: self.recovery_elapsed_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl AccountDeliveryOverflowState {
+    fn observe_queue_depth(&self, queue_depth: usize) {
+        let depth = u64::try_from(queue_depth).unwrap_or(u64::MAX);
+        self.metrics
+            .max_queue_depth
+            .fetch_max(depth, Ordering::Relaxed);
+    }
+
+    /// Record an omitted delivery and return the generation only when this
+    /// caller must enqueue the generation's control record.
+    fn record_drop(&self, queue_depth: usize) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.pending {
+            state.generation = state.generation.saturating_add(1);
+            state.pending = true;
+            state.dropped = 0;
+            state.started_at = Some(Instant::now());
+            state.marker_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
+            state.marker_in_progress = false;
+            state.marker_durable = false;
+            state.marker_closed = false;
+        }
+        state.dropped = state.dropped.saturating_add(1);
+        state.queue_depth = state.queue_depth.max(queue_depth);
+        RelayNotificationForwarderHealth::increment(&self.metrics.dropped, 1);
+        self.observe_queue_depth(queue_depth);
+        if state.signal_queued {
+            None
+        } else {
+            state.signal_queued = true;
+            Some(state.generation)
+        }
+    }
+
+    fn cancel_signal(&self, generation: u64) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation == generation {
+            state.signal_queued = false;
+        }
+    }
+
+    /// Claim the one account-local marker worker for the current generation.
+    /// Once the marker is durable (or storage has closed), later omissions need
+    /// only update the bounded counter and reuse the existing control record.
+    fn start_marker_persistence(&self) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.marker_durable || state.marker_closed || state.marker_in_progress {
+            return false;
+        }
+        state.marker_in_progress = true;
+        true
+    }
+
+    fn marker_barrier_complete(&self) -> bool {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.marker_durable || state.marker_closed
+    }
+
+    /// Persist the generation marker on one account-local blocking worker while
+    /// the shared relay router continues serving every other route. Retryable
+    /// failures retain only this task and aggregate later omissions into the
+    /// generation counter; terminal storage closure releases the task.
+    async fn persist_marker_before_drop(&self, marker: AccountDeliveryRecoveryMarker) {
+        let generation = {
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.generation
+        };
+        loop {
+            let (marker_token, dropped) = {
+                let state = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (state.marker_token, state.dropped)
+            };
+            let marker = marker.clone();
+            match tokio::task::spawn_blocking(move || marker(marker_token, dropped)).await {
+                Ok(Ok(())) => {
+                    let mut state = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if state.generation == generation {
+                        state.marker_in_progress = false;
+                        state.marker_durable = true;
+                    }
+                    return;
+                }
+                Ok(Err(AccountDeliveryRecoveryMarkerError::Closed)) => {
+                    let mut state = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if state.generation == generation {
+                        state.marker_in_progress = false;
+                        state.marker_closed = true;
+                        tracing::debug!(
+                            target: "marmot_app::relay_plane",
+                            method = "persist_marker_before_drop",
+                            error_kind = "storage_closed",
+                            "account delivery overflow marker worker stopped after storage closure",
+                        );
+                    }
+                    return;
+                }
+                Ok(Err(AccountDeliveryRecoveryMarkerError::Retryable)) | Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::relay_plane",
+                        method = "persist_marker_before_drop",
+                        error_kind = "overflow_marker_persist_failed",
+                        "durable account delivery overflow marker write failed; retrying",
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            let state = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.generation != generation {
+                return;
+            }
+        }
+    }
+
+    fn pending_snapshot(&self) -> Option<AccountDeliveryOverflow> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.pending && !state.recovery_in_progress).then(|| Self::snapshot(&state))
+    }
+
+    fn consume_signal(&self, generation: u64) -> AccountDeliveryOverflow {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation == generation {
+            state.signal_queued = false;
+        }
+        Self::snapshot(&state)
+    }
+
+    fn start_recovery(&self, durable_marker_token: u64) -> AccountDeliveryOverflow {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A durable marker can outlive the process-local route that detected
+        // it. Recreate a synthetic pending generation on reopen so completion
+        // still has a compare-and-clear guard against new local overflow.
+        if !state.pending {
+            state.generation = state.generation.saturating_add(1);
+            state.pending = true;
+            state.dropped = 0;
+            state.queue_depth = 0;
+            state.started_at = Some(Instant::now());
+            // This path exists only because the durable database marker was
+            // loaded after a restart; the process-local generation is already
+            // covered before its first recovery subscription is issued.
+            state.marker_token = durable_marker_token;
+            state.marker_durable = true;
+            state.marker_closed = false;
+        }
+        state.recovery_in_progress = true;
+        state.recovery_started_at = Some(Instant::now());
+        RelayNotificationForwarderHealth::increment(&self.metrics.recovery_attempts, 1);
+        Self::snapshot(&state)
+    }
+
+    fn finish_recovery(&self, attempt: AccountDeliveryOverflow) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let resolved = state.pending
+            && state.generation == attempt.generation
+            && state.dropped == attempt.dropped
+            && !state.signal_queued;
+        if resolved {
+            state.pending = false;
+            state.recovery_in_progress = false;
+            state.marker_in_progress = false;
+            state.marker_durable = false;
+            state.marker_closed = false;
+            state.started_at = None;
+            let elapsed_ms = state
+                .recovery_started_at
+                .take()
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or_default();
+            return Some(elapsed_ms);
+        }
+        None
+    }
+
+    fn record_recovery_success(&self, elapsed_ms: u64) {
+        RelayNotificationForwarderHealth::increment(&self.metrics.recovery_successes, 1);
+        RelayNotificationForwarderHealth::increment(&self.metrics.recovery_elapsed_ms, elapsed_ms);
+    }
+
+    fn fail_recovery(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.recovery_in_progress = false;
+        let elapsed_ms = state
+            .recovery_started_at
+            .take()
+            .map(|started| started.elapsed().as_millis() as u64)
+            .unwrap_or_default();
+        RelayNotificationForwarderHealth::increment(&self.metrics.recovery_failures, 1);
+        RelayNotificationForwarderHealth::increment(&self.metrics.recovery_elapsed_ms, elapsed_ms);
+    }
+
+    fn blocks_ordinary_eose(&self) -> bool {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending && !state.recovery_in_progress
+    }
+
+    fn snapshot(state: &AccountDeliveryOverflowInner) -> AccountDeliveryOverflow {
+        AccountDeliveryOverflow {
+            generation: state.generation,
+            marker_token: state.marker_token,
+            dropped: state.dropped,
+            queue_depth: state.queue_depth,
+            elapsed_ms: state
+                .started_at
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +511,25 @@ pub struct RelayPlaneHealth {
     pub notification_forwarder_lagged_notifications: u64,
     pub notification_forwarder_panics: u64,
     pub notification_forwarder_unexpected_exits: u64,
+    /// Current queued account-delivery records across active accounts.
+    #[serde(default)]
+    pub account_delivery_queue_depth: usize,
+    /// High-water queue depth for any account since this plane started.
+    #[serde(default)]
+    pub account_delivery_max_queue_depth: u64,
+    /// Deliveries omitted from full per-account queues and covered by an
+    /// explicit recovery generation.
+    #[serde(default)]
+    pub account_delivery_dropped: u64,
+    #[serde(default)]
+    pub account_delivery_recovery_attempts: u64,
+    #[serde(default)]
+    pub account_delivery_recovery_successes: u64,
+    #[serde(default)]
+    pub account_delivery_recovery_failures: u64,
+    /// Aggregate wall-clock time spent in completed/failed recovery attempts.
+    #[serde(default)]
+    pub account_delivery_recovery_elapsed_ms: u64,
     pub directory_inflight_fetches: usize,
     pub directory_active_subscriptions: usize,
     pub directory_completed_fetches: usize,
@@ -250,6 +635,7 @@ impl MarmotRelayPlane {
             sdk_relay_client,
             directory_events: broadcast::channel(DIRECTORY_EVENT_BUFFER).0,
             account_deliveries: RwLock::new(HashMap::new()),
+            account_delivery_metrics: Arc::new(AccountDeliveryMetrics::default()),
             router: Mutex::new(None),
             notification_forwarder: Mutex::new(notification_forwarder),
             notification_forwarder_health: Arc::new(RelayNotificationForwarderHealth::default()),
@@ -268,20 +654,49 @@ impl MarmotRelayPlane {
         this
     }
 
+    /// Build an account adapter without durable queue-overflow recovery.
+    ///
+    /// Production callers must use `account_adapter_with_recovery_marker` with
+    /// a marker. This compatibility constructor is retained for tests and
+    /// embedders that do not persist account projection state.
     pub fn account_adapter(
         &self,
         account_id: MemberId,
         publish_client: Arc<dyn NostrRelayClient>,
     ) -> MarmotRelayPlaneAccountAdapter {
+        self.account_adapter_with_recovery_marker(account_id, publish_client, None)
+    }
+
+    pub(crate) fn account_adapter_with_recovery_marker(
+        &self,
+        account_id: MemberId,
+        publish_client: Arc<dyn NostrRelayClient>,
+        recovery_marker: Option<AccountDeliveryRecoveryMarker>,
+    ) -> MarmotRelayPlaneAccountAdapter {
         self.spawn_router();
-        let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER);
-        account_deliveries_write(&self.inner.transport.account_deliveries)
-            .insert(account_id.clone(), delivery_tx);
+        // Keep one slot reserved for the overflow control record. Ordinary
+        // deliveries stop at ACCOUNT_DELIVERY_BUFFER, so a full account queue
+        // can always carry the explicit recovery signal without awaiting the
+        // slow consumer or blocking the shared router.
+        let (delivery_tx, delivery_rx) = mpsc::channel(ACCOUNT_DELIVERY_BUFFER + 1);
+        let delivery_overflow = Arc::new(AccountDeliveryOverflowState {
+            inner: std::sync::Mutex::new(AccountDeliveryOverflowInner::default()),
+            metrics: self.inner.transport.account_delivery_metrics.clone(),
+        });
+        account_deliveries_write(&self.inner.transport.account_deliveries).insert(
+            account_id.clone(),
+            AccountDeliveryRoute {
+                sender: delivery_tx,
+                overflow: delivery_overflow.clone(),
+                recovery_marker,
+            },
+        );
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
+            delivery_overflow,
         }
     }
 
@@ -291,7 +706,11 @@ impl MarmotRelayPlane {
             .get(&delivery.account_id)
             .cloned();
         match sender {
-            Some(sender) => sender.send(delivery).await.is_ok(),
+            Some(route) => route
+                .sender
+                .send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
+                .await
+                .is_ok(),
             None => false,
         }
     }
@@ -405,14 +824,20 @@ impl MarmotRelayPlane {
             .transport
             .notification_forwarder_health
             .snapshot();
+        let account_delivery = self
+            .inner
+            .transport
+            .account_delivery_metrics
+            .snapshot(&self.inner.transport.account_deliveries);
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
             return RelayPlaneHealth::from_sdk(
                 sdk_relay_client.relay_health().await,
                 directory,
                 forwarder,
+                account_delivery,
             );
         }
-        RelayPlaneHealth::from_directory(directory)
+        RelayPlaneHealth::from_directory(directory, account_delivery)
     }
 
     /// Snapshot the device-local relay telemetry for local inspection.
@@ -723,20 +1148,85 @@ impl MarmotRelayPlane {
                 let sender = account_deliveries_read(&transport.account_deliveries)
                     .get(&delivery.account_id)
                     .cloned();
-                if let Some(sender) = sender {
+                if let Some(route) = sender {
                     // Fan out without awaiting the per-account queue: a single
                     // account whose receiver has stalled (full buffer) must not
                     // block this shared router and back-pressure delivery for
                     // every other account (and, upstream, the relay notification
-                    // pipeline). Drop the delivery for the lagging account
-                    // instead; it recovers on the next subscription catch-up.
-                    match sender.try_send(delivery) {
-                        Ok(()) => {}
+                    // pipeline). The extra channel slot is reserved for one
+                    // overflow record. Once ordinary capacity is exhausted,
+                    // every omitted delivery belongs to that explicit recovery
+                    // generation; the account cannot trust EOSE or its cursor
+                    // again until an unfloored replay resolves the generation.
+                    let queue_depth = route
+                        .sender
+                        .max_capacity()
+                        .saturating_sub(route.sender.capacity());
+                    route.overflow.observe_queue_depth(queue_depth);
+                    if route.sender.capacity() <= 1 {
+                        let signal_generation = route.overflow.record_drop(queue_depth);
+                        if let Some(generation) = signal_generation {
+                            if let Some(marker) = route.recovery_marker.clone() {
+                                if route.overflow.marker_barrier_complete() {
+                                    enqueue_account_delivery_overflow_signal(
+                                        &route.sender,
+                                        &route.overflow,
+                                        generation,
+                                    );
+                                } else if route.overflow.start_marker_persistence() {
+                                    // One account-local task owns this generation's
+                                    // persistence. The omitted payload is dropped
+                                    // here; later omissions update only the bounded
+                                    // counter while the shared router keeps serving
+                                    // every other account.
+                                    let sender = route.sender.clone();
+                                    let overflow_state = route.overflow.clone();
+                                    tokio::spawn(async move {
+                                        overflow_state.persist_marker_before_drop(marker).await;
+                                        enqueue_account_delivery_overflow_signal(
+                                            &sender,
+                                            &overflow_state,
+                                            generation,
+                                        );
+                                    });
+                                }
+                            } else {
+                                enqueue_account_delivery_overflow_signal(
+                                    &route.sender,
+                                    &route.overflow,
+                                    generation,
+                                );
+                            }
+                        }
+                        tracing::warn!(
+                            target: "marmot_app::relay_plane",
+                            method = "spawn_router",
+                            queue_depth,
+                            "omitting transport delivery: account delivery queue overflow recovery required",
+                        );
+                        continue;
+                    }
+                    match route
+                        .sender
+                        .try_send(AccountDeliveryEvent::Delivery(Box::new(delivery)))
+                    {
+                        Ok(()) => {
+                            let queue_depth = route
+                                .sender
+                                .max_capacity()
+                                .saturating_sub(route.sender.capacity());
+                            route.overflow.observe_queue_depth(queue_depth);
+                        }
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Only this router writes the route, and it reserves
+                            // one control slot above, so reaching Full here
+                            // indicates a violated queue invariant rather than
+                            // ordinary backpressure.
                             tracing::warn!(
                                 target: "marmot_app::relay_plane",
                                 method = "spawn_router",
-                                "dropping transport delivery: account delivery queue full",
+                                error_kind = "reserved_overflow_slot_unavailable",
+                                "account delivery queue invariant failed",
                             );
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -757,6 +1247,20 @@ impl MarmotRelayPlane {
             .adapter
             .handle_relay_event(relay_event)
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_account_delivery_recovery_marker_for_test(
+        &self,
+        account_id: &MemberId,
+        marker: AccountDeliveryRecoveryMarker,
+    ) -> bool {
+        let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
+        let Some(route) = routes.get_mut(account_id) else {
+            return false;
+        };
+        route.recovery_marker = Some(marker);
+        true
     }
 
     /// Report end-of-stored-events for one subscription on one endpoint, the
@@ -792,6 +1296,7 @@ impl RelayPlaneHealth {
         health: NostrSdkRelayHealth,
         directory: DirectoryRelayStats,
         forwarder: RelayNotificationForwarderHealthSnapshot,
+        account_delivery: AccountDeliveryMetricsSnapshot,
     ) -> Self {
         Self {
             sdk_backed: true,
@@ -812,6 +1317,13 @@ impl RelayPlaneHealth {
             notification_forwarder_lagged_notifications: forwarder.lagged_notifications,
             notification_forwarder_panics: forwarder.panics,
             notification_forwarder_unexpected_exits: forwarder.unexpected_exits,
+            account_delivery_queue_depth: account_delivery.queue_depth,
+            account_delivery_max_queue_depth: account_delivery.max_queue_depth,
+            account_delivery_dropped: account_delivery.dropped,
+            account_delivery_recovery_attempts: account_delivery.recovery_attempts,
+            account_delivery_recovery_successes: account_delivery.recovery_successes,
+            account_delivery_recovery_failures: account_delivery.recovery_failures,
+            account_delivery_recovery_elapsed_ms: account_delivery.recovery_elapsed_ms,
             directory_inflight_fetches: directory.inflight_fetches,
             directory_active_subscriptions: directory.active_subscriptions,
             directory_completed_fetches: directory.completed_fetches,
@@ -823,8 +1335,18 @@ impl RelayPlaneHealth {
         }
     }
 
-    fn from_directory(directory: DirectoryRelayStats) -> Self {
+    fn from_directory(
+        directory: DirectoryRelayStats,
+        account_delivery: AccountDeliveryMetricsSnapshot,
+    ) -> Self {
         Self {
+            account_delivery_queue_depth: account_delivery.queue_depth,
+            account_delivery_max_queue_depth: account_delivery.max_queue_depth,
+            account_delivery_dropped: account_delivery.dropped,
+            account_delivery_recovery_attempts: account_delivery.recovery_attempts,
+            account_delivery_recovery_successes: account_delivery.recovery_successes,
+            account_delivery_recovery_failures: account_delivery.recovery_failures,
+            account_delivery_recovery_elapsed_ms: account_delivery.recovery_elapsed_ms,
             directory_inflight_fetches: directory.inflight_fetches,
             directory_active_subscriptions: directory.active_subscriptions,
             directory_completed_fetches: directory.completed_fetches,
@@ -1258,12 +1780,62 @@ impl MarmotRelayPlaneAccountAdapter {
     /// The epoch-gap backfill drain reads this to tell a relay that has
     /// finished replaying stored history from one that has simply gone quiet.
     pub(crate) async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
-        self.relay_plane
+        let mut eose = self
+            .relay_plane
             .inner
             .transport
             .adapter
             .account_subscription_eose(&self.account_id)
-            .await
+            .await;
+        if self.delivery_overflow.blocks_ordinary_eose() {
+            eose.with_eose = 0;
+        }
+        eose
+    }
+
+    pub(crate) async fn receive_account_delivery(
+        &self,
+    ) -> Result<Option<AccountDeliveryReceive>, TransportAdapterError> {
+        let event = self.delivery_rx.lock().await.recv().await;
+        Ok(event.map(|event| match event {
+            AccountDeliveryEvent::Delivery(delivery) => AccountDeliveryReceive::Delivery(delivery),
+            AccountDeliveryEvent::Overflow { generation } => {
+                AccountDeliveryReceive::Overflow(self.delivery_overflow.consume_signal(generation))
+            }
+        }))
+    }
+
+    /// Process-local overflow evidence becomes visible at the exact omission,
+    /// before marker I/O or the queued control record can complete.
+    pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
+        self.delivery_overflow.pending_snapshot()
+    }
+
+    /// Begin (or resume after process restart) the unfloored replay required by
+    /// a durable account-delivery overflow marker.
+    pub(crate) fn start_delivery_overflow_recovery(
+        &self,
+        durable_marker_token: u64,
+    ) -> AccountDeliveryOverflow {
+        self.delivery_overflow.start_recovery(durable_marker_token)
+    }
+
+    /// Resolve only the exact overflow prefix the replay started against. A
+    /// newer omitted delivery keeps the generation pending and forces another
+    /// unfloored attempt.
+    pub(crate) fn finish_delivery_overflow_recovery(
+        &self,
+        attempt: AccountDeliveryOverflow,
+    ) -> Option<u64> {
+        self.delivery_overflow.finish_recovery(attempt)
+    }
+
+    pub(crate) fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
+        self.delivery_overflow.record_recovery_success(elapsed_ms);
+    }
+
+    pub(crate) fn fail_delivery_overflow_recovery(&self) {
+        self.delivery_overflow.fail_recovery();
     }
 
     pub(crate) async fn remove_group_maintenance_subscription(
@@ -1406,21 +1978,49 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     }
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
-        Ok(self.delivery_rx.lock().await.recv().await)
+        match self.receive_account_delivery().await? {
+            Some(AccountDeliveryReceive::Delivery(delivery)) => Ok(Some(*delivery)),
+            Some(AccountDeliveryReceive::Overflow(_)) => Err(TransportAdapterError::Other(
+                "account delivery overflow recovery required".to_owned(),
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+fn enqueue_account_delivery_overflow_signal(
+    sender: &mpsc::Sender<AccountDeliveryEvent>,
+    overflow: &AccountDeliveryOverflowState,
+    generation: u64,
+) {
+    match sender.try_send(AccountDeliveryEvent::Overflow { generation }) {
+        Ok(()) => {}
+        Err(error) => {
+            overflow.cancel_signal(generation);
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "spawn_router",
+                error_kind = match error {
+                    mpsc::error::TrySendError::Full(_) => "queue_full",
+                    mpsc::error::TrySendError::Closed(_) => "queue_closed",
+                },
+                "could not enqueue account delivery overflow recovery signal",
+            );
+        }
     }
 }
 
 fn account_deliveries_read(
-    deliveries: &RwLock<HashMap<MemberId, mpsc::Sender<TransportDelivery>>>,
-) -> RwLockReadGuard<'_, HashMap<MemberId, mpsc::Sender<TransportDelivery>>> {
+    deliveries: &RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+) -> RwLockReadGuard<'_, HashMap<MemberId, AccountDeliveryRoute>> {
     deliveries
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn account_deliveries_write(
-    deliveries: &RwLock<HashMap<MemberId, mpsc::Sender<TransportDelivery>>>,
-) -> RwLockWriteGuard<'_, HashMap<MemberId, mpsc::Sender<TransportDelivery>>> {
+    deliveries: &RwLock<HashMap<MemberId, AccountDeliveryRoute>>,
+) -> RwLockWriteGuard<'_, HashMap<MemberId, AccountDeliveryRoute>> {
     deliveries
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
