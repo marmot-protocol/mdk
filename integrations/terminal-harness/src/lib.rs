@@ -1,3 +1,4 @@
+mod artifacts;
 mod bridge;
 mod chunking;
 mod config;
@@ -18,6 +19,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+pub use artifacts::{
+    ArtifactExportConfig, ArtifactExportGrant, ArtifactOutput, ArtifactOutputRequest,
+    read_artifact_output_manifest,
+};
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
@@ -55,6 +60,8 @@ pub struct Config {
     pub backend_idle_timeout: Duration,
     /// Connector execution-permission policy selected by the operator.
     pub execution_profile: ExecutionProfile,
+    /// Explicitly authorized outbound artifact export policy.
+    pub artifact_exports: ArtifactExportConfig,
     /// Connector identity and naming.
     pub spec: ConfigSpec,
 }
@@ -72,6 +79,7 @@ impl fmt::Debug for Config {
             .field("backend_timeout", &self.backend_timeout)
             .field("backend_idle_timeout", &self.backend_idle_timeout)
             .field("execution_profile", &self.execution_profile)
+            .field("artifact_exports_enabled", &self.artifact_exports.enabled())
             .field("spec", &self.spec)
             .finish_non_exhaustive()
     }
@@ -90,6 +98,8 @@ pub struct Invocation {
     pub session_id: Option<String>,
     /// Prompt plaintext passed only to the backend process.
     pub prompt: String,
+    /// Backend completion-file contract for typed artifact output.
+    pub artifact_output: Option<ArtifactOutputRequest>,
 }
 
 impl fmt::Debug for Invocation {
@@ -100,6 +110,7 @@ impl fmt::Debug for Invocation {
             .field("idle_timeout", &self.idle_timeout)
             .field("prompt_len", &self.prompt.len())
             .field("session_present", &self.session_id.is_some())
+            .field("artifact_output_enabled", &self.artifact_output.is_some())
             .finish()
     }
 }
@@ -155,6 +166,8 @@ impl fmt::Debug for RunFailure {
 pub enum RunnerEvent {
     /// Completed assistant text; never a thinking or tool delta.
     Text(String),
+    /// Explicit backend-declared output artifacts; paths are never inferred from text.
+    Artifacts(Vec<ArtifactOutput>),
 }
 
 impl fmt::Debug for RunnerEvent {
@@ -163,6 +176,10 @@ impl fmt::Debug for RunnerEvent {
             Self::Text(text) => formatter
                 .debug_struct("Text")
                 .field("text_len", &text.len())
+                .finish(),
+            Self::Artifacts(artifacts) => formatter
+                .debug_struct("Artifacts")
+                .field("artifact_count", &artifacts.len())
                 .finish(),
         }
     }
@@ -176,12 +193,23 @@ pub trait Backend: Send + Sync + 'static {
         ExecutionSupport::INHERITED
     }
 
+    /// Whether this backend implements the explicit completion-file artifact contract.
+    fn artifact_support(&self) -> ArtifactSupport {
+        ArtifactSupport::Unsupported
+    }
+
     /// Runs one prompt and streams completed assistant text to `tx`.
     async fn run(
         &self,
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactSupport {
+    Unsupported,
+    CompletionFile,
 }
 
 /// Backend support state for the selected execution profile.
@@ -270,6 +298,7 @@ mod privacy_tests {
             cwd: PathBuf::from("/secret/worktree"),
             session_id: Some("secret-session".to_owned()),
             prompt: "secret prompt".to_owned(),
+            artifact_output: None,
         };
         let invocation_debug = format!("{invocation:?}");
         for secret in ["/secret", "secret-session", "secret prompt"] {
@@ -298,5 +327,16 @@ mod privacy_tests {
         let debug = format!("{event:?}");
         assert!(!debug.contains("secret reply"));
         assert!(debug.contains("text_len: 12"));
+
+        let artifact = RunnerEvent::Artifacts(vec![ArtifactOutput {
+            authorization_id: "auth".to_owned(),
+            path: PathBuf::from("/secret/report.pdf"),
+            media_type: "application/pdf".to_owned(),
+            file_name: "private-report.pdf".to_owned(),
+        }]);
+        let debug = format!("{artifact:?}");
+        assert!(!debug.contains("/secret"));
+        assert!(!debug.contains("private-report"));
+        assert!(debug.contains("artifact_count: 1"));
     }
 }

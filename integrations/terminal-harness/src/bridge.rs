@@ -4,18 +4,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_control::{AgentControlAccount, AgentControlEvent};
+use agent_control::{AgentControlAccount, AgentControlEvent, AgentControlMediaUpload};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+use crate::artifacts::{
+    ArtifactDeliveryContext, ArtifactOutbox, PendingArtifactBatch, prepare_manifest_path,
+    remove_staged_files, stage_artifacts, validate_staged_batch,
+};
 use crate::chunking::split_reply_chunks;
 use crate::control::ControlClient;
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{SessionRecord, SessionStore};
 use crate::{
-    Backend, Config, Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
+    ArtifactOutput, ArtifactOutputRequest, ArtifactSupport, Backend, Config, Invocation, Outcome,
+    RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
 };
 
 const DEDUPE_LIMIT: usize = 2048;
@@ -27,6 +32,10 @@ const SEND_RETRY_ATTEMPTS: usize = 3;
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
     let execution_support = backend.execution_support();
+    validate_artifact_support(
+        config.artifact_exports.enabled(),
+        backend.artifact_support(),
+    )?;
     info!(
         target: TRACE_TARGET,
         method = "startup",
@@ -54,6 +63,13 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
     .await?;
     install_allowlist(&client, &account_ref, &config.allowed_senders).await?;
 
+    let outbox_path = config.artifact_exports.outbox_path().to_path_buf();
+    let outbox = if config.artifact_exports.enabled() {
+        ArtifactOutbox::load(outbox_path)?
+    } else {
+        ArtifactOutbox::disabled(outbox_path)
+    };
+    let outbox = Arc::new(Mutex::new(outbox));
     let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &home)?);
     let queues = Arc::new(GroupQueues::new(config.max_pending_per_group));
     let ctx = Arc::new(BridgeContext {
@@ -64,10 +80,25 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
         queues,
         dedupe: Arc::new(InboundDedupe::new(DEDUPE_LIMIT)),
         backend: Arc::new(backend),
+        outbox,
         home,
     });
 
+    if ctx.cfg.artifact_exports.enabled() {
+        retry_pending_artifacts(&ctx).await;
+    }
+
     subscribe_loop(ctx).await
+}
+
+fn validate_artifact_support(enabled: bool, support: ArtifactSupport) -> Result<()> {
+    if enabled && support != ArtifactSupport::CompletionFile {
+        return Err(HarnessError::Config(
+            "artifact exports are enabled for a backend without typed completion-file support"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 struct BridgeContext {
@@ -78,6 +109,7 @@ struct BridgeContext {
     queues: Arc<GroupQueues>,
     dedupe: Arc<InboundDedupe>,
     backend: Arc<dyn Backend>,
+    outbox: Arc<Mutex<ArtifactOutbox>>,
     home: PathBuf,
 }
 
@@ -398,55 +430,125 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let session_id = known_session
         .as_ref()
         .and_then(|record| (!record.session_id.is_empty()).then(|| record.session_id.clone()));
+    let (artifact_authorization, artifact_setup_failed) = match ctx
+        .cfg
+        .artifact_exports
+        .authorize(&inbound.group_ref, &inbound.message_ref)
+    {
+        Ok(authorization) => (authorization, false),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "artifact_authorize",
+                error_kind = err.privacy_safe_kind(),
+                "failed to mint artifact authorization"
+            );
+            (None, true)
+        }
+    };
+    let artifact_output = if let Some(authorization) = artifact_authorization.as_ref() {
+        match prepare_manifest_path(&inbound.message_ref) {
+            Ok(path) => Some(ArtifactOutputRequest::from_authorization(
+                path,
+                authorization,
+            )),
+            Err(err) => {
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "artifact_manifest_prepare",
+                    error_kind = err.privacy_safe_kind(),
+                    "failed to prepare typed artifact manifest"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let artifact_setup_failed =
+        artifact_setup_failed || (artifact_authorization.is_some() && artifact_output.is_none());
     let invocation = Invocation {
         timeout: ctx.cfg.backend_timeout,
         idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
         prompt,
+        artifact_output,
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
     let runner = tokio::spawn(async move { backend.run(invocation, tx).await });
-    let mut chunk_index = 0usize;
-    let mut delivered_chunks = 0usize;
-    let mut delivery_failed = false;
+    let mut buffered_text = Vec::new();
+    let mut artifact_outputs: Vec<ArtifactOutput> = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
             RunnerEvent::Text(text) => {
-                if delivery_failed {
-                    continue;
-                }
-                for chunk in split_reply_chunks(&text, ctx.cfg.max_reply_bytes) {
-                    chunk_index += 1;
-                    if let Err(err) = send_reply(
-                        &ctx,
-                        &inbound.account_ref,
-                        &inbound.group_ref,
-                        &inbound.message_ref,
-                        chunk,
-                        chunk_index,
-                    )
-                    .await
-                    {
-                        warn!(
-                            target: TRACE_TARGET,
-                            method = "send_final",
-                            error_kind = err.privacy_safe_kind(),
-                            "failed to send backend reply chunk"
-                        );
-                        delivery_failed = true;
-                        break;
-                    } else {
-                        delivered_chunks += 1;
-                    }
-                }
+                buffered_text.push(text);
             }
+            RunnerEvent::Artifacts(outputs) => artifact_outputs.extend(outputs),
         }
     }
 
     match runner.await {
         Ok(Ok(outcome)) => {
+            let mut delivered_chunks = 0usize;
+            let mut delivery_failed = false;
+            if artifact_setup_failed {
+                let _ = send_artifact_status(
+                    &ctx,
+                    &inbound,
+                    1,
+                    "rejected because the connector could not initialize its private export state",
+                    1,
+                )
+                .await;
+            } else if !artifact_outputs.is_empty() {
+                if let Some(authorization) = artifact_authorization.as_ref() {
+                    deliver_artifact_outputs(
+                        &ctx,
+                        &inbound,
+                        authorization,
+                        (!buffered_text.is_empty()).then(|| buffered_text.join("\n\n")),
+                        &artifact_outputs,
+                        1,
+                    )
+                    .await;
+                } else {
+                    let _ = send_artifact_status(
+                        &ctx,
+                        &inbound,
+                        artifact_outputs.len(),
+                        "rejected because this group has no active artifact grant",
+                        1,
+                    )
+                    .await;
+                }
+            } else {
+                'messages: for text in &buffered_text {
+                    for chunk in split_reply_chunks(text, ctx.cfg.max_reply_bytes) {
+                        delivered_chunks += 1;
+                        if send_reply(
+                            &ctx,
+                            &inbound.account_ref,
+                            &inbound.group_ref,
+                            &inbound.message_ref,
+                            chunk,
+                            delivered_chunks,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            delivery_failed = true;
+                            break 'messages;
+                        }
+                    }
+                }
+            }
+            let terminal_delivery_count = if artifact_setup_failed || !artifact_outputs.is_empty() {
+                1
+            } else {
+                delivered_chunks
+            };
             finish_success(
                 ctx,
                 inbound,
@@ -454,9 +556,9 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 cwd,
                 outcome,
                 DeliveryReport {
-                    chunk_count: delivered_chunks,
+                    chunk_count: terminal_delivery_count,
                     failed: delivery_failed,
-                    failure_chunk_index: chunk_index + 1,
+                    failure_chunk_index: delivered_chunks + 1,
                 },
             )
             .await;
@@ -510,6 +612,216 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             .await;
         }
     }
+}
+
+async fn deliver_artifact_outputs(
+    ctx: &Arc<BridgeContext>,
+    inbound: &InboundPrompt,
+    authorization: &crate::artifacts::ArtifactAuthorization,
+    caption: Option<String>,
+    outputs: &[ArtifactOutput],
+    status_chunk_index: usize,
+) {
+    let batch = match stage_artifacts(
+        &ctx.cfg.artifact_exports,
+        ArtifactDeliveryContext {
+            reply_prefix: ctx.cfg.spec.reply_prefix,
+            account_ref: &inbound.account_ref,
+            group_ref: &inbound.group_ref,
+            message_ref: &inbound.message_ref,
+            caption,
+        },
+        authorization,
+        outputs,
+    ) {
+        Ok(batch) => batch,
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "artifact_stage",
+                error_kind = err.privacy_safe_kind(),
+                artifact_count = outputs.len(),
+                "rejected backend artifact output"
+            );
+            let reason = match err {
+                HarnessError::ArtifactOutsideAllowedRoots => {
+                    "rejected because it is outside the configured export roots"
+                }
+                HarnessError::ArtifactUnsafeSource => {
+                    "rejected because it is not a regular non-symlink file"
+                }
+                HarnessError::ArtifactInvalidMetadata => {
+                    "rejected because its structured metadata is invalid"
+                }
+                HarnessError::ArtifactLimitsExceeded => {
+                    "rejected because it exceeds the connector media limits"
+                }
+                _ => "rejected by the connector safety policy",
+            };
+            let _ =
+                send_artifact_status(ctx, inbound, outputs.len(), reason, status_chunk_index).await;
+            return;
+        }
+    };
+
+    if let Err(err) = ctx.outbox.lock().await.record(batch.clone()) {
+        warn!(
+            target: TRACE_TARGET,
+            method = "artifact_outbox_record",
+            error_kind = err.privacy_safe_kind(),
+            artifact_count = outputs.len(),
+            "failed to persist artifact delivery intent"
+        );
+        let _ = send_artifact_status(
+            ctx,
+            inbound,
+            outputs.len(),
+            "rejected because durable delivery state could not be recorded",
+            status_chunk_index,
+        )
+        .await;
+        for artifact in batch.artifacts {
+            let _ = std::fs::remove_file(artifact.path);
+        }
+        return;
+    }
+
+    match send_pending_artifact_batch(ctx, &batch).await {
+        Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key).await,
+        Err(err) => {
+            if err.artifact_validation_failed() {
+                discard_artifact_batch(ctx, &batch.idempotency_key).await;
+            }
+            warn!(
+                target: TRACE_TARGET,
+                method = "send_media",
+                error_kind = err.privacy_safe_kind(),
+                artifact_count = outputs.len(),
+                "artifact delivery remains pending"
+            );
+            let reason = if err.artifact_validation_failed() {
+                "was rejected because the staged bytes no longer match durable delivery state"
+            } else {
+                "is pending automatic retry after a delivery failure"
+            };
+            let _ =
+                send_artifact_status(ctx, inbound, outputs.len(), reason, status_chunk_index).await;
+        }
+    }
+}
+
+async fn retry_pending_artifacts(ctx: &Arc<BridgeContext>) {
+    if !ctx.cfg.artifact_exports.enabled() {
+        return;
+    }
+    let pending = ctx.outbox.lock().await.pending();
+    for batch in pending {
+        match send_pending_artifact_batch(ctx, &batch).await {
+            Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key).await,
+            Err(err) => {
+                if err.artifact_validation_failed() {
+                    discard_artifact_batch(ctx, &batch.idempotency_key).await;
+                }
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "send_media_retry",
+                    error_kind = err.privacy_safe_kind(),
+                    artifact_count = batch.artifacts.len(),
+                    "durable artifact delivery remains pending"
+                );
+            }
+        }
+    }
+}
+
+async fn send_pending_artifact_batch(
+    ctx: &BridgeContext,
+    batch: &PendingArtifactBatch,
+) -> Result<()> {
+    validate_staged_batch(&ctx.cfg.artifact_exports, ctx.cfg.spec.reply_prefix, batch)?;
+    let attachments = batch
+        .artifacts
+        .iter()
+        .map(|artifact| AgentControlMediaUpload {
+            path: artifact.path.to_string_lossy().into_owned(),
+            media_type: artifact.media_type.clone(),
+            file_name: artifact.file_name.clone(),
+            dim: None,
+            thumbhash: None,
+        })
+        .collect::<Vec<_>>();
+    let mut last_error = None;
+    for attempt in 0..SEND_RETRY_ATTEMPTS {
+        match ctx
+            .client
+            .send_artifacts(
+                &batch.account_ref,
+                &batch.group_ref,
+                attachments.clone(),
+                batch.caption.clone(),
+                batch.idempotency_key.clone(),
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if err.retryable() && attempt + 1 < SEND_RETRY_ATTEMPTS => {
+                last_error = Some(err);
+                sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error.unwrap_or(HarnessError::ControlClosed))
+}
+
+async fn discard_artifact_batch(ctx: &BridgeContext, key: &str) {
+    match ctx.outbox.lock().await.complete(key) {
+        Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "artifact_outbox_discard",
+                error_kind = err.privacy_safe_kind(),
+                "failed to discard invalid artifact delivery intent"
+            );
+        }
+    }
+}
+
+async fn complete_artifact_batch(ctx: &BridgeContext, key: &str) {
+    match ctx.outbox.lock().await.complete(key) {
+        Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "artifact_outbox_complete",
+                error_kind = err.privacy_safe_kind(),
+                "artifact delivery succeeded but durable completion cleanup failed"
+            );
+        }
+    }
+}
+
+async fn send_artifact_status(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    artifact_count: usize,
+    reason: &str,
+    chunk_index: usize,
+) -> Result<()> {
+    let details = (1..=artifact_count)
+        .map(|index| format!("Artifact {index}: {reason}."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    send_reply(
+        ctx,
+        &inbound.account_ref,
+        &inbound.group_ref,
+        &inbound.message_ref,
+        &format!("[{}] {details}", ctx.cfg.spec.reply_prefix),
+        chunk_index,
+    )
+    .await
 }
 
 async fn handle_session_reset(ctx: &BridgeContext, inbound: &InboundPrompt) {
@@ -966,6 +1278,8 @@ impl InboundDedupe {
 mod tests {
     use super::*;
     use crate::store::SessionStore;
+    use sha2::Digest;
+    use std::os::unix::net::UnixListener;
 
     fn test_config(root: &std::path::Path) -> Config {
         Config {
@@ -980,6 +1294,7 @@ mod tests {
             backend_timeout: Duration::from_secs(60),
             backend_idle_timeout: Duration::from_secs(45),
             execution_profile: crate::ExecutionProfile::Inherit,
+            artifact_exports: crate::ArtifactExportConfig::default(),
             spec: crate::ConfigSpec {
                 env_prefix: "WN_OPENCODE",
                 default_home_name: "harnesses",
@@ -993,8 +1308,25 @@ mod tests {
         }
     }
 
+    struct NoopBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for NoopBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            unreachable!("retry test does not invoke a backend")
+        }
+    }
+
     #[tokio::test]
     async fn dedupe_rejects_repeated_message_refs() {
+        assert!(validate_artifact_support(false, ArtifactSupport::Unsupported).is_ok());
+        assert!(validate_artifact_support(true, ArtifactSupport::Unsupported).is_err());
+        assert!(validate_artifact_support(true, ArtifactSupport::CompletionFile).is_ok());
+
         let dedupe = InboundDedupe::new(8);
         assert!(dedupe.insert("m1".to_owned()).await);
         assert!(!dedupe.insert("m1".to_owned()).await);
@@ -1009,6 +1341,113 @@ mod tests {
         assert!(queues.try_enter("g").await.is_none());
         drop(first);
         assert!(queues.try_enter("g").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_retry_replays_durable_send_media_and_cleans_staged_file() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read_half);
+            let request: agent_control::AgentControlEnvelope<agent_control::AgentControlRequest> =
+                agent_control::read_envelope(&mut reader)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let agent_control::AgentControlRequest::SendMedia { caption, .. } = request.payload
+            else {
+                panic!("expected send_media request");
+            };
+            assert_eq!(caption.as_deref(), Some("Report attached"));
+            let response = agent_control::AgentControlEnvelope::request(
+                request.id,
+                agent_control::AgentControlResponse::FinalSent {
+                    message_ids_hex: vec!["sent".to_owned()],
+                    maintenance_disposition: Default::default(),
+                },
+            );
+            agent_control::write_frame(&mut write_half, &response)
+                .await
+                .unwrap();
+        });
+
+        let staged = root.path().join("staged.bin");
+        fs_private::write_private(&staged, b"payload").unwrap();
+        let outbox_path = root.path().join("outbox.json");
+        let mut outbox = ArtifactOutbox::load(outbox_path.clone()).unwrap();
+        let artifacts = vec![crate::artifacts::StagedArtifact {
+            path: staged.clone(),
+            media_type: "application/octet-stream".to_owned(),
+            file_name: "result.bin".to_owned(),
+            size_bytes: 7,
+            plaintext_sha256: hex::encode(sha2::Sha256::digest(b"payload")),
+        }];
+        let idempotency_key = crate::artifacts::artifact_idempotency_key(
+            "wn-opencode",
+            "account",
+            "group",
+            "inbound",
+            Some("Report attached"),
+            &artifacts,
+        )
+        .unwrap();
+        outbox
+            .record(PendingArtifactBatch {
+                idempotency_key,
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                reply_to_message_ref: "inbound".to_owned(),
+                caption: Some("Report attached".to_owned()),
+                artifacts,
+            })
+            .unwrap();
+        let mut config = test_config(root.path());
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            vec![crate::ArtifactExportGrant {
+                group_id_hex: "group".to_owned(),
+                export_root: root.path().to_path_buf(),
+                ttl_seconds: 300,
+            }],
+            root.path().to_path_buf(),
+            outbox_path.clone(),
+        );
+        let sessions = SessionStore::load(config.state_path.clone(), root.path()).unwrap();
+        let persisted = ArtifactOutbox::load(outbox_path.clone()).unwrap().pending();
+        validate_staged_batch(&config.artifact_exports, "wn-opencode", &persisted[0]).unwrap();
+        let ctx = Arc::new(BridgeContext {
+            cfg: Arc::new(config),
+            client: ControlClient::new(socket, None, Duration::from_secs(5), "wn-test"),
+            account_ref: "account".to_owned(),
+            sessions: Arc::new(sessions),
+            queues: Arc::new(GroupQueues::new(1)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: Arc::new(NoopBackend),
+            outbox: Arc::new(Mutex::new(
+                ArtifactOutbox::load(outbox_path.clone()).unwrap(),
+            )),
+            home: root.path().to_path_buf(),
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), retry_pending_artifacts(&ctx))
+            .await
+            .expect("artifact retry timed out");
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("fake control server timed out")
+            .unwrap();
+        assert!(
+            ArtifactOutbox::load(outbox_path)
+                .unwrap()
+                .pending()
+                .is_empty()
+        );
+        assert!(!staged.exists());
     }
 
     #[test]

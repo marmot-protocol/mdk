@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, Invocation, IsolationSupport,
-    Outcome, ParsedEvent, PromptTransport, RunFailure, RunnerEvent,
-    process::{ProcessSpec, run_jsonl_process},
+    ApprovalSupport, ArtifactSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError,
+    Invocation, IsolationSupport, Outcome, ParsedEvent, PromptTransport, RunFailure, RunnerEvent,
+    process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
+    read_artifact_output_manifest,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -40,6 +41,10 @@ impl Backend for CodexBackend {
         }
     }
 
+    fn artifact_support(&self) -> ArtifactSupport {
+        ArtifactSupport::CompletionFile
+    }
+
     async fn run(
         &self,
         invocation: Invocation,
@@ -60,24 +65,67 @@ async fn run_with_bin(
         idle_timeout,
         cwd,
         session_id,
-        prompt,
+        mut prompt,
+        artifact_output,
     } = invocation;
-    run_jsonl_process(
+    let mut environment = Vec::new();
+    if let Some(request) = &artifact_output {
+        environment.push(EnvironmentChange::Set {
+            name: "MARMOT_ARTIFACT_OUTPUT_FILE",
+            value: request.manifest_path().to_string_lossy().into_owned(),
+        });
+        environment.push(EnvironmentChange::Set {
+            name: "MARMOT_ARTIFACT_AUTHORIZATION_ID",
+            value: request.authorization_id().to_owned(),
+        });
+        environment.push(EnvironmentChange::Set {
+            name: "MARMOT_ARTIFACT_EXPORT_ROOT",
+            value: request.export_root().to_string_lossy().into_owned(),
+        });
+        prompt.push_str("\n\nIf this task produces files for the requester, place them beneath $MARMOT_ARTIFACT_EXPORT_ROOT and write exactly one JSON object to $MARMOT_ARTIFACT_OUTPUT_FILE using this schema: {\"artifacts\":[{\"authorization_id\":\"value from $MARMOT_ARTIFACT_AUTHORIZATION_ID\",\"path\":\"relative/path\",\"media_type\":\"application/octet-stream\",\"file_name\":\"name.ext\"}]}. Paths must be relative to the export root. Use an empty artifacts array when there are no files. This structured file is the only artifact-delivery signal; do not rely on mentioning paths in chat text.");
+    }
+    let process_result = run_jsonl_process(
         ProcessSpec {
             executable: bin.to_owned(),
             args: build_exec_args(session_id.as_deref(), execution_profile),
             cwd,
-            environment: Vec::new(),
+            environment,
             prompt: PromptTransport::Stdin(prompt),
             trace_method: "codex_exec",
             backend_name: "codex",
             total_timeout: timeout,
             idle_timeout,
         },
-        tx,
+        tx.clone(),
         parse_event_line,
     )
-    .await
+    .await;
+    let outcome = match process_result {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            if let Some(request) = &artifact_output {
+                let _ = std::fs::remove_file(request.manifest_path());
+            }
+            return Err(failure);
+        }
+    };
+    if let Some(request) = artifact_output {
+        let artifacts_result = read_artifact_output_manifest(request.manifest_path());
+        let _ = std::fs::remove_file(request.manifest_path());
+        let artifacts = artifacts_result.map_err(|error| RunFailure {
+            error,
+            observed_session: outcome.observed_session.clone(),
+        })?;
+        if !artifacts.is_empty() {
+            tx.send(RunnerEvent::Artifacts(artifacts))
+                .await
+                .map_err(|_| RunFailure {
+                    error: HarnessError::BackendStream,
+                    observed_session: outcome.observed_session.clone(),
+                })?;
+        }
+    }
+    Ok(outcome)
 }
 
 fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<String> {
@@ -280,6 +328,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
                 cwd: root.path().to_path_buf(),
                 session_id: None,
                 prompt: "--prompt-via-stdin".to_owned(),
+                artifact_output: None,
             },
             tx,
         )
@@ -292,6 +341,61 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
             rx.recv().await,
             Some(RunnerEvent::Text("reply: --prompt-via-stdin".to_owned()))
         );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_emits_artifacts_only_from_the_explicit_completion_file() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("artifact-codex");
+        let artifact = root.path().join("report.pdf");
+        fs::write(&artifact, b"pdf").unwrap();
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+printf '{"artifacts":[{"authorization_id":"%s","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf"}]}' "$MARMOT_ARTIFACT_AUTHORIZATION_ID" >"$MARMOT_ARTIFACT_OUTPUT_FILE"
+printf '%s\n' '{"type":"thread.started","thread_id":"codex-artifact"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Created report.pdf at /not/a/delivery/signal"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let manifest = root.path().join("manifest.json");
+        fs::write(&manifest, br#"{"artifacts":[]}"#).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "create the report".to_owned(),
+                artifact_output: Some(marmot_terminal_harness::ArtifactOutputRequest::new(
+                    manifest,
+                    "auth".to_owned(),
+                    root.path().to_path_buf(),
+                )),
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rx.recv().await, Some(RunnerEvent::Text(_))));
+        let Some(RunnerEvent::Artifacts(artifacts)) = rx.recv().await else {
+            panic!("missing typed artifact event");
+        };
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].authorization_id, "auth");
+        assert_eq!(artifacts[0].path, std::path::PathBuf::from("report.pdf"));
+        assert_eq!(artifacts[0].media_type, "application/pdf");
+        assert_eq!(artifacts[0].file_name, "report.pdf");
         assert!(rx.recv().await.is_none());
     }
 
@@ -329,6 +433,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"received
                 cwd: root.path().to_path_buf(),
                 session_id: Some("thread-123".to_owned()),
                 prompt: "p".repeat(60_000),
+                artifact_output: None,
             },
             tx,
         )
@@ -358,6 +463,12 @@ exit 64
         let mut permissions = fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).unwrap();
+        let manifest = root.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({ "artifacts": [] })).unwrap(),
+        )
+        .unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let outcome = run_with_bin(
             script.to_str().unwrap(),
@@ -368,6 +479,11 @@ exit 64
                 cwd: root.path().to_path_buf(),
                 session_id: None,
                 prompt: "p".repeat(60_000),
+                artifact_output: Some(marmot_terminal_harness::ArtifactOutputRequest::new(
+                    manifest.clone(),
+                    "auth".to_owned(),
+                    root.path().to_path_buf(),
+                )),
             },
             tx,
         )
@@ -376,6 +492,7 @@ exit 64
 
         assert_eq!(outcome.exit_code, Some(64));
         assert_eq!(outcome.stderr, "authentication required");
+        assert!(!manifest.exists());
     }
 
     #[tokio::test]
@@ -401,6 +518,7 @@ exit 64
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 session_id: None,
                 prompt: "Reply with exactly CODEX_CONNECTOR_OK and nothing else.".to_owned(),
+                artifact_output: None,
             },
             tx,
         )
@@ -426,6 +544,7 @@ exit 64
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 session_id: Some(session_id.clone()),
                 prompt: "Reply with exactly CODEX_RESUME_OK and nothing else.".to_owned(),
+                artifact_output: None,
             },
             resume_tx,
         )

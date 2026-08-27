@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::{Config, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING, Result};
+use crate::{
+    ArtifactExportConfig, ArtifactExportGrant, Config, DEFAULT_MAX_REPLY_BYTES, HarnessError,
+    MARMOT_MESSAGE_BYTES_CEILING, Result,
+};
 
 const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_BACKEND_IDLE_TIMEOUT_SECS: u64 = 120;
@@ -217,6 +220,31 @@ pub fn load_config_with(
             .join(spec.reply_prefix)
             .join("sessions.json")
     });
+    let artifact_enabled_name = env_name("ARTIFACT_EXPORTS_ENABLED");
+    let artifact_enabled = parse_bool(
+        lookup(&artifact_enabled_name),
+        false,
+        &artifact_enabled_name,
+    )?;
+    let artifact_grants_name = env_name("ARTIFACT_GRANTS_JSON");
+    let artifact_grants = lookup(&artifact_grants_name)
+        .map(|raw| parse_artifact_grants(&artifact_grants_name, &raw))
+        .transpose()?
+        .unwrap_or_default();
+    if artifact_enabled && artifact_grants.is_empty() {
+        return Err(config_error(format!(
+            "{artifact_grants_name} must contain at least one exact group/root grant when artifact exports are enabled"
+        )));
+    }
+    let artifact_staging_root = lookup(&env_name("ARTIFACT_STAGING_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("media-uploads"));
+    let artifact_exports = ArtifactExportConfig::new(
+        artifact_enabled,
+        artifact_grants,
+        artifact_staging_root,
+        state_path.with_extension("artifact-outbox.json"),
+    );
 
     Ok(LoadedConfig {
         harness: Config {
@@ -231,6 +259,7 @@ pub fn load_config_with(
             backend_timeout,
             backend_idle_timeout,
             execution_profile,
+            artifact_exports,
             spec,
         },
         home,
@@ -289,6 +318,32 @@ fn parse_usize(raw: Option<String>, default: usize, name: &str) -> Result<usize>
     })
 }
 
+fn parse_bool(raw: Option<String>, default: bool, name: &str) -> Result<bool> {
+    raw.map_or(Ok(default), |value| match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(config_error(format!("{name} must be `true` or `false`"))),
+    })
+}
+
+fn parse_artifact_grants(name: &str, raw: &str) -> Result<Vec<ArtifactExportGrant>> {
+    let mut grants: Vec<ArtifactExportGrant> = serde_json::from_str(raw)
+        .map_err(|_| config_error(format!("{name} must be a JSON array of artifact grants")))?;
+    let mut groups = HashSet::new();
+    for grant in &mut grants {
+        grant.group_id_hex = normalize_hex(name, &grant.group_id_hex)?;
+        if !grant.export_root.is_absolute()
+            || grant.ttl_seconds == 0
+            || !groups.insert(grant.group_id_hex.clone())
+        {
+            return Err(config_error(format!(
+                "{name} grants require a unique 64-character group id, absolute export_root, and positive ttl_seconds"
+            )));
+        }
+    }
+    Ok(grants)
+}
+
 fn config_error(message: impl Into<String>) -> HarnessError {
     HarnessError::Config(message.into())
 }
@@ -330,6 +385,41 @@ mod tests {
         assert_eq!(loaded.harness.backend_timeout, Duration::from_secs(3600));
         assert_eq!(loaded.harness.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
         assert_eq!(loaded.harness.execution_profile, ExecutionProfile::Inherit);
+        assert!(!loaded.harness.artifact_exports.enabled());
+    }
+
+    #[test]
+    fn artifact_exports_require_explicit_enablement_and_roots() {
+        let base = [
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+        ];
+        assert!(load(&base).is_err());
+
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+            (
+                "WN_TEST_ARTIFACT_GRANTS_JSON",
+                r#"[{"group_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","export_root":"/home/test/output","ttl_seconds":300}]"#,
+            ),
+        ])
+        .unwrap();
+        assert!(loaded.harness.artifact_exports.enabled());
+        assert_eq!(loaded.harness.artifact_exports.grants().len(), 1);
+    }
+
+    #[test]
+    fn artifact_exports_reject_ambiguous_boolean_values() {
+        let error = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "yes"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("ARTIFACT_EXPORTS_ENABLED"));
     }
 
     #[test]

@@ -84,6 +84,7 @@ async fn run_with_bin(
         cwd,
         session_id,
         prompt,
+        artifact_output: _,
     } = invocation;
     let environment = config_overlay(execution_profile)
         .map(|(remove, name, value)| {
@@ -197,6 +198,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             session_id: None,
             prompt: scenario.to_owned(),
+            artifact_output: None,
         }
     }
 

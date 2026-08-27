@@ -7,6 +7,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 
 pub const AGENT_CONTROL_PROTOCOL_V2: &str = "marmot.agent-control.v2";
 pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_MEDIA_UPLOAD_ATTACHMENTS: usize = 10;
+pub const MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES: u64 = 512 * 1024 * 1024 - 16;
+pub const MAX_MEDIA_UPLOAD_BATCH_BYTES: u64 = MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES;
 pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
 pub const AGENT_CONTROL_REFERENCED_TEXT_MAX_CHARS: usize = 2_000;
 pub const AGENT_CONTROL_REFERENCED_ATTACHMENTS_MAX: usize = 16;
