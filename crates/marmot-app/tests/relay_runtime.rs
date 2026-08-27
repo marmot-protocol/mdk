@@ -6564,10 +6564,10 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
 }
 
 #[tokio::test]
-async fn failed_send_keeps_read_marker_and_inbound_unread() {
-    // mdk#338: the local-send projection recorded BEFORE publish must not
-    // advance the per-group read marker. If it did, a hard publish failure
-    // would leave the marker pointing at the invalidated own message and
+async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
+    // mdk#338/#1577: the local-send projection recorded BEFORE publish must
+    // not advance the per-group read marker. If it did, an unresolved publish
+    // would leave the marker pointing at the unconfirmed own message and
     // silently mark older inbound unreads as read. Only the post-publish
     // success projection may advance the marker.
     let dir = tempfile::tempdir().unwrap();
@@ -6656,23 +6656,44 @@ async fn failed_send_keeps_read_marker_and_inbound_unread() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    // Hard publish failure: no relay left to accept bob's message. The failed
+    // No relay remains to confirm whether bob's message was accepted. The
     // attempt can take up to the adapter's ~20s publish overall-wait
-    // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports the failure.
+    // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports completion unknown.
     relay.shutdown();
-    bob.send(&group_id, b"bob failure")
+    let unresolved = bob
+        .send(&group_id, b"bob unresolved")
         .await
-        .expect_err("send must fail once the relay is gone");
+        .expect("an ambiguous publish is retained rather than reported as a hard failure");
+    assert_eq!(
+        unresolved.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    assert_eq!(unresolved.published, 0);
+    let timeline = app
+        .timeline_messages_with_query(
+            "bob",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        timeline.messages.iter().any(|message| {
+            message.direction == "sent" && message.plaintext == "bob unresolved"
+        }),
+        "an unresolved local send must remain in the timeline"
+    );
 
     let row = bob_row();
     assert_eq!(
         row.unread_count, 1,
-        "a failed send must not mark inbound unreads as read"
+        "an unresolved send must not mark inbound unreads as read"
     );
     assert_eq!(
         row.last_read_message_id_hex.as_deref(),
         Some(read_baseline_id.as_str()),
-        "a failed send must leave the read marker untouched, never at the failed event"
+        "an unresolved send must leave the read marker untouched"
     );
     assert_eq!(
         row.first_unread_message_id_hex.as_deref(),
@@ -6688,7 +6709,7 @@ async fn failed_send_keeps_read_marker_and_inbound_unread() {
         .unwrap_or(0);
     assert_eq!(
         account_unread, 1,
-        "the account-level unread aggregate must survive the failed send"
+        "the account-level unread aggregate must survive the unresolved send"
     );
 }
 

@@ -242,11 +242,11 @@ pub enum SendResult {
 /// What happened to a send the engine *accepted*, as reported back to the
 /// application.
 ///
-/// This is the app-facing projection of the [`SendResult::Queued`] versus
-/// "published now" split. `AcceptedPending` is deliberately **not** a failure:
-/// the intent is durable, survives restart, and publishes once the group's
-/// convergence input settles. A refused send never reaches this type at all —
-/// it returns an error instead.
+/// This is the app-facing projection of "published now", retained before
+/// publication, and acknowledgement-unknown. `AcceptedPending` and
+/// `CompletionUnknown` are deliberately **not** failures: in both cases the
+/// outbound obligation is durable and survives restart. A refused send never
+/// reaches this type at all — it returns an error instead.
 ///
 /// It is not an unconditional promise of publication, though. A group that goes
 /// terminal — disbanded, or this device's copy removed — discards its outbound
@@ -264,6 +264,10 @@ pub enum SendAcceptDisposition {
     /// The send was accepted and retained in the group's durable outbound
     /// queue. It publishes on a later convergence drain.
     AcceptedPending,
+    /// The exact transport event is durably retained because an endpoint may
+    /// have exposed it without returning an acknowledgement. Hosts must show
+    /// this as unresolved and must not create a semantically new send.
+    CompletionUnknown,
 }
 
 /// Group evolution produced as a side effect of inbound processing.

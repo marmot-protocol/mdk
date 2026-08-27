@@ -110,7 +110,10 @@ impl AppClient {
                 .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
                 .await
             {
-                Ok((_event, _summary)) => {
+                Ok((_event, summary))
+                    if summary.accept_disposition
+                        == cgka_traits::SendAcceptDisposition::Published =>
+                {
                     if let Err(err) = self.app.apply_local_push_removal(
                         &account.label,
                         &group_id_hex,
@@ -129,6 +132,13 @@ impl AppClient {
                         &group_id_hex,
                         &retired_registration,
                     )?;
+                }
+                Ok((_event, _summary)) => {
+                    tracing::debug!(
+                        target: "marmot_app::notifications",
+                        method = "share_push_registration",
+                        "push token removal remains durable while publication is unresolved",
+                    );
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -214,7 +224,10 @@ impl AppClient {
                     .send_app_event(&group_id, AppMessageIntent::PushTokenUpdate { content })
                     .await
                 {
-                    Ok((_event, _summary)) => {
+                    Ok((_event, summary))
+                        if summary.accept_disposition
+                            == cgka_traits::SendAcceptDisposition::Published =>
+                    {
                         if let Err(err) = self.app.upsert_group_push_token(&account.label, &record)
                         {
                             tracing::warn!(
@@ -231,6 +244,13 @@ impl AppClient {
                             &registration.registration.token_fingerprint,
                             registration.registration.updated_at_ms,
                         )?;
+                    }
+                    Ok((_event, _summary)) => {
+                        tracing::debug!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            "push token update remains durable while publication is unresolved",
+                        );
                     }
                     Err(err) => {
                         tracing::warn!(

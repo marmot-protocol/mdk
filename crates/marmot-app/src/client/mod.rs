@@ -3017,6 +3017,9 @@ impl AppClient {
         let published = effects.published_app_messages.iter().find(|published| {
             published.group_id == *group_id && published.app_event_id == app_event_id
         });
+        let completion_unknown = effects.unresolved_app_messages.iter().any(|unresolved| {
+            unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
+        });
         let source_message_id_hex =
             published.map(|published| hex::encode(published.message_id.as_slice()));
         let source_state =
@@ -3028,7 +3031,7 @@ impl AppClient {
                 &event,
                 source_message_id_hex,
                 source_state,
-                true,
+                published.is_some(),
             )?;
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
@@ -3055,7 +3058,7 @@ impl AppClient {
         Ok((
             event,
             SendSummary {
-                published: effects.reports.len(),
+                published: usize::from(published.is_some()),
                 message_ids: vec![app_event_id],
                 // Per-message, not per-pass: `published` above matched this
                 // exact `app_event_id` in `effects.published_app_messages`. A
@@ -3065,6 +3068,8 @@ impl AppClient {
                 // accepted and retained it (mdk#1177).
                 accept_disposition: if published.is_some() {
                     cgka_traits::SendAcceptDisposition::Published
+                } else if completion_unknown {
+                    cgka_traits::SendAcceptDisposition::CompletionUnknown
                 } else {
                     cgka_traits::SendAcceptDisposition::AcceptedPending
                 },
@@ -3871,11 +3876,6 @@ impl AppClient {
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
-        let message_ids = effects
-            .reports
-            .iter()
-            .map(|report| hex::encode(report.message_id.as_slice()))
-            .collect::<Vec<_>>();
         let group_metadata = self.runtime.group_record(group_id).ok();
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         let projection = EventGroupProjection {
@@ -3898,12 +3898,7 @@ impl AppClient {
         self.mark_group_projection_dirty(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
-        Ok(SendSummary {
-            published: effects.reports.len(),
-            message_ids,
-            accept_disposition: crate::groups::accept_disposition_from_effects(&effects),
-            maintenance_disposition: effects.maintenance_disposition,
-        })
+        Ok(send_summary_from_effects(&effects))
     }
 
     fn ensure_group(&self, group_id: &GroupId) -> Result<(), AppError> {

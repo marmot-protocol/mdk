@@ -1,7 +1,7 @@
 use cgka_traits::TransportAdapterError;
 use cgka_traits::transport_adapter::{
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointRejectionCategory,
-    TransportPublishFailure,
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointRejectionCategory, TransportPublishFailure,
 };
 
 use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
@@ -2428,11 +2428,13 @@ fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_cate
                 TransportEndpointFailure {
                     endpoint: TransportEndpoint("wss://relay-a.example".into()),
                     reason: hostile_reason.to_owned(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
                     rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
                 },
                 TransportEndpointFailure {
                     endpoint: TransportEndpoint("wss://relay-b.example".into()),
                     reason: hostile_reason.to_owned(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
                     rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
                 },
             ],
