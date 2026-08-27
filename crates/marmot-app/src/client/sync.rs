@@ -74,6 +74,18 @@ pub(crate) enum EpochBackfillRunOutcome {
     Incomplete(SyncSummary),
 }
 
+/// Result of one durable account-delivery overflow recovery attempt.
+///
+/// An incomplete replay is not a transport failure: its durable marker stays
+/// armed, its real summary remains publishable, and a later sync seam retries
+/// the unfloored replay. Activation, ingest, and persistence errors remain
+/// typed hard failures outside this outcome.
+#[derive(Debug)]
+pub(crate) enum DeliveryOverflowRecoveryOutcome {
+    Completed(SyncSummary),
+    Incomplete(SyncSummary),
+}
+
 /// What ends a transport drain.
 ///
 /// The two contracts differ only in what silence means, so they share one loop
@@ -1185,9 +1197,11 @@ impl AppClient {
     /// makes the compare-and-clear fail so another attempt remains required.
     pub(crate) async fn recover_delivery_overflow(
         &mut self,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+    ) -> Result<DeliveryOverflowRecoveryOutcome, ClassifiedSyncFailure> {
         if !self.delivery_overflow_recovery_pending {
-            return Ok(SyncSummary::default());
+            return Ok(DeliveryOverflowRecoveryOutcome::Completed(
+                SyncSummary::default(),
+            ));
         }
         let marker_token = self
             .delivery_overflow_recovery_marker_token
@@ -1279,7 +1293,7 @@ impl AppClient {
             );
             let mut summary = summary;
             self.drain_epoch_stall_escalations(&mut summary);
-            return Ok(summary);
+            return Ok(DeliveryOverflowRecoveryOutcome::Completed(summary));
         }
 
         self.adapter.fail_delivery_overflow_recovery();
@@ -1297,13 +1311,7 @@ impl AppClient {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "account delivery overflow recovery remains incomplete",
         );
-        Err(ClassifiedSyncFailure::at_stage(
-            summary,
-            AppError::Transport(cgka_traits::TransportAdapterError::Other(
-                "account delivery overflow recovery incomplete".to_owned(),
-            )),
-            SyncFailureStage::RelayReceive,
-        ))
+        Ok(DeliveryOverflowRecoveryOutcome::Incomplete(summary))
     }
 
     async fn recover_delivery_overflow_and_merge(
@@ -1311,7 +1319,10 @@ impl AppClient {
         summary: &mut SyncSummary,
     ) -> Result<(), ClassifiedSyncFailure> {
         match self.recover_delivery_overflow().await {
-            Ok(recovered) => {
+            Ok(
+                DeliveryOverflowRecoveryOutcome::Completed(recovered)
+                | DeliveryOverflowRecoveryOutcome::Incomplete(recovered),
+            ) => {
                 summary.merge(recovered);
                 Ok(())
             }

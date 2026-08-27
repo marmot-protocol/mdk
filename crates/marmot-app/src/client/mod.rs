@@ -72,7 +72,9 @@ use push::notification_trigger_for_intent;
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
 #[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
-pub(crate) use sync::{ConvergenceScheduleState, EpochBackfillRunOutcome};
+pub(crate) use sync::{
+    ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
+};
 
 #[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;

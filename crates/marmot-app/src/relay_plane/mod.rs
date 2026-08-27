@@ -334,8 +334,8 @@ impl AccountDeliveryOverflowState {
                         .inner
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state.marker_in_progress = false;
                     if state.generation == generation {
+                        state.marker_in_progress = false;
                         state.marker_durable = true;
                     }
                     return;
@@ -345,14 +345,16 @@ impl AccountDeliveryOverflowState {
                         .inner
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state.marker_in_progress = false;
-                    state.marker_closed = true;
-                    tracing::debug!(
-                        target: "marmot_app::relay_plane",
-                        method = "persist_marker_before_drop",
-                        error_kind = "storage_closed",
-                        "account delivery overflow marker worker stopped after storage closure",
-                    );
+                    if state.generation == generation {
+                        state.marker_in_progress = false;
+                        state.marker_closed = true;
+                        tracing::debug!(
+                            target: "marmot_app::relay_plane",
+                            method = "persist_marker_before_drop",
+                            error_kind = "storage_closed",
+                            "account delivery overflow marker worker stopped after storage closure",
+                        );
+                    }
                     return;
                 }
                 Ok(Err(AccountDeliveryRecoveryMarkerError::Retryable)) | Err(_) => {
@@ -365,12 +367,11 @@ impl AccountDeliveryOverflowState {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
-            let mut state = self
+            let state = self
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.generation != generation {
-                state.marker_in_progress = false;
                 return;
             }
         }

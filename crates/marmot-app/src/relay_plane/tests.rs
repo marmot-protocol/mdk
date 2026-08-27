@@ -188,6 +188,74 @@ async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
     );
 }
 
+async fn assert_stale_marker_worker_preserves_new_generation(
+    result: Result<(), AccountDeliveryRecoveryMarkerError>,
+) {
+    let overflow = Arc::new(AccountDeliveryOverflowState::default());
+    let old_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    overflow.consume_signal(old_generation);
+    assert!(overflow.start_marker_persistence());
+    let old_attempt = overflow.start_recovery(1);
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let marker: AccountDeliveryRecoveryMarker = {
+        let entered = entered.clone();
+        let release = release.clone();
+        Arc::new(move |_, _| {
+            entered.store(true, Ordering::SeqCst);
+            while !release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            result
+        })
+    };
+    let worker = {
+        let overflow = overflow.clone();
+        tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old generation marker worker must start");
+
+    assert!(overflow.finish_recovery(old_attempt).is_some());
+    let new_generation = overflow.record_drop(ACCOUNT_DELIVERY_BUFFER).unwrap();
+    overflow.consume_signal(new_generation);
+    assert!(overflow.start_marker_persistence());
+
+    release.store(true, Ordering::SeqCst);
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("the stale marker worker must stop")
+        .unwrap();
+
+    assert!(
+        !overflow.start_marker_persistence(),
+        "a stale worker must not release the newer generation's worker claim"
+    );
+    assert!(
+        !overflow.marker_barrier_complete(),
+        "a stale worker must not publish its outcome into the newer generation"
+    );
+}
+
+#[tokio::test]
+async fn stale_overflow_marker_workers_preserve_new_generation_claim() {
+    assert_stale_marker_worker_preserves_new_generation(Ok(())).await;
+    assert_stale_marker_worker_preserves_new_generation(Err(
+        AccountDeliveryRecoveryMarkerError::Closed,
+    ))
+    .await;
+    assert_stale_marker_worker_preserves_new_generation(Err(
+        AccountDeliveryRecoveryMarkerError::Retryable,
+    ))
+    .await;
+}
+
 #[test]
 fn notification_restart_backoff_caps_and_resets_after_healthy_runtime() {
     let mut backoff = RelayNotificationRestartBackoff::default();

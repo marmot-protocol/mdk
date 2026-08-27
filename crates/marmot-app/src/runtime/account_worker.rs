@@ -36,11 +36,12 @@ use crate::{
     AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppPreparedGroupImageUpload, AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup,
     ChatListUpdateTrigger, ClassifiedSyncFailure, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
-    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationSettings, PendingWelcomeDelivery, PushPlatform,
-    PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome, GroupInviteDeclineResult,
+    MaintenanceRunSummary, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, ReceivedMessage, RetentionSweepReport, SecureDeleteExpiredResult,
+    SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -1237,24 +1238,29 @@ async fn run_app_runtime_account_worker(
                     }
                     Ok(crate::relay_plane::AccountDeliveryReceive::Overflow(_)) => {
                         match client.recover_delivery_overflow().await {
-                            Ok(summary) => (Ok(summary), false),
-                            Err(failure) => {
+                            Ok(DeliveryOverflowRecoveryOutcome::Completed(summary)) => {
+                                (Ok(summary), false)
+                            }
+                            Ok(DeliveryOverflowRecoveryOutcome::Incomplete(summary)) => {
                                 publish_app_runtime_account_error(
                                     &events,
                                     &account_id_hex,
                                     &account_label,
-                                    account_error_message(
-                                        "account delivery overflow recovery incomplete",
-                                        &failure.source,
-                                    ),
+                                    "account delivery overflow recovery incomplete".to_owned(),
                                 );
-                                client
-                                    .pending_failed_sync_summary
-                                    .merge(failure.partial_summary);
                                 // The durable marker remains armed. Keep the
                                 // account session available and let the next
                                 // receive/catch-up seam retry the replay.
-                                (Ok(SyncSummary::default()), true)
+                                (Ok(summary), true)
+                            }
+                            Err(failure) => {
+                                publish_app_runtime_summary(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    &failure.partial_summary,
+                                );
+                                (Err(failure.source), false)
                             }
                         }
                     }
@@ -4376,7 +4382,10 @@ async fn run_pending_epoch_backfill_reporting_arm(
     // another sync seam.
     if result.is_ok() && client.delivery_overflow_recovery_pending {
         result = match client.recover_delivery_overflow().await {
-            Ok(summary) => {
+            Ok(
+                DeliveryOverflowRecoveryOutcome::Completed(summary)
+                | DeliveryOverflowRecoveryOutcome::Incomplete(summary),
+            ) => {
                 publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
                 Ok(())
             }
@@ -5122,6 +5131,51 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(relay.subscription_count(), subscriptions_after_replay);
+    }
+
+    #[tokio::test]
+    async fn incomplete_delivery_overflow_recovery_does_not_fail_catch_up() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config().with_dev_epoch_backfill_eose_wait_ms(25),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let marker_token = 7;
+        app.account_storage("alice")
+            .unwrap()
+            .mark_account_delivery_recovery("alice", marker_token, 1)
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(marker_token);
+
+        let (events, _subscriber) = broadcast::channel(4);
+        run_pending_epoch_backfill_reporting_arm(
+            &mut client,
+            &events,
+            "account-id",
+            "alice",
+            &RuntimeSharedServices::default(),
+            EpochBackfillExecutionSeam::ExplicitCatchUp,
+        )
+        .await
+        .expect("missing relay EOSE is incomplete recovery, not a catch-up failure");
+
+        assert!(client.delivery_overflow_recovery_pending);
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some(),
+            "incomplete recovery must retain its durable retry marker"
+        );
     }
 
     #[tokio::test]
