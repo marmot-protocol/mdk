@@ -9,6 +9,7 @@ use cgka_traits::{
     TransportEndpoint, TransportGroupSubscription, TransportGroupSync, TransportPublishRequest,
     TransportPublishTarget,
 };
+use nostr::RelayUrl;
 use tokio::sync::{Barrier, Notify};
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
@@ -3007,7 +3008,16 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
     let inbox_a = TransportEndpoint("wss://inbox-a.example".to_owned());
     let inbox_b = TransportEndpoint("wss://inbox-b.example".to_owned());
     let group_a = TransportEndpoint("wss://group-a.example".to_owned());
-    let group_b = TransportEndpoint("wss://group-b.example".to_owned());
+    let group_b = TransportEndpoint("wss://Group-B.Example:443".to_owned());
+    let group_b_inbound = TransportEndpoint(
+        RelayUrl::parse(group_b.as_str())
+            .expect("route B parses")
+            .to_string(),
+    );
+    assert_ne!(
+        group_b, group_b_inbound,
+        "the test requires a verbatim route spelling that normalizes on inbound"
+    );
     let group = TransportGroupSubscription {
         group_id: cgka_traits::GroupId::new(vec![0x33; 16]),
         transport_group_id: vec![0x44; 32],
@@ -3064,7 +3074,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
     assert_eq!(
         adapter
             .handle_relay_event(NostrRelayEvent {
-                endpoint: group_b.clone(),
+                endpoint: group_b_inbound.clone(),
                 subscription_id: Some(group_id.clone()),
                 event: group_event("relay-b-only", &group.transport_group_id),
             })
@@ -3080,7 +3090,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
             .expect("B's event is delivered")
             .source
             .endpoint,
-        Some(group_b.clone())
+        Some(group_b_inbound.clone())
     );
     adapter
         .handle_relay_eose(inbox_b.clone(), inbox_id.clone())
@@ -3124,7 +3134,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         "a route shrink must not complete an older replay attempt"
     );
 
-    adapter.handle_relay_eose(group_b, group_id).await;
+    adapter.handle_relay_eose(group_b_inbound, group_id).await;
     assert!(
         adapter
             .account_subscription_eose(&account_id)
