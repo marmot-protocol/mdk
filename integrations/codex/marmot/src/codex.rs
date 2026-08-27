@@ -119,8 +119,14 @@ async fn run_with_bin(
                 tracing::warn!(
                     target: "codex",
                     method = "run_with_bin",
-                    "artifact manifest unreadable; falling back to text"
+                    "artifact manifest unreadable; reporting typed artifact failure"
                 );
+                tx.send(RunnerEvent::ArtifactDeclarationFailed)
+                    .await
+                    .map_err(|_| RunFailure {
+                        error: HarnessError::BackendStream,
+                        observed_session: outcome.observed_session.clone(),
+                    })?;
             }
         }
     }
@@ -646,6 +652,10 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"t
         assert_eq!(
             rx.recv().await,
             Some(RunnerEvent::Text("text still succeeds".to_owned()))
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::ArtifactDeclarationFailed)
         );
         assert!(rx.recv().await.is_none());
     }

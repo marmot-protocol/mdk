@@ -172,6 +172,8 @@ pub enum RunnerEvent {
     Text(String),
     /// Explicit backend-declared output artifacts; paths are never inferred from text.
     Artifacts(Vec<ArtifactOutput>),
+    /// The backend emitted an artifact declaration that could not be validated.
+    ArtifactDeclarationFailed,
     /// The presentation stream is idle while the backend process is still alive.
     LivenessUnknown,
 }
@@ -187,6 +189,7 @@ impl fmt::Debug for RunnerEvent {
                 .debug_struct("Artifacts")
                 .field("artifact_count", &artifacts.len())
                 .finish(),
+            Self::ArtifactDeclarationFailed => formatter.write_str("ArtifactDeclarationFailed"),
             Self::LivenessUnknown => formatter.write_str("LivenessUnknown"),
         }
     }

@@ -782,6 +782,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let runner = tokio::spawn(async move { backend.run(invocation, tx).await });
     let mut buffered_text = Vec::new();
     let mut artifact_outputs: Vec<ArtifactOutput> = Vec::new();
+    let mut artifact_declaration_failed = false;
     let mut chunk_index = 0usize;
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
@@ -855,18 +856,30 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 }
             }
             RunnerEvent::Artifacts(outputs) => artifact_outputs.extend(outputs),
+            RunnerEvent::ArtifactDeclarationFailed => artifact_declaration_failed = true,
         }
     }
 
     match runner.await {
         Ok(Ok(outcome)) => {
-            let artifact_delivery_attempted = artifact_setup_failed || !artifact_outputs.is_empty();
+            let artifact_delivery_attempted = artifact_setup_failed
+                || artifact_declaration_failed
+                || !artifact_outputs.is_empty();
             let artifact_delivery = if artifact_setup_failed {
                 let _ = send_artifact_failure_activity(
                     &ctx,
                     &inbound,
                     1,
                     "rejected because the connector could not initialize its private export state",
+                )
+                .await;
+                ArtifactDeliveryOutcome::FallbackAllowed
+            } else if artifact_declaration_failed {
+                let _ = send_artifact_failure_activity(
+                    &ctx,
+                    &inbound,
+                    1,
+                    "rejected because the backend artifact declaration was malformed or unreadable",
                 )
                 .await;
                 ArtifactDeliveryOutcome::FallbackAllowed
@@ -1133,12 +1146,12 @@ async fn deliver_artifact_outputs(
 
     match send_pending_artifact_batch(ctx, &batch).await {
         Ok(()) => {
-            complete_artifact_batch(ctx, &batch.idempotency_key).await;
+            complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
             ArtifactDeliveryOutcome::Delivered
         }
         Err(err) => {
             if err.artifact_validation_failed() {
-                discard_artifact_batch(ctx, &batch.idempotency_key).await;
+                discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
             }
             warn!(
                 target: TRACE_TARGET,
@@ -1165,10 +1178,10 @@ async fn retry_pending_artifacts(ctx: &Arc<BridgeContext>) {
     let pending = ctx.outbox.lock().await.pending();
     for batch in pending {
         match send_pending_artifact_batch(ctx, &batch).await {
-            Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key).await,
+            Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await,
             Err(err) => {
                 if err.artifact_validation_failed() {
-                    discard_artifact_batch(ctx, &batch.idempotency_key).await;
+                    discard_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
                 }
                 warn!(
                     target: TRACE_TARGET,
@@ -1284,9 +1297,12 @@ async fn remove_artifact_batch(ctx: &BridgeContext, key: &str) -> Result<Vec<Pat
         .map_err(HarnessError::from)?
 }
 
-async fn discard_artifact_batch(ctx: &BridgeContext, key: &str) {
+async fn discard_artifact_batch(ctx: &BridgeContext, key: &str, group_ref: &str) {
     match remove_artifact_batch(ctx, key).await {
-        Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
+        Ok(paths) => {
+            remove_staged_files(&ctx.cfg.artifact_exports, paths);
+            ctx.queues.signal_group_changed(group_ref).await;
+        }
         Err(err) => {
             warn!(
                 target: TRACE_TARGET,
@@ -1298,9 +1314,12 @@ async fn discard_artifact_batch(ctx: &BridgeContext, key: &str) {
     }
 }
 
-async fn complete_artifact_batch(ctx: &BridgeContext, key: &str) {
+async fn complete_artifact_batch(ctx: &BridgeContext, key: &str, group_ref: &str) {
     match remove_artifact_batch(ctx, key).await {
-        Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
+        Ok(paths) => {
+            remove_staged_files(&ctx.cfg.artifact_exports, paths);
+            ctx.queues.signal_group_changed(group_ref).await;
+        }
         Err(err) => {
             warn!(
                 target: TRACE_TARGET,
@@ -1336,7 +1355,9 @@ async fn send_artifact_failure_activity(
 }
 
 async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
-    ctx.recovery.get(group_ref).await.is_some() || ctx.deliveries.blocks_group(group_ref).await
+    ctx.recovery.get(group_ref).await.is_some()
+        || ctx.deliveries.blocks_group(group_ref).await
+        || ctx.outbox.lock().await.has_pending_group(group_ref)
 }
 
 async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: ChatCommand) {
@@ -2278,6 +2299,14 @@ impl GroupQueues {
             _pending: None,
         })
     }
+
+    async fn signal_group_changed(&self, group_ref: &str) {
+        if let Some(queue) = self.queue(group_ref).await {
+            queue
+                .recovery_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
 }
 
 impl Drop for GroupPermit {
@@ -2368,6 +2397,7 @@ mod tests {
         text: Option<String>,
         file_names: Vec<String>,
         invented_authorization: bool,
+        declaration_failed: bool,
     }
 
     static ARTIFACT_DELIVERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2396,6 +2426,19 @@ mod tests {
         ) -> std::result::Result<Outcome, RunFailure> {
             if let Some(text) = &self.text {
                 tx.send(RunnerEvent::Text(text.clone())).await.unwrap();
+            }
+            if self.declaration_failed {
+                tx.send(RunnerEvent::ArtifactDeclarationFailed)
+                    .await
+                    .unwrap();
+                return Ok(Outcome {
+                    observed_session: None,
+                    exit_code: Some(0),
+                    error_summary: None,
+                    no_side_effects_proven: false,
+                    stderr: String::new(),
+                    elapsed_ms: 1,
+                });
             }
             let authorization_id = if self.invented_authorization {
                 "backend-invented".to_owned()
@@ -2487,6 +2530,7 @@ mod tests {
     async fn run_artifact_delivery_case(
         text: Option<&str>,
         invented_authorization: bool,
+        declaration_failed: bool,
     ) -> Vec<agent_control::AgentControlRequest> {
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
@@ -2501,7 +2545,9 @@ mod tests {
         let text_chunk_count = text
             .map(|text| split_reply_chunks(text, 30_000).len())
             .unwrap_or(0);
-        let expected = if invented_authorization {
+        let expected = if declaration_failed {
+            1 + text_chunk_count
+        } else if invented_authorization {
             1 + usize::from(text.is_some())
         } else {
             1 + text_chunk_count.saturating_sub(1)
@@ -2580,6 +2626,7 @@ mod tests {
                 text: text.map(str::to_owned),
                 file_names: vec!["report.pdf".to_owned(), "chart.png".to_owned()],
                 invented_authorization,
+                declaration_failed,
             }),
             outbox: Arc::new(Mutex::new(
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
@@ -2694,6 +2741,50 @@ mod tests {
         assert!(dedupe.insert("m1".to_owned()).await);
         assert!(!dedupe.insert("m1".to_owned()).await);
         assert!(dedupe.insert("m2".to_owned()).await);
+    }
+
+    #[tokio::test]
+    async fn pending_artifact_batch_blocks_later_same_group_prompt_until_resolved() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let backend = Arc::new(RecordingBackend::default());
+        let (ctx, server) = test_context(root.path(), &home, backend.clone());
+        ctx.sessions
+            .set_workdir("group", home.clone())
+            .await
+            .unwrap();
+        ctx.outbox
+            .lock()
+            .await
+            .record(PendingArtifactBatch {
+                idempotency_key: "pending-media".to_owned(),
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                reply_to_message_ref: "earlier-message".to_owned(),
+                caption: None,
+                remaining_text: Vec::new(),
+                artifacts: Vec::new(),
+            })
+            .unwrap();
+
+        let dispatched = tokio::spawn(dispatch_test_message(
+            ctx.clone(),
+            "later-message",
+            "run later work",
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(backend.invocations.lock().await.is_empty());
+
+        ctx.outbox.lock().await.complete("pending-media").unwrap();
+        ctx.queues.signal_group_changed("group").await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), dispatched)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(backend.invocations.lock().await.len(), 1);
+        server.abort();
     }
 
     #[test]
@@ -2850,7 +2941,7 @@ mod tests {
     #[tokio::test]
     async fn collector_routes_artifact_success_and_failure_without_duplicate_finals() {
         let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
-        let mixed_success = run_artifact_delivery_case(Some("completed text"), false).await;
+        let mixed_success = run_artifact_delivery_case(Some("completed text"), false, false).await;
         let agent_control::AgentControlRequest::SendMedia {
             attachments,
             caption,
@@ -2867,7 +2958,7 @@ mod tests {
         assert!(idempotency_key.as_ref().is_some_and(|key| !key.is_empty()));
 
         let long_text = "x".repeat(30_005);
-        let long_success = run_artifact_delivery_case(Some(&long_text), false).await;
+        let long_success = run_artifact_delivery_case(Some(&long_text), false, false).await;
         let agent_control::AgentControlRequest::SendMedia { caption, .. } = &long_success[0] else {
             panic!("expected media before overflow text");
         };
@@ -2877,7 +2968,7 @@ mod tests {
         };
         assert_eq!(text, "xxxxx");
 
-        let artifact_only_success = run_artifact_delivery_case(None, false).await;
+        let artifact_only_success = run_artifact_delivery_case(None, false, false).await;
         let agent_control::AgentControlRequest::SendMedia { caption, .. } =
             &artifact_only_success[0]
         else {
@@ -2885,7 +2976,7 @@ mod tests {
         };
         assert!(caption.is_none());
 
-        let mixed_failure = run_artifact_delivery_case(Some("completed text"), true).await;
+        let mixed_failure = run_artifact_delivery_case(Some("completed text"), true, false).await;
         assert!(matches!(
             mixed_failure[0],
             agent_control::AgentControlRequest::SendAgentActivity { .. }
@@ -2895,7 +2986,19 @@ mod tests {
         };
         assert_eq!(text, "completed text");
 
-        let artifact_only_failure = run_artifact_delivery_case(None, true).await;
+        let artifact_only_failure = run_artifact_delivery_case(None, true, false).await;
+
+        let malformed_declaration =
+            run_artifact_delivery_case(Some("completed text"), false, true).await;
+        assert!(matches!(
+            malformed_declaration[0],
+            agent_control::AgentControlRequest::SendAgentActivity { .. }
+        ));
+        let agent_control::AgentControlRequest::SendFinal { text, .. } = &malformed_declaration[1]
+        else {
+            panic!("expected text fallback after malformed artifact declaration");
+        };
+        assert_eq!(text, "completed text");
         assert!(matches!(
             artifact_only_failure[0],
             agent_control::AgentControlRequest::SendAgentActivity { .. }
@@ -3119,6 +3222,7 @@ mod tests {
                 text: Some("completed text".to_owned()),
                 file_names: vec!["report.pdf".to_owned()],
                 invented_authorization: false,
+                declaration_failed: false,
             }),
             outbox: Arc::new(Mutex::new(
                 ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),

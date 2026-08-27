@@ -346,6 +346,12 @@ impl ArtifactOutbox {
         self.batches.clone()
     }
 
+    pub(crate) fn has_pending_group(&self, group_ref: &str) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.group_ref == group_ref)
+    }
+
     pub(crate) fn record(&mut self, batch: PendingArtifactBatch) -> Result<()> {
         if let Some(existing) = self
             .batches
@@ -395,6 +401,9 @@ impl ArtifactOutbox {
             batches: batches.to_vec(),
         };
         let bytes = serde_json::to_vec(&persisted)?;
+        if bytes.len() as u64 > MAX_ARTIFACT_OUTBOX_BYTES {
+            return Err(HarnessError::ArtifactLimitsExceeded);
+        }
         let temp = self.path.with_extension("tmp");
         fs_private::write_private(&temp, &bytes)?;
         std::fs::rename(&temp, &self.path)?;
@@ -927,23 +936,86 @@ fn validate_authorization(
     Ok(())
 }
 
+#[cfg(unix)]
 fn open_authorized_source(relative_path: &Path, root: &Path) -> Result<File> {
-    let path = root.join(relative_path);
-    let metadata = std::fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(HarnessError::ArtifactUnsafeSource);
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        return Err(HarnessError::ArtifactInvalidMetadata);
     }
-    let file = options.open(&path)?;
-    if !file.metadata()?.is_file() {
-        return Err(HarnessError::ArtifactUnsafeSource);
+
+    let mut root_options = OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut directory = root_options
+        .open(root)
+        .map_err(|_| HarnessError::ArtifactUnsafeSource)?;
+
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(HarnessError::ArtifactInvalidMetadata);
+        };
+        let name =
+            CString::new(name.as_bytes()).map_err(|_| HarnessError::ArtifactInvalidMetadata)?;
+        let final_component = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if final_component {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(HarnessError::ArtifactUnsafeSource);
+        }
+        let opened = unsafe { File::from_raw_fd(fd) };
+        if final_component {
+            if !opened.metadata()?.is_file() {
+                return Err(HarnessError::ArtifactUnsafeSource);
+            }
+            let opened_path = opened_file_path(&opened, &root.join(relative_path))?;
+            if !opened_path.starts_with(root) {
+                return Err(HarnessError::ArtifactOutsideAllowedRoots);
+            }
+            return Ok(opened);
+        }
+        directory = opened;
     }
+    Err(HarnessError::ArtifactUnsafeSource)
+}
+
+#[cfg(not(unix))]
+fn open_authorized_source(relative_path: &Path, root: &Path) -> Result<File> {
+    let mut path = root.to_path_buf();
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(HarnessError::ArtifactInvalidMetadata);
+    }
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(HarnessError::ArtifactInvalidMetadata);
+        };
+        path.push(name);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || (index + 1 == components.len() && !metadata.is_file())
+            || (index + 1 < components.len() && !metadata.is_dir())
+        {
+            return Err(HarnessError::ArtifactUnsafeSource);
+        }
+    }
+    let file = File::open(&path)?;
     let opened_path = opened_file_path(&file, &path)?;
     if !opened_path.starts_with(root) {
         return Err(HarnessError::ArtifactOutsideAllowedRoots);
@@ -1163,6 +1235,11 @@ mod tests {
         std::fs::write(&outside, b"secret").unwrap();
         let link = root.join("link.txt");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let outside_dir = temp.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("nested.txt"), b"nested secret").unwrap();
+        let intermediate_link = root.join("linked-dir");
+        std::os::unix::fs::symlink(&outside_dir, &intermediate_link).unwrap();
         let cfg = config(&root, &staging, &temp.path().join("outbox.json"));
         for output in [
             ArtifactOutput {
@@ -1176,6 +1253,12 @@ mod tests {
                 path: link,
                 media_type: "text/plain".to_owned(),
                 file_name: "link.txt".to_owned(),
+            },
+            ArtifactOutput {
+                authorization_id: "auth".to_owned(),
+                path: intermediate_link.join("nested.txt"),
+                media_type: "text/plain".to_owned(),
+                file_name: "nested.txt".to_owned(),
             },
             ArtifactOutput {
                 authorization_id: "auth".to_owned(),
@@ -1367,6 +1450,44 @@ mod tests {
         std::fs::write(temp.path().join("blocked"), b"not-a-directory").unwrap();
         assert!(durable.complete("key").is_err());
         assert_eq!(durable.pending().len(), 1);
+    }
+
+    #[test]
+    fn outbox_writer_never_persists_state_that_the_loader_rejects_for_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("outbox.json");
+        let mut outbox = ArtifactOutbox::load(path.clone()).unwrap();
+        let batch = PendingArtifactBatch {
+            idempotency_key: "near-limit".to_owned(),
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_message_ref: "message".to_owned(),
+            caption: None,
+            remaining_text: vec!["x".repeat(MAX_ARTIFACT_OUTBOX_BYTES as usize - 4096)],
+            artifacts: Vec::new(),
+        };
+        outbox.record(batch).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= MAX_ARTIFACT_OUTBOX_BYTES);
+        assert_eq!(
+            ArtifactOutbox::load(path.clone()).unwrap().pending().len(),
+            1
+        );
+
+        let oversized = PendingArtifactBatch {
+            idempotency_key: "overflow".to_owned(),
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_message_ref: "later-message".to_owned(),
+            caption: None,
+            remaining_text: vec!["overflow".repeat(1024)],
+            artifacts: Vec::new(),
+        };
+        assert!(matches!(
+            outbox.record(oversized),
+            Err(HarnessError::ArtifactLimitsExceeded)
+        ));
+        assert_eq!(outbox.pending().len(), 1);
+        assert_eq!(ArtifactOutbox::load(path).unwrap().pending().len(), 1);
     }
 
     #[test]
