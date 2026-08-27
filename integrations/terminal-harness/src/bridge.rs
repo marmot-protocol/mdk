@@ -408,9 +408,31 @@ fn classify_prompt(text: &str) -> PromptDisposition {
     }
 }
 
+fn is_inspect_disposition(disposition: &PromptDisposition) -> bool {
+    matches!(
+        disposition,
+        PromptDisposition::Usage(_)
+            | PromptDisposition::HarnessCommand(
+                ChatCommand::Help | ChatCommand::Status | ChatCommand::Pwd | ChatCommand::GoalShow
+            )
+    )
+}
+
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut permit: GroupPermit) {
     let mut inbound = inbound;
     let disposition = classify_prompt(&inbound.text);
+    if is_inspect_disposition(&disposition) {
+        match disposition {
+            PromptDisposition::HarnessCommand(command) => {
+                handle_command(&ctx, &inbound, command).await;
+            }
+            PromptDisposition::Usage(usage) => {
+                send_command_reply(&ctx, &inbound, usage).await;
+            }
+            _ => unreachable!("inspect dispositions are read-only commands or usage"),
+        }
+        return;
+    }
     let recovery_command = matches!(
         disposition,
         PromptDisposition::RetryLast | PromptDisposition::DiscardLast
@@ -1891,6 +1913,7 @@ mod tests {
             sessions,
             recovery,
             deliveries,
+            reconciliation_slot: ReconciliationSlot::new(),
             queues: Arc::new(GroupQueues::new(4)),
             dedupe: Arc::new(InboundDedupe::new(8)),
             backend,
@@ -1951,6 +1974,68 @@ mod tests {
         dispatch_test_message(ctx.clone(), "session-status", "/session-status").await;
 
         assert!(backend.invocations.lock().await.is_empty());
+        assert!(ctx.sessions.get("group").await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn inspect_commands_reply_while_recovery_fifo_is_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let (ctx, server) = test_context(root.path(), &home, backend.clone());
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    cwd: repo.clone(),
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(fifo_is_blocked(&ctx, "group").await);
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_test_message(ctx.clone(), "help", "/help"),
+        )
+        .await
+        .expect("blocked recovery must not park /help");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_test_message(ctx.clone(), "status", "/status"),
+        )
+        .await
+        .expect("blocked recovery must not park /status");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_test_message(ctx.clone(), "pwd", "/pwd"),
+        )
+        .await
+        .expect("blocked recovery must not park /pwd");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_test_message(ctx.clone(), "goal-show", "/goal"),
+        )
+        .await
+        .expect("blocked recovery must not park /goal show");
+
+        assert!(backend.invocations.lock().await.is_empty());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                dispatch_test_message(ctx.clone(), "cd", "/cd repo"),
+            )
+            .await
+            .is_err(),
+            "mutating commands still wait on the recovery FIFO"
+        );
         assert!(ctx.sessions.get("group").await.is_none());
         server.abort();
     }
@@ -2528,13 +2613,7 @@ mod tests {
         let store = SessionStore::load(home.join("sessions.json"), &home).unwrap();
         let recovery = RecoveryStore::load(home.join("recovery.json")).unwrap();
         store
-            .set(
-                "group1",
-                SessionRecord {
-                    session_id: "ses_stream".to_owned(),
-                    cwd: home.join("repo"),
-                },
-            )
+            .record_session("group1", "ses_stream".to_owned(), home.join("repo"))
             .await
             .unwrap();
 
