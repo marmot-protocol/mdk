@@ -1198,18 +1198,6 @@ impl<S: StorageProvider> Engine<S> {
                             .map(|seconds| seconds.unwrap_or(0)),
                     }
                 };
-                // Full-data forensic mode: surface the decrypted app content
-                // and authenticated author. Strictly gated — obfuscated mode
-                // never decodes or logs plaintext/author identities.
-                if self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData
-                    && let Some(decoded) = crate::audit_helpers::message_content_decoded_event(
-                        hex::encode(msg.id.as_slice()),
-                        &sender,
-                        &payload,
-                    )
-                {
-                    self.audit_group(&group_id, decoded);
-                }
                 let event = GroupEvent::MessageReceived {
                     group_id: group_id.clone(),
                     message_id: msg.id.clone(),

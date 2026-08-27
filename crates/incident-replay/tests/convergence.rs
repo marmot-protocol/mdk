@@ -40,6 +40,31 @@ fn recovers_a_committer_decided_two_branch_convergence() {
     assert_eq!(recovered.kind, ConvergenceDecisionKind::CommitterDecided);
 }
 
+#[test]
+fn recovers_a_safe_only_v3_convergence_decision() {
+    let json = r#"{
+      "events": [
+        {
+          "schema_version": "marmot-forensics-audit/v3",
+          "kind": {
+            "type": "convergence_decision",
+            "selected_branch_id": "win",
+            "decisive_rule": "tip_committer",
+            "candidates": [
+              { "branch_id": "win", "score": { "witness_quorum_met": false } },
+              { "branch_id": "lose", "score": { "witness_quorum_met": false } }
+            ],
+            "losing_branch_ids": ["lose"]
+          }
+        }
+      ]
+    }"#;
+
+    let recovered = recover(json).expect("recovers safe-only v3 decision");
+    assert_eq!(recovered.decisive_rule, "tip_committer");
+    assert_eq!(recovered.kind, ConvergenceDecisionKind::CommitterDecided);
+}
+
 /// A witness-decided contested convergence: `effective_commit_depth` decisive
 /// because both branches sit at equal valid depth and the winner's quorum boost
 /// broke the tie.

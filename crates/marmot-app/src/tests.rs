@@ -854,11 +854,8 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -1076,11 +1073,8 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -1207,11 +1201,8 @@ async fn armed_epoch_backfill(
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
             .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     app.relay_plane =
         MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
 
@@ -1900,11 +1891,8 @@ fn account_worker_services_local_command_after_duplicate_backfill_quantum() {
         let mut app =
             MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
                 .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -2828,11 +2816,8 @@ async fn armed_epoch_backfill_across_two_relays(
         config,
     )
     .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     app.relay_plane =
         MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
 
@@ -3245,11 +3230,8 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
 
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
@@ -3418,11 +3400,8 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
 
         let mut client = app.client("alice").await.unwrap();
         let group_id = client
@@ -3558,11 +3537,8 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
 
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
@@ -11898,11 +11874,8 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://escalation.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("escalation redelivery", &[])
@@ -11998,11 +11971,8 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://drain-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("drain arm ordering", &[])
@@ -12090,11 +12060,8 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://advance-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("advance arm ordering", &[])
@@ -12137,11 +12104,8 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://retry-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("retry arm ordering", &[])
@@ -12212,11 +12176,8 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://send-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("send arm ordering", &[]).await.unwrap();
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
@@ -12253,11 +12214,8 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://send-soft-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("send soft arm ordering", &[])
@@ -12721,11 +12679,8 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
             .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     app.relay_plane =
         MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
 
@@ -13006,11 +12961,8 @@ fn a_transport_deferred_delivery_is_still_marked_seen() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),

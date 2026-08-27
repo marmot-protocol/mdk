@@ -402,11 +402,6 @@ pub(crate) enum AccountWorkerCommand {
         enabled: bool,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
-    SetAuditDataMode {
-        mode: marmot_forensics::AuditDataMode,
-        reason: String,
-        respond: oneshot::Sender<Result<(), AppError>>,
-    },
     /// Count seeded groups the session has not fully hydrated yet, without
     /// promoting them on demand (mdk#1337 regression probe).
     #[cfg(test)]
@@ -3690,14 +3685,6 @@ async fn handle_account_worker_command(
             client.set_audit_recording(enabled);
             let _ = respond.send(Ok(()));
         }
-        AccountWorkerCommand::SetAuditDataMode {
-            mode,
-            reason,
-            respond,
-        } => {
-            client.set_audit_data_mode(mode, &reason);
-            let _ = respond.send(Ok(()));
-        }
     }
     // Publishing from this seam — rather than inside each send arm — keeps
     // every command path covered; the summary is empty for commands that
@@ -4902,11 +4889,8 @@ mod tests {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(AuditLogSettings { enabled: true })
+            .unwrap();
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
@@ -4994,11 +4978,8 @@ mod tests {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(AuditLogSettings { enabled: true })
+            .unwrap();
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client

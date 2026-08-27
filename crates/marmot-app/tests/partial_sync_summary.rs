@@ -108,10 +108,7 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     // cold second boot then drains exactly the application messages below.
     let app_bob_boot1 = open_store(&bob_dir, &relay_url, None);
     app_bob_boot1
-        .set_audit_log_settings(AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     {
         let mut bob_setup = app_bob_boot1.client("bob").await.unwrap();

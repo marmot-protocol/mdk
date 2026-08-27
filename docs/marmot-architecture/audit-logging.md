@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-08-06
+updated: 2026-08-27
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -12,8 +12,9 @@ This is a source-grounded inventory of the append-only JSONL audit logging used 
 It is intentionally separate from the privacy-safe telemetry/tracing surface described in
 [`telemetry.md`](./telemetry.md).
 
-Audit logs are sensitive local artifacts. They are opt-in, raw enough for incident reconstruction, and should not be
-treated like telemetry.
+Audit logs are opt-in forensic artifacts and should not be treated like telemetry. The current v3 model has one
+privacy-safe shape: it cannot represent decrypted application content, cleartext group-state values, full account or
+member identities, or arbitrary convergence-rule input/result JSON. There is no sensitive/full-data mode.
 
 ## Current status
 
@@ -21,16 +22,16 @@ treated like telemetry.
 | --- | --- |
 | Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed into each `AccountDeviceSession` only when app-level `AuditLogSettings.enabled` is true before that account session opens. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
-| File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v1`; the line-level JSON Schema is [`audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json). |
-| Local file location | `<account_dir>/audit-<engine_id>.jsonl` for app-opened account sessions. |
-| Upload/listing | App and UniFFI expose listing and explicit upload of local `audit-*.jsonl` files. Runtime can also post all local audit files to a configured tracker. |
+| File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v3`; the line-level JSON Schema is [`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json). |
+| Local file location | `<account_dir>/audit-<engine_id>-v3.jsonl` for app-opened account sessions. Existing v1/v2 files are not rewritten or appended to. |
+| Upload/listing | App and UniFFI expose listing and explicit upload of all local `audit-*.jsonl` files. Runtime tracker uploads continue to include existing v1/v2 files. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
 
 ## Source map
 
 | Area | Files |
 | --- | --- |
-| Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json) |
+| Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json) |
 | Engine recorder installation point | [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs), [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
@@ -86,7 +87,7 @@ When audit logging is enabled for an account session, `MarmotApp::open_account()
 | `audit-device-id` | Random 16 bytes, hex encoded, generated once per account directory and stored in `<account_dir>/audit-device-id`. | Input to `engine_id`; not included in JSONL events directly. |
 | `account_ref` | First 16 bytes of `SHA-256("marmot-audit-account-ref/v1" + account_id)`, hex encoded. | Top-level JSONL `account_ref`. |
 | `engine_id` | First 16 bytes of `SHA-256("marmot-audit-engine-id/v2" + account_id + device_id_hex)`, hex encoded. | Top-level JSONL `engine_id` and the file name. |
-| File path | `<account_dir>/audit-<engine_id>.jsonl`. | Listed and uploaded by app APIs. |
+| File path | `<account_dir>/audit-<engine_id>-v3.jsonl`. | Listed and uploaded by app APIs. |
 
 The generic schema helper `default_jsonl_path(dir, engine_id)` also returns `<dir>/audit-<engine_id>.jsonl`.
 
@@ -103,7 +104,7 @@ Each line serializes an `AuditEvent`:
 
 | Top-level field | Type | Present when | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | string | Always | Current value: `marmot-forensics-audit/v1`. |
+| `schema_version` | string | Always | Current value: `marmot-forensics-audit/v3`. |
 | `seq` | u64 | Always | Recorder-local sequence number. Starts at `0` for each `JsonlRecorder` opening and uses wrapping increment. |
 | `wall_time_ms` | u64 | Always | `SystemTime::now()` milliseconds since Unix epoch at record time. Falls back to `0` if system time is before epoch. |
 | `recorder_session_id` | string | Optional | Locally generated id for this recorder opening. Present for `JsonlRecorder` rows. |
@@ -117,7 +118,7 @@ Each line serializes an `AuditEvent`:
 
 ```json
 {
-  "schema_version": "marmot-forensics-audit/v1",
+  "schema_version": "marmot-forensics-audit/v3",
   "seq": 0,
   "wall_time_ms": 1700000000000,
   "recorder_session_id": "00000000000000000000018f2d0c1e2f000012340000000000000000",
@@ -157,7 +158,7 @@ Do not treat `seq` as globally unique. It is recorder-local and can reset after 
 prefer file hash plus line number, or raw line hash plus line number, for dedupe and indexing.
 
 The JSON Schema validates one `AuditEvent` object, not a whole JSONL file. JSONL/NDJSON consumers should parse each line
-independently against [`audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json)
+independently against [`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json)
 and retain the raw line for forward-compatible reprocessing.
 
 ### `context`
@@ -190,16 +191,16 @@ and retain the raw line for forward-compatible reprocessing.
 
 ## Event catalogue
 
-This catalogue is not yet complete. `AuditEventKind` currently has 46 variants, and these fifteen have no section
-here yet — treat `crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
-`audit_data_mode_changed`, `convergence_pass_discarded`, `epoch_stall_backfill_completed`,
+This catalogue is not yet complete. These event kinds have no section here yet — treat
+`crates/marmot-forensics/src/audit.rs` as authoritative until they are written up:
+`convergence_pass_discarded`, `epoch_stall_backfill_completed`,
 `epoch_stall_backfill_deferred`, `epoch_stall_backfill_failed`, `epoch_stall_backfill_started`,
-`group_hydration_quarantined`, `group_hydration_recovered`, `message_content_decoded`,
+`group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
 `sync_drain`, and `transport_received`.
 
 The authoritative catalogue is the `AuditEventKind` enum together with
-[`audit-log-event.v2.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v2.schema.json); the
+[`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json); the
 `audit_log_event_schema_tracks_kind_catalog` test keeps those two in lockstep.
 
 ### `recorder_started`
@@ -1234,7 +1235,8 @@ Recommended indexes for downstream ingestion:
 
 Recommended parser behavior:
 
-- Require `schema_version == "marmot-forensics-audit/v1"` for the current parser.
+- Dispatch parsers by `schema_version`; new rows use `marmot-forensics-audit/v3`, while retained v1/v2 files may still
+  be listed and uploaded.
 - Preserve the raw JSON line even when normalizing fields into columns.
 - Do not assume the following:
   - `seq` is globally unique.

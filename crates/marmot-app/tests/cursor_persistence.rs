@@ -201,10 +201,7 @@ async fn frozen_wake_collection_body() {
     // Enable forensic audit recording before any runtime starts; the setting
     // persists in the store, so boots 2 and 3 record as well.
     app_bob_boot1
-        .set_audit_log_settings(AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     {
         let mut bob_setup = app_bob_boot1.client("bob").await.unwrap();

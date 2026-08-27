@@ -168,9 +168,6 @@ pub use groups::{
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
 };
-/// Re-exported so FFI/CLI consumers can name the audit data mode without
-/// depending on `marmot-forensics` directly.
-pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
@@ -3466,9 +3463,9 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>.jsonl`. Sensitive mode — raw values.
-        // Temporary forensic measure; disable the setting and remove files when
-        // done debugging.
+        // `<account_dir>/audit-<engine_id>-v3.jsonl`. The v3 schema contains
+        // privacy-safe derived values only: obfuscated identifiers, digests,
+        // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::new(
             session_path,
             session_key,

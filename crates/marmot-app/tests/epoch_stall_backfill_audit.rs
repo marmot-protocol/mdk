@@ -270,10 +270,7 @@ async fn stalled_bob_in_a_live_group_with_config(
     // Enable forensic audit recording before any client opens; the setting
     // persists in the store so every client this account builds records.
     app_bob
-        .set_audit_log_settings(AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
+        .set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     {
         let mut bob_setup = app_bob.client("bob").await.unwrap();

@@ -8,39 +8,17 @@
 //!
 //! ## Privacy
 //!
-//! Audit events deliberately carry raw bytes (hex-encoded identifiers,
-//! envelope payload digests, and so on) — this is the "sensitive" forensic
-//! mode that bypasses the normal redaction discipline. The recorder is
-//! opt-in and intended for local debugging of group desync / fork incidents.
-//! Do not ship audit log files off-device unless you understand they expose
-//! group ids, message ids, and engine identity material.
+//! Audit events carry the obfuscated identifiers, digests, counts, and state
+//! transitions needed for incident reconstruction. They never carry decrypted
+//! message/app content, cleartext group-state values, or full account/member
+//! identities. The recorder is opt-in and intended for local debugging of
+//! group desync / fork incidents.
 //!
 //! ## Schema stability
 //!
 //! Every line is tagged with [`AUDIT_LOG_SCHEMA_VERSION`]. Bump the version
 //! when adding required fields; analyzers should reject unknown versions.
 //!
-//! ## Data modes
-//!
-//! Every line also carries an [`AuditDataMode`] recording how aggressively the
-//! producing recorder withheld sensitive content:
-//!
-//! - [`AuditDataMode::ObfuscatedSensitiveData`] — the default safety posture.
-//!   Identifiers are hashed/truncated and no plaintext, decoded content, or
-//!   full pubkeys appear.
-//! - [`AuditDataMode::FullData`] — an explicit opt-in that additionally emits
-//!   decrypted message/app content and full identifiers where useful.
-//!
-//! A recorder stamps its configured mode onto every event. Switching modes
-//! ([`ForensicRecorder::set_data_mode`]) rotates the backing store so each
-//! file has a single, unambiguous mode boundary.
-//!
-//! The obfuscated-mode contract is enforced at the sink, not just by producer
-//! convention: [`JsonlRecorder`]'s `record()` scrubs full-data-only fields
-//! (decoded payloads, full pubkeys/npubs) before serializing when the mode is
-//! [`AuditDataMode::ObfuscatedSensitiveData`], so a single producer bug cannot
-//! write them into a log that is expected to be safe to share.
-
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -50,26 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v2";
-
-/// How aggressively a recorder withholds sensitive content from its events.
-///
-/// Stamped onto every [`AuditEvent`] so an analyzer can tell, per line, which
-/// safety posture produced it without inspecting the whole file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuditDataMode {
-    /// Default/current safety posture. Identifiers are hashed or truncated;
-    /// no plaintext, decoded content, full author pubkeys, full group-state
-    /// values, or expected-recipient pubkeys are written.
-    #[default]
-    ObfuscatedSensitiveData,
-    /// Explicit opt-in. Additionally includes decrypted message/app content and
-    /// full identifiers where useful for forensic reconstruction. Never
-    /// includes bearer/upload tokens, auth headers, private keys, ciphertext,
-    /// or raw MLS bytes.
-    FullData,
-}
+pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v3";
 
 /// Hex-encoded 16-byte account identity hash. Stable across devices for the
 /// same account when the caller supplies it.
@@ -102,12 +61,6 @@ pub struct AuditEvent {
     pub schema_version: String,
     pub seq: u64,
     pub wall_time_ms: u64,
-    /// Safety posture the producing recorder used for this line. The recorder
-    /// always serializes it explicitly; the `default` only makes a truncated or
-    /// partially-written final line still deserialize as the safe (obfuscated)
-    /// mode rather than erroring.
-    #[serde(default)]
-    pub audit_data_mode: AuditDataMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorder_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,9 +115,8 @@ pub struct AuditEventContext {
 }
 
 /// Identifies the account/device/app that produced an audit log, for upload
-/// correlation. `account_pubkey_hex`/`account_npub` are full member identities
-/// and appear only in [`AuditDataMode::FullData`]; the labels are opaque,
-/// user-supplied display strings safe in both modes.
+/// correlation. Labels are opaque, user-supplied display strings; full account
+/// identities are never included.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditSourceContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,10 +133,6 @@ pub struct AuditSourceContext {
     pub app_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_trigger: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_pubkey_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_npub: Option<String>,
 }
 
 /// Correlates every row produced during one distributed-convergence run via a
@@ -307,7 +255,7 @@ pub struct AuditTransportContext {
 /// All fields are optional so any transport (and either direction) can populate
 /// only what it has. These are transport-layer identifiers (e.g. an ephemeral
 /// Nostr event pubkey), never the message author's account identity, so they
-/// are safe in both audit data modes. Never carries auth tokens, signatures,
+/// are safe for audit recording. Never carries auth tokens, signatures,
 /// ciphertext, or key material.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditTransportWire {
@@ -416,10 +364,8 @@ pub enum RecipientScope {
 }
 
 /// The set of recipients an outbound message is expected to reach, derived from
-/// authenticated group membership at send time. `expected_pubkeys_hex` carries
-/// full member identities and is only populated in
-/// [`AuditDataMode::FullData`]; `expected_member_refs` (salted hashes) and
-/// `expected_count` are safe in both modes.
+/// authenticated group membership at send time. Recipients are represented by
+/// salted member refs and an aggregate count, never full member identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecipientExpectation {
     pub artifact_kind: MessageArtifactKind,
@@ -430,8 +376,6 @@ pub struct RecipientExpectation {
     pub basis_commit_id: Option<MessageRefHex>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_member_refs: Vec<MemberRefHex>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expected_pubkeys_hex: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_count: Option<u64>,
 }
@@ -449,18 +393,16 @@ pub struct OutboundMessage {
 }
 
 /// One witness application message observed at a future epoch, used by the
-/// witness-quorum convergence rule. `sender_pubkey_hex` is full-data only.
+/// witness-quorum convergence rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergenceAppWitness {
     pub epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_ref: Option<MemberRefHex>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_pubkey_hex: Option<String>,
 }
 
 /// The score the selector computed for a convergence candidate. Mirrors the
-/// engine's `BranchScore`. `tip_committer_pubkey_hex` is full-data only.
+/// engine's `BranchScore` using only obfuscated identities and digests.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergenceScore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,8 +417,6 @@ pub struct ConvergenceScore {
     pub tip_priority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_committer_ref: Option<MemberRefHex>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tip_committer_pubkey_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_digest: Option<DigestHex>,
 }
@@ -500,8 +440,6 @@ pub struct ConvergenceCandidate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_committer_ref: Option<MemberRefHex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tip_committer_pubkey_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_anchor_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_input_time_ms: Option<u64>,
@@ -515,116 +453,13 @@ pub struct ConvergenceCandidate {
     pub app_witnesses: Vec<ConvergenceAppWitness>,
 }
 
-/// One selector rule evaluation, recording its inputs, result, and whether it
-/// was the decisive rule that picked the winner. `inputs`/`result` are free-form
-/// JSON so each rule can carry its own shape.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvergenceRuleEvaluation {
-    pub rule_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_branch_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub other_candidate_branch_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<serde_json::Value>,
-    pub result: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decisive: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_branch_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rejected_branch_id: Option<String>,
-}
-
-/// The authenticated author of a decoded message. `member_ref` (salted hash) is
-/// safe in both modes; the pubkeys/npub are full member identities and appear
-/// only in [`AuditDataMode::FullData`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessageAuthor {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member_ref: Option<MemberRefHex>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member_pubkey_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_pubkey_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub npub: Option<String>,
-}
-
-/// Decrypted payload bytes, rendered as text/JSON/base64. Full-data only — the
-/// producer must not construct this in obfuscated mode.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecodedPayload {
-    pub content_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub json: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes_b64: Option<String>,
-}
-
-/// Decoded inner application event (Marmot/Nostr-shaped). Full-data only.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecodedApplicationEvent {
-    pub format: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pubkey_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply_to_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_root_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<AttachmentMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<serde_json::Value>,
-}
-
-/// Attachment metadata decoded from an application event's tags. Non-secret
-/// descriptors only — never the attachment bytes or decryption keys.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachmentMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub component_id: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub byte_len: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digest: Option<DigestHex>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// The value of a group-state change. `digest`/`len` are safe in both modes;
-/// `text`/`json`/`pubkeys_hex` carry the cleartext value and appear only in
-/// [`AuditDataMode::FullData`].
+/// The value of a group-state change, represented only by a digest and length.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupStateValue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<DigestHex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub len: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub json: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pubkeys_hex: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,17 +476,6 @@ pub enum AuditEventKind {
     /// is carried on the enclosing [`AuditEvent::recorder_session_id`] rather
     /// than duplicated here.
     RecorderStarted { recorder: String },
-    /// The recorder's [`AuditDataMode`] changed. Emitted on the freshly-rotated
-    /// file so the boundary between modes is explicit. `recorder_restarted` is
-    /// `true` when the change rotated the backing store (always so for the
-    /// file-backed recorder).
-    AuditDataModeChanged {
-        previous_mode: AuditDataMode,
-        new_mode: AuditDataMode,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        recorder_restarted: Option<bool>,
-    },
     /// Engine/session settings that explain how later decisions should be read.
     EngineContext { context: AuditEngineContext },
     /// Group-scoped settings/state that may vary by group or over time.
@@ -726,20 +550,8 @@ pub enum AuditEventKind {
     /// Engine accepted a `SendIntent` at `do_send` entry.
     SendEntry { intent_kind: String },
     /// Identifies the account/device/app that produced this log. Emitted once
-    /// per recorder session; the cleartext account identity (`account_pubkey_hex`
-    /// / `account_npub`) is full-data only.
+    /// per recorder session using opaque source labels only.
     SourceContext { source: AuditSourceContext },
-    /// Decrypted message content surfaced after a successful MLS/app decode.
-    /// Full-data only — the producer must not emit this in obfuscated mode.
-    MessageContentDecoded {
-        msg_id: MessageRefHex,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        artifact_kind: Option<MessageArtifactKind>,
-        author: MessageAuthor,
-        decoded_payload: DecodedPayload,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        decoded_app_event: Option<DecodedApplicationEvent>,
-    },
     /// A per-message recipient expectation derived from authenticated group
     /// membership at send time: normal group messages/commits target all other
     /// current members; welcomes target only the added member.
@@ -869,11 +681,7 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor_member_ref: Option<MemberRefHex>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor_pubkey_hex: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         subject_member_ref: Option<MemberRefHex>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subject_pubkey_hex: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_commit_id: Option<MessageRefHex>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -938,15 +746,18 @@ pub enum AuditEventKind {
         error_kind: Option<String>,
     },
     /// `select_canonical_branch` evaluated a candidate set. Carries every
-    /// candidate with its score, the full `rule_trace` (each selector rule and
-    /// which one was decisive), the selected branch, and the losing branches.
+    /// candidate with its safe score summary, the selected branch, and the
+    /// losing branches.
     ConvergenceDecision {
         current_tip_epoch: u64,
         max_rewind_commits: u64,
         // Always serialized (schema-required), even when empty.
         candidates: Vec<ConvergenceCandidate>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        rule_trace: Vec<ConvergenceRuleEvaluation>,
+        /// Name of the first selector rule that distinguished the winner.
+        /// This preserves the useful scalar outcome without retaining the
+        /// former free-form rule input/value trace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decisive_rule: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected_branch_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1026,9 +837,8 @@ pub enum AuditEventKind {
     /// Privacy: `relay_results` carries relay URLs. This is deliberate and
     /// mirrors the existing publish-path kinds — [`AuditEventKind::PublishAttempt`]
     /// and [`AuditEventKind::PublishOutcome`] already carry `relay_url` /
-    /// `relay_urls` / `accepted_relay_urls`, and [`scrub_full_data_fields`]
-    /// leaves those relay fields untouched even in obfuscated mode. The forensic
-    /// audit channel is a consented, sensitivity-classified surface, distinct
+    /// `relay_urls` / `accepted_relay_urls`. The forensic audit channel is a
+    /// consented operational surface, distinct
     /// from the tracing/logging invariant that forbids relay URLs in logs; so
     /// rebuild rows carry the same relay identifiers the publish rows already do
     /// rather than being the odd kind out. The URLs are caller-supplied
@@ -1058,7 +868,7 @@ pub enum AuditEventKind {
     /// are `_secs`; `duration_ms` is a genuine millisecond wall-clock duration.
     ///
     /// Privacy: scalar counts and timestamps only — no relay URLs, ids, or
-    /// payloads — so nothing here needs scrubbing in either data mode.
+    /// payloads.
     SyncDrain {
         duration_ms: u64,
         deliveries: u64,
@@ -1105,9 +915,8 @@ pub enum AuditEventKind {
     /// export is self-describing when the constant is retuned across builds.
     ///
     /// Privacy: scalar counts plus a closed trigger enum only — no ids, relay
-    /// URLs, message ids, or payloads — so nothing here needs scrubbing in
-    /// either [`AuditDataMode`]. `trigger` is optional only so existing v2 rows
-    /// emitted before this field was added remain readable.
+    /// URLs, message ids, or payloads. `trigger` is optional only so existing v2
+    /// rows emitted before this field was added remain readable.
     EpochStallBackfillArmed {
         stalled_epoch: u64,
         threshold: u64,
@@ -1219,7 +1028,7 @@ pub enum AuditEventKind {
     /// epoch the device sat at when the escalating arm fired.
     ///
     /// Privacy: three scalar counts only — no ids, relay URLs, message ids, or
-    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
+    /// payloads.
     EpochStallBackfillEscalated {
         stalled_epoch: u64,
         arms: u64,
@@ -1236,8 +1045,7 @@ pub enum AuditEventKind {
     /// scheduling state was dropped.
     ///
     /// Group-scoped through the enclosing [`AuditEvent::group_ref`]; three scalar
-    /// epochs/counters only, so nothing here needs scrubbing in either
-    /// [`AuditDataMode`].
+    /// epochs/counters only.
     ConvergencePassDiscarded {
         stale_base_epoch: u64,
         current_tip_epoch: u64,
@@ -1253,7 +1061,6 @@ impl AuditEventKind {
     pub fn type_tag(&self) -> &'static str {
         match self {
             AuditEventKind::RecorderStarted { .. } => "recorder_started",
-            AuditEventKind::AuditDataModeChanged { .. } => "audit_data_mode_changed",
             AuditEventKind::EngineContext { .. } => "engine_context",
             AuditEventKind::GroupContext { .. } => "group_context",
             AuditEventKind::RecorderHealth { .. } => "recorder_health",
@@ -1263,7 +1070,6 @@ impl AuditEventKind {
             AuditEventKind::IngestOutcome { .. } => "ingest_outcome",
             AuditEventKind::IngestError { .. } => "ingest_error",
             AuditEventKind::SourceContext { .. } => "source_context",
-            AuditEventKind::MessageContentDecoded { .. } => "message_content_decoded",
             AuditEventKind::RecipientExpectation { .. } => "recipient_expectation",
             AuditEventKind::SendEntry { .. } => "send_entry",
             AuditEventKind::SendOutcome { .. } => "send_outcome",
@@ -1322,7 +1128,7 @@ pub struct PublishRelayFailure {
 /// [`AuditEventKind::SubscriptionRebuild`]. `relay_url` is the caller-supplied
 /// subscription endpoint; `accepted` is whether the relay acknowledged the
 /// subscription registration. See the kind doc for why the relay URL is carried
-/// here (publish-kind precedent, not scrubbed in obfuscated mode).
+/// here (publish-kind precedent).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayRegistration {
     pub relay_url: String,
@@ -1381,24 +1187,6 @@ pub trait ForensicRecorder: Send + Sync {
     fn rotate(&self) -> std::io::Result<()> {
         Ok(())
     }
-
-    /// The [`AuditDataMode`] this recorder stamps onto every event.
-    fn data_mode(&self) -> AuditDataMode {
-        AuditDataMode::default()
-    }
-
-    /// Switch the recorder's [`AuditDataMode`].
-    ///
-    /// On a real change this rotates the backing store so the file carries a
-    /// single, unambiguous mode, then records an
-    /// [`AuditEventKind::AuditDataModeChanged`] boundary row on the fresh file.
-    /// When the requested mode already matches the current one this is a no-op
-    /// (no spurious rotation). The default is a no-op for recorders with no
-    /// mode or rotatable backing store.
-    fn set_data_mode(&self, new_mode: AuditDataMode, reason: &str) -> std::io::Result<()> {
-        let _ = (new_mode, reason);
-        Ok(())
-    }
 }
 
 /// Default recorder. Drops every event without observable side effects.
@@ -1431,7 +1219,6 @@ struct JsonlInner {
     account_ref: Option<AccountRefHex>,
     engine_id: EngineIdHex,
     recorder_session_id: String,
-    data_mode: AuditDataMode,
     health: AuditRecorderHealthSnapshot,
 }
 
@@ -1452,33 +1239,18 @@ impl JsonlRecorder {
         Self::open_with_account_ref(path, engine_id, None)
     }
 
-    /// Open a recorder in the default [`AuditDataMode::ObfuscatedSensitiveData`]
-    /// posture. To start in another mode use [`open_with_data_mode`].
-    ///
-    /// [`open_with_data_mode`]: Self::open_with_data_mode
+    /// Open a recorder with an optional obfuscated account reference.
     pub fn open_with_account_ref(
         path: impl AsRef<Path>,
         engine_id: EngineIdHex,
         account_ref: Option<AccountRefHex>,
     ) -> std::io::Result<Self> {
-        Self::open_with_data_mode(path, engine_id, account_ref, AuditDataMode::default())
-    }
-
-    /// Open a recorder that stamps `data_mode` onto every event.
-    pub fn open_with_data_mode(
-        path: impl AsRef<Path>,
-        engine_id: EngineIdHex,
-        account_ref: Option<AccountRefHex>,
-        data_mode: AuditDataMode,
-    ) -> std::io::Result<Self> {
         if let Some(account_ref) = account_ref.as_deref() {
             validate_account_ref_hex(account_ref)?;
         }
         let path = path.as_ref().to_path_buf();
-        // Owner-only from creation: in FullData mode this file carries
-        // decrypted content and full identifiers, so it must never exist at
-        // umask-default permissions. Pre-existing permissive files are
-        // tightened by the helper.
+        // Audit files are private local operational artifacts. Create them
+        // owner-only and tighten pre-existing permissive files.
         let file = fs_private::open_private_append(&path)?;
         let recorder_session_id = generate_recorder_session_id();
         let recorder = Self {
@@ -1489,7 +1261,6 @@ impl JsonlRecorder {
                 account_ref,
                 engine_id,
                 recorder_session_id,
-                data_mode,
                 health: AuditRecorderHealthSnapshot::default(),
             }),
         };
@@ -1547,95 +1318,6 @@ fn stamp_system_human_action(
     Some(context)
 }
 
-/// Enforce the obfuscated-mode redaction contract at the sink.
-///
-/// `record()` is the single chokepoint every producer writes through, so
-/// scrubbing here means one producer bug (or a future caller unaware of the
-/// contract) cannot write full-data-only material — decrypted content, full
-/// author/subject pubkeys, npubs — into an obfuscated-mode audit log that is
-/// expected to be safe to share. Obfuscated-safe siblings (salted member refs,
-/// digests, lengths, counts) are kept, so a scrubbed row stays useful and the
-/// producer bug stays visible to analyzers.
-fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditEventContext>) {
-    if let Some(context) = context.as_mut()
-        && let Some(source) = context.source.as_mut()
-    {
-        scrub_source_context(source);
-    }
-    match kind {
-        AuditEventKind::SourceContext { source } => scrub_source_context(source),
-        AuditEventKind::MessageContentDecoded {
-            author,
-            decoded_payload,
-            decoded_app_event,
-            ..
-        } => {
-            author.member_pubkey_hex = None;
-            author.account_pubkey_hex = None;
-            author.npub = None;
-            decoded_payload.text = None;
-            decoded_payload.json = None;
-            decoded_payload.bytes_b64 = None;
-            *decoded_app_event = None;
-        }
-        AuditEventKind::RecipientExpectation { expectation, .. } => {
-            expectation.expected_pubkeys_hex.clear();
-        }
-        AuditEventKind::SendOutcome {
-            outbound_messages, ..
-        }
-        | AuditEventKind::CreateGroupOutcome {
-            outbound_messages, ..
-        } => {
-            for message in outbound_messages {
-                if let Some(expectation) = message.recipient_expectation.as_mut() {
-                    expectation.expected_pubkeys_hex.clear();
-                }
-            }
-        }
-        AuditEventKind::GroupStateChanged {
-            actor_pubkey_hex,
-            subject_pubkey_hex,
-            value,
-            ..
-        } => {
-            *actor_pubkey_hex = None;
-            *subject_pubkey_hex = None;
-            if let Some(value) = value.as_mut() {
-                value.text = None;
-                value.json = None;
-                value.pubkeys_hex.clear();
-            }
-        }
-        AuditEventKind::ConvergenceDecision {
-            candidates,
-            rule_trace,
-            ..
-        } => {
-            for candidate in candidates {
-                candidate.tip_committer_pubkey_hex = None;
-                if let Some(score) = candidate.score.as_mut() {
-                    score.tip_committer_pubkey_hex = None;
-                }
-                for witness in &mut candidate.app_witnesses {
-                    witness.sender_pubkey_hex = None;
-                }
-            }
-            // Rule inputs/results are intentionally free-form JSON, so the
-            // sink cannot prove that arbitrary future producer fields contain
-            // no full identities. Keep the typed, scrubbed candidate summary
-            // and omit the untyped trace in shareable obfuscated logs.
-            rule_trace.clear();
-        }
-        _ => {}
-    }
-}
-
-fn scrub_source_context(source: &mut AuditSourceContext) {
-    source.account_pubkey_hex = None;
-    source.account_npub = None;
-}
-
 impl ForensicRecorder for JsonlRecorder {
     fn record(&self, record: AuditRecord) {
         // Poisoning means a prior `record()` panicked while holding the lock.
@@ -1651,11 +1333,8 @@ impl ForensicRecorder for JsonlRecorder {
         };
         let seq = inner.seq;
         inner.seq = seq.wrapping_add(1);
-        let mut kind = record.kind;
-        let mut context = stamp_system_human_action(record.context, &kind);
-        if inner.data_mode == AuditDataMode::ObfuscatedSensitiveData {
-            scrub_full_data_fields(&mut kind, &mut context);
-        }
+        let kind = record.kind;
+        let context = stamp_system_human_action(record.context, &kind);
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
             seq,
@@ -1663,7 +1342,6 @@ impl ForensicRecorder for JsonlRecorder {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
-            audit_data_mode: inner.data_mode,
             recorder_session_id: Some(inner.recorder_session_id.clone()),
             account_ref: inner.account_ref.clone(),
             engine_id: inner.engine_id.clone(),
@@ -1705,53 +1383,10 @@ impl ForensicRecorder for JsonlRecorder {
             };
             self.swap_to_fresh_file(&mut inner)?;
         }
-        // Mark the start of the fresh file, mirroring `open_with_data_mode`.
+        // Mark the start of the fresh file, mirroring `open_with_account_ref`.
         // `record` re-acquires the lock, so this runs after the guard is
         // dropped above.
         self.record(AuditRecord::new(None, recorder_started_kind()));
-        Ok(())
-    }
-
-    fn data_mode(&self) -> AuditDataMode {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .data_mode
-    }
-
-    fn set_data_mode(&self, new_mode: AuditDataMode, reason: &str) -> std::io::Result<()> {
-        let previous_mode = {
-            let mut inner = match self.inner.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let previous_mode = inner.data_mode;
-            // No real change: leave the current file (and its single mode)
-            // intact rather than inserting a spurious boundary.
-            if previous_mode == new_mode {
-                return Ok(());
-            }
-            // Swap before applying the mode: a failed swap must leave the
-            // recorder in its previous mode, still appending to the original
-            // file, so no records are lost and the call is retryable. The
-            // fresh file is still stamped entirely with `new_mode` because
-            // both steps happen under the lock, before any row lands on it.
-            self.swap_to_fresh_file(&mut inner)?;
-            inner.data_mode = new_mode;
-            previous_mode
-        };
-        // Boundary rows on the fresh file: the `recorder_started` marker
-        // followed by the mode-change record, both stamped with `new_mode`.
-        self.record(AuditRecord::new(None, recorder_started_kind()));
-        self.record(AuditRecord::new(
-            None,
-            AuditEventKind::AuditDataModeChanged {
-                previous_mode,
-                new_mode,
-                reason: reason.to_string(),
-                recorder_restarted: Some(true),
-            },
-        ));
         Ok(())
     }
 }
@@ -1761,10 +1396,8 @@ impl JsonlRecorder {
     /// path, resetting the sequence, recorder session id, and health counters.
     /// The fresh file is staged as an owner-only sibling and renamed over the
     /// live path, so any failure leaves the original file, writer fd, seq,
-    /// session id, and data mode untouched and still recording. The caller
-    /// must hold the inner lock; the data mode is left untouched so both
-    /// [`rotate`](ForensicRecorder::rotate) and
-    /// [`set_data_mode`](ForensicRecorder::set_data_mode) can reuse it.
+    /// session id, and health state untouched and still recording. The caller
+    /// must hold the inner lock.
     fn swap_to_fresh_file(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
         // Best-effort flush of whatever is buffered into the file we are about
         // to discard.

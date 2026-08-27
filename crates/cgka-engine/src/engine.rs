@@ -1070,9 +1070,8 @@ impl<S: StorageProvider> Engine<S> {
     /// Compute per-message recipient expectations for a completed send/create,
     /// derived from authenticated membership: the main message (commit, app
     /// message, or proposal) targets all OTHER current group members; each
-    /// welcome targets only its added member. Full member pubkeys are included
-    /// only in [`AuditDataMode::FullData`]; member refs (salted hashes) and
-    /// counts are always safe.
+    /// welcome targets only its added member. Recipients are represented only by
+    /// salted member refs and aggregate counts.
     fn recipient_expectation_records(
         &self,
         group_id: &GroupId,
@@ -1084,7 +1083,6 @@ impl<S: StorageProvider> Engine<S> {
         use cgka_traits::transport::TransportEnvelope;
         use marmot_forensics::{MessageArtifactKind, RecipientExpectation, RecipientScope};
 
-        let full_data = self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData;
         let membership_epoch = self
             .audit_group_context_snapshot(group_id)
             .and_then(|ctx| ctx.epoch);
@@ -1105,15 +1103,6 @@ impl<S: StorageProvider> Engine<S> {
             let self_id = self.identity.self_id();
             let members = self.do_members(group_id).unwrap_or_default();
             let others: Vec<_> = members.iter().filter(|m| &m.id != self_id).collect();
-            let expected_pubkeys_hex = if full_data {
-                others
-                    .iter()
-                    .filter(|m| m.credential.len() == 32)
-                    .map(|m| hex::encode(&m.credential))
-                    .collect()
-            } else {
-                Vec::new()
-            };
             rows.push((
                 hex::encode(msg.id.as_slice()),
                 RecipientExpectation {
@@ -1125,7 +1114,6 @@ impl<S: StorageProvider> Engine<S> {
                         .iter()
                         .map(|m| crate::audit_helpers::member_ref_hex(&m.id))
                         .collect(),
-                    expected_pubkeys_hex,
                     expected_count: Some(others.len() as u64),
                 },
             ));
@@ -1142,20 +1130,12 @@ impl<S: StorageProvider> Engine<S> {
                 TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
                 TransportEnvelope::GroupMessage { .. } => None,
             };
-            let (expected_member_refs, expected_pubkeys_hex, expected_count) = match &recipient {
-                Some(recipient) => {
-                    let pubkeys = if full_data && recipient.as_slice().len() == 32 {
-                        vec![hex::encode(recipient.as_slice())]
-                    } else {
-                        Vec::new()
-                    };
-                    (
-                        vec![crate::audit_helpers::member_ref_hex(recipient)],
-                        pubkeys,
-                        Some(1),
-                    )
-                }
-                None => (Vec::new(), Vec::new(), None),
+            let (expected_member_refs, expected_count) = match &recipient {
+                Some(recipient) => (
+                    vec![crate::audit_helpers::member_ref_hex(recipient)],
+                    Some(1),
+                ),
+                None => (Vec::new(), None),
             };
             rows.push((
                 hex::encode(welcome.id.as_slice()),
@@ -1165,7 +1145,6 @@ impl<S: StorageProvider> Engine<S> {
                     membership_epoch,
                     basis_commit_id: None,
                     expected_member_refs,
-                    expected_pubkeys_hex,
                     expected_count,
                 },
             ));
@@ -2551,18 +2530,6 @@ impl<S: StorageProvider> Engine<S> {
     /// begin a fresh one, then keep recording. No-op for non-file recorders.
     pub fn rotate_audit_recorder(&self) -> std::io::Result<()> {
         self.recorder.rotate()
-    }
-
-    /// Switch the installed forensic recorder's [`AuditDataMode`] in place. On a
-    /// real change a file-backed recorder rotates so the file carries a single,
-    /// unambiguous mode and writes an `audit_data_mode_changed` boundary row.
-    /// No-op for the [`NoopRecorder`] or when the mode is unchanged.
-    pub fn set_audit_recorder_data_mode(
-        &self,
-        mode: marmot_forensics::AuditDataMode,
-        reason: &str,
-    ) -> std::io::Result<()> {
-        self.recorder.set_data_mode(mode, reason)
     }
 
     /// Override the deferred-peel retry budget (mdk#339). Rows that
