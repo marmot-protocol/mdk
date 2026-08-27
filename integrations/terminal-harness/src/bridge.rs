@@ -494,7 +494,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             let mut delivered_chunks = 0usize;
             let mut delivery_failed = false;
             let artifact_delivery_attempted = artifact_setup_failed || !artifact_outputs.is_empty();
-            let artifacts_delivered = if artifact_setup_failed {
+            let artifact_delivery = if artifact_setup_failed {
                 let _ = send_artifact_failure_activity(
                     &ctx,
                     &inbound,
@@ -502,7 +502,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                     "rejected because the connector could not initialize its private export state",
                 )
                 .await;
-                false
+                ArtifactDeliveryOutcome::FallbackAllowed
             } else if !artifact_outputs.is_empty() {
                 if let Some(authorization) = artifact_authorization.as_ref() {
                     deliver_artifact_outputs(
@@ -521,13 +521,15 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                         "rejected because this group has no active artifact grant",
                     )
                     .await;
-                    false
+                    ArtifactDeliveryOutcome::FallbackAllowed
                 }
             } else {
-                false
+                ArtifactDeliveryOutcome::FallbackAllowed
             };
 
-            if !artifact_delivery_attempted || !artifacts_delivered {
+            if !artifact_delivery_attempted
+                || matches!(artifact_delivery, ArtifactDeliveryOutcome::FallbackAllowed)
+            {
                 'messages: for text in &buffered_text {
                     for chunk in split_reply_chunks(text, ctx.cfg.max_reply_bytes) {
                         delivered_chunks += 1;
@@ -549,12 +551,12 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 }
             }
             let terminal_delivery_count = if artifact_delivery_attempted {
-                // The activity event is terminal for an artifact-only failure; completed text,
-                // when present, is still delivered exactly once as ordinary text-only finals.
-                1 + if artifacts_delivered {
-                    0
-                } else {
+                // Preflight failures may fall back to completed text. Once a durable media
+                // intent exists, the activity is the only terminal event until retry succeeds.
+                1 + if matches!(artifact_delivery, ArtifactDeliveryOutcome::FallbackAllowed) {
                     delivered_chunks
+                } else {
+                    0
                 }
             } else {
                 delivered_chunks
@@ -624,13 +626,20 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactDeliveryOutcome {
+    Delivered,
+    FallbackAllowed,
+    Pending,
+}
+
 async fn deliver_artifact_outputs(
     ctx: &Arc<BridgeContext>,
     inbound: &InboundPrompt,
     authorization: &crate::artifacts::ArtifactAuthorization,
     caption: Option<String>,
     outputs: &[ArtifactOutput],
-) -> bool {
+) -> ArtifactDeliveryOutcome {
     let batch = match stage_artifacts(
         &ctx.cfg.artifact_exports,
         ArtifactDeliveryContext {
@@ -668,7 +677,7 @@ async fn deliver_artifact_outputs(
                 _ => "rejected by the connector safety policy",
             };
             let _ = send_artifact_failure_activity(ctx, inbound, outputs.len(), reason).await;
-            return false;
+            return ArtifactDeliveryOutcome::FallbackAllowed;
         }
     };
 
@@ -690,13 +699,13 @@ async fn deliver_artifact_outputs(
         for artifact in batch.artifacts {
             let _ = std::fs::remove_file(artifact.path);
         }
-        return false;
+        return ArtifactDeliveryOutcome::FallbackAllowed;
     }
 
     match send_pending_artifact_batch(ctx, &batch).await {
         Ok(()) => {
             complete_artifact_batch(ctx, &batch.idempotency_key).await;
-            true
+            ArtifactDeliveryOutcome::Delivered
         }
         Err(err) => {
             if err.artifact_validation_failed() {
@@ -715,7 +724,7 @@ async fn deliver_artifact_outputs(
                 "is pending automatic retry after a delivery failure"
             };
             let _ = send_artifact_failure_activity(ctx, inbound, outputs.len(), reason).await;
-            false
+            ArtifactDeliveryOutcome::Pending
         }
     }
 }
@@ -1327,6 +1336,8 @@ mod tests {
         invented_authorization: bool,
     }
 
+    static ARTIFACT_DELIVERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[async_trait::async_trait]
     impl Backend for NoopBackend {
         async fn run(
@@ -1516,6 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn collector_routes_artifact_success_and_failure_without_duplicate_finals() {
+        let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
         let mixed_success = run_artifact_delivery_case(Some("completed text"), false).await;
         let agent_control::AgentControlRequest::SendMedia {
             attachments,
@@ -1555,6 +1567,140 @@ mod tests {
             artifact_only_failure[0],
             agent_control::AgentControlRequest::SendAgentActivity { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn send_media_failure_stays_pending_without_text_final_and_reuses_idempotency() {
+        let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let export_root = root.path().join("exports");
+        std::fs::create_dir(&export_root).unwrap();
+        std::fs::write(export_root.join("report.pdf"), b"report").unwrap();
+
+        let socket = root.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for request_index in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let request: agent_control::AgentControlEnvelope<
+                    agent_control::AgentControlRequest,
+                > = agent_control::read_envelope(&mut reader)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response = match (request_index, &request.payload) {
+                    (0, agent_control::AgentControlRequest::SendMedia { .. }) => {
+                        agent_control::AgentControlResponse::Error {
+                            code: "temporary_failure".to_owned(),
+                            message: "retry later".to_owned(),
+                        }
+                    }
+                    (1, agent_control::AgentControlRequest::SendAgentActivity { .. }) => {
+                        agent_control::AgentControlResponse::AppEventSent {
+                            message_ids_hex: vec!["activity".to_owned()],
+                            maintenance_disposition: Default::default(),
+                        }
+                    }
+                    (2, agent_control::AgentControlRequest::SendMedia { .. }) => {
+                        agent_control::AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["sent".to_owned()],
+                            maintenance_disposition: Default::default(),
+                        }
+                    }
+                    other => panic!("unexpected request order: {other:?}"),
+                };
+                agent_control::write_frame(
+                    &mut write_half,
+                    &agent_control::AgentControlEnvelope::request(request.id.clone(), response),
+                )
+                .await
+                .unwrap();
+                requests.push(request.payload);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected text final or duplicate terminal request"
+            );
+            requests
+        });
+
+        let mut config = test_config(root.path());
+        config.socket = socket.clone();
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            vec![crate::ArtifactExportGrant {
+                group_id_hex: "group".to_owned(),
+                export_root: export_root.clone(),
+                ttl_seconds: 300,
+            }],
+            root.path().join("staging"),
+            root.path().join("outbox.json"),
+        );
+        let sessions = SessionStore::load(config.state_path.clone(), root.path()).unwrap();
+        let ctx = Arc::new(BridgeContext {
+            cfg: Arc::new(config),
+            client: ControlClient::new(socket, None, Duration::from_secs(2), "wn-test"),
+            account_ref: "account".to_owned(),
+            sessions: Arc::new(sessions),
+            queues: Arc::new(GroupQueues::new(1)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: Arc::new(ScriptedArtifactBackend {
+                text: Some("completed text".to_owned()),
+                file_names: vec!["report.pdf".to_owned()],
+                invented_authorization: false,
+            }),
+            outbox: Arc::new(Mutex::new(
+                ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
+            )),
+            home: root.path().to_path_buf(),
+        });
+        let permit = ctx.queues.try_enter("group").await.unwrap();
+        handle_message(
+            ctx.clone(),
+            InboundPrompt {
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                message_ref: "message".to_owned(),
+                text: "create artifact".to_owned(),
+            },
+            permit,
+        )
+        .await;
+        assert_eq!(ctx.outbox.lock().await.pending().len(), 1);
+        retry_pending_artifacts(&ctx).await;
+
+        let requests = server.await.unwrap();
+        let agent_control::AgentControlRequest::SendMedia {
+            idempotency_key: first_key,
+            caption: first_caption,
+            ..
+        } = &requests[0]
+        else {
+            panic!("expected initial send_media");
+        };
+        assert_eq!(first_caption.as_deref(), Some("completed text"));
+        assert!(matches!(
+            requests[1],
+            agent_control::AgentControlRequest::SendAgentActivity { .. }
+        ));
+        let agent_control::AgentControlRequest::SendMedia {
+            idempotency_key: retry_key,
+            caption: retry_caption,
+            ..
+        } = &requests[2]
+        else {
+            panic!("expected retry send_media");
+        };
+        assert_eq!(retry_caption, first_caption);
+        assert_eq!(retry_key, first_key);
+        assert!(ctx.outbox.lock().await.pending().is_empty());
     }
 
     #[tokio::test]
