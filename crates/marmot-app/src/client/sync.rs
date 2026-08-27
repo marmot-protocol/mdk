@@ -2714,7 +2714,19 @@ impl AppClient {
                             SyncFailureStage::Unknown,
                         )
                     })? {
-                    EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
+                    EpochBackfillRunOutcome::Completed(mut summary) => {
+                        if self.delivery_overflow_recovery_pending {
+                            self.recover_delivery_overflow_and_merge(&mut summary)
+                                .await?;
+                            if self.delivery_overflow_recovery_pending {
+                                return Err(incomplete_full_history_repair(
+                                    summary,
+                                    DrainVerdict::Overflow,
+                                ));
+                            }
+                        }
+                        return Ok(summary);
+                    }
                     // The intent's own replay could not confirm it served this
                     // account's history. Retain what it did ingest and fall
                     // through to the caller-directed unfloored repair below
@@ -3963,6 +3975,7 @@ mod tests {
             DrainVerdict::EoseTimeout,
             DrainVerdict::NovelProgressQuantumYield,
             DrainVerdict::NoProgressQuantumYield,
+            DrainVerdict::Overflow,
         ] {
             let partial = SyncSummary {
                 joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
