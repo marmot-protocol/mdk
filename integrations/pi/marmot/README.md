@@ -105,6 +105,15 @@ On the first message in a group, use `/<path>` to select a working directory
 under `$HOME`, using the same picker rules as `wn-opencode`. Subsequent prompts
 resume that group's Pi session.
 
+## Chat Commands
+
+Pi's non-interactive interface does not expand interactive slash commands. The
+shared harness answers its own reserved commands, including `/help`, `/status`,
+`/pwd`, `/cd`, `/new`, `/reset-session`, and `/goal`, before Pi is invoked. Send
+`/help` in a chat to list them; the full table and the `//` literal escape are
+documented in the
+[shared chat-command reference](../../terminal-harness/README.md#chat-commands).
+
 ## Configuration
 
 | Environment variable | Default | Meaning |

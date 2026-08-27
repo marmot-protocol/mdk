@@ -792,6 +792,36 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group_id)
     }
 
+    /// Originating stored commit for a live pending publication.
+    pub fn pending_origin_message_id(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<MessageId, EngineError> {
+        self.pending_group_id(pending)?;
+        self.peek_pending_origin_commit(pending)
+            .ok_or(EngineError::UnknownPending)
+    }
+
+    /// Durable fanout discriminator for a live pending publication.
+    pub fn pending_fanout_kind(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<cgka_traits::FanoutPendingKind, EngineError> {
+        self.pending_group_id(pending)?;
+        match self.epoch_manager.kind_for_pending(pending) {
+            Some(crate::epoch_manager::PendingKind::CreateGroup) => {
+                Ok(cgka_traits::FanoutPendingKind::CreateGroup)
+            }
+            Some(crate::epoch_manager::PendingKind::GroupEvolution) => {
+                Ok(cgka_traits::FanoutPendingKind::GroupEvolution)
+            }
+            Some(crate::epoch_manager::PendingKind::Disband) => {
+                Ok(cgka_traits::FanoutPendingKind::Disband)
+            }
+            None => Err(EngineError::UnknownPending),
+        }
+    }
+
     /// Confirm MLS and persist the matching fanout's terminal MLS edge in the
     /// same backend transaction.
     pub async fn confirm_published_fanout(
@@ -1645,16 +1675,37 @@ impl<S: StorageProvider> Engine<S> {
             // Validate the fanout's origin-commit row still resolves to a
             // stored OpenMLS wire message before restoring the pending
             // lifecycle around it.
+            let origin_message_id = fanout.pending_origin_message_id().cloned();
+            let stored_message_id = origin_message_id
+                .as_ref()
+                .unwrap_or_else(|| fanout.message_id());
             let stored = self
                 .storage
-                .get_message(fanout.message_id())
+                .get_message(stored_message_id)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
             let payload = StoredMessagePayload::decode(&stored.payload)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            if payload.as_openmls_wire().is_none() {
+            let valid_origin = if origin_message_id.is_some() {
+                payload.as_openmls_wire().is_some()
+            } else {
+                payload
+                    .as_outbound_welcome()
+                    .or_else(|| payload.as_raw_transport())
+                    .is_some_and(|message| {
+                        matches!(message.envelope, TransportEnvelope::Welcome { .. })
+                    })
+            };
+            if !valid_origin {
                 return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
             }
-            Some((pending_ref, prior_epoch, fanout.message_id().clone()))
+            Some((
+                pending_ref,
+                prior_epoch,
+                origin_message_id,
+                fanout
+                    .pending_kind()
+                    .unwrap_or(cgka_traits::FanoutPendingKind::GroupEvolution),
+            ))
         } else {
             None
         };
@@ -1790,7 +1841,19 @@ impl<S: StorageProvider> Engine<S> {
             self.epoch_manager
                 .restore_unrecoverable(group_id.clone(), group.epoch);
             ("unrecoverable", "hydrate_unrecoverable_group")
-        } else if let Some((pending_ref, prior_epoch, message_id)) = pending_recovery {
+        } else if let Some((pending_ref, prior_epoch, message_id, pending_kind)) = pending_recovery
+        {
+            let pending_kind = match pending_kind {
+                cgka_traits::FanoutPendingKind::GroupEvolution => {
+                    crate::epoch_manager::PendingKind::GroupEvolution
+                }
+                cgka_traits::FanoutPendingKind::CreateGroup => {
+                    crate::epoch_manager::PendingKind::CreateGroup
+                }
+                cgka_traits::FanoutPendingKind::Disband => {
+                    crate::epoch_manager::PendingKind::Disband
+                }
+            };
             self.epoch_manager
                 .restore_pending(
                     group_id.clone(),
@@ -1798,10 +1861,12 @@ impl<S: StorageProvider> Engine<S> {
                     EpochId(prior_epoch.0.saturating_add(1)),
                     StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
                     pending_ref,
-                    crate::epoch_manager::PendingKind::GroupEvolution,
+                    pending_kind,
                 )
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            self.track_pending_origin_commit(pending_ref, message_id);
+            if let Some(message_id) = message_id {
+                self.track_pending_origin_commit(pending_ref, message_id);
+            }
             ("pending_publish", "hydrate_stable_group")
         } else if restored_durable_evolution {
             ("pending_publish", "hydrate_stable_group")

@@ -8,10 +8,15 @@ use tokio::sync::{Mutex, watch};
 
 use crate::error::Result;
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
-    pub(crate) cwd: PathBuf,
+    /// Selected working directory, or `None` when this chat has not chosen one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<PathBuf>,
+    /// Standing instruction prepended to every prompt in this chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) goal: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +62,13 @@ pub(crate) struct FinalDeliveryRecord {
 #[serde(untagged)]
 enum RawRecord {
     Bare(String),
-    Full { session_id: String, cwd: PathBuf },
+    Full {
+        session_id: String,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        goal: Option<String>,
+    },
 }
 
 impl RawRecord {
@@ -65,9 +76,18 @@ impl RawRecord {
         match self {
             Self::Bare(session_id) => SessionRecord {
                 session_id,
-                cwd: default_cwd.to_path_buf(),
+                cwd: Some(default_cwd.to_path_buf()),
+                goal: None,
             },
-            Self::Full { session_id, cwd } => SessionRecord { session_id, cwd },
+            Self::Full {
+                session_id,
+                cwd,
+                goal,
+            } => SessionRecord {
+                session_id,
+                cwd,
+                goal,
+            },
         }
     }
 }
@@ -103,15 +123,33 @@ impl SessionStore {
         self.map.lock().await.get(group_key).cloned()
     }
 
-    pub(crate) async fn set(&self, group_key: &str, record: SessionRecord) -> Result<()> {
-        let mut map = self.map.lock().await;
-        let mut next = map.clone();
-        next.insert(group_key.to_owned(), record);
-        let path = self.path.clone();
-        let snapshot = next.clone();
-        tokio::task::spawn_blocking(move || write_snapshot(&path, &snapshot)).await??;
-        *map = next;
-        Ok(())
+    /// Records the backend session and working directory, retaining the goal.
+    pub(crate) async fn record_session(
+        &self,
+        group_key: &str,
+        session_id: String,
+        cwd: PathBuf,
+    ) -> Result<()> {
+        self.update(group_key, |record| {
+            record.session_id = session_id;
+            record.cwd = Some(cwd);
+        })
+        .await
+    }
+
+    /// Selects the working directory and starts a new session epoch, retaining
+    /// the goal.
+    pub(crate) async fn set_workdir(&self, group_key: &str, cwd: PathBuf) -> Result<()> {
+        self.update(group_key, |record| {
+            record.session_id.clear();
+            record.cwd = Some(cwd);
+        })
+        .await
+    }
+
+    /// Replaces the standing goal, retaining the session and working directory.
+    pub(crate) async fn set_goal(&self, group_key: &str, goal: Option<String>) -> Result<()> {
+        self.update(group_key, |record| record.goal = goal).await
     }
 
     pub(crate) async fn reset_session(&self, group_key: &str) -> Result<bool> {
@@ -128,12 +166,28 @@ impl SessionStore {
             .expect("record exists in cloned session map")
             .session_id
             .clear();
-        let path = self.path.clone();
-        let snapshot = next.clone();
-        tokio::task::spawn_blocking(move || write_snapshot(&path, &snapshot)).await??;
-        *map = next;
+        persist(&self.path, &mut map, next).await?;
         Ok(true)
     }
+
+    async fn update(&self, group_key: &str, apply: impl FnOnce(&mut SessionRecord)) -> Result<()> {
+        let mut map = self.map.lock().await;
+        let mut next = map.clone();
+        apply(next.entry(group_key.to_owned()).or_default());
+        persist(&self.path, &mut map, next).await
+    }
+}
+
+async fn persist(
+    path: &Path,
+    map: &mut HashMap<String, SessionRecord>,
+    next: HashMap<String, SessionRecord>,
+) -> Result<()> {
+    let path = path.to_path_buf();
+    let snapshot = next.clone();
+    tokio::task::spawn_blocking(move || write_snapshot(&path, &snapshot)).await??;
+    *map = next;
+    Ok(())
 }
 
 pub(crate) struct RecoveryStore {
@@ -487,17 +541,76 @@ mod tests {
 
         {
             let store = SessionStore::load(path.clone(), &home).unwrap();
-            let record = SessionRecord {
-                session_id: "ses_abc123".to_owned(),
-                cwd: home.join("proj"),
-            };
-            store.set("group1", record).await.unwrap();
+            store
+                .record_session("group1", "ses_abc123".to_owned(), home.join("proj"))
+                .await
+                .unwrap();
+            store
+                .set_goal("group1", Some("ship the release".to_owned()))
+                .await
+                .unwrap();
         }
 
         let store = SessionStore::load(path.clone(), &home).unwrap();
         let record = store.get("group1").await.expect("record persisted");
         assert_eq!(record.session_id, "ses_abc123");
-        assert_eq!(record.cwd, home.join("proj"));
+        assert_eq!(record.cwd, Some(home.join("proj")));
+        assert_eq!(record.goal.as_deref(), Some("ship the release"));
+    }
+
+    #[tokio::test]
+    async fn goal_only_records_leave_the_workdir_unselected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+
+        {
+            let store = SessionStore::load(path.clone(), &home).unwrap();
+            store
+                .set_goal("group1", Some("pick a repo later".to_owned()))
+                .await
+                .unwrap();
+            let record = store.get("group1").await.expect("goal-only record");
+            assert_eq!(record.cwd, None);
+            assert_eq!(record.session_id, "");
+        }
+
+        let store = SessionStore::load(path, &home).unwrap();
+        let record = store
+            .get("group1")
+            .await
+            .expect("goal-only record reloaded");
+        assert_eq!(record.cwd, None);
+        assert_eq!(record.goal.as_deref(), Some("pick a repo later"));
+    }
+
+    #[tokio::test]
+    async fn set_workdir_starts_a_new_epoch_and_keeps_the_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let store = SessionStore::load(path, &home).unwrap();
+        store
+            .record_session("group1", "ses_old".to_owned(), home.join("first"))
+            .await
+            .unwrap();
+        store
+            .set_goal("group1", Some("keep CI green".to_owned()))
+            .await
+            .unwrap();
+
+        store
+            .set_workdir("group1", home.join("second"))
+            .await
+            .unwrap();
+
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "");
+        assert_eq!(record.cwd, Some(home.join("second")));
+        assert_eq!(record.goal.as_deref(), Some("keep CI green"));
+
+        store.set_goal("group1", None).await.unwrap();
+        assert_eq!(store.get("group1").await.unwrap().goal, None);
     }
 
     #[tokio::test]
@@ -511,23 +624,15 @@ mod tests {
         {
             let store = SessionStore::load(path.clone(), &home).unwrap();
             store
-                .set(
-                    "group1",
-                    SessionRecord {
-                        session_id: "ses_first".to_owned(),
-                        cwd: first_cwd.clone(),
-                    },
-                )
+                .record_session("group1", "ses_first".to_owned(), first_cwd.clone())
                 .await
                 .unwrap();
             store
-                .set(
-                    "group2",
-                    SessionRecord {
-                        session_id: "ses_second".to_owned(),
-                        cwd: second_cwd.clone(),
-                    },
-                )
+                .record_session("group2", "ses_second".to_owned(), second_cwd.clone())
+                .await
+                .unwrap();
+            store
+                .set_goal("group2", Some("second goal".to_owned()))
                 .await
                 .unwrap();
 
@@ -537,10 +642,11 @@ mod tests {
         let store = SessionStore::load(path, &home).unwrap();
         let first = store.get("group1").await.expect("first group retained");
         assert_eq!(first.session_id, "");
-        assert_eq!(first.cwd, first_cwd);
+        assert_eq!(first.cwd, Some(first_cwd));
         let second = store.get("group2").await.expect("second group retained");
         assert_eq!(second.session_id, "ses_second");
-        assert_eq!(second.cwd, second_cwd);
+        assert_eq!(second.cwd, Some(second_cwd));
+        assert_eq!(second.goal.as_deref(), Some("second goal"));
     }
 
     #[tokio::test]
@@ -551,27 +657,41 @@ mod tests {
         let cwd = home.join("proj");
         let store = SessionStore::load(path.clone(), &home).unwrap();
         store
-            .set(
-                "group1",
-                SessionRecord {
-                    session_id: "ses_original".to_owned(),
-                    cwd: cwd.clone(),
-                },
-            )
+            .record_session("group1", "ses_original".to_owned(), cwd.clone())
             .await
             .unwrap();
         std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
 
         assert!(store.reset_session("group1").await.is_err());
+        assert!(
+            store
+                .set_goal("group1", Some("g".to_owned()))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .set_workdir("group1", home.join("other"))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .record_session("group1", "ses_other".to_owned(), home.join("other"))
+                .await
+                .is_err()
+        );
         let current = store.get("group1").await.unwrap();
         assert_eq!(current.session_id, "ses_original");
-        assert_eq!(current.cwd, cwd);
+        assert_eq!(current.cwd, Some(cwd.clone()));
+        assert_eq!(current.goal, None);
         drop(store);
 
         let reloaded = SessionStore::load(path, &home).unwrap();
         let current = reloaded.get("group1").await.unwrap();
         assert_eq!(current.session_id, "ses_original");
-        assert_eq!(current.cwd, cwd);
+        assert_eq!(current.cwd, Some(cwd));
+        assert_eq!(current.goal, None);
     }
 
     #[tokio::test]
@@ -585,7 +705,25 @@ mod tests {
         let store = SessionStore::load(path, &home).unwrap();
         let record = store.get("group1").await.expect("legacy record");
         assert_eq!(record.session_id, "ses_legacy");
-        assert_eq!(record.cwd, home);
+        assert_eq!(record.cwd, Some(home));
+        assert_eq!(record.goal, None);
+    }
+
+    #[tokio::test]
+    async fn session_store_accepts_records_written_before_the_goal_field_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let legacy = serde_json::json!({
+            "group1": { "session_id": "ses_full", "cwd": home.join("proj") }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let store = SessionStore::load(path, &home).unwrap();
+        let record = store.get("group1").await.expect("legacy full record");
+        assert_eq!(record.session_id, "ses_full");
+        assert_eq!(record.cwd, Some(home.join("proj")));
+        assert_eq!(record.goal, None);
     }
 
     #[tokio::test]
@@ -747,13 +885,7 @@ mod tests {
         let home = dir.path().to_path_buf();
         let store = SessionStore::load(path.clone(), &home).unwrap();
         store
-            .set(
-                "group1",
-                SessionRecord {
-                    session_id: "ses_private".to_owned(),
-                    cwd: home,
-                },
-            )
+            .record_session("group1", "ses_private".to_owned(), home)
             .await
             .unwrap();
         assert!(store.reset_session("group1").await.unwrap());

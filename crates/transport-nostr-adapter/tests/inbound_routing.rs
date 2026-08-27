@@ -9,6 +9,7 @@ use cgka_traits::{
     TransportEndpoint, TransportGroupSubscription, TransportGroupSync, TransportPublishRequest,
     TransportPublishTarget,
 };
+use nostr::RelayUrl;
 use tokio::sync::{Barrier, Notify};
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
@@ -1466,6 +1467,14 @@ async fn resolve_relay_labels_maps_observed_indices_to_endpoints() {
         TransportEndpoint("wss://group-a.example".into()),
         TransportEndpoint("wss://group-b.example".into()),
     ];
+    let canonical_endpoints = endpoints.clone().map(|endpoint| {
+        TransportEndpoint(
+            nostr::Url::from(
+                RelayUrl::parse(endpoint.as_str()).expect("test relay URL should parse"),
+            )
+            .to_string(),
+        )
+    });
 
     // Observing per-relay copies assigns opaque indices in first-seen order.
     for endpoint in &endpoints {
@@ -1484,8 +1493,14 @@ async fn resolve_relay_labels_maps_observed_indices_to_endpoints() {
         .resolve_relay_labels(RelayExportConsent::affirm())
         .await;
     assert_eq!(resolution.len(), 2);
-    assert_eq!(resolution.label_for(RelayIndex(0)), Some(&endpoints[0]));
-    assert_eq!(resolution.label_for(RelayIndex(1)), Some(&endpoints[1]));
+    assert_eq!(
+        resolution.label_for(RelayIndex(0)),
+        Some(&canonical_endpoints[0])
+    );
+    assert_eq!(
+        resolution.label_for(RelayIndex(1)),
+        Some(&canonical_endpoints[1])
+    );
     assert_eq!(resolution.label_for(RelayIndex(2)), None);
 }
 
@@ -3007,7 +3022,17 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
     let inbox_a = TransportEndpoint("wss://inbox-a.example".to_owned());
     let inbox_b = TransportEndpoint("wss://inbox-b.example".to_owned());
     let group_a = TransportEndpoint("wss://group-a.example".to_owned());
-    let group_b = TransportEndpoint("wss://group-b.example".to_owned());
+    let group_b = TransportEndpoint("wss://Group-B.Example:443/".to_owned());
+    let group_b_inbound = TransportEndpoint("wss://group-b.example".to_owned());
+    assert_ne!(
+        group_b, group_b_inbound,
+        "the test requires a verbatim route spelling that normalizes on inbound"
+    );
+    assert_eq!(
+        RelayUrl::parse(group_b.as_str()).expect("route B parses"),
+        RelayUrl::parse(group_b_inbound.as_str()).expect("inbound B parses"),
+        "the spellings must identify the same relay"
+    );
     let group = TransportGroupSubscription {
         group_id: cgka_traits::GroupId::new(vec![0x33; 16]),
         transport_group_id: vec![0x44; 32],
@@ -3064,7 +3089,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
     assert_eq!(
         adapter
             .handle_relay_event(NostrRelayEvent {
-                endpoint: group_b.clone(),
+                endpoint: group_b_inbound.clone(),
                 subscription_id: Some(group_id.clone()),
                 event: group_event("relay-b-only", &group.transport_group_id),
             })
@@ -3080,7 +3105,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
             .expect("B's event is delivered")
             .source
             .endpoint,
-        Some(group_b.clone())
+        Some(group_b_inbound.clone())
     );
     adapter
         .handle_relay_eose(inbox_b.clone(), inbox_id.clone())
@@ -3124,7 +3149,7 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         "a route shrink must not complete an older replay attempt"
     );
 
-    adapter.handle_relay_eose(group_b, group_id).await;
+    adapter.handle_relay_eose(group_b_inbound, group_id).await;
     assert!(
         adapter
             .account_subscription_eose(&account_id)

@@ -112,8 +112,9 @@ impl DrainCompletion {
 /// contract also retains its silence-specific unconfirmed verdicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainVerdict {
-    /// Every live subscription reached end-of-stored-events and the relays then
-    /// went quiet: the account's stored history was served in full.
+    /// Every endpoint-scoped attempt in the activation's frozen route snapshot
+    /// reached end-of-stored-events and the relays then went quiet: the
+    /// account's stored history was served in full.
     Complete,
     /// The silence budget ran out with stored history still unconfirmed, though
     /// some relay did reach end-of-stored-events.

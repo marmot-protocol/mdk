@@ -13,6 +13,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
 use crate::chunking::split_reply_chunks;
+use crate::commands::{self, ChatCommand, Routed};
 use crate::control::{ControlClient, DownloadedMedia};
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
@@ -287,14 +288,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 return DispatchOutcome::Continue;
             }
             let disposition = classify_prompt(&message.text);
-            let permit = if matches!(
-                disposition,
-                PromptDisposition::RetryLast | PromptDisposition::DiscardLast
-            ) {
-                ctx.queues.enter_recovery(&group_id_hex).await
-            } else {
-                ctx.queues.try_enter_waiter(&group_id_hex).await
-            };
+            let permit = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await;
             let Some(permit) = permit else {
                 warn!(
                     target: TRACE_TARGET,
@@ -388,6 +382,8 @@ enum PromptDisposition {
     ResetSession,
     RetryLast,
     DiscardLast,
+    HarnessCommand(ChatCommand),
+    Usage(&'static str),
     Forward {
         prompt: String,
         allow_workdir_picker: bool,
@@ -395,24 +391,64 @@ enum PromptDisposition {
 }
 
 fn classify_prompt(text: &str) -> PromptDisposition {
-    match text.trim() {
-        "/reset-session" => PromptDisposition::ResetSession,
-        "/retry-last" => PromptDisposition::RetryLast,
-        "/discard-last" => PromptDisposition::DiscardLast,
-        "//reset-session" => PromptDisposition::Forward {
-            prompt: "/reset-session".to_owned(),
+    match commands::route(text) {
+        Routed::Command(ChatCommand::NewSession) => PromptDisposition::ResetSession,
+        Routed::Command(ChatCommand::RetryLast) => PromptDisposition::RetryLast,
+        Routed::Command(ChatCommand::DiscardLast) => PromptDisposition::DiscardLast,
+        Routed::Command(command) => PromptDisposition::HarnessCommand(command),
+        Routed::Usage(usage) => PromptDisposition::Usage(usage),
+        Routed::Literal(prompt) => PromptDisposition::Forward {
+            prompt,
             allow_workdir_picker: false,
         },
-        _ => PromptDisposition::Forward {
-            prompt: text.to_owned(),
+        Routed::Prompt(prompt) => PromptDisposition::Forward {
+            prompt,
             allow_workdir_picker: true,
         },
+    }
+}
+
+fn is_inspect_disposition(disposition: &PromptDisposition) -> bool {
+    matches!(
+        disposition,
+        PromptDisposition::Usage(_)
+            | PromptDisposition::HarnessCommand(
+                ChatCommand::Help | ChatCommand::Status | ChatCommand::Pwd | ChatCommand::GoalShow
+            )
+    )
+}
+
+async fn acquire_dispatch_permit(
+    queues: &GroupQueues,
+    group_ref: &str,
+    disposition: &PromptDisposition,
+) -> Option<GroupPermit> {
+    if matches!(
+        disposition,
+        PromptDisposition::RetryLast | PromptDisposition::DiscardLast
+    ) || is_inspect_disposition(disposition)
+    {
+        queues.enter_without_waiter_quota(group_ref).await
+    } else {
+        queues.try_enter_waiter(group_ref).await
     }
 }
 
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut permit: GroupPermit) {
     let mut inbound = inbound;
     let disposition = classify_prompt(&inbound.text);
+    if is_inspect_disposition(&disposition) {
+        match disposition {
+            PromptDisposition::HarnessCommand(command) => {
+                handle_command(&ctx, &inbound, command).await;
+            }
+            PromptDisposition::Usage(usage) => {
+                send_command_reply(&ctx, &inbound, usage).await;
+            }
+            _ => unreachable!("inspect dispositions are read-only commands or usage"),
+        }
+        return;
+    }
     let recovery_command = matches!(
         disposition,
         PromptDisposition::RetryLast | PromptDisposition::DiscardLast
@@ -486,7 +522,15 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let mut retrying = false;
     let forced_run = match disposition {
         PromptDisposition::ResetSession => {
-            handle_session_reset(&ctx, &inbound).await;
+            handle_command(&ctx, &inbound, ChatCommand::NewSession).await;
+            return;
+        }
+        PromptDisposition::HarnessCommand(command) => {
+            handle_command(&ctx, &inbound, command).await;
+            return;
+        }
+        PromptDisposition::Usage(usage) => {
+            send_command_reply(&ctx, &inbound, usage).await;
             return;
         }
         PromptDisposition::DiscardLast => {
@@ -622,6 +666,11 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     };
     let known_session = ctx.sessions.get(&inbound.group_ref).await;
 
+    let goal = known_session
+        .as_ref()
+        .and_then(|record| record.goal.as_deref());
+    let (recovery_prompt, prompt) = prepare_prompt(goal, prompt);
+
     info!(
         target: TRACE_TARGET,
         method = "handle_message",
@@ -629,10 +678,10 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         has_session = known_session
             .as_ref()
             .is_some_and(|record| !record.session_id.is_empty()),
+        has_goal = goal.is_some(),
         "handling inbound prompt"
     );
 
-    let recovery_prompt = prompt.clone();
     let attachment_batch = match prepare_attachment_batch(&ctx, &inbound).await {
         Ok(batch) => batch,
         Err(err) => {
@@ -1062,15 +1111,55 @@ fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
     )
 }
 
-async fn handle_session_reset(ctx: &BridgeContext, inbound: &InboundPrompt) {
-    let message = match ctx.sessions.reset_session(&inbound.group_ref).await {
+async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: ChatCommand) {
+    let record = ctx.sessions.get(&inbound.group_ref).await;
+    let body =
+        match command {
+            ChatCommand::Help => commands::help_text(ctx.cfg.spec.display_name),
+            ChatCommand::Status => status_text(ctx, record.as_ref()),
+            ChatCommand::Pwd => match record.as_ref().and_then(|record| record.cwd.as_deref()) {
+                Some(cwd) => format!("Working directory: {}", display_home_path(cwd, &ctx.home)),
+                None => "No working directory is selected yet. Use `/cd <path>`.".to_owned(),
+            },
+            ChatCommand::NewSession => new_session_body(ctx, inbound).await,
+            ChatCommand::Cd { path } => {
+                change_workdir_body(ctx, inbound, record.as_ref(), &path).await
+            }
+            ChatCommand::GoalShow => {
+                match record.as_ref().and_then(|record| record.goal.as_deref()) {
+                    Some(goal) => format!("Standing goal:\n{goal}"),
+                    None => "No standing goal is set. Use `/goal <text>`.".to_owned(),
+                }
+            }
+            ChatCommand::GoalClear => match set_goal(ctx, &inbound.group_ref, None).await {
+                Ok(()) => "Standing goal cleared.".to_owned(),
+                Err(()) => "Failed to clear the standing goal.".to_owned(),
+            },
+            ChatCommand::GoalSet { text } => {
+                match set_goal(ctx, &inbound.group_ref, Some(text)).await {
+                    Ok(()) => {
+                        "Standing goal set. It is prepended to every prompt in this chat until you send `/goal clear`."
+                            .to_owned()
+                    }
+                    Err(()) => "Failed to set the standing goal.".to_owned(),
+                }
+            }
+            ChatCommand::RetryLast | ChatCommand::DiscardLast => {
+                unreachable!("recovery commands are handled before generic command dispatch")
+            }
+        };
+    send_command_reply(ctx, inbound, &body).await;
+}
+
+async fn new_session_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> String {
+    match ctx.sessions.reset_session(&inbound.group_ref).await {
         Ok(true) => format!(
-            "[{}] Session reset. The next prompt will start a new {} session in the preserved workdir.",
-            ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+            "Session reset. The next prompt will start a new {} session in the preserved workdir.",
+            ctx.cfg.spec.display_name
         ),
         Ok(false) => format!(
-            "[{}] No {} session is recorded for this group.",
-            ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+            "No {} session is recorded for this chat.",
+            ctx.cfg.spec.display_name
         ),
         Err(err) => {
             warn!(
@@ -1079,28 +1168,119 @@ async fn handle_session_reset(ctx: &BridgeContext, inbound: &InboundPrompt) {
                 error_kind = err.privacy_safe_kind(),
                 "failed to reset backend session"
             );
-            format!(
-                "[{}] Failed to reset the {} session.",
-                ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
-            )
+            format!("Failed to reset the {} session.", ctx.cfg.spec.display_name)
         }
+    }
+}
+
+async fn change_workdir_body(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    record: Option<&SessionRecord>,
+    path: &str,
+) -> String {
+    let cwd = match resolve_repo(path, &ctx.home).await {
+        Ok(cwd) => cwd,
+        Err(err) => return err.to_string(),
     };
-    if let Err(err) = send_reply(
-        ctx,
-        &inbound.account_ref,
-        &inbound.group_ref,
-        &inbound.message_ref,
-        &message,
-        0,
-    )
-    .await
-    {
+    let had_session = record.is_some_and(|record| !record.session_id.is_empty());
+    match ctx.sessions.set_workdir(&inbound.group_ref, cwd).await {
+        Ok(()) if had_session => format!(
+            "Working directory set to ~/{path}. The previous {} session was ended; the next prompt starts a new one.",
+            ctx.cfg.spec.display_name
+        ),
+        Ok(()) => format!("Working directory set to ~/{path}. Send your prompt."),
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "set_workdir",
+                error_kind = err.privacy_safe_kind(),
+                "failed to record selected workdir"
+            );
+            "Failed to set the working directory.".to_owned()
+        }
+    }
+}
+
+async fn set_goal(
+    ctx: &BridgeContext,
+    group_ref: &str,
+    goal: Option<String>,
+) -> std::result::Result<(), ()> {
+    ctx.sessions.set_goal(group_ref, goal).await.map_err(|err| {
         warn!(
             target: TRACE_TARGET,
-            method = "session_reset_reply",
+            method = "set_goal",
             error_kind = err.privacy_safe_kind(),
-            "failed to send session-reset reply"
+            "failed to record standing goal"
         );
+    })
+}
+
+fn status_text(ctx: &BridgeContext, record: Option<&SessionRecord>) -> String {
+    let workdir = match record.and_then(|record| record.cwd.as_deref()) {
+        Some(cwd) => display_home_path(cwd, &ctx.home),
+        None => "not selected".to_owned(),
+    };
+    let session = if record.is_some_and(|record| !record.session_id.is_empty()) {
+        "active"
+    } else {
+        "none"
+    };
+    let goal = record
+        .and_then(|record| record.goal.as_deref())
+        .unwrap_or("none");
+    format!(
+        "backend: {}\nworkdir: {workdir}\nsession: {session}\nexecution profile: {}\ngoal: {goal}",
+        ctx.cfg.spec.display_name,
+        ctx.cfg.execution_profile.as_str()
+    )
+}
+
+fn prepare_prompt(goal: Option<&str>, prompt: String) -> (String, String) {
+    // Recovery persists the original user prompt. Persisting the expanded form
+    // would prepend a standing goal again when `/retry-last` re-enters this path.
+    let recovery_prompt = prompt.clone();
+    let invocation_prompt = match goal {
+        Some(goal) => commands::apply_goal(goal, &prompt),
+        None => prompt,
+    };
+    (recovery_prompt, invocation_prompt)
+}
+
+/// Renders a stored workdir as a `$HOME`-relative display path for chat replies.
+fn display_home_path(cwd: &std::path::Path, home: &std::path::Path) -> String {
+    match cwd.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => "outside $HOME".to_owned(),
+    }
+}
+
+async fn send_command_reply(ctx: &BridgeContext, inbound: &InboundPrompt, body: &str) {
+    let text = format!("[{}] {body}", ctx.cfg.spec.reply_prefix);
+    for (index, chunk) in split_reply_chunks(&text, ctx.cfg.max_reply_bytes)
+        .into_iter()
+        .enumerate()
+    {
+        if let Err(err) = send_reply(
+            ctx,
+            &inbound.account_ref,
+            &inbound.group_ref,
+            &inbound.message_ref,
+            chunk,
+            index,
+        )
+        .await
+        {
+            warn!(
+                target: TRACE_TARGET,
+                method = "command_reply",
+                error_kind = err.privacy_safe_kind(),
+                "failed to send harness command reply"
+            );
+            return;
+        }
     }
 }
 
@@ -1473,9 +1653,7 @@ async fn persist_observed_session_if_unset(
         .as_ref()
         .is_none_or(|record| record.session_id.is_empty());
     if needs_persist && let Some(session_id) = observed_session {
-        sessions
-            .set(group_ref, SessionRecord { session_id, cwd })
-            .await?;
+        sessions.record_session(group_ref, session_id, cwd).await?;
     }
     Ok(())
 }
@@ -1486,8 +1664,8 @@ async fn resolve_cwd_and_prompt(
     known_session: Option<&SessionRecord>,
     allow_workdir_picker: bool,
 ) -> Result<Option<(PathBuf, String)>> {
-    if let Some(record) = known_session {
-        let cwd = validate_session_cwd(&record.cwd, &ctx.home).await?;
+    if let Some(selected) = known_session.and_then(|record| record.cwd.as_deref()) {
+        let cwd = validate_session_cwd(selected, &ctx.home).await?;
         return Ok(Some((cwd, inbound.text.clone())));
     }
     if !allow_workdir_picker {
@@ -1497,15 +1675,12 @@ async fn resolve_cwd_and_prompt(
     let (name, rest) = match parse_repo_picker(&inbound.text) {
         RepoPicker::Absent => return Ok(Some((ctx.home.clone(), inbound.text.clone()))),
         RepoPicker::Invalid => {
-            send_reply(
+            send_command_reply(
                 ctx,
-                &inbound.account_ref,
-                &inbound.group_ref,
-                &inbound.message_ref,
-                &format!("[{}] Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments.", ctx.cfg.spec.reply_prefix),
-                0,
+                inbound,
+                "Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments. Send /help for the harness commands.",
             )
-            .await?;
+            .await;
             return Ok(None);
         }
         RepoPicker::Valid { path, prompt } => (path, prompt),
@@ -1513,41 +1688,23 @@ async fn resolve_cwd_and_prompt(
     let cwd = match resolve_repo(&name, &ctx.home).await {
         Ok(cwd) => cwd,
         Err(err) => {
-            let text = err.to_string();
-            send_reply(
+            send_command_reply(
                 ctx,
-                &inbound.account_ref,
-                &inbound.group_ref,
-                &inbound.message_ref,
-                &format!("[{}] {text}", ctx.cfg.spec.reply_prefix),
-                0,
+                inbound,
+                &format!("{err} Send /help for the harness commands."),
             )
-            .await?;
+            .await;
             return Ok(None);
         }
     };
     if rest.is_empty() {
-        ctx.sessions
-            .set(
-                &inbound.group_ref,
-                SessionRecord {
-                    session_id: String::new(),
-                    cwd,
-                },
-            )
-            .await?;
-        send_reply(
+        ctx.sessions.set_workdir(&inbound.group_ref, cwd).await?;
+        send_command_reply(
             ctx,
-            &inbound.account_ref,
-            &inbound.group_ref,
-            &inbound.message_ref,
-            &format!(
-                "[{}] Session workdir set to ~/{name}. Send your prompt.",
-                ctx.cfg.spec.reply_prefix
-            ),
-            0,
+            inbound,
+            &format!("Session workdir set to ~/{name}. Send your prompt."),
         )
-        .await?;
+        .await;
         return Ok(None);
     }
     Ok(Some((cwd, rest)))
@@ -1831,7 +1988,9 @@ impl GroupQueues {
         })
     }
 
-    async fn enter_recovery(&self, group_ref: &str) -> Option<GroupPermit> {
+    /// Admits inspect and recovery commands without consuming the waiting quota
+    /// or taking the serial lock.
+    async fn enter_without_waiter_quota(&self, group_ref: &str) -> Option<GroupPermit> {
         let queue = self.queue(group_ref).await?;
         queue.active.fetch_add(1, Ordering::Relaxed);
         Some(GroupPermit {
@@ -1888,6 +2047,13 @@ impl InboundDedupe {
 mod tests {
     use super::*;
     use crate::store::SessionStore;
+    use agent_control::{
+        AgentControlEnvelope, AgentControlRequest, AgentControlResponse,
+        AgentControlSendMaintenanceDisposition, read_envelope, write_frame,
+    };
+    use async_trait::async_trait;
+    use tokio::io::BufReader;
+    use tokio::net::UnixListener;
 
     #[test]
     fn attachment_names_are_sanitized_and_keep_stable_ordering() {
@@ -2046,6 +2212,111 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingBackend {
+        invocations: Mutex<Vec<Invocation>>,
+    }
+
+    #[async_trait]
+    impl Backend for RecordingBackend {
+        async fn run(
+            &self,
+            invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            self.invocations.lock().await.push(invocation);
+            Ok(Outcome {
+                observed_session: None,
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    fn spawn_final_server(socket: &std::path::Path) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                assert!(matches!(
+                    request.payload,
+                    AgentControlRequest::SendFinal { .. }
+                ));
+                let response = AgentControlEnvelope::request(
+                    request.id,
+                    AgentControlResponse::FinalSent {
+                        message_ids_hex: vec!["reply".to_owned()],
+                        maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                    },
+                );
+                write_frame(&mut write_half, &response).await.unwrap();
+            }
+        })
+    }
+
+    fn test_context(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        backend: Arc<RecordingBackend>,
+    ) -> (Arc<BridgeContext>, tokio::task::JoinHandle<()>) {
+        std::fs::create_dir_all(home).unwrap();
+        let config = test_config(root);
+        let server = spawn_final_server(&config.socket);
+        let sessions = Arc::new(SessionStore::load(config.state_path.clone(), home).unwrap());
+        let recovery = Arc::new(
+            RecoveryStore::load(config.state_path.with_extension("recovery.json")).unwrap(),
+        );
+        let deliveries = Arc::new(
+            FinalDeliveryStore::load(config.state_path.with_extension("delivery.json")).unwrap(),
+        );
+        let ctx = Arc::new(BridgeContext {
+            client: ControlClient::new(
+                config.socket.clone(),
+                None,
+                Duration::from_secs(1),
+                "wn-test",
+            ),
+            cfg: Arc::new(config),
+            account_ref: "account".to_owned(),
+            sessions,
+            recovery,
+            deliveries,
+            reconciliation_slot: ReconciliationSlot::new(),
+            queues: Arc::new(GroupQueues::new(4)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend,
+            home: home.to_path_buf(),
+        });
+        (ctx, server)
+    }
+
+    async fn dispatch_test_message(ctx: Arc<BridgeContext>, message_ref: &str, text: &str) -> bool {
+        let disposition = classify_prompt(text);
+        let Some(permit) = acquire_dispatch_permit(&ctx.queues, "group", &disposition).await else {
+            return false;
+        };
+        handle_message(
+            ctx,
+            InboundPrompt {
+                account_ref: "account".to_owned(),
+                group_ref: "group".to_owned(),
+                message_ref: message_ref.to_owned(),
+                text: text.to_owned(),
+                media: Vec::new(),
+            },
+            permit,
+        )
+        .await;
+        true
+    }
+
     #[tokio::test]
     async fn dedupe_rejects_repeated_message_refs() {
         let dedupe = InboundDedupe::new(8);
@@ -2071,13 +2342,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_commands_and_usage_never_invoke_backend_or_picker() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let backend = Arc::new(RecordingBackend::default());
+        let (ctx, server) = test_context(root.path(), &home, backend.clone());
+
+        dispatch_test_message(ctx.clone(), "help", "/help").await;
+        dispatch_test_message(ctx.clone(), "bad-cd", "/cd a b").await;
+        dispatch_test_message(ctx.clone(), "bad-retry", "/retry-last please").await;
+        dispatch_test_message(ctx.clone(), "session-status", "/session-status").await;
+
+        assert!(backend.invocations.lock().await.is_empty());
+        assert!(ctx.sessions.get("group").await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn inspect_commands_reply_while_recovery_fifo_is_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let (ctx, server) = test_context(root.path(), &home, backend.clone());
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    cwd: repo.clone(),
+                    session_id: "session".to_owned(),
+                    media: Vec::new(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(fifo_is_blocked(&ctx, "group").await);
+        let mut waiters = Vec::new();
+        while let Some(permit) = ctx.queues.try_enter_waiter("group").await {
+            waiters.push(permit);
+        }
+        assert!(
+            !waiters.is_empty(),
+            "queued prompts must be able to exhaust the waiter quota"
+        );
+
+        for (message_ref, text) in [
+            ("help", "/help"),
+            ("status", "/status"),
+            ("pwd", "/pwd"),
+            ("goal-show", "/goal"),
+        ] {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    dispatch_test_message(ctx.clone(), message_ref, text),
+                )
+                .await
+                .expect("inspect command must not wait on recovery or waiter quota")
+            );
+        }
+
+        assert!(backend.invocations.lock().await.is_empty());
+        assert!(
+            !dispatch_test_message(ctx.clone(), "cd-full", "/cd repo").await,
+            "mutating commands must not steal a waiter while the quota is full"
+        );
+        drop(waiters);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                dispatch_test_message(ctx.clone(), "cd", "/cd repo"),
+            )
+            .await
+            .is_err(),
+            "mutating commands still wait on the recovery FIFO"
+        );
+        assert!(ctx.sessions.get("group").await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_literal_and_goal_invoke_backend_once_with_exact_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let (ctx, server) = test_context(root.path(), &home, backend.clone());
+        ctx.sessions
+            .set_workdir("group", repo.canonicalize().unwrap())
+            .await
+            .unwrap();
+
+        dispatch_test_message(ctx.clone(), "literal", "  //status \n").await;
+        dispatch_test_message(ctx.clone(), "set-goal", "/goal finish the migration").await;
+        dispatch_test_message(ctx.clone(), "prompt", "check status").await;
+
+        let invocations = backend.invocations.lock().await;
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].prompt, "  /status \n");
+        assert_eq!(
+            invocations[1].prompt,
+            commands::apply_goal("finish the migration", "check status")
+        );
+        assert_eq!(
+            invocations[1]
+                .prompt
+                .matches("Standing goal for this chat")
+                .count(),
+            1
+        );
+        drop(invocations);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn group_queue_enforces_waiting_limit_but_recovery_bypasses_it() {
         let queues = GroupQueues::new(1);
         let first = queues.try_enter_waiter("g").await;
         assert!(first.is_some());
         assert_eq!(first.as_ref().unwrap().queue.pending.available_permits(), 1);
         assert!(queues.try_enter_waiter("g").await.is_none());
-        let recovery = queues.enter_recovery("g").await;
+        let inspect = queues.enter_without_waiter_quota("g").await;
+        assert!(inspect.is_some());
+        drop(inspect);
+        let recovery = queues.enter_without_waiter_quota("g").await;
         assert!(recovery.is_some());
         drop(recovery);
         drop(first);
@@ -2085,7 +2478,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_command_is_exact_and_has_a_literal_escape() {
+    fn reset_command_is_reserved_and_has_a_literal_escape() {
         assert_eq!(
             classify_prompt("/reset-session"),
             PromptDisposition::ResetSession
@@ -2103,10 +2496,7 @@ mod tests {
         );
         assert_eq!(
             classify_prompt("/reset-session please"),
-            PromptDisposition::Forward {
-                prompt: "/reset-session please".to_owned(),
-                allow_workdir_picker: true,
-            }
+            PromptDisposition::Usage("`/reset-session` takes no arguments.")
         );
     }
 
@@ -2129,17 +2519,31 @@ mod tests {
         );
         assert_eq!(
             classify_prompt("/goal retry-last"),
-            PromptDisposition::Forward {
-                prompt: "/goal retry-last".to_owned(),
-                allow_workdir_picker: true,
-            }
+            PromptDisposition::HarnessCommand(ChatCommand::GoalSet {
+                text: "retry-last".to_owned(),
+            })
         );
         assert_eq!(
             classify_prompt("/retry-last please"),
-            PromptDisposition::Forward {
-                prompt: "/retry-last please".to_owned(),
-                allow_workdir_picker: true,
-            }
+            PromptDisposition::Usage("`/retry-last` takes no arguments.")
+        );
+    }
+
+    #[test]
+    fn recovery_reapplies_a_standing_goal_exactly_once() {
+        let (persisted, first_invocation) =
+            prepare_prompt(Some("finish the migration"), "check status".to_owned());
+        let (persisted_again, retry_invocation) =
+            prepare_prompt(Some("finish the migration"), persisted.clone());
+
+        assert_eq!(persisted, "check status");
+        assert_eq!(persisted_again, "check status");
+        assert_eq!(retry_invocation, first_invocation);
+        assert_eq!(
+            retry_invocation
+                .matches("Standing goal for this chat")
+                .count(),
+            1
         );
     }
 
@@ -2296,7 +2700,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let recovery = queues.enter_recovery("g").await.unwrap();
+        let recovery = queues.enter_without_waiter_quota("g").await.unwrap();
         let active = recovery.serial.lock().await;
         assert!(recovery.serial.try_lock().is_err());
         drop(active);
@@ -2334,7 +2738,7 @@ mod tests {
         .unwrap();
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_new");
-        assert_eq!(record.cwd, cwd);
+        assert_eq!(record.cwd.as_deref(), Some(cwd.as_path()));
 
         persist_observed_session_if_unset(
             &store,
@@ -2357,13 +2761,11 @@ mod tests {
         let cwd = home.join("proj");
         let store = SessionStore::load(path, &home).unwrap();
         store
-            .set(
-                "group1",
-                SessionRecord {
-                    session_id: "ses_old".to_owned(),
-                    cwd: cwd.clone(),
-                },
-            )
+            .record_session("group1", "ses_old".to_owned(), cwd.clone())
+            .await
+            .unwrap();
+        store
+            .set_goal("group1", Some("keep the workdir".to_owned()))
             .await
             .unwrap();
         assert!(store.reset_session("group1").await.unwrap());
@@ -2373,7 +2775,7 @@ mod tests {
             &store,
             "group1",
             Some(&reset_record),
-            reset_record.cwd.clone(),
+            reset_record.cwd.clone().unwrap(),
             Some("ses_new".to_owned()),
         )
         .await
@@ -2381,7 +2783,8 @@ mod tests {
 
         let current = store.get("group1").await.unwrap();
         assert_eq!(current.session_id, "ses_new");
-        assert_eq!(current.cwd, cwd);
+        assert_eq!(current.cwd.as_deref(), Some(cwd.as_path()));
+        assert_eq!(current.goal.as_deref(), Some("keep the workdir"));
     }
 
     #[tokio::test]
@@ -2458,7 +2861,7 @@ mod tests {
 
         let record = store.get("group1").await.unwrap();
         assert_eq!(record.session_id, "ses_idle");
-        assert_eq!(record.cwd, home);
+        assert_eq!(record.cwd.as_deref(), Some(home.as_path()));
         assert_eq!(
             reply,
             "[wn-opencode] The configured time limit ended this attempt. The backend session was saved; send `/retry-last` to retry it, or `/discard-last` to abandon it and continue queued work."
@@ -2631,13 +3034,7 @@ mod tests {
         let store = SessionStore::load(home.join("sessions.json"), &home).unwrap();
         let recovery = RecoveryStore::load(home.join("recovery.json")).unwrap();
         store
-            .set(
-                "group1",
-                SessionRecord {
-                    session_id: "ses_stream".to_owned(),
-                    cwd: home.join("repo"),
-                },
-            )
+            .record_session("group1", "ses_stream".to_owned(), home.join("repo"))
             .await
             .unwrap();
 
