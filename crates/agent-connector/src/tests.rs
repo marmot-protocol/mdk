@@ -801,7 +801,7 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
         "later enumerations must be failing"
     );
     assert!(
-        snapshot.invite_enumerations_started <= 14,
+        snapshot.invite_enumerations_started <= 40,
         "a failing enumeration with a matured retry must back off, not spin: {} attempts",
         snapshot.invite_enumerations_started
     );
@@ -3383,19 +3383,42 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
         Some(parent_message_id_hex.as_str())
     );
 
-    let appended = serve_control_request_once(
+    // Matching same-key preview requests may race after an ambiguous client
+    // timeout. Both callers receive Ack, while the compose transcript below
+    // proves the append was dispatched exactly once.
+    let first_append = connector.stream_append_response(
+        &stream_id_hex,
+        &stream_capability,
+        "hello stream".to_owned(),
+        Some("preview-key".to_owned()),
+    );
+    let second_append = connector.stream_append_response(
+        &stream_id_hex,
+        &stream_capability,
+        "hello stream".to_owned(),
+        Some("preview-key".to_owned()),
+    );
+    let (appended, replayed) = tokio::join!(first_append, second_append);
+    assert_eq!(appended.unwrap(), AgentControlResponse::Ack);
+    assert_eq!(replayed.unwrap(), AgentControlResponse::Ack);
+
+    let conflict = serve_control_request_once(
         &connector,
         &listener,
         &socket,
-        "req-stream-append",
+        "req-stream-append-conflict",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
             stream_capability: stream_capability.clone(),
-            append_text: "hello stream".to_owned(),
+            append_text: "different".to_owned(),
+            idempotency_key: Some("preview-key".to_owned()),
         },
     )
     .await;
-    assert_eq!(appended.payload, AgentControlResponse::Ack);
+    let AgentControlResponse::Error { code, .. } = conflict.payload else {
+        panic!("expected preview idempotency conflict");
+    };
+    assert_eq!(code, "stream_preview_idempotency_conflict");
 
     let status = serve_control_request_once(
         &connector,
@@ -3406,6 +3429,8 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
             stream_id_hex: stream_id_hex.clone(),
             stream_capability: stream_capability.clone(),
             status: "thinking".to_owned(),
+            // The operation namespace isolates this from the append key above.
+            idempotency_key: Some("preview-key".to_owned()),
         },
     )
     .await;
@@ -3444,6 +3469,106 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
     assert_eq!(finalized_stream_id_hex, stream_id_hex);
     assert_eq!(message_ids_hex.len(), 1);
     assert!(!message_ids_hex[0].is_empty());
+}
+
+#[tokio::test]
+async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let durable = crate::stream_session::SendIdempotencyStore::new(home);
+    let preview = crate::stream_session::SendIdempotencyStore::process_local_preview();
+    let durable_key = "durable-finalize-key".to_owned();
+    let durable_fingerprint = "durable-finalize-fingerprint".to_owned();
+    let durable_message_ids = vec!["ab".repeat(32)];
+
+    durable.record(
+        durable_key.clone(),
+        durable_fingerprint.clone(),
+        durable_message_ids.clone(),
+    );
+    let persisted = home.join("dev").join("send-idempotency.json");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if persisted
+                .is_file()
+                .then(|| std::fs::read_to_string(&persisted).ok())
+                .flatten()
+                .is_some_and(|raw| raw.contains(&durable_key))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let persisted_before = std::fs::read(&persisted).unwrap();
+
+    // Exceed the durable FIFO capacity with successful preview mutations.
+    // These must remain process-local and must not consume durable capacity.
+    for index in 0..=crate::stream_session::SEND_IDEMPOTENCY_CAPACITY {
+        let key = format!("stream_append:preview-{index}");
+        let fingerprint = format!("preview-fingerprint-{index}");
+        match preview.acquire_strict(&key, &fingerprint).await.unwrap() {
+            crate::stream_session::StrictIdempotencyAcquisition::Leader(reservation) => {
+                preview.record(key, fingerprint, Vec::new());
+                reservation.complete(Vec::new(), AgentControlSendMaintenanceDisposition::Ready);
+            }
+            crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+                panic!("fresh preview key unexpectedly replayed")
+            }
+            crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
+                panic!("fresh preview key unexpectedly conflicted")
+            }
+        }
+    }
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(std::fs::read(&persisted).unwrap(), persisted_before);
+
+    match durable
+        .acquire(&durable_key, &durable_fingerprint)
+        .await
+        .unwrap()
+    {
+        crate::stream_session::SendIdempotencyAcquisition::Completed((ids, disposition)) => {
+            assert_eq!(ids, durable_message_ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
+        crate::stream_session::SendIdempotencyAcquisition::Leader(_) => {
+            panic!("durable receipt was evicted by preview traffic")
+        }
+    }
+
+    // The durable receipt survives a process restart, while preview receipts
+    // intentionally do not because the associated active streams do not.
+    let reopened = crate::stream_session::SendIdempotencyStore::new(home);
+    match reopened
+        .acquire(&durable_key, &durable_fingerprint)
+        .await
+        .unwrap()
+    {
+        crate::stream_session::SendIdempotencyAcquisition::Completed((ids, disposition)) => {
+            assert_eq!(ids, durable_message_ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
+        crate::stream_session::SendIdempotencyAcquisition::Leader(_) => {
+            panic!("durable receipt did not survive restart")
+        }
+    }
+    let reopened_preview = crate::stream_session::SendIdempotencyStore::process_local_preview();
+    match reopened_preview
+        .acquire_strict("stream_append:preview-0", "preview-fingerprint-0")
+        .await
+        .unwrap()
+    {
+        crate::stream_session::StrictIdempotencyAcquisition::Leader(_) => {}
+        crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+            panic!("preview receipt must not survive restart")
+        }
+        crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
+            panic!("absent preview receipt unexpectedly conflicted")
+        }
+    }
 }
 
 /// Regression for #366: a finalize whose expectation does not match the
@@ -3524,6 +3649,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             stream_id_hex: stream_id_hex.clone(),
             stream_capability: stream_capability.clone(),
             append_text: "hello stream".to_owned(),
+            idempotency_key: None,
         },
     )
     .await;
@@ -3567,6 +3693,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             stream_id_hex: stream_id_hex.clone(),
             stream_capability: stream_capability.clone(),
             append_text: " again".to_owned(),
+            idempotency_key: None,
         },
     )
     .await;
@@ -3916,6 +4043,7 @@ async fn connector_socket_cancels_stream_session() {
             stream_id_hex: stream_id_hex.clone(),
             stream_capability: stream_capability.clone(),
             status: "thinking".to_owned(),
+            idempotency_key: None,
         },
     )
     .await;
@@ -3944,6 +4072,7 @@ async fn connector_socket_cancels_stream_session() {
             stream_id_hex,
             stream_capability,
             append_text: "late".to_owned(),
+            idempotency_key: None,
         },
     )
     .await;

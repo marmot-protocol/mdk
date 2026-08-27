@@ -9,10 +9,11 @@
 
 import { randomUUID } from "node:crypto";
 import { AppendOnlyText, NonAppendOnlyUpdateError } from "./append-only.js";
-import { isRetryable, type MarmotAgentControlClient } from "./client.js";
+import { AgentControlError, isRetryable, type MarmotAgentControlClient } from "./client.js";
 import { AgentTextStreamTranscript, DEFAULT_STREAM_CHUNK_BYTES } from "./transcript.js";
 
 const STREAM_FINALIZE_RETRY_BACKOFF_MS = [100, 300] as const;
+const STREAM_PREVIEW_RETRY_BACKOFF_MS = [100, 300] as const;
 
 /** Narrow control-client surface used by the live preview (eases testing). */
 export type StreamControlClient = Pick<
@@ -46,6 +47,8 @@ export class MarmotLivePreview {
   private readonly finalizeIdempotencyKey = randomUUID();
   private readonly appendOnly = new AppendOnlyText();
   private readonly chunkBytes: number;
+  private mutationTail: Promise<void> | null = null;
+  private pendingPreviewMutation: { operation: string; payload: string; key: string } | null = null;
 
   constructor(
     private readonly client: StreamControlClient,
@@ -69,6 +72,54 @@ export class MarmotLivePreview {
   private ensureOpen(): void {
     if (this.closed) {
       throw new Error("live preview is already finalized or cancelled");
+    }
+  }
+
+  private serializeMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail ? this.mutationTail.then(mutation, mutation) : mutation();
+    const tail = result.then(() => undefined, () => undefined);
+    this.mutationTail = tail;
+    void tail.finally(() => {
+      if (this.mutationTail === tail) {
+        this.mutationTail = null;
+      }
+    });
+    return result;
+  }
+
+  private async retryPreviewMutation(
+    operation: string,
+    payload: string,
+    mutation: (key: string) => Promise<unknown>,
+  ): Promise<void> {
+    const pending = this.pendingPreviewMutation;
+    if (pending && (pending.operation !== operation || pending.payload !== payload)) {
+      throw new AgentControlError("an ambiguous preview mutation must be reconciled first", {
+        code: "preview_mutation_pending",
+        retryable: true,
+      });
+    }
+    const key = pending?.key ?? randomUUID();
+    this.pendingPreviewMutation = { operation, payload, key };
+    for (let attempt = 0; ; attempt += 1) {
+      this.ensureOpen();
+      try {
+        await mutation(key);
+      } catch (error) {
+        const backoff = STREAM_PREVIEW_RETRY_BACKOFF_MS[attempt];
+        if (!isRetryable(error)) {
+          this.pendingPreviewMutation = null;
+          throw error;
+        }
+        if (backoff === undefined) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        continue;
+      }
+      this.ensureOpen();
+      this.pendingPreviewMutation = null;
+      return;
     }
   }
 
@@ -130,6 +181,10 @@ export class MarmotLivePreview {
    * if it is not an extension of what was already streamed.
    */
   async update(fullText: string): Promise<void> {
+    return this.serializeMutation(() => this.updateSerialized(fullText));
+  }
+
+  private async updateSerialized(fullText: string): Promise<void> {
     this.ensureOpen();
     await this.ensureBegun();
     this.ensureOpen();
@@ -144,12 +199,17 @@ export class MarmotLivePreview {
     // Commit local transcript/append state only after the remote append
     // succeeds, so a failed append can be retried with the same text without
     // diverging from wn-agent's transcript.
-    await this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix);
+    await this.retryPreviewMutation("append", suffix, (key) =>
+      this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix, key));
     this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(fullText);
   }
 
   async appendDelta(delta: string): Promise<void> {
+    return this.serializeMutation(() => this.appendDeltaSerialized(delta));
+  }
+
+  private async appendDeltaSerialized(delta: string): Promise<void> {
     this.ensureOpen();
     await this.ensureBegun();
     this.ensureOpen();
@@ -158,12 +218,17 @@ export class MarmotLivePreview {
       return;
     }
     const next = `${this.appendOnly.current}${suffix}`;
-    await this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix);
+    await this.retryPreviewMutation("append", suffix, (key) =>
+      this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix, key));
     this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(next);
   }
 
   async status(status: string): Promise<void> {
+    return this.serializeMutation(() => this.statusSerialized(status));
+  }
+
+  private async statusSerialized(status: string): Promise<void> {
     this.ensureOpen();
     const text = String(status ?? "");
     if (text.length === 0) {
@@ -171,11 +236,16 @@ export class MarmotLivePreview {
     }
     await this.ensureBegun();
     this.ensureOpen();
-    await this.client.streamStatus(this.streamIdHex!, this.streamCapability!, text);
+    await this.retryPreviewMutation("status", text, (key) =>
+      this.client.streamStatus(this.streamIdHex!, this.streamCapability!, text, key));
     this.transcript!.appendStatus(text, this.chunkBytes);
   }
 
   async progress(text: string): Promise<void> {
+    return this.serializeMutation(() => this.progressSerialized(text));
+  }
+
+  private async progressSerialized(text: string): Promise<void> {
     this.ensureOpen();
     const progressText = String(text ?? "");
     if (progressText.length === 0) {
@@ -183,7 +253,8 @@ export class MarmotLivePreview {
     }
     await this.ensureBegun();
     this.ensureOpen();
-    await this.client.streamProgress(this.streamIdHex!, this.streamCapability!, progressText);
+    await this.retryPreviewMutation("progress", progressText, (key) =>
+      this.client.streamProgress(this.streamIdHex!, this.streamCapability!, progressText, key));
     this.transcript!.appendProgress(progressText, this.chunkBytes);
   }
 
@@ -193,6 +264,10 @@ export class MarmotLivePreview {
    * of the streamed text.
    */
   async finalize(finalText: string): Promise<MarmotLiveFinalizeResult> {
+    return this.serializeMutation(() => this.finalizeSerialized(finalText));
+  }
+
+  private async finalizeSerialized(finalText: string): Promise<MarmotLiveFinalizeResult> {
     this.ensureOpen();
     await this.ensureBegun();
     this.ensureOpen();
@@ -202,12 +277,14 @@ export class MarmotLivePreview {
     }
     const suffix = finalText.slice(current.length);
     if (suffix.length > 0) {
-      await this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix);
+      await this.retryPreviewMutation("append", suffix, (key) =>
+        this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix, key));
       this.transcript!.appendText(suffix, this.chunkBytes);
       this.appendOnly.suffixFor(finalText);
     }
     let response: Awaited<ReturnType<StreamControlClient["streamFinalize"]>> | null = null;
     for (let attempt = 0; attempt <= STREAM_FINALIZE_RETRY_BACKOFF_MS.length; attempt += 1) {
+      this.ensureOpen();
       try {
         response = await this.client.streamFinalize(
           this.streamIdHex!,
@@ -217,14 +294,16 @@ export class MarmotLivePreview {
           this.transcript!.chunkCount,
           this.finalizeIdempotencyKey,
         );
-        break;
       } catch (error) {
         const backoff = STREAM_FINALIZE_RETRY_BACKOFF_MS[attempt];
         if (backoff === undefined || !isRetryable(error)) {
           throw error;
         }
         await new Promise((resolve) => setTimeout(resolve, backoff));
+        continue;
       }
+      this.ensureOpen();
+      break;
     }
     if (!response) {
       throw new Error("stream finalize failed without a response");
