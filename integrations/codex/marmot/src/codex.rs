@@ -71,18 +71,14 @@ async fn run_with_bin(
     let mut environment = Vec::new();
     if let Some(request) = &artifact_output {
         environment.push(EnvironmentChange::Set {
-            name: "MARMOT_ARTIFACT_OUTPUT_FILE",
-            value: request.manifest_path().to_string_lossy().into_owned(),
-        });
-        environment.push(EnvironmentChange::Set {
-            name: "MARMOT_ARTIFACT_AUTHORIZATION_ID",
+            name: "WN_ARTIFACT_AUTHORIZATION_ID",
             value: request.authorization_id().to_owned(),
         });
-        environment.push(EnvironmentChange::Set {
-            name: "MARMOT_ARTIFACT_EXPORT_ROOT",
-            value: request.export_root().to_string_lossy().into_owned(),
-        });
-        prompt.push_str("\n\nIf this task produces files for the requester, place them beneath $MARMOT_ARTIFACT_EXPORT_ROOT and write exactly one JSON object to $MARMOT_ARTIFACT_OUTPUT_FILE using this schema: {\"artifacts\":[{\"authorization_id\":\"value from $MARMOT_ARTIFACT_AUTHORIZATION_ID\",\"path\":\"relative/path\",\"media_type\":\"application/octet-stream\",\"file_name\":\"name.ext\"}]}. Paths must be relative to the export root. Use an empty artifacts array when there are no files. This structured file is the only artifact-delivery signal; do not rely on mentioning paths in chat text.");
+        prompt.push_str(&format!(
+            "\n\nIf this task produces files for the requester, place them beneath {} and write exactly one JSON object to {} using this schema: {{\"artifacts\":[{{\"authorization_id\":\"value from $WN_ARTIFACT_AUTHORIZATION_ID\",\"path\":\"relative/path\",\"media_type\":\"application/octet-stream\",\"file_name\":\"name.ext\"}}]}}. Paths must be relative to the export root. Use an empty artifacts array when there are no files. This structured file is the only artifact-delivery signal; do not rely on mentioning paths in chat text.",
+            request.export_root().display(),
+            request.manifest_path().display(),
+        ));
     }
     let process_result = run_jsonl_process(
         ProcessSpec {
@@ -355,8 +351,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
             &script,
             r#"#!/usr/bin/env bash
 set -euo pipefail
-cat >/dev/null
-printf '{"artifacts":[{"authorization_id":"%s","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf"}]}' "$MARMOT_ARTIFACT_AUTHORIZATION_ID" >"$MARMOT_ARTIFACT_OUTPUT_FILE"
+test -n "$WN_ARTIFACT_AUTHORIZATION_ID"
+test -z "${MARMOT_ARTIFACT_AUTHORIZATION_ID+x}"
+test -z "${MARMOT_ARTIFACT_OUTPUT_FILE+x}"
+test -z "${MARMOT_ARTIFACT_EXPORT_ROOT+x}"
+prompt="$(cat)"
+manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+printf '{"artifacts":[{"authorization_id":"%s","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf"}]}' "$WN_ARTIFACT_AUTHORIZATION_ID" >"$manifest"
 printf '%s\n' '{"type":"thread.started","thread_id":"codex-artifact"}'
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Created report.pdf at /not/a/delivery/signal"}}'
 "#,

@@ -333,11 +333,11 @@ fn parse_artifact_grants(name: &str, raw: &str) -> Result<Vec<ArtifactExportGran
     for grant in &mut grants {
         grant.group_id_hex = normalize_hex(name, &grant.group_id_hex)?;
         if !grant.export_root.is_absolute()
-            || grant.ttl_seconds == 0
+            || !(1..=crate::artifacts::MAX_ARTIFACT_GRANT_TTL_SECONDS).contains(&grant.ttl_seconds)
             || !groups.insert(grant.group_id_hex.clone())
         {
             return Err(config_error(format!(
-                "{name} grants require a unique 64-character group id, absolute export_root, and positive ttl_seconds"
+                "{name} grants require a unique 64-character group id, absolute export_root, and ttl_seconds between 1 and 86400"
             )));
         }
     }
@@ -409,6 +409,37 @@ mod tests {
         .unwrap();
         assert!(loaded.harness.artifact_exports.enabled());
         assert_eq!(loaded.harness.artifact_exports.grants().len(), 1);
+    }
+
+    #[test]
+    fn artifact_grant_ttl_defaults_to_one_hour_and_rejects_values_above_one_day() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+            (
+                "WN_TEST_ARTIFACT_GRANTS_JSON",
+                r#"[{"group_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","export_root":"/home/test/output"}]"#,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            loaded.harness.artifact_exports.grants()[0].ttl_seconds,
+            crate::artifacts::DEFAULT_ARTIFACT_GRANT_TTL_SECONDS
+        );
+
+        assert!(
+            load(&[
+                ("HOME", "/home/test"),
+                ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+                (
+                    "WN_TEST_ARTIFACT_GRANTS_JSON",
+                    r#"[{"group_id_hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","export_root":"/home/test/output","ttl_seconds":86401}]"#,
+                ),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

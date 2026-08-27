@@ -17,6 +17,12 @@ pub(crate) const MAX_ARTIFACT_BYTES: u64 = MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES;
 pub(crate) const MAX_ARTIFACT_BATCH_BYTES: u64 = MAX_MEDIA_UPLOAD_BATCH_BYTES;
 const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_OUTBOX_BYTES: u64 = 1024 * 1024;
+pub(crate) const DEFAULT_ARTIFACT_GRANT_TTL_SECONDS: u64 = 3600;
+pub(crate) const MAX_ARTIFACT_GRANT_TTL_SECONDS: u64 = 86_400;
+
+fn default_artifact_grant_ttl_seconds() -> u64 {
+    DEFAULT_ARTIFACT_GRANT_TTL_SECONDS
+}
 
 /// Operator-authorized policy for exporting backend-created artifacts.
 #[derive(Clone)]
@@ -73,7 +79,7 @@ impl ArtifactExportConfig {
         else {
             return Ok(None);
         };
-        if grant.ttl_seconds == 0 {
+        if !(1..=MAX_ARTIFACT_GRANT_TTL_SECONDS).contains(&grant.ttl_seconds) {
             return Err(HarnessError::ArtifactAuthorizationInvalid);
         }
         let metadata = std::fs::symlink_metadata(&grant.export_root)
@@ -130,9 +136,11 @@ impl fmt::Debug for ArtifactExportConfig {
 
 /// One operator-approved destination scope for one exact Marmot group.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactExportGrant {
     pub group_id_hex: String,
     pub export_root: PathBuf,
+    #[serde(default = "default_artifact_grant_ttl_seconds")]
     pub ttl_seconds: u64,
 }
 
@@ -216,6 +224,7 @@ impl fmt::Debug for ArtifactOutputRequest {
 
 /// One explicitly declared backend output file.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactOutput {
     pub authorization_id: String,
     pub path: PathBuf,
@@ -235,6 +244,7 @@ impl fmt::Debug for ArtifactOutput {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactOutputManifest {
     #[serde(default)]
     pub(crate) artifacts: Vec<ArtifactOutput>,
@@ -1028,6 +1038,36 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn declaration_rejects_unknown_metadata_and_backend_invented_authorization() {
+        let unknown = serde_json::from_str::<ArtifactOutputManifest>(
+            r#"{"artifacts":[{"authorization_id":"auth","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf","caption":"secret"}]}"#,
+        );
+        assert!(unknown.is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        let staging = temp.path().join("staging");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("report.pdf"), b"report").unwrap();
+        let cfg = config(&root, &staging, &temp.path().join("outbox.json"));
+        let error = stage_artifacts(
+            &cfg,
+            "wn-test",
+            "account",
+            "group",
+            "message",
+            &[ArtifactOutput {
+                authorization_id: "backend-invented".to_owned(),
+                path: PathBuf::from("report.pdf"),
+                media_type: "application/pdf".to_owned(),
+                file_name: "report.pdf".to_owned(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, HarnessError::ArtifactAuthorizationInvalid));
     }
 
     #[test]
