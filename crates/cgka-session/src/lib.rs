@@ -1145,6 +1145,10 @@ impl AccountDeviceSession {
         Ok(())
     }
 
+    pub fn pending_origin_message_id(&self, pending: PendingStateRef) -> SessionResult<MessageId> {
+        Ok(self.engine.pending_origin_message_id(pending)?)
+    }
+
     pub fn outbound_fanouts(&self) -> SessionResult<Vec<OutboundFanout>> {
         Ok(self.engine.outbound_fanouts()?)
     }

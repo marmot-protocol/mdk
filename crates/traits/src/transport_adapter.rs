@@ -217,6 +217,14 @@ pub enum FanoutMlsState {
     RolledBack,
 }
 
+/// Engine pending lifecycle restored with a durable fanout after restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FanoutPendingKind {
+    GroupEvolution,
+    CreateGroup,
+}
+
 /// One durable transport fanout frozen before its first external side effect.
 ///
 /// The request owns the exact serialized transport message and original target
@@ -230,6 +238,10 @@ pub struct OutboundFanout {
     request: TransportPublishRequest,
     group_id: Option<GroupId>,
     #[serde(default)]
+    pending_origin_message_id: Option<MessageId>,
+    #[serde(default)]
+    pending_kind: Option<FanoutPendingKind>,
+    #[serde(default)]
     published_message_id: Option<MessageId>,
     target_statuses: Vec<FanoutTargetStatus>,
     #[serde(default)]
@@ -240,6 +252,12 @@ pub struct OutboundFanout {
     target_last_attempt_at_ms: Vec<Option<u64>>,
     #[serde(default)]
     target_possible_exposure: Vec<bool>,
+    /// Exact Welcome artifacts that must be released only after this fanout
+    /// confirms its pending MLS transition.
+    #[serde(default)]
+    post_confirmation_welcomes: Vec<TransportMessage>,
+    #[serde(default)]
+    post_confirmation_welcomes_pending: bool,
     mls_state: FanoutMlsState,
     created_at_ms: u64,
 }
@@ -251,7 +269,67 @@ impl OutboundFanout {
         pending_group_id: Option<GroupId>,
         created_at_ms: u64,
     ) -> Result<Self, TransportAdapterError> {
+        let pending_origin_message_id = pending.map(|_| request.message.id.clone());
+        let pending_kind = pending.map(|_| FanoutPendingKind::GroupEvolution);
+        Self::stage_with_post_confirmation_welcomes(
+            request,
+            pending,
+            pending_group_id,
+            created_at_ms,
+            pending_origin_message_id,
+            pending_kind,
+            Vec::new(),
+        )
+    }
+
+    /// Freeze a publication and the Welcome artifacts released by its MLS
+    /// confirmation in one durable record.
+    pub fn stage_with_post_confirmation_welcomes(
+        request: TransportPublishRequest,
+        pending: Option<PendingStateRef>,
+        pending_group_id: Option<GroupId>,
+        created_at_ms: u64,
+        pending_origin_message_id: Option<MessageId>,
+        pending_kind: Option<FanoutPendingKind>,
+        post_confirmation_welcomes: Vec<TransportMessage>,
+    ) -> Result<Self, TransportAdapterError> {
         request.validate_envelope_matches_target()?;
+        if pending.is_none() && !post_confirmation_welcomes.is_empty() {
+            return Err(TransportAdapterError::Other(
+                "post-confirmation Welcomes require pending MLS state".into(),
+            ));
+        }
+        if pending.is_some() != pending_kind.is_some() {
+            return Err(TransportAdapterError::Other(
+                "pending MLS state and pending kind must be staged together".into(),
+            ));
+        }
+        match (pending_kind, pending_origin_message_id.as_ref()) {
+            (Some(FanoutPendingKind::GroupEvolution), None) => {
+                return Err(TransportAdapterError::Other(
+                    "group evolution fanout requires its stored origin commit".into(),
+                ));
+            }
+            (Some(FanoutPendingKind::CreateGroup), Some(_)) => {
+                return Err(TransportAdapterError::Other(
+                    "legacy group creation has no published origin commit".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(TransportAdapterError::Other(
+                    "origin commit requires pending MLS state".into(),
+                ));
+            }
+            _ => {}
+        }
+        if post_confirmation_welcomes
+            .iter()
+            .any(|message| !matches!(message.envelope, TransportEnvelope::Welcome { .. }))
+        {
+            return Err(TransportAdapterError::Other(
+                "post-confirmation fanout continuation must contain only Welcomes".into(),
+            ));
+        }
         let target_group_id = match &request.target {
             TransportPublishTarget::Group { group_id, .. } => Some(group_id.clone()),
             TransportPublishTarget::Inbox { .. } => None,
@@ -269,12 +347,16 @@ impl OutboundFanout {
         Ok(Self {
             request,
             group_id: target_group_id.or(pending_group_id),
+            pending_origin_message_id,
+            pending_kind,
             published_message_id: None,
             target_statuses: vec![FanoutTargetStatus::NotAttempted; target_count],
             target_failures: vec![None; target_count],
             target_attempt_counts: vec![0; target_count],
             target_last_attempt_at_ms: vec![None; target_count],
             target_possible_exposure: vec![false; target_count],
+            post_confirmation_welcomes_pending: !post_confirmation_welcomes.is_empty(),
+            post_confirmation_welcomes,
             mls_state: pending.map_or(FanoutMlsState::NotApplicable, FanoutMlsState::Pending),
             created_at_ms,
         })
@@ -298,6 +380,26 @@ impl OutboundFanout {
 
     pub fn group_id(&self) -> Option<&GroupId> {
         self.group_id.as_ref()
+    }
+
+    /// Stored OpenMLS commit row used to restore this pending lifecycle.
+    /// Legacy-profile creation has no published commit artifact and returns
+    /// `None`; its durable Welcome plus pending-kind marker restore the edge.
+    pub fn pending_origin_message_id(&self) -> Option<&MessageId> {
+        self.pending_origin_message_id.as_ref().or_else(|| {
+            // Compatibility for fanouts written before the explicit origin
+            // field: those records could only represent group evolution, and
+            // the frozen request id was the stored origin commit id.
+            (self.pending_kind.is_none() && matches!(self.mls_state, FanoutMlsState::Pending(_)))
+                .then_some(&self.request.message.id)
+        })
+    }
+
+    pub fn pending_kind(&self) -> Option<FanoutPendingKind> {
+        self.pending_kind.or_else(|| {
+            matches!(self.mls_state, FanoutMlsState::Pending(_))
+                .then_some(FanoutPendingKind::GroupEvolution)
+        })
     }
 
     pub fn created_at_ms(&self) -> u64 {
@@ -329,6 +431,22 @@ impl OutboundFanout {
             || self
                 .target_statuses
                 .contains(&FanoutTargetStatus::PossiblyExposed)
+    }
+
+    pub fn pending_post_confirmation_welcomes(&self) -> &[TransportMessage] {
+        if self.post_confirmation_welcomes_pending {
+            &self.post_confirmation_welcomes
+        } else {
+            &[]
+        }
+    }
+
+    pub fn mark_post_confirmation_welcomes_released(&mut self) -> bool {
+        if !self.post_confirmation_welcomes_pending {
+            return false;
+        }
+        self.post_confirmation_welcomes_pending = false;
+        true
     }
 
     pub fn pending_ref(&self) -> Option<PendingStateRef> {
@@ -404,6 +522,12 @@ impl OutboundFanout {
             ));
         }
         self.ensure_target_metadata_len();
+        let current = self.target_status(index).ok_or_else(|| {
+            TransportAdapterError::Other("fanout target index is out of bounds".into())
+        })?;
+        if current.is_terminal() {
+            return Ok(false);
+        }
         if failure.kind == TransportEndpointFailureKind::PossiblyExposed {
             self.target_possible_exposure[index] = true;
         }
@@ -421,12 +545,6 @@ impl OutboundFanout {
                 }
             }
         };
-        let current = self.target_status(index).ok_or_else(|| {
-            TransportAdapterError::Other("fanout target index is out of bounds".into())
-        })?;
-        if current.is_terminal() {
-            return Ok(false);
-        }
         self.target_statuses[index] = next;
         self.target_failures[index] = Some(failure);
         Ok(true)
@@ -515,7 +633,10 @@ impl OutboundFanout {
     pub fn validate_successor_of(&self, previous: &Self) -> Result<(), TransportAdapterError> {
         let immutable_matches = self.request == previous.request
             && self.group_id == previous.group_id
+            && self.pending_origin_message_id == previous.pending_origin_message_id
+            && self.pending_kind == previous.pending_kind
             && self.created_at_ms == previous.created_at_ms
+            && self.post_confirmation_welcomes == previous.post_confirmation_welcomes
             && self.target_statuses.len() == previous.target_statuses.len()
             && fanout_metadata_len_is_compatible(
                 self.target_failures.len(),
@@ -557,7 +678,9 @@ impl OutboundFanout {
                 .zip(&previous.target_possible_exposure)
                 .all(|(next, prior)| !*prior || *next);
         let mls_advances = mls_state_advances(previous.mls_state, self.mls_state);
-        if targets_advance && exposure_advances && mls_advances {
+        let continuation_advances =
+            previous.post_confirmation_welcomes_pending || !self.post_confirmation_welcomes_pending;
+        if targets_advance && exposure_advances && mls_advances && continuation_advances {
             Ok(())
         } else {
             Err(TransportAdapterError::Other(
@@ -1146,6 +1269,46 @@ mod tests {
     }
 
     #[test]
+    fn late_ambiguous_result_cannot_reopen_terminal_no_exposure_target() {
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        fanout.mark_attempt_started_at(0, 100).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://one.example".into()),
+                    reason: "connection failed before send".into(),
+                    kind: TransportEndpointFailureKind::NotExposed,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(fanout.target_status(0), Some(FanoutTargetStatus::Failed));
+
+        assert!(
+            !fanout
+                .record_target_failure(
+                    0,
+                    TransportEndpointFailure {
+                        endpoint: TransportEndpoint("wss://one.example".into()),
+                        reason: "late acknowledgement unknown".into(),
+                        kind: TransportEndpointFailureKind::PossiblyExposed,
+                        rejection_category: None,
+                    },
+                )
+                .unwrap()
+        );
+        assert!(!fanout.possible_exposure());
+        assert_eq!(fanout.target_status(0), Some(FanoutTargetStatus::Failed));
+    }
+
+    #[test]
     fn endpoint_failure_without_kind_deserializes_conservatively() {
         let failure: TransportEndpointFailure = serde_json::from_value(serde_json::json!({
             "endpoint": "wss://relay.example",
@@ -1177,6 +1340,70 @@ mod tests {
         assert_eq!(restored.request().message.id, original_id);
         assert_eq!(restored.request().target.endpoints(), original_targets);
         assert_eq!(restored.outstanding_target_indexes(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn legacy_pending_fanout_without_explicit_origin_restores_request_id() {
+        let fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        let expected = fanout.message_id().clone();
+        let mut encoded = serde_json::to_value(fanout).unwrap();
+        let object = encoded.as_object_mut().unwrap();
+        object.remove("pending_origin_message_id");
+        object.remove("pending_kind");
+
+        let restored: OutboundFanout = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.pending_origin_message_id(), Some(&expected));
+        assert_eq!(
+            restored.pending_kind(),
+            Some(FanoutPendingKind::GroupEvolution)
+        );
+    }
+
+    #[test]
+    fn post_confirmation_welcome_release_is_durable_and_cannot_reopen() {
+        let recipient = MemberId::new(vec![0xE5; 32]);
+        let welcome = TransportMessage {
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+            ..fanout_request().message
+        };
+        let request = TransportPublishRequest {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            message: welcome.clone(),
+            target: TransportPublishTarget::Inbox {
+                recipient,
+                endpoints: vec![TransportEndpoint("wss://one.example".into())],
+            },
+            required_acks: 1,
+        };
+        let mut fanout = OutboundFanout::stage_with_post_confirmation_welcomes(
+            request,
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+            None,
+            Some(FanoutPendingKind::CreateGroup),
+            vec![welcome.clone()],
+        )
+        .unwrap();
+        let unreleased = fanout.clone();
+
+        assert_eq!(fanout.pending_post_confirmation_welcomes(), &[welcome]);
+        assert!(fanout.mark_post_confirmation_welcomes_released());
+        assert!(fanout.pending_post_confirmation_welcomes().is_empty());
+        fanout.validate_successor_of(&unreleased).unwrap();
+        assert!(unreleased.validate_successor_of(&fanout).is_err());
+
+        let restored: OutboundFanout =
+            serde_json::from_slice(&serde_json::to_vec(&fanout).unwrap()).unwrap();
+        assert!(restored.pending_post_confirmation_welcomes().is_empty());
     }
 
     fn report(accepted: usize, failed: usize, required_acks: usize) -> TransportPublishReport {

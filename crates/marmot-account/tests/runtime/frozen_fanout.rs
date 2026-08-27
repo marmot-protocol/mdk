@@ -380,7 +380,12 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     bob.ingest(welcome).await.unwrap();
     let endpoint = TransportEndpoint("wss://unknown-app.example".into());
     let adapter = RecordingAdapter::default();
-    adapter.error_for_endpoints(vec![endpoint.clone()]);
+    let transport_event_id = MessageId::new(vec![0xA7; 32]);
+    adapter.report_message_id_next(transport_event_id.clone());
+    adapter.fail_endpoints_as(
+        vec![endpoint.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
     let policy = StaticTransportRouting::new(vec![TransportEndpoint(
         "wss://unknown-app-inbox.example".into(),
     )])
@@ -412,10 +417,219 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     assert_eq!(effects.unresolved_app_messages[0].group_id, group_id);
     assert_eq!(effects.unresolved_app_messages[0].app_event_id, app_event_id);
     assert_eq!(
+        effects.unresolved_app_messages[0].message_id,
+        transport_event_id
+    );
+    assert_eq!(
         effects.unresolved_app_messages[0].reason,
         marmot_account::UnresolvedPublishReason::AcknowledgementUnknown
     );
     assert_eq!(runtime.session().outbound_fanouts().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ambiguous_legacy_create_welcome_confirms_after_restart_with_exact_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-create-unknown.sqlite");
+    let key_text = "marmot unknown create key";
+    let key = SqlCipherKey::new(key_text).unwrap();
+    let alice = session(&alice_path, &key, b"alice-create-unknown");
+    let mut bob = session(
+        dir.path().join("bob-create-unknown.sqlite"),
+        &key,
+        b"bob-create-unknown",
+    );
+    let bob_id = bob.self_id();
+    let endpoint = TransportEndpoint("wss://create-unknown.example".into());
+    let adapter = RecordingAdapter::default();
+    let transport_event_id = MessageId::new(vec![0xC7; 32]);
+    adapter.report_message_id_next(transport_event_id.clone());
+    adapter.report_message_id_next(transport_event_id.clone());
+    adapter.fail_endpoints_as(
+        vec![endpoint.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
+    let policy = StaticTransportRouting::new(vec![endpoint.clone()])
+        .with_inbox_route(bob_id, vec![endpoint]);
+    let wall = Arc::new(TestWallClock::new(200_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let (group_id, unresolved) = runtime
+        .create_group(CreateGroupRequest {
+            name: "unknown create".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(unresolved.pending.is_empty());
+    assert_eq!(unresolved.unresolved_publishes.len(), 1);
+    assert_eq!(runtime.session().outbound_fanouts().unwrap().len(), 1);
+    let first_attempt = adapter.publishes()[0].clone();
+    drop(runtime);
+
+    adapter.fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
+    let reopened = session(
+        &alice_path,
+        &SqlCipherKey::new(key_text).unwrap(),
+        b"alice-create-unknown",
+    );
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    wall.set(200_030);
+
+    let recovered = restarted.resume_outbound_fanouts().await.unwrap();
+    assert!(
+        matches!(
+            recovered.pending.as_slice(),
+            [PendingResolution::Confirmed { .. }]
+        ),
+        "recovered effects: {recovered:?}; fanouts: {:?}; quarantined: {:?}",
+        restarted.session().outbound_fanouts().unwrap(),
+        restarted.session().quarantined_groups()
+    );
+    assert_eq!(restarted.session().epoch(&group_id).unwrap().0, 1);
+    let attempts = adapter.publishes();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].message, attempts[1].message);
+    assert_eq!(recovered.reports[0].message_id, transport_event_id);
+    bob.ingest(first_attempt.message).await.unwrap();
+}
+
+#[tokio::test]
+async fn ambiguous_invite_commit_recovery_publishes_its_frozen_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-invite-unknown.sqlite");
+    let key_text = "marmot unknown invite key";
+    let key = SqlCipherKey::new(key_text).unwrap();
+    let mut alice = session(&alice_path, &key, b"alice-invite-unknown");
+    let mut bob = session(
+        dir.path().join("bob-invite-unknown.sqlite"),
+        &key,
+        b"bob-invite-unknown",
+    );
+    let mut carol = session(
+        dir.path().join("carol-invite-unknown.sqlite"),
+        &key,
+        b"carol-invite-unknown",
+    );
+    let carol_id = carol.self_id();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "unknown invite".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    let group_id = created.group_id;
+
+    let group_endpoint = TransportEndpoint("wss://invite-commit.example".into());
+    let inbox_endpoint = TransportEndpoint("wss://invite-welcome.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![group_endpoint.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
+    let policy = StaticTransportRouting::new(vec![inbox_endpoint.clone()])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![group_endpoint.clone()],
+        )
+        .with_inbox_route(carol_id, vec![inbox_endpoint.clone()]);
+    let wall = Arc::new(TestWallClock::new(300_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let unresolved = runtime
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(unresolved.pending.is_empty());
+    assert_eq!(unresolved.unresolved_publishes.len(), 1);
+    let original_commit = adapter.publishes()[0].message.clone();
+    drop(runtime);
+
+    adapter.fail_endpoints_as(Vec::new(), TransportEndpointFailureKind::PossiblyExposed);
+    adapter.accept_only_endpoints(vec![group_endpoint, inbox_endpoint]);
+    let reopened = session(
+        &alice_path,
+        &SqlCipherKey::new(key_text).unwrap(),
+        b"alice-invite-unknown",
+    );
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    wall.set(300_030);
+
+    let recovered = restarted.resume_outbound_fanouts().await.unwrap();
+    assert!(matches!(
+        recovered.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    let attempts = adapter.publishes();
+    assert_eq!(attempts.len(), 3, "commit retry must release the frozen Welcome");
+    assert_eq!(attempts[1].message, original_commit);
+    let recovered_welcome = attempts
+        .iter()
+        .find(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .expect("confirmed invite must publish its Welcome")
+        .message
+        .clone();
+    carol.ingest(recovered_welcome).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
 }
 
 /// The production-adapter partial-accept shape: one relay accepts while its

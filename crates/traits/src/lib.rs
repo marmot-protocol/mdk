@@ -110,7 +110,7 @@ pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 pub use transport_adapter::{
-    FanoutMlsState, FanoutTargetStatus, OutboundFanout, OutboundFanoutOutcome,
+    FanoutMlsState, FanoutPendingKind, FanoutTargetStatus, OutboundFanout, OutboundFanoutOutcome,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
     TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,

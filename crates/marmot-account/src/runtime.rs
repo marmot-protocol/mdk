@@ -24,11 +24,11 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome,
-    StorageError, Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
-    TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
-    TransportPublishTarget,
+    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, OutboundFanout,
+    OutboundFanoutOutcome, StorageError, Timestamp, TransportAccountActivation, TransportAdapter,
+    TransportAdapterError, TransportDelivery, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointReceipt, TransportGroupSync,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -92,6 +92,12 @@ struct PublishStatus {
     accepted_by_any_endpoint: bool,
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
+}
+
+struct PendingFanoutContinuation {
+    pending: PendingStateRef,
+    kind: FanoutPendingKind,
+    post_confirmation_welcomes: Vec<TransportMessage>,
 }
 
 enum PreparedLegacyPublish {
@@ -2124,8 +2130,8 @@ where
                     source_epoch,
                     retention,
                 } => {
-                    let engine_message_id = msg.id.clone();
                     let reports_before = output.reports.len();
+                    let unresolved_before = output.unresolved_publishes.len();
                     let status =
                         Box::pin(self.publish_one(msg, None, output, queue, context.clone()))
                             .await?;
@@ -2153,18 +2159,14 @@ where
                             );
                         }
                     } else if status.retry_deferred
-                        && let Some(unresolved) = output
-                            .unresolved_publishes
-                            .iter()
-                            .rev()
-                            .find(|unresolved| unresolved.message_id == engine_message_id)
+                        && let Some(unresolved) = output.unresolved_publishes.get(unresolved_before)
                     {
                         output
                             .unresolved_app_messages
                             .push(UnresolvedApplicationMessage {
                                 group_id,
                                 app_event_id,
-                                message_id: engine_message_id,
+                                message_id: unresolved.message_id.clone(),
                                 reason: unresolved.reason,
                             });
                     }
@@ -2553,64 +2555,27 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        let mut all_published = true;
-        let mut any_welcome_exposed = false;
-        let mut retry_deferred = false;
-        let mut welcome_failures = Vec::new();
-        let mut delivered_welcome_ids = Vec::new();
-        for welcome in welcomes {
-            let recipient = welcome_recipient(&welcome);
-            let welcome_id = welcome.id.clone();
-            let failures_before = output.failures.len();
-            let status =
-                Box::pin(self.publish_one(welcome, None, output, queue, context.clone())).await?;
-            any_welcome_exposed |= status.accepted_by_any_endpoint;
-            retry_deferred |= status.retry_deferred;
-            if status.met_required_acks {
-                delivered_welcome_ids.push(welcome_id);
-            } else {
-                if let Some(recipient) = recipient {
-                    welcome_failures.push(self.welcome_delivery_failure(
-                        welcome_id,
-                        recipient,
-                        None,
-                        output,
-                        failures_before,
-                    ));
-                }
-                all_published = false;
-                if !any_welcome_exposed {
-                    break;
-                }
-            }
-        }
-
-        if all_published || any_welcome_exposed {
+        let mut welcomes = welcomes.into_iter();
+        let Some(first_welcome) = welcomes.next() else {
             let effects = self.confirm_published_retrying(pending).await?;
-            let group_id = confirmed_group_id(&effects);
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
-            for message_id in &delivered_welcome_ids {
-                self.mark_welcome_delivered_best_effort(message_id);
-            }
-            for failure in &mut welcome_failures {
-                if failure.group_id.is_none() {
-                    failure.group_id = group_id.clone();
-                }
-            }
-            // Only a confirmed legacy create leaves welcomes worth
-            // re-delivering; a rolled-back create discards the whole
-            // evolution, welcomes included.
-            output.welcome_failures.extend(welcome_failures);
-        } else if !retry_deferred {
-            let effects = self.session.publish_failed(pending).await?;
-            output
-                .pending
-                .push(PendingResolution::RolledBack { pending });
-            output.absorb_session_effects(effects, queue);
-        }
+            return Ok(());
+        };
+        Box::pin(self.publish_one_with_post_confirmation_welcomes(
+            first_welcome,
+            Some(PendingFanoutContinuation {
+                pending,
+                kind: FanoutPendingKind::CreateGroup,
+                post_confirmation_welcomes: welcomes.collect(),
+            }),
+            output,
+            queue,
+            context,
+        ))
+        .await?;
         Ok(())
     }
 
@@ -2792,36 +2757,18 @@ where
             return Ok(());
         }
 
-        let commit_status =
-            Box::pin(self.publish_one(commit, Some(pending), output, queue, context.clone()))
-                .await?;
-        if commit_status.accepted_by_any_endpoint {
-            let group_id = confirmed_group_id_from_events(&output.events);
-            for welcome in welcomes {
-                let recipient = welcome_recipient(&welcome);
-                let welcome_id = welcome.id.clone();
-                let failures_before = output.failures.len();
-                let status =
-                    Box::pin(self.publish_one(welcome, None, output, queue, context.clone()))
-                        .await?;
-                if status.met_required_acks {
-                    self.mark_welcome_delivered_best_effort(&welcome_id);
-                } else {
-                    // The commit is already confirmed, so this member's join
-                    // hinges on re-delivering exactly this welcome.
-                    if let Some(recipient) = recipient {
-                        let failure = self.welcome_delivery_failure(
-                            welcome_id,
-                            recipient,
-                            group_id.clone(),
-                            output,
-                            failures_before,
-                        );
-                        output.welcome_failures.push(failure);
-                    }
-                }
-            }
-        }
+        Box::pin(self.publish_one_with_post_confirmation_welcomes(
+            commit,
+            Some(PendingFanoutContinuation {
+                pending,
+                kind: FanoutPendingKind::GroupEvolution,
+                post_confirmation_welcomes: welcomes,
+            }),
+            output,
+            queue,
+            context,
+        ))
+        .await?;
         Ok(())
     }
 
@@ -3047,7 +2994,37 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
-        if matches!(message.envelope, TransportEnvelope::GroupMessage { .. }) {
+        self.publish_one_with_post_confirmation_welcomes(
+            message,
+            pending.map(|pending| PendingFanoutContinuation {
+                pending,
+                kind: FanoutPendingKind::GroupEvolution,
+                post_confirmation_welcomes: Vec::new(),
+            }),
+            output,
+            queue,
+            context,
+        )
+        .await
+    }
+
+    async fn publish_one_with_post_confirmation_welcomes(
+        &mut self,
+        message: TransportMessage,
+        continuation: Option<PendingFanoutContinuation>,
+        output: &mut AccountDeviceEffects,
+        queue: &mut VecDeque<PublishWork>,
+        context: Option<AuditEventContext>,
+    ) -> AccountResult<PublishStatus> {
+        let (pending, pending_kind, post_confirmation_welcomes) = match continuation {
+            Some(continuation) => (
+                Some(continuation.pending),
+                Some(continuation.kind),
+                continuation.post_confirmation_welcomes,
+            ),
+            None => (None, None, Vec::new()),
+        };
+        if matches!(message.envelope, TransportEnvelope::GroupMessage { .. }) || pending.is_some() {
             let target = match self.routing.publish_target(&message) {
                 Ok(target) => target,
                 Err(error) => {
@@ -3072,7 +3049,23 @@ where
                     return Err(error.into());
                 }
             };
-            let fanout = match OutboundFanout::stage(
+            let pending_origin_message_id = if pending_kind == Some(FanoutPendingKind::CreateGroup)
+            {
+                None
+            } else {
+                match pending
+                    .map(|pending| self.session.pending_origin_message_id(pending))
+                    .transpose()
+                {
+                    Ok(message_id) => message_id,
+                    Err(error) => {
+                        self.rollback_unstaged_pending(pending, output, queue)
+                            .await?;
+                        return Err(error.into());
+                    }
+                }
+            };
+            let fanout = match OutboundFanout::stage_with_post_confirmation_welcomes(
                 TransportPublishRequest {
                     account_id: self.session.self_id(),
                     message,
@@ -3082,6 +3075,9 @@ where
                 pending,
                 pending_group_id,
                 self.wall_clock.now().0.saturating_mul(1_000),
+                pending_origin_message_id,
+                pending_kind,
+                post_confirmation_welcomes,
             ) {
                 Ok(fanout) => fanout,
                 Err(error) => {
@@ -3124,7 +3120,7 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
-        self.resolve_outbound_fanout_mls(&mut fanout, output, queue)
+        self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
             .await?;
         let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
@@ -3206,7 +3202,27 @@ where
                 }
             }
             self.session.put_outbound_fanout(&fanout)?;
-            self.resolve_outbound_fanout_mls(&mut fanout, output, queue)
+            let report = frozen_fanout_report(&fanout);
+            // Record this artifact before confirmation releases any frozen
+            // Welcome continuations, preserving transport chronology in the
+            // returned effects while keeping the MLS edge atomic below.
+            self.session.record_audit_event(
+                fanout.group_id(),
+                context.clone(),
+                AuditEventKind::PublishOutcome {
+                    msg_id: hex::encode(report.message_id.as_slice()),
+                    artifact_kind: None,
+                    target_kind: "frozen_group_fanout".into(),
+                    relay_url: None,
+                    accepted_relay_urls: Vec::new(),
+                    failed_relays: Vec::new(),
+                    required_acks: report.required_acks as u64,
+                    met_required_acks: report.met_required_acks(),
+                    transport: Some(publish_wire_metadata(&fanout.request().message)),
+                },
+            );
+            output.reports.push(report);
+            self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
                 .await?;
         }
 
@@ -3219,7 +3235,7 @@ where
             possible_ambiguous_exposure,
             retry_deferred: fanout_outcome.outstanding_targets > 0,
         };
-        if fanout_outcome.outstanding_targets > 0 {
+        if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
             output.unresolved_publishes.push(UnresolvedPublish {
                 message_id: report.message_id.clone(),
                 reason: if possible_ambiguous_exposure {
@@ -3234,27 +3250,25 @@ where
                 reason: "insufficient publish acknowledgements".into(),
             });
         }
-        // `EpochConfirmed` / `EpochRolledBack` records the MLS edge. This
-        // endpoint-free publish row records the separate terminal fanout edge;
-        // relay URLs stay solely in the encrypted fanout record and never enter
-        // this privacy-safe audit summary.
-        if attempted_any {
-            self.session.record_audit_event(
-                fanout.group_id(),
-                context,
-                AuditEventKind::PublishOutcome {
-                    msg_id: hex::encode(report.message_id.as_slice()),
-                    artifact_kind: None,
-                    target_kind: "frozen_group_fanout".into(),
-                    relay_url: None,
-                    accepted_relay_urls: Vec::new(),
-                    failed_relays: Vec::new(),
-                    required_acks: report.required_acks as u64,
-                    met_required_acks: status.met_required_acks,
-                    transport: Some(publish_wire_metadata(&fanout.request().message)),
-                },
-            );
-            output.reports.push(report);
+        if matches!(
+            fanout.request().message.envelope,
+            TransportEnvelope::Welcome { .. }
+        ) {
+            if status.met_required_acks {
+                self.mark_welcome_delivered_best_effort(fanout.message_id());
+            } else if attempted_any
+                && matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+                && let Some(recipient) = welcome_recipient(&fanout.request().message)
+            {
+                let failure = self.welcome_delivery_failure(
+                    fanout.message_id().clone(),
+                    recipient,
+                    fanout.group_id().cloned(),
+                    output,
+                    output.failures.len().saturating_sub(1),
+                );
+                output.welcome_failures.push(failure);
+            }
         }
         output.fanout.push(fanout_outcome.clone());
         if fanout_outcome.fanout_complete
@@ -3270,6 +3284,7 @@ where
         fanout: &mut OutboundFanout,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
+        context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
         let outcome = fanout.outcome();
         if outcome.mls_confirmation_required {
@@ -3293,6 +3308,17 @@ where
                 .pending
                 .push(PendingResolution::RolledBack { pending });
             output.absorb_session_effects(effects, queue);
+        }
+        if matches!(fanout.mls_state(), FanoutMlsState::Confirmed)
+            && !fanout.pending_post_confirmation_welcomes().is_empty()
+        {
+            let welcomes = fanout.pending_post_confirmation_welcomes().to_vec();
+            let group_id = fanout.group_id().cloned();
+            self.publish_welcome_fanout(welcomes, group_id, output, context, false)
+                .await?;
+            if fanout.mark_post_confirmation_welcomes_released() {
+                self.session.put_outbound_fanout(fanout)?;
+            }
         }
         Ok(())
     }
@@ -3995,28 +4021,6 @@ fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
         TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
         TransportEnvelope::GroupMessage { .. } => None,
     }
-}
-
-/// Extract the group id from the event that confirms a create/evolution.
-///
-/// Session effects are drained after every session call, so the confirmation
-/// effects contain exactly one `GroupCreated` or `EpochChanged` for this
-/// pending operation rather than events left by earlier work. This per-call
-/// drain is load-bearing: batching effects across calls would require matching
-/// the event to the pending operation explicitly. Keeping extraction
-/// best-effort preserves the existing `WelcomeDeliveryFailure::group_id`
-/// contract without re-reading the durable sent-welcome record.
-fn confirmed_group_id(effects: &SessionEffects) -> Option<GroupId> {
-    confirmed_group_id_from_events(&effects.events)
-}
-
-fn confirmed_group_id_from_events(events: &[GroupEvent]) -> Option<GroupId> {
-    events.iter().rev().find_map(|event| match event {
-        GroupEvent::GroupCreated { group_id } | GroupEvent::EpochChanged { group_id, .. } => {
-            Some(group_id.clone())
-        }
-        _ => None,
-    })
 }
 
 /// Build the outbound transport wire envelope for a publish, from the message's
