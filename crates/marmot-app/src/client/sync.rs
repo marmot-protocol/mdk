@@ -3883,7 +3883,15 @@ mod tests {
         DrainVerdict, backfill_drain_verdict, incomplete_full_history_repair,
         retry_backoff_for_ordinal,
     };
-    use crate::{EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP, SyncSummary};
+    use crate::tests::{
+        ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+    };
+    use crate::{
+        EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP, MarmotApp,
+        SyncFailureStage, SyncSummary,
+    };
+    use marmot_account::AccountHome;
+    use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
 
@@ -3970,5 +3978,43 @@ mod tests {
                 "the caller must be able to distinguish why the repair stayed incomplete",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_full_history_repair_preserves_ingested_prefix_without_eose() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let ingested = SyncSummary {
+            joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
+            ..SyncSummary::default()
+        };
+        client.pending_failed_sync_summary.merge(ingested.clone());
+
+        let failure = client
+            .repair_full_history()
+            .await
+            .expect_err("relay silence cannot prove that full history was served");
+
+        assert_eq!(failure.partial_summary, ingested);
+        assert_eq!(
+            failure.classification().failure_stage,
+            SyncFailureStage::RelayReceive
+        );
+        let source = failure.source.to_string();
+        assert!(
+            source.contains("backfill_drain_no_relay_eose")
+                || source.contains("backfill_drain_no_progress_quantum_yield"),
+            "the public failure must preserve the incomplete-drain cause; actual: {source}"
+        );
     }
 }
