@@ -2863,6 +2863,117 @@ fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
     });
 }
 
+/// A restart must not shorten the pacing interval the previous process owed.
+///
+/// The unit tests pin the rule on the detector's own clock; this pins it end to
+/// end, through the durable row, with an interval a test can actually be inside
+/// of. That combination is the whole hazard: the counter is persisted so
+/// restarts cannot erase it, which is exactly what would let a restart *become*
+/// the re-arm clock if the mark beside it were not wall-clock too. Three
+/// force-kills would then be worth three hours of waiting.
+#[test]
+fn a_restart_inside_the_pacing_interval_does_not_buy_a_rearm() {
+    run_composed_app_runtime_test("frozen-epoch-restart-inside-interval", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        // A real interval, long enough that this test is always inside it.
+        let config = backfill_drain_test_config()
+            .with_dev_epoch_stall_wedge_rearm_interval_ms(10 * 60 * 1_000);
+        let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let probe_base = crate::unix_now_seconds() - 1_000;
+
+        for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+            client
+                .ingest_received_delivery(route.probe(
+                    probe_base + probe as u64,
+                    &format!("before-restart-{probe}"),
+                ))
+                .await
+                .expect("a retained undecryptable object completes its ingest pass");
+        }
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "the first arm needs no interval to have elapsed",
+        );
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the armed replay must run");
+        drop(client);
+
+        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+            reopened
+                .ingest_received_delivery(route.probe(
+                    probe_base + 100 + probe as u64,
+                    &format!("after-restart-{probe}"),
+                ))
+                .await
+                .expect("a retained undecryptable object completes its ingest pass");
+        }
+        assert!(
+            !reopened.has_pending_epoch_backfill(),
+            "the restored arm mark is wall-clock, so restarting owes the same wait",
+        );
+        assert!(
+            reopened.pending_epoch_stall_escalations.is_empty(),
+            "and nothing was reported off an interval nobody waited out",
+        );
+    });
+}
+
+/// Only a completion the relays confirmed counts as evidence.
+///
+/// The detector takes the caller's word for that — it is handed completions,
+/// not completion kinds — so the admission test lives at this seam and is worth
+/// pinning here. A drain that gives up without one relay reaching
+/// end-of-stored-events proves that the drain gave up, nothing about whether the
+/// history it wanted exists, and must never accumulate toward a report however
+/// many times it happens.
+#[test]
+fn drains_that_never_confirmed_stored_history_are_not_evidence() {
+    run_composed_app_runtime_test("frozen-epoch-unconfirmed-drains", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let config = backfill_drain_test_config().with_dev_epoch_stall_wedge_rearm_interval_ms(0);
+        let (_app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        let probe_base = crate::unix_now_seconds() - 1_000;
+        // Deliberately no EOSE pump: every drain below ends unconfirmed.
+
+        for round in
+            0..u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD + 1)
+        {
+            for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+                client
+                    .ingest_received_delivery(route.probe(
+                        probe_base + round * 100 + probe as u64,
+                        &format!("round-{round}-probe-{probe}"),
+                    ))
+                    .await
+                    .expect("a retained undecryptable object completes its ingest pass");
+            }
+            assert!(
+                matches!(
+                    client
+                        .run_pending_epoch_backfill(
+                            marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                        )
+                        .await
+                        .expect("the armed replay must run"),
+                    crate::EpochBackfillRunOutcome::Incomplete(_)
+                ),
+                "round {round}: a drain no relay served is an incomplete replay",
+            );
+        }
+
+        assert!(
+            client.pending_epoch_stall_escalations.is_empty(),
+            "unconfirmed drains must never accumulate toward a report",
+        );
+    });
+}
+
 /// A zero-delivery replay after which a tracked group's epoch moved is genuine
 /// success: the value of the replay was letting already-deferred rows converge,
 /// and that is exactly what the epoch delta reports.

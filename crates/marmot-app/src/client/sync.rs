@@ -2329,6 +2329,7 @@ impl AppClient {
                 group_id,
                 stalled_epoch,
                 arms,
+                self.epoch_stall.escalation_arm_threshold(),
                 "apply_backfill_decision",
             );
         }
@@ -2349,13 +2350,17 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         stalled_epoch: u64,
         arms: u32,
+        decided_by_threshold: u32,
         method: &'static str,
     ) {
+        // The threshold logged is the one that actually decided, which is not
+        // always the arm-run threshold the audit row carries: `method` names the
+        // rule and this names the count it reached.
         tracing::warn!(
             target: "marmot_app::epoch_stall",
             method,
             arms,
-            arm_threshold = self.epoch_stall.escalation_arm_threshold(),
+            decided_by_threshold,
             "epoch-gap backfill armed repeatedly without recovering a group; escalating"
         );
         self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
@@ -2417,7 +2422,7 @@ impl AppClient {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     stalled_epoch: evidence.stalled_epoch,
                     fruitless_completions: evidence.fruitless_completions,
-                    escalated: evidence.fruitless_reported,
+                    fruitless_reported: evidence.fruitless_reported,
                     last_arm_at_ms: evidence.last_arm_at_ms,
                 })
             })
@@ -2453,7 +2458,7 @@ impl AppClient {
                     super::epoch_stall::EpochStallEvidence {
                         stalled_epoch: entry.stalled_epoch,
                         fruitless_completions: entry.fruitless_completions,
-                        fruitless_reported: entry.escalated,
+                        fruitless_reported: entry.fruitless_reported,
                         last_arm_at_ms: entry.last_arm_at_ms,
                     },
                 ))
@@ -2745,6 +2750,7 @@ impl AppClient {
             completion_kind,
             Some(EpochBackfillCompletionKind::EndOfStoredEvents)
         ) {
+            let fruitless_threshold = self.epoch_stall.fruitless_completion_threshold();
             let escalations = self
                 .epoch_stall
                 .observe_fruitless_completion(execution.pending.groups.keys());
@@ -2753,6 +2759,7 @@ impl AppClient {
                     &escalation.group_id,
                     escalation.stalled_epoch,
                     escalation.completions,
+                    fruitless_threshold,
                     "finish_epoch_backfill_execution",
                 );
             }

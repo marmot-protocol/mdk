@@ -10,7 +10,7 @@ CREATE TABLE app_epoch_stall_evidence (
                           REFERENCES cgka_groups(id) ON DELETE CASCADE,
     stalled_epoch         INTEGER NOT NULL CHECK (stalled_epoch >= 0),
     fruitless_completions INTEGER NOT NULL CHECK (fruitless_completions >= 0),
-    escalated             INTEGER NOT NULL CHECK (escalated IN (0, 1)),
+    fruitless_reported    INTEGER NOT NULL CHECK (fruitless_reported IN (0, 1)),
     last_arm_at_ms        INTEGER NOT NULL CHECK (last_arm_at_ms >= 0),
     updated_at            INTEGER NOT NULL
 );

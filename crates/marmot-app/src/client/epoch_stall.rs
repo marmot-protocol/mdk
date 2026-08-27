@@ -50,9 +50,12 @@
 //! rather than landing as arm two of something long dead.
 //!
 //! The arm run is process-local, like the stall counts it extends. The
-//! frozen-epoch evidence is not: a wedged group earns at most one confirmed
-//! fruitless replay per pacing interval, so a device restarted more often than
-//! that would never reach the threshold at all. That evidence and the
+//! frozen-epoch evidence is not: a group with nothing to re-arm on but the
+//! clock earns at most one confirmed fruitless replay per pacing interval, so a
+//! device restarted more often than that would never reach the threshold at
+//! all. (A group whose replay keeps *refusing* its history re-arms off those
+//! refusals instead, unpaced, and reaches the threshold faster.) That evidence
+//! and the
 //! wall-clock mark of the last arm are persisted per group and restored at
 //! account open ([`EpochStallDetector::restore_wedge_evidence`]). Wall-clock
 //! deliberately: the counter survives a restart, but the restart never becomes
@@ -117,11 +120,14 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 /// Safety is structural on both sides: escalation only *reports*, it never
 /// changes recovery behavior — the stronger heal (key-package rotation plus full
 /// re-activation) stays an app decision — and an arm run cannot be inflated by
-/// minted traffic, because each additional arm requires a real epoch advance,
-/// which only an authenticated commit produces. The paced same-epoch re-arm a
-/// wedged group spends ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) deliberately
-/// does not count here, so that property survives it intact; what reports a
-/// wedged group instead is
+/// minted traffic. Each additional arm needs either a real epoch advance, which
+/// only an authenticated commit produces, or a replay that came back having
+/// refused this group's own history, which is the engine reporting a local
+/// resource bound rather than anything a sender chose. The paced same-epoch
+/// re-arm a wedged group spends
+/// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) is the one arm minted traffic can
+/// reach, and it deliberately does not count here, so the property survives it
+/// intact; what reports a wedged group instead is
 /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
 pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
 
@@ -268,8 +274,16 @@ struct GroupStall {
     /// see [`GroupStall::rearm_wedged`].
     arms: u32,
     /// Whether the current run already escalated, so a run that keeps arming
-    /// reports once rather than on every further arm.
+    /// reports once rather than on every further arm. Process-local, like the
+    /// `arms` it is paired with — a rebuilt client re-earns both.
     escalated: bool,
+    /// Whether this run already reported off *frozen-epoch* evidence at
+    /// `epoch`. The durable half of the report latch, and separate from
+    /// `escalated` for exactly that reason: `arms` is not persisted, so
+    /// rehydrating one shared latch would silence a fresh arm run the restart
+    /// had nothing to say about. Its lifetime is the shorter of the run and the
+    /// epoch, so both resets clear it.
+    fruitless_reported: bool,
     /// Wall-clock ms at the last arm of the current run, whether it counted
     /// toward `arms` or not. Paces a wedged group's re-arms
     /// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) and bounds a run in time
@@ -291,6 +305,7 @@ impl GroupStall {
             armed_at_epoch: None,
             arms: 0,
             escalated: false,
+            fruitless_reported: false,
             last_arm_at_ms: None,
             fruitless_completions: 0,
         }
@@ -368,14 +383,25 @@ impl GroupStall {
         self.undecryptable.clear();
         self.fired_at_epoch = None;
         // Relay-confirmed evidence about the epoch being left says nothing
-        // about the one being entered.
+        // about the one being entered, and neither does having reported it.
         self.fruitless_completions = 0;
+        self.fruitless_reported = false;
     }
 
     /// Start counting a fresh run.
+    ///
+    /// The frozen-epoch evidence goes with it. A run and a stalled epoch are
+    /// two different lifetimes and only one of them is an epoch change, so a run
+    /// can end while the group sits exactly where it was — the continuation
+    /// window expiring is precisely that case. Clearing the report latch there
+    /// without clearing the evidence behind it would let the very next
+    /// completion report off a run that had already ended. A fresh run re-earns
+    /// its evidence exactly as it re-earns its arms.
     fn end_run(&mut self) {
         self.arms = 0;
         self.escalated = false;
+        self.fruitless_reported = false;
+        self.fruitless_completions = 0;
         self.last_arm_at_ms = None;
     }
 
@@ -439,7 +465,7 @@ impl GroupStall {
         self.armed_at_epoch == Some(self.epoch)
             && self
                 .last_arm_at_ms
-                .is_some_and(|last| now_ms.saturating_sub(last) >= interval_ms)
+                .is_some_and(|last| elapsed_since_mark_ms(now_ms, last) >= interval_ms)
     }
 
     fn note_arm(&mut self, now_ms: u64) {
@@ -455,11 +481,36 @@ impl GroupStall {
             return None;
         }
         self.fruitless_completions = self.fruitless_completions.saturating_add(1);
-        if self.fruitless_completions >= threshold && !self.escalated {
+        if self.fruitless_completions >= threshold && !self.escalated && !self.fruitless_reported {
             self.escalated = true;
+            self.fruitless_reported = true;
             return Some(self.fruitless_completions);
         }
         None
+    }
+}
+
+/// Wall-clock elapsed since a recorded mark, tolerant of a clock that ran ahead.
+///
+/// A mark ahead of `now` is not a negative duration — it is a reading that was
+/// wrong when it was taken, from a dead RTC, a hand-set date, or a saturated
+/// clock, and the device has since been corrected. Saturating the subtraction
+/// would call that zero elapsed at every later reading, so both gates that
+/// consult a mark would stay shut forever; and because the mark is durable, a
+/// restart would not clear it either. Beyond
+/// [`EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS`] such a mark therefore reads as fully
+/// elapsed, which self-heals in the safe direction: the pacing gate allows one
+/// re-arm, and the run window starts a fresh run that re-earns its arms and its
+/// evidence from zero.
+///
+/// Inside the allowance the answer is zero, because two honest readings of
+/// wall-clock time disagree a little and a few minutes of that must not buy a
+/// re-arm the interval had not earned.
+fn elapsed_since_mark_ms(now_ms: u64, mark_ms: u64) -> u64 {
+    match now_ms.checked_sub(mark_ms) {
+        Some(elapsed) => elapsed,
+        None if mark_ms - now_ms <= EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS => 0,
+        None => u64::MAX,
     }
 }
 
@@ -517,6 +568,13 @@ impl EpochStallDetector {
     /// reason [`Self::threshold`] is reported on the arm row.
     pub(crate) fn escalation_arm_threshold(&self) -> u32 {
         self.escalation_arm_threshold
+    }
+
+    /// The confirmed-fruitless-completion count at which this detector reports a
+    /// group wedged at one epoch. Logged as the deciding threshold when that
+    /// rule is what escalated.
+    pub(crate) fn fruitless_completion_threshold(&self) -> u32 {
+        self.fruitless_completion_threshold
     }
 
     /// Record that an account-wide full-history replay was just triggered. One
@@ -758,7 +816,7 @@ impl EpochStallDetector {
         Some(EpochStallEvidence {
             stalled_epoch: stall.epoch.0,
             fruitless_completions: stall.fruitless_completions,
-            fruitless_reported: stall.escalated,
+            fruitless_reported: stall.fruitless_reported,
             last_arm_at_ms: stall.last_arm_at_ms?,
         })
     }
@@ -794,7 +852,7 @@ impl EpochStallDetector {
             stall.fired_at_epoch = Some(epoch);
             stall.last_arm_at_ms = Some(evidence.last_arm_at_ms);
             stall.fruitless_completions = evidence.fruitless_completions;
-            stall.escalated = evidence.fruitless_reported;
+            stall.fruitless_reported = evidence.fruitless_reported;
         }
     }
 }
@@ -1781,7 +1839,8 @@ mod tests {
 
         // The device limps: one epoch of progress per arm, three times over.
         detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
-        let first = detector.observe_undecryptable(g.clone(), "a".into(), EpochId(11), T0 + HOUR_MS);
+        let first =
+            detector.observe_undecryptable(g.clone(), "a".into(), EpochId(11), T0 + HOUR_MS);
         detector.observe_epoch_passage(&g, EpochId(11), EpochId(12));
         let second =
             detector.observe_undecryptable(g.clone(), "b".into(), EpochId(12), T0 + 2 * HOUR_MS);

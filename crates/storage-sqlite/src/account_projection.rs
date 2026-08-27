@@ -140,7 +140,10 @@ pub struct StoredEpochStallEvidence {
     pub group_id_hex: String,
     pub stalled_epoch: u64,
     pub fruitless_completions: u32,
-    pub escalated: bool,
+    /// Whether the run that gathered this evidence already reported it, so a
+    /// restart cannot re-report a group already reported. Scoped to
+    /// `stalled_epoch`: a group observed at any other epoch discards it.
+    pub fruitless_reported: bool,
     pub last_arm_at_ms: u64,
 }
 
@@ -652,20 +655,20 @@ impl SqliteAccountStorage {
                 })?;
                 conn.execute(
                     "INSERT INTO app_epoch_stall_evidence
-                        (group_id, stalled_epoch, fruitless_completions, escalated,
+                        (group_id, stalled_epoch, fruitless_completions, fruitless_reported,
                          last_arm_at_ms, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(group_id) DO UPDATE SET
                         stalled_epoch = excluded.stalled_epoch,
                         fruitless_completions = excluded.fruitless_completions,
-                        escalated = excluded.escalated,
+                        fruitless_reported = excluded.fruitless_reported,
                         last_arm_at_ms = excluded.last_arm_at_ms,
                         updated_at = excluded.updated_at",
                     params![
                         group_id,
                         u64_to_i64(entry.stalled_epoch)?,
                         i64::from(entry.fruitless_completions),
-                        i64::from(entry.escalated),
+                        i64::from(entry.fruitless_reported),
                         u64_to_i64(entry.last_arm_at_ms)?,
                         now
                     ],
@@ -677,11 +680,19 @@ impl SqliteAccountStorage {
     }
 
     /// Every group's frozen-epoch evidence, for account-open restore.
+    ///
+    /// Rows are written when evidence is gathered, never when it is voided:
+    /// nothing persists the resets, because they happen on the delivery hot
+    /// path and a group that recovers has no further reason to touch storage.
+    /// A recovered group therefore leaves its last row behind. That is bounded
+    /// and inert by construction — one row per group, cascading with the
+    /// protocol group — and the restore path discards it on the first
+    /// observation at any other epoch.
     pub fn epoch_stall_evidence(&self) -> StorageResult<Vec<StoredEpochStallEvidence>> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT group_id, stalled_epoch, fruitless_completions, escalated, last_arm_at_ms
+                "SELECT group_id, stalled_epoch, fruitless_completions, fruitless_reported, last_arm_at_ms
                  FROM app_epoch_stall_evidence
                  ORDER BY updated_at, group_id",
             )
@@ -701,13 +712,25 @@ impl SqliteAccountStorage {
             .storage()?;
         rows.into_iter()
             .map(
-                |(group_id, stalled_epoch, fruitless_completions, escalated, last_arm_at_ms)| {
+                |(
+                    group_id,
+                    stalled_epoch,
+                    fruitless_completions,
+                    fruitless_reported,
+                    last_arm_at_ms,
+                )| {
                     Ok(StoredEpochStallEvidence {
                         group_id_hex: hex::encode(group_id),
                         stalled_epoch: i64_to_u64(stalled_epoch)?,
-                        fruitless_completions: u32::try_from(fruitless_completions)
-                            .unwrap_or(u32::MAX),
-                        escalated: escalated != 0,
+                        // Errors rather than saturating: a corrupt count must
+                        // not clamp toward the escalation threshold.
+                        fruitless_completions: u32::try_from(i64_to_u64(fruitless_completions)?)
+                            .map_err(|error| {
+                                StorageError::Serialization(format!(
+                                    "invalid epoch stall completion count: {error}"
+                                ))
+                            })?,
+                        fruitless_reported: fruitless_reported != 0,
                         last_arm_at_ms: i64_to_u64(last_arm_at_ms)?,
                     })
                 },

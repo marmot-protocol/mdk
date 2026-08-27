@@ -485,7 +485,7 @@ fn epoch_stall_evidence_round_trips_and_replaces_in_place() {
         group_id_hex: group.clone(),
         stalled_epoch: 7,
         fruitless_completions: 1,
-        escalated: false,
+        fruitless_reported: false,
         last_arm_at_ms: 1_700_000_000_000,
     };
     store
@@ -498,7 +498,7 @@ fn epoch_stall_evidence_round_trips_and_replaces_in_place() {
     let later = StoredEpochStallEvidence {
         stalled_epoch: 8,
         fruitless_completions: 3,
-        escalated: true,
+        fruitless_reported: true,
         last_arm_at_ms: 1_700_000_600_000,
         ..first
     };

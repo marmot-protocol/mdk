@@ -40,3 +40,4 @@ A9|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_ESCALATION_ARM_THRESH
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD
+A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS
