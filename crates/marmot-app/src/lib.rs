@@ -1719,6 +1719,8 @@ impl MarmotApp {
         };
         let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
         client.restore_persisted_epoch_backfill_intents(persisted_backfills);
+        let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
+        client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
@@ -3210,6 +3212,25 @@ impl MarmotApp {
         self.account_storage(label)?
             .clear_epoch_backfill_intents(intents)?;
         Ok(())
+    }
+
+    pub(crate) fn record_epoch_stall_evidence(
+        &self,
+        label: &str,
+        evidence: &[storage_sqlite::StoredEpochStallEvidence],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .record_epoch_stall_evidence(evidence)?;
+        Ok(())
+    }
+
+    pub(crate) fn epoch_stall_evidence(
+        &self,
+        label: &str,
+    ) -> Result<Vec<storage_sqlite::StoredEpochStallEvidence>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.account_storage(label)?.epoch_stall_evidence()?)
     }
 
     /// `group_id_hex` of every `account_groups` row still carrying the migration

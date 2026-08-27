@@ -2175,6 +2175,7 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
                     bystander.clone(),
                     format!("bystander-{probe}"),
                     cgka_traits::EpochId(stalled_epoch),
+                    epoch_stall_test_now_ms(),
                 ),
                 BackfillDecision::Skip,
             );
@@ -2199,6 +2200,7 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
                 bystander,
                 "bystander-threshold".to_owned(),
                 cgka_traits::EpochId(stalled_epoch),
+                epoch_stall_test_now_ms(),
             ),
             BackfillDecision::Arm,
             "an unconfirmed replay must not disarm a group it never recovered"
@@ -2270,6 +2272,7 @@ fn bystander_stalled_below_threshold(
                 bystander.clone(),
                 format!("bystander-{probe}"),
                 cgka_traits::EpochId(stalled_epoch),
+                epoch_stall_test_now_ms(),
             ),
             BackfillDecision::Skip,
         );
@@ -2287,6 +2290,7 @@ fn bystander_crosses_threshold(
         bystander,
         "bystander-threshold".to_owned(),
         cgka_traits::EpochId(stalled_epoch),
+        epoch_stall_test_now_ms(),
     )
 }
 
@@ -2514,7 +2518,8 @@ fn a_group_armed_through_the_detector_rearms_after_a_fruitless_replay() {
         assert_eq!(
             client.epoch_stall.observe_resource_refusal(
                 route.group_id.clone(),
-                cgka_traits::EpochId(stalled_epoch)
+                cgka_traits::EpochId(stalled_epoch),
+                epoch_stall_test_now_ms(),
             ),
             BackfillDecision::Arm,
             "a replay that retained none of this group's refused history must leave it \
@@ -2639,9 +2644,11 @@ fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
         // the replay below.
         let untouched = cgka_traits::GroupId::new(vec![9_u8; 32]);
         assert_eq!(
-            client
-                .epoch_stall
-                .observe_resource_refusal(untouched.clone(), cgka_traits::EpochId(stalled_epoch)),
+            client.epoch_stall.observe_resource_refusal(
+                untouched.clone(),
+                cgka_traits::EpochId(stalled_epoch),
+                epoch_stall_test_now_ms()
+            ),
             BackfillDecision::Arm,
         );
 
@@ -2667,15 +2674,18 @@ fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
         assert_eq!(
             client.epoch_stall.observe_resource_refusal(
                 route.group_id.clone(),
-                cgka_traits::EpochId(stalled_epoch)
+                cgka_traits::EpochId(stalled_epoch),
+                epoch_stall_test_now_ms(),
             ),
             BackfillDecision::Arm,
             "the group whose refusal the replay counted re-arms",
         );
         assert_eq!(
-            client
-                .epoch_stall
-                .observe_resource_refusal(untouched, cgka_traits::EpochId(stalled_epoch)),
+            client.epoch_stall.observe_resource_refusal(
+                untouched,
+                cgka_traits::EpochId(stalled_epoch),
+                epoch_stall_test_now_ms()
+            ),
             BackfillDecision::Skip,
             "a group the replay refused nothing for keeps its latch",
         );
@@ -2711,7 +2721,8 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let probe_base = crate::unix_now_seconds() - 1_000;
 
-        for round in 0..u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD)
+        for round in
+            0..u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD)
         {
             for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
                 client
@@ -2743,9 +2754,9 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
                 stalled_epoch,
                 "round {round}: the device under test stays frozen at one epoch",
             );
-            if round + 1 < u64::from(
-                crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD,
-            ) {
+            if round + 1
+                < u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD)
+            {
                 assert!(
                     client.pending_epoch_stall_escalations.is_empty(),
                     "round {round}: evidence short of the threshold must not report",
@@ -2771,6 +2782,83 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
                 .count(),
             1,
             "the escalation must leave exactly one durable forensic row",
+        );
+    });
+}
+
+/// The frozen-epoch evidence a process gathers has to outlive that process.
+///
+/// Detector state is otherwise deliberately process-local, and for the arm run
+/// that is the right trade: a discarded run is re-earned from zero, delayed
+/// rather than lost. It is the wrong trade here. A wedged group accumulates one
+/// confirmed fruitless replay per pacing interval, so a device restarted more
+/// often than that would never reach the threshold at all — which is the field
+/// shape, where frozen devices plateau at two arms and restarts wipe the count.
+/// So the evidence and the wall-clock arm mark are durable, and the run is not.
+#[test]
+fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
+    run_composed_app_runtime_test("frozen-epoch-evidence-restart", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let config = backfill_drain_test_config().with_dev_epoch_stall_wedge_rearm_interval_ms(0);
+        let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let probe_base = crate::unix_now_seconds() - 1_000;
+
+        let threshold =
+            u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD);
+        // Every round but the last, then throw the client away.
+        for round in 0..threshold - 1 {
+            for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+                client
+                    .ingest_received_delivery(route.probe(
+                        probe_base + round * 100 + probe as u64,
+                        &format!("round-{round}-probe-{probe}"),
+                    ))
+                    .await
+                    .expect("a retained undecryptable object completes its ingest pass");
+            }
+            client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .expect("the armed replay must run");
+        }
+        assert!(
+            client.pending_epoch_stall_escalations.is_empty(),
+            "evidence short of the threshold must not report",
+        );
+        drop(client);
+
+        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+            reopened
+                .ingest_received_delivery(route.probe(
+                    probe_base + threshold * 100 + probe as u64,
+                    &format!("after-restart-probe-{probe}"),
+                ))
+                .await
+                .expect("a retained undecryptable object completes its ingest pass");
+        }
+        assert!(
+            reopened.has_pending_epoch_backfill(),
+            "the restored arm mark must still allow a paced re-arm",
+        );
+        reopened
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the armed replay must run");
+
+        assert_eq!(
+            reopened
+                .pending_epoch_stall_escalations
+                .iter()
+                .map(|escalation| (escalation.group_id.clone(), escalation.stalled_epoch))
+                .collect::<Vec<_>>(),
+            vec![(route.group_id.clone(), stalled_epoch)],
+            "the replays the previous process confirmed still count toward the report",
         );
     });
 }
@@ -2926,6 +3014,7 @@ async fn armed_epoch_backfill_across_two_relays(
             group_id.clone(),
             format!("two-relay-stall-{probe}"),
             cgka_traits::EpochId(stalled_epoch),
+            epoch_stall_test_now_ms(),
         );
     }
     assert_eq!(decision, BackfillDecision::Arm);
@@ -12837,9 +12926,11 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
-        client
-            .epoch_stall
-            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        client.epoch_stall.observe_resource_refusal(
+            group_id.clone(),
+            cgka_traits::EpochId(10),
+            epoch_stall_test_now_ms()
+        ),
         crate::client::epoch_stall::BackfillDecision::Arm
     );
 
@@ -12859,15 +12950,19 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
     // So the stalls that follow are a new run: without the maintenance report
     // the second of these is the run's escalating third arm.
     assert_eq!(
-        client
-            .epoch_stall
-            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        client.epoch_stall.observe_resource_refusal(
+            group_id.clone(),
+            cgka_traits::EpochId(12),
+            epoch_stall_test_now_ms()
+        ),
         crate::client::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client
-            .epoch_stall
-            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        client.epoch_stall.observe_resource_refusal(
+            group_id,
+            cgka_traits::EpochId(13),
+            epoch_stall_test_now_ms()
+        ),
         crate::client::epoch_stall::BackfillDecision::Arm,
         "the maintenance passage must have ended the run, so this is only its second arm"
     );
@@ -12901,9 +12996,11 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
-        client
-            .epoch_stall
-            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(10)),
+        client.epoch_stall.observe_resource_refusal(
+            group_id.clone(),
+            cgka_traits::EpochId(10),
+            epoch_stall_test_now_ms()
+        ),
         crate::client::epoch_stall::BackfillDecision::Arm
     );
 
@@ -12921,15 +13018,19 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
     );
 
     assert_eq!(
-        client
-            .epoch_stall
-            .observe_resource_refusal(group_id.clone(), cgka_traits::EpochId(12)),
+        client.epoch_stall.observe_resource_refusal(
+            group_id.clone(),
+            cgka_traits::EpochId(12),
+            epoch_stall_test_now_ms()
+        ),
         crate::client::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client
-            .epoch_stall
-            .observe_resource_refusal(group_id, cgka_traits::EpochId(13)),
+        client.epoch_stall.observe_resource_refusal(
+            group_id,
+            cgka_traits::EpochId(13),
+            epoch_stall_test_now_ms()
+        ),
         crate::client::epoch_stall::BackfillDecision::Arm,
         "the confirm must have been observed, so this is only the new run's second arm"
     );
@@ -13124,6 +13225,13 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         "the failed delivery's message must be durably projected exactly once",
     );
 }
+/// One fixed wall-clock instant for tests that drive the epoch-stall detector
+/// directly. The frozen-epoch pacing gate is a wall clock, so a test that means
+/// "no time passed between these two arms" has to say so.
+fn epoch_stall_test_now_ms() -> u64 {
+    1_700_000_000_000
+}
+
 /// A group whose per-group retained-undecryptable backlog is exactly full, plus
 /// everything a test needs to mint one more undecryptable delivery for it.
 ///

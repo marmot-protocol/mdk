@@ -26,8 +26,8 @@ pub use account_projection::{
     AccountNotificationSettings, AccountPendingPushRegistrationRemoval, AccountPushRegistration,
     AccountStoredPushRegistration, AppEventReplayCursor, DeleteLocalGroupDataResult,
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
-    StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent, StoredNostrRoute,
-    clamp_to_max_future_skew,
+    StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
+    StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use chat_list::{
     AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,

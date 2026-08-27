@@ -499,9 +499,11 @@ impl AppClient {
                     // same unrecovered run as a deferred-delivery arm, and the
                     // detector raises the run's escalation only once, at
                     // whichever path happens to arm third.
-                    let decision = self
-                        .epoch_stall
-                        .observe_resource_refusal(group_id.clone(), record.epoch);
+                    let decision = self.epoch_stall.observe_resource_refusal(
+                        group_id.clone(),
+                        record.epoch,
+                        epoch_stall_now_ms(),
+                    );
                     self.apply_backfill_decision(
                         group_id,
                         record.epoch.0,
@@ -2205,15 +2207,18 @@ impl AppClient {
         let Ok(record) = self.runtime.group_record(&group_id) else {
             return;
         };
+        let now_ms = epoch_stall_now_ms();
         let decision = match outcome {
             IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
                 group_id.clone(),
                 message_id_hex.to_owned(),
                 record.epoch,
+                now_ms,
             ),
-            IngestOutcome::ResourceRefused { .. } => self
-                .epoch_stall
-                .observe_resource_refusal(group_id.clone(), record.epoch),
+            IngestOutcome::ResourceRefused { .. } => {
+                self.epoch_stall
+                    .observe_resource_refusal(group_id.clone(), record.epoch, now_ms)
+            }
             // Any other outcome carries no stall evidence, but it does tell the
             // detector where this device now sits. This is a landing position
             // only: the epochs a folded commit carried the device *through* reach
@@ -2310,27 +2315,56 @@ impl AppClient {
             if record_arm {
                 self.record_epoch_stall_backfill_armed(group_id, stalled_epoch, trigger, &context);
             }
+            // The arm mark is what paces the next one, so it has to outlive the
+            // process: a device wedged for six hours must not buy a re-arm by
+            // being force-killed.
+            self.persist_epoch_stall_evidence(std::slice::from_ref(group_id));
         }
         if let BackfillDecision::ArmAndEscalate { arms } = decision {
             // The replay is armed above regardless: escalating reports that
             // replay alone is not repairing this group, it does not replace the
             // attempt (see EPOCH_STALL_ESCALATION_ARM_THRESHOLD for why
             // reporting is all this decision does).
-            tracing::warn!(
-                target: "marmot_app::epoch_stall",
-                method = "apply_backfill_decision",
+            self.report_epoch_stall_escalation(
+                group_id,
+                stalled_epoch,
                 arms,
-                arm_threshold = self.epoch_stall.escalation_arm_threshold(),
-                "epoch-gap backfill armed repeatedly without recovering a group; escalating"
+                "apply_backfill_decision",
             );
-            self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
-            self.pending_epoch_stall_escalations
-                .push(crate::EpochStallEscalation {
-                    group_id: group_id.clone(),
-                    stalled_epoch,
-                    arms,
-                });
         }
+    }
+
+    /// Report that repeated full-history replay is not recovering a group.
+    ///
+    /// Two rules reach here and the report they produce is deliberately the
+    /// same shape, because the claim is the same one: this many armed
+    /// full-history replays did not return this group to the tip. An arm run
+    /// across moving epochs counts arms
+    /// ([`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`]); a group frozen at one epoch
+    /// counts the relay-confirmed fruitless completions those arms produced
+    /// ([`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`]). The detector latches
+    /// `escalated` for the run either way, so a run reports once.
+    fn report_epoch_stall_escalation(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        stalled_epoch: u64,
+        arms: u32,
+        method: &'static str,
+    ) {
+        tracing::warn!(
+            target: "marmot_app::epoch_stall",
+            method,
+            arms,
+            arm_threshold = self.epoch_stall.escalation_arm_threshold(),
+            "epoch-gap backfill armed repeatedly without recovering a group; escalating"
+        );
+        self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
+        self.pending_epoch_stall_escalations
+            .push(crate::EpochStallEscalation {
+                group_id: group_id.clone(),
+                stalled_epoch,
+                arms,
+            });
     }
 
     pub(crate) fn restore_persisted_epoch_backfill_intents(
@@ -2362,6 +2396,78 @@ impl AppClient {
         if !pending.groups.is_empty() {
             self.pending_epoch_backfill = Some(pending);
         }
+    }
+
+    /// Write the detector's frozen-epoch evidence for `groups` to durable
+    /// storage.
+    ///
+    /// Best-effort like the durable arm marker beside it: losing a row costs
+    /// the affected group one more paced attempt after a restart, which is the
+    /// same cost the pre-persistence behavior paid every time. Failing the
+    /// replay over it would trade a delayed report for a lost one.
+    pub(crate) fn persist_epoch_stall_evidence<'groups>(
+        &mut self,
+        groups: impl IntoIterator<Item = &'groups cgka_traits::GroupId>,
+    ) {
+        let evidence = groups
+            .into_iter()
+            .filter_map(|group_id| {
+                let evidence = self.epoch_stall.wedge_evidence(group_id)?;
+                Some(storage_sqlite::StoredEpochStallEvidence {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    stalled_epoch: evidence.stalled_epoch,
+                    fruitless_completions: evidence.fruitless_completions,
+                    escalated: evidence.escalated,
+                    last_arm_at_ms: evidence.last_arm_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .app
+            .record_epoch_stall_evidence(&self.state.label, &evidence)
+        {
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "persist_epoch_stall_evidence",
+                error_kind = error.privacy_safe_kind(),
+                "frozen-epoch recovery evidence is live in memory but was not made durable"
+            );
+        }
+    }
+
+    /// Rebuild the frozen-epoch evidence a previous process gathered.
+    pub(crate) fn restore_persisted_epoch_stall_evidence(
+        &mut self,
+        evidence: Vec<storage_sqlite::StoredEpochStallEvidence>,
+    ) {
+        let mut malformed = 0_u64;
+        let restored = evidence
+            .into_iter()
+            .filter_map(|entry| {
+                let Ok(group_id) = hex::decode(&entry.group_id_hex) else {
+                    malformed = malformed.saturating_add(1);
+                    return None;
+                };
+                Some((
+                    cgka_traits::GroupId::new(group_id),
+                    super::epoch_stall::EpochStallEvidence {
+                        stalled_epoch: entry.stalled_epoch,
+                        fruitless_completions: entry.fruitless_completions,
+                        escalated: entry.escalated,
+                        last_arm_at_ms: entry.last_arm_at_ms,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        if malformed > 0 {
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "restore_persisted_epoch_stall_evidence",
+                malformed,
+                "ignored malformed durable frozen-epoch recovery evidence"
+            );
+        }
+        self.epoch_stall.restore_wedge_evidence(restored);
     }
 
     fn stored_epoch_backfill_intents(
@@ -2629,10 +2735,33 @@ impl AppClient {
             self.epoch_stall.mark_replayed();
             return true;
         }
-        // Fruitless but complete. Withholding `mark_replayed` re-arms bystanders
-        // only; the groups this drain actually refused history for latched
-        // themselves when they armed, so they need an explicit clear or they can
-        // never arm again at this epoch.
+        // Fruitless. An end-of-stored-events completion is the relays saying
+        // they served this account's stored history in full and it held nothing
+        // that moves these groups — the one piece of evidence a device wedged
+        // at an epoch nobody can advance is able to accumulate, and the only
+        // completion shape strong enough to count. A drain that gave up
+        // unconfirmed proves only that the drain gave up.
+        if matches!(
+            completion_kind,
+            Some(EpochBackfillCompletionKind::EndOfStoredEvents)
+        ) {
+            let escalations = self
+                .epoch_stall
+                .observe_fruitless_completion(execution.pending.groups.keys());
+            for escalation in escalations {
+                self.report_epoch_stall_escalation(
+                    &escalation.group_id,
+                    escalation.stalled_epoch,
+                    escalation.completions,
+                    "finish_epoch_backfill_execution",
+                );
+            }
+            self.persist_epoch_stall_evidence(execution.pending.groups.keys());
+        }
+        // Withholding `mark_replayed` re-arms bystanders only; the groups this
+        // drain actually refused history for latched themselves when they armed,
+        // so they need an explicit clear or they can never arm again at this
+        // epoch.
         self.epoch_stall
             .rearm_refused_groups(&counts.refused_groups);
         false
@@ -4135,6 +4264,17 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
 /// Doubling backoff from `base`, capped at [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`]
 /// (or `base` itself when a test override exceeds the cap). Pure so the
 /// schedule is table-testable without a client.
+/// Wall clock for the epoch-stall detector's two time gates.
+///
+/// Wall clock rather than [`Instant`] because both gates have to survive a
+/// restart: a device wedged for six hours must not buy a re-arm by being
+/// force-killed, and a monotonic clock that restarts at zero would hand it one.
+/// Read here rather than inside the detector, which stays I/O-free so its
+/// policy can be unit-tested in isolation.
+fn epoch_stall_now_ms() -> u64 {
+    crate::notifications::unix_now_ms().max(0) as u64
+}
+
 fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
     let doubling = 1_u32 << retry_ordinal.min(8);
     base.saturating_mul(doubling)

@@ -27,12 +27,36 @@
 //! one epoch in a single passage; a confirmed local publish and a folded peer
 //! commit each advance exactly one, which is why the adjacency rule in
 //! [`EpochStallDetector::observe_epoch_passage`] must stay a *delayed* reset and
-//! not no reset at all. One blind spot remains, tracked for a follow-up rather
-//! than defended here: a group whose reported epoch never moves at all arms once
-//! and never escalates, because every arm after the first needs that epoch to
-//! change.
+//! not no reset at all.
 //!
-//! All detector state is process-local, like the stall counts it extends.
+//! A group whose reported epoch never moves at all is the one shape that rule
+//! cannot report, because every arm after the first needs that epoch to change
+//! and the missing commit is the only thing that would change it. That group
+//! gets a second rule, on a second kind of evidence. Its same-epoch re-arms are
+//! paced on a wall clock
+//! ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) — each one buys another
+//! full-history replay, because a replay is the only thing that can learn
+//! anything new — and it escalates once
+//! [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`] of those replays have come
+//! back end-of-stored-events confirmed and empty
+//! ([`EpochStallDetector::observe_fruitless_completion`]). Counting the relays'
+//! verdicts rather than the arms is what keeps the minted-traffic property
+//! below: garbage can pace attempts, it cannot forge a relay's confirmation
+//! that it served everything it had.
+//!
+//! Runs are bounded in wall-clock too. Nothing else ends a quiet group's run,
+//! so two arms more than [`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`] apart are
+//! two runs, not one — an unrelated stall weeks after a single arm starts fresh
+//! rather than landing as arm two of something long dead.
+//!
+//! The arm run is process-local, like the stall counts it extends. The
+//! frozen-epoch evidence is not: a wedged group earns at most one confirmed
+//! fruitless replay per pacing interval, so a device restarted more often than
+//! that would never reach the threshold at all. That evidence and the
+//! wall-clock mark of the last arm are persisted per group and restored at
+//! account open ([`EpochStallDetector::restore_wedge_evidence`]). Wall-clock
+//! deliberately: the counter survives a restart, but the restart never becomes
+//! the re-arm clock.
 //! `sync_with_partial_progress` moves a one-shot escalation into either its
 //! success summary or its failure prefix before the managed runtime can rebuild
 //! the client. The compatibility `sync()` API instead leaves it stashed after
@@ -44,11 +68,10 @@
 //! A discarded run is re-earned from zero rather than re-raised: escalating
 //! again costs a whole fresh run of [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`]
 //! arms, and only the first can land at the epoch the device already sits at,
-//! because an arm at an epoch already fired at is skipped. A group still
-//! reporting epoch advances therefore escalates again once the run refills —
-//! delayed, not lost — while the frozen group above never does. That frozen case
-//! is not a restart artifact: a group frozen from its first arm never escalates
-//! in a fresh process either.
+//! because an arm at an epoch already fired at is skipped until the pacing
+//! interval elapses. A group still reporting epoch advances therefore escalates
+//! again once the run refills — delayed, not lost — and a frozen group reports
+//! off its restored evidence instead.
 //!
 //! The policy is deliberately I/O-free so it can be unit-tested in isolation;
 //! the recovery action it triggers — a full-history transport replay — lives in
@@ -95,7 +118,11 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 /// changes recovery behavior — the stronger heal (key-package rotation plus full
 /// re-activation) stays an app decision — and an arm run cannot be inflated by
 /// minted traffic, because each additional arm requires a real epoch advance,
-/// which only an authenticated commit produces.
+/// which only an authenticated commit produces. The paced same-epoch re-arm a
+/// wedged group spends ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) deliberately
+/// does not count here, so that property survives it intact; what reports a
+/// wedged group instead is
+/// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
 pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
 
 /// How long a group wedged at one stalled epoch must wait between paced
@@ -174,6 +201,12 @@ pub(crate) const EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_
 /// wedged, so being wrong high delays the report rather than losing it.
 pub(crate) const EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD: u32 = 3;
 
+/// The invariant the two wall-clock constants above are chosen under, checked
+/// at compile time rather than by a test: a wedged group's own paced re-arms
+/// must land inside the run window they are meant to continue, or the group
+/// would age out its own run.
+const _: () = assert!(EPOCH_STALL_WEDGE_REARM_INTERVAL_MS < EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS);
+
 /// What one undecryptable-traffic observation decided.
 ///
 /// `#[must_use]` because dropping a decision is unrecoverable, not merely
@@ -218,11 +251,23 @@ struct GroupStall {
     /// replay applies to groups that never armed.
     armed_at_epoch: Option<EpochId>,
     /// Arms in the current unrecovered run: arms with no epoch the device left
-    /// without arming at it (see [`GroupStall::observe_epoch`]).
+    /// without arming at it (see [`GroupStall::observe_epoch`]). Paced
+    /// same-epoch re-arms of a wedged group are deliberately not counted here;
+    /// see [`GroupStall::rearm_wedged`].
     arms: u32,
     /// Whether the current run already escalated, so a run that keeps arming
     /// reports once rather than on every further arm.
     escalated: bool,
+    /// Wall-clock ms at the last arm of the current run, whether it counted
+    /// toward `arms` or not. Paces a wedged group's re-arms
+    /// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) and bounds a run in time
+    /// ([`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`]).
+    last_arm_at_ms: Option<u64>,
+    /// End-of-stored-events replay completions that recovered nothing while
+    /// this group sat at `epoch`. Per-epoch like `undecryptable`, because the
+    /// question it answers is "how many times have the relays confirmed they
+    /// have nothing that moves this device off *this* epoch".
+    fruitless_completions: u32,
 }
 
 impl GroupStall {
@@ -234,6 +279,8 @@ impl GroupStall {
             armed_at_epoch: None,
             arms: 0,
             escalated: false,
+            last_arm_at_ms: None,
+            fruitless_completions: 0,
         }
     }
 
@@ -303,26 +350,104 @@ impl GroupStall {
             return;
         }
         if self.armed_at_epoch != Some(self.epoch) {
-            self.arms = 0;
-            self.escalated = false;
+            self.end_run();
         }
         self.epoch = epoch;
         self.undecryptable.clear();
         self.fired_at_epoch = None;
+        // Relay-confirmed evidence about the epoch being left says nothing
+        // about the one being entered.
+        self.fruitless_completions = 0;
+    }
+
+    /// Start counting a fresh run.
+    fn end_run(&mut self) {
+        self.arms = 0;
+        self.escalated = false;
+        self.last_arm_at_ms = None;
     }
 
     /// Record an arm at the current epoch and decide whether this run has now
     /// armed enough times to escalate.
-    fn arm(&mut self, escalation_arm_threshold: u32) -> BackfillDecision {
-        self.fired_at_epoch = Some(self.epoch);
+    ///
+    /// An arm landing more than [`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`]
+    /// after the previous one starts a fresh run instead of continuing the old
+    /// one. Nothing else bounds a run in wall-clock — [`Self::observe_epoch`]
+    /// ends runs on evidence, and a quiet group produces none — so without this
+    /// an unrelated stall weeks later would land as arm two of a long-dead run.
+    /// The bound is on the *gap between consecutive arms*, not on total run
+    /// length: the field shape this counter exists for ran for hours, and
+    /// bounding total length would lose it.
+    fn arm(&mut self, now_ms: u64, escalation_arm_threshold: u32) -> BackfillDecision {
+        if self.last_arm_at_ms.is_some_and(|last| {
+            now_ms.saturating_sub(last) > EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
+        }) {
+            self.end_run();
+        }
         self.armed_at_epoch = Some(self.epoch);
         self.arms = self.arms.saturating_add(1);
+        self.note_arm(now_ms);
         if self.arms >= escalation_arm_threshold && !self.escalated {
             self.escalated = true;
             BackfillDecision::ArmAndEscalate { arms: self.arms }
         } else {
             BackfillDecision::Arm
         }
+    }
+
+    /// Re-arm at an epoch this group already armed at, to gather evidence.
+    ///
+    /// Deliberately *not* an arm of the run. The undecryptable traffic that
+    /// reaches this path is attacker-mintable, so letting a paced re-arm count
+    /// toward [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] would hand minted
+    /// traffic an escalation for the price of waiting — exactly the property
+    /// that threshold's doc claims it does not have. What the re-arm is allowed
+    /// to do instead is run one more full-history replay, and the relays'
+    /// verdict on that replay is the evidence that escalates
+    /// ([`EpochStallDetector::observe_fruitless_completion`]).
+    fn rearm_wedged(&mut self, now_ms: u64) -> BackfillDecision {
+        self.note_arm(now_ms);
+        BackfillDecision::Arm
+    }
+
+    /// Whether this group may spend a paced re-arm now.
+    ///
+    /// `armed_at_epoch == Some(self.epoch)` is load-bearing:
+    /// [`EpochStallDetector::mark_replayed`] latches `fired_at_epoch` for every
+    /// tracked group without setting `armed_at_epoch`, so without this conjunct
+    /// a group that never armed would re-arm out of another group's replay
+    /// suppression.
+    ///
+    /// There is no separate "fresh traffic arrived" conjunct because this is
+    /// only ever asked from [`EpochStallDetector::observe_undecryptable`]: the
+    /// call *is* the fresh undecryptable. Liveness without leverage — the
+    /// traffic decides when the question is asked, the clock decides the
+    /// answer, and the relays decide what it is worth.
+    fn may_rearm_wedged(&self, now_ms: u64, interval_ms: u64) -> bool {
+        self.armed_at_epoch == Some(self.epoch)
+            && self
+                .last_arm_at_ms
+                .is_some_and(|last| now_ms.saturating_sub(last) >= interval_ms)
+    }
+
+    fn note_arm(&mut self, now_ms: u64) {
+        self.fired_at_epoch = Some(self.epoch);
+        self.last_arm_at_ms = Some(now_ms);
+    }
+
+    /// Count one end-of-stored-events replay completion that recovered nothing
+    /// while this group sat at the epoch it armed at. Reports whether that
+    /// evidence has now earned an escalation this run has not already made.
+    fn observe_fruitless_completion(&mut self, threshold: u32) -> Option<u32> {
+        if self.armed_at_epoch != Some(self.epoch) {
+            return None;
+        }
+        self.fruitless_completions = self.fruitless_completions.saturating_add(1);
+        if self.fruitless_completions >= threshold && !self.escalated {
+            self.escalated = true;
+            return Some(self.fruitless_completions);
+        }
+        None
     }
 }
 
@@ -528,6 +653,7 @@ impl EpochStallDetector {
         group: GroupId,
         message: String,
         epoch: EpochId,
+        now_ms: u64,
     ) -> BackfillDecision {
         let stall = self
             .groups
@@ -539,12 +665,19 @@ impl EpochStallDetector {
         if stall.undecryptable.len() < self.threshold {
             stall.undecryptable.insert(message);
         }
-        let crossed = stall.undecryptable.len() >= self.threshold;
-        if crossed && stall.fired_at_epoch != Some(epoch) {
-            stall.arm(self.escalation_arm_threshold)
-        } else {
-            BackfillDecision::Skip
+        if stall.undecryptable.len() < self.threshold {
+            return BackfillDecision::Skip;
         }
+        if stall.fired_at_epoch != Some(epoch) {
+            return stall.arm(now_ms, self.escalation_arm_threshold);
+        }
+        // Already signalled at this epoch. A group whose epoch still moves gets
+        // its next arm from that movement; a group wedged at one epoch gets no
+        // movement ever, so its only way back to a replay is this paced re-arm.
+        if stall.may_rearm_wedged(now_ms, self.wedge_rearm_interval_ms) {
+            return stall.rearm_wedged(now_ms);
+        }
+        BackfillDecision::Skip
     }
 
     /// A resource refusal proves that at least one object in the fetched
@@ -559,6 +692,7 @@ impl EpochStallDetector {
         &mut self,
         group: GroupId,
         epoch: EpochId,
+        now_ms: u64,
     ) -> BackfillDecision {
         let stall = self
             .groups
@@ -568,9 +702,111 @@ impl EpochStallDetector {
         if stall.fired_at_epoch == Some(epoch) {
             BackfillDecision::Skip
         } else {
-            stall.arm(self.escalation_arm_threshold)
+            stall.arm(now_ms, self.escalation_arm_threshold)
         }
     }
+
+    /// Count one replay completion that reached end-of-stored-events and
+    /// recovered nothing, against each of the `groups` it was armed for.
+    ///
+    /// This is the escalation rule for a group whose epoch never moves, and the
+    /// admission test is deliberately narrow (see
+    /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`]): the caller passes only
+    /// completions the relays confirmed served the account's stored history in
+    /// full, and only ones that recovered nothing. A group that has since left
+    /// the epoch it armed at is skipped — it is no longer wedged where the
+    /// evidence was gathered.
+    ///
+    /// Returns one entry per group whose evidence has now earned a report that
+    /// its run has not already made. Like every escalation, this only reports;
+    /// the replay it followed is unaffected.
+    pub(crate) fn observe_fruitless_completion<'groups>(
+        &mut self,
+        groups: impl IntoIterator<Item = &'groups GroupId>,
+    ) -> Vec<FruitlessEscalation> {
+        let threshold = self.fruitless_completion_threshold;
+        groups
+            .into_iter()
+            .filter_map(|group_id| {
+                let stall = self.groups.get_mut(group_id)?;
+                let completions = stall.observe_fruitless_completion(threshold)?;
+                Some(FruitlessEscalation {
+                    group_id: group_id.clone(),
+                    stalled_epoch: stall.epoch.0,
+                    completions,
+                })
+            })
+            .collect()
+    }
+
+    /// The durable frozen-epoch evidence for `group`, for the storage row that
+    /// carries it across a restart. `None` for a group with no stall history.
+    pub(crate) fn wedge_evidence(&self, group: &GroupId) -> Option<EpochStallEvidence> {
+        let stall = self.groups.get(group)?;
+        Some(EpochStallEvidence {
+            stalled_epoch: stall.epoch.0,
+            fruitless_completions: stall.fruitless_completions,
+            escalated: stall.escalated,
+            last_arm_at_ms: stall.last_arm_at_ms?,
+        })
+    }
+
+    /// Rebuild the frozen-epoch evidence a previous process gathered.
+    ///
+    /// Only the per-epoch evidence and the wall-clock arm mark survive: the arm
+    /// run itself stays process-local, as the module header describes. That
+    /// split is the whole point. Persisting the counter is what stops a restart
+    /// from erasing hours of confirmed relay verdicts, while persisting
+    /// `last_arm_at_ms` as wall-clock is what stops the restart from *becoming*
+    /// the re-arm clock — a force-killed daemon must not buy a re-arm it had
+    /// not waited for. `escalated` rides along so a restart cannot re-report a
+    /// group whose evidence is already at the threshold.
+    ///
+    /// A restored group starts with an empty undecryptable set, so it must
+    /// re-earn the stall threshold before it can spend a paced re-arm. An entry
+    /// whose `stalled_epoch` no longer matches is harmless: the first
+    /// observation at the real epoch resets the per-epoch evidence exactly as a
+    /// live epoch move does.
+    pub(crate) fn restore_wedge_evidence(
+        &mut self,
+        entries: impl IntoIterator<Item = (GroupId, EpochStallEvidence)>,
+    ) {
+        for (group_id, evidence) in entries {
+            let epoch = EpochId(evidence.stalled_epoch);
+            let stall = self
+                .groups
+                .entry(group_id)
+                .or_insert_with(|| GroupStall::new(epoch));
+            stall.epoch = epoch;
+            stall.armed_at_epoch = Some(epoch);
+            stall.fired_at_epoch = Some(epoch);
+            stall.last_arm_at_ms = Some(evidence.last_arm_at_ms);
+            stall.fruitless_completions = evidence.fruitless_completions;
+            stall.escalated = evidence.escalated;
+        }
+    }
+}
+
+/// A wedged group whose fruitless end-of-stored-events completions have reached
+/// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FruitlessEscalation {
+    pub(crate) group_id: GroupId,
+    pub(crate) stalled_epoch: u64,
+    /// Confirmed fruitless replay completions at `stalled_epoch`. Reported as
+    /// the escalation's `arms`: each completion is one armed full-history
+    /// replay the relays confirmed served the stored history and that recovered
+    /// nothing, which is the same claim the arm count makes and a stricter one.
+    pub(crate) completions: u32,
+}
+
+/// The part of a group's stall state that survives a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EpochStallEvidence {
+    pub(crate) stalled_epoch: u64,
+    pub(crate) fruitless_completions: u32,
+    pub(crate) escalated: bool,
+    pub(crate) last_arm_at_ms: u64,
 }
 
 impl Default for EpochStallDetector {
@@ -652,6 +888,16 @@ fn new_recovery_attempt_id() -> String {
 mod tests {
     use super::*;
 
+    /// One fixed wall-clock instant, in ms.
+    ///
+    /// Every test below that does not care about the frozen-epoch clock arms at
+    /// exactly this instant, so no pacing interval ever elapses and no run
+    /// continuation window ever expires: the two time gates stay inert and the
+    /// test decides on the evidence rules alone.
+    const T0: u64 = 1_700_000_000_000;
+
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+
     fn group(byte: u8) -> GroupId {
         GroupId::new(vec![byte])
     }
@@ -671,15 +917,15 @@ mod tests {
         // The field shape: the replay recovers some backlog, the device advances
         // an epoch, and it stalls again — three times over, never reaching tip.
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10)),
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11)),
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
             "the threshold-th arm in an unrecovered run must escalate"
         );
@@ -690,21 +936,21 @@ mod tests {
         let mut detector = EpochStallDetector::new(1, 3);
         let g = group(0x01);
 
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 }
         );
         // The device keeps arming and keeps falling behind. It is already
         // reported; re-reporting every further arm would be the noise the app
         // cannot act on.
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(13)),
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(13), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(14)),
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(14), T0),
             BackfillDecision::Arm
         );
     }
@@ -715,8 +961,8 @@ mod tests {
         let g = group(0x01);
 
         // Two arms into an unrecovered run.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
 
         // The device then processes this group's traffic at 12 and moves on to 13
         // without ever stalling at 12 — it kept up with an epoch, which is as
@@ -726,11 +972,11 @@ mod tests {
 
         // So a fresh stall opens a new run instead of completing the old one.
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(14)),
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(14), T0),
             BackfillDecision::Arm,
             "the arm count must have restarted, so this is the run's second arm"
         );
@@ -756,19 +1002,19 @@ mod tests {
         // detector is never told about — the convergence fold reaches no
         // `observe_*` call, so nothing between the arm and the next stall records
         // 11, 12 or 13.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
 
         // The next stall is therefore the first observation since the arm, and it
         // finds the detector still sitting at the epoch it armed at. The run
         // continues even though the device passed through three epochs in between,
         // and reaches its escalation threshold.
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(13)),
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(13), T0),
             BackfillDecision::Arm,
             "an unobserved advance leaves the run open, so this is arm two"
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(14)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(14), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
         );
     }
@@ -782,10 +1028,10 @@ mod tests {
         let g = group(0x01);
 
         // A full unrecovered run, reported.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 }
         );
 
@@ -797,15 +1043,15 @@ mod tests {
         // So the stalls that follow are a new run, counted from one, and able to
         // report again on their own third arm rather than staying latched shut.
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(15)),
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(15), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(16)),
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(16), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m6".into(), EpochId(17)),
+            detector.observe_undecryptable(g.clone(), "m6".into(), EpochId(17), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
             "the passage must have cleared the escalation latch too"
         );
@@ -820,15 +1066,15 @@ mod tests {
 
         // Arm, limp forward exactly one epoch, stall again at it: the field
         // shape, now with the advance actually reported.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
         detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11)),
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0),
             BackfillDecision::Arm
         );
         detector.observe_epoch_passage(&g, EpochId(11), EpochId(12));
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
             "a device that arms at every epoch it reaches is still failing to catch up"
         );
@@ -842,9 +1088,9 @@ mod tests {
         let g = group(0x01);
 
         // Two arms into a run, one epoch apart.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
         detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
 
         // The device then keeps moving: it reaches 12, arms nothing there, and
         // moves on to 13. Leaving 12 is the clean pass that ends the run.
@@ -852,7 +1098,7 @@ mod tests {
         detector.observe_epoch_passage(&g, EpochId(12), EpochId(13));
 
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13), T0),
             BackfillDecision::Arm,
             "sustained movement must restart the run, so this is its first arm"
         );
@@ -870,7 +1116,7 @@ mod tests {
         // surviving it proves the passage created no entry to suppress.
         detector.mark_replayed();
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14)),
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14), T0),
             BackfillDecision::Arm,
             "a passage must not enroll a group with no stall history"
         );
@@ -881,7 +1127,7 @@ mod tests {
         let mut detector = EpochStallDetector::new(1, 3);
         let g = group(0x01);
 
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
 
         // A reorg that rolls the tip back moves the device away from the group's
         // history, not toward it. Synthesizing an intermediate epoch here would
@@ -889,11 +1135,11 @@ mod tests {
         detector.observe_epoch_passage(&g, EpochId(10), EpochId(9));
 
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11)),
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
             "the rollback must not have ended the run"
         );
@@ -909,9 +1155,9 @@ mod tests {
         let g = group(0x01);
 
         // Two arms into a run, one epoch apart, so the detector sits at 15.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(14), T0);
         detector.observe_epoch_passage(&g, EpochId(14), EpochId(15));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(15));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(15), T0);
 
         // A reorg rolls the tip back to 12. The passage is dropped, so the
         // detector keeps believing 15 while the engine restarts from 12.
@@ -921,7 +1167,7 @@ mod tests {
         detector.observe_epoch_passage(&g, EpochId(14), EpochId(15));
 
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(15)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(15), T0),
             BackfillDecision::Skip,
             "re-climbing to 15 must not reopen the backfill already fired there"
         );
@@ -929,7 +1175,7 @@ mod tests {
         // And the run is intact: the next genuine advance is still arm three.
         detector.observe_epoch_passage(&g, EpochId(15), EpochId(16));
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(16)),
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(16), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
             "the re-climb must not have reset the run"
         );
@@ -945,24 +1191,24 @@ mod tests {
         let g = group(0x01);
 
         // A spanning passage ends the first run, then two arms open a new one.
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(12));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(12), T0);
         detector.observe_epoch_passage(&g, EpochId(12), EpochId(15));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(15));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(15), T0);
         detector.observe_epoch_passage(&g, EpochId(15), EpochId(16));
-        let _ = detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(16));
+        let _ = detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(16), T0);
 
         // The very same passage observed a second time, now far behind the tip.
         detector.observe_epoch_passage(&g, EpochId(12), EpochId(15));
 
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(16)),
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(16), T0),
             BackfillDecision::Skip,
             "a re-observed passage must not reopen the backfill fired at 16"
         );
 
         detector.observe_epoch_passage(&g, EpochId(16), EpochId(17));
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(17)),
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(17), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 },
             "a re-observed passage must not reset the run either"
         );
@@ -978,7 +1224,7 @@ mod tests {
 
         // Tracked but never armed, then suppressed by someone else's replay.
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10)),
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
             BackfillDecision::Skip
         );
         detector.mark_replayed();
@@ -986,9 +1232,9 @@ mod tests {
         // A passage the device already made, re-reported: no movement at all.
         detector.observe_epoch_passage(&g, EpochId(8), EpochId(10));
 
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10));
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0);
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(10)),
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(10), T0),
             BackfillDecision::Skip,
             "the replay suppression at 10 must survive a stale passage"
         );
@@ -1002,15 +1248,15 @@ mod tests {
         // A refused object and a stalled epoch are both "a full-history replay
         // was armed and did not get this device to the tip".
         assert_eq!(
-            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10)),
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_resource_refusal(g.clone(), EpochId(11)),
+            detector.observe_resource_refusal(g.clone(), EpochId(11), T0),
             BackfillDecision::Arm
         );
         assert_eq!(
-            detector.observe_resource_refusal(g.clone(), EpochId(12)),
+            detector.observe_resource_refusal(g.clone(), EpochId(12), T0),
             BackfillDecision::ArmAndEscalate { arms: 3 }
         );
     }
@@ -1025,25 +1271,25 @@ mod tests {
         // A arms and the caller runs one account-wide replay, which suppresses
         // every tracked group at its current epoch — including B, which was
         // accumulating undecryptables but never armed.
-        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e);
+        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e, T0);
         assert_eq!(
-            detector.observe_undecryptable(a, "a2".into(), e),
+            detector.observe_undecryptable(a, "a2".into(), e, T0),
             BackfillDecision::Arm
         );
-        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e);
+        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e, T0);
         detector.mark_replayed();
 
         // B stalls at the next two epochs. Its run starts at the first of those
         // arms: the suppression it inherited was never a repair attempt of its
         // own, so it must not count toward escalating B.
-        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), EpochId(6));
+        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), EpochId(6), T0);
         assert_eq!(
-            detector.observe_undecryptable(b.clone(), "b3".into(), EpochId(6)),
+            detector.observe_undecryptable(b.clone(), "b3".into(), EpochId(6), T0),
             BackfillDecision::Arm
         );
-        let _ = detector.observe_undecryptable(b.clone(), "b4".into(), EpochId(7));
+        let _ = detector.observe_undecryptable(b.clone(), "b4".into(), EpochId(7), T0);
         assert_eq!(
-            detector.observe_undecryptable(b, "b5".into(), EpochId(7)),
+            detector.observe_undecryptable(b, "b5".into(), EpochId(7), T0),
             BackfillDecision::ArmAndEscalate { arms: 2 }
         );
     }
@@ -1076,17 +1322,17 @@ mod tests {
 
         assert!(
             !detector
-                .observe_undecryptable(g.clone(), "m1".into(), e)
+                .observe_undecryptable(g.clone(), "m1".into(), e, T0)
                 .arms_backfill()
         );
         assert!(
             !detector
-                .observe_undecryptable(g.clone(), "m2".into(), e)
+                .observe_undecryptable(g.clone(), "m2".into(), e, T0)
                 .arms_backfill()
         );
         assert!(
             detector
-                .observe_undecryptable(g.clone(), "m3".into(), e)
+                .observe_undecryptable(g.clone(), "m3".into(), e, T0)
                 .arms_backfill(),
             "the threshold-crossing message should signal a backfill"
         );
@@ -1098,11 +1344,11 @@ mod tests {
         let g = group(0x01);
         let e = EpochId(19);
 
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), e);
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), e);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), e, T0);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), e, T0);
         assert!(
             detector
-                .observe_undecryptable(g.clone(), "m3".into(), e)
+                .observe_undecryptable(g.clone(), "m3".into(), e, T0)
                 .arms_backfill()
         );
         // Further undecryptable traffic at the same stalled epoch must not
@@ -1110,12 +1356,12 @@ mod tests {
         // would let a burst (or a spray of attacker-minted ids) trigger a storm.
         assert!(
             !detector
-                .observe_undecryptable(g.clone(), "m4".into(), e)
+                .observe_undecryptable(g.clone(), "m4".into(), e, T0)
                 .arms_backfill()
         );
         assert!(
             !detector
-                .observe_undecryptable(g.clone(), "m5".into(), e)
+                .observe_undecryptable(g.clone(), "m5".into(), e, T0)
                 .arms_backfill()
         );
     }
@@ -1127,17 +1373,17 @@ mod tests {
 
         assert!(
             detector
-                .observe_resource_refusal(g.clone(), EpochId(19))
+                .observe_resource_refusal(g.clone(), EpochId(19), T0)
                 .arms_backfill()
         );
         assert!(
             !detector
-                .observe_resource_refusal(g.clone(), EpochId(19))
+                .observe_resource_refusal(g.clone(), EpochId(19), T0)
                 .arms_backfill()
         );
         assert!(
             detector
-                .observe_resource_refusal(g, EpochId(20))
+                .observe_resource_refusal(g, EpochId(20), T0)
                 .arms_backfill()
         );
     }
@@ -1151,18 +1397,18 @@ mod tests {
 
         // Group A crosses the threshold and the caller runs ONE account-wide
         // replay (which re-fetches every group's history, B included).
-        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e);
-        let _ = detector.observe_undecryptable(a.clone(), "a2".into(), e);
+        let _ = detector.observe_undecryptable(a.clone(), "a1".into(), e, T0);
+        let _ = detector.observe_undecryptable(a.clone(), "a2".into(), e, T0);
         assert!(
             detector
-                .observe_undecryptable(a.clone(), "a3".into(), e)
+                .observe_undecryptable(a.clone(), "a3".into(), e, T0)
                 .arms_backfill()
         );
 
         // Group B was accumulating undecryptables at the same epoch in the same
         // drain but had not yet crossed the threshold.
-        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e);
-        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), e);
+        let _ = detector.observe_undecryptable(b.clone(), "b1".into(), e, T0);
+        let _ = detector.observe_undecryptable(b.clone(), "b2".into(), e, T0);
 
         detector.mark_replayed();
 
@@ -1170,7 +1416,7 @@ mod tests {
         // one: the single replay already covered it.
         assert!(
             !detector
-                .observe_undecryptable(b.clone(), "b3".into(), e)
+                .observe_undecryptable(b.clone(), "b3".into(), e, T0)
                 .arms_backfill(),
             "one account-wide replay should cover every stuck group at this epoch"
         );
@@ -1181,25 +1427,299 @@ mod tests {
         let mut detector = stall_detector(3);
         let g = group(0x01);
 
-        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(19));
-        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(19));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(19), T0);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(19), T0);
         // The group advanced to epoch 20 — its commits are reaching us again, so
         // the earlier undecryptables must not count toward a stall at epoch 20.
         assert!(
             !detector
-                .observe_undecryptable(g.clone(), "m3".into(), EpochId(20))
+                .observe_undecryptable(g.clone(), "m3".into(), EpochId(20), T0)
                 .arms_backfill()
         );
         assert!(
             !detector
-                .observe_undecryptable(g.clone(), "m4".into(), EpochId(20))
+                .observe_undecryptable(g.clone(), "m4".into(), EpochId(20), T0)
                 .arms_backfill()
         );
         assert!(
             detector
-                .observe_undecryptable(g.clone(), "m5".into(), EpochId(20))
+                .observe_undecryptable(g.clone(), "m5".into(), EpochId(20), T0)
                 .arms_backfill(),
             "the count should restart at the new epoch, not carry over"
+        );
+    }
+
+    /// The blind spot this pacing exists for: a group whose epoch never moves
+    /// arms once and nothing else can ever re-arm it, because `fired_at_epoch`
+    /// is cleared only by an epoch change and the epoch cannot change without
+    /// the very commit the replay could not find.
+    #[test]
+    fn a_wedged_group_cannot_rearm_before_the_pacing_interval_elapses() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS - 1),
+            BackfillDecision::Skip,
+            "traffic alone must not re-arm: the clock is what paces the attempt",
+        );
+    }
+
+    #[test]
+    fn a_wedged_group_rearms_once_the_pacing_interval_elapses() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS),
+            BackfillDecision::Arm,
+            "a wedged group's only way back to a replay is the paced re-arm",
+        );
+        // And the re-arm resets its own clock rather than opening a window.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(10), T0 + HOUR_MS + 1),
+            BackfillDecision::Skip,
+        );
+    }
+
+    /// The security property `EPOCH_STALL_ESCALATION_ARM_THRESHOLD` claims:
+    /// minted traffic cannot inflate an arm run. Pacing must not weaken it, so
+    /// a paced re-arm buys a replay and nothing else — however many of them a
+    /// patient attacker pays for.
+    #[test]
+    fn paced_rearms_never_escalate_by_themselves() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+
+        for hour in 0..10 {
+            assert_eq!(
+                detector.observe_undecryptable(
+                    g.clone(),
+                    format!("minted-{hour}"),
+                    EpochId(10),
+                    T0 + hour * HOUR_MS,
+                ),
+                BackfillDecision::Arm,
+                "hour {hour}: a paced re-arm is an arm of the replay, never of the run",
+            );
+        }
+    }
+
+    /// What does escalate a wedged group: replays whose relays confirmed they
+    /// had served the account's stored history and that recovered nothing.
+    #[test]
+    fn fruitless_end_of_stored_events_completions_escalate_a_wedged_group_once() {
+        let mut detector = EpochStallDetector::new(1, 3)
+            .with_wedge_rearm_interval_ms(HOUR_MS)
+            .with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "one confirmed fruitless replay is not yet a report",
+        );
+        assert!(detector.observe_fruitless_completion([&g]).is_empty());
+        assert_eq!(
+            detector.observe_fruitless_completion([&g]),
+            vec![FruitlessEscalation {
+                group_id: g.clone(),
+                stalled_epoch: 10,
+                completions: 3,
+            }],
+        );
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "a run reports once, however long it keeps gathering evidence",
+        );
+    }
+
+    /// Evidence is about one epoch. A group that has moved on since it armed is
+    /// no longer wedged where the evidence was gathered, so the completion says
+    /// nothing about it.
+    #[test]
+    fn a_completion_for_a_group_that_left_its_armed_epoch_is_not_evidence() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(1);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(12));
+
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "a group that moved off its armed epoch cannot be reported wedged at it",
+        );
+    }
+
+    /// And the count is per-epoch: evidence gathered at one stalled epoch says
+    /// nothing about the next one.
+    #[test]
+    fn leaving_a_stalled_epoch_discards_its_fruitless_evidence() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(2);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        assert!(detector.observe_fruitless_completion([&g]).is_empty());
+
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "the first epoch's evidence must not carry into the second",
+        );
+    }
+
+    /// The storm-collapse suppression a replay applies to groups that never
+    /// armed sets `fired_at_epoch` without `armed_at_epoch`. It must not be
+    /// mistaken for an arm this group can pace a re-arm off.
+    #[test]
+    fn storm_collapse_suppression_does_not_unlock_a_paced_rearm() {
+        let mut detector = EpochStallDetector::new(2, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        detector.mark_replayed();
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS * 5),
+            BackfillDecision::Skip,
+            "a group that never armed has no arm to pace a re-arm from",
+        );
+    }
+
+    /// A run is unbounded in wall-clock without this: an unrelated stall weeks
+    /// after a single arm would land as arm two of a long-dead run.
+    #[test]
+    fn an_arm_past_the_run_continuation_window_starts_a_fresh_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(11), T0);
+        // Weeks of quiet, then an unrelated stall.
+        let later = T0 + EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS + 1;
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(12), later),
+            BackfillDecision::Arm,
+            "an arm this far from the last one starts its own run",
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m4".into(), EpochId(13), later),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m5".into(), EpochId(14), later),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "the fresh run still escalates on its own third arm",
+        );
+    }
+
+    #[test]
+    fn an_arm_inside_the_run_continuation_window_continues_the_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_undecryptable(
+            g.clone(),
+            "m2".into(),
+            EpochId(11),
+            T0 + EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS,
+        );
+        assert_eq!(
+            detector.observe_undecryptable(
+                g.clone(),
+                "m3".into(),
+                EpochId(12),
+                T0 + 2 * EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS,
+            ),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "hours-long field stalls have to stay one run",
+        );
+    }
+
+    /// The restart rule, in both directions. Restored evidence is not lost, and
+    /// the restart itself buys nothing: the arm mark is wall-clock, so a device
+    /// force-killed a minute after arming still owes the rest of the interval.
+    #[test]
+    fn a_restart_carries_the_evidence_without_becoming_the_clock() {
+        let mut detector = EpochStallDetector::new(1, 3)
+            .with_wedge_rearm_interval_ms(HOUR_MS)
+            .with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 2,
+                escalated: false,
+                last_arm_at_ms: T0,
+            },
+        )]);
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0 + 60_000),
+            BackfillDecision::Skip,
+            "a restart must not shorten the interval the previous process owed",
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_fruitless_completion([&g]),
+            vec![FruitlessEscalation {
+                group_id: g.clone(),
+                stalled_epoch: 10,
+                completions: 3,
+            }],
+            "the two completions the previous process confirmed still count",
+        );
+    }
+
+    /// And a run already reported stays reported, so a restart cannot re-raise
+    /// a group whose evidence is already past the threshold.
+    #[test]
+    fn a_restart_does_not_re_report_an_already_escalated_run() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 3,
+                escalated: true,
+                last_arm_at_ms: T0,
+            },
+        )]);
+
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "the run reported before the restart; restarting is not new evidence",
+        );
+    }
+
+    #[test]
+    fn wedge_evidence_round_trips_what_a_restart_has_to_carry() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        assert_eq!(
+            detector.wedge_evidence(&g),
+            None,
+            "a group with no stall history has nothing durable to say",
+        );
+
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_fruitless_completion([&g]);
+        assert_eq!(
+            detector.wedge_evidence(&g),
+            Some(EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 1,
+                escalated: false,
+                last_arm_at_ms: T0,
+            }),
         );
     }
 }

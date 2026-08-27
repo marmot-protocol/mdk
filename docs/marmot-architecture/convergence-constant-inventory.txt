@@ -37,3 +37,6 @@ A6|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_BACKFILL_THRESHOLD
 A7|crates/marmot-app/src/lib.rs|APP_RUNTIME_RELAY_REBUILD_LOOKBACK
 A8|crates/marmot-app/src/lib.rs|TRANSPORT_CURSOR_MAX_FUTURE_SKEW
 A9|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_ESCALATION_ARM_THRESHOLD
+A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
+A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
+A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD
