@@ -580,20 +580,14 @@ impl NostrSdkRelayClient {
         let deadline = tokio::time::Instant::now() + SDK_RELAY_PUBLISH_OVERALL_WAIT;
         let mut aborted_publishes = false;
         let mut timed_out = false;
-        let result = loop {
+        let (accepted, failed, timed_out) = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 publishes.abort_all();
                 aborted_publishes = true;
                 timed_out = true;
                 append_missing_publish_failures(&mut failed, &accepted, &attempted_endpoints);
-                break Self::finish_publish_outcome(
-                    message_id,
-                    accepted,
-                    failed,
-                    request.required_acks,
-                    timed_out,
-                );
+                break (accepted, failed, timed_out);
             }
             match timeout(remaining, publishes.join_next()).await {
                 Err(_) => {
@@ -601,23 +595,11 @@ impl NostrSdkRelayClient {
                     aborted_publishes = true;
                     timed_out = true;
                     append_missing_publish_failures(&mut failed, &accepted, &attempted_endpoints);
-                    break Self::finish_publish_outcome(
-                        message_id,
-                        accepted,
-                        failed,
-                        request.required_acks,
-                        timed_out,
-                    );
+                    break (accepted, failed, timed_out);
                 }
                 Ok(None) => {
                     append_missing_publish_failures(&mut failed, &accepted, &attempted_endpoints);
-                    break Self::finish_publish_outcome(
-                        message_id,
-                        accepted,
-                        failed,
-                        request.required_acks,
-                        timed_out,
-                    );
+                    break (accepted, failed, timed_out);
                 }
                 Ok(Some(result)) => match result {
                     Ok(Ok(receipt)) => {
@@ -625,13 +607,7 @@ impl NostrSdkRelayClient {
                         if accepted.len() >= ack_goal {
                             publishes.abort_all();
                             aborted_publishes = true;
-                            break Self::finish_publish_outcome(
-                                message_id,
-                                accepted,
-                                failed,
-                                request.required_acks,
-                                timed_out,
-                            );
+                            break (accepted, failed, timed_out);
                         }
                     }
                     Ok(Err(failure)) => failed.push(failure),
@@ -644,7 +620,14 @@ impl NostrSdkRelayClient {
         if aborted_publishes {
             while publishes.join_next().await.is_some() {}
         }
-        result
+        self.reset_ambiguous_publish_relays(&failed).await;
+        Self::finish_publish_outcome(
+            message_id,
+            accepted,
+            failed,
+            request.required_acks,
+            timed_out,
+        )
     }
 
     async fn publish_prepared_single(
@@ -909,6 +892,34 @@ impl NostrSdkRelayClient {
         }
 
         self.client.remove_relay(endpoint).await.map_err(|_| ())
+    }
+
+    /// Invalidate sockets whose publish result cannot establish whether the
+    /// relay accepted the event. On iOS a network transition can leave an
+    /// established WebSocket silently dead while the SDK still reports it as
+    /// connected; a later `connect_relay` is then intentionally a no-op. Moving
+    /// that relay to `Terminated` preserves its registration and subscriptions
+    /// while ensuring the next publish starts a fresh connection (mdk#926).
+    async fn reset_ambiguous_publish_relays(&self, failures: &[TransportEndpointFailure]) {
+        let mut reset = HashSet::new();
+        for failure in failures {
+            if failure.kind != TransportEndpointFailureKind::PossiblyExposed {
+                continue;
+            }
+            let Ok(endpoint) = RelayUrl::parse(failure.endpoint.as_str()) else {
+                continue;
+            };
+            if !reset.insert(endpoint.clone()) {
+                continue;
+            }
+            if self.client.disconnect_relay(endpoint).await.is_err() {
+                tracing::warn!(
+                    target: "transport_nostr_adapter::sdk_client",
+                    method = "reset_ambiguous_publish_relays",
+                    "failed to reset SDK relay after ambiguous publish failure"
+                );
+            }
+        }
     }
 
     fn finish_publish_outcome(
@@ -2047,6 +2058,61 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn ambiguous_publish_timeout_resets_stale_durable_relay_before_retry() {
+        let (relay_url, connection_count, stale_connection_closed) =
+            stale_then_healthy_relay_url().await;
+        let endpoint = TransportEndpoint(relay_url);
+        let client = Client::builder().signer(Keys::generate()).build();
+        client
+            .add_relay(endpoint.as_str())
+            .await
+            .expect("add durable relay");
+        let sdk = NostrSdkRelayClient::new(client);
+        let dto = signed_group_event_dto();
+        let first_sdk = sdk.clone();
+        let first_endpoint = endpoint.clone();
+        let first_dto = dto.clone();
+        let first_publish = tokio::spawn(async move {
+            first_sdk
+                .publish_event(std::slice::from_ref(&first_endpoint), &first_dto, 1)
+                .await
+        });
+
+        for _ in 0..100 {
+            if *connection_count.lock().await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *connection_count.lock().await,
+            1,
+            "the first publish must reach the stale connection"
+        );
+
+        advance(SDK_RELAY_PUBLISH_OVERALL_WAIT + Duration::from_secs(1)).await;
+        first_publish
+            .await
+            .expect("first publish task must not panic")
+            .expect_err("the stale connection must miss the acknowledgement deadline");
+
+        let health = sdk.relay_health().await;
+        assert_eq!(
+            health.terminated, 1,
+            "an ambiguous timeout must invalidate the SDK's stale Connected status"
+        );
+        stale_connection_closed.notified().await;
+        tokio::time::resume();
+
+        let retry = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &dto, 1)
+            .await
+            .expect("the next publish must reconnect through a fresh socket");
+        assert_eq!(retry.accepted.len(), 1);
+        assert_eq!(*connection_count.lock().await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn relay_that_stores_event_but_withholds_ok_is_possibly_exposed() {
         let stored_ids = Arc::new(Mutex::new(Vec::new()));
         let endpoint = TransportEndpoint(storing_no_ack_relay_url(stored_ids.clone()).await);
@@ -2819,6 +2885,70 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    async fn stale_then_healthy_relay_url() -> (String, Arc<Mutex<usize>>, Arc<tokio::sync::Notify>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connection_count = Arc::new(Mutex::new(0));
+        let server_connection_count = connection_count.clone();
+        let stale_connection_closed = Arc::new(tokio::sync::Notify::new());
+        let server_stale_connection_closed = stale_connection_closed.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let connection_number = {
+                    let mut count = server_connection_count.lock().await;
+                    *count += 1;
+                    *count
+                };
+                let stale_connection_closed = server_stale_connection_closed.clone();
+                tokio::spawn(async move {
+                    let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = websocket.next().await {
+                        let Ok(text) = message.into_text() else {
+                            continue;
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let Some(items) = value.as_array() else {
+                            continue;
+                        };
+                        if items.first().and_then(serde_json::Value::as_str) != Some("EVENT") {
+                            continue;
+                        }
+                        let Some(id) = items
+                            .get(1)
+                            .and_then(|event| event.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                        else {
+                            continue;
+                        };
+                        // The first WebSocket models iOS's silently dead socket:
+                        // writes appear to work but no OK or disconnect arrives.
+                        // A fresh connection after MDK invalidates that socket is
+                        // healthy and acknowledges the byte-identical retry.
+                        if connection_number > 1 {
+                            let ok = serde_json::json!(["OK", id, true, ""]);
+                            if websocket.send(ok.to_string().into()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if connection_number == 1 {
+                        stale_connection_closed.notify_one();
+                    }
+                });
+            }
+        });
+        (
+            format!("ws://{addr}"),
+            connection_count,
+            stale_connection_closed,
+        )
     }
 
     async fn hanging_connect_relay_url() -> String {
