@@ -106,9 +106,9 @@ directory by default, so select a repository before sending the first prompt.
 
 ## Chat Commands
 
-`codex exec` does not expand Codex's interactive slash commands, so `/goal`,
-`/plan`, `/review`, and the rest of the TUI command set are not available through
-this connector. The shared harness instead answers its own reserved commands
+`codex exec` does not expand Codex's interactive TUI slash commands, so Codex's
+own `/goal`, `/plan`, `/review`, and the rest of that TUI set never run here.
+The shared harness intercepts its reserved chat commands — including `/goal` —
 before Codex is invoked. Send `/help` in a chat to list them; the full table and
 the `//` literal escape are documented in the
 [shared chat-command reference](../../terminal-harness/README.md#chat-commands).

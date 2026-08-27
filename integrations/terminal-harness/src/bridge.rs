@@ -283,14 +283,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 return DispatchOutcome::Continue;
             }
             let disposition = classify_prompt(&message.text);
-            let permit = if matches!(
-                disposition,
-                PromptDisposition::RetryLast | PromptDisposition::DiscardLast
-            ) {
-                ctx.queues.enter_recovery(&group_id_hex).await
-            } else {
-                ctx.queues.try_enter_waiter(&group_id_hex).await
-            };
+            let permit = acquire_dispatch_permit(&ctx.queues, &group_id_hex, &disposition).await;
             let Some(permit) = permit else {
                 warn!(
                     target: TRACE_TARGET,
@@ -416,6 +409,22 @@ fn is_inspect_disposition(disposition: &PromptDisposition) -> bool {
                 ChatCommand::Help | ChatCommand::Status | ChatCommand::Pwd | ChatCommand::GoalShow
             )
     )
+}
+
+async fn acquire_dispatch_permit(
+    queues: &GroupQueues,
+    group_ref: &str,
+    disposition: &PromptDisposition,
+) -> Option<GroupPermit> {
+    if matches!(
+        disposition,
+        PromptDisposition::RetryLast | PromptDisposition::DiscardLast
+    ) || is_inspect_disposition(disposition)
+    {
+        queues.enter_without_waiter_quota(group_ref).await
+    } else {
+        queues.try_enter_waiter(group_ref).await
+    }
 }
 
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut permit: GroupPermit) {
@@ -1746,7 +1755,9 @@ impl GroupQueues {
         })
     }
 
-    async fn enter_recovery(&self, group_ref: &str) -> Option<GroupPermit> {
+    /// Admits inspect and recovery commands without consuming the waiting quota
+    /// or taking the serial lock.
+    async fn enter_without_waiter_quota(&self, group_ref: &str) -> Option<GroupPermit> {
         let queue = self.queue(group_ref).await?;
         queue.active.fetch_add(1, Ordering::Relaxed);
         Some(GroupPermit {
@@ -1922,8 +1933,11 @@ mod tests {
         (ctx, server)
     }
 
-    async fn dispatch_test_message(ctx: Arc<BridgeContext>, message_ref: &str, text: &str) {
-        let permit = ctx.queues.try_enter_waiter("group").await.unwrap();
+    async fn dispatch_test_message(ctx: Arc<BridgeContext>, message_ref: &str, text: &str) -> bool {
+        let disposition = classify_prompt(text);
+        let Some(permit) = acquire_dispatch_permit(&ctx.queues, "group", &disposition).await else {
+            return false;
+        };
         handle_message(
             ctx,
             InboundPrompt {
@@ -1935,6 +1949,7 @@ mod tests {
             permit,
         )
         .await;
+        true
     }
 
     #[tokio::test]
@@ -2000,33 +2015,37 @@ mod tests {
             .await
             .unwrap();
         assert!(fifo_is_blocked(&ctx, "group").await);
+        let mut waiters = Vec::new();
+        while let Some(permit) = ctx.queues.try_enter_waiter("group").await {
+            waiters.push(permit);
+        }
+        assert!(
+            !waiters.is_empty(),
+            "queued prompts must be able to exhaust the waiter quota"
+        );
 
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            dispatch_test_message(ctx.clone(), "help", "/help"),
-        )
-        .await
-        .expect("blocked recovery must not park /help");
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            dispatch_test_message(ctx.clone(), "status", "/status"),
-        )
-        .await
-        .expect("blocked recovery must not park /status");
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            dispatch_test_message(ctx.clone(), "pwd", "/pwd"),
-        )
-        .await
-        .expect("blocked recovery must not park /pwd");
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            dispatch_test_message(ctx.clone(), "goal-show", "/goal"),
-        )
-        .await
-        .expect("blocked recovery must not park /goal show");
+        for (message_ref, text) in [
+            ("help", "/help"),
+            ("status", "/status"),
+            ("pwd", "/pwd"),
+            ("goal-show", "/goal"),
+        ] {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    dispatch_test_message(ctx.clone(), message_ref, text),
+                )
+                .await
+                .expect("inspect command must not wait on recovery or waiter quota")
+            );
+        }
 
         assert!(backend.invocations.lock().await.is_empty());
+        assert!(
+            !dispatch_test_message(ctx.clone(), "cd-full", "/cd repo").await,
+            "mutating commands must not steal a waiter while the quota is full"
+        );
+        drop(waiters);
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(200),
@@ -2082,7 +2101,10 @@ mod tests {
         assert!(first.is_some());
         assert_eq!(first.as_ref().unwrap().queue.pending.available_permits(), 1);
         assert!(queues.try_enter_waiter("g").await.is_none());
-        let recovery = queues.enter_recovery("g").await;
+        let inspect = queues.enter_without_waiter_quota("g").await;
+        assert!(inspect.is_some());
+        drop(inspect);
+        let recovery = queues.enter_without_waiter_quota("g").await;
         assert!(recovery.is_some());
         drop(recovery);
         drop(first);
@@ -2311,7 +2333,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let recovery = queues.enter_recovery("g").await.unwrap();
+        let recovery = queues.enter_without_waiter_quota("g").await.unwrap();
         let active = recovery.serial.lock().await;
         assert!(recovery.serial.try_lock().is_err());
         drop(active);
