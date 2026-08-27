@@ -29,6 +29,7 @@ use std::collections::HashSet;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
+use nostr::RelayUrl;
 use serde::{Deserialize, Serialize};
 
 /// Upper bounds, in milliseconds, of the duration histogram buckets shared by
@@ -74,13 +75,19 @@ pub struct RelayIndexRegistry {
 
 impl RelayIndexRegistry {
     /// Stable index for `endpoint`, assigning a new one on first sighting.
+    ///
+    /// Valid relay URLs are keyed by their parsed [`RelayUrl`] spelling so a
+    /// verbatim signed route and the normalized endpoint emitted by nostr-sdk
+    /// resolve to the same device-local relay. Invalid/non-relay endpoints stay
+    /// byte-exact; this registry never rewrites authoritative routing state.
     pub fn index_for(&mut self, endpoint: &TransportEndpoint) -> RelayIndex {
-        if let Some(index) = self.indices.get(endpoint) {
+        let key = relay_index_key(endpoint);
+        if let Some(index) = self.indices.get(&key) {
             return *index;
         }
         let index = RelayIndex(self.next);
         self.next += 1;
-        self.indices.insert(endpoint.clone(), index);
+        self.indices.insert(key, index);
         index
     }
 
@@ -106,6 +113,14 @@ impl RelayIndexRegistry {
         pairs.sort_by_key(|(index, _)| index.0);
         pairs
     }
+}
+
+/// Device-local identity key shared by subscription attempts, EOSE callbacks,
+/// delivery timing, and frozen replay coverage.
+fn relay_index_key(endpoint: &TransportEndpoint) -> TransportEndpoint {
+    RelayUrl::parse(endpoint.as_str())
+        .map(|relay_url| TransportEndpoint(relay_url.to_string()))
+        .unwrap_or_else(|_| endpoint.clone())
 }
 
 /// Capability that authorizes resolving opaque [`RelayIndex`] values back to
@@ -833,6 +848,22 @@ mod tests {
         let first = registry.index_for(&a);
         assert_eq!(registry.index_for(&b), RelayIndex(1));
         assert_eq!(registry.index_for(&a), first, "stable across calls");
+    }
+
+    #[test]
+    fn registry_folds_verbatim_and_normalized_relay_spellings() {
+        let mut registry = RelayIndexRegistry::default();
+        let verbatim = TransportEndpoint("wss://Relay.Example:443".into());
+        let normalized = TransportEndpoint(
+            RelayUrl::parse(verbatim.as_str())
+                .expect("relay URL parses")
+                .to_string(),
+        );
+        assert_ne!(verbatim, normalized);
+
+        let index = registry.index_for(&verbatim);
+        assert_eq!(registry.index_for(&normalized), index);
+        assert_eq!(registry.resolutions(), vec![(index, normalized)]);
     }
 
     #[test]
