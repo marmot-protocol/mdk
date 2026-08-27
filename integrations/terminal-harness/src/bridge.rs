@@ -28,6 +28,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const SEND_RETRY_ATTEMPTS: usize = 3;
 const LIVENESS_UNKNOWN_TEXT: &str = "The backend is still running, but the connector cannot confirm progress. No action is needed; it will keep checking until the configured total limit.";
 const TEXT_FINAL_ACK_UNKNOWN_TEXT: &str = "The backend finished, but the connector could not confirm delivery of its final response. No action is needed; it is reconciling delivery.";
+const INCOMPLETE_FINAL_TEXT: &str = "The backend finished, but the connector could not persist the complete final response. Send `/retry-last` to retry it, or `/discard-last` to abandon it and continue queued work.";
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
@@ -482,25 +483,35 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             return;
         }
         PromptDisposition::DiscardLast => {
-            let message = match ctx.recovery.discard(&inbound.group_ref).await {
-                Ok(true) => {
-                    permit
-                        .queue
-                        .recovery_changed
-                        .send_modify(|generation| *generation = generation.wrapping_add(1));
-                    format!(
-                        "[{}] The saved recovery was discarded; queued work can continue.",
-                        ctx.cfg.spec.reply_prefix
-                    )
-                }
-                Ok(false) => format!(
+            let recovery = ctx.recovery.discard(&inbound.group_ref).await;
+            let incomplete = ctx
+                .deliveries
+                .discard_incomplete_final(&inbound.group_ref)
+                .await;
+            if let Err(err) = &recovery {
+                warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard recovery record");
+            }
+            if let Err(err) = &incomplete {
+                warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to discard incomplete-final barrier");
+            }
+            let message = match (recovery, incomplete) {
+                (Err(_), _) | (_, Err(_)) => format!(
+                    "[{}] Failed to discard the saved recovery.",
+                    ctx.cfg.spec.reply_prefix
+                ),
+                (Ok(false), Ok(false)) => format!(
                     "[{}] There is no saved recovery to discard.",
                     ctx.cfg.spec.reply_prefix
                 ),
-                Err(err) => {
-                    warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard recovery record");
+                (Ok(recovery_cleared), Ok(_)) => {
+                    if recovery_cleared {
+                        permit
+                            .queue
+                            .recovery_changed
+                            .send_modify(|generation| *generation = generation.wrapping_add(1));
+                    }
                     format!(
-                        "[{}] Failed to discard the saved recovery.",
+                        "[{}] The saved recovery was discarded; queued work can continue.",
                         ctx.cfg.spec.reply_prefix
                     )
                 }
@@ -627,30 +638,34 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let mut chunk_index = 0usize;
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
+    let mut persist_failed = false;
     while let Some(event) = rx.recv().await {
         match event {
             RunnerEvent::Text(text) => {
-                let mut staged = Vec::new();
-                for chunk in split_reply_chunks(&text, ctx.cfg.max_reply_bytes) {
-                    chunk_index += 1;
-                    match stage_backend_reply(
-                        &ctx,
-                        &inbound.account_ref,
-                        &inbound.group_ref,
-                        &inbound.message_ref,
-                        chunk,
-                        chunk_index,
-                    )
-                    .await
-                    {
-                        Ok(key) => staged.push((key, chunk.to_owned(), chunk_index)),
-                        Err(err) => {
-                            warn!(target: TRACE_TARGET, method = "stage_final", error_kind = err.privacy_safe_kind(), "failed to persist backend reply chunk");
-                            delivery_failed = true;
-                        }
+                let staged = match stage_text_chunks(
+                    &FinalReplyTarget {
+                        deliveries: &ctx.deliveries,
+                        account_ref: &inbound.account_ref,
+                        group_ref: &inbound.group_ref,
+                        reply_to_ref: &inbound.message_ref,
+                    },
+                    &text,
+                    ctx.cfg.max_reply_bytes,
+                    &mut chunk_index,
+                    &mut persist_failed,
+                )
+                .await
+                {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        warn!(target: TRACE_TARGET, method = "stage_final", error_kind = err.privacy_safe_kind(), "failed to persist incomplete-final barrier");
+                        Vec::new()
                     }
+                };
+                if persist_failed {
+                    delivery_failed = true;
                 }
-                if delivery_failed {
+                if persist_failed || delivery_failed {
                     continue;
                 }
                 for (key, chunk, index) in staged {
@@ -693,14 +708,28 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
 
     match runner.await {
         Ok(Ok(outcome)) => {
-            if retrying
-                && outcome.exit_code == Some(0)
-                && ctx.recovery.discard(&inbound.group_ref).await.is_ok()
-            {
-                permit
-                    .queue
-                    .recovery_changed
-                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            if retrying && outcome.exit_code == Some(0) && !persist_failed {
+                match ctx.recovery.discard(&inbound.group_ref).await {
+                    Ok(_) => {
+                        permit
+                            .queue
+                            .recovery_changed
+                            .send_modify(|generation| *generation = generation.wrapping_add(1));
+                    }
+                    Err(err) => {
+                        warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard completed recovery record");
+                        if let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+                            warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
+                        }
+                    }
+                }
+                if let Err(err) = ctx
+                    .deliveries
+                    .discard_incomplete_final(&inbound.group_ref)
+                    .await
+                {
+                    warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to discard incomplete-final barrier");
+                }
             }
             finish_success(
                 ctx,
@@ -712,6 +741,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 DeliveryReport {
                     chunk_count: delivered_chunks,
                     failed: delivery_failed,
+                    persist_failed,
                     status_chunk_index: chunk_index + 1,
                 },
             )
@@ -807,7 +837,7 @@ async fn begin_validated_retry(
 }
 
 async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
-    ctx.recovery.get(group_ref).await.is_some() || ctx.deliveries.has_group(group_ref).await
+    ctx.recovery.get(group_ref).await.is_some() || ctx.deliveries.blocks_group(group_ref).await
 }
 
 async fn handle_session_reset(ctx: &BridgeContext, inbound: &InboundPrompt) {
@@ -941,6 +971,38 @@ async fn finish_success(
             delivery.status_chunk_index,
         )
         .await;
+    } else if completion_route == CompletionRoute::IncompleteFinal {
+        let session_id = outcome
+            .observed_session
+            .clone()
+            .or_else(|| {
+                known_session
+                    .as_ref()
+                    .map(|record| record.session_id.clone())
+            })
+            .filter(|value| !value.is_empty());
+        if let Some(session_id) = session_id
+            && let Err(err) = persist_recovery_record(
+                &ctx.recovery,
+                &inbound.group_ref,
+                recovery_prompt,
+                cwd,
+                session_id,
+                RecoveryKind::UncertainOutcome,
+            )
+            .await
+        {
+            warn!(target: TRACE_TARGET, method = "recovery_store", error_kind = err.privacy_safe_kind(), "failed to persist recovery record");
+        }
+        let _ = send_reply(
+            &ctx,
+            &inbound.account_ref,
+            &inbound.group_ref,
+            &inbound.message_ref,
+            &format!("[{}] {INCOMPLETE_FINAL_TEXT}", ctx.cfg.spec.reply_prefix),
+            delivery.status_chunk_index,
+        )
+        .await;
     } else if completion_route == CompletionRoute::TextFinalAckUnknown {
         let _ = send_reply(
             &ctx,
@@ -986,12 +1048,14 @@ async fn finish_success(
 struct DeliveryReport {
     chunk_count: usize,
     failed: bool,
+    persist_failed: bool,
     status_chunk_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionRoute {
     NonzeroExit,
+    IncompleteFinal,
     TextFinalAckUnknown,
     NoText,
     Complete,
@@ -1000,6 +1064,8 @@ enum CompletionRoute {
 fn completion_route(outcome: &Outcome, delivery: &DeliveryReport) -> CompletionRoute {
     if outcome.exit_code != Some(0) {
         CompletionRoute::NonzeroExit
+    } else if delivery.persist_failed {
+        CompletionRoute::IncompleteFinal
     } else if delivery.failed {
         CompletionRoute::TextFinalAckUnknown
     } else if delivery.chunk_count == 0 {
@@ -1112,10 +1178,36 @@ async fn handle_backend_run_failure(
                 config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
             )
         }
-        _ => format!(
-            "[{}] {} failed while streaming its response.",
-            config.spec.reply_prefix, config.spec.display_name
-        ),
+        _ => {
+            if let Some(session_id) = resumable_session {
+                if let Err(err) = persist_recovery_record(
+                    recovery,
+                    group_ref,
+                    prompt,
+                    cwd,
+                    session_id,
+                    RecoveryKind::UncertainOutcome,
+                )
+                .await
+                {
+                    warn!(target: TRACE_TARGET, method = "recovery_store", error_kind = err.privacy_safe_kind(), "failed to persist recovery record");
+                    format!(
+                        "[{}] The backend exited and this attempt cannot be resumed. Send a new prompt or `/reset-session`.",
+                        config.spec.reply_prefix
+                    )
+                } else {
+                    recovery_resolution_message(
+                        config.spec.reply_prefix,
+                        RecoveryKind::UncertainOutcome,
+                    )
+                }
+            } else {
+                format!(
+                    "[{}] {} failed while streaming its response.",
+                    config.spec.reply_prefix, config.spec.display_name
+                )
+            }
+        }
     }
 }
 
@@ -1283,7 +1375,7 @@ async fn install_allowlist(
 }
 
 async fn reconcile_pending_deliveries(client: &ControlClient, store: &FinalDeliveryStore) {
-    for (key, record) in store.list().await {
+    for (key, record) in store.list_reconcilable().await {
         match send_final_with_retry(
             client,
             &record.account_ref,
@@ -1306,8 +1398,53 @@ async fn reconcile_pending_deliveries(client: &ControlClient, store: &FinalDeliv
     }
 }
 
-async fn stage_backend_reply(
-    ctx: &BridgeContext,
+struct FinalReplyTarget<'a> {
+    deliveries: &'a FinalDeliveryStore,
+    account_ref: &'a str,
+    group_ref: &'a str,
+    reply_to_ref: &'a str,
+}
+
+async fn stage_text_chunks(
+    target: &FinalReplyTarget<'_>,
+    text: &str,
+    max_reply_bytes: usize,
+    chunk_index: &mut usize,
+    persist_failed: &mut bool,
+) -> Result<Vec<(String, String, usize)>> {
+    if *persist_failed {
+        return Ok(Vec::new());
+    }
+    let mut staged = Vec::new();
+    for chunk in split_reply_chunks(text, max_reply_bytes) {
+        *chunk_index += 1;
+        match stage_delivery_record(
+            target.deliveries,
+            target.account_ref,
+            target.group_ref,
+            target.reply_to_ref,
+            chunk,
+            *chunk_index,
+        )
+        .await
+        {
+            Ok(key) => staged.push((key, chunk.to_owned(), *chunk_index)),
+            Err(err) => {
+                warn!(target: TRACE_TARGET, method = "stage_final", error_kind = err.privacy_safe_kind(), "failed to persist backend reply chunk");
+                *persist_failed = true;
+                target
+                    .deliveries
+                    .mark_incomplete_final(target.group_ref, target.reply_to_ref)
+                    .await?;
+                break;
+            }
+        }
+    }
+    Ok(staged)
+}
+
+async fn stage_delivery_record(
+    deliveries: &FinalDeliveryStore,
     account_ref: &str,
     group_ref: &str,
     reply_to_ref: &str,
@@ -1315,7 +1452,7 @@ async fn stage_backend_reply(
     chunk_index: usize,
 ) -> Result<String> {
     let key = format!("{group_ref}:{reply_to_ref}:{chunk_index}");
-    ctx.deliveries
+    deliveries
         .set(
             &key,
             FinalDeliveryRecord {
@@ -1668,6 +1805,7 @@ mod tests {
         let failed_delivery = DeliveryReport {
             chunk_count: 0,
             failed: true,
+            persist_failed: false,
             status_chunk_index: 2,
         };
         let uncertain = Outcome {
@@ -1716,6 +1854,27 @@ mod tests {
             completion_route(&completed, &failed_delivery),
             CompletionRoute::TextFinalAckUnknown
         );
+
+        let persist_failed = DeliveryReport {
+            persist_failed: true,
+            ..failed_delivery
+        };
+        assert_eq!(
+            completion_route(&completed, &persist_failed),
+            CompletionRoute::IncompleteFinal
+        );
+        let persist_failed_nonzero = Outcome {
+            no_side_effects_proven: false,
+            exit_code: Some(64),
+            observed_session: Some("session".to_owned()),
+            error_summary: Some("failed".to_owned()),
+            stderr: String::new(),
+            elapsed_ms: 1,
+        };
+        assert_eq!(
+            completion_route(&persist_failed_nonzero, &persist_failed),
+            CompletionRoute::NonzeroExit
+        );
     }
 
     #[tokio::test]
@@ -1748,6 +1907,14 @@ mod tests {
             TEXT_FINAL_ACK_UNKNOWN_TEXT,
             "The backend finished, but the connector could not confirm delivery of its final response. No action is needed; it is reconciling delivery."
         );
+        assert_eq!(
+            INCOMPLETE_FINAL_TEXT,
+            "The backend finished, but the connector could not persist the complete final response. Send `/retry-last` to retry it, or `/discard-last` to abandon it and continue queued work."
+        );
+        assert!(!INCOMPLETE_FINAL_TEXT.contains("No action is needed"));
+        assert!(!INCOMPLETE_FINAL_TEXT.contains("reconciling delivery"));
+        assert!(INCOMPLETE_FINAL_TEXT.contains("/retry-last"));
+        assert!(INCOMPLETE_FINAL_TEXT.contains("/discard-last"));
     }
 
     #[tokio::test]
@@ -1871,7 +2038,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(validated.cwd, home.join("repo"));
+        assert_eq!(validated.cwd, home.join("repo").canonicalize().unwrap());
         assert_eq!(validated.status, RecoveryStatus::Retrying);
 
         recovery
@@ -1932,5 +2099,237 @@ mod tests {
         let recovery = recovery.get("group1").await.unwrap();
         assert_eq!(recovery.kind, RecoveryKind::PolicyLimit);
         assert_eq!(recovery.status, RecoveryStatus::Pending);
+    }
+
+    struct UnusedBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for UnusedBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            Err(RunFailure {
+                error: HarnessError::BackendStream,
+                observed_session: None,
+            })
+        }
+    }
+
+    fn test_bridge_context(root: &std::path::Path) -> BridgeContext {
+        let cfg = test_config(root);
+        BridgeContext {
+            cfg: Arc::new(cfg.clone()),
+            client: ControlClient::new(
+                cfg.socket.clone(),
+                None,
+                cfg.request_timeout,
+                cfg.spec.reply_prefix,
+            ),
+            account_ref: "account".to_owned(),
+            sessions: Arc::new(SessionStore::load(root.join("sessions.json"), root).unwrap()),
+            recovery: Arc::new(RecoveryStore::load(root.join("recovery.json")).unwrap()),
+            deliveries: Arc::new(FinalDeliveryStore::load(root.join("delivery.json")).unwrap()),
+            reconciliation_slot: ReconciliationSlot::new(),
+            queues: Arc::new(GroupQueues::new(4)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: Arc::new(UnusedBackend),
+            home: root.to_path_buf(),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_persist_failure_raises_discardable_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_bridge_context(dir.path());
+        let mut chunk_index = 0usize;
+        let mut persist_failed = false;
+
+        let target = FinalReplyTarget {
+            deliveries: &ctx.deliveries,
+            account_ref: "account",
+            group_ref: "group",
+            reply_to_ref: "message",
+        };
+        let first = stage_text_chunks(&target, "aaaa", 4, &mut chunk_index, &mut persist_failed)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(!persist_failed);
+
+        ctx.deliveries.fail_next_set();
+        let second = stage_text_chunks(
+            &target,
+            "bbbbcccc",
+            4,
+            &mut chunk_index,
+            &mut persist_failed,
+        )
+        .await
+        .unwrap();
+        assert!(persist_failed);
+        assert!(second.is_empty());
+
+        let later = stage_text_chunks(&target, "dddd", 4, &mut chunk_index, &mut persist_failed)
+            .await
+            .unwrap();
+        assert!(later.is_empty());
+
+        let records = ctx.deliveries.list().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1.chunk_index, 1);
+        assert_eq!(records[0].1.text, "aaaa");
+        assert!(ctx.deliveries.list_reconcilable().await.is_empty());
+        assert!(fifo_is_blocked(&ctx, "group").await);
+
+        ctx.deliveries.remove(&records[0].0).await.unwrap();
+        assert!(
+            !ctx.deliveries.has_group("group").await,
+            "barrier must outlive removed delivery records"
+        );
+        assert!(fifo_is_blocked(&ctx, "group").await);
+        assert!(ctx.deliveries.list_reconcilable().await.is_empty());
+
+        let copy = format!("[{}] {INCOMPLETE_FINAL_TEXT}", ctx.cfg.spec.reply_prefix);
+        assert!(!copy.contains(TEXT_FINAL_ACK_UNKNOWN_TEXT));
+        assert!(!copy.contains("No action is needed"));
+        assert!(copy.contains("/retry-last"));
+        assert!(copy.contains("/discard-last"));
+        assert_eq!(
+            completion_route(
+                &Outcome {
+                    observed_session: Some("session".to_owned()),
+                    exit_code: Some(0),
+                    error_summary: None,
+                    no_side_effects_proven: true,
+                    stderr: String::new(),
+                    elapsed_ms: 1,
+                },
+                &DeliveryReport {
+                    chunk_count: 1,
+                    failed: true,
+                    persist_failed: true,
+                    status_chunk_index: 3,
+                },
+            ),
+            CompletionRoute::IncompleteFinal
+        );
+
+        assert!(
+            ctx.deliveries
+                .discard_incomplete_final("group")
+                .await
+                .unwrap()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        assert!(ctx.deliveries.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_spawn_stream_failure_persists_uncertain_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        std::fs::create_dir_all(home.join("repo")).unwrap();
+        let store = SessionStore::load(home.join("sessions.json"), &home).unwrap();
+        let recovery = RecoveryStore::load(home.join("recovery.json")).unwrap();
+        store
+            .set(
+                "group1",
+                SessionRecord {
+                    session_id: "ses_stream".to_owned(),
+                    cwd: home.join("repo"),
+                },
+            )
+            .await
+            .unwrap();
+
+        let failure = RunFailure {
+            error: HarnessError::BackendStream,
+            observed_session: Some("ses_stream".to_owned()),
+        };
+        let config = test_config(&home);
+        let reply = handle_backend_run_failure(
+            FailureRecoveryContext {
+                config: &config,
+                sessions: &store,
+                recovery: &recovery,
+            },
+            "group1",
+            store.get("group1").await.as_ref(),
+            home.join("repo"),
+            "private prompt".to_owned(),
+            &failure,
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            recovery_resolution_message("wn-opencode", RecoveryKind::UncertainOutcome)
+        );
+        assert!(!reply.contains("failed while streaming"));
+        let record = recovery.get("group1").await.unwrap();
+        assert_eq!(record.kind, RecoveryKind::UncertainOutcome);
+        assert_eq!(record.status, RecoveryStatus::Pending);
+        assert_eq!(record.session_id, "ses_stream");
+
+        let retried = begin_validated_retry(&recovery, "group1", &home)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, RecoveryStatus::Retrying);
+        assert_eq!(retried.session_id, "ses_stream");
+
+        let streaming = handle_backend_run_failure(
+            FailureRecoveryContext {
+                config: &config,
+                sessions: &store,
+                recovery: &recovery,
+            },
+            "group2",
+            None,
+            home.clone(),
+            "private prompt".to_owned(),
+            &RunFailure {
+                error: HarnessError::BackendStream,
+                observed_session: None,
+            },
+        )
+        .await;
+        assert!(streaming.contains("failed while streaming"));
+        assert!(recovery.get("group2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_retry_discard_failure_restores_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
+        store
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    cwd: dir.path().join("repo"),
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Retrying,
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir(dir.path().join("recovery.json.tmp")).unwrap();
+
+        assert!(store.discard("group").await.is_err());
+        assert_eq!(
+            store.get("group").await.unwrap().status,
+            RecoveryStatus::Retrying
+        );
+        std::fs::remove_dir(dir.path().join("recovery.json.tmp")).unwrap();
+        assert!(store.reset_retry("group").await.unwrap());
+        assert_eq!(
+            store.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(store.begin_retry("group").await.unwrap().is_some());
     }
 }

@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
@@ -227,10 +228,18 @@ impl RecoveryStore {
     }
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct FinalDeliverySnapshot {
+    records: HashMap<String, FinalDeliveryRecord>,
+    #[serde(default)]
+    incomplete_finals: HashMap<String, HashSet<String>>,
+}
+
 pub(crate) struct FinalDeliveryStore {
     path: PathBuf,
-    map: Mutex<HashMap<String, FinalDeliveryRecord>>,
+    state: Mutex<FinalDeliverySnapshot>,
     changed: watch::Sender<u64>,
+    fail_next_set: AtomicBool,
 }
 
 impl FinalDeliveryStore {
@@ -238,17 +247,20 @@ impl FinalDeliveryStore {
         if path.exists() {
             fs_private::tighten_existing_private_file(&path)?;
         }
-        let map = match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)?,
-            Ok(_) => HashMap::new(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        let state = match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => parse_final_delivery_snapshot(&bytes)?,
+            Ok(_) => FinalDeliverySnapshot::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                FinalDeliverySnapshot::default()
+            }
             Err(err) => return Err(err.into()),
         };
         let (changed, _) = watch::channel(0);
         Ok(Self {
             path,
-            map: Mutex::new(map),
+            state: Mutex::new(state),
             changed,
+            fail_next_set: AtomicBool::new(false),
         })
     }
 
@@ -257,18 +269,34 @@ impl FinalDeliveryStore {
     }
 
     pub(crate) async fn has_group(&self, group_ref: &str) -> bool {
-        self.map
+        self.state
             .lock()
             .await
+            .records
             .values()
             .any(|record| record.group_ref == group_ref)
     }
 
-    pub(crate) async fn list(&self) -> Vec<(String, FinalDeliveryRecord)> {
-        let mut records: Vec<_> = self
-            .map
+    pub(crate) async fn has_incomplete_final(&self, group_ref: &str) -> bool {
+        self.state
             .lock()
             .await
+            .incomplete_finals
+            .get(group_ref)
+            .is_some_and(|reply_tos| !reply_tos.is_empty())
+    }
+
+    pub(crate) async fn blocks_group(&self, group_ref: &str) -> bool {
+        self.has_incomplete_final(group_ref).await || self.has_group(group_ref).await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn list(&self) -> Vec<(String, FinalDeliveryRecord)> {
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .records
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
@@ -289,47 +317,126 @@ impl FinalDeliveryStore {
         records
     }
 
+    pub(crate) async fn list_reconcilable(&self) -> Vec<(String, FinalDeliveryRecord)> {
+        let state = self.state.lock().await;
+        let mut records: Vec<_> = state
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                !state
+                    .incomplete_finals
+                    .get(&record.group_ref)
+                    .is_some_and(|reply_tos| reply_tos.contains(&record.reply_to_ref))
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        records.sort_by(|(_, left), (_, right)| {
+            (
+                &left.account_ref,
+                &left.group_ref,
+                &left.reply_to_ref,
+                left.chunk_index,
+            )
+                .cmp(&(
+                    &right.account_ref,
+                    &right.group_ref,
+                    &right.reply_to_ref,
+                    right.chunk_index,
+                ))
+        });
+        records
+    }
+
     pub(crate) async fn set(&self, key: &str, record: FinalDeliveryRecord) -> Result<()> {
-        let mut map = self.map.lock().await;
-        let mut next = map.clone();
-        next.insert(key.to_owned(), record);
-        self.commit(&mut map, next).await?;
-        self.changed
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-        Ok(())
+        if self.fail_next_set.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Other).into());
+        }
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.records.insert(key.to_owned(), record);
+        self.commit(&mut state, next).await
     }
 
     pub(crate) async fn remove(&self, key: &str) -> Result<bool> {
-        let mut map = self.map.lock().await;
-        if !map.contains_key(key) {
+        let mut state = self.state.lock().await;
+        if !state.records.contains_key(key) {
             return Ok(false);
         }
-        let mut next = map.clone();
-        next.remove(key);
-        self.commit(&mut map, next).await?;
-        self.changed
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let mut next = state.clone();
+        next.records.remove(key);
+        self.commit(&mut state, next).await?;
         Ok(true)
+    }
+
+    pub(crate) async fn mark_incomplete_final(
+        &self,
+        group_ref: &str,
+        reply_to_ref: &str,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.incomplete_finals
+            .entry(group_ref.to_owned())
+            .or_default()
+            .insert(reply_to_ref.to_owned());
+        self.commit(&mut state, next).await
+    }
+
+    /// Clears the group's incomplete-final barrier and removes only the records
+    /// that belong to those incomplete reply sets. Other groups and later
+    /// complete reply sets are left in place.
+    pub(crate) async fn discard_incomplete_final(&self, group_ref: &str) -> Result<bool> {
+        let mut state = self.state.lock().await;
+        if state
+            .incomplete_finals
+            .get(group_ref)
+            .is_none_or(|reply_tos| reply_tos.is_empty())
+        {
+            return Ok(false);
+        }
+        let mut next = state.clone();
+        let reply_tos = next.incomplete_finals.remove(group_ref).unwrap_or_default();
+        next.records.retain(|_, record| {
+            record.group_ref != group_ref || !reply_tos.contains(&record.reply_to_ref)
+        });
+        self.commit(&mut state, next).await?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_set(&self) {
+        self.fail_next_set.store(true, Ordering::SeqCst);
     }
 
     async fn commit(
         &self,
-        map: &mut tokio::sync::MutexGuard<'_, HashMap<String, FinalDeliveryRecord>>,
-        next: HashMap<String, FinalDeliveryRecord>,
+        state: &mut tokio::sync::MutexGuard<'_, FinalDeliverySnapshot>,
+        next: FinalDeliverySnapshot,
     ) -> Result<()> {
         let path = self.path.clone();
         let snapshot = next.clone();
         tokio::task::spawn_blocking(move || write_final_delivery_snapshot(&path, &snapshot))
             .await??;
-        **map = next;
+        **state = next;
+        self.changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(())
     }
 }
 
-fn write_final_delivery_snapshot(
-    path: &Path,
-    snapshot: &HashMap<String, FinalDeliveryRecord>,
-) -> Result<()> {
+fn parse_final_delivery_snapshot(bytes: &[u8]) -> Result<FinalDeliverySnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    if value.get("records").is_some() || value.get("incomplete_finals").is_some() {
+        Ok(serde_json::from_value(value)?)
+    } else {
+        Ok(FinalDeliverySnapshot {
+            records: serde_json::from_value(value)?,
+            incomplete_finals: HashMap::new(),
+        })
+    }
+}
+
+fn write_final_delivery_snapshot(path: &Path, snapshot: &FinalDeliverySnapshot) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs_private::create_dir_all_private(parent)?;
     }
@@ -558,6 +665,72 @@ mod tests {
         changed.changed().await.unwrap();
         assert!(!store.has_group("group").await);
         assert!(store.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_barrier_survives_restart_and_blocks_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let first = FinalDeliveryRecord {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_ref: "message".to_owned(),
+            text: "first".to_owned(),
+            chunk_index: 0,
+        };
+        let store = FinalDeliveryStore::load(path.clone()).unwrap();
+        store.set("first", first.clone()).await.unwrap();
+        store.fail_next_set();
+        assert!(
+            store
+                .set(
+                    "second",
+                    FinalDeliveryRecord {
+                        text: "second".to_owned(),
+                        chunk_index: 1,
+                        ..first.clone()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        store
+            .mark_incomplete_final("group", "message")
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert!(store.has_incomplete_final("group").await);
+        assert!(store.blocks_group("group").await);
+        assert_eq!(store.list().await.len(), 1);
+        assert!(store.list_reconcilable().await.is_empty());
+        assert!(store.discard_incomplete_final("group").await.unwrap());
+        assert!(!store.has_incomplete_final("group").await);
+        assert!(!store.blocks_group("group").await);
+        assert!(store.list().await.is_empty());
+        assert!(!store.discard_incomplete_final("group").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn final_delivery_store_loads_legacy_bare_record_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let legacy = serde_json::json!({
+            "first": {
+                "account_ref": "account",
+                "group_ref": "group",
+                "reply_to_ref": "message",
+                "text": "first",
+                "chunk_index": 0
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert!(store.has_group("group").await);
+        assert!(!store.has_incomplete_final("group").await);
+        assert_eq!(store.list().await.len(), 1);
     }
 
     #[cfg(unix)]
