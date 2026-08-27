@@ -1,29 +1,20 @@
-//! Characterization test for the since-floor defect. In two sentences:
+//! Characterization tests for transport-cursor floor safety and epoch-gap
+//! recovery.
 //!
-//! > `last_transport_timestamp` is one account-wide durable cursor advanced
-//! > from the sender-controlled `created_at` of every ingested kind-445
-//! > (undecryptable included), and every subscription rebuild floors at
-//! > `since = cursor − 120s` — so any 445 not delivered while the cursor was
-//! > still low is permanently unfetchable, with no gap detection.
+//! `last_transport_timestamp` has two stages: every retained kind-445 may
+//! advance an in-memory candidate, but only a completed transport drain
+//! promotes that candidate to the durable subscription floor. Isolated live
+//! delivery saves retain the previous drain checkpoint. That separation keeps
+//! a later bounded-queue overflow from stranding an older newest-first event
+//! below a cursor committed by the retained prefix.
 //!
-//! This test PINS today's behavior on purpose: an event whose `created_at`
-//! falls below the rebuilt subscription's `since` floor is never delivered to
-//! the runtime, while a sibling event just above the floor is delivered —
-//! and the miss survives a cold restart because the floor is derived from a
-//! durable, monotonic cursor. It is deliberately independent of the other
-//! fixes: the frozen wake-collection cursor does not change this outcome (a
-//! `Frozen` wake between the two probe events still leaves the same floor in
-//! place), and EOSE-gated cursor completeness and epoch-gap backfill are the
-//! fixes that are expected to flip these assertions — when they land, the
-//! below-floor probe should start arriving (via backfill) and this file's
-//! expectations must be updated accordingly.
-//!
-//! Epoch-gap backfill has since landed, splitting this file in two:
-//! `cold_restart_since_floor_permanently_drops_backlog_below_it` still pins the
-//! UNARMED floor-drop (one undecryptable probe stays under the backfill
-//! threshold, so it stays dropped forever), while
-//! `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed` pins the
-//! ARMED recovery of below-floor backlog through the full-history backfill.
+//! This file pins both consequences. The first test proves that an isolated
+//! live delivery cannot make below-candidate backlog permanently unfetchable:
+//! the first cold restart receives both probes, then its completed drain safely
+//! promotes the cursor, so the second restart may floor the older probe only
+//! after it is already durable. The second test independently pins unfloored
+//! epoch-gap recovery when a previously completed drain really did establish a
+//! floor below which new backlog appears.
 //!
 //! # Why one account per store
 //!
@@ -62,9 +53,10 @@
 //! runtime down for good, publishes the probe events while `bob` has no
 //! store-side app instance running at all, then opens a *brand new*
 //! `MarmotApp`/`MarmotAppRuntime` pair against the same on-disk store. That
-//! new pair's first subscription rebuild is a genuine cold boot, and doing it
-//! twice (independently) demonstrates the permanence property: the
-//! below-floor probe never arrives, not even on a second independent boot.
+//! new pair's first subscription rebuild is a genuine cold boot. Doing it
+//! twice demonstrates the cursor transition: the first drain recovers and
+//! checkpoints the older probe; only the later rebuild applies the newly safe
+//! floor.
 //!
 //! # Delivery observable
 //!
@@ -88,9 +80,10 @@
 //! group's real history (the welcome and the one ordinary message this test
 //! sends to advance the cursor), the test measures that legitimate count on
 //! the very first (still-live) boot rather than assuming it, then asserts
-//! each subsequent cold boot's delivered count is exactly
-//! `legitimate_count + 1` (the sibling, and only the sibling) — never
-//! `+ 2` (which would mean the below-floor probe leaked through).
+//! the first subsequent cold boot's delivered count is exactly
+//! `legitimate_count + 2` (both probes), while the following cold boot is
+//! exactly `legitimate_count + 1`: its newly promoted floor may exclude the
+//! older probe because the previous drain already retained it durably.
 
 use std::time::{Duration, Instant};
 
@@ -280,7 +273,7 @@ async fn publish_garbage_group_message_at(
 }
 
 #[tokio::test]
-async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
+async fn cold_restart_keeps_backlog_fetchable_until_a_drain_promotes_the_floor() {
     let (_relay, url) = mock_relay().await;
 
     // --- bob's store: the account whose since-floor we are pinning ---
@@ -321,8 +314,8 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
     })
     .await;
 
-    // Ordinary traffic: advances bob's durable transport cursor exactly the
-    // way the defect describes (every ingested kind-445 advances it).
+    // Ordinary live traffic advances bob's in-memory cursor candidate. Its
+    // isolated projection save must retain the prior completed-drain floor.
     alice_client
         .send(&group_id, b"ordinary traffic advances the cursor")
         .await
@@ -383,17 +376,15 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
     let delivered_after_boot2 = inbound_events_delivered(&app_bob_boot2).await;
     assert_eq!(
         delivered_after_boot2,
-        legitimate_delivery_count + 1,
-        "only the above-floor sibling should reach ingest on a cold boot; the \
-         below-floor probe must be silently dropped by the rebuilt \
-         subscription's since floor",
+        legitimate_delivery_count + 2,
+        "an isolated live-delivery cursor candidate must not become the durable \
+         floor: the first cold boot must still fetch both probe siblings",
     );
     runtime_bob_boot2.shutdown().await;
 
-    // --- boot 3: a second, independent cold restart — the permanence
-    // property. If the miss were a timing fluke rather than a permanent
-    // consequence of the durable cursor, a second independent rebuild could
-    // behave differently; it must not. ---
+    // --- boot 3: boot 2's completed drain has now durably retained both
+    // probes and promoted its cursor candidate. A later rebuild can safely
+    // floor the older probe without making it unfetchable. ---
     let app_bob_boot3 = open_store(&dir_bob, &url);
     let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
     start_with_maintenance_paused(&runtime_bob_boot3, "bob").await;
@@ -403,17 +394,16 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
     assert_eq!(
         delivered_after_boot3,
         legitimate_delivery_count + 1,
-        "a second, independent cold restart must still never deliver the \
-         below-floor probe: the miss is permanent, not a one-off timing \
-         fluke (the permanent-drop property)",
+        "after the first cold boot retained both probes, its completed drain \
+         may promote the cursor so the next rebuild delivers only the \
+         above-floor sibling",
     );
     runtime_bob_boot3.shutdown().await;
 }
 
-/// The armed counterpart to
-/// [`cold_restart_since_floor_permanently_drops_backlog_below_it`]: with enough
-/// undecryptable traffic at a stalled epoch, epoch-gap backfill recovers the
-/// backlog the rebuilt subscription's since floor would otherwise drop forever.
+/// Separate armed-recovery characterization: with enough undecryptable traffic
+/// at a stalled epoch, epoch-gap backfill recovers backlog below a floor already
+/// established by a completed drain.
 ///
 /// The probes play two distinct roles on either side of the floor:
 ///
