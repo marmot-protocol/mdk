@@ -98,6 +98,82 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 /// which only an authenticated commit produces.
 pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
 
+/// How long a group wedged at one stalled epoch must wait between paced
+/// same-epoch re-arms of its full-history replay.
+///
+/// A device whose missing commit is genuinely absent from the relays never sees
+/// its epoch move, and every arm after the first needs that epoch to change —
+/// so before this interval existed such a device armed once and then retried
+/// nothing, forever. Re-arming is what runs another replay, and the replay is
+/// the only thing that can produce new evidence, because decryption is
+/// deterministic: a re-replay pays off only when its *inputs* changed, and
+/// exactly two do change with time. Relay-side content changes when a commit is
+/// published late — it carries an old `created_at`, so the floored live
+/// subscription can never deliver it and the unfloored replay is the only
+/// channel back to it. Local admission capacity changes when the deferred-peel
+/// cap drains — a commit refused at a full cap is admitted by an identical
+/// later replay. Both are time-shaped, which is why the pacing is a clock and
+/// not a count.
+///
+/// One hour, cited to `CATCH_UP_GRACE_MS`
+/// (`crates/incident-replay/src/classify.rs`), which already answers almost
+/// exactly this question — how long being behind stops being ordinary catch-up
+/// — and records a measured insensitivity plateau across [15 min, ~6 h]. Safety
+/// is structural on both sides: too low costs extra whole-account replays,
+/// which is the same operation a key-package publish already performs and is
+/// separately bounded by the fruitless-replay retry cooldown; too high only
+/// delays a report, because the evidence being gathered is monotone while the
+/// group stays wedged.
+///
+/// A paced re-arm deliberately does *not* count toward
+/// [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`]: what it is allowed to do is gather
+/// evidence, and only the relay-confirmed evidence in
+/// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`] escalates.
+pub(crate) const EPOCH_STALL_WEDGE_REARM_INTERVAL_MS: u64 = 60 * 60 * 1_000;
+
+/// How far apart two arms may be and still belong to the same unrecovered run.
+///
+/// [`GroupStall::observe_epoch`] ends a run on evidence and nothing ends it on
+/// time, so without this bound a run is unbounded in wall-clock: a group that
+/// armed once and then went quiet for weeks has an arm counter still sitting at
+/// one, and an unrelated stall a month later lands as arm two of a long-dead
+/// run. Bounding the *gap between consecutive arms* rather than the total run
+/// length is what keeps the field shape — the 2026-07-29 cohort ran for hours —
+/// while making a weeks-later arm start fresh.
+///
+/// Twenty-four hours, sized off the same incident-replay cohort
+/// `EPOCH_STALL_WEDGE_REARM_INTERVAL_MS` cites: its real incidents stayed
+/// behind 6 h and 18 h, so a genuine long stall stays one run.
+///
+/// Invariant: this window must exceed
+/// [`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`], or a wedged group's own paced
+/// re-arms would age out the very run they are continuing. Asserted by
+/// `the_rearm_interval_is_shorter_than_the_run_continuation_window`.
+pub(crate) const EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// Replay completions that reached end-of-stored-events and recovered nothing,
+/// at one stalled epoch, before the runtime reports the group as beyond what
+/// full-history replay can repair.
+///
+/// This is the escalation rule for a group whose epoch never moves, and it
+/// counts *evidence*, not attempts. A completion counts only when the relays
+/// confirmed they had served the account's stored history
+/// (`EpochBackfillCompletionKind::EndOfStoredEvents`) and the replay still
+/// recovered nothing for the group (`AppClient::replay_recovered_something`).
+/// A drain that gave up unconfirmed proves only that the drain gave up, and the
+/// legacy `quiescence_fallback` completion is a deliberately weaker claim — so
+/// neither counts. That restriction is what preserves the property
+/// [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] relies on: minted undecryptable
+/// traffic can pace re-arms, but it cannot manufacture a relay's confirmation
+/// that the history it asked for was served in full and held nothing.
+///
+/// Three, matching [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] and for the same
+/// reason: two escalates a single unlucky follow-up, four costs another whole
+/// pacing interval. Safety is structural on both sides in the same way —
+/// escalation only *reports*, and the count is monotone while the group stays
+/// wedged, so being wrong high delays the report rather than losing it.
+pub(crate) const EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD: u32 = 3;
+
 /// What one undecryptable-traffic observation decided.
 ///
 /// `#[must_use]` because dropping a decision is unrecoverable, not merely
@@ -255,6 +331,8 @@ impl GroupStall {
 pub(crate) struct EpochStallDetector {
     threshold: usize,
     escalation_arm_threshold: u32,
+    wedge_rearm_interval_ms: u64,
+    fruitless_completion_threshold: u32,
     groups: HashMap<GroupId, GroupStall>,
 }
 
@@ -263,8 +341,30 @@ impl EpochStallDetector {
         Self {
             threshold,
             escalation_arm_threshold,
+            wedge_rearm_interval_ms: EPOCH_STALL_WEDGE_REARM_INTERVAL_MS,
+            fruitless_completion_threshold: EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD,
             groups: HashMap::new(),
         }
+    }
+
+    /// Pace a wedged group's same-epoch re-arms `interval_ms` apart instead of
+    /// the production [`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`].
+    ///
+    /// The only injection seam for the wedge clock: an hour is not a wall-clock
+    /// budget any test can spend, and the alternative — reading a clock inside
+    /// the detector — would cost the I/O-freedom the whole module is built on.
+    pub(crate) fn with_wedge_rearm_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.wedge_rearm_interval_ms = interval_ms;
+        self
+    }
+
+    /// Escalate a wedged group after `threshold` fruitless end-of-stored-events
+    /// completions instead of the production
+    /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
+    #[cfg(test)]
+    pub(crate) fn with_fruitless_completion_threshold(mut self, threshold: u32) -> Self {
+        self.fruitless_completion_threshold = threshold;
+        self
     }
 
     /// The distinct-undecryptable count at which this detector arms a backfill.

@@ -138,6 +138,13 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides`; this lets a test exercise both sides of the
     /// cooldown without spending it in wall-clock.
     pub dev_epoch_backfill_retry_backoff_ms: Option<u64>,
+    /// Dev/test-only override for how long a group wedged at one stalled epoch
+    /// must wait between paced re-arms
+    /// ([`crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
+    /// Honored only with `test-policy-overrides`; the production interval is an
+    /// hour, so this is the only way a test can reach the second and third
+    /// re-arm of a frozen device without sleeping through them.
+    pub dev_epoch_stall_wedge_rearm_interval_ms: Option<u64>,
     /// Dev/test-only fault injected before the next delivery after this many
     /// completed catch-up deliveries. Honored only with
     /// `test-policy-overrides`; this exercises truthful partial-progress
@@ -213,6 +220,7 @@ impl Default for MarmotAppConfig {
             dev_epoch_backfill_eose_wait_ms: None,
             dev_epoch_backfill_execution_quantum_ms: None,
             dev_epoch_backfill_retry_backoff_ms: None,
+            dev_epoch_stall_wedge_rearm_interval_ms: None,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
             dev_fail_ingest_after_application_event_ack: false,
@@ -354,6 +362,13 @@ impl MarmotAppConfig {
     /// builds. Normal builds ignore this field.
     pub fn with_dev_epoch_backfill_retry_backoff_ms(mut self, ms: u64) -> Self {
         self.dev_epoch_backfill_retry_backoff_ms = Some(ms);
+        self
+    }
+
+    /// Pace a wedged group's same-epoch backfill re-arms `ms` apart in
+    /// test-policy builds. Normal builds ignore this field.
+    pub fn with_dev_epoch_stall_wedge_rearm_interval_ms(mut self, ms: u64) -> Self {
+        self.dev_epoch_stall_wedge_rearm_interval_ms = Some(ms);
         self
     }
 

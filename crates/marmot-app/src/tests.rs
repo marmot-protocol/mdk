@@ -2682,6 +2682,99 @@ fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
     });
 }
 
+/// A device frozen at one stalled epoch must eventually be *reported*, not
+/// retry in silence forever.
+///
+/// This is the blind spot the `epoch_stall` module header names. Escalation
+/// needs three arms in one unrecovered run; every arm after the first needs the
+/// group's epoch to move; and a device whose missing commit is genuinely absent
+/// from the relays never sees it move. The 2026-08 field cohort shows exactly
+/// that plateau — twelve `epoch_stall_backfill_armed` rows across five devices,
+/// every one at `retry_ordinal: 0`, and not one escalation row anywhere.
+///
+/// The escalation for this shape therefore counts relay-confirmed *evidence*
+/// instead of arms: `EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD` replays that
+/// reached end-of-stored-events and recovered nothing, all at the same stalled
+/// epoch. Nothing here injects a decision — every round crosses the
+/// undecryptable threshold through the receive seam the way production does,
+/// and every replay is a real drain the scripted pump confirms EOSE for.
+#[test]
+fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
+    run_composed_app_runtime_test("frozen-epoch-fruitless-escalation", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        // The wedge clock is an hour in production; a test buys the second and
+        // third re-arm with the dev override rather than with wall-clock.
+        let config = backfill_drain_test_config().with_dev_epoch_stall_wedge_rearm_interval_ms(0);
+        let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let probe_base = crate::unix_now_seconds() - 1_000;
+
+        for round in 0..u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD)
+        {
+            for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+                client
+                    .ingest_received_delivery(route.probe(
+                        probe_base + round * 100 + probe as u64,
+                        &format!("round-{round}-probe-{probe}"),
+                    ))
+                    .await
+                    .expect("a retained undecryptable object completes its ingest pass");
+            }
+            assert!(
+                client.has_pending_epoch_backfill(),
+                "round {round}: undecryptable traffic at a frozen epoch must arm a replay",
+            );
+            assert!(
+                matches!(
+                    client
+                        .run_pending_epoch_backfill(
+                            marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                        )
+                        .await
+                        .expect("the armed replay must run"),
+                    crate::EpochBackfillRunOutcome::Completed(_)
+                ),
+                "round {round}: a served end-of-stored-events drain is a completed replay",
+            );
+            assert_eq!(
+                client.group_mls_state(&route.group_id).unwrap().epoch,
+                stalled_epoch,
+                "round {round}: the device under test stays frozen at one epoch",
+            );
+            if round + 1 < u64::from(
+                crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD,
+            ) {
+                assert!(
+                    client.pending_epoch_stall_escalations.is_empty(),
+                    "round {round}: evidence short of the threshold must not report",
+                );
+            }
+        }
+
+        assert_eq!(
+            client
+                .pending_epoch_stall_escalations
+                .iter()
+                .map(|escalation| (escalation.group_id.clone(), escalation.stalled_epoch))
+                .collect::<Vec<_>>(),
+            vec![(route.group_id.clone(), stalled_epoch)],
+            "three fruitless end-of-stored-events replays at one stalled epoch must report \
+             the group exactly once",
+        );
+        drop(client);
+        assert_eq!(
+            recorded_audit_rows(&app)
+                .iter()
+                .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_escalated")
+                .count(),
+            1,
+            "the escalation must leave exactly one durable forensic row",
+        );
+    });
+}
+
 /// A zero-delivery replay after which a tracked group's epoch moved is genuine
 /// success: the value of the replay was letting already-deferred rows converge,
 /// and that is exactly what the epoch delta reports.
@@ -13093,6 +13186,29 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
     config: MarmotAppConfig,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    let (app, mut client, route) = undecryptable_probe_route(dir, relay, config).await;
+    for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+        client
+            .ingest_received_delivery(route.probe(filled_through, &format!("cap-fill-{row}")))
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert_eq!(
+        client.state.last_transport_timestamp,
+        Some(filled_through),
+        "the retained probes must have advanced the cursor to their own timestamp",
+    );
+    (app, client, route)
+}
+
+/// [`UndecryptableProbeRoute`]'s group with its retained-undecryptable backlog
+/// still empty, for the tests that need probes to be *retained*
+/// (`IngestOutcome::TransportDeferred`) rather than refused.
+async fn undecryptable_probe_route(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
     let account_id_hex = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap()
@@ -13121,18 +13237,6 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
         group_id,
         nostr_group_id_hex,
     };
-
-    for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
-        client
-            .ingest_received_delivery(route.probe(filled_through, &format!("cap-fill-{row}")))
-            .await
-            .expect("a retained undecryptable object completes its ingest pass");
-    }
-    assert_eq!(
-        client.state.last_transport_timestamp,
-        Some(filled_through),
-        "the retained probes must have advanced the cursor to their own timestamp",
-    );
     (app, client, route)
 }
 
