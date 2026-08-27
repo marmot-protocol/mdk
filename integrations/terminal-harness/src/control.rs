@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_control::{
-    AgentControlEnvelope, AgentControlEvent, AgentControlRequest, AgentControlResponse,
-    read_envelope, write_frame,
+    AgentControlEnvelope, AgentControlEvent, AgentControlMediaRef, AgentControlRequest,
+    AgentControlResponse, read_envelope, write_frame,
 };
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
@@ -24,6 +24,13 @@ pub(crate) struct ControlClient {
     request_timeout: Duration,
     request_prefix: &'static str,
     request_seq: Arc<AtomicU64>,
+}
+
+pub(crate) struct DownloadedMedia {
+    pub(crate) path: PathBuf,
+    pub(crate) media_type: String,
+    pub(crate) file_name: String,
+    pub(crate) size_bytes: u64,
 }
 
 impl ControlClient {
@@ -132,6 +139,42 @@ impl ControlClient {
                 code,
             }),
             other => Err(unexpected_response("send_final", &other)),
+        }
+    }
+
+    pub(crate) async fn download_media(
+        &self,
+        account_ref: &str,
+        group_ref: &str,
+        media: AgentControlMediaRef,
+    ) -> Result<DownloadedMedia> {
+        match self
+            .call(
+                "download_media",
+                AgentControlRequest::DownloadMedia {
+                    account_id_hex: account_ref.to_owned(),
+                    group_id_hex: group_ref.to_owned(),
+                    media,
+                },
+            )
+            .await?
+        {
+            AgentControlResponse::MediaDownloaded {
+                path,
+                media_type,
+                file_name,
+                size_bytes,
+            } => Ok(DownloadedMedia {
+                path: PathBuf::from(path),
+                media_type,
+                file_name,
+                size_bytes,
+            }),
+            AgentControlResponse::Error { code, .. } => Err(HarnessError::ControlRejected {
+                method: "download_media",
+                code,
+            }),
+            other => Err(unexpected_response("download_media", &other)),
         }
     }
 

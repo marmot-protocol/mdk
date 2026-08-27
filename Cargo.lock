@@ -3422,6 +3422,7 @@ dependencies = [
  "agent-control",
  "async-trait",
  "fs-private",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

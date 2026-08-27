@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::{Config, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING, Result};
+use crate::{
+    Config, DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_REPLY_BYTES,
+    HarnessError, MARMOT_MESSAGE_BYTES_CEILING, Result,
+};
 
 const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_BACKEND_IDLE_TIMEOUT_SECS: u64 = 120;
@@ -208,6 +211,28 @@ pub fn load_config_with(
             "{max_pending_name} must be greater than zero"
         )));
     }
+    let max_attachments_name = env_name("MAX_ATTACHMENTS");
+    let max_attachments = parse_usize(
+        lookup(&max_attachments_name),
+        DEFAULT_MAX_ATTACHMENTS,
+        &max_attachments_name,
+    )?;
+    if max_attachments == 0 {
+        return Err(config_error(format!(
+            "{max_attachments_name} must be greater than zero"
+        )));
+    }
+    let max_attachment_bytes_name = env_name("MAX_ATTACHMENT_BYTES");
+    let max_attachment_bytes = parse_u64(
+        lookup(&max_attachment_bytes_name),
+        DEFAULT_MAX_ATTACHMENT_BYTES,
+        &max_attachment_bytes_name,
+    )?;
+    if max_attachment_bytes == 0 {
+        return Err(config_error(format!(
+            "{max_attachment_bytes_name} must be greater than zero"
+        )));
+    }
 
     let state_name = env_name("STATE_PATH");
     let state_path = lookup(&state_name).map(PathBuf::from).unwrap_or_else(|| {
@@ -227,6 +252,11 @@ pub fn load_config_with(
             request_timeout,
             max_reply_bytes,
             max_pending_per_group,
+            max_attachments,
+            max_attachment_bytes,
+            attachment_staging_root: home
+                .join("tmp")
+                .join(format!("{}-inbound-attachments", spec.reply_prefix)),
             state_path,
             backend_timeout,
             backend_idle_timeout,
@@ -329,6 +359,15 @@ mod tests {
         assert_eq!(loaded.home, PathBuf::from("/home/test/.marmot-agents/test"));
         assert_eq!(loaded.harness.backend_timeout, Duration::from_secs(3600));
         assert_eq!(loaded.harness.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
+        assert_eq!(loaded.harness.max_attachments, DEFAULT_MAX_ATTACHMENTS);
+        assert_eq!(
+            loaded.harness.max_attachment_bytes,
+            DEFAULT_MAX_ATTACHMENT_BYTES
+        );
+        assert_eq!(
+            loaded.harness.attachment_staging_root,
+            PathBuf::from("/home/test/.marmot-agents/test/tmp/wn-test-inbound-attachments")
+        );
         assert_eq!(loaded.harness.execution_profile, ExecutionProfile::Inherit);
     }
 
@@ -376,6 +415,16 @@ mod tests {
             ])
             .is_err()
         );
+        for name in ["WN_TEST_MAX_ATTACHMENTS", "WN_TEST_MAX_ATTACHMENT_BYTES"] {
+            assert!(
+                load(&[
+                    ("HOME", "/home/test"),
+                    ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+                    (name, "0"),
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

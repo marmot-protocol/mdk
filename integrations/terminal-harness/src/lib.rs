@@ -27,6 +27,10 @@ pub use process::{ParsedEvent, PromptTransport};
 pub const DEFAULT_MAX_REPLY_BYTES: usize = 30_000;
 /// Maximum plaintext byte length accepted by the Marmot message layer.
 pub const MARMOT_MESSAGE_BYTES_CEILING: usize = 60_000;
+/// Default maximum attachments accepted in one inbound turn.
+pub const DEFAULT_MAX_ATTACHMENTS: usize = 8;
+/// Default maximum aggregate bytes accepted in one inbound attachment batch.
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Shared tracing target for bridge, control, and process lifecycle diagnostics.
 pub const TRACE_TARGET: &str = "marmot_terminal_harness";
 
@@ -47,6 +51,12 @@ pub struct Config {
     pub max_reply_bytes: usize,
     /// Maximum queued prompts for one group.
     pub max_pending_per_group: usize,
+    /// Maximum attachments accepted in one backend turn.
+    pub max_attachments: usize,
+    /// Maximum aggregate plaintext bytes accepted in one backend turn.
+    pub max_attachment_bytes: u64,
+    /// Private, connector-owned root for ephemeral attachment batches.
+    pub attachment_staging_root: PathBuf,
     /// Private session-mapping file.
     pub state_path: PathBuf,
     /// Total backend invocation timeout.
@@ -69,10 +79,35 @@ impl fmt::Debug for Config {
             .field("request_timeout", &self.request_timeout)
             .field("max_reply_bytes", &self.max_reply_bytes)
             .field("max_pending_per_group", &self.max_pending_per_group)
+            .field("max_attachments", &self.max_attachments)
+            .field("max_attachment_bytes", &self.max_attachment_bytes)
             .field("backend_timeout", &self.backend_timeout)
             .field("backend_idle_timeout", &self.backend_idle_timeout)
             .field("execution_profile", &self.execution_profile)
             .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One validated, private staging copy of an inbound attachment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// Private regular-file path, valid only for this invocation.
+    pub path: PathBuf,
+    /// Sender-provided media type preserved by the control protocol.
+    pub media_type: String,
+    /// Sanitized display name.
+    pub file_name: String,
+    /// Validated plaintext byte length.
+    pub size_bytes: u64,
+}
+
+impl fmt::Debug for Attachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Attachment")
+            .field("media_type", &self.media_type)
+            .field("size_bytes", &self.size_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -188,6 +223,24 @@ pub trait Backend: Send + Sync + 'static {
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure>;
+
+    /// Runs one prompt with an ordered batch of validated private attachment copies.
+    /// Backends opt in explicitly so adding the shared attachment boundary does not
+    /// silently change existing adapter behavior.
+    async fn run_with_attachments(
+        &self,
+        invocation: Invocation,
+        attachments: Vec<Attachment>,
+        tx: mpsc::Sender<RunnerEvent>,
+    ) -> std::result::Result<Outcome, RunFailure> {
+        if attachments.is_empty() {
+            return self.run(invocation, tx).await;
+        }
+        Err(RunFailure {
+            error: HarnessError::AttachmentUnsupported,
+            observed_session: invocation.session_id,
+        })
+    }
 }
 
 /// Backend support state for the selected execution profile.

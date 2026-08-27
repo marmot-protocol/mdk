@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use agent_control::AgentControlMediaRef;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 
@@ -33,6 +34,8 @@ pub(crate) enum RecoveryStatus {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecord {
     pub(crate) prompt: String,
+    #[serde(default)]
+    pub(crate) media: Vec<AgentControlMediaRef>,
     pub(crate) cwd: PathBuf,
     pub(crate) session_id: String,
     pub(crate) kind: RecoveryKind,
@@ -591,6 +594,7 @@ mod tests {
         let path = dir.path().join("recovery.json");
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
+            media: Vec::new(),
             cwd: dir.path().join("repo"),
             session_id: "session".to_owned(),
             kind: RecoveryKind::UncertainOutcome,

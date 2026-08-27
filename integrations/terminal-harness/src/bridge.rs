@@ -1,16 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_control::{AgentControlAccount, AgentControlEvent};
+use agent_control::{AgentControlAccount, AgentControlEvent, AgentControlMediaRef};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::AbortHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
 use crate::chunking::split_reply_chunks;
-use crate::control::ControlClient;
+use crate::control::{ControlClient, DownloadedMedia};
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{
@@ -18,7 +21,8 @@ use crate::store::{
     RecoveryStore, SessionRecord, SessionStore,
 };
 use crate::{
-    Backend, Config, Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
+    Attachment, Backend, Config, Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET,
+    dirs_home,
 };
 
 const DEDUPE_LIMIT: usize = 2048;
@@ -32,6 +36,7 @@ const INCOMPLETE_FINAL_TEXT: &str = "The backend finished, but the connector cou
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
+    reconcile_attachment_staging(&config.attachment_staging_root)?;
     let execution_support = backend.execution_support();
     info!(
         target: TRACE_TARGET,
@@ -334,6 +339,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 group_ref: group_id_hex,
                 message_ref: message.message_id_hex,
                 text: message.text,
+                media: message.media,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
             DispatchOutcome::Continue
@@ -374,6 +380,7 @@ struct InboundPrompt {
     group_ref: String,
     message_ref: String,
     text: String,
+    media: Vec<AgentControlMediaRef>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -565,6 +572,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 }
             };
             retrying = true;
+            inbound.media = record.media.clone();
             Some((record.cwd, Some(record.session_id), record.prompt))
         }
         PromptDisposition::Forward {
@@ -625,6 +633,31 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     );
 
     let recovery_prompt = prompt.clone();
+    let attachment_batch = match prepare_attachment_batch(&ctx, &inbound).await {
+        Ok(batch) => batch,
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "prepare_attachments",
+                error_kind = err.privacy_safe_kind(),
+                attachment_count = inbound.media.len(),
+                "failed to prepare inbound attachments"
+            );
+            let _ = send_reply(
+                &ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                &attachment_failure_reply(&ctx.cfg, &err),
+                0,
+            )
+            .await;
+            return;
+        }
+    };
+    let attachments = attachment_batch
+        .as_ref()
+        .map_or_else(Vec::new, |batch| batch.attachments.clone());
     let invocation = Invocation {
         timeout: ctx.cfg.backend_timeout,
         idle_timeout: ctx.cfg.backend_idle_timeout,
@@ -634,7 +667,17 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
-    let runner = tokio::spawn(async move { backend.run(invocation, tx).await });
+    let runner = tokio::spawn(async move {
+        // The staging lease lives in the backend task so its paths cannot
+        // disappear while that task still has access to them.
+        let _attachment_batch = attachment_batch;
+        backend
+            .run_with_attachments(invocation, attachments, tx)
+            .await
+    });
+    // Dropping a JoinHandle detaches its task. Abort explicitly when this
+    // message handler is cancelled so the task drops its staging lease too.
+    let _runner_abort = AbortBackendOnDrop(runner.abort_handle());
     let mut chunk_index = 0usize;
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
@@ -767,6 +810,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 known_session.as_ref(),
                 cwd,
                 recovery_prompt,
+                inbound.media.clone(),
                 &failure,
             )
             .await;
@@ -838,6 +882,184 @@ async fn begin_validated_retry(
 
 async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
     ctx.recovery.get(group_ref).await.is_some() || ctx.deliveries.blocks_group(group_ref).await
+}
+
+struct AttachmentBatch {
+    _directory: tempfile::TempDir,
+    attachments: Vec<Attachment>,
+}
+
+struct AbortBackendOnDrop(AbortHandle);
+
+impl Drop for AbortBackendOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn validate_attachment_count(count: usize, maximum: usize) -> Result<()> {
+    if count > maximum {
+        return Err(HarnessError::AttachmentCountLimit);
+    }
+    Ok(())
+}
+
+fn add_attachment_bytes(current: u64, next: u64, maximum: u64) -> Result<u64> {
+    let total = current
+        .checked_add(next)
+        .ok_or(HarnessError::AttachmentBytesLimit)?;
+    if total > maximum {
+        return Err(HarnessError::AttachmentBytesLimit);
+    }
+    Ok(total)
+}
+
+fn staged_attachment_name(index: usize, file_name: &str) -> String {
+    let leaf = std::path::Path::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let mut sanitized = String::with_capacity(leaf.len().min(128));
+    for character in leaf.chars().take(128) {
+        sanitized.push(
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    let sanitized = sanitized.trim_matches(['.', '_']);
+    let sanitized = if sanitized.is_empty() {
+        "attachment"
+    } else {
+        sanitized
+    };
+    format!("{index:03}-{sanitized}")
+}
+
+fn reconcile_attachment_staging(root: &std::path::Path) -> Result<()> {
+    fs_private::create_dir_all_private(root)?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_attachment_batch(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+) -> Result<Option<AttachmentBatch>> {
+    validate_attachment_count(inbound.media.len(), ctx.cfg.max_attachments)?;
+    if inbound.media.is_empty() {
+        return Ok(None);
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("batch-")
+        .tempdir_in(&ctx.cfg.attachment_staging_root)?;
+    let mut attachments = Vec::with_capacity(inbound.media.len());
+    let mut aggregate_bytes = 0_u64;
+    for (index, media) in inbound.media.iter().cloned().enumerate() {
+        let downloaded = ctx
+            .client
+            .download_media(&inbound.account_ref, &inbound.group_ref, media)
+            .await?;
+        aggregate_bytes = add_attachment_bytes(
+            aggregate_bytes,
+            downloaded.size_bytes,
+            ctx.cfg.max_attachment_bytes,
+        )?;
+        attachments.push(stage_downloaded_attachment(
+            directory.path(),
+            index,
+            downloaded,
+        )?);
+    }
+    Ok(Some(AttachmentBatch {
+        _directory: directory,
+        attachments,
+    }))
+}
+
+fn stage_downloaded_attachment(
+    directory: &std::path::Path,
+    index: usize,
+    downloaded: DownloadedMedia,
+) -> Result<Attachment> {
+    let metadata =
+        fs::symlink_metadata(&downloaded.path).map_err(|_| HarnessError::AttachmentInvalid)?;
+    if !metadata.file_type().is_file() || !owner_can_read(&metadata) {
+        return Err(HarnessError::AttachmentInvalid);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut source = options
+        .open(&downloaded.path)
+        .map_err(|_| HarnessError::AttachmentInvalid)?;
+    let opened_metadata = source
+        .metadata()
+        .map_err(|_| HarnessError::AttachmentInvalid)?;
+    if !opened_metadata.is_file()
+        || !owner_can_read(&opened_metadata)
+        || opened_metadata.len() != downloaded.size_bytes
+    {
+        return Err(HarnessError::AttachmentInvalid);
+    }
+
+    let file_name = staged_attachment_name(index, &downloaded.file_name);
+    let destination_path = directory.join(&file_name);
+    let mut destination = fs_private::create_new_private(&destination_path)?;
+    let copied = {
+        let mut bounded_source = (&mut source).take(downloaded.size_bytes);
+        io::copy(&mut bounded_source, &mut destination)?
+    };
+    let mut extra = [0_u8; 1];
+    let has_extra = source.read(&mut extra)? != 0;
+    destination.sync_all()?;
+    if copied != downloaded.size_bytes || has_extra {
+        return Err(HarnessError::AttachmentInvalid);
+    }
+    Ok(Attachment {
+        path: destination_path,
+        media_type: downloaded.media_type,
+        file_name,
+        size_bytes: copied,
+    })
+}
+
+#[cfg(unix)]
+fn owner_can_read(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o400 != 0
+}
+
+#[cfg(not(unix))]
+fn owner_can_read(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
+    let detail = match error {
+        HarnessError::AttachmentCountLimit => "too many attachments",
+        HarnessError::AttachmentBytesLimit => "the attachment batch is too large",
+        HarnessError::AttachmentUnsupported => "one or more attachment types are unsupported",
+        _ => "an attachment could not be downloaded and validated",
+    };
+    format!(
+        "[{}] could not process this turn because {detail}; no backend turn was started.",
+        config.spec.reply_prefix
+    )
 }
 
 async fn handle_session_reset(ctx: &BridgeContext, inbound: &InboundPrompt) {
@@ -942,6 +1164,7 @@ async fn finish_success(
                 &ctx.recovery,
                 &inbound.group_ref,
                 recovery_prompt,
+                inbound.media.clone(),
                 cwd,
                 session_id,
                 kind,
@@ -986,6 +1209,7 @@ async fn finish_success(
                 &ctx.recovery,
                 &inbound.group_ref,
                 recovery_prompt,
+                inbound.media.clone(),
                 cwd,
                 session_id,
                 RecoveryKind::UncertainOutcome,
@@ -1087,6 +1311,7 @@ async fn persist_recovery_record(
     recovery: &RecoveryStore,
     group_ref: &str,
     prompt: String,
+    media: Vec<AgentControlMediaRef>,
     cwd: PathBuf,
     session_id: String,
     kind: RecoveryKind,
@@ -1096,6 +1321,7 @@ async fn persist_recovery_record(
             group_ref,
             RecoveryRecord {
                 prompt,
+                media,
                 cwd,
                 session_id,
                 kind,
@@ -1117,6 +1343,7 @@ async fn handle_backend_run_failure(
     known_session: Option<&SessionRecord>,
     cwd: PathBuf,
     prompt: String,
+    media: Vec<AgentControlMediaRef>,
     failure: &RunFailure,
 ) -> String {
     let FailureRecoveryContext {
@@ -1151,6 +1378,7 @@ async fn handle_backend_run_failure(
             if let Some(session_id) = resumable_session {
                 let record = RecoveryRecord {
                     prompt,
+                    media,
                     cwd,
                     session_id,
                     kind: RecoveryKind::PolicyLimit,
@@ -1178,12 +1406,17 @@ async fn handle_backend_run_failure(
                 config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
             )
         }
+        HarnessError::AttachmentUnsupported => format!(
+            "[{}] {} does not support this attachment batch; no backend turn was started.",
+            config.spec.reply_prefix, config.spec.display_name
+        ),
         _ => {
             if let Some(session_id) = resumable_session {
                 if let Err(err) = persist_recovery_record(
                     recovery,
                     group_ref,
                     prompt,
+                    media,
                     cwd,
                     session_id,
                     RecoveryKind::UncertainOutcome,
@@ -1656,6 +1889,134 @@ mod tests {
     use super::*;
     use crate::store::SessionStore;
 
+    #[test]
+    fn attachment_names_are_sanitized_and_keep_stable_ordering() {
+        assert_eq!(
+            staged_attachment_name(0, "../../screen shot.PNG"),
+            "000-screen_shot.PNG"
+        );
+        assert_eq!(
+            staged_attachment_name(1, "\u{0000}\u{0001}"),
+            "001-attachment"
+        );
+    }
+
+    #[test]
+    fn attachment_count_limit_rejects_before_download() {
+        assert!(validate_attachment_count(8, 8).is_ok());
+        let error = validate_attachment_count(9, 8).unwrap_err();
+        assert_eq!(error.privacy_safe_kind(), "attachment_count_limit");
+    }
+
+    #[test]
+    fn attachment_byte_limit_is_checked_without_overflow() {
+        assert_eq!(add_attachment_bytes(3, 4, 7).unwrap(), 7);
+        assert!(matches!(
+            add_attachment_bytes(4, 4, 7),
+            Err(HarnessError::AttachmentBytesLimit)
+        ));
+        assert!(matches!(
+            add_attachment_bytes(u64::MAX, 1, u64::MAX),
+            Err(HarnessError::AttachmentBytesLimit)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_files_are_copied_privately_and_batch_drop_cleans_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let borrowed = root.path().join("borrowed.png");
+        fs_private::write_private(&borrowed, b"image-one").unwrap();
+        let staging = root.path().join("staging");
+        reconcile_attachment_staging(&staging).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("batch-")
+            .tempdir_in(&staging)
+            .unwrap();
+        let batch_path = directory.path().to_path_buf();
+        let first = stage_downloaded_attachment(
+            directory.path(),
+            0,
+            DownloadedMedia {
+                path: borrowed,
+                media_type: "image/png".to_owned(),
+                file_name: "../first image.png".to_owned(),
+                size_bytes: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.file_name, "000-first_image.png");
+        assert_eq!(fs::read(&first.path).unwrap(), b"image-one");
+        assert_eq!(
+            fs::metadata(&first.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(directory);
+        assert!(!batch_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_symlink_sources_and_restart_removes_stale_batches() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let borrowed = root.path().join("borrowed.txt");
+        fs_private::write_private(&borrowed, b"private").unwrap();
+        let link = root.path().join("link.txt");
+        symlink(&borrowed, &link).unwrap();
+        let fifo = root.path().join("pipe");
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        }
+        let staging = root.path().join("staging");
+        reconcile_attachment_staging(&staging).unwrap();
+        let stale = staging.join("batch-stale");
+        fs_private::create_dir_all_private(&stale).unwrap();
+        fs_private::write_private(&stale.join("copy"), b"private").unwrap();
+        assert!(matches!(
+            stage_downloaded_attachment(
+                &staging,
+                0,
+                DownloadedMedia {
+                    path: link,
+                    media_type: "text/plain".to_owned(),
+                    file_name: "link.txt".to_owned(),
+                    size_bytes: 7,
+                },
+            ),
+            Err(HarnessError::AttachmentInvalid)
+        ));
+        assert!(matches!(
+            stage_downloaded_attachment(
+                &staging,
+                1,
+                DownloadedMedia {
+                    path: fifo,
+                    media_type: "application/octet-stream".to_owned(),
+                    file_name: "pipe".to_owned(),
+                    size_bytes: 0,
+                },
+            ),
+            Err(HarnessError::AttachmentInvalid)
+        ));
+        reconcile_attachment_staging(&staging).unwrap();
+        assert!(fs::read_dir(staging).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_guard_cancels_detached_backend_task() {
+        let runner = tokio::spawn(std::future::pending::<()>());
+        let guard = AbortBackendOnDrop(runner.abort_handle());
+        drop(guard);
+        assert!(runner.await.unwrap_err().is_cancelled());
+    }
+
     fn test_config(root: &std::path::Path) -> Config {
         Config {
             socket: root.join("socket"),
@@ -1665,6 +2026,9 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             max_reply_bytes: 30_000,
             max_pending_per_group: 4,
+            max_attachments: 8,
+            max_attachment_bytes: 64 * 1024 * 1024,
+            attachment_staging_root: root.join("attachments"),
             state_path: root.join("sessions.json"),
             backend_timeout: Duration::from_secs(60),
             backend_idle_timeout: Duration::from_secs(45),
@@ -1885,6 +2249,7 @@ mod tests {
             &store,
             "group",
             "private prompt".to_owned(),
+            Vec::new(),
             dir.path().join("repo"),
             "session".to_owned(),
             RecoveryKind::UncertainOutcome,
@@ -2027,6 +2392,7 @@ mod tests {
         let recovery = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
+            media: Vec::new(),
             cwd: home.join("repo").join("..").join("repo"),
             session_id: "session".to_owned(),
             kind: RecoveryKind::PolicyLimit,
@@ -2085,6 +2451,7 @@ mod tests {
             None,
             home.clone(),
             "private prompt".to_owned(),
+            Vec::new(),
             &failure,
         )
         .await;
@@ -2248,6 +2615,18 @@ mod tests {
             error: HarnessError::BackendStream,
             observed_session: Some("ses_stream".to_owned()),
         };
+        let media = vec![AgentControlMediaRef {
+            media_type: "image/png".to_owned(),
+            file_name: "screen.png".to_owned(),
+            ciphertext_sha256: "cipher".to_owned(),
+            plaintext_sha256: "plain".to_owned(),
+            nonce_hex: "nonce".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 7,
+            locators: Vec::new(),
+            dim: None,
+            thumbhash: None,
+        }];
         let config = test_config(&home);
         let reply = handle_backend_run_failure(
             FailureRecoveryContext {
@@ -2259,6 +2638,7 @@ mod tests {
             store.get("group1").await.as_ref(),
             home.join("repo"),
             "private prompt".to_owned(),
+            media.clone(),
             &failure,
         )
         .await;
@@ -2272,6 +2652,7 @@ mod tests {
         assert_eq!(record.kind, RecoveryKind::UncertainOutcome);
         assert_eq!(record.status, RecoveryStatus::Pending);
         assert_eq!(record.session_id, "ses_stream");
+        assert_eq!(record.media, media);
 
         let retried = begin_validated_retry(&recovery, "group1", &home)
             .await
@@ -2279,6 +2660,7 @@ mod tests {
             .unwrap();
         assert_eq!(retried.status, RecoveryStatus::Retrying);
         assert_eq!(retried.session_id, "ses_stream");
+        assert_eq!(retried.media, media);
 
         let streaming = handle_backend_run_failure(
             FailureRecoveryContext {
@@ -2290,6 +2672,7 @@ mod tests {
             None,
             home.clone(),
             "private prompt".to_owned(),
+            Vec::new(),
             &RunFailure {
                 error: HarnessError::BackendStream,
                 observed_session: None,
@@ -2309,6 +2692,7 @@ mod tests {
                 "group",
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
+                    media: Vec::new(),
                     cwd: dir.path().join("repo"),
                     session_id: "session".to_owned(),
                     kind: RecoveryKind::UncertainOutcome,

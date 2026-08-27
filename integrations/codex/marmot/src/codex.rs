@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use marmot_terminal_harness::{
-    ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, Invocation, IsolationSupport,
-    Outcome, ParsedEvent, PromptTransport, RunFailure, RunnerEvent,
+    ApprovalSupport, Attachment, Backend, ExecutionProfile, ExecutionSupport, Invocation,
+    IsolationSupport, Outcome, ParsedEvent, PromptTransport, RunFailure, RunnerEvent,
     process::{ProcessSpec, run_jsonl_process},
 };
 use serde_json::Value;
@@ -45,7 +45,30 @@ impl Backend for CodexBackend {
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,
     ) -> std::result::Result<Outcome, RunFailure> {
-        run_with_bin(&self.bin, self.execution_profile, invocation, tx).await
+        run_with_bin(
+            &self.bin,
+            self.execution_profile,
+            invocation,
+            Vec::new(),
+            tx,
+        )
+        .await
+    }
+
+    async fn run_with_attachments(
+        &self,
+        invocation: Invocation,
+        attachments: Vec<Attachment>,
+        tx: mpsc::Sender<RunnerEvent>,
+    ) -> std::result::Result<Outcome, RunFailure> {
+        run_with_bin(
+            &self.bin,
+            self.execution_profile,
+            invocation,
+            attachments,
+            tx,
+        )
+        .await
     }
 }
 
@@ -53,6 +76,7 @@ async fn run_with_bin(
     bin: &str,
     execution_profile: ExecutionProfile,
     invocation: Invocation,
+    attachments: Vec<Attachment>,
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
     let Invocation {
@@ -62,10 +86,23 @@ async fn run_with_bin(
         session_id,
         prompt,
     } = invocation;
+    if attachments
+        .iter()
+        .any(|attachment| !attachment.media_type.starts_with("image/"))
+    {
+        return Err(RunFailure {
+            error: marmot_terminal_harness::HarnessError::AttachmentUnsupported,
+            observed_session: None,
+        });
+    }
+    let images = attachments
+        .iter()
+        .map(|attachment| attachment.path.clone())
+        .collect::<Vec<_>>();
     run_jsonl_process(
         ProcessSpec {
             executable: bin.to_owned(),
-            args: build_exec_args(session_id.as_deref(), execution_profile),
+            args: build_exec_args_with_images(session_id.as_deref(), execution_profile, &images),
             cwd,
             environment: Vec::new(),
             prompt: PromptTransport::Stdin(prompt),
@@ -80,7 +117,16 @@ async fn run_with_bin(
     .await
 }
 
+#[cfg(test)]
 fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<String> {
+    build_exec_args_with_images(session_id, profile, &[])
+}
+
+fn build_exec_args_with_images(
+    session_id: Option<&str>,
+    profile: ExecutionProfile,
+    images: &[std::path::PathBuf],
+) -> Vec<String> {
     let session_id = session_id.filter(|value| !value.is_empty());
     let mut args = vec!["exec".to_owned()];
     if session_id.is_some() {
@@ -94,6 +140,10 @@ fn build_exec_args(session_id: Option<&str>, profile: ExecutionProfile) -> Vec<S
         ExecutionProfile::Unrestricted => {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
         }
+    }
+    for image in images {
+        args.push("--image".to_owned());
+        args.push(image.to_string_lossy().into_owned());
     }
     args.push("--json".to_owned());
     if let Some(session_id) = session_id {
@@ -166,6 +216,40 @@ mod tests {
     }
 
     #[test]
+    fn args_preserve_ordered_image_attachments_for_new_and_resumed_turns() {
+        let images = [
+            PathBuf::from("/private/000-a.png"),
+            PathBuf::from("/private/001-b.jpg"),
+        ];
+        assert_eq!(
+            build_exec_args_with_images(None, ExecutionProfile::Inherit, &images),
+            vec![
+                "exec",
+                "--image",
+                "/private/000-a.png",
+                "--image",
+                "/private/001-b.jpg",
+                "--json",
+                "-",
+            ]
+        );
+        assert_eq!(
+            build_exec_args_with_images(Some("thread-123"), ExecutionProfile::Inherit, &images,),
+            vec![
+                "exec",
+                "resume",
+                "--image",
+                "/private/000-a.png",
+                "--image",
+                "/private/001-b.jpg",
+                "--json",
+                "thread-123",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
     fn autonomous_preserves_configured_sandbox_and_network_for_new_and_resumed_threads() {
         assert_eq!(
             build_exec_args(None, ExecutionProfile::Autonomous),
@@ -207,6 +291,35 @@ mod tests {
                 "-",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn non_image_attachments_fail_before_backend_spawn() {
+        let (tx, _rx) = mpsc::channel(1);
+        let failure = run_with_bin(
+            "/definitely/missing/codex",
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(1),
+                cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                session_id: None,
+                prompt: "inspect".to_owned(),
+            },
+            vec![Attachment {
+                path: PathBuf::from("/private/000-log.txt"),
+                media_type: "text/plain".to_owned(),
+                file_name: "000-log.txt".to_owned(),
+                size_bytes: 3,
+            }],
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            marmot_terminal_harness::HarnessError::AttachmentUnsupported
+        ));
     }
 
     #[test]
@@ -281,6 +394,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
                 session_id: None,
                 prompt: "--prompt-via-stdin".to_owned(),
             },
+            Vec::new(),
             tx,
         )
         .await
@@ -330,6 +444,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"received
                 session_id: Some("thread-123".to_owned()),
                 prompt: "p".repeat(60_000),
             },
+            Vec::new(),
             tx,
         )
         .await
@@ -369,6 +484,7 @@ exit 64
                 session_id: None,
                 prompt: "p".repeat(60_000),
             },
+            Vec::new(),
             tx,
         )
         .await
@@ -402,6 +518,7 @@ exit 64
                 session_id: None,
                 prompt: "Reply with exactly CODEX_CONNECTOR_OK and nothing else.".to_owned(),
             },
+            Vec::new(),
             tx,
         )
         .await
@@ -427,6 +544,7 @@ exit 64
                 session_id: Some(session_id.clone()),
                 prompt: "Reply with exactly CODEX_RESUME_OK and nothing else.".to_owned(),
             },
+            Vec::new(),
             resume_tx,
         )
         .await
