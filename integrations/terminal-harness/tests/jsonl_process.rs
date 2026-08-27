@@ -49,6 +49,10 @@ fn parse_event(line: &str) -> serde_json::Result<ParsedEvent> {
                 .unwrap_or("classified_error")
                 .to_owned(),
         },
+        Some("failed_without_side_effects") => ParsedEvent::FailedWithoutSideEffects {
+            session_id: value["session_id"].as_str().map(str::to_owned),
+            summary: "failed_resumable".to_owned(),
+        },
         _ => ParsedEvent::Ignored,
     })
 }
@@ -232,6 +236,58 @@ printf '%s\n' '{"type":"text","text":"done"}'
 }
 
 #[tokio::test]
+async fn silent_live_backend_reports_unknown_once_then_completes() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "silent-live-backend",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"session","id":"silent-live"}'
+sleep 1
+printf '%s\n' '{"type":"text","text":"done"}'
+"#,
+    );
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.total_timeout = Duration::from_secs(3);
+    spec.idle_timeout = Duration::from_millis(250);
+
+    let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
+
+    assert_eq!(outcome.exit_code, Some(0));
+    assert_eq!(outcome.observed_session.as_deref(), Some("silent-live"));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::Text("done".to_owned())));
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn explicit_no_side_effect_proof_reaches_outcome() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "proven-failure-backend",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"failed_without_side_effects","session_id":"safe-session"}'
+exit 64
+"#,
+    );
+    let (tx, _rx) = mpsc::channel(2);
+    let outcome = run_jsonl_process(
+        process_spec(&script, root.path(), PromptTransport::Stdin(String::new())),
+        tx,
+        parse_event,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.exit_code, Some(64));
+    assert!(outcome.no_side_effects_proven);
+    assert_eq!(outcome.observed_session.as_deref(), Some("safe-session"));
+}
+
+#[tokio::test]
 async fn channel_backpressure_is_bounded_by_total_not_idle_timeout() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();
@@ -283,7 +339,7 @@ exec sleep 30
 }
 
 #[tokio::test]
-async fn idle_timeout_applies_while_reading_output() {
+async fn presentation_idle_reports_unknown_and_waits_for_total_limit() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();
     let script = executable_script(
@@ -294,20 +350,23 @@ printf '%s\n' '{"type":"session","id":"output-idle"}'
 exec sleep 30
 "#,
     );
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(2);
     let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
-    spec.idle_timeout = Duration::from_secs(2);
+    spec.total_timeout = Duration::from_secs(2);
+    spec.idle_timeout = Duration::from_millis(500);
     let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
 
     assert!(matches!(
         failure.error,
-        marmot_terminal_harness::HarnessError::BackendIdle
+        marmot_terminal_harness::HarnessError::BackendTimedOut
     ));
     assert_eq!(failure.observed_session.as_deref(), Some("output-idle"));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+    assert!(rx.recv().await.is_none());
 }
 
 #[tokio::test]
-async fn idle_timeout_applies_after_stdout_eof_during_final_wait() {
+async fn stdout_eof_while_child_lives_reports_unknown_and_waits_for_total_limit() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();
     let script = executable_script(
@@ -319,7 +378,7 @@ exec 1>&-
 sleep 30
 "#,
     );
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(2);
     let mut spec = process_spec(
         &script,
         root.path(),
@@ -328,14 +387,55 @@ sleep 30
             prompt: "prompt".to_owned(),
         },
     );
-    spec.idle_timeout = Duration::from_secs(2);
+    spec.total_timeout = Duration::from_secs(2);
+    spec.idle_timeout = Duration::from_millis(500);
     let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
 
     assert!(matches!(
         failure.error,
-        marmot_terminal_harness::HarnessError::BackendIdle
+        marmot_terminal_harness::HarnessError::BackendTimedOut
     ));
     assert_eq!(failure.observed_session.as_deref(), Some("wait-idle"));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn immediate_child_exit_does_not_wait_for_inherited_stdout_writer() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "inherited-stdout-backend",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"session","id":"immediate-exit"}'
+printf '\033[31minherited-stderr\033[0m\n' >&2
+sleep 30 &
+printf '%s' "$!" > background.pid
+exit 23
+"#,
+    );
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut spec = process_spec(
+        &script,
+        root.path(),
+        PromptTransport::Stdin("x".repeat(1024 * 1024)),
+    );
+    spec.total_timeout = Duration::from_secs(3);
+    spec.idle_timeout = Duration::from_secs(2);
+
+    let started = std::time::Instant::now();
+    let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
+    let background_pid = std::fs::read_to_string(root.path().join("background.pid")).unwrap();
+    let _ = std::process::Command::new("kill")
+        .arg(background_pid.trim())
+        .status();
+
+    assert_eq!(outcome.exit_code, Some(23));
+    assert_eq!(outcome.observed_session.as_deref(), Some("immediate-exit"));
+    assert_eq!(outcome.stderr, "inherited-stderr");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(rx.recv().await.is_none());
 }
 
 #[tokio::test]

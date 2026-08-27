@@ -51,7 +51,7 @@ pub struct Config {
     pub state_path: PathBuf,
     /// Total backend invocation timeout.
     pub backend_timeout: Duration,
-    /// Maximum backend stdout silence.
+    /// Presentation-idle interval before liveness becomes unknown.
     pub backend_idle_timeout: Duration,
     /// Connector execution-permission policy selected by the operator.
     pub execution_profile: ExecutionProfile,
@@ -82,7 +82,7 @@ impl fmt::Debug for Config {
 pub struct Invocation {
     /// Total invocation timeout.
     pub timeout: Duration,
-    /// Maximum stdout silence.
+    /// Presentation-idle interval; expiry never authorizes teardown.
     pub idle_timeout: Duration,
     /// Validated working directory.
     pub cwd: PathBuf,
@@ -113,6 +113,8 @@ pub struct Outcome {
     pub exit_code: Option<i32>,
     /// Sanitized backend error classification.
     pub error_summary: Option<String>,
+    /// True only when the backend explicitly proves the failed turn made no side effects.
+    pub no_side_effects_proven: bool,
     /// Bounded and ANSI-stripped stderr.
     pub stderr: String,
     /// Elapsed wall-clock milliseconds.
@@ -126,6 +128,7 @@ impl fmt::Debug for Outcome {
             .field("session_present", &self.observed_session.is_some())
             .field("exit_code", &self.exit_code)
             .field("error_summary_present", &self.error_summary.is_some())
+            .field("no_side_effects_proven", &self.no_side_effects_proven)
             .field("stderr_len", &self.stderr.len())
             .field("elapsed_ms", &self.elapsed_ms)
             .finish()
@@ -155,6 +158,8 @@ impl fmt::Debug for RunFailure {
 pub enum RunnerEvent {
     /// Completed assistant text; never a thinking or tool delta.
     Text(String),
+    /// The presentation stream is idle while the backend process is still alive.
+    LivenessUnknown,
 }
 
 impl fmt::Debug for RunnerEvent {
@@ -164,6 +169,7 @@ impl fmt::Debug for RunnerEvent {
                 .debug_struct("Text")
                 .field("text_len", &text.len())
                 .finish(),
+            Self::LivenessUnknown => formatter.write_str("LivenessUnknown"),
         }
     }
 }
@@ -282,6 +288,7 @@ mod privacy_tests {
             observed_session: Some("secret-session".to_owned()),
             exit_code: Some(64),
             error_summary: Some("secret-summary".to_owned()),
+            no_side_effects_proven: false,
             stderr: "secret stderr".to_owned(),
             elapsed_ms: 10,
         };

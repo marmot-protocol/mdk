@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::error::Result;
 
@@ -10,6 +11,43 @@ use crate::error::Result;
 pub(crate) struct SessionRecord {
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryKind {
+    FailedResumable,
+    UncertainOutcome,
+    PolicyLimit,
+    NotResponding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryStatus {
+    Pending,
+    Retrying,
+}
+
+/// Private durable replay obligation. Its contents are never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryRecord {
+    pub(crate) prompt: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) kind: RecoveryKind,
+    pub(crate) status: RecoveryStatus,
+}
+
+/// Durable acknowledgement reconciliation for text-only `SendFinal` chunks.
+/// Media and mixed-media terminals are intentionally outside this store.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FinalDeliveryRecord {
+    pub(crate) account_ref: String,
+    pub(crate) group_ref: String,
+    pub(crate) reply_to_ref: String,
+    pub(crate) text: String,
+    pub(crate) chunk_index: usize,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +131,333 @@ impl SessionStore {
         *map = next;
         Ok(true)
     }
+}
+
+pub(crate) struct RecoveryStore {
+    path: PathBuf,
+    map: Mutex<HashMap<String, RecoveryRecord>>,
+}
+
+impl RecoveryStore {
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
+        if path.exists() {
+            fs_private::tighten_existing_private_file(&path)?;
+        }
+        let mut map: HashMap<String, RecoveryRecord> = match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)?,
+            Ok(_) => HashMap::new(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(err) => return Err(err.into()),
+        };
+        for record in map.values_mut() {
+            if record.status == RecoveryStatus::Retrying {
+                record.status = RecoveryStatus::Pending;
+            }
+        }
+        Ok(Self {
+            path,
+            map: Mutex::new(map),
+        })
+    }
+
+    pub(crate) async fn get(&self, group_key: &str) -> Option<RecoveryRecord> {
+        self.map.lock().await.get(group_key).cloned()
+    }
+
+    pub(crate) async fn set(&self, group_key: &str, record: RecoveryRecord) -> Result<()> {
+        let mut map = self.map.lock().await;
+        let mut next = map.clone();
+        next.insert(group_key.to_owned(), record);
+        self.commit(&mut map, next).await
+    }
+
+    /// Atomically consumes retry authority while retaining the restart barrier.
+    pub(crate) async fn begin_retry(&self, group_key: &str) -> Result<Option<RecoveryRecord>> {
+        let mut map = self.map.lock().await;
+        let Some(current) = map.get(group_key) else {
+            return Ok(None);
+        };
+        if current.status != RecoveryStatus::Pending {
+            return Ok(None);
+        }
+        let mut next = map.clone();
+        let record = next.get_mut(group_key).expect("recovery record exists");
+        record.status = RecoveryStatus::Retrying;
+        let result = record.clone();
+        self.commit(&mut map, next).await?;
+        Ok(Some(result))
+    }
+
+    pub(crate) async fn reset_retry(&self, group_key: &str) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        let Some(current) = map.get(group_key) else {
+            return Ok(false);
+        };
+        if current.status != RecoveryStatus::Retrying {
+            return Ok(false);
+        }
+        let mut next = map.clone();
+        next.get_mut(group_key)
+            .expect("recovery record exists")
+            .status = RecoveryStatus::Pending;
+        self.commit(&mut map, next).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn discard(&self, group_key: &str) -> Result<bool> {
+        let mut map = self.map.lock().await;
+        if !map.contains_key(group_key) {
+            return Ok(false);
+        }
+        let mut next = map.clone();
+        next.remove(group_key);
+        self.commit(&mut map, next).await?;
+        Ok(true)
+    }
+
+    async fn commit(
+        &self,
+        map: &mut tokio::sync::MutexGuard<'_, HashMap<String, RecoveryRecord>>,
+        next: HashMap<String, RecoveryRecord>,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let snapshot = next.clone();
+        tokio::task::spawn_blocking(move || write_recovery_snapshot(&path, &snapshot)).await??;
+        **map = next;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct FinalDeliverySnapshot {
+    records: HashMap<String, FinalDeliveryRecord>,
+    #[serde(default)]
+    incomplete_finals: HashMap<String, HashSet<String>>,
+}
+
+pub(crate) struct FinalDeliveryStore {
+    path: PathBuf,
+    state: Mutex<FinalDeliverySnapshot>,
+    changed: watch::Sender<u64>,
+    fail_next_set: AtomicBool,
+}
+
+impl FinalDeliveryStore {
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
+        if path.exists() {
+            fs_private::tighten_existing_private_file(&path)?;
+        }
+        let state = match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => parse_final_delivery_snapshot(&bytes)?,
+            Ok(_) => FinalDeliverySnapshot::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                FinalDeliverySnapshot::default()
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let (changed, _) = watch::channel(0);
+        Ok(Self {
+            path,
+            state: Mutex::new(state),
+            changed,
+            fail_next_set: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub(crate) async fn has_group(&self, group_ref: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .records
+            .values()
+            .any(|record| record.group_ref == group_ref)
+    }
+
+    pub(crate) async fn has_incomplete_final(&self, group_ref: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .incomplete_finals
+            .get(group_ref)
+            .is_some_and(|reply_tos| !reply_tos.is_empty())
+    }
+
+    pub(crate) async fn blocks_group(&self, group_ref: &str) -> bool {
+        self.has_incomplete_final(group_ref).await || self.has_group(group_ref).await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn list(&self) -> Vec<(String, FinalDeliveryRecord)> {
+        let mut records: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .records
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        records.sort_by(|(_, left), (_, right)| {
+            (
+                &left.account_ref,
+                &left.group_ref,
+                &left.reply_to_ref,
+                left.chunk_index,
+            )
+                .cmp(&(
+                    &right.account_ref,
+                    &right.group_ref,
+                    &right.reply_to_ref,
+                    right.chunk_index,
+                ))
+        });
+        records
+    }
+
+    pub(crate) async fn list_reconcilable(&self) -> Vec<(String, FinalDeliveryRecord)> {
+        let state = self.state.lock().await;
+        let mut records: Vec<_> = state
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                !state
+                    .incomplete_finals
+                    .get(&record.group_ref)
+                    .is_some_and(|reply_tos| reply_tos.contains(&record.reply_to_ref))
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        records.sort_by(|(_, left), (_, right)| {
+            (
+                &left.account_ref,
+                &left.group_ref,
+                &left.reply_to_ref,
+                left.chunk_index,
+            )
+                .cmp(&(
+                    &right.account_ref,
+                    &right.group_ref,
+                    &right.reply_to_ref,
+                    right.chunk_index,
+                ))
+        });
+        records
+    }
+
+    pub(crate) async fn set(&self, key: &str, record: FinalDeliveryRecord) -> Result<()> {
+        if self.fail_next_set.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Other).into());
+        }
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.records.insert(key.to_owned(), record);
+        self.commit(&mut state, next).await
+    }
+
+    pub(crate) async fn remove(&self, key: &str) -> Result<bool> {
+        let mut state = self.state.lock().await;
+        if !state.records.contains_key(key) {
+            return Ok(false);
+        }
+        let mut next = state.clone();
+        next.records.remove(key);
+        self.commit(&mut state, next).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn mark_incomplete_final(
+        &self,
+        group_ref: &str,
+        reply_to_ref: &str,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.incomplete_finals
+            .entry(group_ref.to_owned())
+            .or_default()
+            .insert(reply_to_ref.to_owned());
+        self.commit(&mut state, next).await
+    }
+
+    /// Clears the group's incomplete-final barrier and removes only the records
+    /// that belong to those incomplete reply sets. Other groups and later
+    /// complete reply sets are left in place.
+    pub(crate) async fn discard_incomplete_final(&self, group_ref: &str) -> Result<bool> {
+        let mut state = self.state.lock().await;
+        if state
+            .incomplete_finals
+            .get(group_ref)
+            .is_none_or(|reply_tos| reply_tos.is_empty())
+        {
+            return Ok(false);
+        }
+        let mut next = state.clone();
+        let reply_tos = next.incomplete_finals.remove(group_ref).unwrap_or_default();
+        next.records.retain(|_, record| {
+            record.group_ref != group_ref || !reply_tos.contains(&record.reply_to_ref)
+        });
+        self.commit(&mut state, next).await?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_set(&self) {
+        self.fail_next_set.store(true, Ordering::SeqCst);
+    }
+
+    async fn commit(
+        &self,
+        state: &mut tokio::sync::MutexGuard<'_, FinalDeliverySnapshot>,
+        next: FinalDeliverySnapshot,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let snapshot = next.clone();
+        tokio::task::spawn_blocking(move || write_final_delivery_snapshot(&path, &snapshot))
+            .await??;
+        **state = next;
+        self.changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Ok(())
+    }
+}
+
+fn parse_final_delivery_snapshot(bytes: &[u8]) -> Result<FinalDeliverySnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    if value.get("records").is_some() || value.get("incomplete_finals").is_some() {
+        Ok(serde_json::from_value(value)?)
+    } else {
+        Ok(FinalDeliverySnapshot {
+            records: serde_json::from_value(value)?,
+            incomplete_finals: HashMap::new(),
+        })
+    }
+}
+
+fn write_final_delivery_snapshot(path: &Path, snapshot: &FinalDeliverySnapshot) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_private::create_dir_all_private(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    fs_private::write_private(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    fs_private::tighten_existing_private_file(path)?;
+    Ok(())
+}
+
+fn write_recovery_snapshot(path: &Path, snapshot: &HashMap<String, RecoveryRecord>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_private::create_dir_all_private(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    fs_private::write_private(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    fs_private::tighten_existing_private_file(path)?;
+    Ok(())
 }
 
 fn write_snapshot(path: &Path, snapshot: &HashMap<String, SessionRecord>) -> Result<()> {
@@ -218,6 +583,154 @@ mod tests {
         let record = store.get("group1").await.expect("legacy record");
         assert_eq!(record.session_id, "ses_legacy");
         assert_eq!(record.cwd, home);
+    }
+
+    #[tokio::test]
+    async fn recovery_store_persists_and_consumes_retry_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.json");
+        let record = RecoveryRecord {
+            prompt: "private prompt".to_owned(),
+            cwd: dir.path().join("repo"),
+            session_id: "session".to_owned(),
+            kind: RecoveryKind::UncertainOutcome,
+            status: RecoveryStatus::Pending,
+        };
+        RecoveryStore::load(path.clone())
+            .unwrap()
+            .set("group", record.clone())
+            .await
+            .unwrap();
+
+        let store = RecoveryStore::load(path.clone()).unwrap();
+        assert!(store.get("group").await == Some(record));
+        let first = store.begin_retry("group").await.unwrap().unwrap();
+        assert_eq!(first.status, RecoveryStatus::Retrying);
+        assert!(store.begin_retry("group").await.unwrap().is_none());
+        assert!(store.reset_retry("group").await.unwrap());
+        assert_eq!(
+            store.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(store.begin_retry("group").await.unwrap().is_some());
+        drop(store);
+
+        let store = RecoveryStore::load(path).unwrap();
+        assert_eq!(
+            store.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(store.begin_retry("group").await.unwrap().is_some());
+        assert!(store.discard("group").await.unwrap());
+        assert!(store.get("group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn discard_is_idempotent_and_never_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
+        assert!(!store.discard("missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn final_delivery_store_survives_restart_until_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let first = FinalDeliveryRecord {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_ref: "message".to_owned(),
+            text: "first".to_owned(),
+            chunk_index: 1,
+        };
+        let second = FinalDeliveryRecord {
+            text: "second".to_owned(),
+            chunk_index: 2,
+            ..first.clone()
+        };
+        let initial = FinalDeliveryStore::load(path.clone()).unwrap();
+        initial.set("second", second.clone()).await.unwrap();
+        initial.set("first", first.clone()).await.unwrap();
+        let store = FinalDeliveryStore::load(path).unwrap();
+        let mut changed = store.subscribe();
+        assert!(store.has_group("group").await);
+        assert!(!store.has_group("other-group").await);
+        assert!(
+            store.list().await == vec![("first".to_owned(), first), ("second".to_owned(), second),]
+        );
+        assert!(store.remove("first").await.unwrap());
+        changed.changed().await.unwrap();
+        assert!(store.has_group("group").await);
+        assert!(store.remove("second").await.unwrap());
+        changed.changed().await.unwrap();
+        assert!(!store.has_group("group").await);
+        assert!(store.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_barrier_survives_restart_and_blocks_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let first = FinalDeliveryRecord {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_ref: "message".to_owned(),
+            text: "first".to_owned(),
+            chunk_index: 0,
+        };
+        let store = FinalDeliveryStore::load(path.clone()).unwrap();
+        store.set("first", first.clone()).await.unwrap();
+        store.fail_next_set();
+        assert!(
+            store
+                .set(
+                    "second",
+                    FinalDeliveryRecord {
+                        text: "second".to_owned(),
+                        chunk_index: 1,
+                        ..first.clone()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        store
+            .mark_incomplete_final("group", "message")
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert!(store.has_incomplete_final("group").await);
+        assert!(store.blocks_group("group").await);
+        assert_eq!(store.list().await.len(), 1);
+        assert!(store.list_reconcilable().await.is_empty());
+        assert!(store.discard_incomplete_final("group").await.unwrap());
+        assert!(!store.has_incomplete_final("group").await);
+        assert!(!store.blocks_group("group").await);
+        assert!(store.list().await.is_empty());
+        assert!(!store.discard_incomplete_final("group").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn final_delivery_store_loads_legacy_bare_record_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.json");
+        let legacy = serde_json::json!({
+            "first": {
+                "account_ref": "account",
+                "group_ref": "group",
+                "reply_to_ref": "message",
+                "text": "first",
+                "chunk_index": 0
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let store = FinalDeliveryStore::load(path).unwrap();
+        assert!(store.has_group("group").await);
+        assert!(!store.has_incomplete_final("group").await);
+        assert_eq!(store.list().await.len(), 1);
     }
 
     #[cfg(unix)]

@@ -1,16 +1,17 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::debug;
 
-use crate::{HarnessError, Outcome, Result, RunFailure, RunnerEvent, TRACE_TARGET};
+use crate::{HarnessError, Outcome, RunFailure, RunnerEvent, TRACE_TARGET};
 
 const STDERR_CAPTURE_BYTES: usize = 4096;
 
@@ -73,7 +74,7 @@ pub struct ProcessSpec {
     pub backend_name: &'static str,
     /// Total wall-clock budget, including reply-channel backpressure.
     pub total_timeout: Duration,
-    /// Maximum silence between stdout reads and through the final child wait.
+    /// Presentation-idle interval. Expiry reports unknown liveness but never kills work.
     pub idle_timeout: Duration,
 }
 
@@ -106,6 +107,13 @@ pub enum ParsedEvent {
         /// Sanitized error classification; never a raw backend message.
         summary: String,
     },
+    /// A failed turn whose backend contract explicitly proves no side effects occurred.
+    FailedWithoutSideEffects {
+        /// Optional durable session id.
+        session_id: Option<String>,
+        /// Sanitized error classification.
+        summary: String,
+    },
     /// A valid event that has no durable connector effect.
     Ignored,
 }
@@ -126,6 +134,14 @@ impl fmt::Debug for ParsedEvent {
                 summary,
             } => formatter
                 .debug_struct("Error")
+                .field("session_present", &session_id.is_some())
+                .field("summary_len", &summary.len())
+                .finish(),
+            Self::FailedWithoutSideEffects {
+                session_id,
+                summary,
+            } => formatter
+                .debug_struct("FailedWithoutSideEffects")
                 .field("session_present", &session_id.is_some())
                 .field("summary_len", &summary.len())
                 .finish(),
@@ -209,17 +225,37 @@ where
             return Err(spawn_failure());
         }
     };
-    let mut stderr_task = tokio::spawn(capture_stderr(stderr));
+    let stderr_snapshot = Arc::new(Mutex::new(String::new()));
+    let mut stderr_task = tokio::spawn(capture_stderr(stderr, stderr_snapshot.clone()));
     let started = StdInstant::now();
     let mut observed_session = None;
     let mut error_summary = None;
+    let mut no_side_effects_proven = false;
     let mut idle_deadline = Instant::now() + idle_timeout;
+    let mut reported_liveness_unknown = false;
 
     let lifecycle_result = timeout_at(total_deadline, async {
         let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let Some(line) = next_stdout_line(&mut lines, idle_deadline).await? else {
-                break;
+        let child_status = loop {
+            let line = tokio::select! {
+                biased;
+                line = lines.next_line() => Some(line),
+                status = child.wait() => break Some(status.map_err(HarnessError::from)?),
+                _ = sleep_until(idle_deadline) => {
+                    if !reported_liveness_unknown {
+                        tx.send(RunnerEvent::LivenessUnknown)
+                            .await
+                            .map_err(|_| HarnessError::BackendStream)?;
+                        reported_liveness_unknown = true;
+                    }
+                    idle_deadline = Instant::now() + idle_timeout;
+                    continue;
+                }
+            };
+            let line = match line.expect("line branch returns a value") {
+                Err(_) => return Err(HarnessError::BackendStream),
+                Ok(Some(line)) => line,
+                Ok(None) => break None,
             };
             if !line.is_empty() {
                 match parse_event(&line) {
@@ -250,6 +286,20 @@ where
                             error_summary = Some(summary);
                         }
                     }
+                    Ok(ParsedEvent::FailedWithoutSideEffects {
+                        session_id,
+                        summary,
+                    }) => {
+                        if observed_session.is_none()
+                            && let Some(session_id) = session_id.filter(|id| !id.is_empty())
+                        {
+                            observed_session = Some(session_id);
+                        }
+                        if error_summary.is_none() {
+                            error_summary = Some(summary);
+                        }
+                        no_side_effects_proven = true;
+                    }
                     Ok(ParsedEvent::Ignored) => {}
                     Err(_) => debug!(
                         target: TRACE_TARGET,
@@ -261,9 +311,27 @@ where
                 }
             }
             idle_deadline = Instant::now() + idle_timeout;
+        };
+
+        if let Some(status) = child_status {
+            if let Some(task) = writer_task.as_mut() {
+                task.abort();
+                let _ = task.await;
+            }
+            stderr_task.abort();
+            let _ = (&mut stderr_task).await;
+            let stderr = stderr_snapshot.lock().await.clone();
+            return Ok(Outcome {
+                observed_session: observed_session.clone(),
+                exit_code: status.code(),
+                error_summary,
+                no_side_effects_proven,
+                stderr: strip_ansi(stderr.trim()),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
         }
 
-        let (status, stderr) = match timeout_at(idle_deadline, async {
+        let completion = async {
             let writer = async {
                 match writer_task.as_mut() {
                     Some(task) => Some(task.await),
@@ -287,16 +355,27 @@ where
                 }
             }
             Ok::<_, HarnessError>((status, stderr))
-        })
-        .await
-        {
-            Err(_) => return Err(HarnessError::BackendIdle),
-            Ok(result) => result?,
+        };
+        tokio::pin!(completion);
+        let (status, stderr) = loop {
+            tokio::select! {
+                result = &mut completion => break result?,
+                _ = sleep_until(idle_deadline) => {
+                    if !reported_liveness_unknown {
+                        tx.send(RunnerEvent::LivenessUnknown)
+                            .await
+                            .map_err(|_| HarnessError::BackendStream)?;
+                        reported_liveness_unknown = true;
+                    }
+                    idle_deadline = Instant::now() + idle_timeout;
+                }
+            }
         };
         Ok::<_, HarnessError>(Outcome {
             observed_session: observed_session.clone(),
             exit_code: status.code(),
             error_summary,
+            no_side_effects_proven,
             stderr: strip_ansi(stderr.trim()),
             elapsed_ms: started.elapsed().as_millis(),
         })
@@ -339,18 +418,6 @@ async fn cleanup_missing_pipe(
     kill_and_reap(child).await;
 }
 
-/// Reads one stdout line before the current idle deadline.
-async fn next_stdout_line(
-    lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
-    idle_deadline: Instant,
-) -> Result<Option<String>> {
-    match timeout_at(idle_deadline, lines.next_line()).await {
-        Err(_) => Err(HarnessError::BackendIdle),
-        Ok(Err(_)) => Err(HarnessError::BackendStream),
-        Ok(Ok(line)) => Ok(line),
-    }
-}
-
 /// Writes and closes backend stdin concurrently with stdout consumption.
 fn write_stdin(stdin: ChildStdin, prompt: String) -> JoinHandle<std::io::Result<()>> {
     tokio::spawn(async move {
@@ -361,24 +428,33 @@ fn write_stdin(stdin: ChildStdin, prompt: String) -> JoinHandle<std::io::Result<
 }
 
 /// Captures a bounded prefix of backend stderr.
-async fn capture_stderr(stderr: ChildStderr) -> String {
-    capture_bounded(stderr).await
+async fn capture_stderr(stderr: ChildStderr, captured: Arc<Mutex<String>>) -> String {
+    capture_bounded_shared(stderr, captured).await
 }
 
-async fn capture_bounded(mut reader: impl AsyncRead + Unpin) -> String {
+#[cfg(test)]
+async fn capture_bounded(reader: impl AsyncRead + Unpin) -> String {
+    capture_bounded_shared(reader, Arc::new(Mutex::new(String::new()))).await
+}
+
+async fn capture_bounded_shared(
+    mut reader: impl AsyncRead + Unpin,
+    captured: Arc<Mutex<String>>,
+) -> String {
     let mut buf = [0_u8; 1024];
-    let mut captured = String::new();
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(read) if captured.len() < STDERR_CAPTURE_BYTES => {
-                captured.push_str(&String::from_utf8_lossy(&buf[..read]));
-                truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
+            Ok(read) => {
+                let mut captured = captured.lock().await;
+                if captured.len() < STDERR_CAPTURE_BYTES {
+                    captured.push_str(&String::from_utf8_lossy(&buf[..read]));
+                    truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
+                }
             }
-            Ok(_) => {}
         }
     }
-    captured
+    captured.lock().await.clone()
 }
 
 /// Aborts auxiliary tasks, terminates the child, and reaps it after failure.
