@@ -1,13 +1,14 @@
 //! C mirrors of the raw message conversions.
 
 use marmot_uniffi::conversions::{
-    AppMessageRecordFfi, MessageUpdateFfi, ReceivedMessageFfi, RuntimeMessageReceivedFfi,
+    AppMessageRecordFfi, MessageUpdateFfi, ReceivedMessageFfi, RetentionSweepGroupOutcomeFfi,
+    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeMessageReceivedFfi,
     SecureDeleteExpiredResultFfi,
 };
 
 use super::common::MarmotMessageTag;
 use super::markdown::MarmotMarkdownDocument;
-use crate::macros::c_mirror;
+use crate::macros::{c_enum, c_mirror};
 use crate::memory::CFree;
 
 c_mirror! {
@@ -127,4 +128,41 @@ impl CFree for MarmotMessageUpdate {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_message_update_free(update: *mut MarmotMessageUpdate) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
+}
+
+c_enum! {
+    /// What a retention sweep did to one group.
+    MarmotRetentionSweepStatus from RetentionSweepStatusFfi {
+        NoExpiredMessages,
+        Pruned,
+        /// Host clock moved backwards; pruning waits rather than risk
+        /// deleting unexpired messages.
+        DeferredClockSkew,
+        /// Expired messages are still unread; pruning waits.
+        DeferredUnread,
+        DeferredScanExhausted,
+        Failed,
+    }
+}
+
+c_mirror! {
+    /// One group's retention-sweep outcome.
+    MarmotRetentionSweepGroupOutcome from RetentionSweepGroupOutcomeFfi {
+        str group_id_hex,
+        copy status: MarmotRetentionSweepStatus,
+        copy pruned_messages: u64,
+        copy secrets_deleted: u64,
+        /// Ciphertext hashes whose blobs the caller may now delete.
+        str_vec media_ciphertext_sha256/media_ciphertext_sha256_len,
+        opt_str failure_kind,
+    }
+}
+
+c_mirror! {
+    /// What one retention sweep did across the account. Free with
+    /// `marmot_retention_sweep_report_free`.
+    MarmotRetentionSweepReport from RetentionSweepReportFfi,
+    free marmot_retention_sweep_report_free {
+        vec groups/groups_len: MarmotRetentionSweepGroupOutcome,
+    }
 }

@@ -71,6 +71,17 @@ pub(crate) unsafe fn preflight_out_ptr<T>(out: *mut *mut T) -> Result<(), Marmot
     unsafe { write_out(out, std::ptr::null_mut()) }
 }
 
+/// Validate a required out-pointer whose type has no meaningful zero
+/// (a C enum). Same entry-point timing as [`preflight_out_ptr`]; it
+/// simply has nothing safe to pre-write.
+pub(crate) unsafe fn check_out<T>(out: *mut T) -> Result<(), MarmotStatus> {
+    if out.is_null() {
+        set_last_error("out-pointer argument was NULL");
+        return Err(MarmotStatus::NullPointer);
+    }
+    Ok(())
+}
+
 /// [`preflight_out_ptr`] for by-value scalar out-params.
 pub(crate) unsafe fn preflight_out<T: Default>(out: *mut T) -> Result<(), MarmotStatus> {
     unsafe { write_out(out, T::default()) }

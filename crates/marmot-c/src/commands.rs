@@ -23,9 +23,9 @@ use crate::MarmotStatus;
 use crate::memory::{CFree, boxed, owned_c_string, required_str, str_array};
 use crate::status::status_from_error;
 use crate::types::account::{
-    MarmotAccountKeyPackageList, MarmotAccountSummary, MarmotAccountSummaryList,
-    MarmotAccountUnreadList, MarmotSendSummary, MarmotSignOutOutcome, MarmotUserProfileMetadata,
-    MarmotWipeOutcome,
+    MarmotAccountKeyPackageList, MarmotAccountSetupReadiness, MarmotAccountSummary,
+    MarmotAccountSummaryList, MarmotAccountUnreadList, MarmotIdentityCreationResult,
+    MarmotSendSummary, MarmotSignOutOutcome, MarmotUserProfileMetadata, MarmotWipeOutcome,
 };
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
@@ -34,20 +34,33 @@ use crate::types::audit::{
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
+    MarmotExistingDirectConversation,
 };
-use crate::types::common::MarmotStringList;
+use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
+use crate::types::directory::MarmotCachedIdentityProjectionList;
+use crate::types::draft::MarmotMessageDraftAttachmentInput;
+use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
-    MarmotAppBlobEndpoint, MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState,
-    MarmotAppGroupRecord, MarmotAppQuarantinedGroupList, MarmotDisbandRequest, MarmotGroupDetails,
-    MarmotGroupInviteDeclineResult, MarmotGroupManagementState, MarmotGroupMutationResult,
-    MarmotMemberRef,
+    MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
+    MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
+    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest,
+    MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
+    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRoster,
+    MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef,
+    MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+};
+use crate::types::maintenance::{
+    MarmotGroupMaintenanceStatus, MarmotKeyPackageMaintenanceStatus, MarmotMaintenanceRunSummary,
+    MarmotPeriodicMaintenancePolicy,
 };
 use crate::types::markdown::MarmotMarkdownDocument;
 use crate::types::media::{
     MarmotMediaAttachmentReference, MarmotMediaDownloadResult, MarmotMediaRecordList,
     MarmotMediaUploadRequest, MarmotMediaUploadResult,
 };
-use crate::types::message::{MarmotAppMessageRecordList, MarmotSecureDeleteExpiredResult};
+use crate::types::message::{
+    MarmotAppMessageRecordList, MarmotRetentionSweepReport, MarmotSecureDeleteExpiredResult,
+};
 use crate::types::notification::{
     MarmotBackgroundNotificationCollection, MarmotNotificationSettings,
     MarmotNotificationWakeSource,
@@ -57,8 +70,11 @@ use crate::types::push::{
     MarmotPushRegistrationShareOutcome, MarmotPushRegistrationSyncResult,
 };
 use crate::types::relay::{
-    MarmotAccountRelayLists, MarmotRelayHealth, MarmotRelayTelemetryRuntimeConfig,
-    MarmotRelayTelemetrySettings,
+    MarmotAccountRelayLists, MarmotRelayEndpointClassificationList, MarmotRelayHealth,
+    MarmotRelayTelemetryRuntimeConfig, MarmotRelayTelemetrySettings,
+};
+use crate::types::telemetry::{
+    MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
 use crate::types::timeline::{MarmotTimelineMessageQuery, MarmotTimelinePage};
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
@@ -154,6 +170,23 @@ pub(crate) unsafe fn deliver_string(
                 }
             }
         }
+        Err(err) => status_from_error(&err),
+    }
+}
+
+/// Deliver a fallible fieldless-enum result by value.
+pub(crate) unsafe fn deliver_enum<TFfi, TMirror>(
+    result: Result<TFfi, MarmotKitError>,
+    out: *mut TMirror,
+) -> MarmotStatus
+where
+    TMirror: From<TFfi>,
+{
+    match result {
+        Ok(value) => match unsafe { write_out(out, TMirror::from(value)) } {
+            Ok(()) => MarmotStatus::Ok,
+            Err(status) => status,
+        },
         Err(err) => status_from_error(&err),
     }
 }
@@ -298,6 +331,28 @@ macro_rules! c_cmd {
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver_string(c_cmd!(@call client, $mode, $method, $($a)*), out) }
+            })
+        }
+    };
+    (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, (enum_ret($t:ty)), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*}) => {
+        $($m)*
+        ///
+        /// # Safety
+        /// `client` must be a live handle; string arguments must be valid
+        /// NUL-terminated strings (nullable ones may be NULL); array
+        /// arguments must hold their stated length (or be NULL with
+        /// length 0); out-pointers must be valid.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $cname(
+            client: *const MarmotClient,
+            $($p)*
+            out: *mut $t,
+        ) -> MarmotStatus {
+            ffi_guard(|| {
+                try_arg!(unsafe { crate::check_out(out) });
+                let client = try_arg!(unsafe { client_ref(client) });
+                $($r)*
+                unsafe { deliver_enum(c_cmd!(@call client, $mode, $method, $($a)*), out) }
             })
         }
     };
@@ -896,6 +951,94 @@ c_cmd! {
     /// host can suspend without leaving the database leased. The client
     /// handle stays valid but the runtime is finished.
     async fn marmot_client_shutdown_and_close() -> unit = shutdown_and_close;
+
+    /// How far the account's setup has progressed.
+    sync fn marmot_account_setup_readiness(account_ref: str) -> enum_ret(MarmotAccountSetupReadiness) = account_setup_readiness;
+
+    /// Create a fresh identity and publish a default profile in one
+    /// step. Free with `marmot_identity_creation_result_free`.
+    async fn marmot_create_identity_with_profile(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotIdentityCreationResult) = create_identity_with_profile;
+
+    /// The existing one-to-one conversation with `peer_account_id`, or
+    /// NULL with `MARMOT_STATUS_OK` when there is none. Check `reusable`
+    /// before opening it. Free with
+    /// `marmot_existing_direct_conversation_free`.
+    async fn marmot_existing_direct_conversation(account_ref: str, peer_account_id: str) -> opt_rec(MarmotExistingDirectConversation) = existing_direct_conversation;
+
+    /// What the local directory cache holds for each requested id, one
+    /// row per request in order. Free with
+    /// `marmot_cached_identity_projection_list_free`.
+    sync fn marmot_cached_identity_projections(account_id_hexes/account_id_hexes_len: str_arr) -> rec(MarmotCachedIdentityProjectionList) = cached_identity_projections;
+
+    /// Every stored draft for the account, attachment metadata only.
+    /// Free with `marmot_message_draft_summary_list_free`.
+    sync fn marmot_message_drafts(account_ref: str) -> rec(MarmotMessageDraftSummaryList) = message_drafts;
+
+    /// The stored draft for one conversation, with attachment bytes;
+    /// writes NULL with `MARMOT_STATUS_OK` when there is none. Free with
+    /// `marmot_message_draft_free`.
+    sync fn marmot_message_draft(account_ref: str, group_id_hex: str) -> opt_rec(MarmotMessageDraft) = message_draft;
+
+    /// Resolve and cache KeyPackages for prospective members ahead of a
+    /// group creation, so the create itself does not wait on the
+    /// network. Free with
+    /// `marmot_member_key_package_prewarm_summary_free`.
+    async fn marmot_prewarm_group_member_key_packages(account_ref: str, member_refs/member_refs_len: str_arr) -> rec(MarmotMemberKeyPackagePrewarmSummary) = prewarm_group_member_key_packages;
+
+    /// `marmot_create_group` plus the new chat-list row in one round
+    /// trip. Free with `marmot_created_group_free`.
+    async fn marmot_create_group_detailed(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str) -> rec(MarmotCreatedGroup) = create_group_detailed;
+
+    /// Member and admin ids for several groups in one read. Free with
+    /// `marmot_app_group_member_ids_list_free`.
+    async fn marmot_group_member_ids_page(account_ref: str, group_ids_hex/group_ids_hex_len: str_arr) -> rec(MarmotAppGroupMemberIdsList) = group_member_ids_page;
+
+    /// Group details and management state in one read. Free with
+    /// `marmot_group_conversation_snapshot_free`.
+    async fn marmot_group_conversation_snapshot(account_ref: str, group_id_hex: str) -> rec(MarmotGroupConversationSnapshot) = group_conversation_snapshot;
+
+    /// The group's member roster at the current MLS epoch. Free with
+    /// `marmot_group_roster_free`.
+    async fn marmot_group_roster(account_ref: str, group_id_hex: str) -> rec(MarmotGroupRoster) = group_roster;
+
+    /// Upload a staged group image now, so a later group creation can
+    /// consume it without waiting. Free with
+    /// `marmot_prepared_group_image_upload_free`.
+    async fn marmot_upload_prepared_group_image(account_ref: str, upload_id: str) -> rec(MarmotPreparedGroupImageUpload) = upload_prepared_group_image;
+
+    /// Where one staged group image sits in its upload lifecycle. Free
+    /// with `marmot_prepared_group_image_upload_free`.
+    async fn marmot_prepared_group_image_status(account_ref: str, upload_id: str) -> rec(MarmotPreparedGroupImageUpload) = prepared_group_image_status;
+
+    /// Every staged group image for the account. Free with
+    /// `marmot_prepared_group_image_upload_list_free`.
+    async fn marmot_prepared_group_images(account_ref: str) -> rec(MarmotPreparedGroupImageUploadList) = prepared_group_images;
+
+    /// Create a group whose avatar is an already-staged prepared image.
+    /// Writes the new group id as a hex string; free it with
+    /// `marmot_string_free`.
+    async fn marmot_create_group_with_prepared_initial_image(account_ref: str, name: str, member_refs/member_refs_len: str_arr, description: opt_str, upload_id: str) -> string = create_group_with_prepared_initial_image;
+
+    /// One group's maintenance state. Free with
+    /// `marmot_group_maintenance_status_free`.
+    async fn marmot_group_maintenance_status(account_ref: str, group_id_hex: str) -> rec(MarmotGroupMaintenanceStatus) = group_maintenance_status;
+
+    /// The account's KeyPackage slot state; writes NULL with
+    /// `MARMOT_STATUS_OK` when no slot exists yet. Free with
+    /// `marmot_key_package_maintenance_status_free`.
+    async fn marmot_key_package_maintenance_status(account_ref: str) -> opt_rec(MarmotKeyPackageMaintenanceStatus) = key_package_maintenance_status;
+
+    /// Run every maintenance obligation that is due now. Free with
+    /// `marmot_maintenance_run_summary_free`.
+    async fn marmot_run_due_maintenance(account_ref: str) -> rec(MarmotMaintenanceRunSummary) = run_due_maintenance;
+
+    /// Whether new groups enroll in periodic maintenance.
+    async fn marmot_periodic_maintenance_policy(account_ref: str) -> enum_ret(MarmotPeriodicMaintenancePolicy) = periodic_maintenance_policy;
+
+    /// Prune messages past their disappearing-message retention.
+    /// `now_ms` is the caller's wall clock. Free with
+    /// `marmot_retention_sweep_report_free`.
+    async fn marmot_sweep_expired_retention(account_ref: str, now_ms: val u64) -> rec(MarmotRetentionSweepReport) = sweep_expired_retention;
 }
 
 /// Parse Markdown text into the display token tree. Infallible: malformed
@@ -1611,6 +1754,430 @@ pub unsafe extern "C" fn marmot_retired_relay_hosts(
         let client = try_arg!(unsafe { client_ref(client) });
         let hosts = client.marmot.retired_relay_hosts();
         unsafe { deliver(Ok::<_, MarmotKitError>(hosts), out) }
+    })
+}
+
+/// Store (or replace) the draft for a conversation. `attachments` are
+/// copied — the caller keeps ownership of every buffer. Free the result
+/// with `marmot_message_draft_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid
+/// (`reply_to_message_id_hex` nullable); `attachments` must point to
+/// `attachments_len` valid structs (or be NULL with length 0); `out`
+/// valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_save_message_draft(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    content: *const c_char,
+    reply_to_message_id_hex: *const c_char,
+    attachments: *const MarmotMessageDraftAttachmentInput,
+    attachments_len: usize,
+    out: *mut *mut MarmotMessageDraft,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let content = try_arg!(unsafe { required_str(content) });
+        let reply_to_message_id_hex =
+            try_arg!(unsafe { crate::memory::optional_str(reply_to_message_id_hex) });
+        let attachments =
+            try_arg!(unsafe { struct_array(attachments, attachments_len, |a| a.to_ffi()) });
+        unsafe {
+            deliver(
+                client.marmot.save_message_draft(
+                    account_ref,
+                    group_id_hex,
+                    content,
+                    reply_to_message_id_hex,
+                    attachments,
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Create a group with the options struct: description, an optional
+/// initial avatar, and disappearing-message retention. Writes the new
+/// group id as a hex string; free it with `marmot_string_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; the member array must
+/// hold `member_refs_len` valid strings (or be NULL with length 0);
+/// `options` a valid borrowed struct; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_group_with_options(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    name: *const c_char,
+    member_refs: *const *const c_char,
+    member_refs_len: usize,
+    options: *const MarmotCreateGroupOptions,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let name = try_arg!(unsafe { required_str(name) });
+        let member_refs = try_arg!(unsafe { str_array(member_refs, member_refs_len) });
+        let options = try_arg!(unsafe { borrowed(options) });
+        let options = try_arg!(unsafe { options.to_ffi() });
+        unsafe {
+            deliver_string(
+                client.block_on(client.marmot.create_group_with_options(
+                    account_ref,
+                    name,
+                    member_refs,
+                    options,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// `marmot_create_group_with_options` plus the new chat-list row in one
+/// round trip. Free with `marmot_created_group_free`.
+///
+/// # Safety
+/// Same as `marmot_create_group_with_options`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_group_with_options_detailed(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    name: *const c_char,
+    member_refs: *const *const c_char,
+    member_refs_len: usize,
+    options: *const MarmotCreateGroupOptions,
+    out: *mut *mut MarmotCreatedGroup,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let name = try_arg!(unsafe { required_str(name) });
+        let member_refs = try_arg!(unsafe { str_array(member_refs, member_refs_len) });
+        let options = try_arg!(unsafe { borrowed(options) });
+        let options = try_arg!(unsafe { options.to_ffi() });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.create_group_with_options_detailed(
+                    account_ref,
+                    name,
+                    member_refs,
+                    options,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Create a group with an inline initial avatar. `initial_image` may be
+/// NULL for no image. Writes the new group id as a hex string; free it
+/// with `marmot_string_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid (`description`
+/// nullable); the member array must hold `member_refs_len` valid strings
+/// (or be NULL with length 0); `initial_image` NULL or a valid struct;
+/// `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_group_with_initial_image(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    name: *const c_char,
+    member_refs: *const *const c_char,
+    member_refs_len: usize,
+    description: *const c_char,
+    initial_image: *const MarmotInitialGroupImage,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let name = try_arg!(unsafe { required_str(name) });
+        let member_refs = try_arg!(unsafe { str_array(member_refs, member_refs_len) });
+        let description = try_arg!(unsafe { crate::memory::optional_str(description) });
+        let initial_image = try_arg!(unsafe { optional_initial_image(initial_image) });
+        unsafe {
+            deliver_string(
+                client.block_on(client.marmot.create_group_with_initial_image(
+                    account_ref,
+                    name,
+                    member_refs,
+                    description,
+                    initial_image,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// `marmot_create_group_with_initial_image` plus the new chat-list row
+/// in one round trip. Free with `marmot_created_group_free`.
+///
+/// # Safety
+/// Same as `marmot_create_group_with_initial_image`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_group_with_initial_image_detailed(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    name: *const c_char,
+    member_refs: *const *const c_char,
+    member_refs_len: usize,
+    description: *const c_char,
+    initial_image: *const MarmotInitialGroupImage,
+    out: *mut *mut MarmotCreatedGroup,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let name = try_arg!(unsafe { required_str(name) });
+        let member_refs = try_arg!(unsafe { str_array(member_refs, member_refs_len) });
+        let description = try_arg!(unsafe { crate::memory::optional_str(description) });
+        let initial_image = try_arg!(unsafe { optional_initial_image(initial_image) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.create_group_with_initial_image_detailed(
+                    account_ref,
+                    name,
+                    member_refs,
+                    description,
+                    initial_image,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Read a nullable borrowed initial-image struct.
+///
+/// # Safety
+/// `ptr` must be NULL or point to a valid struct.
+unsafe fn optional_initial_image(
+    ptr: *const MarmotInitialGroupImage,
+) -> Result<Option<marmot_uniffi::InitialGroupImageFfi>, MarmotStatus> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    unsafe { (*ptr).to_ffi() }.map(Some)
+}
+
+/// Encrypt and stage a group image without attaching it to a group yet,
+/// so the upload can finish before the caller commits to creating one.
+/// The bytes are copied — the caller keeps ownership. Free with
+/// `marmot_prepared_group_image_upload_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `plaintext` must point
+/// to `plaintext_len` valid bytes (or be NULL with length 0); `out`
+/// valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_stage_prepared_group_image(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    plaintext: *const u8,
+    plaintext_len: usize,
+    media_type: *const c_char,
+    out: *mut *mut MarmotPreparedGroupImageUpload,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let media_type = try_arg!(unsafe { required_str(media_type) });
+        let plaintext = try_arg!(unsafe { byte_array(plaintext, plaintext_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.stage_prepared_group_image(
+                    account_ref,
+                    plaintext,
+                    media_type,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Set whether new groups enroll in periodic maintenance.
+///
+/// # Safety
+/// `client` must be a live handle; `account_ref` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_periodic_maintenance_policy(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    policy: u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let policy = try_arg!(MarmotPeriodicMaintenancePolicy::from_c(policy));
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        deliver_unit(
+            client.block_on(
+                client
+                    .marmot
+                    .set_periodic_maintenance_policy(account_ref, policy.into()),
+            ),
+        )
+    })
+}
+
+/// Build the NIP-92 `imeta` tag for an already-uploaded attachment, so a
+/// host can compose the outgoing event itself. Free with
+/// `marmot_message_tag_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `reference` a valid
+/// borrowed struct; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_build_media_imeta_tag(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    reference: *const MarmotMediaAttachmentReference,
+    out: *mut *mut MarmotMessageTag,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let reference = try_arg!(unsafe { borrowed(reference) });
+        let reference = try_arg!(unsafe { reference.to_ffi() });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.build_media_imeta_tag(
+                    account_ref,
+                    group_id_hex,
+                    reference,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Send a custom application event into the group. `tags` is a flat
+/// array of `tags_len` tag rows, each row a `(char **, len)` pair of
+/// string values. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `tags` must point to
+/// `tags_len` valid rows (or be NULL with length 0), each row's values
+/// pointer holding its stated length; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_custom_event(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    kind: u64,
+    tags: *const MarmotStringArray,
+    tags_len: usize,
+    content: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let content = try_arg!(unsafe { required_str(content) });
+        let tags = try_arg!(unsafe {
+            struct_array(tags, tags_len, |row| str_array(row.values, row.values_len))
+        });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_custom_event(
+                    account_ref,
+                    group_id_hex,
+                    kind,
+                    tags,
+                    content,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Classify relay endpoints against the dial-safety and retired-relay
+/// policies without dialing any of them. Free with
+/// `marmot_relay_endpoint_classification_list_free`.
+///
+/// # Safety
+/// `client` must be a live handle; the endpoint array must hold
+/// `endpoints_len` valid strings (or be NULL with length 0); `out`
+/// valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_classify_relay_endpoints(
+    client: *const MarmotClient,
+    endpoints: *const *const c_char,
+    endpoints_len: usize,
+    out: *mut *mut MarmotRelayEndpointClassificationList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let endpoints = try_arg!(unsafe { str_array(endpoints, endpoints_len) });
+        let classified = client.marmot.classify_relay_endpoints(endpoints);
+        unsafe { deliver(Ok::<_, MarmotKitError>(classified), out) }
+    })
+}
+
+/// Process-wide performance counters. Aggregates only — no account,
+/// group, relay, or path information. Free with
+/// `marmot_app_performance_snapshot_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_app_performance_snapshot(
+    client: *const MarmotClient,
+    out: *mut *mut MarmotAppPerformanceSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let snapshot = client.marmot.app_performance_snapshot();
+        unsafe { deliver(Ok::<_, MarmotKitError>(snapshot), out) }
+    })
+}
+
+/// Record how long a host-side operation took, so it joins the runtime's
+/// own timings in `marmot_app_performance_snapshot`. `operation` and
+/// `outcome` are discriminants; out-of-range values are rejected with
+/// `MARMOT_STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+/// `client` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_record_host_performance(
+    client: *const MarmotClient,
+    operation: u32,
+    duration_ms: u64,
+    outcome: u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let operation = try_arg!(MarmotHostPerformanceOperation::from_c(operation));
+        let outcome = try_arg!(MarmotHostPerformanceOutcome::from_c(outcome));
+        let client = try_arg!(unsafe { client_ref(client) });
+        client
+            .marmot
+            .record_host_performance(operation.into(), duration_ms, outcome.into());
+        MarmotStatus::Ok
     })
 }
 

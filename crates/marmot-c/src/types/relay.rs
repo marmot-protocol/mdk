@@ -1,8 +1,9 @@
 //! C mirrors of the relay-list, relay-health, and telemetry conversions.
 
 use marmot_uniffi::conversions::{
-    AccountRelayListsFfi, MissingRelayListKindFfi, RelayHealthFfi, RelayListFfi,
-    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
+    AccountRelayListsFfi, MissingRelayListKindFfi, RelayEndpointClassificationFfi,
+    RelayEndpointPolicyFfi, RelayHealthFfi, RelayListFfi, RelayTelemetryResourceFfi,
+    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
 };
 
 use crate::MarmotStatus;
@@ -140,5 +141,32 @@ impl MarmotRelayTelemetryRuntimeConfig {
             authorization_bearer_token: unsafe { optional_str(self.authorization_bearer_token) }?,
             resource,
         })
+    }
+}
+
+c_enum! {
+    /// Whether a relay endpoint may be dialed.
+    MarmotRelayEndpointPolicy from RelayEndpointPolicyFfi {
+        Allowed,
+        /// On the centralized retired-relay denylist; never dial it.
+        Retired,
+        /// Not a parseable relay URL.
+        Invalid,
+        /// Parseable but rejected by the host-safety dial discipline.
+        Unsafe,
+    }
+}
+
+c_mirror! {
+    /// One endpoint's dial verdict. Free the list with
+    /// `marmot_relay_endpoint_classification_list_free`.
+    MarmotRelayEndpointClassification from RelayEndpointClassificationFfi,
+    free marmot_relay_endpoint_classification_free,
+    list(MarmotRelayEndpointClassificationList, marmot_relay_endpoint_classification_list_free) {
+        /// The endpoint as the caller wrote it.
+        str endpoint,
+        /// Canonical form, NULL when the endpoint does not parse.
+        opt_str normalized_endpoint,
+        copy policy: MarmotRelayEndpointPolicy,
     }
 }

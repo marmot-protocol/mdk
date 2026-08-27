@@ -2,17 +2,24 @@
 
 use marmot_uniffi::conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupHydrationQuarantineReasonFfi,
-    AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi, AppProtocolProfileFfi,
-    AppQuarantinedGroupFfi, DisbandFailureReasonFfi, DisbandRequestFfi, EncryptedMediaVersionFfi,
-    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi, MemberRefFfi,
-    SelfMembershipFfi,
+    AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
+    AppProtocolProfileFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandFailureReasonFfi,
+    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRosterFfi,
+    MemberRefFfi, SelfMembershipFfi,
+};
+// Group-creation option/image records live on the command module rather
+// than `conversions`, because they are inputs, not projections.
+use marmot_uniffi::{
+    CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
+    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
 };
 
 use super::account::MarmotSendSummary;
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
-use crate::memory::{CFree, required_str};
+use crate::memory::{CFree, optional_str, required_str};
 
 c_enum! {
     /// Marmot protocol profile the group runs.
@@ -442,5 +449,164 @@ mod tests {
         assert_eq!(mirror.summary.message_ids_len, 1);
         let root = boxed(mirror);
         unsafe { marmot_group_invite_decline_result_free(root) };
+    }
+}
+
+c_mirror! {
+    /// KeyPackage prewarm counters for a prospective member set.
+    MarmotMemberKeyPackagePrewarmSummary from MemberKeyPackagePrewarmSummaryFfi,
+    free marmot_member_key_package_prewarm_summary_free {
+        copy requested_members: u64,
+        copy unique_members: u64,
+        copy reused_members: u64,
+        copy network_resolved_members: u64,
+    }
+}
+
+c_mirror! {
+    /// A newly created group plus its chat-list row, so a caller can
+    /// render the conversation without a follow-up read. Free with
+    /// `marmot_created_group_free`.
+    MarmotCreatedGroup from CreatedGroupFfi,
+    free marmot_created_group_free {
+        str group_id_hex,
+        rec chat_list_row: super::chat_list::MarmotChatListRow,
+    }
+}
+
+c_mirror! {
+    /// Member and admin ids for one group in a batch page.
+    MarmotAppGroupMemberIds from AppGroupMemberIdsFfi,
+    free marmot_app_group_member_ids_free,
+    list(MarmotAppGroupMemberIdsList, marmot_app_group_member_ids_list_free) {
+        str group_id_hex,
+        str_vec member_ids_hex/member_ids_hex_len,
+        str_vec admin_ids_hex/admin_ids_hex_len,
+    }
+}
+
+c_mirror! {
+    /// Group details and management state in one read. Free with
+    /// `marmot_group_conversation_snapshot_free`.
+    MarmotGroupConversationSnapshot from GroupConversationSnapshotFfi,
+    free marmot_group_conversation_snapshot_free {
+        rec details: MarmotGroupDetails,
+        rec management_state: MarmotGroupManagementState,
+    }
+}
+
+c_mirror! {
+    /// The group's member roster at one MLS epoch. Free with
+    /// `marmot_group_roster_free`.
+    MarmotGroupRoster from GroupRosterFfi,
+    free marmot_group_roster_free {
+        str group_id_hex,
+        vec members/members_len: MarmotGroupMemberDetails,
+        copy epoch: u64,
+        /// Monotonic change token for MLS roster state plus caller
+        /// membership. Non-roster commits may bump it; directory-only
+        /// display-name changes do not.
+        copy roster_revision: u64,
+        copy self_membership: MarmotSelfMembership,
+        copy member_count: u32,
+        copy lifecycle_state: MarmotGroupLifecycleState,
+    }
+}
+
+c_enum! {
+    /// Where a prepared group image sits in the upload lifecycle.
+    MarmotPreparedGroupImageUploadState from PreparedGroupImageUploadStateFfi {
+        Staged,
+        Uploading,
+        Uploaded,
+        Failed,
+        /// Already attached to a group; it cannot be reused.
+        Consumed,
+    }
+}
+
+c_mirror! {
+    /// A group image staged ahead of group creation, so the upload can
+    /// finish before the caller commits. Free with
+    /// `marmot_prepared_group_image_upload_free`.
+    MarmotPreparedGroupImageUpload from PreparedGroupImageUploadFfi,
+    free marmot_prepared_group_image_upload_free,
+    list(MarmotPreparedGroupImageUploadList, marmot_prepared_group_image_upload_list_free) {
+        str upload_id,
+        copy state: MarmotPreparedGroupImageUploadState,
+        copy attempt_count: u32,
+        opt_str last_error_kind,
+        /// Set once the image is consumed by a group.
+        opt_str group_id_hex,
+    }
+}
+
+/// An image to attach while creating a group. Borrowed input only: the
+/// plaintext bytes are copied, never retained or freed.
+#[repr(C)]
+pub struct MarmotInitialGroupImage {
+    pub plaintext: *const u8,
+    pub plaintext_len: usize,
+    pub media_type: *const ::std::ffi::c_char,
+    /// Nullable.
+    pub source_url: *const ::std::ffi::c_char,
+    /// Nullable.
+    pub dim: *const ::std::ffi::c_char,
+    /// Nullable.
+    pub thumbhash: *const ::std::ffi::c_char,
+}
+
+impl MarmotInitialGroupImage {
+    /// # Safety
+    /// Strings must be valid; `plaintext` must point to `plaintext_len`
+    /// bytes (or be NULL with length 0).
+    pub(crate) unsafe fn to_ffi(&self) -> Result<InitialGroupImageFfi, MarmotStatus> {
+        if self.plaintext.is_null() && self.plaintext_len != 0 {
+            crate::status::set_last_error("plaintext was NULL with nonzero length");
+            return Err(MarmotStatus::NullPointer);
+        }
+        let plaintext = if self.plaintext.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(self.plaintext, self.plaintext_len) }.to_vec()
+        };
+
+        Ok(InitialGroupImageFfi {
+            plaintext,
+            media_type: unsafe { required_str(self.media_type) }?,
+            source_url: unsafe { optional_str(self.source_url) }?,
+            dim: unsafe { optional_str(self.dim) }?,
+            thumbhash: unsafe { optional_str(self.thumbhash) }?,
+        })
+    }
+}
+
+/// Everything optional about a new group. Borrowed input only.
+#[repr(C)]
+pub struct MarmotCreateGroupOptions {
+    /// Nullable.
+    pub description: *const ::std::ffi::c_char,
+    /// Nullable; NULL creates the group without an image.
+    pub initial_image: *const MarmotInitialGroupImage,
+    /// Disappearing-message retention; 0 disables it.
+    pub disappearing_message_secs: u64,
+}
+
+impl MarmotCreateGroupOptions {
+    /// # Safety
+    /// Non-NULL strings must be valid; `initial_image` NULL or a valid
+    /// struct.
+    pub(crate) unsafe fn to_ffi(&self) -> Result<CreateGroupOptionsFfi, MarmotStatus> {
+        let initial_image = if self.initial_image.is_null() {
+            None
+        } else {
+            Some(unsafe { (*self.initial_image).to_ffi() }?)
+        };
+
+        Ok(CreateGroupOptionsFfi {
+            description: unsafe { optional_str(self.description) }?,
+            initial_image,
+            disappearing_message_secs: self.disappearing_message_secs,
+        })
     }
 }

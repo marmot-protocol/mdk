@@ -39,6 +39,15 @@ pub unsafe extern "C" fn marmot_string_list_free(list: *mut MarmotStringList) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(list) });
 }
 
+/// One borrowed row of a string matrix (e.g. one Nostr tag's values in
+/// `marmot_send_custom_event`). Borrowed input only: never freed or
+/// retained. `(NULL, 0)` is an empty row.
+#[repr(C)]
+pub struct MarmotStringArray {
+    pub values: *const *const ::std::ffi::c_char,
+    pub values_len: usize,
+}
+
 c_mirror! {
     /// One Nostr tag of the inner Marmot app event, as its string values.
     MarmotMessageTag from MessageTagFfi,

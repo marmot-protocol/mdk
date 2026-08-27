@@ -1,10 +1,10 @@
 //! C mirrors of the account conversions.
 
 use marmot_uniffi::conversions::{
-    AccountKeyPackageFfi, AccountSummaryFfi, AccountUnreadFfi, GroupLeaveFailureFfi,
-    LocalCleanupReportFfi, RelayFailureFfi, SendAcceptDispositionFfi,
-    SendMaintenanceDispositionFfi, SendSummaryFfi, SignOutOutcomeFfi, UserProfileMetadataFfi,
-    WipeOutcomeFfi,
+    AccountKeyPackageFfi, AccountSetupReadinessFfi, AccountSummaryFfi, AccountUnreadFfi,
+    GroupLeaveFailureFfi, IdentityCreationResultFfi, LocalCleanupReportFfi, RelayFailureFfi,
+    SendAcceptDispositionFfi, SendMaintenanceDispositionFfi, SendSummaryFfi, SignOutOutcomeFfi,
+    UserProfileMetadataFfi, WipeOutcomeFfi,
 };
 
 use crate::MarmotStatus;
@@ -120,6 +120,31 @@ impl MarmotUserProfileMetadata {
             nip05: unsafe { optional_str(self.nip05) }?,
             lud16: unsafe { optional_str(self.lud16) }?,
         })
+    }
+}
+
+c_enum! {
+    /// How far an account's setup has progressed.
+    MarmotAccountSetupReadiness from AccountSetupReadinessFfi {
+        Initializing,
+        LocalReady,
+        Publishing,
+        NetworkReady,
+        /// Setup stopped partway; recover with
+        /// `marmot_login_recovering_incomplete_setup` or discard it with
+        /// `marmot_reset_incomplete_account_setup`.
+        RecoveryRequired,
+    }
+}
+
+c_mirror! {
+    /// A freshly created identity plus its published profile and setup
+    /// progress. Free with `marmot_identity_creation_result_free`.
+    MarmotIdentityCreationResult from IdentityCreationResultFfi,
+    free marmot_identity_creation_result_free {
+        rec account: MarmotAccountSummary,
+        rec profile: MarmotUserProfileMetadata,
+        copy readiness: MarmotAccountSetupReadiness,
     }
 }
 

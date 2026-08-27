@@ -4,13 +4,31 @@ use marmot_uniffi::conversions::{
     ChatConversationKindFfi, ChatListAttachmentKindFfi, ChatListAvatarFfi,
     ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
-    ChatPinStateFfi,
+    ChatPinStateFfi, ExistingDirectConversationFfi,
 };
 
 use super::group::{MarmotDisbandRequest, MarmotGroupLifecycleState, MarmotSelfMembership};
 use super::markdown::MarmotMarkdownDocument;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, free_vec, owned_c_string, owned_vec};
+
+c_mirror! {
+    /// An existing one-to-one conversation with a peer. `reusable` is
+    /// the only field a caller needs to decide whether to open this
+    /// group or create a new one; the rest explain why.
+    MarmotExistingDirectConversation from ExistingDirectConversationFfi,
+    free marmot_existing_direct_conversation_free {
+        str group_id_hex,
+        copy reusable: bool,
+        copy lifecycle_state: MarmotGroupLifecycleState,
+        copy self_membership: MarmotSelfMembership,
+        copy pending_confirmation: bool,
+        copy leave_request_pending: bool,
+        copy disbanding: bool,
+        copy archived: bool,
+        copy activity_sort_at: u64,
+    }
+}
 
 c_mirror! {
     /// The account's pinned chats, in display order.

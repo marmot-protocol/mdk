@@ -11,10 +11,12 @@ C ABI bindings for the Marmot app runtime. Read `README.md` first for build, lin
 
 ## Known gaps
 
-- External-signer accounts (`register_external_signer` / `login_external_signer`) are not yet exposed. They take a
-  host-implemented `ExternalAccountSignerFfi` trait (public key, sign event, NIP-04 encrypt/decrypt). A C mapping needs a
-  callback vtable (function pointers + `user_data`) invoked from runtime worker threads, with owned-string return and
-  error signalling across the boundary. That deserves its own focused design + tests rather than a rushed vtable.
+`scripts/check_c_binding_parity.py` is the authoritative list: it fails CI on any exported `Marmot` method without a C
+wrapper, so every omission must be argued in its `DELIBERATELY_UNEXPORTED` allowlist. Today the only ones are the
+external-signer constructors (`register_external_signer` / `login_external_signer`). They take a host-implemented
+`ExternalAccountSignerFfi` trait (public key, sign event, NIP-04 encrypt/decrypt); a C mapping needs a callback vtable
+(function pointers + `user_data`) invoked from runtime worker threads, with owned-string return and error signalling
+across the boundary. That deserves its own focused design + tests rather than a rushed vtable.
 
 ## Architecture
 
@@ -58,7 +60,9 @@ C ABI bindings for the Marmot app runtime. Read `README.md` first for build, lin
   32-byte route-id/pubkey/message-id rule.
 - No `tracing`/logging in this crate; error detail strings carry only what `MarmotKitError` Display already exposes.
 - Keep this crate in lockstep with `marmot-uniffi` surface changes; bump the workspace version when mirrors,
-  commands, status codes, or callback signatures change.
+  commands, status codes, or callback signatures change. `just c-parity-gate` enforces the command half of that
+  lockstep; new *fields* on an existing record are still silent (`c_mirror!` ignores what its spec does not name), so
+  re-read the record when upstream touches it.
 
 ## Verification
 

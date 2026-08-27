@@ -49,7 +49,7 @@ use std::time::Duration;
 use marmot_uniffi::subscriptions::{
     AgentStreamSubscription, ChatListSubscription, ChatsSubscription, EventsSubscription,
     GroupStateSubscription, MessagesSubscription, NotificationsSubscription,
-    TimelineMessagesSubscription,
+    TimelineMessagesSubscription, UserSearchSubscription,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -64,6 +64,7 @@ use crate::types::agent_stream::MarmotAgentStreamUpdate;
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatListSubscriptionUpdate,
 };
+use crate::types::directory::MarmotUserSearchUpdate;
 use crate::types::event::MarmotEvent;
 use crate::types::group::MarmotAppGroupRecord;
 use crate::types::message::{MarmotAppMessageRecordList, MarmotMessageUpdate};
@@ -98,6 +99,7 @@ unsafe impl Send for MarmotAppGroupRecord {}
 unsafe impl Send for MarmotChatListRow {}
 unsafe impl Send for MarmotMessageUpdate {}
 unsafe impl Send for MarmotAgentStreamUpdate {}
+unsafe impl Send for MarmotUserSearchUpdate {}
 
 /// Shared body of every subscription handle: the runtime that drives it
 /// and the slot holding an installed callback task.
@@ -274,6 +276,7 @@ macro_rules! c_subscription {
         $(#[$m:meta])* $handle:ident($inner:ty),
         item $mirror:ident from $ffi:ty, item_free $item_free:literal,
         callback $cb:ident,
+        read $read:ident,
         next $next:ident,
         set_callback $set:ident,
         clear_callback $clear:ident,
@@ -306,7 +309,7 @@ macro_rules! c_subscription {
                 try_arg!(unsafe { preflight_out_ptr(out) });
                 let sub = try_arg!(unsafe { sub_ref(sub) });
                 let inner = sub.inner.clone();
-                let result = sub.core.block_next(timeout_ms, inner.next());
+                let result = sub.core.block_next(timeout_ms, inner.$read());
                 unsafe { deliver_next(result, out) }
             })
         }
@@ -338,7 +341,7 @@ macro_rules! c_subscription {
                 sub.core.install(|runtime| {
                     spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                         let inner = inner.clone();
-                        async move { inner.next().await }
+                        async move { inner.$read().await }
                     })
                 })
             })
@@ -385,6 +388,7 @@ c_subscription! {
     item MarmotEvent from marmot_uniffi::conversions::MarmotEventFfi,
     item_free "marmot_event_free",
     callback MarmotEventCallback,
+    read next,
     next marmot_events_subscription_next,
     set_callback marmot_events_subscription_set_callback,
     clear_callback marmot_events_subscription_clear_callback,
@@ -421,6 +425,7 @@ c_subscription! {
     item MarmotTimelinePage from marmot_uniffi::conversions::TimelinePageFfi,
     item_free "marmot_timeline_page_free",
     callback MarmotTimelinePageCallback,
+    read next,
     next marmot_timeline_subscription_next,
     set_callback marmot_timeline_subscription_set_callback,
     clear_callback marmot_timeline_subscription_clear_callback,
@@ -571,6 +576,7 @@ c_subscription! {
     item MarmotNotificationUpdate from marmot_uniffi::conversions::NotificationUpdateFfi,
     item_free "marmot_notification_update_free",
     callback MarmotNotificationUpdateCallback,
+    read next,
     next marmot_notifications_subscription_next,
     set_callback marmot_notifications_subscription_set_callback,
     clear_callback marmot_notifications_subscription_clear_callback,
@@ -612,6 +618,7 @@ c_subscription! {
     item MarmotAppGroupRecord from marmot_uniffi::conversions::AppGroupRecordFfi,
     item_free "marmot_app_group_record_free",
     callback MarmotAppGroupRecordCallback,
+    read next,
     next marmot_chats_subscription_next,
     set_callback marmot_chats_subscription_set_callback,
     clear_callback marmot_chats_subscription_clear_callback,
@@ -686,6 +693,7 @@ c_subscription! {
     item MarmotChatListRow from marmot_uniffi::conversions::ChatListRowFfi,
     item_free "marmot_chat_list_row_free",
     callback MarmotChatListRowCallback,
+    read next,
     next marmot_chat_list_subscription_next,
     set_callback marmot_chat_list_subscription_set_callback,
     clear_callback marmot_chat_list_subscription_clear_callback,
@@ -778,6 +786,7 @@ c_subscription! {
     item MarmotMessageUpdate from marmot_uniffi::conversions::MessageUpdateFfi,
     item_free "marmot_message_update_free",
     callback MarmotMessageUpdateCallback,
+    read next,
     next marmot_messages_subscription_next,
     set_callback marmot_messages_subscription_set_callback,
     clear_callback marmot_messages_subscription_clear_callback,
@@ -862,6 +871,7 @@ c_subscription! {
     item MarmotAppGroupRecord from marmot_uniffi::conversions::AppGroupRecordFfi,
     item_free "marmot_app_group_record_free",
     callback MarmotGroupStateRecordCallback,
+    read next,
     next marmot_group_state_subscription_next,
     set_callback marmot_group_state_subscription_set_callback,
     clear_callback marmot_group_state_subscription_clear_callback,
@@ -941,6 +951,7 @@ c_subscription! {
     item MarmotAgentStreamUpdate from marmot_uniffi::conversions::AgentStreamUpdateFfi,
     item_free "marmot_agent_stream_update_free",
     callback MarmotAgentStreamUpdateCallback,
+    read next,
     next marmot_agent_stream_subscription_next,
     set_callback marmot_agent_stream_subscription_set_callback,
     clear_callback marmot_agent_stream_subscription_clear_callback,
@@ -1086,4 +1097,62 @@ mod tests {
         );
         core.clear();
     }
+}
+
+c_subscription! {
+    /// Opaque handle to a running user search. Each read yields the next
+    /// step of the traversal; the stream closes after the
+    /// `SearchCompleted` trigger. Freeing the handle stops the traversal
+    /// at its next checkpoint.
+    MarmotUserSearchSubscription(UserSearchSubscription),
+    item MarmotUserSearchUpdate from marmot_uniffi::conversions::UserSearchUpdateFfi,
+    item_free "marmot_user_search_update_free",
+    callback MarmotUserSearchUpdateCallback,
+    read next_update,
+    next marmot_user_search_subscription_next,
+    set_callback marmot_user_search_subscription_set_callback,
+    clear_callback marmot_user_search_subscription_clear_callback,
+    free marmot_user_search_subscription_free
+}
+
+/// Search the identity directory outward from `account_id_hex`, widening
+/// from `radius_start` to `radius_end` social hops. Results stream in
+/// through the returned handle. Free it with
+/// `marmot_user_search_subscription_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `account_id_hex` and `query` valid
+/// strings; `out_sub` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_search_users(
+    client: *const MarmotClient,
+    account_id_hex: *const std::ffi::c_char,
+    query: *const std::ffi::c_char,
+    radius_start: u8,
+    radius_end: u8,
+    out_sub: *mut *mut MarmotUserSearchSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_id_hex = try_arg!(unsafe { required_str(account_id_hex) });
+        let query = try_arg!(unsafe { required_str(query) });
+        match client.block_on(client.marmot.search_users(
+            account_id_hex,
+            query,
+            radius_start,
+            radius_end,
+        )) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotUserSearchSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(err) => status_from_error(&err),
+        }
+    })
 }
