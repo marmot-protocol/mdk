@@ -69,6 +69,7 @@ async fn run_with_bin(
         cwd,
         session_id,
         prompt,
+        artifact_output: _,
     } = invocation;
     run_jsonl_process(
         ProcessSpec {
@@ -277,6 +278,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 cwd: root.path().to_path_buf(),
                 session_id: None,
                 prompt: "--prompt-via-stdin".to_owned(),
+                artifact_output: None,
             },
             tx,
         )
@@ -330,6 +332,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 cwd: root.path().to_path_buf(),
                 session_id: Some("missing-session".to_owned()),
                 prompt: "p".repeat(60_000),
+                artifact_output: None,
             },
             tx,
         )
@@ -372,6 +375,7 @@ exit 64
                 cwd: root.path().to_path_buf(),
                 session_id: None,
                 prompt: "p".repeat(60_000),
+                artifact_output: None,
             },
             tx,
         )
@@ -405,6 +409,7 @@ exit 64
                 cwd: root.path().to_path_buf(),
                 session_id: Some("wn-pi-real-contract".to_owned()),
                 prompt: "Reply with exactly PI_CONNECTOR_OK and nothing else.".to_owned(),
+                artifact_output: None,
             },
             tx,
         )

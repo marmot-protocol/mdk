@@ -3,8 +3,8 @@
 `wn-codex` is a terminal-harness connector that sends authorized Marmot group
 messages to [Codex](https://learn.chatgpt.com/) through the local
 `wn-agent` control socket. It is intentionally a thin harness: no mention
-activation, media handling, profile onboarding, live previews, MLS, or relay
-logic.
+activation, profile onboarding, live previews, MLS, or relay logic. Optional
+artifact export reuses `wn-agent`'s existing encrypted `send_media` path.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
@@ -138,6 +138,24 @@ instruction alive across thread resets and Codex-side context compaction.
 | `WN_CODEX_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
 | `WN_CODEX_STATE_PATH` | `$XDG_STATE_HOME/wn-codex/sessions.json` | Group thread/workdir map |
 | `WN_CODEX_ACTIVATION` | `always` | Only supported activation mode |
+| `WN_CODEX_ARTIFACT_EXPORTS_ENABLED` | `false` | Opt in to typed Codex completion-file artifact delivery |
+| `WN_CODEX_ARTIFACT_GRANTS_JSON` | unset | Required JSON array of exact `group_id_hex`, absolute `export_root`, and positive `ttl_seconds` grants |
+| `WN_CODEX_ARTIFACT_MAX_COUNT` | `10` | Maximum artifacts accepted per result; configurable from 1 to 10 |
+| `WN_CODEX_ARTIFACT_STAGING_ROOT` | `$MARMOT_HOME/media-uploads` | Private staging root that must also be passed to `wn-agent --media-allowed-root` |
+
+Artifact export is fail-closed and Codex-only in the initial release. Enable it only with both layers configured:
+
+```sh
+export WN_CODEX_ARTIFACT_EXPORTS_ENABLED=true
+export WN_CODEX_ARTIFACT_GRANTS_JSON='[{"group_id_hex":"<opaque-hex-group-id>","export_root":"'"$HOME"'/src/my-project/output","ttl_seconds":300}]'
+export WN_CODEX_ARTIFACT_STAGING_ROOT="$MARMOT_HOME/media-uploads"
+wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
+  --media-allowed-root "$WN_CODEX_ARTIFACT_STAGING_ROOT" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat
+```
+
+Codex receives one connector-minted, turn-scoped capability only through `WN_ARTIFACT_AUTHORIZATION_ID`. The authorized export location is supplied as a workdir-relative path when it sits under the working directory; otherwise Codex sees `$WN_ARTIFACT_EXPORT_ROOT` and the path stays in that process-local environment variable. The private completion-manifest path is never written into the prompt: when it cannot be expressed relative to the workdir, Codex receives it only as `$WN_ARTIFACT_MANIFEST`. The harness never scans assistant prose for paths. Each declaration uses a relative path to a regular non-symlink file beneath the authorized root. The harness copies accepted bytes into its private staging root, persists the pending send before calling `send_media`, and replays that idempotent send after restart until `wn-agent` confirms it.
 
 Codex credentials, model, config, and project trust remain authoritative.
 `autonomous` overrides only `approval_policy` to `never`, preserving configured
@@ -162,6 +180,7 @@ boundary.
 - Prompts are passed to Codex over stdin rather than process arguments.
 - Only completed assistant messages are returned. Reasoning, command/tool
   events, partial items, and usage events are not sent to Marmot.
+- Artifact export is disabled by default, rejects undeclared prose paths, and emits privacy-safe per-artifact rejection or pending-retry status without exposing host paths.
 - Logs exclude identifiers, paths, prompts, Codex output, relay URLs, pubkeys,
   ciphertext, plaintext, and key material.
 - Connector state is created with owner-only permissions by the shared harness.
