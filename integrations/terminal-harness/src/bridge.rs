@@ -2484,6 +2484,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn default_backend_rejects_non_empty_attachment_batch_without_running() {
+        let root = tempfile::tempdir().unwrap();
+        let invocation = Invocation {
+            timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+            cwd: root.path().to_path_buf(),
+            session_id: Some("existing-session".to_owned()),
+            prompt: "text accompanying a file".to_owned(),
+        };
+        let attachment = Attachment {
+            path: root.path().join("staged.png"),
+            media_type: "image/png".to_owned(),
+            file_name: "000-staged.png".to_owned(),
+            size_bytes: 1,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        let failure = UnusedBackend
+            .run_with_attachments(invocation, vec![attachment], tx)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure.error, HarnessError::AttachmentUnsupported));
+        assert_eq!(
+            failure.observed_session.as_deref(),
+            Some("existing-session")
+        );
+    }
+
     fn test_bridge_context(root: &std::path::Path) -> BridgeContext {
         let cfg = test_config(root);
         BridgeContext {

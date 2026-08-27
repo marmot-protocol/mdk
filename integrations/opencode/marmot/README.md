@@ -6,9 +6,15 @@ sends every message from an allowed sender to `opencode run --format json`.
 
 `wn-agent` owns the Marmot account, MLS state, Nostr transport, invite allowlist,
 and durable encrypted sends. `wn-opencode` is intentionally thinner than the
-Hermes and OpenClaw gateway integrations: it has no mention activation, media
-handling, profile onboarding, or live previews. It is a pure harness for an
-authorized operator.
+Hermes and OpenClaw gateway integrations: it has no mention activation, backend
+attachment support, profile onboarding, or live previews. It is a pure harness
+for an authorized operator.
+
+Text-only turns are unchanged. For a turn containing one or more files, the
+shared terminal harness first applies its attachment-count and aggregate-byte
+limits and downloads the complete ordered batch into private staging. Because
+the OpenCode backend does not opt in to attachments, the batch is then rejected
+before `opencode` is spawned; its accompanying text is not forwarded either.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
 [White Noise + Agents quickstart](../../README.md#get-started-white-noise--agents).
