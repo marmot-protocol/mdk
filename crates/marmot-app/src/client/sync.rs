@@ -2417,7 +2417,7 @@ impl AppClient {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     stalled_epoch: evidence.stalled_epoch,
                     fruitless_completions: evidence.fruitless_completions,
-                    escalated: evidence.escalated,
+                    escalated: evidence.fruitless_reported,
                     last_arm_at_ms: evidence.last_arm_at_ms,
                 })
             })
@@ -2453,7 +2453,7 @@ impl AppClient {
                     super::epoch_stall::EpochStallEvidence {
                         stalled_epoch: entry.stalled_epoch,
                         fruitless_completions: entry.fruitless_completions,
-                        escalated: entry.escalated,
+                        fruitless_reported: entry.escalated,
                         last_arm_at_ms: entry.last_arm_at_ms,
                     },
                 ))

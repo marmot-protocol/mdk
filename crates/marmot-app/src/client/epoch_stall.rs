@@ -207,6 +207,18 @@ pub(crate) const EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD: u32 = 3;
 /// would age out its own run.
 const _: () = assert!(EPOCH_STALL_WEDGE_REARM_INTERVAL_MS < EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS);
 
+/// How far a recorded wall-clock mark may sit ahead of a later reading and
+/// still be read as ordinary skew rather than as a clock that was wrong.
+///
+/// Five minutes, the same allowance ledger A8's `TRANSPORT_CURSOR_MAX_FUTURE_SKEW`
+/// makes for a sender's timestamp, and for the same reason: two readings of
+/// wall-clock time disagree a little, and a bound is what separates that from a
+/// reading that cannot be true. Beyond it, a mark in the future of `now` is not
+/// a duration at all — it is a dead RTC, a hand-set date, or a saturated
+/// reading, taken before the clock was corrected — and treating it as zero
+/// elapsed would wedge both gates permanently, durably, and silently.
+pub(crate) const EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS: u64 = 5 * 60 * 1_000;
+
 /// What one undecryptable-traffic observation decided.
 ///
 /// `#[must_use]` because dropping a decision is unrecoverable, not merely
@@ -746,7 +758,7 @@ impl EpochStallDetector {
         Some(EpochStallEvidence {
             stalled_epoch: stall.epoch.0,
             fruitless_completions: stall.fruitless_completions,
-            escalated: stall.escalated,
+            fruitless_reported: stall.escalated,
             last_arm_at_ms: stall.last_arm_at_ms?,
         })
     }
@@ -782,7 +794,7 @@ impl EpochStallDetector {
             stall.fired_at_epoch = Some(epoch);
             stall.last_arm_at_ms = Some(evidence.last_arm_at_ms);
             stall.fruitless_completions = evidence.fruitless_completions;
-            stall.escalated = evidence.escalated;
+            stall.escalated = evidence.fruitless_reported;
         }
     }
 }
@@ -805,7 +817,7 @@ pub(crate) struct FruitlessEscalation {
 pub(crate) struct EpochStallEvidence {
     pub(crate) stalled_epoch: u64,
     pub(crate) fruitless_completions: u32,
-    pub(crate) escalated: bool,
+    pub(crate) fruitless_reported: bool,
     pub(crate) last_arm_at_ms: u64,
 }
 
@@ -1653,7 +1665,7 @@ mod tests {
             EpochStallEvidence {
                 stalled_epoch: 10,
                 fruitless_completions: 2,
-                escalated: false,
+                fruitless_reported: false,
                 last_arm_at_ms: T0,
             },
         )]);
@@ -1689,7 +1701,7 @@ mod tests {
             EpochStallEvidence {
                 stalled_epoch: 10,
                 fruitless_completions: 3,
-                escalated: true,
+                fruitless_reported: true,
                 last_arm_at_ms: T0,
             },
         )]);
@@ -1697,6 +1709,142 @@ mod tests {
         assert!(
             detector.observe_fruitless_completion([&g]).is_empty(),
             "the run reported before the restart; restarting is not new evidence",
+        );
+    }
+
+    /// A dead run's evidence must not report a live one.
+    ///
+    /// `end_run` and `observe_epoch` are two different resets: the first fires
+    /// when an arm lands past the run continuation window, at whatever epoch the
+    /// group happens to sit on, and the second only when the epoch changes. The
+    /// fruitless counter is per-epoch, so only the second used to clear it —
+    /// which left a window where a stale-run arm cleared the report latch while
+    /// the evidence behind it survived, and the very next completion re-reported
+    /// off a run that had already ended. The cap-saturated shape reaches it for
+    /// real: `rearm_refused_groups` clears `fired_at_epoch` at the same epoch, so
+    /// the next undecryptable takes the unpaced arm branch.
+    #[test]
+    fn a_run_that_ended_on_the_clock_does_not_report_off_its_predecessor() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_fruitless_completion([&g]);
+        let _ = detector.observe_fruitless_completion([&g]);
+        assert_eq!(
+            detector.observe_fruitless_completion([&g]).len(),
+            1,
+            "the first run reports on its third confirmed fruitless replay",
+        );
+        // A fruitless replay re-arms the groups whose refusals it counted, and
+        // the device then goes quiet long enough for the run to age out.
+        detector.rearm_refused_groups(&std::iter::once(g.clone()).collect());
+        let later = T0 + EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS + 1;
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), later),
+            BackfillDecision::Arm,
+            "an arm this far from the last one starts a fresh run",
+        );
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "a fresh run re-earns its evidence exactly as it re-earns its arms",
+        );
+        assert!(detector.observe_fruitless_completion([&g]).is_empty());
+        assert_eq!(
+            detector.observe_fruitless_completion([&g]).len(),
+            1,
+            "and reports again only once it has earned three of its own",
+        );
+    }
+
+    /// A restart must not suppress the arm-run rule.
+    ///
+    /// The report latch gates both escalation rules, but only the frozen-epoch
+    /// half of the state is durable: `arms` deliberately restarts at zero.
+    /// Rehydrating one shared latch therefore silenced a whole fresh arm run —
+    /// and a device limping one epoch per arm, which is the field shape the arm
+    /// run exists for, never clears it, because leaving an epoch it armed at
+    /// continues the run. The durable half is scoped to the frozen-epoch rule
+    /// instead.
+    #[test]
+    fn a_restart_does_not_suppress_a_fresh_arm_run() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: T0,
+            },
+        )]);
+
+        // The device limps: one epoch of progress per arm, three times over.
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
+        let first = detector.observe_undecryptable(g.clone(), "a".into(), EpochId(11), T0 + HOUR_MS);
+        detector.observe_epoch_passage(&g, EpochId(11), EpochId(12));
+        let second =
+            detector.observe_undecryptable(g.clone(), "b".into(), EpochId(12), T0 + 2 * HOUR_MS);
+        detector.observe_epoch_passage(&g, EpochId(12), EpochId(13));
+        let third =
+            detector.observe_undecryptable(g.clone(), "c".into(), EpochId(13), T0 + 3 * HOUR_MS);
+
+        assert_eq!(
+            (first, second, third),
+            (
+                BackfillDecision::Arm,
+                BackfillDecision::Arm,
+                BackfillDecision::ArmAndEscalate { arms: 3 },
+            ),
+            "a run earned entirely after the restart is a report the restart never made",
+        );
+    }
+
+    /// A clock that ran ahead must not wedge the gate for good.
+    ///
+    /// A mark taken under a dead RTC, a hand-set date, or a saturating
+    /// `unix_now_ms` sits in the future of every later correct reading, and a
+    /// plain saturating subtraction calls that zero elapsed forever. The mark is
+    /// durable, so restarting does not clear it either: the device would never
+    /// re-arm again.
+    #[test]
+    fn a_mark_from_a_clock_that_ran_ahead_does_not_wedge_the_pacing_gate() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 0,
+                fruitless_reported: false,
+                last_arm_at_ms: T0 + 365 * 24 * HOUR_MS,
+            },
+        )]);
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
+            BackfillDecision::Arm,
+            "a mark the clock cannot have produced reads as elapsed, not as zero",
+        );
+    }
+
+    /// Ordinary skew between two readings is not a corrected clock, though, and
+    /// must not hand out a re-arm the interval had not earned.
+    #[test]
+    fn ordinary_clock_skew_does_not_buy_a_rearm() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+
+        assert_eq!(
+            detector.observe_undecryptable(
+                g.clone(),
+                "m2".into(),
+                EpochId(10),
+                T0 - EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS,
+            ),
+            BackfillDecision::Skip,
+            "a reading a few minutes behind the mark is skew, not a year of waiting",
         );
     }
 
@@ -1717,7 +1865,7 @@ mod tests {
             Some(EpochStallEvidence {
                 stalled_epoch: 10,
                 fruitless_completions: 1,
-                escalated: false,
+                fruitless_reported: false,
                 last_arm_at_ms: T0,
             }),
         );
