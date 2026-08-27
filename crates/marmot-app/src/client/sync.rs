@@ -1501,7 +1501,7 @@ impl AppClient {
                             .finish_failed_sync_drain(
                                 summary,
                                 routes_dirty,
-                                *counts,
+                                counts.clone(),
                                 StagedSyncError::new(error, SyncFailureStage::StatePersist),
                                 drain_started,
                                 cursor_before_secs,
@@ -1642,7 +1642,7 @@ impl AppClient {
                     .finish_failed_sync_drain(
                         summary,
                         routes_dirty,
-                        *counts,
+                        counts.clone(),
                         StagedSyncError::new(error, SyncFailureStage::StatePersist),
                         drain_started,
                         cursor_before_secs,
