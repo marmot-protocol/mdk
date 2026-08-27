@@ -4271,7 +4271,7 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
 /// force-killed, and a monotonic clock that restarts at zero would hand it one.
 /// Read here rather than inside the detector, which stays I/O-free so its
 /// policy can be unit-tested in isolation.
-fn epoch_stall_now_ms() -> u64 {
+pub(crate) fn epoch_stall_now_ms() -> u64 {
     crate::notifications::unix_now_ms().max(0) as u64
 }
 

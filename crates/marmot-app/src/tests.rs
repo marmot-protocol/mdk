@@ -13225,11 +13225,15 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         "the failed delivery's message must be durably projected exactly once",
     );
 }
-/// One fixed wall-clock instant for tests that drive the epoch-stall detector
-/// directly. The frozen-epoch pacing gate is a wall clock, so a test that means
-/// "no time passed between these two arms" has to say so.
+/// The clock a test uses when it drives the epoch-stall detector directly.
+///
+/// The very same reading production takes, deliberately. These tests arm
+/// through the detector and then let real ingests observe the same group, and
+/// the frozen-epoch pacing gate compares the two readings: a test clock frozen
+/// at some fixed past instant would make every later production observation
+/// look hours late and buy a paced re-arm nothing asked for.
 fn epoch_stall_test_now_ms() -> u64 {
-    1_700_000_000_000
+    crate::client::epoch_stall_now_ms()
 }
 
 /// A group whose per-group retained-undecryptable backlog is exactly full, plus
