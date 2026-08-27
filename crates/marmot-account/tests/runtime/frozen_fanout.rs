@@ -49,7 +49,12 @@ impl TransportAdapter for CrashDuringFanoutPublishAdapter {
     }
 }
 
-async fn assert_frozen_fanout_case(accept_at: Option<usize>, error_at: &[usize]) {
+async fn assert_frozen_fanout_case(
+    accept_at: Option<usize>,
+    error_at: &[usize],
+    error_kind: Option<TransportEndpointFailureKind>,
+    expect_unresolved: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot fanout matrix key").unwrap();
     let mut alice = session(
@@ -92,12 +97,15 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, error_at: &[usize])
     // whole-call `Err` on that endpoint's single-endpoint publish (an unmet
     // `required_acks: 1` discards the report), so error endpoints model the
     // real contract rather than an `Ok` report with no receipt.
-    adapter.error_for_endpoints(
-        error_at
-            .iter()
-            .map(|&index| endpoints[index].clone())
-            .collect(),
-    );
+    let error_endpoints = error_at
+        .iter()
+        .map(|&index| endpoints[index].clone())
+        .collect();
+    if let Some(kind) = error_kind {
+        adapter.fail_endpoints_as(error_endpoints, kind);
+    } else {
+        adapter.error_for_endpoints(error_endpoints);
+    }
     let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
         .with_group_route(
             group_id.clone(),
@@ -137,11 +145,15 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, error_at: &[usize])
     assert!(publishes.iter().all(|publish| publish.required_acks == 1));
     assert_eq!(effects.reports.len(), 1);
     assert_eq!(effects.fanout.len(), 1);
-    assert!(effects.fanout[0].fanout_complete);
-    assert_eq!(effects.fanout[0].outstanding_targets, 0);
-    assert!(
+    assert_eq!(effects.fanout[0].fanout_complete, !expect_unresolved);
+    assert_eq!(
+        effects.fanout[0].outstanding_targets,
+        if expect_unresolved { error_at.len() } else { 0 }
+    );
+    assert_eq!(
         runtime.session().outbound_fanouts().unwrap().is_empty(),
-        "terminal fanouts must be pruned after their outcome is surfaced"
+        !expect_unresolved,
+        "unresolved fanouts must remain durable while terminal fanouts are pruned"
     );
 
     if accept_at.is_some() {
@@ -152,6 +164,28 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, error_at: &[usize])
             effects.pending.as_slice(),
             [PendingResolution::Confirmed { .. }]
         ));
+    } else if expect_unresolved {
+        assert!(effects.failures.is_empty());
+        assert!(matches!(
+            effects.unresolved_publishes.as_slice(),
+            [marmot_account::UnresolvedPublish {
+                reason,
+                ..
+            }] if *reason == match error_kind {
+                Some(TransportEndpointFailureKind::RetryableUnavailable) => {
+                    marmot_account::UnresolvedPublishReason::RetryableUnavailable
+                }
+                _ => marmot_account::UnresolvedPublishReason::AcknowledgementUnknown,
+            }
+        ));
+        assert!(!effects.fanout[0].mls_confirmed);
+        assert_eq!(effects.fanout[0].accepted_targets, 0);
+        assert_eq!(
+            runtime.session().epoch(&group_id).unwrap().0,
+            2,
+            "the staged MLS transition must remain intact while completion is unknown"
+        );
+        assert!(effects.pending.is_empty());
     } else {
         assert!(!effects.fanout[0].mls_confirmed);
         assert_eq!(effects.fanout[0].accepted_targets, 0);
@@ -174,13 +208,214 @@ async fn assert_frozen_fanout_case(accept_at: Option<usize>, error_at: &[usize])
 #[tokio::test]
 async fn frozen_fanout_first_middle_last_ack_and_all_fail_are_terminal() {
     for accept_at in [Some(0), Some(1), Some(2), None] {
-        assert_frozen_fanout_case(accept_at, &[]).await;
+        assert_frozen_fanout_case(accept_at, &[], None, false).await;
     }
 }
 
 #[tokio::test]
-async fn frozen_fanout_whole_call_adapter_errors_are_terminal() {
-    assert_frozen_fanout_case(None, &[0, 1, 2]).await;
+async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
+    assert_frozen_fanout_case(None, &[0, 1, 2], None, true).await;
+}
+
+#[tokio::test]
+async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-unknown-retry.sqlite");
+    let key_text = "marmot unknown retry key";
+    let key = SqlCipherKey::new(key_text).unwrap();
+    let mut alice = session(&alice_path, &key, b"alice-unknown-retry");
+    let mut bob = session(
+        dir.path().join("bob-unknown-retry.sqlite"),
+        &key,
+        b"bob-unknown-retry",
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "unknown retry".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let (create_pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let endpoint = TransportEndpoint("wss://unknown-retry.example".into());
+    let adapter = RecordingAdapter::default();
+    let transport_event_id = MessageId::new(vec![0xE7; 32]);
+    adapter.report_message_id_next(transport_event_id.clone());
+    adapter.report_message_id_next(transport_event_id.clone());
+    adapter.fail_endpoints_as(
+        vec![endpoint.clone()],
+        TransportEndpointFailureKind::PossiblyExposed,
+    );
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint(
+        "wss://unknown-retry-inbox.example".into(),
+    )])
+    .with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let wall = Arc::new(TestWallClock::new(100_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let unresolved = runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("possibly exposed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    assert!(unresolved.pending.is_empty());
+    assert_eq!(unresolved.unresolved_publishes.len(), 1);
+    assert_eq!(
+        unresolved.unresolved_publishes[0].message_id,
+        transport_event_id
+    );
+    let first_attempt = adapter.publishes()[0].clone();
+
+    // The endpoint could have forwarded these exact bytes even though its OK
+    // was lost. A peer applying them proves sender rollback would split state.
+    bob.ingest(first_attempt.message.clone()).await.unwrap();
+    let convergence_delay = bob
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+        .expect("buffered commit must open a convergence pass");
+    tokio::time::sleep(Duration::from_millis(convergence_delay.saturating_add(1))).await;
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
+    drop(runtime);
+
+    adapter.error_for_endpoints(Vec::new());
+    let reopened = session(
+        &alice_path,
+        &SqlCipherKey::new(key_text).unwrap(),
+        b"alice-unknown-retry",
+    );
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let deferred = restarted.resume_outbound_fanouts().await.unwrap();
+    assert!(deferred.reports.is_empty());
+    assert_eq!(adapter.publishes().len(), 1);
+
+    wall.set(100_030);
+    let recovered = restarted.resume_outbound_fanouts().await.unwrap();
+    assert!(matches!(
+        recovered.pending.as_slice(),
+        [PendingResolution::Confirmed { .. }]
+    ));
+    assert_eq!(restarted.session().epoch(&group_id).unwrap().0, 2);
+    assert_eq!(recovered.reports[0].message_id, transport_event_id);
+    assert!(restarted.session().outbound_fanouts().unwrap().is_empty());
+    let attempts = adapter.publishes();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].message.id, attempts[1].message.id);
+    assert_eq!(attempts[0].message.payload, attempts[1].message.payload);
+}
+
+#[tokio::test]
+async fn ambiguous_application_publish_is_retained_without_definite_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot unknown app message key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice-unknown-app.sqlite"),
+        &key,
+        b"alice-unknown-app",
+    );
+    let mut bob = session(
+        dir.path().join("bob-unknown-app.sqlite"),
+        &key,
+        b"bob-unknown-app",
+    );
+    let alice_id = alice.self_id();
+    let alice_hex = hex::encode(alice_id.as_slice());
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "unknown app message".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let (create_pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+    let endpoint = TransportEndpoint("wss://unknown-app.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.error_for_endpoints(vec![endpoint.clone()]);
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint(
+        "wss://unknown-app-inbox.example".into(),
+    )])
+    .with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter,
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let payload = app_payload_for(&alice_hex, b"only one semantic message");
+    let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
+
+    let effects = runtime
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .unwrap();
+
+    assert!(effects.failures.is_empty());
+    assert!(effects.published_app_messages.is_empty());
+    assert_eq!(effects.unresolved_app_messages.len(), 1);
+    assert_eq!(effects.unresolved_app_messages[0].group_id, group_id);
+    assert_eq!(effects.unresolved_app_messages[0].app_event_id, app_event_id);
+    assert_eq!(
+        effects.unresolved_app_messages[0].reason,
+        marmot_account::UnresolvedPublishReason::AcknowledgementUnknown
+    );
+    assert_eq!(runtime.session().outbound_fanouts().unwrap().len(), 1);
 }
 
 /// The production-adapter partial-accept shape: one relay accepts while its
@@ -189,8 +424,29 @@ async fn frozen_fanout_whole_call_adapter_errors_are_terminal() {
 /// "everything failed".
 #[tokio::test]
 async fn frozen_fanout_partial_accept_with_sibling_adapter_errors_confirms_mls() {
-    assert_frozen_fanout_case(Some(0), &[1, 2]).await;
-    assert_frozen_fanout_case(Some(2), &[0, 1]).await;
+    assert_frozen_fanout_case(Some(0), &[1, 2], None, true).await;
+    assert_frozen_fanout_case(Some(2), &[0, 1], None, true).await;
+    // Accepted + explicit rejection + acknowledgement-unknown remains
+    // confirmed while retaining only the unresolved endpoint.
+    assert_frozen_fanout_case(Some(0), &[2], None, true).await;
+}
+
+#[tokio::test]
+async fn frozen_fanout_typed_unavailable_is_retryable_but_rejection_is_terminal() {
+    assert_frozen_fanout_case(
+        None,
+        &[0, 1, 2],
+        Some(TransportEndpointFailureKind::RetryableUnavailable),
+        true,
+    )
+    .await;
+    assert_frozen_fanout_case(
+        None,
+        &[0, 1, 2],
+        Some(TransportEndpointFailureKind::TerminalRejected),
+        false,
+    )
+    .await;
 }
 
 async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {

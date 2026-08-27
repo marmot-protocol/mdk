@@ -27,8 +27,10 @@ use cgka_traits::transport::{
 use cgka_traits::{
     EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId, OutboundFanout,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointReceipt,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
+    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
@@ -340,6 +342,7 @@ struct RecordingAdapterInner {
     accepted_counts: Mutex<VecDeque<usize>>,
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
+    error_kind: Mutex<Option<TransportEndpointFailureKind>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -391,6 +394,16 @@ impl RecordingAdapter {
     /// endpoints all sit in this set returns `Err` instead of a report.
     fn error_for_endpoints(&self, endpoints: Vec<TransportEndpoint>) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
+        *self.inner.error_kind.lock().unwrap() = None;
+    }
+
+    fn fail_endpoints_as(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        kind: TransportEndpointFailureKind,
+    ) {
+        *self.inner.error_endpoints.lock().unwrap() = endpoints;
+        *self.inner.error_kind.lock().unwrap() = Some(kind);
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -478,6 +491,34 @@ impl TransportAdapter for RecordingAdapter {
                     .iter()
                     .all(|endpoint| error_endpoints.contains(endpoint))
             {
+                if let Some(kind) = *self.inner.error_kind.lock().unwrap() {
+                    let failures = request
+                        .target
+                        .endpoints()
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| TransportEndpointFailure {
+                            endpoint,
+                            reason: "injected typed endpoint failure".into(),
+                            kind,
+                            rejection_category: None,
+                        })
+                        .collect();
+                    let message_id = self
+                        .inner
+                        .reported_message_ids
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(request.message.id);
+                    return Err(TransportAdapterError::PublishEndpoints(
+                        TransportPublishFailure::with_endpoint_failures(
+                            "injected typed endpoint failure",
+                            failures,
+                        )
+                        .with_message_id(message_id),
+                    ));
+                }
                 return Err(TransportAdapterError::Publish(
                     "endpoint-policy adapter error".into(),
                 ));
@@ -504,7 +545,19 @@ impl TransportAdapter for RecordingAdapter {
                         accepted_at: None,
                     })
                     .collect(),
-                failed: Vec::new(),
+                failed: request
+                    .target
+                    .endpoints()
+                    .iter()
+                    .filter(|endpoint| !accepted_endpoints.contains(endpoint))
+                    .cloned()
+                    .map(|endpoint| TransportEndpointFailure {
+                        endpoint,
+                        reason: "injected explicit relay rejection".into(),
+                        kind: TransportEndpointFailureKind::TerminalRejected,
+                        rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                    })
+                    .collect(),
                 required_acks: request.required_acks,
             });
         }

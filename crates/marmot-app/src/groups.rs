@@ -2287,10 +2287,15 @@ pub(crate) fn send_summary_from_effects(
     effects: &marmot_account::AccountDeviceEffects,
 ) -> SendSummary {
     SendSummary {
-        published: effects.reports.len(),
+        published: effects
+            .reports
+            .iter()
+            .filter(|report| report.accepted_count() > 0)
+            .count(),
         message_ids: effects
             .reports
             .iter()
+            .filter(|report| report.accepted_count() > 0)
             .map(|report| hex::encode(report.message_id.as_slice()))
             .collect(),
         accept_disposition: accept_disposition_from_effects(effects),
@@ -2311,7 +2316,9 @@ pub(crate) fn send_summary_from_effects(
 pub(crate) fn accept_disposition_from_effects(
     effects: &marmot_account::AccountDeviceEffects,
 ) -> cgka_traits::SendAcceptDisposition {
-    if effects.queued.is_empty() {
+    if !effects.unresolved_publishes.is_empty() {
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    } else if effects.queued.is_empty() {
         cgka_traits::SendAcceptDisposition::Published
     } else {
         cgka_traits::SendAcceptDisposition::AcceptedPending
@@ -2568,7 +2575,8 @@ mod fail_if_publish_failed_tests {
     use cgka_traits::engine_state::PendingStateRef;
     use cgka_traits::{GroupId, MemberId, MessageId};
     use marmot_account::{
-        AccountDeviceEffects, PendingResolution, PublishFailure, WelcomeDeliveryFailure,
+        AccountDeviceEffects, PendingResolution, PublishFailure, UnresolvedPublish,
+        UnresolvedPublishReason, WelcomeDeliveryFailure,
     };
 
     fn failure(reason: &str) -> PublishFailure {
@@ -2586,6 +2594,21 @@ mod fail_if_publish_failed_tests {
     fn no_failures_is_ok() {
         let effects = AccountDeviceEffects::default();
         assert!(fail_if_publish_failed(&effects).is_ok());
+    }
+
+    #[test]
+    fn unresolved_publish_is_non_failure_with_typed_completion_unknown_disposition() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.unresolved_publishes.push(UnresolvedPublish {
+            message_id: MessageId::new(vec![0xac; 32]),
+            reason: UnresolvedPublishReason::AcknowledgementUnknown,
+        });
+
+        assert!(fail_if_publish_failed(&effects).is_ok());
+        assert_eq!(
+            accept_disposition_from_effects(&effects),
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
     }
 
     // mdk#428: a confirmed-but-partial create/commit (pending Confirmed,

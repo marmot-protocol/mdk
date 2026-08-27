@@ -26,8 +26,9 @@ use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome,
     StorageError, Timestamp, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    TransportDelivery, TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -57,6 +58,8 @@ const MAINTENANCE_QUIET_SECS: u64 = 60;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
 const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
+const FROZEN_FANOUT_RETRY_BASE_MS: u64 = 30 * 1_000;
+const FROZEN_FANOUT_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. Completion order therefore cannot reorder reports or select a
@@ -2121,6 +2124,7 @@ where
                     source_epoch,
                     retention,
                 } => {
+                    let engine_message_id = msg.id.clone();
                     let reports_before = output.reports.len();
                     let status =
                         Box::pin(self.publish_one(msg, None, output, queue, context.clone()))
@@ -2148,6 +2152,21 @@ where
                                 "accepted application publish had no transport report"
                             );
                         }
+                    } else if status.retry_deferred
+                        && let Some(unresolved) = output
+                            .unresolved_publishes
+                            .iter()
+                            .rev()
+                            .find(|unresolved| unresolved.message_id == engine_message_id)
+                    {
+                        output
+                            .unresolved_app_messages
+                            .push(UnresolvedApplicationMessage {
+                                group_id,
+                                app_event_id,
+                                message_id: engine_message_id,
+                                reason: unresolved.reason,
+                            });
                     }
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
@@ -3062,7 +3081,7 @@ where
                 },
                 pending,
                 pending_group_id,
-                0,
+                self.wall_clock.now().0.saturating_mul(1_000),
             ) {
                 Ok(fanout) => fanout,
                 Err(error) => {
@@ -3108,10 +3127,16 @@ where
         self.resolve_outbound_fanout_mls(&mut fanout, output, queue)
             .await?;
         let endpoints = fanout.request().target.endpoints().to_vec();
-        let outstanding = fanout.outstanding_target_indexes();
-        if !outstanding.is_empty() {
-            for &index in &outstanding {
-                fanout.mark_attempt_started(index)?;
+        let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
+        let due = fanout
+            .outstanding_target_indexes()
+            .into_iter()
+            .filter(|&index| frozen_fanout_target_retry_due(&fanout, index, now_ms))
+            .collect::<Vec<_>>();
+        let attempted_any = !due.is_empty();
+        if !due.is_empty() {
+            for &index in &due {
+                fanout.mark_attempt_started_at(index, now_ms)?;
             }
             self.session.put_outbound_fanout(&fanout)?;
 
@@ -3127,7 +3152,7 @@ where
             // one-awaited-ack-at-a-time serialization.
             let adapter = &self.adapter;
             let account_id = fanout.request().account_id.clone();
-            let attempts = outstanding.iter().map(|&index| {
+            let attempts = due.iter().map(|&index| {
                 let attempt = TransportPublishRequest {
                     account_id: account_id.clone(),
                     message: fanout.request().message.clone(),
@@ -3140,20 +3165,44 @@ where
                 async move { (index, adapter.publish(attempt).await) }
             });
             for (index, result) in futures::future::join_all(attempts).await {
-                let accepted = match result {
+                let endpoint = endpoints[index].clone();
+                let failure = match result {
                     Ok(report) => {
                         fanout.record_published_message_id(report.message_id)?;
-                        report
+                        if report
                             .accepted
                             .iter()
-                            .any(|receipt| receipt.endpoint == endpoints[index])
+                            .any(|receipt| receipt.endpoint == endpoint)
+                        {
+                            fanout.mark_target_accepted(index)?;
+                            None
+                        } else {
+                            Some(
+                                report
+                                    .failed
+                                    .iter()
+                                    .find(|failure| failure.endpoint == endpoint)
+                                    .cloned()
+                                    .unwrap_or_else(|| ambiguous_endpoint_failure(endpoint)),
+                            )
+                        }
                     }
-                    Err(_) => false,
+                    Err(error) => {
+                        if let Some(message_id) = error.publish_message_id() {
+                            fanout.record_published_message_id(message_id.clone())?;
+                        }
+                        Some(
+                            error
+                                .publish_endpoint_failures()
+                                .iter()
+                                .find(|failure| failure.endpoint == endpoint)
+                                .cloned()
+                                .unwrap_or_else(|| ambiguous_endpoint_failure(endpoint)),
+                        )
+                    }
                 };
-                if accepted {
-                    fanout.mark_target_accepted(index)?;
-                } else {
-                    fanout.mark_target_failed(index)?;
+                if let Some(failure) = failure {
+                    fanout.record_target_failure(index, failure)?;
                 }
             }
             self.session.put_outbound_fanout(&fanout)?;
@@ -3162,13 +3211,24 @@ where
         }
 
         let report = frozen_fanout_report(&fanout);
+        let fanout_outcome = fanout.outcome();
+        let possible_ambiguous_exposure = fanout.possible_exposure();
         let status = PublishStatus {
             met_required_acks: report.met_required_acks(),
             accepted_by_any_endpoint: report.accepted_count() > 0,
-            possible_ambiguous_exposure: false,
-            retry_deferred: false,
+            possible_ambiguous_exposure,
+            retry_deferred: fanout_outcome.outstanding_targets > 0,
         };
-        if !status.met_required_acks {
+        if fanout_outcome.outstanding_targets > 0 {
+            output.unresolved_publishes.push(UnresolvedPublish {
+                message_id: report.message_id.clone(),
+                reason: if possible_ambiguous_exposure {
+                    UnresolvedPublishReason::AcknowledgementUnknown
+                } else {
+                    UnresolvedPublishReason::RetryableUnavailable
+                },
+            });
+        } else if !status.met_required_acks {
             output.failures.push(PublishFailure {
                 message_id: report.message_id.clone(),
                 reason: "insufficient publish acknowledgements".into(),
@@ -3178,24 +3238,26 @@ where
         // endpoint-free publish row records the separate terminal fanout edge;
         // relay URLs stay solely in the encrypted fanout record and never enter
         // this privacy-safe audit summary.
-        self.session.record_audit_event(
-            fanout.group_id(),
-            context,
-            AuditEventKind::PublishOutcome {
-                msg_id: hex::encode(report.message_id.as_slice()),
-                artifact_kind: None,
-                target_kind: "frozen_group_fanout".into(),
-                relay_url: None,
-                accepted_relay_urls: Vec::new(),
-                failed_relays: Vec::new(),
-                required_acks: report.required_acks as u64,
-                met_required_acks: status.met_required_acks,
-                transport: Some(publish_wire_metadata(&fanout.request().message)),
-            },
-        );
-        output.reports.push(report);
-        output.fanout.push(fanout.outcome());
-        if fanout.outcome().fanout_complete
+        if attempted_any {
+            self.session.record_audit_event(
+                fanout.group_id(),
+                context,
+                AuditEventKind::PublishOutcome {
+                    msg_id: hex::encode(report.message_id.as_slice()),
+                    artifact_kind: None,
+                    target_kind: "frozen_group_fanout".into(),
+                    relay_url: None,
+                    accepted_relay_urls: Vec::new(),
+                    failed_relays: Vec::new(),
+                    required_acks: report.required_acks as u64,
+                    met_required_acks: status.met_required_acks,
+                    transport: Some(publish_wire_metadata(&fanout.request().message)),
+                },
+            );
+            output.reports.push(report);
+        }
+        output.fanout.push(fanout_outcome.clone());
+        if fanout_outcome.fanout_complete
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
         {
             self.session.delete_outbound_fanout(fanout.message_id())?;
@@ -3223,6 +3285,7 @@ where
             output.absorb_session_effects(effects, queue);
         } else if outcome.fanout_complete
             && outcome.accepted_targets == 0
+            && !fanout.possible_exposure()
             && let Some(pending) = fanout.pending_ref()
         {
             let effects = self.session.publish_failed_fanout(pending, fanout).await?;
@@ -3633,11 +3696,39 @@ fn publish_target_with_endpoints(
     }
 }
 
+fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointFailure {
+    TransportEndpointFailure {
+        endpoint,
+        reason: "publish acknowledgement unknown".into(),
+        kind: TransportEndpointFailureKind::PossiblyExposed,
+        rejection_category: None,
+    }
+}
+
+fn frozen_fanout_target_retry_due(fanout: &OutboundFanout, index: usize, now_ms: u64) -> bool {
+    use cgka_traits::FanoutTargetStatus;
+
+    match fanout.target_status(index) {
+        Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::Attempting) => true,
+        Some(FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::RetryableUnavailable) => {
+            let attempt_count = fanout.target_attempt_count(index);
+            let shift = attempt_count.saturating_sub(1).min(7);
+            let backoff_ms = FROZEN_FANOUT_RETRY_BASE_MS
+                .saturating_mul(1_u64 << shift)
+                .min(FROZEN_FANOUT_RETRY_MAX_MS);
+            fanout
+                .target_last_attempt_at_ms(index)
+                .is_none_or(|last| now_ms >= last.saturating_add(backoff_ms))
+        }
+        Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => false,
+    }
+}
+
 fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
     let endpoints = fanout.request().target.endpoints();
     let mut accepted = Vec::new();
     let mut failed = Vec::new();
-    for (endpoint, status) in endpoints.iter().zip(fanout.target_statuses()) {
+    for (index, (endpoint, status)) in endpoints.iter().zip(fanout.target_statuses()).enumerate() {
         match status {
             cgka_traits::FanoutTargetStatus::Accepted => {
                 accepted.push(TransportEndpointReceipt {
@@ -3646,14 +3737,23 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
                 });
             }
             cgka_traits::FanoutTargetStatus::Failed => {
-                failed.push(TransportEndpointFailure {
-                    endpoint: endpoint.clone(),
-                    reason: "publish attempt failed".into(),
-                    rejection_category: None,
-                });
+                failed.push(fanout.target_failure(index).cloned().unwrap_or_else(|| {
+                    TransportEndpointFailure {
+                        endpoint: endpoint.clone(),
+                        reason: "publish attempt failed before exposure".into(),
+                        kind: TransportEndpointFailureKind::NotExposed,
+                        rejection_category: None,
+                    }
+                }));
             }
             cgka_traits::FanoutTargetStatus::NotAttempted
             | cgka_traits::FanoutTargetStatus::Attempting => {}
+            cgka_traits::FanoutTargetStatus::PossiblyExposed
+            | cgka_traits::FanoutTargetStatus::RetryableUnavailable => {
+                if let Some(failure) = fanout.target_failure(index) {
+                    failed.push(failure.clone());
+                }
+            }
         }
     }
     TransportPublishReport {
@@ -3947,6 +4047,13 @@ pub struct AccountDeviceEffects {
     /// Privacy-safe summaries separate MLS release from target fanout completion.
     pub fanout: Vec<OutboundFanoutOutcome>,
     pub failures: Vec<PublishFailure>,
+    /// Exact signed events retained because publication completion is not yet
+    /// known. This is a typed non-failure result: callers must not create a
+    /// semantically new send to recover it.
+    pub unresolved_publishes: Vec<UnresolvedPublish>,
+    /// Application-message identity attached to unresolved publication so app
+    /// consumers can keep exactly the affected local row in a sending state.
+    pub unresolved_app_messages: Vec<UnresolvedApplicationMessage>,
     /// Application messages accepted by at least one transport endpoint,
     /// carrying source-state metadata captured by the exact MLS encryption
     /// operation and the adapter-visible transport id.
@@ -3993,6 +4100,10 @@ impl AccountDeviceEffects {
             .append(&mut other.pending_convergence);
         self.reports.append(&mut other.reports);
         self.failures.append(&mut other.failures);
+        self.unresolved_publishes
+            .append(&mut other.unresolved_publishes);
+        self.unresolved_app_messages
+            .append(&mut other.unresolved_app_messages);
         self.published_app_messages
             .append(&mut other.published_app_messages);
         self.welcome_failures.append(&mut other.welcome_failures);
@@ -4018,6 +4129,26 @@ pub struct AccountIngestEffects {
 pub struct PublishFailure {
     pub message_id: cgka_traits::MessageId,
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnresolvedPublishReason {
+    AcknowledgementUnknown,
+    RetryableUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedPublish {
+    pub message_id: cgka_traits::MessageId,
+    pub reason: UnresolvedPublishReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedApplicationMessage {
+    pub group_id: GroupId,
+    pub app_event_id: String,
+    pub message_id: cgka_traits::MessageId,
+    pub reason: UnresolvedPublishReason,
 }
 
 /// A welcome left undelivered by a confirmed group create/evolution (mdk#352).

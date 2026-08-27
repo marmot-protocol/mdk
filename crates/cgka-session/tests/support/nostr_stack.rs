@@ -20,9 +20,9 @@ use cgka_traits::app_components::{
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt,
-    TransportGroupSubscription, TransportGroupSync, TransportMessage, TransportPublishReport,
-    TransportPublishRequest, TransportPublishTarget,
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync, TransportMessage,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use sha2::{Digest, Sha256};
 use storage_sqlite::SqlCipherKey;
@@ -128,6 +128,7 @@ impl NostrRelayClient for FakeRelayClient {
                 .map(|endpoint| TransportEndpointFailure {
                     endpoint,
                     reason: "not accepted by in-memory relay".into(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
                     rejection_category: None,
                 })
                 .collect(),

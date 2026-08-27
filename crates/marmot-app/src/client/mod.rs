@@ -3017,6 +3017,9 @@ impl AppClient {
         let published = effects.published_app_messages.iter().find(|published| {
             published.group_id == *group_id && published.app_event_id == app_event_id
         });
+        let completion_unknown = effects.unresolved_app_messages.iter().any(|unresolved| {
+            unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
+        });
         let source_message_id_hex =
             published.map(|published| hex::encode(published.message_id.as_slice()));
         let source_state =
@@ -3055,7 +3058,7 @@ impl AppClient {
         Ok((
             event,
             SendSummary {
-                published: effects.reports.len(),
+                published: usize::from(published.is_some()),
                 message_ids: vec![app_event_id],
                 // Per-message, not per-pass: `published` above matched this
                 // exact `app_event_id` in `effects.published_app_messages`. A
@@ -3065,6 +3068,8 @@ impl AppClient {
                 // accepted and retained it (mdk#1177).
                 accept_disposition: if published.is_some() {
                     cgka_traits::SendAcceptDisposition::Published
+                } else if completion_unknown {
+                    cgka_traits::SendAcceptDisposition::CompletionUnknown
                 } else {
                     cgka_traits::SendAcceptDisposition::AcceptedPending
                 },

@@ -164,25 +164,37 @@ impl TransportPublishRequest {
     }
 }
 
-/// Durable first-attempt state for one endpoint in a frozen publish fanout.
+/// Durable state for one endpoint in a frozen publish fanout.
 ///
 /// `Attempting` is written before the external send. A process that restarts
 /// with an `Attempting` target treats it as outstanding and safely repeats the
-/// same already-signed event bytes. Terminal callbacks are idempotent: once a
-/// target is `Accepted` or `Failed`, later duplicate or contradictory results
-/// do not change it.
+/// same already-signed event bytes. Ambiguous and transient outcomes remain
+/// outstanding so that exact event can be retried. Terminal callbacks are
+/// idempotent: once a target is `Accepted` or `Failed`, later duplicate or
+/// contradictory results do not change it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FanoutTargetStatus {
     NotAttempted,
     Attempting,
     Accepted,
+    /// An explicit rejection or terminal no-exposure outcome.
     Failed,
+    /// The endpoint may have exposed the event but did not acknowledge it.
+    PossiblyExposed,
+    /// The endpoint was transiently unavailable without a claim of exposure.
+    RetryableUnavailable,
 }
 
 impl FanoutTargetStatus {
     pub fn is_outstanding(self) -> bool {
-        matches!(self, Self::NotAttempted | Self::Attempting)
+        matches!(
+            self,
+            Self::NotAttempted
+                | Self::Attempting
+                | Self::PossiblyExposed
+                | Self::RetryableUnavailable
+        )
     }
 
     pub fn is_terminal(self) -> bool {
@@ -220,6 +232,14 @@ pub struct OutboundFanout {
     #[serde(default)]
     published_message_id: Option<MessageId>,
     target_statuses: Vec<FanoutTargetStatus>,
+    #[serde(default)]
+    target_failures: Vec<Option<TransportEndpointFailure>>,
+    #[serde(default)]
+    target_attempt_counts: Vec<u32>,
+    #[serde(default)]
+    target_last_attempt_at_ms: Vec<Option<u64>>,
+    #[serde(default)]
+    target_possible_exposure: Vec<bool>,
     mls_state: FanoutMlsState,
     created_at_ms: u64,
 }
@@ -251,6 +271,10 @@ impl OutboundFanout {
             group_id: target_group_id.or(pending_group_id),
             published_message_id: None,
             target_statuses: vec![FanoutTargetStatus::NotAttempted; target_count],
+            target_failures: vec![None; target_count],
+            target_attempt_counts: vec![0; target_count],
+            target_last_attempt_at_ms: vec![None; target_count],
+            target_possible_exposure: vec![false; target_count],
             mls_state: pending.map_or(FanoutMlsState::NotApplicable, FanoutMlsState::Pending),
             created_at_ms,
         })
@@ -288,6 +312,25 @@ impl OutboundFanout {
         self.target_statuses.get(index).copied()
     }
 
+    pub fn target_failure(&self, index: usize) -> Option<&TransportEndpointFailure> {
+        self.target_failures.get(index).and_then(Option::as_ref)
+    }
+
+    pub fn target_attempt_count(&self, index: usize) -> u32 {
+        self.target_attempt_counts.get(index).copied().unwrap_or(0)
+    }
+
+    pub fn target_last_attempt_at_ms(&self, index: usize) -> Option<u64> {
+        self.target_last_attempt_at_ms.get(index).copied().flatten()
+    }
+
+    pub fn possible_exposure(&self) -> bool {
+        self.target_possible_exposure.iter().any(|exposed| *exposed)
+            || self
+                .target_statuses
+                .contains(&FanoutTargetStatus::PossiblyExposed)
+    }
+
     pub fn pending_ref(&self) -> Option<PendingStateRef> {
         match self.mls_state {
             FanoutMlsState::Pending(pending) => Some(pending),
@@ -311,19 +354,34 @@ impl OutboundFanout {
 
     /// Persist the send-before-side-effect edge for one target.
     ///
-    /// Returns `true` only for the first `NotAttempted -> Attempting`
-    /// transition. Re-marking an `Attempting` target after restart is harmless;
-    /// terminal targets remain unchanged.
+    /// Returns `true` when an outstanding target begins or resumes an attempt.
+    /// Re-marking an `Attempting` target after restart is safe and increments
+    /// the durable attempt counter; terminal targets remain unchanged.
     pub fn mark_attempt_started(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
-        let status = self.target_status_mut(index)?;
-        match status {
-            FanoutTargetStatus::NotAttempted => {
-                *status = FanoutTargetStatus::Attempting;
+        self.mark_attempt_started_at(index, self.created_at_ms)
+    }
+
+    pub fn mark_attempt_started_at(
+        &mut self,
+        index: usize,
+        attempted_at_ms: u64,
+    ) -> Result<bool, TransportAdapterError> {
+        self.ensure_target_metadata_len();
+        match self.target_status(index).ok_or_else(|| {
+            TransportAdapterError::Other("fanout target index is out of bounds".into())
+        })? {
+            FanoutTargetStatus::NotAttempted
+            | FanoutTargetStatus::Attempting
+            | FanoutTargetStatus::PossiblyExposed
+            | FanoutTargetStatus::RetryableUnavailable => {
+                self.target_statuses[index] = FanoutTargetStatus::Attempting;
+                self.target_attempt_counts[index] =
+                    self.target_attempt_counts[index].saturating_add(1);
+                self.target_last_attempt_at_ms[index] = Some(attempted_at_ms);
+                self.target_failures[index] = None;
                 Ok(true)
             }
-            FanoutTargetStatus::Attempting
-            | FanoutTargetStatus::Accepted
-            | FanoutTargetStatus::Failed => Ok(false),
+            FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed => Ok(false),
         }
     }
 
@@ -333,6 +391,45 @@ impl OutboundFanout {
 
     pub fn mark_target_failed(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
         self.mark_target_terminal(index, FanoutTargetStatus::Failed)
+    }
+
+    pub fn record_target_failure(
+        &mut self,
+        index: usize,
+        failure: TransportEndpointFailure,
+    ) -> Result<bool, TransportAdapterError> {
+        if self.request.target.endpoints().get(index) != Some(&failure.endpoint) {
+            return Err(TransportAdapterError::Other(
+                "endpoint failure does not match frozen fanout target".into(),
+            ));
+        }
+        self.ensure_target_metadata_len();
+        if failure.kind == TransportEndpointFailureKind::PossiblyExposed {
+            self.target_possible_exposure[index] = true;
+        }
+        let next = if self.target_possible_exposure[index] {
+            FanoutTargetStatus::PossiblyExposed
+        } else {
+            match failure.kind {
+                TransportEndpointFailureKind::TerminalRejected
+                | TransportEndpointFailureKind::NotExposed => FanoutTargetStatus::Failed,
+                TransportEndpointFailureKind::PossiblyExposed => {
+                    FanoutTargetStatus::PossiblyExposed
+                }
+                TransportEndpointFailureKind::RetryableUnavailable => {
+                    FanoutTargetStatus::RetryableUnavailable
+                }
+            }
+        };
+        let current = self.target_status(index).ok_or_else(|| {
+            TransportAdapterError::Other("fanout target index is out of bounds".into())
+        })?;
+        if current.is_terminal() {
+            return Ok(false);
+        }
+        self.target_statuses[index] = next;
+        self.target_failures[index] = Some(failure);
+        Ok(true)
     }
 
     pub fn record_published_message_id(
@@ -419,7 +516,27 @@ impl OutboundFanout {
         let immutable_matches = self.request == previous.request
             && self.group_id == previous.group_id
             && self.created_at_ms == previous.created_at_ms
-            && self.target_statuses.len() == previous.target_statuses.len();
+            && self.target_statuses.len() == previous.target_statuses.len()
+            && fanout_metadata_len_is_compatible(
+                self.target_failures.len(),
+                previous.target_failures.len(),
+                self.target_statuses.len(),
+            )
+            && fanout_metadata_len_is_compatible(
+                self.target_attempt_counts.len(),
+                previous.target_attempt_counts.len(),
+                self.target_statuses.len(),
+            )
+            && fanout_metadata_len_is_compatible(
+                self.target_last_attempt_at_ms.len(),
+                previous.target_last_attempt_at_ms.len(),
+                self.target_statuses.len(),
+            )
+            && fanout_metadata_len_is_compatible(
+                self.target_possible_exposure.len(),
+                previous.target_possible_exposure.len(),
+                self.target_statuses.len(),
+            );
         let published_id_advances =
             match (&previous.published_message_id, &self.published_message_id) {
                 (None, _) => true,
@@ -433,8 +550,14 @@ impl OutboundFanout {
                 .iter()
                 .zip(&previous.target_statuses)
                 .all(|(next, prior)| target_status_advances(*prior, *next));
+        let exposure_advances = previous.target_possible_exposure.is_empty()
+            || self
+                .target_possible_exposure
+                .iter()
+                .zip(&previous.target_possible_exposure)
+                .all(|(next, prior)| !*prior || *next);
         let mls_advances = mls_state_advances(previous.mls_state, self.mls_state);
-        if targets_advance && mls_advances {
+        if targets_advance && exposure_advances && mls_advances {
             Ok(())
         } else {
             Err(TransportAdapterError::Other(
@@ -450,6 +573,14 @@ impl OutboundFanout {
         self.target_statuses.get_mut(index).ok_or_else(|| {
             TransportAdapterError::Other("fanout target index is out of bounds".into())
         })
+    }
+
+    fn ensure_target_metadata_len(&mut self) {
+        let target_count = self.target_statuses.len();
+        self.target_failures.resize(target_count, None);
+        self.target_attempt_counts.resize(target_count, 0);
+        self.target_last_attempt_at_ms.resize(target_count, None);
+        self.target_possible_exposure.resize(target_count, false);
     }
 
     fn mark_target_terminal(
@@ -476,9 +607,19 @@ fn target_status_advances(prior: FanoutTargetStatus, next: FanoutTargetStatus) -
                 FanoutTargetStatus::Attempting
             ) | (
                 FanoutTargetStatus::Attempting,
-                FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed
+                FanoutTargetStatus::Accepted
+                    | FanoutTargetStatus::Failed
+                    | FanoutTargetStatus::PossiblyExposed
+                    | FanoutTargetStatus::RetryableUnavailable
+            ) | (
+                FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::RetryableUnavailable,
+                FanoutTargetStatus::Attempting
             )
         )
+}
+
+fn fanout_metadata_len_is_compatible(next: usize, prior: usize, targets: usize) -> bool {
+    (next == targets && (prior == targets || prior == 0)) || (next == 0 && prior == 0)
 }
 
 fn mls_state_advances(prior: FanoutMlsState, next: FanoutMlsState) -> bool {
@@ -549,12 +690,37 @@ impl TransportEndpointRejectionCategory {
     }
 }
 
+/// Exposure and retry semantics for one endpoint publish failure.
+///
+/// This classification is deliberately separate from the human-readable
+/// reason and relay rejection category. Coordinators must make rollback and
+/// retry decisions from this closed vocabulary, never by matching strings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportEndpointFailureKind {
+    /// The endpoint explicitly rejected the event. Repeating the exact event
+    /// without a policy/configuration change is not useful.
+    TerminalRejected,
+    /// The adapter proved that no send attempt crossed its external boundary.
+    NotExposed,
+    /// The event may have been accepted or forwarded, but acknowledgement is
+    /// unknown. This is the conservative default for older serialized data.
+    #[default]
+    PossiblyExposed,
+    /// A pre-send connectivity/resource failure or explicitly retryable relay
+    /// rejection made the endpoint unavailable; the exact event remains
+    /// durably retryable without claiming exposure.
+    RetryableUnavailable,
+}
+
 /// Endpoint-level publish failure. The overall publish may still succeed if
 /// enough other endpoints acknowledge the message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportEndpointFailure {
     pub endpoint: TransportEndpoint,
     pub reason: String,
+    #[serde(default)]
+    pub kind: TransportEndpointFailureKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection_category: Option<TransportEndpointRejectionCategory>,
 }
@@ -567,6 +733,10 @@ pub struct TransportEndpointFailure {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportPublishFailure {
     pub summary: String,
+    /// Deterministic transport-visible id of the exact signed event, when the
+    /// adapter prepared it before publication became unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<MessageId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoint_failures: Vec<TransportEndpointFailure>,
 }
@@ -578,8 +748,14 @@ impl TransportPublishFailure {
     ) -> Self {
         Self {
             summary: summary.into(),
+            message_id: None,
             endpoint_failures,
         }
+    }
+
+    pub fn with_message_id(mut self, message_id: MessageId) -> Self {
+        self.message_id = Some(message_id);
+        self
     }
 }
 
@@ -742,6 +918,13 @@ impl TransportAdapterError {
             _ => &[],
         }
     }
+
+    pub fn publish_message_id(&self) -> Option<&MessageId> {
+        match self {
+            Self::PublishEndpoints(failure) => failure.message_id.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Account-aware network adapter that moves wrapped transport messages.
@@ -886,6 +1069,94 @@ mod tests {
     }
 
     #[test]
+    fn frozen_fanout_ambiguous_failure_remains_outstanding_and_retryable() {
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        fanout.mark_attempt_started_at(0, 100).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://one.example".into()),
+                    reason: "publish acknowledgement unknown".into(),
+                    kind: TransportEndpointFailureKind::PossiblyExposed,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            fanout.target_status(0),
+            Some(FanoutTargetStatus::PossiblyExposed)
+        );
+        assert_eq!(fanout.target_attempt_count(0), 1);
+        assert_eq!(fanout.outcome().outstanding_targets, 3);
+        assert!(!fanout.outcome().fanout_complete);
+
+        let restored: OutboundFanout =
+            serde_json::from_slice(&serde_json::to_vec(&fanout).unwrap()).unwrap();
+        assert_eq!(restored, fanout);
+    }
+
+    #[test]
+    fn later_rejection_cannot_erase_prior_possible_exposure() {
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        fanout.mark_attempt_started_at(0, 100).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://one.example".into()),
+                    reason: "acknowledgement unknown".into(),
+                    kind: TransportEndpointFailureKind::PossiblyExposed,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
+        fanout.mark_attempt_started_at(0, 200).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    endpoint: TransportEndpoint("wss://one.example".into()),
+                    reason: "later explicit rejection".into(),
+                    kind: TransportEndpointFailureKind::TerminalRejected,
+                    rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                },
+            )
+            .unwrap();
+
+        assert!(fanout.possible_exposure());
+        assert_eq!(
+            fanout.target_status(0),
+            Some(FanoutTargetStatus::PossiblyExposed)
+        );
+        assert!(!fanout.outcome().fanout_complete);
+    }
+
+    #[test]
+    fn endpoint_failure_without_kind_deserializes_conservatively() {
+        let failure: TransportEndpointFailure = serde_json::from_value(serde_json::json!({
+            "endpoint": "wss://relay.example",
+            "reason": "legacy adapter error"
+        }))
+        .unwrap();
+
+        assert_eq!(failure.kind, TransportEndpointFailureKind::PossiblyExposed);
+    }
+
+    #[test]
     fn frozen_fanout_round_trip_preserves_bytes_id_and_original_targets() {
         let request = fanout_request();
         let original_bytes = request.message.payload.clone();
@@ -921,6 +1192,7 @@ mod tests {
                 .map(|i| TransportEndpointFailure {
                     endpoint: TransportEndpoint(format!("wss://failed-{i}.example")),
                     reason: "unreachable".into(),
+                    kind: TransportEndpointFailureKind::RetryableUnavailable,
                     rejection_category: None,
                 })
                 .collect(),
