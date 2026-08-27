@@ -1252,7 +1252,8 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
-    /// End-of-stored-events progress across this account's live subscriptions.
+    /// End-of-stored-events progress across this account activation's frozen
+    /// endpoint coverage snapshot.
     ///
     /// The epoch-gap backfill drain reads this to tell a relay that has
     /// finished replaying stored history from one that has simply gone quiet.
