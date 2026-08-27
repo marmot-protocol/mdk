@@ -411,6 +411,61 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 }
 
 #[test]
+fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    insert_protocol_group_marker(&store, &[0xbb]);
+
+    let sorted = |mut intents: Vec<StoredEpochBackfillIntent>| {
+        intents.sort_by(|left, right| left.group_id_hex.cmp(&right.group_id_hex));
+        intents
+    };
+
+    let aa_epoch_7 = StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 7,
+    };
+    let aa_epoch_8 = StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 8,
+    };
+    let bb_epoch_3 = StoredEpochBackfillIntent {
+        group_id_hex: "bb".to_owned(),
+        stalled_epoch: 3,
+    };
+    store
+        .arm_epoch_backfill_intents(&[aa_epoch_8.clone(), bb_epoch_3.clone()])
+        .unwrap();
+    store
+        .arm_epoch_backfill_intents(std::slice::from_ref(&aa_epoch_7))
+        .unwrap();
+    assert_eq!(
+        sorted(store.pending_epoch_backfill_intents().unwrap()),
+        vec![aa_epoch_8.clone(), bb_epoch_3.clone()],
+        "an older concurrent arm must not regress the durable epoch, even without app projection rows"
+    );
+
+    store
+        .clear_epoch_backfill_intents(&[aa_epoch_7, bb_epoch_3])
+        .unwrap();
+    assert_eq!(
+        sorted(store.pending_epoch_backfill_intents().unwrap()),
+        vec![aa_epoch_8.clone()],
+        "completion clears exact epochs and preserves newer recovery evidence"
+    );
+
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM cgka_groups WHERE id = ?1", params![&[0xaa_u8]])
+        .unwrap();
+    assert!(
+        store.pending_epoch_backfill_intents().unwrap().is_empty(),
+        "deleting the owning protocol group must consume its recovery intent"
+    );
+}
+
+#[test]
 fn pending_confirmation_group_invites_reads_only_pending_outlines() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     // One applied member group, one pending invite with a welcomer, one

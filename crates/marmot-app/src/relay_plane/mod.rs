@@ -285,6 +285,17 @@ impl MarmotRelayPlane {
         }
     }
 
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    pub(crate) async fn inject_delivery_for_test(&self, delivery: TransportDelivery) -> bool {
+        let sender = account_deliveries_read(&self.inner.transport.account_deliveries)
+            .get(&delivery.account_id)
+            .cloned();
+        match sender {
+            Some(sender) => sender.send(delivery).await.is_ok(),
+            None => false,
+        }
+    }
+
     pub(crate) fn sanitize_relay_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,

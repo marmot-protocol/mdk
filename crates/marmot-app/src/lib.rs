@@ -307,6 +307,17 @@ const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
+/// Maximum wall-clock quantum one epoch-gap backfill drain owns the serial
+/// account worker before it checkpoints its prefix and yields incomplete.
+///
+/// The bound is observed between deliveries, where no engine snapshot guard or
+/// account-state transaction is live. One already-claimed delivery and the
+/// final prefix checkpoint may therefore extend wall-clock time past the
+/// quantum, but the relay receive loop itself cannot monopolize the worker.
+/// Five seconds leaves headroom inside [`APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT`]
+/// for that boundary work while still amortizing relay subscription setup over
+/// useful replay progress.
+pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_secs(5);
 /// How long the epoch-gap backfill drain waits through *silence* for
 /// end-of-stored-events before it gives up and reports an incomplete replay.
 ///
@@ -317,42 +328,36 @@ const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 /// whole-account history query. Only EOSE separates them, and this is the
 /// budget for waiting on it.
 ///
-/// This bounds *consecutive silence*, not the drain. Every delivery resets it,
-/// so there is no cap on total drain time and a relay that trickles one event
-/// inside every window holds the drain open indefinitely. That is deliberate:
-/// the alternative — an overall cap — cuts off exactly the long, working
-/// replays this recovery exists to complete (the 2026-08 field export has one
-/// that ran 59 minutes and delivered 63 events). A drain that keeps delivering
-/// is making progress; what needs bounding is a drain that has stopped, and
-/// this bounds that.
+/// This bounds consecutive silence inside one
+/// [`EPOCH_BACKFILL_EXECUTION_QUANTUM`]. Every delivery resets it. Long working
+/// replays therefore continue across multiple checkpointed quanta instead of
+/// being discarded or holding the worker for their entire wall-clock span.
 ///
 /// Because this budget is only consulted when the receive wait times out, a
 /// relay delivering faster than [`SDK_DRAIN_WAIT`] never reaches it; skipped
-/// deliveries therefore poll the end-of-stored-events gate directly, so a
-/// replay the relays have finished serving ends as soon as they say so rather
-/// than when their traffic stops. That closes the case where the drain had
-/// already won. It does not bound the case where a relay streams events this
-/// account already has and never reports end-of-stored-events: nothing here
-/// ends that drain before its traffic stops or the account worker is aborted
-/// at shutdown. Distinguishing it from a working replay needs the
-/// ingested-versus-skipped split now recorded on the `sync_drain` and
-/// `epoch_stall_backfill_*` audit rows; that residual is filed, not fixed.
+/// deliveries therefore poll the end-of-stored-events gate directly. The
+/// execution quantum independently ends duplicate-only traffic when that gate
+/// never arrives.
 ///
-/// 30 s is chosen to be far longer than any silence a working relay leaves
-/// mid-replay while still short enough that a wedged relay costs one worker
-/// stall rather than an unbounded one, and it is paced against repetition by
-/// [`EPOCH_BACKFILL_RETRY_BACKOFF`].
+/// 30 s remains the conservative consecutive-silence ceiling, but an open
+/// production stream never spends it in one attempt: the 5 s execution quantum
+/// yields first and a later seam resubscribes. Production EOSE completion
+/// therefore requires the gate to report within that quantum (or before an
+/// adapter-closed result). A worker-quantum yield is only a scheduling event:
+/// it paces a later resubscription but does not spend the EOSE-failure budget
+/// or unlock the weaker quiescence fallback. Keeping the budgets distinct
+/// makes long-replay slicing independent from that fallback policy, and
+/// test-policy builds can exercise either boundary directly.
 pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
 /// How long an epoch-gap backfill whose replay went unconfirmed waits before
 /// the automatic seams may try it again, doubling per attempt up to
 /// [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
 ///
 /// Without pacing, the receive seam runs a pending intent after *every* inbound
-/// ingest, so a permanently unconfirmable replay would spend
-/// [`EPOCH_BACKFILL_EOSE_WAIT`] of the serial account worker per delivery,
-/// blocking user commands behind it. The floor matches the maintenance tick
-/// cadence: the slowest automatic seam is the right baseline for how often an
-/// unproductive account-wide replay may repeat.
+/// ingest, so a permanently unconfirmable replay would spend one
+/// [`EPOCH_BACKFILL_EXECUTION_QUANTUM`] per delivery. Productive quantum yields
+/// are exempt; only an unproductive account-wide replay earns this floor,
+/// which matches the maintenance tick cadence.
 pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 /// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
 /// that outlasts this is not going to be resolved by trying harder, and the
@@ -1706,6 +1711,8 @@ impl MarmotApp {
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
+        let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
+        client.restore_persisted_epoch_backfill_intents(persisted_backfills);
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
@@ -3165,6 +3172,38 @@ impl MarmotApp {
         Ok(self
             .account_storage(label)?
             .account_group_self_memberships()?)
+    }
+
+    pub(crate) fn arm_epoch_backfill_intents(
+        &self,
+        label: &str,
+        intents: &[storage_sqlite::StoredEpochBackfillIntent],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .arm_epoch_backfill_intents(intents)?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_epoch_backfill_intents(
+        &self,
+        label: &str,
+    ) -> Result<Vec<storage_sqlite::StoredEpochBackfillIntent>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .pending_epoch_backfill_intents()?)
+    }
+
+    pub(crate) fn clear_epoch_backfill_intents(
+        &self,
+        label: &str,
+        intents: &[storage_sqlite::StoredEpochBackfillIntent],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .clear_epoch_backfill_intents(intents)?;
+        Ok(())
     }
 
     /// `group_id_hex` of every `account_groups` row still carrying the migration

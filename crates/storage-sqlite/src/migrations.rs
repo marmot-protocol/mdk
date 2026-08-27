@@ -100,6 +100,8 @@ mod migration_0049_pending_invite_index;
 mod migration_0050_direct_conversation_members;
 #[path = "migrations/0051_prepared_group_image_uploads.rs"]
 mod migration_0051_prepared_group_image_uploads;
+#[path = "migrations/0052_epoch_backfill_intents.rs"]
+mod migration_0052_epoch_backfill_intents;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -369,6 +371,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 51,
         name: "0051_prepared_group_image_uploads",
         apply: migration_0051_prepared_group_image_uploads::apply,
+    },
+    Migration {
+        version: 52,
+        name: "0052_epoch_backfill_intents",
+        apply: migration_0052_epoch_backfill_intents::apply,
     },
 ];
 
@@ -897,7 +904,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 51,
+                found: 52,
                 latest_supported: 46,
             }
         ));
@@ -953,7 +960,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 51,
+                found: 52,
                 latest_supported: 46,
             }
         ));
@@ -1257,7 +1264,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 51,
+                found: 52,
                 latest_supported: 46,
             }
         ));
@@ -2233,6 +2240,11 @@ mod tests {
             foreign_key(&conn, "pending_push_registration_removals", "group_id_hex"),
             None,
             "durable removal intent must survive projection group deletion"
+        );
+        assert_eq!(
+            foreign_key(&conn, "app_epoch_backfill_intents", "group_id"),
+            Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
+            "durable recovery intent must survive projection deletion but cascade with its protocol group"
         );
     }
 

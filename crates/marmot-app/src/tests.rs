@@ -1381,6 +1381,43 @@ fn redelivery_pump(
     (stop, handle)
 }
 
+/// Repeatedly enqueue one already-peeled delivery directly onto an account's
+/// test transport channel. This models the reachable adapter/engine route-index
+/// disagreement that cannot be produced through the relay plane's outer route
+/// gate.
+#[cfg(feature = "test-policy-overrides")]
+fn transport_delivery_redelivery_pump(
+    app: &MarmotApp,
+    delivery: cgka_traits::TransportDelivery,
+    interval: Duration,
+    deadline: Duration,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<u64>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = {
+        let app = app.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let expires_at = std::time::Instant::now() + deadline;
+            let mut sent = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < expires_at
+                && app
+                    .relay_plane
+                    .inject_delivery_for_test(delivery.clone())
+                    .await
+            {
+                sent += 1;
+                tokio::time::sleep(interval).await;
+            }
+            sent
+        })
+    };
+    (stop, handle)
+}
+
 /// The end-of-stored-events gate must be reachable from the delivery path.
 ///
 /// A relay redelivering faster than [`SDK_DRAIN_WAIT`] never lets the receive
@@ -1438,6 +1475,535 @@ fn epoch_backfill_drain_ends_on_end_of_stored_events_while_duplicates_stream() {
             "the delivery-path gate poll must end the drain promptly, not when \
              the redelivery stops; took {drained_in:?}"
         );
+    });
+}
+
+/// Duplicate traffic is liveness but not recovery progress. It must not keep
+/// the serial account worker inside one backfill drain forever when the relay
+/// never reports end-of-stored-events.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn epoch_backfill_drain_yields_when_duplicates_stream_without_eose() {
+    run_composed_app_runtime_test("backfill-drain-duplicate-quantum", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_eose_wait_ms(30_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(400),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        let duplicate = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            crate::unix_now_seconds(),
+            "duplicates-without-eose",
+        );
+        client.remember_seen_event(duplicate.id.clone());
+        let (stop, pump) = redelivery_pump(
+            &app,
+            duplicate,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            client.run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            ),
+        )
+        .await;
+        let drained_in = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+        let outcome = outcome
+            .expect("duplicate-only replay must yield its account-worker quantum")
+            .expect("a bounded incomplete replay is not a transport error");
+
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "a quantum yield without EOSE must remain incomplete"
+        );
+        assert!(
+            drained_in < Duration::from_millis(1_500),
+            "the duplicate-only drain must yield within its configured quantum; took {drained_in:?}"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "a quantum yield must retain the recovery intent"
+        );
+        drop(client);
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened.has_pending_epoch_backfill(),
+            "an incomplete quantum must re-arm from durable recovery state after restart"
+        );
+        drop(reopened);
+
+        let rows = recorded_audit_rows(&app);
+        assert!(
+            recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed").is_empty(),
+            "a quantum yield must not be reported as successful replay"
+        );
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["error_kind"].as_str(),
+            Some("backfill_drain_no_progress_quantum_yield")
+        );
+        assert_eq!(failed[0]["kind"]["deliveries"], 0);
+        assert!(failed[0]["kind"]["skipped"].as_u64().unwrap() > 0);
+        assert!(failed[0]["kind"]["completion_kind"].is_null());
+    });
+}
+
+/// An unknown-group object that the engine leaves entirely unpersisted is no
+/// more recovery progress than a duplicate. Re-serving it must yield into the
+/// no-progress cooldown rather than keeping the account worker in immediate
+/// back-to-back quanta.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn unpersisted_unknown_group_stream_is_no_progress_and_paced() {
+    run_composed_app_runtime_test("backfill-unpersisted-unknown-group", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_eose_wait_ms(30_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(400)
+                .with_dev_epoch_backfill_retry_backoff_ms(60_000),
+        )
+        .await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+        let account_id_hex = AccountHome::open(dir.path())
+            .account("alice")
+            .unwrap()
+            .account_id_hex;
+        let unknown = unknown_route_delivery(
+            &account_id_hex,
+            crate::unix_now_seconds(),
+            "unpersisted-backfill-prefix",
+        );
+        let event_id = hex::encode(unknown.message.id.as_slice());
+        let (stop, pump) = transport_delivery_redelivery_pump(
+            &app,
+            unknown,
+            Duration::from_millis(50),
+            Duration::from_secs(3),
+        );
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("unpersisted stream must yield without a transport error");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sent = pump.await.expect("redelivery pump must not panic");
+
+        assert!(sent > 1, "the test must exercise same-id redelivery");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        assert!(
+            !client.seen_events_index.contains(&event_id),
+            "an unpersisted object must remain fetchable"
+        );
+        assert!(
+            client.epoch_backfill_retry_not_before.is_some(),
+            "an unproductive quantum must earn the retry cooldown"
+        );
+        assert!(matches!(
+            client
+                .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+                .await
+                .expect("a paced seam is not a failure"),
+            crate::EpochBackfillRunOutcome::Deferred
+        ));
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Arm,
+            "an unpersisted-only quantum must not disarm tracked recovery"
+        );
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["error_kind"].as_str(),
+            Some("backfill_drain_no_progress_quantum_yield")
+        );
+        assert!(failed[0]["kind"]["deliveries"].as_u64().unwrap() > 0);
+        assert_eq!(
+            failed[0]["kind"]["refused"], 0,
+            "unknown-group drops remain distinct from resource refusals"
+        );
+    });
+}
+
+/// Worker-quantum pacing and EOSE-failure fallback are independent policies.
+/// Repeated duplicate-only slices must never make a later quiet slice claim
+/// completion under the weaker quiescence contract.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
+    run_composed_app_runtime_test("backfill-duplicate-quanta-eose-budget", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_eose_wait_ms(30_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(900),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        let duplicate = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            crate::unix_now_seconds(),
+            "duplicates-must-not-unlock-fallback",
+        );
+        client.remember_seen_event(duplicate.id.clone());
+        let (stop, pump) = redelivery_pump(
+            &app,
+            duplicate,
+            Duration::from_millis(50),
+            Duration::from_secs(6),
+        );
+
+        for attempt in 0..crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+            let outcome = client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+                )
+                .await
+                .expect("duplicate-only quantum runs");
+            assert!(
+                matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+                "duplicate-only quantum {attempt} must retain the intent"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+
+        let outcome = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect("quiet continuation runs");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "worker-quantum yields must not unlock quiescence fallback"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "an EOSE-unconfirmed continuation must retain the durable intent"
+        );
+
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let outcome = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect("EOSE-confirmed continuation runs");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Completed(_)
+        ));
+        assert!(!client.has_pending_epoch_backfill());
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(
+            failed.len(),
+            crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT as usize + 1
+        );
+        assert!(failed.iter().all(|row| {
+            row["kind"]["error_kind"].as_str() == Some("backfill_drain_no_progress_quantum_yield")
+        }));
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events")
+        );
+    });
+}
+
+/// Productive replays use the same worker quantum, but their checkpointed
+/// prefix survives the yield and they do not spend the EOSE fallback ordinal.
+/// A later EOSE-confirmed quantum can therefore finish the same arm.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn epoch_backfill_drain_continues_novel_history_across_worker_quanta() {
+    run_composed_app_runtime_test("backfill-drain-productive-quanta", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_eose_wait_ms(30_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(250),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        // Stay below the detector's independent eight-undeliverable arm
+        // threshold: this test owns one pre-armed recovery intent and is about
+        // splitting its novel prefix, not coalescing a second intent into it.
+        let events = (0..6_u32)
+            .map(|index| {
+                epoch_gap_probe(
+                    &group.nostr_routing.nostr_group_id_hex,
+                    crate::unix_now_seconds(),
+                    &format!("productive-quantum-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let event_ids = events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        let producer = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                for event in events {
+                    inject_epoch_gap_probe(&app, event).await;
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+            })
+        };
+
+        let first = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("productive replay quantum runs");
+        assert!(matches!(
+            first,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        assert!(
+            event_ids
+                .iter()
+                .any(|event_id| client.seen_events_index.contains(event_id)),
+            "the first quantum must retain a novel prefix"
+        );
+        let durable_after_first = app.load_state("alice").unwrap();
+        assert!(
+            event_ids
+                .iter()
+                .any(|event_id| durable_after_first.seen_events.contains(event_id)),
+            "the yielded prefix must be checkpointed before the worker is released"
+        );
+        producer
+            .await
+            .expect("novel-history producer must not panic");
+
+        let mut quanta = 1_u32;
+        while !event_ids
+            .iter()
+            .all(|event_id| client.seen_events_index.contains(event_id))
+        {
+            let outcome = client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .expect("next productive replay quantum runs");
+            assert!(matches!(
+                outcome,
+                crate::EpochBackfillRunOutcome::Incomplete(_)
+            ));
+            quanta += 1;
+            assert!(quanta < 10, "novel replay must advance across quanta");
+        }
+        assert!(
+            quanta >= 2,
+            "the replay must actually cross a quantum boundary"
+        );
+        assert!(client.has_pending_epoch_backfill());
+
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let completed = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("EOSE-confirmed continuation runs");
+        assert!(matches!(
+            completed,
+            crate::EpochBackfillRunOutcome::Completed(_)
+        ));
+        assert!(!client.has_pending_epoch_backfill());
+        drop(client);
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            !reopened.has_pending_epoch_backfill(),
+            "EOSE completion must consume the exact durable recovery marker"
+        );
+        drop(reopened);
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), quanta as usize);
+        assert!(failed.iter().all(|row| {
+            row["kind"]["error_kind"].as_str()
+                == Some("backfill_drain_novel_progress_quantum_yield")
+        }));
+        assert_eq!(
+            failed
+                .iter()
+                .map(|row| row["kind"]["deliveries"].as_u64().unwrap())
+                .sum::<u64>(),
+            event_ids.len() as u64,
+            "every novel delivery belongs to exactly one checkpointed quantum"
+        );
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events")
+        );
+    });
+}
+
+/// A command queued after a steady-state CatchUp enters duplicate-only
+/// backfill must be serviced when that drain yields, rather than timing out
+/// behind an open-ended receive loop.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn account_worker_services_local_command_after_duplicate_backfill_quantum() {
+    run_composed_app_runtime_test("backfill-worker-command-quantum", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let config = MarmotAppConfig::default()
+            .with_dev_epoch_backfill_eose_wait_ms(30_000)
+            .with_dev_epoch_backfill_execution_quantum_ms(400)
+            .with_dev_epoch_backfill_retry_backoff_ms(1_500);
+        let mut app =
+            MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
+                .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+
+        let cursor = crate::unix_now_seconds();
+        let group_id = {
+            let mut client = app.client("alice").await.unwrap();
+            let group_id = client
+                .create_group("bounded backfill worker", &[])
+                .await
+                .unwrap();
+            client.state.last_transport_timestamp = Some(cursor);
+            app.save_state(&client.state).unwrap();
+            group_id
+        };
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.start().await.unwrap();
+        runtime.pause_maintenance("alice").await.unwrap();
+
+        relay.block_next_subscribes(2);
+        let catch_up_runtime = runtime.clone();
+        let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
+        tokio::time::timeout(
+            EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
+            relay.wait_for_blocked_subscribes(2),
+        )
+        .await
+        .expect("ordinary catch-up activation must block");
+
+        let mut duplicate = None;
+        for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
+            let probe = epoch_gap_probe(
+                &group.nostr_routing.nostr_group_id_hex,
+                cursor,
+                &format!("worker-arm-{arm}"),
+            );
+            duplicate.get_or_insert_with(|| probe.clone());
+            inject_epoch_gap_probe(&app, probe).await;
+        }
+
+        relay.block_next_subscribes(2);
+        relay.release_subscribe();
+        tokio::time::timeout(
+            EXPLICIT_CATCH_UP_BACKFILL_DEADLINE,
+            relay.wait_for_blocked_subscribes(4),
+        )
+        .await
+        .expect("armed catch-up must enter its unfloored replay");
+        let (stop, pump) = redelivery_pump(
+            &app,
+            duplicate.expect("one arm probe"),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        relay.release_subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !catch_up.is_finished(),
+            "the duplicate stream must still hold the catch-up before its quantum"
+        );
+
+        let command_started = std::time::Instant::now();
+        let state = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            runtime.group_mls_state("alice", &group_id),
+        )
+        .await
+        .expect("queued local read must be serviced after the backfill quantum")
+        .expect("group MLS state remains readable");
+        let command_wait = command_started.elapsed();
+        assert_eq!(state.group_id_hex, hex::encode(group_id.as_slice()));
+        assert!(
+            command_wait < Duration::from_millis(1_500),
+            "queued local read exceeded the worker-yield bound: {command_wait:?}"
+        );
+        catch_up
+            .await
+            .expect("catch-up task must not panic")
+            .expect("an incomplete bounded replay is not a catch-up error");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0]["kind"]["error_kind"].as_str(),
+            Some("backfill_drain_no_progress_quantum_yield")
+        );
+        runtime.shutdown().await;
     });
 }
 
@@ -1652,9 +2218,13 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
             "an unconfirmed replay must not disarm a group it never recovered"
         );
 
-        // The retained intent runs again, under the next retry ordinal.
+        // Caller-directed repair bypasses the automatic retry floor, so the
+        // retained intent runs again under the next execution ordinal in both
+        // production-policy and shortened test-policy builds.
         let retry = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("retained recovery must retry");
         assert!(matches!(
@@ -1675,9 +2245,21 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
             Some("succeeded"),
             "activation did succeed; the drain after it is what did not"
         );
+        // The accelerated policy spends its 300 ms EOSE budget before the
+        // unchanged 5 s quantum. Production instead yields at 5 s before its
+        // 30 s EOSE ceiling.
+        let expected_error_kind = if cfg!(feature = "test-policy-overrides") {
+            "backfill_drain_no_relay_eose"
+        } else {
+            "backfill_drain_no_progress_quantum_yield"
+        };
         assert_eq!(
             failed[0]["kind"]["error_kind"].as_str(),
-            Some("backfill_drain_no_relay_eose")
+            Some(expected_error_kind)
+        );
+        assert_eq!(
+            failed[1]["kind"]["error_kind"].as_str(),
+            Some(expected_error_kind)
         );
         assert_eq!(failed[0]["kind"]["deliveries"], 0);
         assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
@@ -1781,7 +2363,8 @@ fn a_completed_backfill_that_recovered_nothing_does_not_disarm_the_detector() {
 /// object is dropped unpersisted. `deliveries` counts them (a receive really was
 /// ingested, and #1553 pinned that meaning for the field exports), so keying the
 /// disarm on `deliveries` alone read a total loss as a productive replay.
-/// `deliveries - refused` is the count that answers "did anything land".
+/// `deliveries - unpersisted` is the internal count that answers "did anything
+/// land"; `refused` remains the narrower audit evidence for cap saturation.
 #[test]
 fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
     run_composed_app_runtime_test("backfill-all-refusals", || async {
@@ -2210,9 +2793,15 @@ fn epoch_backfill_drain_needs_every_subscription_to_report() {
         let rows = recorded_audit_rows(&app);
         let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
         assert_eq!(failed.len(), 1);
+        // As above, the accelerated EOSE budget wins only in the
+        // test-policy build; the production quantum wins in the default build.
         assert_eq!(
             failed[0]["kind"]["error_kind"].as_str(),
-            Some("backfill_drain_eose_timeout")
+            Some(if cfg!(feature = "test-policy-overrides") {
+                "backfill_drain_eose_timeout"
+            } else {
+                "backfill_drain_no_progress_quantum_yield"
+            })
         );
     });
 }
@@ -2552,6 +3141,7 @@ fn unconfirmed_epoch_backfill_paces_its_automatic_retries() {
 }
 
 #[test]
+#[cfg(feature = "test-policy-overrides")]
 fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
     run_composed_app_runtime_test("backfill-eose-fallback", || async {
         let dir = tempfile::tempdir().unwrap();
@@ -2568,7 +3158,9 @@ fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
         // clear however long it waits.
         for attempt in 0..crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
             let outcome = client
-                .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+                )
                 .await
                 .expect("an unconfirmed replay is not a transport error");
             assert!(
@@ -2588,7 +3180,9 @@ fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
         )
         .await;
         let fallback = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("the fallback attempt runs");
         assert!(
@@ -2726,8 +3320,14 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             ),
             "operation b must execute"
         );
+        // Operation B completed without retaining history, so #1569's
+        // fruitless-replay guard correctly paced the automatic seam. This test
+        // is proving that the older queued intent still exists, so use the
+        // caller-directed seam that deliberately bypasses that cooldown.
         let operation_a_retry = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("operation a must retry");
         assert!(

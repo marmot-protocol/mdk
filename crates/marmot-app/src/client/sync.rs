@@ -19,9 +19,9 @@ use crate::notifications;
 use crate::{
     AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
     AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT,
-    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
-    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
+    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_EXECUTION_QUANTUM, EPOCH_BACKFILL_RETRY_BACKOFF,
+    EPOCH_BACKFILL_RETRY_BACKOFF_CAP, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership,
+    SyncFailure, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillCompletionKind,
@@ -41,6 +41,8 @@ pub(crate) struct EpochBackfillExecution {
     pub(crate) pending: PendingEpochBackfill,
     pub(crate) epochs_before: HashMap<cgka_traits::GroupId, u64>,
     pub(crate) retry_ordinal: u64,
+    pub(crate) eose_unconfirmed_ordinal: u64,
+    pub(crate) no_progress_ordinal: u64,
     pub(crate) started: Instant,
 }
 
@@ -86,19 +88,34 @@ enum DrainCompletion {
     /// end-of-stored-events proves the history query finished. Silence polls
     /// that gate and spends the passed budget; it never ends the drain by
     /// itself.
-    EndOfStoredEvents(Duration),
+    EndOfStoredEvents {
+        silence_budget: Duration,
+        execution_quantum: Duration,
+    },
     /// Epoch-gap backfill that has spent its end-of-stored-events attempt
     /// budget ([`EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT`]). Drains exactly like
     /// [`Self::Quiescence`] so an account whose group route has one unreachable
     /// relay can still heal, and reports itself as the weaker claim it is.
-    QuiescenceFallback,
+    QuiescenceFallback { execution_quantum: Duration },
+}
+
+impl DrainCompletion {
+    fn execution_quantum(self) -> Option<Duration> {
+        match self {
+            Self::Quiescence => None,
+            Self::EndOfStoredEvents {
+                execution_quantum, ..
+            }
+            | Self::QuiescenceFallback { execution_quantum } => Some(execution_quantum),
+        }
+    }
 }
 
 /// How a drain ended.
 ///
-/// Only [`DrainCompletion::EndOfStoredEvents`] can reach the two incomplete
-/// verdicts; a quiescence drain is complete by its own contract as soon as the
-/// relays go quiet.
+/// Ordinary quiescence is complete as soon as the relays go quiet. Backfill
+/// contracts can instead yield incomplete at their worker quantum; the EOSE
+/// contract also retains its silence-specific unconfirmed verdicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainVerdict {
     /// Every live subscription reached end-of-stored-events and the relays then
@@ -115,6 +132,13 @@ enum DrainVerdict {
     /// end-of-stored-events: the subscriptions were registered but never
     /// served.
     NoRelayEose,
+    /// The account-worker quantum ended after at least one novel delivery was
+    /// durably retained. The prefix is checkpointed and recovery resumes in a
+    /// later quantum without spending the no-progress retry ordinal.
+    NovelProgressQuantumYield,
+    /// The account-worker quantum ended without durable novel progress. This
+    /// includes duplicate/echo-only and all-refused streams.
+    NoProgressQuantumYield,
 }
 
 impl DrainVerdict {
@@ -124,6 +148,8 @@ impl DrainVerdict {
             Self::Complete | Self::QuiescenceFallback => None,
             Self::EoseTimeout => Some("backfill_drain_eose_timeout"),
             Self::NoRelayEose => Some("backfill_drain_no_relay_eose"),
+            Self::NovelProgressQuantumYield => Some("backfill_drain_novel_progress_quantum_yield"),
+            Self::NoProgressQuantumYield => Some("backfill_drain_no_progress_quantum_yield"),
         }
     }
 
@@ -133,8 +159,31 @@ impl DrainVerdict {
         match self {
             Self::Complete => Some(EpochBackfillCompletionKind::EndOfStoredEvents),
             Self::QuiescenceFallback => Some(EpochBackfillCompletionKind::QuiescenceFallback),
-            Self::EoseTimeout | Self::NoRelayEose => None,
+            Self::EoseTimeout
+            | Self::NoRelayEose
+            | Self::NovelProgressQuantumYield
+            | Self::NoProgressQuantumYield => None,
         }
+    }
+
+    fn quantum_yield(counts: &DrainCounts) -> Self {
+        if counts.durable_deliveries() > 0 {
+            Self::NovelProgressQuantumYield
+        } else {
+            Self::NoProgressQuantumYield
+        }
+    }
+
+    fn spends_eose_attempt(self) -> bool {
+        matches!(self, Self::EoseTimeout | Self::NoRelayEose)
+    }
+
+    fn made_novel_progress(self) -> bool {
+        self == Self::NovelProgressQuantumYield
+    }
+
+    fn made_no_progress(self) -> bool {
+        self == Self::NoProgressQuantumYield
     }
 }
 
@@ -172,6 +221,11 @@ struct DeliveryIngest {
 pub(crate) struct DrainCounts {
     pub(crate) deliveries: u64,
     pub(crate) skipped: u64,
+    /// The subset of `deliveries` for which the engine kept no durable trace.
+    /// These objects stay fetchable and cannot count as recovery progress.
+    /// Includes `refused`, but is deliberately not an audit field: `refused`
+    /// retains its narrower resource-bound meaning on the forensic wire.
+    pub(crate) unpersisted: u64,
     /// The subset of `deliveries` the engine refused unpersisted. Nested inside
     /// `deliveries` rather than beside it: the receive really was ingested, and
     /// `deliveries` keeps the audit meaning the field exports already depend
@@ -188,11 +242,10 @@ pub(crate) struct DrainCounts {
 
 impl DrainCounts {
     /// Deliveries this drain ingested *and* the engine kept. A drain whose
-    /// every delivery was refused fetched history it could not retain, which is
-    /// no recovery at all — the objects stay fetchable (they are neither marked
-    /// seen nor allowed past the cursor) but nothing durably landed.
+    /// every delivery stayed fetchable recovered nothing, whether a local
+    /// resource bound refused it or an unknown-group path kept no trace.
     fn durable_deliveries(&self) -> u64 {
-        self.deliveries.saturating_sub(self.refused)
+        self.deliveries.saturating_sub(self.unpersisted)
     }
 }
 
@@ -1031,12 +1084,16 @@ impl AppClient {
     async fn backfill_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
-        retry_ordinal: u64,
+        eose_unconfirmed_ordinal: u64,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
-        let completion = if retry_ordinal >= EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
-            DrainCompletion::QuiescenceFallback
+        let execution_quantum = self.epoch_backfill_execution_quantum();
+        let completion = if eose_unconfirmed_ordinal >= EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+            DrainCompletion::QuiescenceFallback { execution_quantum }
         } else {
-            DrainCompletion::EndOfStoredEvents(self.epoch_backfill_eose_wait())
+            DrainCompletion::EndOfStoredEvents {
+                silence_budget: self.epoch_backfill_eose_wait(),
+                execution_quantum,
+            }
         };
         self.drain_sdk_relay(counts, completion).await
     }
@@ -1082,6 +1139,16 @@ impl AppClient {
         EPOCH_BACKFILL_EOSE_WAIT
     }
 
+    /// Maximum wall-clock quantum one backfill drain owns the account worker.
+    fn epoch_backfill_execution_quantum(&self) -> Duration {
+        if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.app.config.dev_epoch_backfill_execution_quantum_ms
+        {
+            return Duration::from_millis(ms);
+        }
+        EPOCH_BACKFILL_EXECUTION_QUANTUM
+    }
+
     /// How an epoch-gap backfill drain that stops now should be read, from the
     /// account's current end-of-stored-events progress.
     async fn backfill_drain_verdict(&self) -> DrainVerdict {
@@ -1102,20 +1169,16 @@ impl AppClient {
     /// and every poll reconstructs the account's subscription ids behind a
     /// read lock.
     ///
-    /// Deliberately gate-only. The silence budget is not consulted here: it is
-    /// reset by the very delivery being skipped, so an elapsed check would be
-    /// dead code, and moving that reset below the skip would turn a liveness
-    /// signal into a progress gate — cutting off exactly the stuttering long
-    /// replays this recovery exists to complete. A relay that streams non-novel
-    /// events forever *and* never reports end-of-stored-events therefore still
-    /// holds the drain until its traffic stops or the worker is aborted at
-    /// shutdown. That residual is tracked, not solved here.
+    /// Deliberately gate-only. The silence budget is reset by the delivery, so
+    /// it has nothing to decide on this path. The independent execution quantum
+    /// is checked at the next safe loop boundary and yields duplicate-only
+    /// traffic without turning the silence timer itself into a progress gate.
     async fn backfill_gate_reports_complete(
         &self,
         completion: DrainCompletion,
         polled_at: &mut Instant,
     ) -> bool {
-        if !matches!(completion, DrainCompletion::EndOfStoredEvents(_))
+        if !matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
             || polled_at.elapsed() < SDK_DRAIN_WAIT
         {
             return false;
@@ -1162,9 +1225,9 @@ impl AppClient {
         let cursor_before_secs = self.state.last_transport_timestamp;
         *counts = DrainCounts::default();
         let mut routes_dirty = false;
-        // Silence, not total drain time, is what the backfill's budget bounds:
-        // every delivery below resets this, so a long replay that keeps making
-        // progress is never cut short.
+        // Every delivery resets the silence budget. The separate wall-clock
+        // quantum never resets; it checkpoints long productive replays in
+        // pieces and bounds streams that carry only duplicates or echoes.
         let mut silence_started = std::time::Instant::now();
         // Skipped deliveries poll the end-of-stored-events gate, which the
         // receive timeout below cannot reach while a relay delivers faster than
@@ -1172,19 +1235,35 @@ impl AppClient {
         let mut gate_polled_at = silence_started;
 
         let verdict = loop {
-            let wait = if first_wait {
+            if completion
+                .execution_quantum()
+                .is_some_and(|quantum| drain_started.elapsed() >= quantum)
+            {
+                if matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
+                    && self.backfill_drain_verdict().await == DrainVerdict::Complete
+                {
+                    break DrainVerdict::Complete;
+                }
+                break DrainVerdict::quantum_yield(counts);
+            }
+            let mut wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
             } else {
                 SDK_DRAIN_WAIT
             };
+            if let Some(quantum) = completion.execution_quantum() {
+                wait = wait.min(quantum.saturating_sub(drain_started.elapsed()));
+            }
             first_wait = false;
             let delivery = match timeout(wait, self.adapter.receive()).await {
                 Ok(Ok(Some(delivery))) => delivery,
                 Ok(Ok(None)) => {
                     break match completion {
                         DrainCompletion::Quiescence => DrainVerdict::Complete,
-                        DrainCompletion::QuiescenceFallback => DrainVerdict::QuiescenceFallback,
-                        DrainCompletion::EndOfStoredEvents(_) => {
+                        DrainCompletion::QuiescenceFallback { .. } => {
+                            DrainVerdict::QuiescenceFallback
+                        }
+                        DrainCompletion::EndOfStoredEvents { .. } => {
                             self.backfill_drain_verdict().await
                         }
                     };
@@ -1203,11 +1282,24 @@ impl AppClient {
                 }
                 Err(_) => match completion {
                     DrainCompletion::Quiescence => break DrainVerdict::Complete,
-                    DrainCompletion::QuiescenceFallback => break DrainVerdict::QuiescenceFallback,
-                    DrainCompletion::EndOfStoredEvents(budget) => {
+                    DrainCompletion::QuiescenceFallback { execution_quantum } => {
+                        if drain_started.elapsed() >= execution_quantum {
+                            break DrainVerdict::quantum_yield(counts);
+                        }
+                        break DrainVerdict::QuiescenceFallback;
+                    }
+                    DrainCompletion::EndOfStoredEvents {
+                        silence_budget,
+                        execution_quantum,
+                    } => {
                         let verdict = self.backfill_drain_verdict().await;
-                        if verdict == DrainVerdict::Complete || silence_started.elapsed() >= budget
-                        {
+                        if verdict == DrainVerdict::Complete {
+                            break verdict;
+                        }
+                        if drain_started.elapsed() >= execution_quantum {
+                            break DrainVerdict::quantum_yield(counts);
+                        }
+                        if silence_started.elapsed() >= silence_budget {
                             break verdict;
                         }
                         continue;
@@ -1272,10 +1364,14 @@ impl AppClient {
                         .await);
                 }
             };
+            if ingested.must_stay_fetchable {
+                counts.unpersisted = counts.unpersisted.saturating_add(1);
+            }
             // The refusal count is keyed on the refusal itself, so the audit
             // row keeps meaning "a local resource bound rejected this" and not
             // the wider "left no durable trace".
             if let Some(group_id) = ingested.refused_group {
+                debug_assert!(ingested.must_stay_fetchable);
                 counts.refused = counts.refused.saturating_add(1);
                 counts.refused_groups.insert(group_id);
             }
@@ -1615,6 +1711,21 @@ impl AppClient {
         trigger: EpochStallBackfillTrigger,
     ) {
         if decision.arms_backfill() {
+            let durable_intent = storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch,
+            };
+            if let Err(error) = self.app.arm_epoch_backfill_intents(
+                &self.state.label,
+                std::slice::from_ref(&durable_intent),
+            ) {
+                tracing::warn!(
+                    target: "marmot_app::epoch_stall",
+                    method = "apply_backfill_decision",
+                    error_kind = error.privacy_safe_kind(),
+                    "epoch-gap recovery arm is live in memory but its durable marker will be retried before replay"
+                );
+            }
             let (attempt_id, record_arm) = {
                 let pending = self
                     .pending_epoch_backfill
@@ -1667,6 +1778,69 @@ impl AppClient {
                     arms,
                 });
         }
+    }
+
+    pub(crate) fn restore_persisted_epoch_backfill_intents(
+        &mut self,
+        intents: Vec<storage_sqlite::StoredEpochBackfillIntent>,
+    ) {
+        let mut pending = PendingEpochBackfill::new();
+        let mut malformed = 0_u64;
+        for intent in intents {
+            let Ok(group_id) = hex::decode(&intent.group_id_hex) else {
+                malformed = malformed.saturating_add(1);
+                continue;
+            };
+            pending.groups.insert(
+                cgka_traits::GroupId::new(group_id),
+                PendingEpochBackfillGroup {
+                    stalled_epoch: intent.stalled_epoch,
+                },
+            );
+        }
+        if malformed > 0 {
+            tracing::warn!(
+                target: "marmot_app::epoch_stall",
+                method = "restore_persisted_epoch_backfill_intents",
+                malformed,
+                "ignored malformed durable epoch-gap recovery markers"
+            );
+        }
+        if !pending.groups.is_empty() {
+            self.pending_epoch_backfill = Some(pending);
+        }
+    }
+
+    fn stored_epoch_backfill_intents(
+        pending: &PendingEpochBackfill,
+    ) -> Vec<storage_sqlite::StoredEpochBackfillIntent> {
+        pending
+            .groups
+            .iter()
+            .map(
+                |(group_id, group)| storage_sqlite::StoredEpochBackfillIntent {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    stalled_epoch: group.stalled_epoch,
+                },
+            )
+            .collect()
+    }
+
+    fn persist_epoch_backfill_intent(
+        &self,
+        pending: &PendingEpochBackfill,
+    ) -> Result<(), AppError> {
+        self.app.arm_epoch_backfill_intents(
+            &self.state.label,
+            &Self::stored_epoch_backfill_intents(pending),
+        )
+    }
+
+    fn clear_epoch_backfill_intent(&self, pending: &PendingEpochBackfill) -> Result<(), AppError> {
+        self.app.clear_epoch_backfill_intents(
+            &self.state.label,
+            &Self::stored_epoch_backfill_intents(pending),
+        )
     }
 
     /// Move every recorded escalation onto the summary a seam is about to
@@ -1827,6 +2001,8 @@ impl AppClient {
     ) -> Option<EpochBackfillExecution> {
         let mut pending = self.take_next_pending_epoch_backfill()?;
         let retry_ordinal = u64::from(pending.execution_attempts);
+        let eose_unconfirmed_ordinal = u64::from(pending.eose_unconfirmed_attempts);
+        let no_progress_ordinal = u64::from(pending.no_progress_attempts);
         let epochs_before = self.capture_pending_group_epochs(&pending);
         let context = Self::epoch_backfill_audit_context(&pending);
         if epochs_before.len() != pending.groups.len() {
@@ -1854,6 +2030,8 @@ impl AppClient {
             pending,
             epochs_before,
             retry_ordinal,
+            eose_unconfirmed_ordinal,
+            no_progress_ordinal,
             started: Instant::now(),
         })
     }
@@ -1923,10 +2101,10 @@ impl AppClient {
     ///   deliveries and moved its epoch a second *after* the terminal row was
     ///   written — so `epochs_after`, read the moment the drain ends, must never
     ///   second-guess a delivery count. Deliveries parked awaiting convergence
-    ///   are recovery in flight. Refused ones are not: the engine dropped them
-    ///   unpersisted, so a drain that refused everything it fetched recovered
-    ///   nothing and must not disarm anything. A mixed drain still counts —
-    ///   one kept delivery is progress.
+    ///   are recovery in flight. Objects left fetchable are not: the engine
+    ///   kept no durable trace, so a drain made entirely of resource refusals
+    ///   or unknown-group drops recovered nothing and must not disarm anything.
+    ///   A mixed drain still counts — one kept delivery is progress.
     /// - a tracked group's local epoch advanced across the run, which is what a
     ///   zero-delivery replay whose value was letting already-deferred rows
     ///   converge looks like.
@@ -2011,9 +2189,21 @@ impl AppClient {
         if self.epoch_backfill_retry_is_paced(seam) {
             return Ok(EpochBackfillRunOutcome::Deferred);
         }
-        let Some(execution) = self.begin_epoch_backfill_execution(seam) else {
+        let Some(mut execution) = self.begin_epoch_backfill_execution(seam) else {
             return Ok(EpochBackfillRunOutcome::Deferred);
         };
+        if let Err(error) = self.persist_epoch_backfill_intent(&execution.pending) {
+            let terminal_error = error.privacy_safe_kind().to_string();
+            self.finish_epoch_backfill_execution(
+                execution,
+                EpochBackfillActivationOutcome::Failed,
+                Some(terminal_error),
+                None,
+                DrainCounts::default(),
+                false,
+            );
+            return Err(error);
+        }
 
         match self.runtime.activate_transport(None).await {
             Ok(()) => {
@@ -2032,23 +2222,27 @@ impl AppClient {
                 self.record_subscription_rebuild(None).await;
                 let mut counts = DrainCounts::default();
                 let retry_ordinal = execution.retry_ordinal;
-                let (mut summary, verdict) =
-                    match self.backfill_sdk_relay(&mut counts, retry_ordinal).await {
-                        Ok(drained) => drained,
-                        Err(err) => {
-                            let terminal_error = err.source.privacy_safe_kind().to_string();
-                            self.finish_epoch_backfill_execution(
-                                execution,
-                                EpochBackfillActivationOutcome::Succeeded,
-                                Some(terminal_error),
-                                None,
-                                counts,
-                                false,
-                            );
-                            self.pending_failed_sync_summary.merge(err.partial_summary);
-                            return Err(err.source);
-                        }
-                    };
+                let eose_unconfirmed_ordinal = execution.eose_unconfirmed_ordinal;
+                let no_progress_ordinal = execution.no_progress_ordinal;
+                let (mut summary, verdict) = match self
+                    .backfill_sdk_relay(&mut counts, eose_unconfirmed_ordinal)
+                    .await
+                {
+                    Ok(drained) => drained,
+                    Err(err) => {
+                        let terminal_error = err.source.privacy_safe_kind().to_string();
+                        self.finish_epoch_backfill_execution(
+                            execution,
+                            EpochBackfillActivationOutcome::Succeeded,
+                            Some(terminal_error),
+                            None,
+                            counts,
+                            false,
+                        );
+                        self.pending_failed_sync_summary.merge(err.partial_summary);
+                        return Err(err.source);
+                    }
+                };
                 let drained = match self.drain_pending_session_events().await {
                     Ok(drained) => drained,
                     Err(err) => {
@@ -2071,6 +2265,33 @@ impl AppClient {
                 // disarm the detector, so it is recorded as a failed attempt
                 // and its intent stays queued for the next seam.
                 let error_kind = verdict.error_kind();
+                if verdict.spends_eose_attempt() {
+                    execution.pending.eose_unconfirmed_attempts = execution
+                        .pending
+                        .eose_unconfirmed_attempts
+                        .saturating_add(1);
+                }
+                if verdict.made_no_progress() {
+                    execution.pending.no_progress_attempts =
+                        execution.pending.no_progress_attempts.saturating_add(1);
+                } else {
+                    execution.pending.no_progress_attempts = 0;
+                }
+                if error_kind.is_none()
+                    && let Err(error) = self.clear_epoch_backfill_intent(&execution.pending)
+                {
+                    let terminal_error = error.privacy_safe_kind().to_string();
+                    self.finish_epoch_backfill_execution(
+                        execution,
+                        EpochBackfillActivationOutcome::Succeeded,
+                        Some(terminal_error),
+                        None,
+                        counts,
+                        false,
+                    );
+                    self.pending_failed_sync_summary.merge(summary);
+                    return Err(error);
+                }
                 let recovered = self.finish_epoch_backfill_execution(
                     execution,
                     EpochBackfillActivationOutcome::Succeeded,
@@ -2090,8 +2311,16 @@ impl AppClient {
                         eose_attempt_limit = EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT,
                         "epoch-gap backfill drain ended without the relays confirming stored history; retrying later"
                     );
-                    self.epoch_backfill_retry_not_before =
-                        Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
+                    self.epoch_backfill_retry_not_before = if verdict.made_novel_progress() {
+                        None
+                    } else {
+                        let pacing_ordinal = if verdict.made_no_progress() {
+                            no_progress_ordinal
+                        } else {
+                            eose_unconfirmed_ordinal
+                        };
+                        Some(Instant::now() + self.epoch_backfill_retry_backoff(pacing_ordinal))
+                    };
                     return Ok(EpochBackfillRunOutcome::Incomplete(summary));
                 }
                 if recovered {
