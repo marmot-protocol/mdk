@@ -5373,15 +5373,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_full_history_repair_without_eose_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+
+        let failure = client
+            .repair_full_history()
+            .await
+            .expect_err("relay silence cannot prove that full history was served");
+
+        assert_eq!(
+            failure.classification().failure_stage,
+            SyncFailureStage::RelayReceive
+        );
+        let source = failure.source.to_string();
+        assert!(
+            source.contains("backfill_drain_no_relay_eose")
+                || source.contains("backfill_drain_no_progress_quantum_yield"),
+            "the public failure must preserve the incomplete-drain cause; actual: {source}",
+        );
+    }
+
+    #[tokio::test]
     async fn full_history_repair_falls_back_when_every_pending_intent_defers() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
-        let mut client = app.client("alice").await.unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("deferred full-history repair", &[])
             .await
