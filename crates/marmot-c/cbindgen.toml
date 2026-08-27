@@ -19,12 +19,22 @@ header = """/*
  *    fields individually and never free a struct twice.
  *  - Input structs and strings are borrowed: the library never frees or
  *    retains caller memory.
+ *  - Values the caller supplies are fixed-width integers, never enum or
+ *    bool types: booleans are uint8_t (nonzero is true) and enums are
+ *    uint32_t discriminants, validated on entry (out of range =>
+ *    MARMOT_STATUS_INVALID_ARGUMENT). Passing an out-of-range value in a
+ *    C enum or _Bool would be undefined behavior before any check runs.
+ *  - Required out-pointers are validated and cleared before the call does
+ *    any work, so a rejected call never leaves a side effect behind.
  *  - Callbacks run on runtime worker threads; item pointers passed to a
  *    callback are borrowed and valid only for the duration of the call.
  */"""
 
 [export]
 prefix = ""
+# Enums a caller passes as a uint32_t discriminant are no longer referenced
+# by any signature, so cbindgen would drop the constants consumers need.
+include = ["MarmotAuditDataMode", "MarmotNotificationWakeSource"]
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

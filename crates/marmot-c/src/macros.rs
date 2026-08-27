@@ -23,6 +23,11 @@
 //! - `str f` / `opt_str f` — `String` / `Option<String>` → owned (nullable)
 //!   `char *`.
 //! - `copy f: T` — scalar or fieldless-enum mirror, converted with `.into()`.
+//! - `enum_val f: M` — fieldless-enum mirror carried as its `uint32_t`
+//!   discriminant. Used where C also *writes* the field (borrowed input
+//!   structs): a caller-supplied out-of-range enum value would be an
+//!   invalid Rust discriminant, so the struct holds an integer and
+//!   `M::from_c` validates it on the way in.
 //! - `opt_copy has_f/f: T` — `Option<scalar>` → `has_f: bool` + `f: T`
 //!   (zero when unset).
 //! - `rec f: M from F` — nested record by value.
@@ -122,6 +127,18 @@ macro_rules! c_mirror {
         c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
             {$($sf)* $(#[$fm])* pub $f: $t,}
             {$($lets)* let $f: $t = $value.$f.into();}
+            {$($names)* $f,}
+            {$($fr)*}
+            $($rest)*);
+    };
+
+    (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
+        {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
+        $(#[$fm:meta])* enum_val $f:ident: $mir:ty, $($rest:tt)*
+    ) => {
+        c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
+            {$($sf)* $(#[$fm])* pub $f: u32,}
+            {$($lets)* let $f = <$mir>::from($value.$f) as u32;}
             {$($names)* $f,}
             {$($fr)*}
             $($rest)*);
@@ -265,6 +282,24 @@ macro_rules! c_enum {
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum $name { $($(#[$vm])* $v),+ }
+
+        impl $name {
+            /// Validate a caller-supplied discriminant. Enums arrive from C
+            /// as `uint32_t`, never as this type: constructing a Rust enum
+            /// from an out-of-range integer is undefined behavior before any
+            /// guard can run.
+            #[allow(dead_code)]
+            pub(crate) fn from_c(value: u32) -> Result<Self, crate::MarmotStatus> {
+                const VARIANTS: &[$name] = &[$($name::$v),+];
+                VARIANTS.get(value as usize).copied().ok_or_else(|| {
+                    crate::status::set_last_error(concat!(
+                        stringify!($name),
+                        " value was out of range"
+                    ));
+                    crate::MarmotStatus::InvalidArgument
+                })
+            }
+        }
 
         impl From<$ffi> for $name {
             fn from(value: $ffi) -> Self {

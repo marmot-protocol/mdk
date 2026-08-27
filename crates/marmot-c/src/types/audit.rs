@@ -8,7 +8,7 @@ use marmot_uniffi::conversions::{
 
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
-use crate::memory::optional_str;
+use crate::memory::{c_bool, optional_str};
 
 c_enum! {
     /// Audit-log content posture.
@@ -35,17 +35,19 @@ c_mirror! {
     /// `marmot_set_audit_log_settings`.
     MarmotAuditLogSettings from AuditLogSettingsFfi,
     free marmot_audit_log_settings_free {
-        copy enabled: bool,
-        copy data_mode: MarmotAuditDataMode,
+        /// Boolean as `uint8_t`: nonzero is enabled.
+        copy enabled: u8,
+        /// `MarmotAuditDataMode` discriminant.
+        enum_val data_mode: MarmotAuditDataMode,
     }
 }
 
 impl MarmotAuditLogSettings {
-    pub(crate) fn to_ffi(&self) -> AuditLogSettingsFfi {
-        AuditLogSettingsFfi {
-            enabled: self.enabled,
-            data_mode: self.data_mode.into(),
-        }
+    pub(crate) fn to_ffi(&self) -> Result<AuditLogSettingsFfi, MarmotStatus> {
+        Ok(AuditLogSettingsFfi {
+            enabled: c_bool(self.enabled),
+            data_mode: MarmotAuditDataMode::from_c(self.data_mode)?.into(),
+        })
     }
 }
 

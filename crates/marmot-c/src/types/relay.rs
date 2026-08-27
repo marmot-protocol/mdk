@@ -7,7 +7,7 @@ use marmot_uniffi::conversions::{
 
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
-use crate::memory::{optional_str, required_str};
+use crate::memory::{c_bool, optional_str, required_str};
 
 c_mirror! {
     /// One published relay list (`kind` is the Nostr event kind).
@@ -70,7 +70,8 @@ c_mirror! {
     /// `marmot_set_relay_telemetry_settings`.
     MarmotRelayTelemetrySettings from RelayTelemetrySettingsFfi,
     free marmot_relay_telemetry_settings_free {
-        copy export_enabled: bool,
+        /// Boolean as `uint8_t`: nonzero enables export.
+        copy export_enabled: u8,
         copy export_interval_seconds: u64,
     }
 }
@@ -78,7 +79,7 @@ c_mirror! {
 impl MarmotRelayTelemetrySettings {
     pub(crate) fn to_ffi(&self) -> RelayTelemetrySettingsFfi {
         RelayTelemetrySettingsFfi {
-            export_enabled: self.export_enabled,
+            export_enabled: c_bool(self.export_enabled),
             export_interval_seconds: self.export_interval_seconds,
         }
     }

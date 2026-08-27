@@ -14,7 +14,10 @@
 //!   *borrowed* item pointer valid only for the duration of the call,
 //!   then a final NULL item when the stream closes. Callbacks run on
 //!   runtime worker threads, so `cb` and any access to `user_data` must
-//!   be thread-safe.
+//!   be thread-safe. Calling a blocking `marmot_*` function from inside a
+//!   callback is supported (see `crate::block_on_handle`) — except a
+//!   blocking read on the same handle, which competes for the receiver
+//!   the pump is already draining.
 //!
 //!   **`user_data` lifetime — read carefully.** `clear_callback` and
 //!   `*_subscription_free` only *request* cancellation: internally they
@@ -66,7 +69,7 @@ use crate::types::group::MarmotAppGroupRecord;
 use crate::types::message::{MarmotAppMessageRecordList, MarmotMessageUpdate};
 use crate::types::notification::MarmotNotificationUpdate;
 use crate::types::timeline::{MarmotTimelinePage, MarmotTimelineSubscriptionUpdate};
-use crate::{MarmotClient, client_ref, ffi_guard, write_out};
+use crate::{MarmotClient, block_on_handle, client_ref, ffi_guard, preflight_out_ptr, write_out};
 
 /// `user_data` travels into a tokio task; the C caller owns its thread
 /// safety (documented on every `set_callback`).
@@ -120,13 +123,12 @@ impl SubscriptionCore {
         fut: impl Future<Output = Option<T>>,
     ) -> Result<Option<T>, MarmotStatus> {
         if timeout_ms == 0 {
-            return Ok(self.runtime.block_on(fut));
+            return Ok(block_on_handle(&self.runtime, fut));
         }
         let duration = Duration::from_millis(u64::from(timeout_ms));
-        match self
-            .runtime
-            .block_on(async { tokio::time::timeout(duration, fut).await })
-        {
+        match block_on_handle(&self.runtime, async {
+            tokio::time::timeout(duration, fut).await
+        }) {
             Ok(item) => Ok(item),
             Err(_elapsed) => Err(MarmotStatus::Timeout),
         }
@@ -301,6 +303,7 @@ macro_rules! c_subscription {
             out: *mut *mut $mirror,
         ) -> MarmotStatus {
             ffi_guard(|| {
+                try_arg!(unsafe { preflight_out_ptr(out) });
                 let sub = try_arg!(unsafe { sub_ref(sub) });
                 let inner = sub.inner.clone();
                 let result = sub.core.block_next(timeout_ms, inner.next());
@@ -399,6 +402,7 @@ pub unsafe extern "C" fn marmot_subscribe_events(
     out_sub: *mut *mut MarmotEventsSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let handle = MarmotEventsSubscription {
             core: SubscriptionCore::new(client.runtime.handle().clone()),
@@ -436,15 +440,16 @@ pub unsafe extern "C" fn marmot_subscribe_timeline_messages(
     client: *const MarmotClient,
     account_ref: *const std::ffi::c_char,
     group_id_hex: *const std::ffi::c_char,
-    has_limit: bool,
+    has_limit: u8,
     limit: u32,
     out_sub: *mut *mut MarmotTimelineSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { optional_str(group_id_hex) });
-        let limit = has_limit.then_some(limit);
+        let limit = crate::memory::c_bool(has_limit).then_some(limit);
         match client.block_on(client.marmot.subscribe_timeline_messages(
             account_ref,
             group_id_hex,
@@ -476,6 +481,7 @@ pub unsafe extern "C" fn marmot_timeline_subscription_snapshot(
     out_page: *mut *mut MarmotTimelinePage,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_page) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let page = sub
             .inner
@@ -503,6 +509,7 @@ pub unsafe extern "C" fn marmot_timeline_subscription_next_update(
     out_update: *mut *mut MarmotTimelineSubscriptionUpdate,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_update) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let inner = sub.inner.clone();
         let result = sub.core.block_next(timeout_ms, inner.next_update());
@@ -524,12 +531,12 @@ pub unsafe extern "C" fn marmot_timeline_subscription_paginate_backwards(
     out_page: *mut *mut MarmotTimelinePage,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_page) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let inner = sub.inner.clone();
-        let result = sub
-            .core
-            .runtime
-            .block_on(async move { inner.paginate_backwards(count).await });
+        let result = block_on_handle(&sub.core.runtime, async move {
+            inner.paginate_backwards(count).await
+        });
         unsafe { deliver(result, out_page) }
     })
 }
@@ -547,12 +554,12 @@ pub unsafe extern "C" fn marmot_timeline_subscription_paginate_forwards(
     out_page: *mut *mut MarmotTimelinePage,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_page) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let inner = sub.inner.clone();
-        let result = sub
-            .core
-            .runtime
-            .block_on(async move { inner.paginate_forwards(count).await });
+        let result = block_on_handle(&sub.core.runtime, async move {
+            inner.paginate_forwards(count).await
+        });
         unsafe { deliver(result, out_page) }
     })
 }
@@ -581,6 +588,7 @@ pub unsafe extern "C" fn marmot_subscribe_notifications(
     out_sub: *mut *mut MarmotNotificationsSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         match client.block_on(client.marmot.subscribe_notifications()) {
             Ok(inner) => unsafe {
@@ -621,13 +629,18 @@ c_subscription! {
 pub unsafe extern "C" fn marmot_subscribe_chats(
     client: *const MarmotClient,
     account_ref: *const std::ffi::c_char,
-    include_archived: bool,
+    include_archived: u8,
     out_sub: *mut *mut MarmotChatsSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
-        match client.block_on(client.marmot.subscribe_chats(account_ref, include_archived)) {
+        match client.block_on(
+            client
+                .marmot
+                .subscribe_chats(account_ref, crate::memory::c_bool(include_archived)),
+        ) {
             Ok(inner) => unsafe {
                 write_handle(
                     MarmotChatsSubscription {
@@ -654,6 +667,7 @@ pub unsafe extern "C" fn marmot_chats_subscription_snapshot(
     out_list: *mut *mut crate::types::group::MarmotAppGroupRecordList,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_list) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         unsafe {
             deliver(
@@ -688,16 +702,17 @@ c_subscription! {
 pub unsafe extern "C" fn marmot_subscribe_chat_list(
     client: *const MarmotClient,
     account_ref: *const std::ffi::c_char,
-    include_archived: bool,
+    include_archived: u8,
     out_sub: *mut *mut MarmotChatListSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         match client.block_on(
             client
                 .marmot
-                .subscribe_chat_list(account_ref, include_archived),
+                .subscribe_chat_list(account_ref, crate::memory::c_bool(include_archived)),
         ) {
             Ok(inner) => unsafe {
                 write_handle(
@@ -725,6 +740,7 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_snapshot(
     out_list: *mut *mut MarmotChatListRowList,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_list) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         unsafe {
             deliver(
@@ -747,6 +763,7 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_next_update(
     out_update: *mut *mut MarmotChatListSubscriptionUpdate,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_update) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let inner = sub.inner.clone();
         let result = sub.core.block_next(timeout_ms, inner.next_update());
@@ -780,15 +797,16 @@ pub unsafe extern "C" fn marmot_subscribe_messages(
     client: *const MarmotClient,
     account_ref: *const std::ffi::c_char,
     group_id_hex: *const std::ffi::c_char,
-    has_limit: bool,
+    has_limit: u8,
     limit: u32,
     out_sub: *mut *mut MarmotMessagesSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { optional_str(group_id_hex) });
-        let limit = has_limit.then_some(limit);
+        let limit = crate::memory::c_bool(has_limit).then_some(limit);
         match client.block_on(
             client
                 .marmot
@@ -820,6 +838,7 @@ pub unsafe extern "C" fn marmot_messages_subscription_snapshot(
     out_list: *mut *mut MarmotAppMessageRecordList,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_list) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         unsafe {
             deliver(
@@ -857,6 +876,7 @@ pub unsafe extern "C" fn marmot_subscribe_group_state(
     out_sub: *mut *mut MarmotGroupStateSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -891,6 +911,7 @@ pub unsafe extern "C" fn marmot_group_state_subscription_snapshot(
     out_record: *mut *mut MarmotAppGroupRecord,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_record) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let record = sub.inner.snapshot().map_or(std::ptr::null_mut(), |r| {
             boxed(MarmotAppGroupRecord::from(r))
@@ -941,10 +962,11 @@ pub unsafe extern "C" fn marmot_watch_agent_text_stream(
     stream_id_hex: *const std::ffi::c_char,
     server_cert_der: *const u8,
     server_cert_der_len: usize,
-    insecure_local: bool,
+    insecure_local: u8,
     out_sub: *mut *mut MarmotAgentStreamSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -966,7 +988,7 @@ pub unsafe extern "C" fn marmot_watch_agent_text_stream(
             group_id_hex,
             stream_id_hex,
             server_cert_der,
-            insecure_local,
+            crate::memory::c_bool(insecure_local),
         )) {
             Ok(inner) => unsafe {
                 write_handle(
@@ -993,6 +1015,7 @@ pub unsafe extern "C" fn marmot_agent_stream_subscription_stream_id_hex(
     out_stream_id_hex: *mut *mut std::ffi::c_char,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_stream_id_hex) });
         let sub = try_arg!(unsafe { sub_ref(sub) });
         let ptr = owned_c_string(sub.inner.stream_id_hex());
         match unsafe { write_out(out_stream_id_hex, ptr) } {

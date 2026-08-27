@@ -188,6 +188,13 @@ pub(crate) fn boxed_opt<T>(value: Option<T>) -> *mut T {
     value.map_or(std::ptr::null_mut(), boxed)
 }
 
+/// Read a caller-supplied boolean. Booleans cross the ABI as `uint8_t`
+/// because a Rust `bool` holding anything but 0 or 1 is undefined
+/// behavior; any nonzero value is `true`, as in C.
+pub(crate) fn c_bool(value: u8) -> bool {
+    value != 0
+}
+
 /// Read a borrowed C string argument into an owned Rust `String`.
 ///
 /// # Safety

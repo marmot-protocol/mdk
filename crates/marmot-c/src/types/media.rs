@@ -10,7 +10,7 @@ use super::account::MarmotSendSummary;
 use super::group::MarmotEncryptedMediaVersion;
 use crate::MarmotStatus;
 use crate::macros::c_mirror;
-use crate::memory::{optional_str, required_str};
+use crate::memory::{c_bool, optional_str, required_str};
 use crate::status::set_last_error;
 
 c_mirror! {
@@ -43,7 +43,8 @@ c_mirror! {
         str nonce_hex,
         str file_name,
         str media_type,
-        copy version: MarmotEncryptedMediaVersion,
+        /// `MarmotEncryptedMediaVersion` discriminant.
+        enum_val version: MarmotEncryptedMediaVersion,
         copy source_epoch: u64,
         opt_str dim,
         opt_str thumbhash,
@@ -70,7 +71,7 @@ impl MarmotMediaAttachmentReference {
             nonce_hex: unsafe { required_str(self.nonce_hex) }?,
             file_name: unsafe { required_str(self.file_name) }?,
             media_type: unsafe { required_str(self.media_type) }?,
-            version: match self.version {
+            version: match MarmotEncryptedMediaVersion::from_c(self.version)? {
                 MarmotEncryptedMediaVersion::V1 => {
                     marmot_uniffi::conversions::EncryptedMediaVersionFfi::V1
                 }
@@ -130,8 +131,9 @@ pub struct MarmotMediaUploadRequest {
     pub attachments_len: usize,
     /// Nullable.
     pub caption: *const ::std::ffi::c_char,
-    /// Whether to also send the message after uploading.
-    pub send: bool,
+    /// Whether to also send the message after uploading (`uint8_t`
+    /// boolean: nonzero is true).
+    pub send: u8,
     /// Override Blossom server URL. Nullable.
     pub blossom_server: *const ::std::ffi::c_char,
 }
@@ -152,7 +154,7 @@ impl MarmotMediaUploadRequest {
         Ok(MediaUploadRequestFfi {
             attachments,
             caption: unsafe { optional_str(self.caption) }?,
-            send: self.send,
+            send: c_bool(self.send),
             blossom_server: unsafe { optional_str(self.blossom_server) }?,
         })
     }

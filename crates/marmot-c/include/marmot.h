@@ -13,6 +13,13 @@
  *    fields individually and never free a struct twice.
  *  - Input structs and strings are borrowed: the library never frees or
  *    retains caller memory.
+ *  - Values the caller supplies are fixed-width integers, never enum or
+ *    bool types: booleans are uint8_t (nonzero is true) and enums are
+ *    uint32_t discriminants, validated on entry (out of range =>
+ *    MARMOT_STATUS_INVALID_ARGUMENT). Passing an out-of-range value in a
+ *    C enum or _Bool would be undefined behavior before any check runs.
+ *  - Required out-pointers are validated and cleared before the call does
+ *    any work, so a rejected call never leaves a side effect behind.
  *  - Callbacks run on runtime worker threads; item pointers passed to a
  *    callback are borrowed and valid only for the duration of the call.
  */
@@ -63,6 +70,10 @@ enum MarmotStatus
    * no further items will be produced.
    */
   MARMOT_STATUS_CLOSED = 5,
+  /**
+   * A caller-supplied enum value was outside the declared range.
+   */
+  MARMOT_STATUS_INVALID_ARGUMENT = 6,
   MARMOT_STATUS_DUPLICATE_IDENTITY = 10,
   MARMOT_STATUS_UNKNOWN_ACCOUNT = 11,
   MARMOT_STATUS_UNKNOWN_GROUP = 12,
@@ -244,21 +255,6 @@ typedef enum MarmotPushRegistrationShareStatus {
 } MarmotPushRegistrationShareStatus;
 
 /**
- * Audit-log content posture.
- */
-typedef enum MarmotAuditDataMode {
-  /**
-   * Default safety posture: obfuscated/hashed identifiers, no
-   * plaintext.
-   */
-  MARMOT_AUDIT_DATA_MODE_OBFUSCATED_SENSITIVE_DATA,
-  /**
-   * Explicit opt-in: decrypted content and full identifiers.
-   */
-  MARMOT_AUDIT_DATA_MODE_FULL_DATA,
-} MarmotAuditDataMode;
-
-/**
  * Safety classification of a link/image/autolink destination.
  */
 typedef enum MarmotMarkdownLinkDestinationKind {
@@ -345,16 +341,6 @@ typedef enum MarmotChatConversationKind {
 } MarmotChatConversationKind;
 
 /**
- * What woke the background collection.
- */
-typedef enum MarmotNotificationWakeSource {
-  MARMOT_NOTIFICATION_WAKE_SOURCE_APNS_NSE,
-  MARMOT_NOTIFICATION_WAKE_SOURCE_FCM_DATA_MESSAGE,
-  MARMOT_NOTIFICATION_WAKE_SOURCE_ANDROID_FOREGROUND_SERVICE,
-  MARMOT_NOTIFICATION_WAKE_SOURCE_MANUAL_CATCH_UP,
-} MarmotNotificationWakeSource;
-
-/**
  * Outcome class of a background collection.
  */
 typedef enum MarmotNotificationCollectionStatus {
@@ -431,6 +417,31 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_SNAPSHOT_REFRESH,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_REMOVED,
 } MarmotChatListUpdateTrigger;
+
+/**
+ * Audit-log content posture.
+ */
+typedef enum MarmotAuditDataMode {
+  /**
+   * Default safety posture: obfuscated/hashed identifiers, no
+   * plaintext.
+   */
+  MARMOT_AUDIT_DATA_MODE_OBFUSCATED_SENSITIVE_DATA,
+  /**
+   * Explicit opt-in: decrypted content and full identifiers.
+   */
+  MARMOT_AUDIT_DATA_MODE_FULL_DATA,
+} MarmotAuditDataMode;
+
+/**
+ * What woke the background collection.
+ */
+typedef enum MarmotNotificationWakeSource {
+  MARMOT_NOTIFICATION_WAKE_SOURCE_APNS_NSE,
+  MARMOT_NOTIFICATION_WAKE_SOURCE_FCM_DATA_MESSAGE,
+  MARMOT_NOTIFICATION_WAKE_SOURCE_ANDROID_FOREGROUND_SERVICE,
+  MARMOT_NOTIFICATION_WAKE_SOURCE_MANUAL_CATCH_UP,
+} MarmotNotificationWakeSource;
 
 /**
  * Opaque handle to a live agent-text-stream watch: incremental
@@ -1070,7 +1081,10 @@ typedef struct MarmotGroupPushDebugInfo {
  * `marmot_set_relay_telemetry_settings`.
  */
 typedef struct MarmotRelayTelemetrySettings {
-  bool export_enabled;
+  /**
+   * Boolean as `uint8_t`: nonzero enables export.
+   */
+  uint8_t export_enabled;
   uint64_t export_interval_seconds;
 } MarmotRelayTelemetrySettings;
 
@@ -1079,8 +1093,14 @@ typedef struct MarmotRelayTelemetrySettings {
  * `marmot_set_audit_log_settings`.
  */
 typedef struct MarmotAuditLogSettings {
-  bool enabled;
-  enum MarmotAuditDataMode data_mode;
+  /**
+   * Boolean as `uint8_t`: nonzero is enabled.
+   */
+  uint8_t enabled;
+  /**
+   * `MarmotAuditDataMode` discriminant.
+   */
+  uint32_t data_mode;
 } MarmotAuditLogSettings;
 
 /**
@@ -1601,7 +1621,10 @@ typedef struct MarmotMediaAttachmentReference {
   char *nonce_hex;
   char *file_name;
   char *media_type;
-  enum MarmotEncryptedMediaVersion version;
+  /**
+   * `MarmotEncryptedMediaVersion` discriminant.
+   */
+  uint32_t version;
   uint64_t source_epoch;
   char *dim;
   char *thumbhash;
@@ -1743,9 +1766,10 @@ typedef struct MarmotMediaUploadRequest {
    */
   const char *caption;
   /**
-   * Whether to also send the message after uploading.
+   * Whether to also send the message after uploading (`uint8_t`
+   * boolean: nonzero is true).
    */
-  bool send;
+  uint8_t send;
   /**
    * Override Blossom server URL. Nullable.
    */
@@ -1795,9 +1819,10 @@ typedef struct MarmotTimelineMessageQuery {
    */
   const char *search;
   /**
-   * Only messages before this timeline timestamp; set `has_before`.
+   * Only messages before this timeline timestamp; set `has_before`
+   * (`uint8_t` boolean: nonzero is true, as for every `has_` flag here).
    */
-  bool has_before;
+  uint8_t has_before;
   uint64_t before;
   /**
    * Anchor message id for `before`. Nullable.
@@ -1806,7 +1831,7 @@ typedef struct MarmotTimelineMessageQuery {
   /**
    * Only messages after this timeline timestamp; set `has_after`.
    */
-  bool has_after;
+  uint8_t has_after;
   uint64_t after;
   /**
    * Anchor message id for `after`. Nullable.
@@ -1815,7 +1840,7 @@ typedef struct MarmotTimelineMessageQuery {
   /**
    * Page-size cap; set `has_limit`.
    */
-  bool has_limit;
+  uint8_t has_limit;
   uint32_t limit;
 } MarmotTimelineMessageQuery;
 
@@ -2718,7 +2743,7 @@ MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client,
  */
 MarmotStatus marmot_sign_out(const struct MarmotClient *client,
                              const char *account_ref,
-                             bool delete_key_packages,
+                             uint8_t delete_key_packages,
                              struct MarmotSignOutOutcome **out);
 
 /**
@@ -3396,7 +3421,7 @@ MarmotStatus marmot_retry_hydrate_quarantined_group(const struct MarmotClient *c
 MarmotStatus marmot_set_group_archived(const struct MarmotClient *client,
                                        const char *account_ref,
                                        const char *group_id_hex,
-                                       bool archived,
+                                       uint8_t archived,
                                        struct MarmotAppGroupRecord **out);
 
 /**
@@ -3566,7 +3591,7 @@ MarmotStatus marmot_notification_settings(const struct MarmotClient *client,
  */
 MarmotStatus marmot_set_local_notifications_enabled(const struct MarmotClient *client,
                                                     const char *account_ref,
-                                                    bool enabled,
+                                                    uint8_t enabled,
                                                     struct MarmotNotificationSettings **out);
 
 /**
@@ -3581,7 +3606,7 @@ MarmotStatus marmot_set_local_notifications_enabled(const struct MarmotClient *c
  */
 MarmotStatus marmot_set_native_push_enabled(const struct MarmotClient *client,
                                             const char *account_ref,
-                                            bool enabled,
+                                            uint8_t enabled,
                                             struct MarmotNotificationSettings **out);
 
 /**
@@ -3747,7 +3772,7 @@ MarmotStatus marmot_post_audit_log_tracker_update(const struct MarmotClient *cli
  */
 MarmotStatus marmot_chat_list(const struct MarmotClient *client,
                               const char *account_ref,
-                              bool include_archived,
+                              uint8_t include_archived,
                               struct MarmotChatListRowList **out);
 
 /**
@@ -3796,7 +3821,7 @@ MarmotStatus marmot_mark_timeline_message_read(const struct MarmotClient *client
 MarmotStatus marmot_messages(const struct MarmotClient *client,
                              const char *account_ref,
                              const char *group_id_hex,
-                             bool has_limit,
+                             uint8_t has_limit,
                              uint32_t limit,
                              struct MarmotAppMessageRecordList **out);
 
@@ -3813,7 +3838,7 @@ MarmotStatus marmot_messages(const struct MarmotClient *client,
 MarmotStatus marmot_list_media(const struct MarmotClient *client,
                                const char *account_ref,
                                const char *group_id_hex,
-                               bool has_limit,
+                               uint8_t has_limit,
                                uint32_t limit,
                                struct MarmotMediaRecordList **out);
 
@@ -4058,7 +4083,9 @@ MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
 
 /**
  * Register (or update) the account's native push token and share it.
- * Free with `marmot_push_registration_sync_result_free`.
+ * `platform` is a `MarmotPushPlatform` discriminant; out-of-range values
+ * are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`. Free with
+ * `marmot_push_registration_sync_result_free`.
  *
  * # Safety
  * `client` must be a live handle; strings valid (`relay_hint`
@@ -4066,14 +4093,16 @@ MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
  */
 MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *client,
                                              const char *account_ref,
-                                             enum MarmotPushPlatform platform,
+                                             uint32_t platform,
                                              const char *raw_token,
                                              const char *server_pubkey_hex,
                                              const char *relay_hint,
                                              struct MarmotPushRegistrationSyncResult **out);
 
 /**
- * Run a bounded background collection pass after a push wake. Free with
+ * Run a bounded background collection pass after a push wake. `source` is
+ * a `MarmotNotificationWakeSource` discriminant; out-of-range values are
+ * rejected with `MARMOT_STATUS_INVALID_ARGUMENT`. Free with
  * `marmot_background_notification_collection_free`.
  *
  * # Safety
@@ -4081,7 +4110,7 @@ MarmotStatus marmot_upsert_push_registration(const struct MarmotClient *client,
  */
 MarmotStatus marmot_collect_notifications_after_wake(const struct MarmotClient *client,
                                                      uint32_t max_wait_ms,
-                                                     enum MarmotNotificationWakeSource source,
+                                                     uint32_t source,
                                                      struct MarmotBackgroundNotificationCollection **out);
 
 /**
@@ -4222,7 +4251,7 @@ void marmot_timeline_subscription_free(struct MarmotTimelineSubscription *sub);
 MarmotStatus marmot_subscribe_timeline_messages(const struct MarmotClient *client,
                                                 const char *account_ref,
                                                 const char *group_id_hex,
-                                                bool has_limit,
+                                                uint8_t has_limit,
                                                 uint32_t limit,
                                                 struct MarmotTimelineSubscription **out_sub);
 
@@ -4392,7 +4421,7 @@ void marmot_chats_subscription_free(struct MarmotChatsSubscription *sub);
  */
 MarmotStatus marmot_subscribe_chats(const struct MarmotClient *client,
                                     const char *account_ref,
-                                    bool include_archived,
+                                    uint8_t include_archived,
                                     struct MarmotChatsSubscription **out_sub);
 
 /**
@@ -4465,7 +4494,7 @@ void marmot_chat_list_subscription_free(struct MarmotChatListSubscription *sub);
  */
 MarmotStatus marmot_subscribe_chat_list(const struct MarmotClient *client,
                                         const char *account_ref,
-                                        bool include_archived,
+                                        uint8_t include_archived,
                                         struct MarmotChatListSubscription **out_sub);
 
 /**
@@ -4552,7 +4581,7 @@ void marmot_messages_subscription_free(struct MarmotMessagesSubscription *sub);
 MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client,
                                        const char *account_ref,
                                        const char *group_id_hex,
-                                       bool has_limit,
+                                       uint8_t has_limit,
                                        uint32_t limit,
                                        struct MarmotMessagesSubscription **out_sub);
 
@@ -4710,7 +4739,7 @@ MarmotStatus marmot_watch_agent_text_stream(const struct MarmotClient *client,
                                             const char *stream_id_hex,
                                             const uint8_t *server_cert_der,
                                             uintptr_t server_cert_der_len,
-                                            bool insecure_local,
+                                            uint8_t insecure_local,
                                             struct MarmotAgentStreamSubscription **out_sub);
 
 /**

@@ -65,6 +65,14 @@ against both linkage models (valgrind when available).
   individually, never free twice; NULL is always a no-op.
 - Input structs and strings are borrowed: the library never frees or
   retains caller memory.
+- Values you supply are fixed-width integers, never C enums or `_Bool`:
+  booleans are `uint8_t` (nonzero is true) and enums are `uint32_t`
+  discriminants — use the generated `MARMOT_*` constants. Out-of-range
+  values are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`.
+- Required out-pointers are checked and zeroed before the call does any
+  work, so a rejected call never leaves a side effect behind and is always
+  safe to retry.
+- Blocking functions may be called from a subscription callback.
 - Subscriptions offer blocking `*_next` (`0` timeout = wait forever;
   `MARMOT_STATUS_TIMEOUT` / `MARMOT_STATUS_CLOSED` otherwise) or callback
   registration. Callback item pointers are borrowed and valid only for

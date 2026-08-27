@@ -16,7 +16,7 @@ use super::markdown::MarmotMarkdownDocument;
 use super::media::MarmotMediaAttachmentReference;
 use crate::MarmotStatus;
 use crate::macros::{c_enum, c_mirror};
-use crate::memory::{CFree, free_c_string, optional_str, owned_c_string};
+use crate::memory::{CFree, c_bool, free_c_string, optional_str, owned_c_string};
 
 /// Timeline read query. Borrowed input to `marmot_timeline_messages`;
 /// NULL string fields and `has_x == false` scalars mean "unset".
@@ -26,18 +26,19 @@ pub struct MarmotTimelineMessageQuery {
     pub group_id_hex: *const c_char,
     /// Substring search. Nullable.
     pub search: *const c_char,
-    /// Only messages before this timeline timestamp; set `has_before`.
-    pub has_before: bool,
+    /// Only messages before this timeline timestamp; set `has_before`
+    /// (`uint8_t` boolean: nonzero is true, as for every `has_` flag here).
+    pub has_before: u8,
     pub before: u64,
     /// Anchor message id for `before`. Nullable.
     pub before_message_id: *const c_char,
     /// Only messages after this timeline timestamp; set `has_after`.
-    pub has_after: bool,
+    pub has_after: u8,
     pub after: u64,
     /// Anchor message id for `after`. Nullable.
     pub after_message_id: *const c_char,
     /// Page-size cap; set `has_limit`.
-    pub has_limit: bool,
+    pub has_limit: u8,
     pub limit: u32,
 }
 
@@ -48,11 +49,11 @@ impl MarmotTimelineMessageQuery {
         Ok(TimelineMessageQueryFfi {
             group_id_hex: unsafe { optional_str(self.group_id_hex) }?,
             search: unsafe { optional_str(self.search) }?,
-            before: self.has_before.then_some(self.before),
+            before: c_bool(self.has_before).then_some(self.before),
             before_message_id: unsafe { optional_str(self.before_message_id) }?,
-            after: self.has_after.then_some(self.after),
+            after: c_bool(self.has_after).then_some(self.after),
             after_message_id: unsafe { optional_str(self.after_message_id) }?,
-            limit: self.has_limit.then_some(self.limit),
+            limit: c_bool(self.has_limit).then_some(self.limit),
         })
     }
 }

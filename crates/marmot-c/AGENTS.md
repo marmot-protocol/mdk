@@ -41,6 +41,16 @@ C ABI bindings for the Marmot app runtime. Read `README.md` first for build, lin
   input structs and strings are borrowed and never freed or retained. Only root-returned types export a free —
   embedded types are released by their parent's deep-free.
 - Every `extern "C"` body is wrapped in `ffi_guard` — panics must not unwind into C.
+- Caller-supplied values cross as fixed-width integers, never `bool` or a mirror enum: booleans are `u8`
+  (`memory::c_bool`, nonzero is true) and enums are `u32` discriminants validated with the generated
+  `Mirror::from_c` (`MARMOT_STATUS_INVALID_ARGUMENT` when out of range). Constructing a Rust `bool`/enum from an
+  out-of-range integer is undefined behavior before `ffi_guard` can catch anything. This covers direct parameters
+  *and* fields of borrowed input structs (`enum_val` in `c_mirror!`).
+- Required out-pointers are validated and cleared at wrapper entry (`preflight_out_ptr` / `preflight_out`), before
+  any async call, mutation, or subscription dequeue — a late NULL check reports failure after the side effect landed,
+  so a retry duplicates a send and a consumed subscription item is lost.
+- Blocking calls go through `block_on_handle`, never a bare `block_on`: a C consumer may call the ABI from a
+  subscription callback, which runs on the embedded runtime's own worker threads.
 - `MarmotStatus` values are stable ABI: append, never renumber. Keep the variant set in lockstep with
   `marmot_uniffi::MarmotKitError`.
 - `include/marmot.h` is generated, never hand-edited; regenerate with `just c-header`. CI diff-gates it.

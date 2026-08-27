@@ -45,8 +45,35 @@ pub struct MarmotClient {
 impl MarmotClient {
     /// Run an async runtime call to completion on the embedded runtime.
     pub(crate) fn block_on<F: Future>(&self, fut: F) -> F::Output {
-        self.runtime.block_on(fut)
+        block_on_handle(self.runtime.handle(), fut)
     }
+}
+
+/// Drive `fut` to completion on `handle`, blocking the calling thread.
+///
+/// Callbacks run on the embedded runtime's worker threads, so a C consumer
+/// calling any blocking `marmot_*` function from a callback re-enters the
+/// runtime — where a bare `block_on` panics. `block_in_place` hands the
+/// worker's remaining tasks to another thread first, which makes the
+/// re-entrant call work instead of returning `MARMOT_STATUS_PANIC_CAUGHT`.
+pub(crate) fn block_on_handle<F: Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => handle.block_on(fut),
+    }
+}
+
+/// Reject a NULL required out-pointer and clear it *before* the operation
+/// runs, so a NULL out can never discard work that already happened (a
+/// retry would duplicate a send, and a consumed subscription item would be
+/// lost).
+pub(crate) unsafe fn preflight_out_ptr<T>(out: *mut *mut T) -> Result<(), MarmotStatus> {
+    unsafe { write_out(out, std::ptr::null_mut()) }
+}
+
+/// [`preflight_out_ptr`] for by-value scalar out-params.
+pub(crate) unsafe fn preflight_out<T: Default>(out: *mut T) -> Result<(), MarmotStatus> {
+    unsafe { write_out(out, T::default()) }
 }
 
 /// Catch panics at the ABI boundary: unwinding into C is undefined
@@ -104,6 +131,9 @@ pub unsafe extern "C" fn marmot_client_new(
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
         let root_path = match unsafe { required_str(root_path) } {
             Ok(v) => v,
             Err(status) => return status,
@@ -191,6 +221,9 @@ pub unsafe extern "C" fn marmot_client_is_stopping(
     out_stopping: *mut bool,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out(out_stopping) } {
+            return status;
+        }
         let client = match unsafe { client_ref(client) } {
             Ok(c) => c,
             Err(status) => return status,
@@ -266,4 +299,63 @@ pub unsafe extern "C" fn marmot_string_free(s: *mut c_char) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_bytes_free(data: *mut u8, len: usize) {
     memory::free_guard(|| unsafe { memory::free_vec(data, len) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::push::MarmotPushPlatform;
+
+    #[test]
+    fn block_on_survives_reentry_from_a_worker_thread() {
+        // A C consumer calling a blocking marmot_* function from a
+        // subscription callback re-enters the runtime from one of its own
+        // worker threads. A bare block_on panics there, which used to
+        // surface as MARMOT_STATUS_PANIC_CAUGHT.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let handle = rt.handle().clone();
+
+        let nested = rt.block_on(async move {
+            tokio::task::spawn(async move { block_on_handle(&handle, async { 42u32 }) })
+                .await
+                .expect("nested task must not panic")
+        });
+        assert_eq!(nested, 42);
+    }
+
+    #[test]
+    fn preflight_rejects_and_clears_out_pointers() {
+        assert_eq!(
+            unsafe { preflight_out_ptr::<u8>(std::ptr::null_mut()) },
+            Err(MarmotStatus::NullPointer)
+        );
+        assert_eq!(
+            unsafe { preflight_out::<u64>(std::ptr::null_mut()) },
+            Err(MarmotStatus::NullPointer)
+        );
+
+        // A stale value must be cleared before the operation runs, so a
+        // later failure can never leave the caller reading it as a result.
+        let mut stale: *mut u8 = std::ptr::dangling_mut::<u8>();
+        assert_eq!(unsafe { preflight_out_ptr(&raw mut stale) }, Ok(()));
+        assert!(stale.is_null());
+    }
+
+    #[test]
+    fn enum_inputs_reject_out_of_range_values() {
+        assert_eq!(MarmotPushPlatform::from_c(0), Ok(MarmotPushPlatform::Apns));
+        assert_eq!(MarmotPushPlatform::from_c(1), Ok(MarmotPushPlatform::Fcm));
+        assert_eq!(
+            MarmotPushPlatform::from_c(2),
+            Err(MarmotStatus::InvalidArgument)
+        );
+        assert_eq!(
+            MarmotPushPlatform::from_c(u32::MAX),
+            Err(MarmotStatus::InvalidArgument)
+        );
+    }
 }

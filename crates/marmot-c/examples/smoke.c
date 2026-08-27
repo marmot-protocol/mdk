@@ -170,6 +170,18 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_OK, "npub lookup call succeeds");
     marmot_string_free(npub);
 
+    /* ---- boundary validation ------------------------------------------ */
+    /* Out-of-range enum discriminants are rejected instead of becoming
+     * invalid Rust enum values. */
+    MarmotBackgroundNotificationCollection *collection = NULL;
+    st = marmot_collect_notifications_after_wake(client, 0, 9999, &collection);
+    check(st == MARMOT_STATUS_INVALID_ARGUMENT && collection == NULL,
+          "out-of-range wake source -> MARMOT_STATUS_INVALID_ARGUMENT");
+
+    /* A NULL required out-pointer is caught before the command runs. */
+    st = marmot_chat_list(client, "no-such-account", 0, NULL);
+    check(st == MARMOT_STATUS_NULL_POINTER, "NULL out rejected up front");
+
     /* ---- error taxonomy ----------------------------------------------- */
     MarmotStringList *relays_out = NULL;
     st = marmot_account_nip65_relays(client, "no-such-account", &relays_out);

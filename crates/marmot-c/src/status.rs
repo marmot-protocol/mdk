@@ -38,6 +38,8 @@ pub enum MarmotStatus {
     /// The subscription is closed (runtime shutdown or sender dropped);
     /// no further items will be produced.
     Closed = 5,
+    /// A caller-supplied enum value was outside the declared range.
+    InvalidArgument = 6,
 
     // Runtime error variants (mirror marmot_uniffi::MarmotKitError).
     DuplicateIdentity = 10,

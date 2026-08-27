@@ -201,7 +201,8 @@ pub(crate) unsafe fn deliver_bytes(
 /// ```
 ///
 /// Arg kinds: `str` (required string), `opt_str` (nullable string),
-/// `str_arr` (string array + length pair), `val: T` (scalar by value).
+/// `str_arr` (string array + length pair), `val: T` (scalar by value),
+/// `flag` (boolean as `uint8_t` — see [`crate::memory::c_bool`]).
 /// Return kinds: `unit`, `scalar(T)`, `string`, `bytes`, `rec(Mirror)`,
 /// `opt_rec(Mirror)`. `sync`/`async` selects direct call vs `block_on`.
 macro_rules! c_cmd {
@@ -245,6 +246,7 @@ macro_rules! c_cmd {
             out: *mut $t,
         ) -> MarmotStatus {
             ffi_guard(|| {
+                try_arg!(unsafe { crate::preflight_out(out) });
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver_scalar(c_cmd!(@call client, $mode, $method, $($a)*), out) }
@@ -266,6 +268,7 @@ macro_rules! c_cmd {
             out: *mut *mut c_char,
         ) -> MarmotStatus {
             ffi_guard(|| {
+                try_arg!(unsafe { crate::preflight_out_ptr(out) });
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver_string(c_cmd!(@call client, $mode, $method, $($a)*), out) }
@@ -288,6 +291,8 @@ macro_rules! c_cmd {
             out_len: *mut usize,
         ) -> MarmotStatus {
             ffi_guard(|| {
+                try_arg!(unsafe { crate::preflight_out_ptr(out_data) });
+                try_arg!(unsafe { crate::preflight_out(out_len) });
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver_bytes(c_cmd!(@call client, $mode, $method, $($a)*), out_data, out_len) }
@@ -309,6 +314,7 @@ macro_rules! c_cmd {
             out: *mut *mut $t,
         ) -> MarmotStatus {
             ffi_guard(|| {
+                try_arg!(unsafe { crate::preflight_out_ptr(out) });
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver(c_cmd!(@call client, $mode, $method, $($a)*), out) }
@@ -330,6 +336,7 @@ macro_rules! c_cmd {
             out: *mut *mut $t,
         ) -> MarmotStatus {
             ffi_guard(|| {
+                try_arg!(unsafe { crate::preflight_out_ptr(out) });
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver_opt(c_cmd!(@call client, $mode, $method, $($a)*), out) }
@@ -366,10 +373,17 @@ macro_rules! c_cmd {
             {$($a)* $f,}
             $($($rest)*)?);
     };
+    (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, ($($ret:tt)+), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*} $f:ident: flag $(, $($rest:tt)*)?) => {
+        c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
+            {$($p)* $f: u8,}
+            {$($r)* let $f = crate::memory::c_bool($f);}
+            {$($a)* $f,}
+            $($($rest)*)?);
+    };
     (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, ($($ret:tt)+), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*} $hf:ident/$f:ident: opt_val $t:ty $(, $($rest:tt)*)?) => {
         c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
-            {$($p)* $hf: bool, $f: $t,}
-            {$($r)* let $f = $hf.then_some($f);}
+            {$($p)* $hf: u8, $f: $t,}
+            {$($r)* let $f = crate::memory::c_bool($hf).then_some($f);}
             {$($a)* $f,}
             $($($rest)*)?);
     };
@@ -404,7 +418,7 @@ c_cmd! {
     /// keeping local state so it can sign back in later. When
     /// `delete_key_packages` is true, relay-published KeyPackages get
     /// NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
-    async fn marmot_sign_out(account_ref: str, delete_key_packages: val bool) -> rec(MarmotSignOutOutcome) = sign_out;
+    async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
     /// Create a brand-new Nostr identity, store its secret in the platform
     /// keychain, and publish initial relay lists + key package. Free with
@@ -590,7 +604,7 @@ c_cmd! {
 
     /// Flag a group archived (or restore it). Local-only projection
     /// state. Free with `marmot_app_group_record_free`.
-    async fn marmot_set_group_archived(account_ref: str, group_id_hex: str, archived: val bool) -> rec(MarmotAppGroupRecord) = set_group_archived;
+    async fn marmot_set_group_archived(account_ref: str, group_id_hex: str, archived: flag) -> rec(MarmotAppGroupRecord) = set_group_archived;
 
     /// Send a chat text message to the group. Free with
     /// `marmot_send_summary_free`.
@@ -634,11 +648,11 @@ c_cmd! {
 
     /// Toggle local notifications for the account. Free with
     /// `marmot_notification_settings_free`.
-    sync fn marmot_set_local_notifications_enabled(account_ref: str, enabled: val bool) -> rec(MarmotNotificationSettings) = set_local_notifications_enabled;
+    sync fn marmot_set_local_notifications_enabled(account_ref: str, enabled: flag) -> rec(MarmotNotificationSettings) = set_local_notifications_enabled;
 
     /// Toggle native push for the account. Free with
     /// `marmot_notification_settings_free`.
-    async fn marmot_set_native_push_enabled(account_ref: str, enabled: val bool) -> rec(MarmotNotificationSettings) = set_native_push_enabled;
+    async fn marmot_set_native_push_enabled(account_ref: str, enabled: flag) -> rec(MarmotNotificationSettings) = set_native_push_enabled;
 
     /// The account's current push registration; writes NULL with
     /// `MARMOT_STATUS_OK` when there is none. Free with
@@ -687,7 +701,7 @@ c_cmd! {
 
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
-    sync fn marmot_chat_list(account_ref: str, include_archived: val bool) -> rec(MarmotChatListRowList) = chat_list;
+    sync fn marmot_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotChatListRowList) = chat_list;
 
     /// Initialize read state for a conversation being opened; writes the
     /// refreshed row, or NULL with `MARMOT_STATUS_OK` when the group has
@@ -729,6 +743,7 @@ pub unsafe extern "C" fn marmot_parse_markdown(
     out: *mut *mut MarmotMarkdownDocument,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let text = try_arg!(unsafe { required_str(text) });
         unsafe {
@@ -754,6 +769,7 @@ pub unsafe extern "C" fn marmot_display_name(
     out: *mut *mut c_char,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_id_hex = try_arg!(unsafe { required_str(account_id_hex) });
         deliver_plain_opt_string(client.marmot.display_name(account_id_hex), out)
@@ -772,6 +788,7 @@ pub unsafe extern "C" fn marmot_npub(
     out: *mut *mut c_char,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_id_hex = try_arg!(unsafe { required_str(account_id_hex) });
         deliver_plain_opt_string(client.marmot.npub(account_id_hex), out)
@@ -792,6 +809,7 @@ pub unsafe extern "C" fn marmot_account_id_hex(
     out: *mut *mut c_char,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let reference = try_arg!(unsafe { required_str(reference) });
         deliver_plain_opt_string(client.marmot.account_id_hex(reference), out)
@@ -819,6 +837,7 @@ pub unsafe extern "C" fn marmot_relay_health(
     out: *mut *mut MarmotRelayHealth,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let health = client.block_on(client.marmot.relay_health());
         unsafe { deliver(Ok::<_, MarmotKitError>(health), out) }
@@ -838,6 +857,7 @@ pub unsafe extern "C" fn marmot_set_relay_telemetry_settings(
     out: *mut *mut MarmotRelayTelemetrySettings,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let settings = try_arg!(unsafe { borrowed(settings) });
         unsafe {
@@ -883,11 +903,13 @@ pub unsafe extern "C" fn marmot_set_audit_log_settings(
     out: *mut *mut MarmotAuditLogSettings,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let settings = try_arg!(unsafe { borrowed(settings) });
+        let settings = try_arg!(settings.to_ffi());
         unsafe {
             deliver(
-                client.block_on(client.marmot.set_audit_log_settings(settings.to_ffi())),
+                client.block_on(client.marmot.set_audit_log_settings(settings)),
                 out,
             )
         }
@@ -907,6 +929,7 @@ pub unsafe extern "C" fn marmot_set_audit_log_tracker_config(
     out: *mut *mut MarmotAuditLogTrackerConfig,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let config = try_arg!(unsafe { borrowed(config) });
         let config = try_arg!(unsafe { config.to_ffi() });
@@ -935,6 +958,7 @@ pub unsafe extern "C" fn marmot_publish_user_profile(
     out: *mut *mut MarmotUserProfileMetadata,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let profile = try_arg!(unsafe { borrowed(profile) });
@@ -974,6 +998,7 @@ pub unsafe extern "C" fn marmot_replace_encrypted_media_blob_endpoints(
     out: *mut *mut MarmotSendSummary,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -1009,6 +1034,7 @@ pub unsafe extern "C" fn marmot_send_media_attachments(
     out: *mut *mut MarmotSendSummary,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -1045,6 +1071,7 @@ pub unsafe extern "C" fn marmot_send_media_reference(
     out: *mut *mut MarmotSendSummary,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -1080,6 +1107,7 @@ pub unsafe extern "C" fn marmot_upload_media(
     out: *mut *mut MarmotMediaUploadResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -1113,6 +1141,7 @@ pub unsafe extern "C" fn marmot_download_media(
     out: *mut *mut MarmotMediaDownloadResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
@@ -1145,6 +1174,7 @@ pub unsafe extern "C" fn marmot_timeline_messages(
     out: *mut *mut MarmotTimelinePage,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let query = try_arg!(unsafe { borrowed(query) });
@@ -1154,7 +1184,9 @@ pub unsafe extern "C" fn marmot_timeline_messages(
 }
 
 /// Register (or update) the account's native push token and share it.
-/// Free with `marmot_push_registration_sync_result_free`.
+/// `platform` is a `MarmotPushPlatform` discriminant; out-of-range values
+/// are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`. Free with
+/// `marmot_push_registration_sync_result_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; strings valid (`relay_hint`
@@ -1163,14 +1195,16 @@ pub unsafe extern "C" fn marmot_timeline_messages(
 pub unsafe extern "C" fn marmot_upsert_push_registration(
     client: *const MarmotClient,
     account_ref: *const c_char,
-    platform: MarmotPushPlatform,
+    platform: u32,
     raw_token: *const c_char,
     server_pubkey_hex: *const c_char,
     relay_hint: *const c_char,
     out: *mut *mut MarmotPushRegistrationSyncResult,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
+        let platform = try_arg!(MarmotPushPlatform::from_c(platform));
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let raw_token = try_arg!(unsafe { required_str(raw_token) });
         let server_pubkey_hex = try_arg!(unsafe { required_str(server_pubkey_hex) });
@@ -1190,7 +1224,9 @@ pub unsafe extern "C" fn marmot_upsert_push_registration(
     })
 }
 
-/// Run a bounded background collection pass after a push wake. Free with
+/// Run a bounded background collection pass after a push wake. `source` is
+/// a `MarmotNotificationWakeSource` discriminant; out-of-range values are
+/// rejected with `MARMOT_STATUS_INVALID_ARGUMENT`. Free with
 /// `marmot_background_notification_collection_free`.
 ///
 /// # Safety
@@ -1199,10 +1235,12 @@ pub unsafe extern "C" fn marmot_upsert_push_registration(
 pub unsafe extern "C" fn marmot_collect_notifications_after_wake(
     client: *const MarmotClient,
     max_wait_ms: u32,
-    source: MarmotNotificationWakeSource,
+    source: u32,
     out: *mut *mut MarmotBackgroundNotificationCollection,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let source = try_arg!(MarmotNotificationWakeSource::from_c(source));
         let client = try_arg!(unsafe { client_ref(client) });
         unsafe {
             deliver(
@@ -1235,6 +1273,7 @@ pub unsafe extern "C" fn marmot_start_agent_text_stream(
     out: *mut *mut MarmotAgentStreamStart,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
