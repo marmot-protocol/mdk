@@ -93,9 +93,8 @@ All connectors:
 - support only `always` activation today;
 - use `/<path>` on the first group message to select a canonical working
   directory beneath `$HOME`;
-- persist private per-group working-directory and session mappings;
-- intercept an exact `/reset-session` message before backend invocation, clear
-  only that group's backend session id, and retain its selected workdir;
+- persist private per-group working-directory, session, and goal mappings;
+- answer the reserved chat commands below before backend invocation;
 - split durable replies on UTF-8 boundaries with a 30,000-byte default and a
   60,000-byte hard ceiling;
 - report presentation-idle liveness as unknown without killing an invocation and
@@ -107,11 +106,48 @@ All connectors:
   FIFO work, without replaying the backend invocation;
 - keep diagnostics free of identifiers, paths, prompts, and backend output.
 
-`/reset-session` is reserved as a harness control message. Send
-`//reset-session` to forward the literal `/reset-session` text to the backend.
-Reset never deletes backend-owned transcripts and never retries a failed resumed
-prompt automatically; the next distinct prompt starts a new logical backend
-session in the retained workdir.
+## Chat Commands
+
+Terminal backends run through their non-interactive machine interfaces, which do
+not expand the backend's own interactive slash commands. A message whose first
+token is a reserved name below is therefore answered by the harness itself and
+never reaches the backend:
+
+| Command | Effect |
+| --- | --- |
+| `/help` | List these commands. |
+| `/status` | Report backend name, workdir, session state, execution profile, and goal. |
+| `/pwd` | Report the selected working directory as a `$HOME`-relative path. |
+| `/cd <path>` | Select a working directory under `$HOME` and start a new session epoch. |
+| `/new` | End the active backend session and keep the workdir. |
+| `/reset-session` | Same as `/new`. |
+| `/session-status` | Reserved for the active-turn status lane; until that lane is supported, return an unavailable reply without invoking the backend. |
+| `/retry-last` | Retry the durable recovery record that currently blocks this chat. |
+| `/discard-last` | Discard the durable recovery record without replay. |
+| `/goal <text>` | Store a standing instruction for this chat. `/goal` shows it; `/goal clear` removes it. |
+
+A reserved name used with arguments it does not accept, such as
+`/new right now`, returns a usage reply instead of being forwarded as a prompt.
+Any other leading-slash message keeps the existing workdir-picker behavior, so
+`/whitenoise fix the build` still selects `~/whitenoise` and prompts with the
+rest. A directory whose name collides with a reserved command must be selected
+with `/cd`.
+
+Prefix a message with `//` to strip one slash and forward the rest verbatim
+without command routing or workdir selection: `//status` sends the literal
+`/status` to the backend. Backends differ in what they do with it. `codex exec`
+and `opencode run` have no slash parsing at all, so the text is prompt prose. A
+backend that does route slash commands in its non-interactive mode receives its
+own command through this escape.
+
+`/new` and `/reset-session` never delete backend-owned transcripts and never
+retry a failed resumed prompt automatically; the next distinct prompt starts a
+new logical backend session in the retained workdir.
+
+The stored goal is prepended to every prompt in its chat as one delimited block.
+That costs prompt tokens on every turn and, in exchange, survives session
+resets, lost session ids, and backend context compaction. Goals are bounded to
+4096 bytes and live only in the connector's private per-group state file.
 
 `/retry-last` and `/discard-last` are available only while one matching durable
 recovery record blocks that group. Retry consumes that record once and runs ahead

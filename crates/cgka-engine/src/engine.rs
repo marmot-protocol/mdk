@@ -792,6 +792,36 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group_id)
     }
 
+    /// Originating stored commit for a live pending publication.
+    pub fn pending_origin_message_id(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<MessageId, EngineError> {
+        self.pending_group_id(pending)?;
+        self.peek_pending_origin_commit(pending)
+            .ok_or(EngineError::UnknownPending)
+    }
+
+    /// Durable fanout discriminator for a live pending publication.
+    pub fn pending_fanout_kind(
+        &self,
+        pending: PendingStateRef,
+    ) -> Result<cgka_traits::FanoutPendingKind, EngineError> {
+        self.pending_group_id(pending)?;
+        match self.epoch_manager.kind_for_pending(pending) {
+            Some(crate::epoch_manager::PendingKind::CreateGroup) => {
+                Ok(cgka_traits::FanoutPendingKind::CreateGroup)
+            }
+            Some(crate::epoch_manager::PendingKind::GroupEvolution) => {
+                Ok(cgka_traits::FanoutPendingKind::GroupEvolution)
+            }
+            Some(crate::epoch_manager::PendingKind::Disband) => {
+                Ok(cgka_traits::FanoutPendingKind::Disband)
+            }
+            None => Err(EngineError::UnknownPending),
+        }
+    }
+
     /// Confirm MLS and persist the matching fanout's terminal MLS edge in the
     /// same backend transaction.
     pub async fn confirm_published_fanout(
@@ -1070,9 +1100,8 @@ impl<S: StorageProvider> Engine<S> {
     /// Compute per-message recipient expectations for a completed send/create,
     /// derived from authenticated membership: the main message (commit, app
     /// message, or proposal) targets all OTHER current group members; each
-    /// welcome targets only its added member. Full member pubkeys are included
-    /// only in [`AuditDataMode::FullData`]; member refs (salted hashes) and
-    /// counts are always safe.
+    /// welcome targets only its added member. Recipients are represented only by
+    /// salted member refs and aggregate counts.
     fn recipient_expectation_records(
         &self,
         group_id: &GroupId,
@@ -1084,7 +1113,6 @@ impl<S: StorageProvider> Engine<S> {
         use cgka_traits::transport::TransportEnvelope;
         use marmot_forensics::{MessageArtifactKind, RecipientExpectation, RecipientScope};
 
-        let full_data = self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData;
         let membership_epoch = self
             .audit_group_context_snapshot(group_id)
             .and_then(|ctx| ctx.epoch);
@@ -1105,15 +1133,6 @@ impl<S: StorageProvider> Engine<S> {
             let self_id = self.identity.self_id();
             let members = self.do_members(group_id).unwrap_or_default();
             let others: Vec<_> = members.iter().filter(|m| &m.id != self_id).collect();
-            let expected_pubkeys_hex = if full_data {
-                others
-                    .iter()
-                    .filter(|m| m.credential.len() == 32)
-                    .map(|m| hex::encode(&m.credential))
-                    .collect()
-            } else {
-                Vec::new()
-            };
             rows.push((
                 hex::encode(msg.id.as_slice()),
                 RecipientExpectation {
@@ -1125,7 +1144,6 @@ impl<S: StorageProvider> Engine<S> {
                         .iter()
                         .map(|m| crate::audit_helpers::member_ref_hex(&m.id))
                         .collect(),
-                    expected_pubkeys_hex,
                     expected_count: Some(others.len() as u64),
                 },
             ));
@@ -1142,20 +1160,12 @@ impl<S: StorageProvider> Engine<S> {
                 TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
                 TransportEnvelope::GroupMessage { .. } => None,
             };
-            let (expected_member_refs, expected_pubkeys_hex, expected_count) = match &recipient {
-                Some(recipient) => {
-                    let pubkeys = if full_data && recipient.as_slice().len() == 32 {
-                        vec![hex::encode(recipient.as_slice())]
-                    } else {
-                        Vec::new()
-                    };
-                    (
-                        vec![crate::audit_helpers::member_ref_hex(recipient)],
-                        pubkeys,
-                        Some(1),
-                    )
-                }
-                None => (Vec::new(), Vec::new(), None),
+            let (expected_member_refs, expected_count) = match &recipient {
+                Some(recipient) => (
+                    vec![crate::audit_helpers::member_ref_hex(recipient)],
+                    Some(1),
+                ),
+                None => (Vec::new(), None),
             };
             rows.push((
                 hex::encode(welcome.id.as_slice()),
@@ -1165,7 +1175,6 @@ impl<S: StorageProvider> Engine<S> {
                     membership_epoch,
                     basis_commit_id: None,
                     expected_member_refs,
-                    expected_pubkeys_hex,
                     expected_count,
                 },
             ));
@@ -1666,16 +1675,37 @@ impl<S: StorageProvider> Engine<S> {
             // Validate the fanout's origin-commit row still resolves to a
             // stored OpenMLS wire message before restoring the pending
             // lifecycle around it.
+            let origin_message_id = fanout.pending_origin_message_id().cloned();
+            let stored_message_id = origin_message_id
+                .as_ref()
+                .unwrap_or_else(|| fanout.message_id());
             let stored = self
                 .storage
-                .get_message(fanout.message_id())
+                .get_message(stored_message_id)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
             let payload = StoredMessagePayload::decode(&stored.payload)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            if payload.as_openmls_wire().is_none() {
+            let valid_origin = if origin_message_id.is_some() {
+                payload.as_openmls_wire().is_some()
+            } else {
+                payload
+                    .as_outbound_welcome()
+                    .or_else(|| payload.as_raw_transport())
+                    .is_some_and(|message| {
+                        matches!(message.envelope, TransportEnvelope::Welcome { .. })
+                    })
+            };
+            if !valid_origin {
                 return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
             }
-            Some((pending_ref, prior_epoch, fanout.message_id().clone()))
+            Some((
+                pending_ref,
+                prior_epoch,
+                origin_message_id,
+                fanout
+                    .pending_kind()
+                    .unwrap_or(cgka_traits::FanoutPendingKind::GroupEvolution),
+            ))
         } else {
             None
         };
@@ -1811,7 +1841,19 @@ impl<S: StorageProvider> Engine<S> {
             self.epoch_manager
                 .restore_unrecoverable(group_id.clone(), group.epoch);
             ("unrecoverable", "hydrate_unrecoverable_group")
-        } else if let Some((pending_ref, prior_epoch, message_id)) = pending_recovery {
+        } else if let Some((pending_ref, prior_epoch, message_id, pending_kind)) = pending_recovery
+        {
+            let pending_kind = match pending_kind {
+                cgka_traits::FanoutPendingKind::GroupEvolution => {
+                    crate::epoch_manager::PendingKind::GroupEvolution
+                }
+                cgka_traits::FanoutPendingKind::CreateGroup => {
+                    crate::epoch_manager::PendingKind::CreateGroup
+                }
+                cgka_traits::FanoutPendingKind::Disband => {
+                    crate::epoch_manager::PendingKind::Disband
+                }
+            };
             self.epoch_manager
                 .restore_pending(
                     group_id.clone(),
@@ -1819,10 +1861,12 @@ impl<S: StorageProvider> Engine<S> {
                     EpochId(prior_epoch.0.saturating_add(1)),
                     StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
                     pending_ref,
-                    crate::epoch_manager::PendingKind::GroupEvolution,
+                    pending_kind,
                 )
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            self.track_pending_origin_commit(pending_ref, message_id);
+            if let Some(message_id) = message_id {
+                self.track_pending_origin_commit(pending_ref, message_id);
+            }
             ("pending_publish", "hydrate_stable_group")
         } else if restored_durable_evolution {
             ("pending_publish", "hydrate_stable_group")
@@ -2551,18 +2595,6 @@ impl<S: StorageProvider> Engine<S> {
     /// begin a fresh one, then keep recording. No-op for non-file recorders.
     pub fn rotate_audit_recorder(&self) -> std::io::Result<()> {
         self.recorder.rotate()
-    }
-
-    /// Switch the installed forensic recorder's [`AuditDataMode`] in place. On a
-    /// real change a file-backed recorder rotates so the file carries a single,
-    /// unambiguous mode and writes an `audit_data_mode_changed` boundary row.
-    /// No-op for the [`NoopRecorder`] or when the mode is unchanged.
-    pub fn set_audit_recorder_data_mode(
-        &self,
-        mode: marmot_forensics::AuditDataMode,
-        reason: &str,
-    ) -> std::io::Result<()> {
-        self.recorder.set_data_mode(mode, reason)
     }
 
     /// Override the deferred-peel retry budget (mdk#339). Rows that

@@ -12,8 +12,8 @@ use std::sync::{Arc, Once};
 
 use marmot_account::AccountHome;
 use marmot_uniffi::{
-    AuditDataModeFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi,
-    CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
+    AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi, CursorPersistenceFfi,
+    Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
     MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayEndpointPolicyFfi,
     RelayTelemetrySettingsFfi, TimelineMessageQueryFfi, parse_media_imeta_tag,
@@ -795,21 +795,12 @@ async fn audit_log_settings_binding_round_trips() {
 
     let settings = kit.audit_log_settings().expect("default audit settings");
     assert!(!settings.enabled);
-    // Default data mode is the safe obfuscated posture.
-    assert!(matches!(
-        settings.data_mode,
-        AuditDataModeFfi::ObfuscatedSensitiveData
-    ));
 
     let stored = kit
-        .set_audit_log_settings(AuditLogSettingsFfi {
-            enabled: true,
-            data_mode: AuditDataModeFfi::FullData,
-        })
+        .set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
         .await
         .expect("set audit settings");
     assert!(stored.enabled);
-    assert!(matches!(stored.data_mode, AuditDataModeFfi::FullData));
     kit.shutdown().await;
     drop(kit);
 
@@ -822,8 +813,6 @@ async fn audit_log_settings_binding_round_trips() {
         .audit_log_settings()
         .expect("persisted audit settings");
     assert!(persisted.enabled);
-    // The data mode round-trips through shared storage across reopen.
-    assert!(matches!(persisted.data_mode, AuditDataModeFfi::FullData));
 }
 
 #[test]
@@ -929,12 +918,9 @@ async fn audit_log_binding_posts_tracker_update() {
     let (tx, rx) = oneshot::channel();
     let server = tokio::spawn(capture_audit_upload(listener, tx));
 
-    kit.set_audit_log_settings(AuditLogSettingsFfi {
-        enabled: true,
-        data_mode: AuditDataModeFfi::ObfuscatedSensitiveData,
-    })
-    .await
-    .expect("enable audit logs");
+    kit.set_audit_log_settings(AuditLogSettingsFfi { enabled: true })
+        .await
+        .expect("enable audit logs");
     kit.set_audit_log_tracker_config(AuditLogTrackerConfigFfi {
         endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
         authorization_bearer_token: Some("goggles_binding_secret".to_owned()),

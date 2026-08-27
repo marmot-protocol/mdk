@@ -358,22 +358,6 @@ impl AppClient {
         self.runtime.session_mut().set_audit_recorder(recorder);
     }
 
-    /// Switch the audit data mode on this live session in place. A file-backed
-    /// recorder rotates so the file carries a single mode and writes an
-    /// `audit_data_mode_changed` boundary row; a no-op recorder (audit logging
-    /// off) ignores it. Best-effort: a rotation IO failure is logged and
-    /// swallowed so a settings change never breaks the worker.
-    pub(crate) fn set_audit_data_mode(&self, mode: marmot_forensics::AuditDataMode, reason: &str) {
-        if let Err(e) = self.runtime.session().set_audit_data_mode(mode, reason) {
-            tracing::warn!(
-                target: "marmot_app",
-                method = "set_audit_data_mode",
-                error_kind = %e.kind(),
-                "failed to switch audit data mode on live session; continuing"
-            );
-        }
-    }
-
     /// Rotate the live forensic recorder iff it is the one appending to
     /// `path`, returning whether a rotation happened.
     ///

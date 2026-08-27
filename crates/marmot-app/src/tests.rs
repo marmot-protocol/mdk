@@ -854,11 +854,8 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -1076,11 +1073,8 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -1207,11 +1201,8 @@ async fn armed_epoch_backfill(
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
             .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     app.relay_plane =
         MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
 
@@ -1650,13 +1641,14 @@ fn unpersisted_unknown_group_stream_is_no_progress_and_paced() {
     });
 }
 
-/// Worker-quantum pacing and EOSE-failure fallback are independent policies.
-/// Repeated duplicate-only slices must never make a later quiet slice claim
-/// completion under the weaker quiescence contract.
+/// Worker-quantum yields do not count as EOSE-unconfirmed attempts. Repeated
+/// duplicate-only slices must retain the intent until the required coverage is
+/// actually confirmed.
 #[test]
 #[cfg(feature = "test-policy-overrides")]
-fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
+fn duplicate_only_quanta_retain_the_eose_coverage_gate() {
     run_composed_app_runtime_test("backfill-duplicate-quanta-eose-budget", || async {
+        const DUPLICATE_QUANTA: u64 = 3;
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let (app, mut client, group_id) = armed_epoch_backfill(
@@ -1674,7 +1666,7 @@ fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
         let duplicate = epoch_gap_probe(
             &group.nostr_routing.nostr_group_id_hex,
             crate::unix_now_seconds(),
-            "duplicates-must-not-unlock-fallback",
+            "duplicates-must-not-unlock-coverage",
         );
         client.remember_seen_event(duplicate.id.clone());
         let (stop, pump) = redelivery_pump(
@@ -1684,7 +1676,7 @@ fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
             Duration::from_secs(6),
         );
 
-        for attempt in 0..crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+        for attempt in 0..DUPLICATE_QUANTA {
             let outcome = client
                 .run_pending_epoch_backfill(
                     marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
@@ -1707,7 +1699,7 @@ fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
             .expect("quiet continuation runs");
         assert!(
             matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
-            "worker-quantum yields must not unlock quiescence fallback"
+            "worker-quantum yields must not weaken the EOSE coverage gate"
         );
         assert!(
             client.has_pending_epoch_backfill(),
@@ -1729,10 +1721,7 @@ fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
 
         let rows = recorded_audit_rows(&app);
         let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(
-            failed.len(),
-            crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT as usize + 1
-        );
+        assert_eq!(failed.len(), DUPLICATE_QUANTA as usize + 1);
         assert!(failed.iter().all(|row| {
             row["kind"]["error_kind"].as_str() == Some("backfill_drain_no_progress_quantum_yield")
         }));
@@ -1746,7 +1735,7 @@ fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
 }
 
 /// Productive replays use the same worker quantum, but their checkpointed
-/// prefix survives the yield and they do not spend the EOSE fallback ordinal.
+/// prefix survives the yield and they do not spend the EOSE-failure ordinal.
 /// A later EOSE-confirmed quantum can therefore finish the same arm.
 #[test]
 #[cfg(feature = "test-policy-overrides")]
@@ -1902,11 +1891,8 @@ fn account_worker_services_local_command_after_duplicate_backfill_quantum() {
         let mut app =
             MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
                 .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),
@@ -2830,11 +2816,8 @@ async fn armed_epoch_backfill_across_two_relays(
         config,
     )
     .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     app.relay_plane =
         MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
 
@@ -2862,9 +2845,9 @@ async fn armed_epoch_backfill_across_two_relays(
     (app, client, group_id)
 }
 
-/// [`scripted_eose_pump`] narrowed to [`FAST_RELAY`]: the account-wide gate asks
-/// for one relay per subscription, and this satisfies it from one of the two
-/// each route is published to while [`SLOW_RELAY`] answers nothing.
+/// [`scripted_eose_pump`] narrowed to [`FAST_RELAY`]. This advances partial
+/// coverage for every subscription while deliberately leaving the replay
+/// incomplete until [`SLOW_RELAY`] answers too.
 fn fast_relay_eose_pump(
     plane: MarmotRelayPlane,
     relay: Arc<ScriptedPushRelayClient>,
@@ -2933,9 +2916,9 @@ fn epoch_backfill_drain_collects_a_slow_relay_commit_inside_its_silence_window()
             .unwrap()
             .expect("local group projection");
 
-        // The fast relay satisfies the account-wide gate on its own, and only
-        // then does the slow relay answer — the drain is still inside its
-        // silence window when that commit lands.
+        // The fast relay reports first. The slow relay then serves the missing
+        // commit and only afterwards reports its EOSE, completing the frozen
+        // endpoint coverage while the drain is inside its silence window.
         let _eose = fast_relay_eose_pump(app.relay_plane.clone(), relay.clone());
         let commit = epoch_gap_probe(
             &group.nostr_routing.nostr_group_id_hex,
@@ -2945,10 +2928,17 @@ fn epoch_backfill_drain_collects_a_slow_relay_commit_inside_its_silence_window()
         let slow_relay = {
             let app = app.clone();
             let relay = relay.clone();
+            let plane = app.relay_plane.clone();
             let subscriptions_before = relay.subscription_count();
             tokio::spawn(async move {
                 epoch_backfill_subscriptions_settled(&relay, subscriptions_before).await;
                 deliver_from_slow_relay(&app, commit).await;
+                let slow = TransportEndpoint(SLOW_RELAY.to_owned());
+                for subscription in relay.accepted_subscriptions() {
+                    plane
+                        .handle_relay_eose_for_test(slow.clone(), subscription.subscription_id())
+                        .await;
+                }
             })
         };
 
@@ -2979,8 +2969,8 @@ fn epoch_backfill_drain_collects_a_slow_relay_commit_inside_its_silence_window()
 }
 
 #[test]
-fn epoch_backfill_drain_leaves_a_late_slow_relay_commit_to_the_next_drain() {
-    run_composed_app_runtime_test("backfill-drain-slow-relay-late", || async {
+fn epoch_backfill_keeps_intent_until_the_slow_relay_reconnects() {
+    run_composed_app_runtime_test("backfill-drain-slow-relay-reconnect", || async {
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let (app, mut client, group_id) = armed_epoch_backfill_across_two_relays(
@@ -2993,47 +2983,25 @@ fn epoch_backfill_drain_leaves_a_late_slow_relay_commit_to_the_next_drain() {
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
             .expect("local group projection");
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
         let _eose = fast_relay_eose_pump(app.relay_plane.clone(), relay.clone());
 
-        // The accepted trade-off, in the words of the gate's own contract:
-        // requiring *every* relay "would make one permanently unreachable relay
-        // indistinguishable from a history replay that never finished". One
-        // relay per subscription therefore ends this drain while a reachable but
-        // slower relay still owes a commit, and the drain claims
-        // `end_of_stored_events` for a history it has not seen in full.
+        // Fast, empty A cannot complete while B is unavailable.
         let outcome = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect("armed replay must run");
         assert!(matches!(
             outcome,
-            crate::EpochBackfillRunOutcome::Completed(_)
+            crate::EpochBackfillRunOutcome::Incomplete(_)
         ));
         assert!(
-            !client.has_pending_epoch_backfill(),
-            "the fast relay's report consumes the intent"
-        );
-        // And no second replay is coming: a confirmed drain latches the group's
-        // stalled epoch, so the same epoch cannot arm again however much
-        // undecryptable traffic it goes on to accumulate.
-        let mut rearm = BackfillDecision::Skip;
-        for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
-            rearm = client.epoch_stall.observe_undecryptable(
-                group_id.clone(),
-                format!("after-replay-{probe}"),
-                cgka_traits::EpochId(stalled_epoch),
-            );
-        }
-        assert_eq!(
-            rearm,
-            BackfillDecision::Skip,
-            "a confirmed replay disarms the epoch it was armed at"
+            client.has_pending_epoch_backfill(),
+            "partial relay coverage must retain the durable intent"
         );
 
-        // What recovers the group is not another replay but the delivery
-        // itself: the subscriptions the backfill opened stay live, so the slow
-        // relay's answer reaches the next drain on the ordinary path.
+        // B reconnects, serves the missing commit, and reports EOSE. An ongoing
+        // pump covers the fresh subscriptions issued by the retry as well as
+        // the current generation.
         deliver_from_slow_relay(
             &app,
             epoch_gap_probe(
@@ -3043,27 +3011,35 @@ fn epoch_backfill_drain_leaves_a_late_slow_relay_commit_to_the_next_drain() {
             ),
         )
         .await;
-        client.sync().await.expect("ordinary sync must run");
+        let _all_eose =
+            scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let outcome = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect("reconnect replay must run");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Completed(_)
+        ));
+        assert!(!client.has_pending_epoch_backfill());
         drop(client);
 
         let rows = recorded_audit_rows(&app);
+        assert_eq!(
+            recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed").len(),
+            1
+        );
         let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
         assert_eq!(completed.len(), 1);
         assert_eq!(
-            completed[0]["kind"]["deliveries"], 0,
-            "the drain ended before the slow relay answered"
+            completed[0]["kind"]["deliveries"], 1,
+            "the confirmed reconnect drain must retain B's missing commit"
         );
         assert_eq!(
             completed[0]["kind"]["completion_kind"].as_str(),
             Some("end_of_stored_events")
-        );
-        let drains = recorded_rows_of_kind(&rows, "sync_drain");
-        assert_eq!(
-            drains
-                .last()
-                .expect("the follow-up sync must record a drain")["kind"]["deliveries"],
-            1,
-            "the late commit is left to the next drain, not dropped"
         );
     });
 }
@@ -3142,8 +3118,9 @@ fn unconfirmed_epoch_backfill_paces_its_automatic_retries() {
 
 #[test]
 #[cfg(feature = "test-policy-overrides")]
-fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
-    run_composed_app_runtime_test("backfill-eose-fallback", || async {
+fn epoch_backfill_remains_pending_after_repeated_unavailable_relay_attempts() {
+    run_composed_app_runtime_test("backfill-eose-remains-pending", || async {
+        const UNCONFIRMED_ATTEMPTS: u64 = 3;
         let dir = tempfile::tempdir().unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let (app, mut client, group_id) =
@@ -3153,10 +3130,10 @@ fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
             .unwrap()
             .expect("local group projection");
 
-        // Stands in for the field shape this exit exists for: a group route
-        // whose only relay never answers, so the account-wide gate can never
-        // clear however long it waits.
-        for attempt in 0..crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+        // Stands in for a route whose required relay never answers. Repeated
+        // bounded attempts must not convert that availability failure into
+        // proof that stored history was served.
+        for attempt in 0..UNCONFIRMED_ATTEMPTS {
             let outcome = client
                 .run_pending_epoch_backfill(
                     marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
@@ -3175,48 +3152,67 @@ fn epoch_backfill_falls_back_to_quiescence_after_spending_its_eose_attempts() {
             epoch_gap_probe(
                 &group.nostr_routing.nostr_group_id_hex,
                 crate::unix_now_seconds(),
-                "fallback-history",
+                "reachable-history",
             ),
         )
         .await;
-        let fallback = client
+        let still_unconfirmed = client
             .run_pending_epoch_backfill(
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
             .await
-            .expect("the fallback attempt runs");
+            .expect("the next bounded attempt runs");
         assert!(
-            matches!(fallback, crate::EpochBackfillRunOutcome::Completed(_)),
-            "a spent gate must not wedge recovery forever"
+            matches!(
+                still_unconfirmed,
+                crate::EpochBackfillRunOutcome::Incomplete(_)
+            ),
+            "reachable history without required EOSE coverage remains unconfirmed"
         );
         assert!(
-            !client.has_pending_epoch_backfill(),
-            "the fallback attempt consumes the intent"
+            client.has_pending_epoch_backfill(),
+            "an unavailable required relay must leave the durable intent pending"
         );
+
+        // Once the relay reconnects and reports EOSE for the current replay,
+        // the same durable intent can complete and clear.
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let completed_after_reconnect = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect("the reconnect attempt runs");
+        assert!(matches!(
+            completed_after_reconnect,
+            crate::EpochBackfillRunOutcome::Completed(_)
+        ));
+        assert!(!client.has_pending_epoch_backfill());
         drop(client);
 
         let rows = recorded_audit_rows(&app);
         let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
         assert_eq!(
             failed.len(),
-            crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT as usize,
-            "every gated attempt must record its own honest failure"
+            UNCONFIRMED_ATTEMPTS as usize + 1,
+            "every unconfirmed attempt must record its own honest failure"
         );
         let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
         assert_eq!(completed.len(), 1);
         assert_eq!(
             completed[0]["kind"]["completion_kind"].as_str(),
-            Some("quiescence_fallback"),
-            "a fallback completion must never read as a served history replay"
+            Some("end_of_stored_events")
         );
         assert_eq!(
             completed[0]["kind"]["retry_ordinal"].as_u64(),
-            Some(crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT)
+            Some(UNCONFIRMED_ATTEMPTS + 1)
         );
         assert_eq!(
-            completed[0]["kind"]["deliveries"], 1,
-            "the fallback drain must still recover reachable history"
+            failed.last().expect("the unconfirmed delivery attempt")["kind"]["deliveries"],
+            1,
+            "the unconfirmed attempt still recovers reachable history"
         );
+        assert_eq!(completed[0]["kind"]["deliveries"], 0);
     });
 }
 
@@ -3234,11 +3230,8 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
 
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
@@ -3407,11 +3400,8 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
 
         let mut client = app.client("alice").await.unwrap();
         let group_id = client
@@ -3547,11 +3537,8 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
             bounded_epoch_backfill_config(),
         )
         .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
 
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
 
@@ -11887,11 +11874,8 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://escalation.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("escalation redelivery", &[])
@@ -11987,11 +11971,8 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://drain-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("drain arm ordering", &[])
@@ -12079,11 +12060,8 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://advance-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("advance arm ordering", &[])
@@ -12126,11 +12104,8 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://retry-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("retry arm ordering", &[])
@@ -12201,11 +12176,8 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://send-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("send arm ordering", &[]).await.unwrap();
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
@@ -12242,11 +12214,8 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://send-soft-arm.example")
         .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("send soft arm ordering", &[])
@@ -12710,11 +12679,8 @@ async fn group_at_the_undecryptable_retention_cap_with_config(
     let mut app =
         MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
             .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     app.relay_plane =
         MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
 
@@ -12995,11 +12961,8 @@ fn a_transport_deferred_delivery_is_still_marked_seen() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings {
-            enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
+        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+            .unwrap();
         app.relay_plane = MarmotRelayPlane::new_with_loopback(
             Some(Duration::from_secs(120)),
             relay.clone(),

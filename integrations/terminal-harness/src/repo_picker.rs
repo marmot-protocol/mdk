@@ -22,25 +22,29 @@ pub(crate) fn parse_repo_picker(text: &str) -> RepoPicker {
         .map(|(index, _)| index)
         .unwrap_or(rest.len());
     let path = &rest[..end];
-    if path.is_empty() {
+    if !is_valid_relative_path(path) {
         return RepoPicker::Invalid;
-    }
-    for segment in path.split('/') {
-        if segment.is_empty() || matches!(segment, "." | "..") {
-            return RepoPicker::Invalid;
-        }
-        if !segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        {
-            return RepoPicker::Invalid;
-        }
     }
 
     RepoPicker::Valid {
         path: path.to_owned(),
         prompt: rest[end..].trim_start().to_owned(),
     }
+}
+
+/// Returns true when `path` is a non-empty `$HOME`-relative path built only from
+/// ASCII letters, digits, `.`, `_`, and `-` segments, with no `.` or `..` segment.
+pub(crate) fn is_valid_relative_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    path.split('/').all(|segment| {
+        !segment.is_empty()
+            && !matches!(segment, "." | "..")
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
 }
 
 pub(crate) async fn resolve_repo(name: &str, home: &Path) -> Result<PathBuf> {

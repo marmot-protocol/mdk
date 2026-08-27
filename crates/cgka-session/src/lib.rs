@@ -1145,6 +1145,17 @@ impl AccountDeviceSession {
         Ok(())
     }
 
+    pub fn pending_origin_message_id(&self, pending: PendingStateRef) -> SessionResult<MessageId> {
+        Ok(self.engine.pending_origin_message_id(pending)?)
+    }
+
+    pub fn pending_fanout_kind(
+        &self,
+        pending: PendingStateRef,
+    ) -> SessionResult<cgka_traits::FanoutPendingKind> {
+        Ok(self.engine.pending_fanout_kind(pending)?)
+    }
+
     pub fn outbound_fanouts(&self) -> SessionResult<Vec<OutboundFanout>> {
         Ok(self.engine.outbound_fanouts()?)
     }
@@ -1209,18 +1220,6 @@ impl AccountDeviceSession {
     /// file-backed recorder is installed.
     pub fn rotate_audit_log(&self) -> std::io::Result<()> {
         self.engine.rotate_audit_recorder()
-    }
-
-    /// Switch the live forensic recorder's audit data mode. A file-backed
-    /// recorder rotates on a real change so each file has one mode, writing an
-    /// `audit_data_mode_changed` boundary row. No-op when audit logging is off
-    /// or the mode is unchanged.
-    pub fn set_audit_data_mode(
-        &self,
-        mode: marmot_forensics::AuditDataMode,
-        reason: &str,
-    ) -> std::io::Result<()> {
-        self.engine.set_audit_recorder_data_mode(mode, reason)
     }
 
     /// Install or replace the forensic recorder on the live engine, e.g. when

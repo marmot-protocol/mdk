@@ -330,14 +330,15 @@ pub struct NostrRelayEvent {
     pub event: NostrTransportEvent,
 }
 
-/// End-of-stored-events progress across one account's live subscriptions,
+/// End-of-stored-events progress across one account replay's route snapshot,
 /// from [`NostrTransportAdapter::account_subscription_eose`].
 ///
-/// "At least one relay" rather than "every relay" is deliberate: a subscription
-/// is issued to every configured endpoint, including ones that are registered
-/// but never connect, and those never report EOSE. Requiring all of them would
-/// make one permanently unreachable relay indistinguishable from a history
-/// replay that never finished.
+/// The logical-subscription counts preserve the coarse progress used for
+/// diagnostics. Completion is deliberately stricter: every endpoint-scoped
+/// subscription attempt in the activation snapshot must report EOSE. A fast,
+/// empty relay is not evidence that another relay holding missing history has
+/// served it, and an unavailable relay leaves recovery incomplete and
+/// retryable rather than converting availability pressure into success.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccountSubscriptionEose {
     /// Subscriptions this account's activation issued: its inbox plus one per
@@ -347,6 +348,11 @@ pub struct AccountSubscriptionEose {
     /// Of those, how many at least one relay has reported end-of-stored-events
     /// for.
     pub with_eose: usize,
+    /// Endpoint-scoped attempts across the activation snapshot. A two-relay
+    /// inbox and two-relay group subscription contribute four attempts.
+    pub relay_subscription_attempts: usize,
+    /// Of those endpoint-scoped attempts, how many reported EOSE.
+    pub relay_subscription_attempts_with_eose: usize,
 }
 
 impl AccountSubscriptionEose {
@@ -355,14 +361,17 @@ impl AccountSubscriptionEose {
     /// An account holding no subscriptions is not complete: nothing was
     /// subscribed, so nothing can have served its stored history.
     pub fn complete(&self) -> bool {
-        self.subscriptions > 0 && self.with_eose == self.subscriptions
+        self.subscriptions > 0
+            && self.with_eose == self.subscriptions
+            && self.relay_subscription_attempts > 0
+            && self.relay_subscription_attempts_with_eose == self.relay_subscription_attempts
     }
 
     /// Whether any relay reported end-of-stored-events at all. `false` after a
     /// wait is the shape of an account whose relays accepted the subscription
     /// registration but never served it.
     pub fn any(&self) -> bool {
-        self.with_eose > 0
+        self.relay_subscription_attempts_with_eose > 0
     }
 }
 
@@ -582,12 +591,13 @@ impl NostrTransportAdapter {
             .subscription_any_eose(subscription_id)
     }
 
-    /// End-of-stored-events progress across every subscription an account
-    /// currently holds — its inbox plus one per group route.
+    /// End-of-stored-events progress across the route snapshot issued by the
+    /// account's most recent activation — its inbox plus one per group route,
+    /// with every endpoint retained as an independent proof obligation.
     ///
-    /// This is the account-wide counterpart of
-    /// [`Self::subscription_any_eose`], for a caller draining an unfloored
-    /// re-activation that must not mistake a quiet relay for a finished
+    /// A later group-route sync does not shrink the snapshot; only a new
+    /// activation replaces it. This lets a caller draining an unfloored
+    /// re-activation avoid mistaking a quiet or fast-empty relay for a finished
     /// history replay. It reports counts only: no ids, endpoints, or routes
     /// cross the boundary.
     pub async fn account_subscription_eose(
@@ -816,6 +826,7 @@ impl TransportAdapter for NostrTransportAdapter {
                 state.clear_pending_unsubscribes_for_account(&account_id);
             }
             state.record_subscription_starts(&issued, now_ms);
+            state.record_account_replay_start(&account_id, &issued);
             state.activate(activation, replaced_count);
         }
 
@@ -1114,6 +1125,51 @@ struct AccountRoutes {
     groups: Vec<TransportGroupSubscription>,
 }
 
+/// Immutable endpoint coverage for the most recent account activation.
+///
+/// Group-route synchronization may change the adapter's live routing table
+/// while a replay is draining. Keeping this snapshot separate prevents such a
+/// change from shrinking the proof obligation of the already-issued replay.
+#[derive(Clone, Default)]
+struct AccountReplayCoverage {
+    subscriptions: HashMap<String, HashMap<RelayIndex, bool>>,
+}
+
+impl AccountReplayCoverage {
+    fn snapshot(&self) -> AccountSubscriptionEose {
+        let subscriptions = self.subscriptions.len();
+        let with_eose = self
+            .subscriptions
+            .values()
+            .filter(|relays| relays.values().any(|eose_seen| *eose_seen))
+            .count();
+        let relay_subscription_attempts =
+            self.subscriptions.values().map(HashMap::len).sum::<usize>();
+        let relay_subscription_attempts_with_eose = self
+            .subscriptions
+            .values()
+            .flat_map(HashMap::values)
+            .filter(|eose_seen| **eose_seen)
+            .count();
+        AccountSubscriptionEose {
+            subscriptions,
+            with_eose,
+            relay_subscription_attempts,
+            relay_subscription_attempts_with_eose,
+        }
+    }
+
+    fn record_eose(&mut self, subscription_id: &str, relay: RelayIndex) {
+        if let Some(eose_seen) = self
+            .subscriptions
+            .get_mut(subscription_id)
+            .and_then(|relays| relays.get_mut(&relay))
+        {
+            *eose_seen = true;
+        }
+    }
+}
+
 /// A stored routing endpoint paired with its parsed/canonical `RelayUrl`, cached
 /// once when the route index is built so `routes_for` never re-parses the same
 /// verbatim signed endpoint on every inbound event (#698/#752). The verbatim
@@ -1173,6 +1229,10 @@ struct GroupRouteEntry {
 #[derive(Default)]
 struct AdapterState {
     accounts: HashMap<MemberId, AccountRoutes>,
+    /// Endpoint-level EOSE proof for the route snapshot issued by the most
+    /// recent activation of each account. This is intentionally independent of
+    /// `accounts`, whose live group routes may change during the drain.
+    account_replay_coverage: HashMap<MemberId, AccountReplayCoverage>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
     /// resolved in O(matching groups) instead of scanning O(accounts × groups)
@@ -1346,6 +1406,7 @@ impl AdapterState {
 
     fn deactivate(&mut self, account_id: &MemberId, removed_count: usize) {
         self.accounts.remove(account_id);
+        self.account_replay_coverage.remove(account_id);
         self.metrics.subscriptions_removed += removed_count;
         self.rebuild_transport_group_index();
     }
@@ -1378,6 +1439,26 @@ impl AdapterState {
             self.sync
                 .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
         }
+    }
+
+    fn record_account_replay_start(
+        &mut self,
+        account_id: &MemberId,
+        subscriptions: &[NostrSubscription],
+    ) {
+        let subscriptions = subscriptions
+            .iter()
+            .map(|subscription| {
+                let relays = subscription
+                    .endpoints()
+                    .iter()
+                    .map(|endpoint| (self.relay_index.index_for(endpoint), false))
+                    .collect();
+                (subscription.subscription_id(), relays)
+            })
+            .collect();
+        self.account_replay_coverage
+            .insert(account_id.clone(), AccountReplayCoverage { subscriptions });
     }
 
     fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
@@ -1446,16 +1527,13 @@ impl AdapterState {
         }
     }
 
-    /// End-of-stored-events progress across an account's live subscriptions.
+    /// End-of-stored-events progress across the account activation's immutable
+    /// route snapshot.
     fn account_subscription_eose(&self, account_id: &MemberId) -> AccountSubscriptionEose {
-        let ids = self.account_subscription_ids(account_id);
-        AccountSubscriptionEose {
-            subscriptions: ids.len(),
-            with_eose: ids
-                .iter()
-                .filter(|id| self.sync.subscription_any_eose(id).unwrap_or(false))
-                .count(),
-        }
+        self.account_replay_coverage
+            .get(account_id)
+            .map(AccountReplayCoverage::snapshot)
+            .unwrap_or_default()
     }
 
     fn record_subscription_first_event(
@@ -1476,6 +1554,9 @@ impl AdapterState {
     ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
+        for coverage in self.account_replay_coverage.values_mut() {
+            coverage.record_eose(subscription_id, relay);
+        }
     }
 
     fn record_publish_attempt(&mut self) {

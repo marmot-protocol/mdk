@@ -168,9 +168,6 @@ pub use groups::{
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
 };
-/// Re-exported so FFI/CLI consumers can name the audit data mode without
-/// depending on `marmot-forensics` directly.
-pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
@@ -344,10 +341,10 @@ pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_sec
 /// yields first and a later seam resubscribes. Production EOSE completion
 /// therefore requires the gate to report within that quantum (or before an
 /// adapter-closed result). A worker-quantum yield is only a scheduling event:
-/// it paces a later resubscription but does not spend the EOSE-failure budget
-/// or unlock the weaker quiescence fallback. Keeping the budgets distinct
-/// makes long-replay slicing independent from that fallback policy, and
-/// test-policy builds can exercise either boundary directly.
+/// it paces a later resubscription but does not spend the EOSE-failure ordinal.
+/// An unavailable required relay leaves the durable intent pending; bounded
+/// worker quanta and paced retries preserve availability without weakening the
+/// proof that stored history was served.
 pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
 /// How long an epoch-gap backfill whose replay went unconfirmed waits before
 /// the automatic seams may try it again, doubling per attempt up to
@@ -364,18 +361,6 @@ pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15
 /// intent is durable, so a five-minute floor between attempts costs nothing but
 /// leaves recovery responsive when the relay returns.
 pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
-/// Attempts an intent spends on the end-of-stored-events gate before its drain
-/// falls back to the quiescence contract.
-///
-/// The gate requires every subscription the replay issued to be served, and a
-/// group route may carry a single relay (group routing requires only a
-/// non-empty endpoint set). One unreachable relay would otherwise leave the
-/// gate permanently unclearable and the account permanently unhealed — a worse
-/// failure than the one the gate fixes. After this many unconfirmed attempts
-/// the replay drains on the pre-gate contract instead, which still recovers
-/// whatever the reachable relays send; the audit row records that weaker claim
-/// as `quiescence_fallback` rather than passing it off as a served history.
-pub(crate) const EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT: u64 = 3;
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 /// Local worker operations include SQLite's bounded busy retry but no relay or
 /// blob transfer. A missing response beyond this point indicates a wedged
@@ -1042,9 +1027,10 @@ pub struct AppMessageQuery {
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,
-    /// Whether the accepted send reached the transport or is retained in the
-    /// group's durable queue. Distinguishes accepted-pending from published
-    /// without inferring either from `message_ids` being empty (mdk#1177).
+    /// Whether the accepted send reached the transport, is retained in the
+    /// group's durable queue, or has unknown transport completion while the
+    /// exact event remains frozen. Callers never infer these states from an
+    /// empty `message_ids` list (mdk#1177, mdk#1577).
     pub accept_disposition: cgka_traits::SendAcceptDisposition,
     pub maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
 }
@@ -3478,9 +3464,9 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>.jsonl`. Sensitive mode — raw values.
-        // Temporary forensic measure; disable the setting and remove files when
-        // done debugging.
+        // `<account_dir>/audit-<engine_id>-v3.jsonl`. The v3 schema contains
+        // privacy-safe derived values only: obfuscated identifiers, digests,
+        // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::new(
             session_path,
             session_key,

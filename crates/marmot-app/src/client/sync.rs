@@ -18,8 +18,8 @@ use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
     AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
-    AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT,
-    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_EXECUTION_QUANTUM, EPOCH_BACKFILL_RETRY_BACKOFF,
+    AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_WAIT,
+    EPOCH_BACKFILL_EXECUTION_QUANTUM, EPOCH_BACKFILL_RETRY_BACKOFF,
     EPOCH_BACKFILL_RETRY_BACKOFF_CAP, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership,
     SyncFailure, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
@@ -92,11 +92,6 @@ enum DrainCompletion {
         silence_budget: Duration,
         execution_quantum: Duration,
     },
-    /// Epoch-gap backfill that has spent its end-of-stored-events attempt
-    /// budget ([`EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT`]). Drains exactly like
-    /// [`Self::Quiescence`] so an account whose group route has one unreachable
-    /// relay can still heal, and reports itself as the weaker claim it is.
-    QuiescenceFallback { execution_quantum: Duration },
 }
 
 impl DrainCompletion {
@@ -105,8 +100,7 @@ impl DrainCompletion {
             Self::Quiescence => None,
             Self::EndOfStoredEvents {
                 execution_quantum, ..
-            }
-            | Self::QuiescenceFallback { execution_quantum } => Some(execution_quantum),
+            } => Some(execution_quantum),
         }
     }
 }
@@ -118,13 +112,10 @@ impl DrainCompletion {
 /// contract also retains its silence-specific unconfirmed verdicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainVerdict {
-    /// Every live subscription reached end-of-stored-events and the relays then
-    /// went quiet: the account's stored history was served in full.
+    /// Every endpoint-scoped attempt in the activation's frozen route snapshot
+    /// reached end-of-stored-events and the relays then went quiet: the
+    /// account's stored history was served in full.
     Complete,
-    /// The relays went quiet under the fallback contract, after the gate had
-    /// spent its attempt budget. Recovery ran and is not a failure, but nothing
-    /// confirms the history was served in full.
-    QuiescenceFallback,
     /// The silence budget ran out with stored history still unconfirmed, though
     /// some relay did reach end-of-stored-events.
     EoseTimeout,
@@ -145,7 +136,7 @@ impl DrainVerdict {
     /// The audit row's `error_kind` for a drain that did not complete.
     fn error_kind(self) -> Option<&'static str> {
         match self {
-            Self::Complete | Self::QuiescenceFallback => None,
+            Self::Complete => None,
             Self::EoseTimeout => Some("backfill_drain_eose_timeout"),
             Self::NoRelayEose => Some("backfill_drain_no_relay_eose"),
             Self::NovelProgressQuantumYield => Some("backfill_drain_novel_progress_quantum_yield"),
@@ -153,12 +144,10 @@ impl DrainVerdict {
         }
     }
 
-    /// What the completed audit row should claim about this drain, so a
-    /// fallback is never read as an end-of-stored-events confirmation.
+    /// What the completed audit row should claim about this drain.
     fn completion_kind(self) -> Option<EpochBackfillCompletionKind> {
         match self {
             Self::Complete => Some(EpochBackfillCompletionKind::EndOfStoredEvents),
-            Self::QuiescenceFallback => Some(EpochBackfillCompletionKind::QuiescenceFallback),
             Self::EoseTimeout
             | Self::NoRelayEose
             | Self::NovelProgressQuantumYield
@@ -1084,16 +1073,11 @@ impl AppClient {
     async fn backfill_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
-        eose_unconfirmed_ordinal: u64,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
         let execution_quantum = self.epoch_backfill_execution_quantum();
-        let completion = if eose_unconfirmed_ordinal >= EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
-            DrainCompletion::QuiescenceFallback { execution_quantum }
-        } else {
-            DrainCompletion::EndOfStoredEvents {
-                silence_budget: self.epoch_backfill_eose_wait(),
-                execution_quantum,
-            }
+        let completion = DrainCompletion::EndOfStoredEvents {
+            silence_budget: self.epoch_backfill_eose_wait(),
+            execution_quantum,
         };
         self.drain_sdk_relay(counts, completion).await
     }
@@ -1260,9 +1244,6 @@ impl AppClient {
                 Ok(Ok(None)) => {
                     break match completion {
                         DrainCompletion::Quiescence => DrainVerdict::Complete,
-                        DrainCompletion::QuiescenceFallback { .. } => {
-                            DrainVerdict::QuiescenceFallback
-                        }
                         DrainCompletion::EndOfStoredEvents { .. } => {
                             self.backfill_drain_verdict().await
                         }
@@ -1282,12 +1263,6 @@ impl AppClient {
                 }
                 Err(_) => match completion {
                     DrainCompletion::Quiescence => break DrainVerdict::Complete,
-                    DrainCompletion::QuiescenceFallback { execution_quantum } => {
-                        if drain_started.elapsed() >= execution_quantum {
-                            break DrainVerdict::quantum_yield(counts);
-                        }
-                        break DrainVerdict::QuiescenceFallback;
-                    }
                     DrainCompletion::EndOfStoredEvents {
                         silence_budget,
                         execution_quantum,
@@ -2227,10 +2202,7 @@ impl AppClient {
                 let retry_ordinal = execution.retry_ordinal;
                 let eose_unconfirmed_ordinal = execution.eose_unconfirmed_ordinal;
                 let no_progress_ordinal = execution.no_progress_ordinal;
-                let (mut summary, verdict) = match self
-                    .backfill_sdk_relay(&mut counts, eose_unconfirmed_ordinal)
-                    .await
-                {
+                let (mut summary, verdict) = match self.backfill_sdk_relay(&mut counts).await {
                     Ok(drained) => drained,
                     Err(err) => {
                         let terminal_error = err.source.privacy_safe_kind().to_string();
@@ -2311,7 +2283,7 @@ impl AppClient {
                         retry_ordinal,
                         deliveries = counts.deliveries,
                         skipped = counts.skipped,
-                        eose_attempt_limit = EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT,
+                        eose_unconfirmed_ordinal,
                         "epoch-gap backfill drain ended without the relays confirming stored history; retrying later"
                     );
                     self.epoch_backfill_retry_not_before = if verdict.made_novel_progress() {
@@ -3596,26 +3568,37 @@ mod tests {
 
     #[test]
     fn drain_verdict_reads_end_of_stored_events_progress() {
-        let progress = |subscriptions, with_eose| AccountSubscriptionEose {
-            subscriptions,
-            with_eose,
-        };
+        let progress =
+            |subscriptions,
+             with_eose,
+             relay_subscription_attempts,
+             relay_subscription_attempts_with_eose| AccountSubscriptionEose {
+                subscriptions,
+                with_eose,
+                relay_subscription_attempts,
+                relay_subscription_attempts_with_eose,
+            };
         assert_eq!(
-            backfill_drain_verdict(progress(2, 2)),
+            backfill_drain_verdict(progress(2, 2, 2, 2)),
             DrainVerdict::Complete
         );
         assert_eq!(
-            backfill_drain_verdict(progress(2, 1)),
+            backfill_drain_verdict(progress(2, 1, 2, 1)),
             DrainVerdict::EoseTimeout
         );
         assert_eq!(
-            backfill_drain_verdict(progress(2, 0)),
+            backfill_drain_verdict(progress(2, 0, 2, 0)),
             DrainVerdict::NoRelayEose
         );
         assert_eq!(
-            backfill_drain_verdict(progress(0, 0)),
+            backfill_drain_verdict(progress(0, 0, 0, 0)),
             DrainVerdict::NoRelayEose,
             "an account with nothing subscribed cannot have been served"
+        );
+        assert_eq!(
+            backfill_drain_verdict(progress(2, 2, 4, 2)),
+            DrainVerdict::EoseTimeout,
+            "EOSE on every logical subscription is insufficient while another relay remains uncovered"
         );
     }
 }

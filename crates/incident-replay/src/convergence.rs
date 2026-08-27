@@ -95,7 +95,7 @@ pub fn recover_convergence(
 ) -> Result<RecoveredConvergence, ConvergenceRecoveryError> {
     // The settled decision is the last contested pass (mirrors the simulator's
     // `settled_decision`: the last pass that actually evaluated a candidate set).
-    let (selected_branch_id, candidates, rule_trace) = export
+    let (selected_branch_id, candidates, decisive_rule_name, rule_trace) = export
         .events
         .iter()
         .rev()
@@ -103,12 +103,16 @@ pub fn recover_convergence(
             EventKind::ConvergenceDecision {
                 selected_branch_id,
                 candidates,
+                decisive_rule,
                 rule_trace,
                 losing_branch_ids,
                 ..
-            } if !losing_branch_ids.is_empty() || candidates.len() >= 2 => {
-                Some((selected_branch_id.as_deref(), candidates, rule_trace))
-            }
+            } if !losing_branch_ids.is_empty() || candidates.len() >= 2 => Some((
+                selected_branch_id.as_deref(),
+                candidates,
+                decisive_rule.as_deref(),
+                rule_trace,
+            )),
             _ => None,
         })
         .ok_or(ConvergenceRecoveryError::NoConvergenceDecision)?;
@@ -132,7 +136,14 @@ pub fn recover_convergence(
         return Err(ConvergenceRecoveryError::IndistinctCandidates);
     }
 
-    let decisive = decisive_rule(rule_trace).ok_or(ConvergenceRecoveryError::NoDecisiveRule)?;
+    // Legacy v2 exports carry the full rule trace; safe-only v3 replaces it
+    // with the scalar rule name. Keep v2 trace semantics when it is present.
+    let decisive = if rule_trace.is_empty() {
+        decisive_rule_name
+    } else {
+        decisive_rule(rule_trace)
+    }
+    .ok_or(ConvergenceRecoveryError::NoDecisiveRule)?;
     let (winner, loser) = winner_and_loser(selected_branch_id, candidates)
         .ok_or(ConvergenceRecoveryError::MissingSelectedBranch)?;
     let quorum_met = winner

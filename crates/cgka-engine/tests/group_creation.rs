@@ -2848,11 +2848,4 @@ async fn audit_log_records_welcome_recipient_expectation() {
     ));
     assert_eq!(app_message.expected_count, Some(1));
     assert_eq!(app_message.expected_member_refs.len(), 1);
-
-    // Obfuscated default posture: no full recipient pubkeys on any row.
-    assert!(
-        expectations
-            .iter()
-            .all(|e| e.expected_pubkeys_hex.is_empty())
-    );
 }

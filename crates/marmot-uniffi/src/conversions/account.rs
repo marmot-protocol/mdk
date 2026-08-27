@@ -92,14 +92,17 @@ pub enum SendMaintenanceDispositionFfi {
     PostJoinRotationPendingRetryable,
 }
 
-/// Whether an accepted send published or is retained pending convergence.
+/// Whether an accepted send published, is retained pending convergence, or
+/// has a frozen transport event whose acknowledgement is still unknown.
 ///
-/// `AcceptedPending` is not an error: the message is durable and publishes
-/// later. Hosts should show it as still sending rather than as failed.
+/// Neither retained state is an error. Hosts should show it as still sending
+/// or unresolved rather than failed, and must not create a new semantic send
+/// for `CompletionUnknown`.
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum SendAcceptDispositionFfi {
     Published,
     AcceptedPending,
+    CompletionUnknown,
 }
 
 impl From<SendSummary> for SendSummaryFfi {
@@ -113,6 +116,9 @@ impl From<SendSummary> for SendSummaryFfi {
                 }
                 cgka_traits::SendAcceptDisposition::AcceptedPending => {
                     SendAcceptDispositionFfi::AcceptedPending
+                }
+                cgka_traits::SendAcceptDisposition::CompletionUnknown => {
+                    SendAcceptDispositionFfi::CompletionUnknown
                 }
             },
             maintenance_disposition: match value.maintenance_disposition {
@@ -379,5 +385,20 @@ mod tests {
             "a retained send must stay distinguishable across the boundary; got {:?}",
             ffi.accept_disposition
         );
+    }
+
+    #[test]
+    fn completion_unknown_crosses_ffi_as_a_typed_disposition() {
+        let ffi = SendSummaryFfi::from(SendSummary {
+            published: 0,
+            message_ids: vec![],
+            accept_disposition: cgka_traits::SendAcceptDisposition::CompletionUnknown,
+            maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
+        });
+
+        assert!(matches!(
+            ffi.accept_disposition,
+            SendAcceptDispositionFfi::CompletionUnknown
+        ));
     }
 }

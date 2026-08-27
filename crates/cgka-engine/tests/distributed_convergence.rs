@@ -9615,21 +9615,12 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
     assert!(started_run.starts_with("conv-"));
 }
 
-// --- Phase 6: full-data decoded message content (req #6, #7) -------------------
+// --- Audit privacy: decrypted application content is never recorded -----------
 
-async fn ingest_app_and_read_audit(
-    data_mode: marmot_forensics::AuditDataMode,
-    path: &std::path::Path,
-) -> Vec<marmot_forensics::AuditEvent> {
+async fn ingest_app_and_read_audit(path: &std::path::Path) -> Vec<marmot_forensics::AuditEvent> {
     // Receiver (bob) records; sender (alice) does not need a recorder.
     let bob_storage = SqliteAccountStorage::in_memory().unwrap();
-    let bob_recorder = marmot_forensics::JsonlRecorder::open_with_data_mode(
-        path,
-        "bob-engine".into(),
-        None,
-        data_mode,
-    )
-    .unwrap();
+    let bob_recorder = marmot_forensics::JsonlRecorder::open(path, "bob-engine".into()).unwrap();
     let mut bob = EngineBuilder::new(bob_storage)
         .legacy_compatibility_profile()
         .identity(pad32(b"bob"))
@@ -9675,66 +9666,22 @@ async fn ingest_app_and_read_audit(
 }
 
 #[tokio::test]
-async fn full_data_ingest_logs_decoded_message_content() {
+async fn ingest_does_not_log_decrypted_message_content() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.jsonl");
-    let events = ingest_app_and_read_audit(marmot_forensics::AuditDataMode::FullData, &path).await;
+    let events = ingest_app_and_read_audit(&path).await;
 
-    let decoded = events
-        .iter()
-        .find_map(|e| match &e.kind {
-            marmot_forensics::AuditEventKind::MessageContentDecoded {
-                author,
-                decoded_app_event,
-                ..
-            } => Some((author, decoded_app_event)),
-            _ => None,
-        })
-        .expect("full_data ingest records message_content_decoded");
-    let (author, decoded_app_event) = decoded;
-    // The decrypted content is present.
-    let app = decoded_app_event
-        .as_ref()
-        .expect("decoded app event present");
-    assert_eq!(app.content.as_deref(), Some("secret hello"));
-    // The authenticated author carries a full member pubkey in full-data mode.
-    assert!(author.member_ref.is_some());
-    assert!(
-        author.member_pubkey_hex.is_some(),
-        "full-data author has a full member pubkey"
-    );
-    // Every line is stamped full_data.
-    assert!(
-        events
-            .iter()
-            .all(|e| e.audit_data_mode == marmot_forensics::AuditDataMode::FullData)
-    );
-}
-
-#[tokio::test]
-async fn obfuscated_ingest_does_not_log_decoded_message_content() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("audit.jsonl");
-    let events = ingest_app_and_read_audit(
-        marmot_forensics::AuditDataMode::ObfuscatedSensitiveData,
-        &path,
-    )
-    .await;
-
-    // The message is still ingested (an ingest_outcome row exists)...
     assert!(
         events.iter().any(|e| matches!(
             e.kind,
             marmot_forensics::AuditEventKind::IngestOutcome { .. }
         )),
-        "obfuscated ingest still records the ingest outcome"
+        "safe audit still records the ingest outcome"
     );
-    // ...but decrypted content is never decoded or logged.
     assert!(
-        !events.iter().any(|e| matches!(
-            e.kind,
-            marmot_forensics::AuditEventKind::MessageContentDecoded { .. }
-        )),
-        "obfuscated mode must not log decoded message content"
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("secret hello"),
+        "audit output must never contain decrypted application content"
     );
 }

@@ -278,7 +278,6 @@ fn audit_event_round_trips_through_serde() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 7,
         wall_time_ms: 1_700_000_000_000,
-        audit_data_mode: AuditDataMode::FullData,
         recorder_session_id: Some("recorder-1".into()),
         account_ref: Some("account-1".into()),
         engine_id: "engine-xyz".into(),
@@ -331,7 +330,6 @@ fn subscription_rebuild_round_trips_through_serde() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 11,
         wall_time_ms: 1_700_000_000_000,
-        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
         recorder_session_id: Some("recorder-1".into()),
         account_ref: None,
         engine_id: "engine-xyz".into(),
@@ -371,7 +369,6 @@ fn sync_drain_round_trips_through_serde() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 12,
         wall_time_ms: 1_700_000_000_000,
-        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
         recorder_session_id: Some("recorder-1".into()),
         account_ref: None,
         engine_id: "engine-xyz".into(),
@@ -451,7 +448,6 @@ fn epoch_stall_backfill_armed_roundtrips_and_carries_its_fields() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 7,
         wall_time_ms: 1_700_000_000_000,
-        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
         recorder_session_id: Some("recorder-1".into()),
         account_ref: None,
         engine_id: "engine-xyz".into(),
@@ -498,7 +494,6 @@ fn epoch_stall_backfill_escalated_roundtrips_and_carries_its_fields() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 9,
         wall_time_ms: 1_700_000_000_000,
-        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
         recorder_session_id: Some("recorder-1".into()),
         account_ref: None,
         engine_id: "engine-xyz".into(),
@@ -520,12 +515,6 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
     vec![
         AuditEventKind::RecorderStarted {
             recorder: "jsonl".into(),
-        },
-        AuditEventKind::AuditDataModeChanged {
-            previous_mode: AuditDataMode::ObfuscatedSensitiveData,
-            new_mode: AuditDataMode::FullData,
-            reason: "settings_changed".into(),
-            recorder_restarted: Some(true),
         },
         AuditEventKind::EngineContext {
             context: AuditEngineContext {
@@ -616,7 +605,6 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 membership_epoch: Some(3),
                 basis_commit_id: None,
                 expected_member_refs: vec!["a".repeat(32), "b".repeat(32)],
-                expected_pubkeys_hex: vec!["c".repeat(64)],
                 expected_count: Some(2),
             },
         },
@@ -661,7 +649,6 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                     membership_epoch: Some(1),
                     basis_commit_id: None,
                     expected_member_refs: vec!["a".repeat(32)],
-                    expected_pubkeys_hex: Vec::new(),
                     expected_count: Some(1),
                 }),
             }],
@@ -734,18 +721,13 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             change_kind: "member_added".into(),
             membership_change_source: Some(MembershipChangeSource::AdminAction),
             actor_member_ref: Some("a".repeat(32)),
-            actor_pubkey_hex: Some("a".repeat(64)),
             subject_member_ref: Some("b".repeat(32)),
-            subject_pubkey_hex: Some("b".repeat(64)),
             origin_commit_id: Some("m".into()),
             fields: vec!["members".into()],
             component_ids: Vec::new(),
             value: Some(GroupStateValue {
                 digest: Some("c".repeat(64)),
                 len: Some(4),
-                text: Some("Team".into()),
-                json: None,
-                pubkeys_hex: vec!["a".repeat(64)],
             }),
         },
         AuditEventKind::SourceContext {
@@ -757,45 +739,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 platform: Some("ios".into()),
                 app_version: Some("2026.6.8".into()),
                 upload_trigger: Some("managed_send".into()),
-                account_pubkey_hex: Some("a".repeat(64)),
-                account_npub: Some("npub1example".into()),
             },
-        },
-        AuditEventKind::MessageContentDecoded {
-            msg_id: "m".into(),
-            artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
-            author: MessageAuthor {
-                member_ref: Some("a".repeat(32)),
-                member_pubkey_hex: Some("a".repeat(64)),
-                account_pubkey_hex: Some("a".repeat(64)),
-                npub: Some("npub1example".into()),
-            },
-            decoded_payload: DecodedPayload {
-                content_type: "application/x-marmot-app-event".into(),
-                text: None,
-                json: Some(serde_json::json!({"kind": 9, "content": "hi"})),
-                bytes_b64: None,
-            },
-            decoded_app_event: Some(DecodedApplicationEvent {
-                format: "marmot.app_event.v1".into(),
-                kind: Some(9),
-                content: Some("hi".into()),
-                pubkey_hex: Some("a".repeat(64)),
-                tags: vec![vec!["imeta".into(), "url https://blossom.example/x".into()]],
-                created_at_ms: Some(1_700_000_000_000),
-                client_message_id: Some("client-1".into()),
-                reply_to_message_id: None,
-                thread_root_message_id: None,
-                attachments: vec![AttachmentMetadata {
-                    component_id: Some(0x8001),
-                    content_type: Some("image/png".into()),
-                    file_name: Some("pic.png".into()),
-                    byte_len: Some(1024),
-                    digest: Some("d".repeat(64)),
-                    metadata: None,
-                }],
-                raw: None,
-            }),
         },
         AuditEventKind::PendingCommitRecoveredOnOpen { recovered_epoch: 3 },
         AuditEventKind::GroupHydrationQuarantined {
@@ -838,7 +782,6 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                 tip_digest: Some("a".repeat(64)),
                 tip_priority: Some("ordinary".into()),
                 tip_committer_ref: Some("b".repeat(32)),
-                tip_committer_pubkey_hex: None,
                 retained_anchor_status: Some("at_or_after".into()),
                 last_input_time_ms: Some(1_700_000_000_000),
                 eligible: Some(true),
@@ -850,26 +793,14 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
                     app_witness_score: Some(0),
                     tip_priority: Some("ordinary".into()),
                     tip_committer_ref: Some("b".repeat(32)),
-                    tip_committer_pubkey_hex: None,
                     tip_digest: Some("a".repeat(64)),
                 }),
                 app_witnesses: vec![ConvergenceAppWitness {
                     epoch: 3,
                     sender_ref: Some("c".repeat(32)),
-                    sender_pubkey_hex: None,
                 }],
             }],
-            rule_trace: vec![ConvergenceRuleEvaluation {
-                rule_name: "effective_commit_depth".into(),
-                scope: Some("candidate_pair".into()),
-                candidate_branch_id: Some("br-1".into()),
-                other_candidate_branch_id: Some("br-2".into()),
-                inputs: Some(serde_json::json!({"a": 1, "b": 0})),
-                result: serde_json::json!("greater"),
-                decisive: Some(true),
-                selected_branch_id: Some("br-1".into()),
-                rejected_branch_id: Some("br-2".into()),
-            }],
+            decisive_rule: Some("effective_commit_depth".into()),
             selected_branch_id: Some("br-1".into()),
             selected_fork_epoch: Some(2),
             selected_tip_epoch: Some(3),
@@ -986,7 +917,6 @@ fn audit_event_kind_round_trips_all_variants() {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
             seq: 0,
             wall_time_ms: 0,
-            audit_data_mode: AuditDataMode::default(),
             recorder_session_id: None,
             account_ref: None,
             engine_id: "e".into(),
@@ -1003,7 +933,7 @@ fn audit_event_kind_round_trips_all_variants() {
 #[test]
 fn audit_log_event_schema_tracks_kind_catalog() {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/audit-log-event.v2.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v3.schema.json")).unwrap();
     assert_eq!(
         schema
             .pointer("/properties/schema_version/const")
@@ -1034,228 +964,29 @@ fn audit_log_event_schema_tracks_kind_catalog() {
 }
 
 #[test]
-fn jsonl_recorder_defaults_to_obfuscated_mode_and_stamps_every_event() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SendEntry {
-            intent_kind: "app_message".into(),
-        },
-    ));
-    drop(recorder);
-
-    // Both the `recorder_started` boundary and the row above carry the mode.
-    let events: Vec<AuditEvent> = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 2);
-    assert!(
-        events
-            .iter()
-            .all(|event| event.audit_data_mode == AuditDataMode::ObfuscatedSensitiveData)
-    );
-}
-
-#[test]
-fn jsonl_recorder_opened_in_full_data_mode_stamps_full_data() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-full");
-    let recorder = JsonlRecorder::open_with_data_mode(
-        &path,
-        "engine-full".to_string(),
-        None,
-        AuditDataMode::FullData,
-    )
-    .unwrap();
-    assert_eq!(recorder.data_mode(), AuditDataMode::FullData);
-    drop(recorder);
-
-    let event: AuditEvent =
-        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
-    assert_eq!(event.audit_data_mode, AuditDataMode::FullData);
-}
-
-#[test]
-fn set_data_mode_rotates_and_writes_a_clear_boundary() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SendEntry {
-            intent_kind: "app_message".into(),
-        },
-    ));
-    // `recorder_started` + the obfuscated send row.
-    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
-
-    recorder
-        .set_data_mode(AuditDataMode::FullData, "settings_changed")
-        .unwrap();
-    assert_eq!(recorder.data_mode(), AuditDataMode::FullData);
-
-    // The rotation discards the obfuscated lines: the fresh file holds only the
-    // `recorder_started` marker and the `audit_data_mode_changed` boundary, both
-    // stamped with the new mode and starting from seq 0.
-    let events: Vec<AuditEvent> = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].seq, 0);
-    assert!(matches!(
-        events[0].kind,
-        AuditEventKind::RecorderStarted { .. }
-    ));
-    assert_eq!(events[1].seq, 1);
-    match &events[1].kind {
-        AuditEventKind::AuditDataModeChanged {
-            previous_mode,
-            new_mode,
-            reason,
-            recorder_restarted,
-        } => {
-            assert_eq!(*previous_mode, AuditDataMode::ObfuscatedSensitiveData);
-            assert_eq!(*new_mode, AuditDataMode::FullData);
-            assert_eq!(reason, "settings_changed");
-            assert_eq!(*recorder_restarted, Some(true));
-        }
-        other => panic!("expected audit_data_mode_changed, got {other:?}"),
+fn v3_schema_cannot_express_former_sensitive_audit_fields() {
+    let schema = include_str!("../../schema/audit-log-event.v3.schema.json");
+    for forbidden in [
+        "audit_data_mode",
+        "full_data",
+        "message_content_decoded",
+        "decoded_payload",
+        "decoded_app_event",
+        "account_pubkey_hex",
+        "account_npub",
+        "expected_pubkeys_hex",
+        "actor_pubkey_hex",
+        "subject_pubkey_hex",
+        "tip_committer_pubkey_hex",
+        "sender_pubkey_hex",
+        "rule_trace",
+        "pubkeys_hex",
+    ] {
+        assert!(
+            !schema.contains(forbidden),
+            "v3 schema unexpectedly exposes former sensitive field {forbidden}"
+        );
     }
-    assert!(
-        events
-            .iter()
-            .all(|event| event.audit_data_mode == AuditDataMode::FullData),
-        "the rotated file must be entirely the new mode"
-    );
-
-    // Recording continues into the new file under the new mode.
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SendEntry {
-            intent_kind: "app_message".into(),
-        },
-    ));
-    drop(recorder);
-    let last: AuditEvent =
-        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().last().unwrap()).unwrap();
-    assert_eq!(last.audit_data_mode, AuditDataMode::FullData);
-}
-
-#[test]
-fn set_data_mode_is_a_no_op_when_mode_is_unchanged() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SendEntry {
-            intent_kind: "app_message".into(),
-        },
-    ));
-    let before = fs::read_to_string(&path).unwrap();
-
-    // Requesting the mode the recorder is already in must not rotate the file
-    // nor insert a spurious boundary row.
-    recorder
-        .set_data_mode(AuditDataMode::ObfuscatedSensitiveData, "noop")
-        .unwrap();
-
-    assert_eq!(fs::read_to_string(&path).unwrap(), before);
-    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
-}
-
-#[test]
-#[cfg(unix)]
-fn set_data_mode_failure_leaves_mode_file_and_recording_intact() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = TempDir::new().unwrap();
-    // A dedicated subdir takes the chmod fault so TempDir cleanup of the root
-    // is never blocked if an assertion fails before the mode is restored.
-    let logs = dir.path().join("logs");
-    fs::create_dir(&logs).unwrap();
-    let path = default_jsonl_path(&logs, "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SendEntry {
-            intent_kind: "app_message".into(),
-        },
-    ));
-    let before = fs::read_to_string(&path).unwrap();
-
-    // Injected fault: a read-only directory rejects creating the staged swap
-    // file. Root bypasses directory modes, so probe and skip silently in that
-    // case (the repo-wide tracing audit bans direct output under src/).
-    fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
-    if fs::write(logs.join("probe.tmp"), b"").is_ok() {
-        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
-        return;
-    }
-
-    let err = recorder
-        .set_data_mode(AuditDataMode::FullData, "settings_changed")
-        .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    // The failed swap must not advance the mode nor touch the live file.
-    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
-    assert_eq!(fs::read_to_string(&path).unwrap(), before);
-
-    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
-
-    // Recording continues into the original file: old mode, continuing seq,
-    // no recorder-session reset.
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SendEntry {
-            intent_kind: "app_message".into(),
-        },
-    ));
-    let events: Vec<AuditEvent> = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[2].seq, 2);
-    assert_eq!(
-        events[2].audit_data_mode,
-        AuditDataMode::ObfuscatedSensitiveData
-    );
-    assert_eq!(events[2].recorder_session_id, events[0].recorder_session_id);
-
-    // With the fault cleared the mode change is retryable: a fresh file holds
-    // exactly the two boundary rows, both stamped with the new mode.
-    recorder
-        .set_data_mode(AuditDataMode::FullData, "settings_changed")
-        .unwrap();
-    assert_eq!(recorder.data_mode(), AuditDataMode::FullData);
-    let events: Vec<AuditEvent> = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 2);
-    assert!(matches!(
-        events[0].kind,
-        AuditEventKind::RecorderStarted { .. }
-    ));
-    assert!(matches!(
-        events[1].kind,
-        AuditEventKind::AuditDataModeChanged { .. }
-    ));
-    assert!(
-        events
-            .iter()
-            .all(|event| event.audit_data_mode == AuditDataMode::FullData)
-    );
 }
 
 #[test]
@@ -1308,54 +1039,6 @@ fn rotate_failure_keeps_recording_to_original_file() {
         .collect();
     assert_eq!(events.len(), 3);
     assert_eq!(events[2].seq, 2);
-}
-
-#[test]
-fn set_data_mode_recovers_from_stale_staged_swap_file() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-
-    // A staged file left behind by an interrupted earlier swap must be
-    // discarded, never adopted into the fresh log.
-    let staged = staged_swap_path(&path);
-    fs::write(&staged, b"stale staged junk\n").unwrap();
-
-    recorder
-        .set_data_mode(AuditDataMode::FullData, "settings_changed")
-        .unwrap();
-
-    assert!(!staged.exists());
-    let events: Vec<AuditEvent> = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 2);
-    assert!(matches!(
-        events[0].kind,
-        AuditEventKind::RecorderStarted { .. }
-    ));
-    assert!(matches!(
-        events[1].kind,
-        AuditEventKind::AuditDataModeChanged { .. }
-    ));
-    assert!(
-        events
-            .iter()
-            .all(|event| event.audit_data_mode == AuditDataMode::FullData)
-    );
-}
-
-#[test]
-fn noop_recorder_reports_default_mode_and_ignores_mode_change() {
-    let recorder = NoopRecorder;
-    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
-    recorder
-        .set_data_mode(AuditDataMode::FullData, "ignored")
-        .unwrap();
-    // A no-op recorder has no backing store; the default mode never changes.
-    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
 }
 
 /// Minimal recursive JSON-Schema conformance check for the subset our schema
@@ -1435,7 +1118,7 @@ fn assert_keys_within_schema(
 #[test]
 fn sample_events_serialize_within_schema_property_names() {
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../schema/audit-log-event.v2.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v3.schema.json")).unwrap();
     let defs = schema["$defs"].clone();
 
     // Every sample kind, wrapped in a full event, must serialize using only keys
@@ -1445,7 +1128,6 @@ fn sample_events_serialize_within_schema_property_names() {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
             seq: 0,
             wall_time_ms: 0,
-            audit_data_mode: AuditDataMode::FullData,
             recorder_session_id: Some("r".into()),
             account_ref: Some("0".repeat(32)),
             engine_id: "e".into(),
@@ -1463,7 +1145,6 @@ fn sample_events_serialize_within_schema_property_names() {
         schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
         seq: 0,
         wall_time_ms: 0,
-        audit_data_mode: AuditDataMode::FullData,
         recorder_session_id: None,
         account_ref: None,
         engine_id: "e".into(),
@@ -1499,7 +1180,6 @@ fn sample_events_serialize_within_schema_property_names() {
             }),
             source: Some(AuditSourceContext {
                 account_label: Some("Alice".into()),
-                account_pubkey_hex: Some("a".repeat(64)),
                 ..Default::default()
             }),
         }),
@@ -1509,239 +1189,4 @@ fn sample_events_serialize_within_schema_property_names() {
     };
     let value = serde_json::to_value(&event).unwrap();
     assert_keys_within_schema(&value, &schema, &defs, "event");
-}
-
-fn full_data_message_content_decoded() -> AuditEventKind {
-    AuditEventKind::MessageContentDecoded {
-        msg_id: "msg-1".into(),
-        artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
-        author: MessageAuthor {
-            member_ref: Some("member-ref-1".into()),
-            member_pubkey_hex: Some("aa".repeat(32)),
-            account_pubkey_hex: Some("bb".repeat(32)),
-            npub: Some("npub1exampleexample".into()),
-        },
-        decoded_payload: DecodedPayload {
-            content_type: "text".into(),
-            text: Some("secret plaintext".into()),
-            json: Some(serde_json::json!({"content": "secret plaintext"})),
-            bytes_b64: Some("c2VjcmV0".into()),
-        },
-        decoded_app_event: Some(DecodedApplicationEvent {
-            format: "nostr".into(),
-            content: Some("secret plaintext".into()),
-            pubkey_hex: Some("cc".repeat(32)),
-            ..DecodedApplicationEvent::default()
-        }),
-    }
-}
-
-#[test]
-fn obfuscated_mode_recorder_scrubs_full_data_only_fields_at_the_sink() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    // Default mode is ObfuscatedSensitiveData.
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-
-    // A buggy producer submits full-data-only material in obfuscated mode.
-    recorder.record(AuditRecord::new(
-        Some("group-1".into()),
-        full_data_message_content_decoded(),
-    ));
-    recorder.record(AuditRecord::new(
-        Some("group-1".into()),
-        AuditEventKind::RecipientExpectation {
-            msg_id: "msg-2".into(),
-            expectation: RecipientExpectation {
-                artifact_kind: MessageArtifactKind::ApplicationMessage,
-                recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
-                membership_epoch: Some(3),
-                basis_commit_id: None,
-                expected_member_refs: vec!["member-ref-1".into()],
-                expected_pubkeys_hex: vec!["dd".repeat(32)],
-                expected_count: Some(1),
-            },
-        },
-    ));
-    recorder.record(AuditRecord::new(
-        Some("group-1".into()),
-        AuditEventKind::GroupStateChanged {
-            epoch: 4,
-            change_kind: "profile_changed".into(),
-            membership_change_source: None,
-            actor_member_ref: Some("member-ref-1".into()),
-            actor_pubkey_hex: Some("ee".repeat(32)),
-            subject_member_ref: None,
-            subject_pubkey_hex: Some("ff".repeat(32)),
-            origin_commit_id: None,
-            fields: vec!["name".into()],
-            component_ids: Vec::new(),
-            value: Some(GroupStateValue {
-                digest: Some("ab".repeat(32)),
-                len: Some(11),
-                text: Some("secret group name".into()),
-                json: None,
-                pubkeys_hex: vec!["dd".repeat(32)],
-            }),
-        },
-    ));
-    recorder.record(
-        AuditRecord::new(
-            None,
-            AuditEventKind::SourceContext {
-                source: AuditSourceContext {
-                    account_label: Some("alice".into()),
-                    account_pubkey_hex: Some("aa".repeat(32)),
-                    account_npub: Some("npub1exampleexample".into()),
-                    ..AuditSourceContext::default()
-                },
-            },
-        )
-        .with_context(AuditEventContext {
-            source: Some(AuditSourceContext {
-                account_pubkey_hex: Some("aa".repeat(32)),
-                ..AuditSourceContext::default()
-            }),
-            ..AuditEventContext::default()
-        }),
-    );
-    drop(recorder);
-
-    let contents = fs::read_to_string(&path).unwrap();
-    for secret in [
-        "secret plaintext",
-        "secret group name",
-        "c2VjcmV0",
-        "npub1exampleexample",
-        &"aa".repeat(32),
-        &"bb".repeat(32),
-        &"cc".repeat(32),
-        &"dd".repeat(32),
-        &"ee".repeat(32),
-        &"ff".repeat(32),
-    ] {
-        assert!(
-            !contents.contains(secret),
-            "obfuscated-mode log leaked {secret:?}: {contents}"
-        );
-    }
-
-    // Obfuscated-safe siblings survive the scrub.
-    assert!(contents.contains("member-ref-1"), "{contents}");
-    assert!(contents.contains(&"ab".repeat(32)), "{contents}");
-    assert!(contents.contains("alice"), "{contents}");
-}
-
-#[test]
-fn full_data_mode_recorder_keeps_full_data_fields() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open_with_data_mode(
-        &path,
-        "engine-abc".to_string(),
-        None,
-        AuditDataMode::FullData,
-    )
-    .unwrap();
-    recorder.record(AuditRecord::new(
-        Some("group-1".into()),
-        full_data_message_content_decoded(),
-    ));
-    drop(recorder);
-
-    let contents = fs::read_to_string(&path).unwrap();
-    assert!(contents.contains("secret plaintext"), "{contents}");
-    assert!(contents.contains(&"aa".repeat(32)), "{contents}");
-}
-
-#[test]
-fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
-    recorder.record(AuditRecord::new(
-        Some("group-1".into()),
-        AuditEventKind::SendOutcome {
-            intent_kind: "app_message".into(),
-            result_kind: "published".into(),
-            outbound_messages: vec![OutboundMessage {
-                msg_id: "msg-3".into(),
-                artifact_kind: MessageArtifactKind::ApplicationMessage,
-                transport: None,
-                recipient_expectation: Some(RecipientExpectation {
-                    artifact_kind: MessageArtifactKind::ApplicationMessage,
-                    recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
-                    membership_epoch: None,
-                    basis_commit_id: None,
-                    expected_member_refs: vec!["member-ref-1".into()],
-                    expected_pubkeys_hex: vec!["dd".repeat(32)],
-                    expected_count: Some(1),
-                }),
-            }],
-        },
-    ));
-    recorder.record(AuditRecord::new(
-        Some("group-1".into()),
-        AuditEventKind::ConvergenceDecision {
-            current_tip_epoch: 7,
-            max_rewind_commits: 5,
-            candidates: vec![ConvergenceCandidate {
-                branch_id: "branch-1".into(),
-                fork_epoch: 6,
-                tip_epoch: 7,
-                tip_committer_pubkey_hex: Some("ee".repeat(32)),
-                score: Some(ConvergenceScore {
-                    tip_committer_pubkey_hex: Some("ee".repeat(32)),
-                    ..ConvergenceScore::default()
-                }),
-                app_witnesses: vec![ConvergenceAppWitness {
-                    epoch: 7,
-                    sender_ref: Some("member-ref-1".into()),
-                    sender_pubkey_hex: Some("ff".repeat(32)),
-                }],
-                ..ConvergenceCandidate::default()
-            }],
-            rule_trace: vec![ConvergenceRuleEvaluation {
-                rule_name: "committer_identity_comparison".into(),
-                inputs: Some(serde_json::json!({
-                    "tip_committer_pubkey_hex": "11".repeat(32),
-                })),
-                result: serde_json::json!({
-                    "selected_committer": "22".repeat(32),
-                }),
-                scope: None,
-                candidate_branch_id: None,
-                other_candidate_branch_id: None,
-                decisive: Some(true),
-                selected_branch_id: Some("branch-1".into()),
-                rejected_branch_id: None,
-            }],
-            selected_branch_id: Some("branch-1".into()),
-            selected_fork_epoch: None,
-            selected_tip_epoch: None,
-            losing_branch_ids: Vec::new(),
-            error_kinds: Vec::new(),
-        },
-    ));
-    drop(recorder);
-
-    let contents = fs::read_to_string(&path).unwrap();
-    for secret in [
-        &"11".repeat(32),
-        &"22".repeat(32),
-        &"dd".repeat(32),
-        &"ee".repeat(32),
-        &"ff".repeat(32),
-    ] {
-        assert!(
-            !contents.contains(secret),
-            "obfuscated-mode log leaked {secret:?}: {contents}"
-        );
-    }
-    assert!(contents.contains("member-ref-1"), "{contents}");
-    assert!(contents.contains("branch-1"), "{contents}");
-    assert!(
-        !contents.contains("committer_identity_comparison"),
-        "obfuscated-mode log retained an untyped rule trace: {contents}"
-    );
 }

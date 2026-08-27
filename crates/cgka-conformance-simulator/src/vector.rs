@@ -1071,9 +1071,7 @@ pub struct AppInvalidationObservation {
 
 /// A convergence decision projected from an
 /// [`AuditEventKind::ConvergenceDecision`] down to the scalar facts a vector can
-/// assert on. The raw audit event carries free-form `serde_json::Value` rule
-/// traces that are not `Eq`; this projection stays comparable and
-/// implementation-neutral.
+/// assert on. The projection stays comparable and implementation-neutral.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergenceDecisionObservation {
     pub current_tip_epoch: u64,
@@ -1097,7 +1095,7 @@ fn observe_convergence_decision(kind: &AuditEventKind) -> Option<ConvergenceDeci
     let AuditEventKind::ConvergenceDecision {
         current_tip_epoch,
         candidates,
-        rule_trace,
+        decisive_rule,
         selected_branch_id,
         selected_tip_epoch,
         ..
@@ -1117,10 +1115,7 @@ fn observe_convergence_decision(kind: &AuditEventKind) -> Option<ConvergenceDeci
         current_tip_epoch: *current_tip_epoch,
         selected_branch_id: selected_branch_id.clone(),
         selected_tip_epoch: *selected_tip_epoch,
-        decisive_rule: rule_trace
-            .iter()
-            .find(|rule| rule.decisive == Some(true))
-            .map(|rule| rule.rule_name.clone()),
+        decisive_rule: decisive_rule.clone(),
         witness_quorum_met: selected_score
             .and_then(|score| score.witness_quorum_met)
             .unwrap_or(false),
@@ -1971,7 +1966,7 @@ mod tests {
 
     #[test]
     fn observe_convergence_decision_projects_selected_branch_scalars() {
-        use marmot_forensics::{ConvergenceCandidate, ConvergenceRuleEvaluation, ConvergenceScore};
+        use marmot_forensics::{ConvergenceCandidate, ConvergenceScore};
 
         let scored = |branch: &str, quorum: bool, app_witnesses: u64| ConvergenceCandidate {
             branch_id: branch.into(),
@@ -1987,17 +1982,7 @@ mod tests {
             current_tip_epoch: 1,
             max_rewind_commits: 5,
             candidates: vec![scored("winner", true, 2), scored("loser", false, 0)],
-            rule_trace: vec![ConvergenceRuleEvaluation {
-                rule_name: "witness_quorum_met".into(),
-                scope: None,
-                candidate_branch_id: None,
-                other_candidate_branch_id: None,
-                inputs: None,
-                result: Value::Null,
-                decisive: Some(true),
-                selected_branch_id: None,
-                rejected_branch_id: None,
-            }],
+            decisive_rule: Some("witness_quorum_met".into()),
             selected_branch_id: Some("winner".into()),
             selected_fork_epoch: Some(1),
             selected_tip_epoch: Some(2),

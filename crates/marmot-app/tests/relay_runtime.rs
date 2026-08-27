@@ -16,8 +16,8 @@ use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
-    AuditDataMode, AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp,
-    MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
+    MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
     NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
     RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
@@ -3398,11 +3398,8 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
 async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -3483,11 +3480,8 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
 async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -3552,11 +3546,8 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let bob_id = home.account("bob").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut bob_setup = app.client("bob").await.unwrap();
     bob_setup.publish_key_package().await.unwrap();
     drop(bob_setup);
@@ -3626,11 +3617,8 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     let bob_id = home.account("bob").unwrap().account_id_hex;
 
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let mut bob_setup = app.client("bob").await.unwrap();
     bob_setup.publish_key_package().await.unwrap();
     drop(bob_setup);
@@ -3725,11 +3713,8 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
 async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
@@ -6579,10 +6564,10 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
 }
 
 #[tokio::test]
-async fn failed_send_keeps_read_marker_and_inbound_unread() {
-    // mdk#338: the local-send projection recorded BEFORE publish must not
-    // advance the per-group read marker. If it did, a hard publish failure
-    // would leave the marker pointing at the invalidated own message and
+async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
+    // mdk#338/#1577: the local-send projection recorded BEFORE publish must
+    // not advance the per-group read marker. If it did, an unresolved publish
+    // would leave the marker pointing at the unconfirmed own message and
     // silently mark older inbound unreads as read. Only the post-publish
     // success projection may advance the marker.
     let dir = tempfile::tempdir().unwrap();
@@ -6671,23 +6656,44 @@ async fn failed_send_keeps_read_marker_and_inbound_unread() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    // Hard publish failure: no relay left to accept bob's message. The failed
+    // No relay remains to confirm whether bob's message was accepted. The
     // attempt can take up to the adapter's ~20s publish overall-wait
-    // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports the failure.
+    // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports completion unknown.
     relay.shutdown();
-    bob.send(&group_id, b"bob failure")
+    let unresolved = bob
+        .send(&group_id, b"bob unresolved")
         .await
-        .expect_err("send must fail once the relay is gone");
+        .expect("an ambiguous publish is retained rather than reported as a hard failure");
+    assert_eq!(
+        unresolved.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    assert_eq!(unresolved.published, 0);
+    let timeline = app
+        .timeline_messages_with_query(
+            "bob",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        timeline.messages.iter().any(|message| {
+            message.direction == "sent" && message.plaintext == "bob unresolved"
+        }),
+        "an unresolved local send must remain in the timeline"
+    );
 
     let row = bob_row();
     assert_eq!(
         row.unread_count, 1,
-        "a failed send must not mark inbound unreads as read"
+        "an unresolved send must not mark inbound unreads as read"
     );
     assert_eq!(
         row.last_read_message_id_hex.as_deref(),
         Some(read_baseline_id.as_str()),
-        "a failed send must leave the read marker untouched, never at the failed event"
+        "an unresolved send must leave the read marker untouched"
     );
     assert_eq!(
         row.first_unread_message_id_hex.as_deref(),
@@ -6703,7 +6709,7 @@ async fn failed_send_keeps_read_marker_and_inbound_unread() {
         .unwrap_or(0);
     assert_eq!(
         account_unread, 1,
-        "the account-level unread aggregate must survive the failed send"
+        "the account-level unread aggregate must survive the unresolved send"
     );
 }
 
@@ -9599,85 +9605,6 @@ async fn app_runtime_sign_out_rejects_tracked_only_account() {
 }
 
 #[tokio::test]
-async fn runtime_data_mode_toggle_rotates_live_recorder_with_boundary() {
-    // Requirement #4: switching the audit data mode on a running account
-    // rotates the live recorder so each file carries a single mode with a clear
-    // `audit_data_mode_changed` boundary.
-    let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
-    // Start in the default obfuscated posture, recording enabled.
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
-
-    let runtime = MarmotAppRuntime::new(app.clone());
-    let setup = AccountSetupRequest {
-        default_relays: vec![endpoint(&url)],
-        bootstrap_relays: vec![endpoint(&url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let alice = create_network_ready_identity(&runtime, setup).await;
-
-    // The live worker is recording in obfuscated mode.
-    let before = app.audit_log_files().unwrap();
-    let alice_before = before
-        .iter()
-        .find(|file| file.account_ref == alice.account.label)
-        .expect("alice has a live audit file");
-    let obfuscated_body = std::fs::read_to_string(&alice_before.path).unwrap();
-    assert!(
-        obfuscated_body
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .all(|event| event["audit_data_mode"] == "obfuscated_sensitive_data"),
-        "every pre-toggle line is obfuscated"
-    );
-
-    // Toggle to full_data while recording stays on.
-    let stored = runtime
-        .set_audit_log_settings(AuditLogSettings {
-            enabled: true,
-            data_mode: AuditDataMode::FullData,
-        })
-        .await
-        .unwrap();
-    assert_eq!(stored.data_mode, AuditDataMode::FullData);
-
-    // The rotated file is entirely full_data and carries the boundary row.
-    let after = app.audit_log_files().unwrap();
-    let alice_after = after
-        .iter()
-        .find(|file| file.account_ref == alice.account.label)
-        .expect("alice still has a live audit file");
-    let events = std::fs::read_to_string(&alice_after.path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert!(
-        events
-            .iter()
-            .all(|event| event["audit_data_mode"] == "full_data"),
-        "the rotated file must be entirely full_data"
-    );
-    let boundary = events
-        .iter()
-        .find(|event| event["kind"]["type"] == "audit_data_mode_changed")
-        .expect("a mode-change boundary row is written on the fresh file");
-    assert_eq!(
-        boundary["kind"]["previous_mode"],
-        "obfuscated_sensitive_data"
-    );
-    assert_eq!(boundary["kind"]["new_mode"], "full_data");
-    assert_eq!(boundary["kind"]["recorder_restarted"], true);
-
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
 async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
     // A scripted sync produces the two forensic diagnostic rows a field export
     // relies on — the subscription rebuild's `since` floor + per-relay
@@ -9686,11 +9613,8 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     // Enable recording before the runtime starts so the live worker records.
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
 
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {

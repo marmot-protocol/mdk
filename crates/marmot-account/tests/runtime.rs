@@ -27,8 +27,10 @@ use cgka_traits::transport::{
 use cgka_traits::{
     EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId, OutboundFanout,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointReceipt,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
+    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
+    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
@@ -340,6 +342,7 @@ struct RecordingAdapterInner {
     accepted_counts: Mutex<VecDeque<usize>>,
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
+    error_kind: Mutex<Option<TransportEndpointFailureKind>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -391,6 +394,16 @@ impl RecordingAdapter {
     /// endpoints all sit in this set returns `Err` instead of a report.
     fn error_for_endpoints(&self, endpoints: Vec<TransportEndpoint>) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
+        *self.inner.error_kind.lock().unwrap() = None;
+    }
+
+    fn fail_endpoints_as(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        kind: TransportEndpointFailureKind,
+    ) {
+        *self.inner.error_endpoints.lock().unwrap() = endpoints;
+        *self.inner.error_kind.lock().unwrap() = Some(kind);
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -478,6 +491,34 @@ impl TransportAdapter for RecordingAdapter {
                     .iter()
                     .all(|endpoint| error_endpoints.contains(endpoint))
             {
+                if let Some(kind) = *self.inner.error_kind.lock().unwrap() {
+                    let failures = request
+                        .target
+                        .endpoints()
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| TransportEndpointFailure {
+                            endpoint,
+                            reason: "injected typed endpoint failure".into(),
+                            kind,
+                            rejection_category: None,
+                        })
+                        .collect();
+                    let message_id = self
+                        .inner
+                        .reported_message_ids
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(request.message.id);
+                    return Err(TransportAdapterError::PublishEndpoints(
+                        TransportPublishFailure::with_endpoint_failures(
+                            "injected typed endpoint failure",
+                            failures,
+                        )
+                        .with_message_id(message_id),
+                    ));
+                }
                 return Err(TransportAdapterError::Publish(
                     "endpoint-policy adapter error".into(),
                 ));
@@ -504,7 +545,19 @@ impl TransportAdapter for RecordingAdapter {
                         accepted_at: None,
                     })
                     .collect(),
-                failed: Vec::new(),
+                failed: request
+                    .target
+                    .endpoints()
+                    .iter()
+                    .filter(|endpoint| !accepted_endpoints.contains(endpoint))
+                    .cloned()
+                    .map(|endpoint| TransportEndpointFailure {
+                        endpoint,
+                        reason: "injected explicit relay rejection".into(),
+                        kind: TransportEndpointFailureKind::TerminalRejected,
+                        rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+                    })
+                    .collect(),
                 required_acks: request.required_acks,
             });
         }
@@ -2572,7 +2625,7 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
     let bob_id = bob_session.self_id();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_next(0);
+    adapter.accept_only_endpoints(Vec::new());
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_inbox_route(
@@ -2616,7 +2669,7 @@ async fn create_group_with_best_effort_acks_rolls_back_when_nothing_accepted() {
     let bob_id = bob_session.self_id();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_next(0);
+    adapter.accept_only_endpoints(Vec::new());
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(0)
@@ -2668,7 +2721,7 @@ async fn create_group_stops_welcome_publish_after_unexposed_failure() {
     let carol_id = carol_session.self_id();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_next(0);
+    adapter.accept_only_endpoints(Vec::new());
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .with_inbox_route(
@@ -3125,7 +3178,7 @@ async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
     let bob_id = bob_session.self_id();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_next(1);
+    adapter.accept_only_endpoints(vec![TransportEndpoint("wss://bob-inbox-a.example".into())]);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)
@@ -3178,11 +3231,13 @@ async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 2);
 
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 1);
-    assert!(matches!(
-        publishes[0].message.envelope,
-        TransportEnvelope::Welcome { .. }
-    ));
+    assert_eq!(publishes.len(), 2);
+    assert!(
+        publishes
+            .iter()
+            .all(|publish| matches!(publish.message.envelope, TransportEnvelope::Welcome { .. }))
+    );
+    assert_eq!(publishes[0].message, publishes[1].message);
 }
 
 #[tokio::test]

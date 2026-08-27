@@ -29,6 +29,7 @@ use std::collections::HashSet;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
+use nostr::{RelayUrl, Url};
 use serde::{Deserialize, Serialize};
 
 /// Upper bounds, in milliseconds, of the duration histogram buckets shared by
@@ -74,13 +75,19 @@ pub struct RelayIndexRegistry {
 
 impl RelayIndexRegistry {
     /// Stable index for `endpoint`, assigning a new one on first sighting.
+    ///
+    /// Valid relay URLs are keyed by their parsed URL identity so a verbatim
+    /// signed route and the normalized endpoint emitted by nostr-sdk resolve to
+    /// the same device-local relay. Invalid/non-relay endpoints stay byte-exact;
+    /// this registry never rewrites authoritative routing state.
     pub fn index_for(&mut self, endpoint: &TransportEndpoint) -> RelayIndex {
-        if let Some(index) = self.indices.get(endpoint) {
+        let key = relay_index_key(endpoint);
+        if let Some(index) = self.indices.get(&key) {
             return *index;
         }
         let index = RelayIndex(self.next);
         self.next += 1;
-        self.indices.insert(endpoint.clone(), index);
+        self.indices.insert(key, index);
         index
     }
 
@@ -106,6 +113,18 @@ impl RelayIndexRegistry {
         pairs.sort_by_key(|(index, _)| index.0);
         pairs
     }
+}
+
+/// Device-local identity key shared by subscription attempts, EOSE callbacks,
+/// delivery timing, and frozen replay coverage.
+///
+/// Serializing the inner [`Url`] discards [`RelayUrl`]'s presentation-only
+/// `has_trailing_slash` flag while preserving real path distinctions such as
+/// `/foo` versus `/foo/`, matching [`RelayUrl`]'s `Eq`/`Hash` identity.
+fn relay_index_key(endpoint: &TransportEndpoint) -> TransportEndpoint {
+    RelayUrl::parse(endpoint.as_str())
+        .map(|relay_url| TransportEndpoint(Url::from(relay_url).to_string()))
+        .unwrap_or_else(|_| endpoint.clone())
 }
 
 /// Capability that authorizes resolving opaque [`RelayIndex`] values back to
@@ -836,17 +855,54 @@ mod tests {
     }
 
     #[test]
+    fn registry_folds_verbatim_and_normalized_relay_spellings() {
+        let mut registry = RelayIndexRegistry::default();
+        let verbatim = TransportEndpoint("wss://Relay.Example:443".into());
+        let normalized = TransportEndpoint(
+            RelayUrl::parse(verbatim.as_str())
+                .expect("relay URL parses")
+                .to_string(),
+        );
+        let canonical = TransportEndpoint(
+            Url::from(RelayUrl::parse(verbatim.as_str()).expect("relay URL parses")).to_string(),
+        );
+        assert_ne!(verbatim, normalized);
+
+        let index = registry.index_for(&verbatim);
+        assert_eq!(registry.index_for(&normalized), index);
+        assert_eq!(registry.resolutions(), vec![(index, canonical)]);
+    }
+
+    #[test]
+    fn registry_folds_origin_slashes_but_preserves_path_slashes() {
+        let mut registry = RelayIndexRegistry::default();
+        let origin = TransportEndpoint("wss://relay.example.com".into());
+        let origin_slash = TransportEndpoint("wss://relay.example.com/".into());
+        let path = TransportEndpoint("wss://relay.example.com/foo".into());
+        let path_slash = TransportEndpoint("wss://relay.example.com/foo/".into());
+
+        let origin_index = registry.index_for(&origin);
+        assert_eq!(registry.index_for(&origin_slash), origin_index);
+        assert_ne!(registry.index_for(&path), registry.index_for(&path_slash));
+    }
+
+    #[test]
     fn registry_resolves_indices_back_to_endpoints() {
         let mut registry = RelayIndexRegistry::default();
         let a = TransportEndpoint("wss://a".into());
         let b = TransportEndpoint("wss://b".into());
         let ia = registry.index_for(&a);
         let ib = registry.index_for(&b);
+        let canonical_a = relay_index_key(&a);
+        let canonical_b = relay_index_key(&b);
 
-        assert_eq!(registry.resolve(ia), Some(&a));
-        assert_eq!(registry.resolve(ib), Some(&b));
+        assert_eq!(registry.resolve(ia), Some(&canonical_a));
+        assert_eq!(registry.resolve(ib), Some(&canonical_b));
         assert_eq!(registry.resolve(RelayIndex(99)), None);
-        assert_eq!(registry.resolutions(), vec![(ia, a), (ib, b)]);
+        assert_eq!(
+            registry.resolutions(),
+            vec![(ia, canonical_a), (ib, canonical_b)]
+        );
     }
 
     #[test]

@@ -1,36 +1,9 @@
 //! Audit-log file, settings, upload, and tracker FFI conversions.
 
 use marmot_app::{
-    AuditDataMode, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, AuditLogUploadSource,
 };
-
-/// Forensic audit data mode exposed to host apps.
-#[derive(Clone, Copy, Debug, uniffi::Enum)]
-pub enum AuditDataModeFfi {
-    /// Default safety posture: obfuscated/hashed identifiers, no plaintext.
-    ObfuscatedSensitiveData,
-    /// Explicit opt-in: decrypted content and full identifiers where useful.
-    FullData,
-}
-
-impl From<AuditDataMode> for AuditDataModeFfi {
-    fn from(value: AuditDataMode) -> Self {
-        match value {
-            AuditDataMode::ObfuscatedSensitiveData => Self::ObfuscatedSensitiveData,
-            AuditDataMode::FullData => Self::FullData,
-        }
-    }
-}
-
-impl From<AuditDataModeFfi> for AuditDataMode {
-    fn from(value: AuditDataModeFfi) -> Self {
-        match value {
-            AuditDataModeFfi::ObfuscatedSensitiveData => Self::ObfuscatedSensitiveData,
-            AuditDataModeFfi::FullData => Self::FullData,
-        }
-    }
-}
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AuditLogFileFfi {
@@ -106,14 +79,12 @@ impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AuditLogSettingsFfi {
     pub enabled: bool,
-    pub data_mode: AuditDataModeFfi,
 }
 
 impl From<AuditLogSettings> for AuditLogSettingsFfi {
     fn from(value: AuditLogSettings) -> Self {
         Self {
             enabled: value.enabled,
-            data_mode: value.data_mode.into(),
         }
     }
 }
@@ -122,7 +93,6 @@ impl From<AuditLogSettingsFfi> for AuditLogSettings {
     fn from(value: AuditLogSettingsFfi) -> Self {
         Self {
             enabled: value.enabled,
-            data_mode: value.data_mode.into(),
         }
     }
 }

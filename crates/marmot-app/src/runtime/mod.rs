@@ -2213,19 +2213,9 @@ impl MarmotAppRuntime {
         let previous = self.accounts.app.audit_log_settings().ok();
         let stored = self.accounts.app.set_audit_log_settings(settings)?;
         let enabled_changed = previous.as_ref().map(|s| s.enabled) != Some(stored.enabled);
-        let mode_changed = previous.as_ref().map(|s| s.data_mode) != Some(stored.data_mode);
         if enabled_changed {
-            // Toggling recording rebuilds the recorder, which opens in the
-            // currently-persisted data mode — so this also applies a concurrent
-            // mode change when enabling.
             self.accounts
                 .apply_audit_recording_to_workers(stored.enabled)
-                .await;
-        } else if mode_changed && stored.enabled {
-            // Recording stayed on but the mode changed: rotate the live
-            // recorder so the file gets a clean mode boundary.
-            self.accounts
-                .apply_audit_data_mode_to_workers(stored.data_mode)
                 .await;
         }
         Ok(stored)
@@ -5165,38 +5155,6 @@ impl AccountManager {
             let (respond, response) = oneshot::channel();
             if command
                 .send(AccountWorkerCommand::SetAuditRecording { enabled, respond })
-                .await
-                .is_ok()
-            {
-                let _ = timeout(APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, response).await;
-            }
-        }
-    }
-
-    /// Apply an audit data-mode change to every running account worker by
-    /// rotating its live recorder in place, so each file carries a single mode
-    /// with a clear `audit_data_mode_changed` boundary.
-    ///
-    /// Best-effort, mirroring [`apply_audit_recording_to_workers`]: non-running
-    /// workers pick the mode up at their next open (the recorder opens in the
-    /// persisted mode), and per-worker failures are ignored. The mode is already
-    /// persisted by the caller; this only updates live sessions.
-    async fn apply_audit_data_mode_to_workers(&self, mode: marmot_forensics::AuditDataMode) {
-        let commands = {
-            let workers = self.workers.lock().await;
-            workers
-                .values()
-                .map(|worker| worker.commands.clone())
-                .collect::<Vec<_>>()
-        };
-        for command in commands {
-            let (respond, response) = oneshot::channel();
-            if command
-                .send(AccountWorkerCommand::SetAuditDataMode {
-                    mode,
-                    reason: "settings_changed".to_owned(),
-                    respond,
-                })
                 .await
                 .is_ok()
             {

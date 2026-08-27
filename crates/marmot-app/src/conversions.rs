@@ -403,32 +403,12 @@ pub(crate) fn audit_log_settings_from_storage(
 ) -> AuditLogSettings {
     AuditLogSettings {
         enabled: settings.enabled,
-        data_mode: audit_data_mode_from_token(&settings.data_mode),
     }
 }
 
 pub(crate) fn audit_log_settings_to_storage(settings: AuditLogSettings) -> StoredAuditLogSettings {
     StoredAuditLogSettings {
         enabled: settings.enabled,
-        data_mode: audit_data_mode_token(settings.data_mode).to_owned(),
-    }
-}
-
-/// Parse a stored audit data-mode token into the typed mode, mapping any
-/// unknown/legacy token to the safe obfuscated default.
-fn audit_data_mode_from_token(token: &str) -> marmot_forensics::AuditDataMode {
-    match token {
-        "full_data" => marmot_forensics::AuditDataMode::FullData,
-        _ => marmot_forensics::AuditDataMode::ObfuscatedSensitiveData,
-    }
-}
-
-/// The canonical storage token for an audit data mode (matches the forensics
-/// enum's serde string).
-fn audit_data_mode_token(mode: marmot_forensics::AuditDataMode) -> &'static str {
-    match mode {
-        marmot_forensics::AuditDataMode::FullData => "full_data",
-        marmot_forensics::AuditDataMode::ObfuscatedSensitiveData => "obfuscated_sensitive_data",
     }
 }
 

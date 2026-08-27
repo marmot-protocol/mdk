@@ -7,8 +7,9 @@
 //! the simulator reproduces the recorded outcome (fail-closed).
 //!
 //! - [`export`] — a lenient, self-owned model of the export (decoupled from the
-//!   engine's forensic types; it tracks the stable `marmot-forensics-audit/v2`
-//!   wire shape Goggles emits, not the Rust enum).
+//!   engine's forensic types; it stays lenient over legacy
+//!   `marmot-forensics-audit/v2` exports and safe-only v3 rows, not the Rust
+//!   enum).
 //! - [`ndjson`] — [`ndjson::parse_stream`], the second parser: the Goggles
 //!   streaming NDJSON export (`goggles-group-export/v1`) into the same
 //!   [`export::AgentStateExport`], enforcing the stream's fail-closed
