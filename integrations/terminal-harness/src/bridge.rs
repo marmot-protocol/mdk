@@ -75,6 +75,7 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
         sessions,
         recovery,
         deliveries,
+        reconciliation_slot: ReconciliationSlot::new(),
         queues,
         dedupe: Arc::new(InboundDedupe::new(DEDUPE_LIMIT)),
         backend: Arc::new(backend),
@@ -91,10 +92,32 @@ struct BridgeContext {
     sessions: Arc<SessionStore>,
     recovery: Arc<RecoveryStore>,
     deliveries: Arc<FinalDeliveryStore>,
+    reconciliation_slot: ReconciliationSlot,
     queues: Arc<GroupQueues>,
     dedupe: Arc<InboundDedupe>,
     backend: Arc<dyn Backend>,
     home: PathBuf,
+}
+
+struct ReconciliationSlot {
+    semaphore: Arc<Semaphore>,
+}
+
+impl ReconciliationSlot {
+    fn new() -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn try_enter(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
 }
 
 async fn subscribe_loop(ctx: Arc<BridgeContext>) -> Result<()> {
@@ -161,7 +184,6 @@ async fn drain_events(
     let mut reconcile = interval(Duration::from_secs(30));
     reconcile.set_missed_tick_behavior(MissedTickBehavior::Delay);
     reconcile.tick().await;
-    let reconciliation_slot = Arc::new(Semaphore::new(1));
     loop {
         tokio::select! {
             result = &mut shutdown => {
@@ -197,7 +219,7 @@ async fn drain_events(
                 }
             }
             _ = reconcile.tick() => {
-                if let Ok(permit) = reconciliation_slot.clone().try_acquire_owned() {
+                if let Some(permit) = ctx.reconciliation_slot.try_enter() {
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -1529,6 +1551,22 @@ mod tests {
         assert!(dedupe.insert("m1".to_owned()).await);
         assert!(!dedupe.insert("m1".to_owned()).await);
         assert!(dedupe.insert("m2".to_owned()).await);
+    }
+
+    #[test]
+    fn reconnect_while_reconciliation_is_pending_keeps_maximum_concurrency_one() {
+        let slot = ReconciliationSlot::new();
+
+        let old_drain = slot.try_enter().expect("first drain starts reconciliation");
+        assert_eq!(slot.available_permits(), 0);
+        assert!(
+            slot.try_enter().is_none(),
+            "a reconnecting drain must share the process-lifetime reconciliation guard"
+        );
+
+        drop(old_drain);
+        assert_eq!(slot.available_permits(), 1);
+        assert!(slot.try_enter().is_some());
     }
 
     #[tokio::test]
