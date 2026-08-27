@@ -41,7 +41,8 @@ pub(crate) struct EpochBackfillExecution {
     pub(crate) pending: PendingEpochBackfill,
     pub(crate) epochs_before: HashMap<cgka_traits::GroupId, u64>,
     pub(crate) retry_ordinal: u64,
-    pub(crate) unconfirmed_ordinal: u64,
+    pub(crate) eose_unconfirmed_ordinal: u64,
+    pub(crate) no_progress_ordinal: u64,
     pub(crate) started: Instant,
 }
 
@@ -173,15 +174,16 @@ impl DrainVerdict {
         }
     }
 
-    fn spends_unconfirmed_attempt(self) -> bool {
-        matches!(
-            self,
-            Self::EoseTimeout | Self::NoRelayEose | Self::NoProgressQuantumYield
-        )
+    fn spends_eose_attempt(self) -> bool {
+        matches!(self, Self::EoseTimeout | Self::NoRelayEose)
     }
 
     fn made_novel_progress(self) -> bool {
         self == Self::NovelProgressQuantumYield
+    }
+
+    fn made_no_progress(self) -> bool {
+        self == Self::NoProgressQuantumYield
     }
 }
 
@@ -1083,10 +1085,10 @@ impl AppClient {
     async fn backfill_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
-        unconfirmed_ordinal: u64,
+        eose_unconfirmed_ordinal: u64,
     ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
         let execution_quantum = self.epoch_backfill_execution_quantum();
-        let completion = if unconfirmed_ordinal >= EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+        let completion = if eose_unconfirmed_ordinal >= EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
             DrainCompletion::QuiescenceFallback { execution_quantum }
         } else {
             DrainCompletion::EndOfStoredEvents {
@@ -1972,7 +1974,8 @@ impl AppClient {
     ) -> Option<EpochBackfillExecution> {
         let mut pending = self.take_next_pending_epoch_backfill()?;
         let retry_ordinal = u64::from(pending.execution_attempts);
-        let unconfirmed_ordinal = u64::from(pending.unconfirmed_attempts);
+        let eose_unconfirmed_ordinal = u64::from(pending.eose_unconfirmed_attempts);
+        let no_progress_ordinal = u64::from(pending.no_progress_attempts);
         let epochs_before = self.capture_pending_group_epochs(&pending);
         let context = Self::epoch_backfill_audit_context(&pending);
         if epochs_before.len() != pending.groups.len() {
@@ -2000,7 +2003,8 @@ impl AppClient {
             pending,
             epochs_before,
             retry_ordinal,
-            unconfirmed_ordinal,
+            eose_unconfirmed_ordinal,
+            no_progress_ordinal,
             started: Instant::now(),
         })
     }
@@ -2183,9 +2187,10 @@ impl AppClient {
                 self.record_subscription_rebuild(None).await;
                 let mut counts = DrainCounts::default();
                 let retry_ordinal = execution.retry_ordinal;
-                let unconfirmed_ordinal = execution.unconfirmed_ordinal;
+                let eose_unconfirmed_ordinal = execution.eose_unconfirmed_ordinal;
+                let no_progress_ordinal = execution.no_progress_ordinal;
                 let (mut summary, verdict) = match self
-                    .backfill_sdk_relay(&mut counts, unconfirmed_ordinal)
+                    .backfill_sdk_relay(&mut counts, eose_unconfirmed_ordinal)
                     .await
                 {
                     Ok(drained) => drained,
@@ -2225,9 +2230,17 @@ impl AppClient {
                 // disarm the detector, so it is recorded as a failed attempt
                 // and its intent stays queued for the next seam.
                 let error_kind = verdict.error_kind();
-                if verdict.spends_unconfirmed_attempt() {
-                    execution.pending.unconfirmed_attempts =
-                        execution.pending.unconfirmed_attempts.saturating_add(1);
+                if verdict.spends_eose_attempt() {
+                    execution.pending.eose_unconfirmed_attempts = execution
+                        .pending
+                        .eose_unconfirmed_attempts
+                        .saturating_add(1);
+                }
+                if verdict.made_no_progress() {
+                    execution.pending.no_progress_attempts =
+                        execution.pending.no_progress_attempts.saturating_add(1);
+                } else {
+                    execution.pending.no_progress_attempts = 0;
                 }
                 if error_kind.is_none()
                     && let Err(error) = self.clear_epoch_backfill_intent(&execution.pending)
@@ -2266,9 +2279,12 @@ impl AppClient {
                     self.epoch_backfill_retry_not_before = if verdict.made_novel_progress() {
                         None
                     } else {
-                        Some(
-                            Instant::now() + self.epoch_backfill_retry_backoff(unconfirmed_ordinal),
-                        )
+                        let pacing_ordinal = if verdict.made_no_progress() {
+                            no_progress_ordinal
+                        } else {
+                            eose_unconfirmed_ordinal
+                        };
+                        Some(Instant::now() + self.epoch_backfill_retry_backoff(pacing_ordinal))
                     };
                     return Ok(EpochBackfillRunOutcome::Incomplete(summary));
                 }

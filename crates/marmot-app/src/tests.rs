@@ -1527,9 +1527,104 @@ fn epoch_backfill_drain_yields_when_duplicates_stream_without_eose() {
     });
 }
 
+/// Worker-quantum pacing and EOSE-failure fallback are independent policies.
+/// Repeated duplicate-only slices must never make a later quiet slice claim
+/// completion under the weaker quiescence contract.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn duplicate_only_quanta_do_not_spend_eose_fallback_attempts() {
+    run_composed_app_runtime_test("backfill-duplicate-quanta-eose-budget", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config()
+                .with_dev_epoch_backfill_eose_wait_ms(30_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(900),
+        )
+        .await;
+        let group = app
+            .group("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .expect("local group projection");
+        let duplicate = epoch_gap_probe(
+            &group.nostr_routing.nostr_group_id_hex,
+            crate::unix_now_seconds(),
+            "duplicates-must-not-unlock-fallback",
+        );
+        client.remember_seen_event(duplicate.id.clone());
+        let (stop, pump) = redelivery_pump(
+            &app,
+            duplicate,
+            Duration::from_millis(50),
+            Duration::from_secs(6),
+        );
+
+        for attempt in 0..crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT {
+            let outcome = client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+                )
+                .await
+                .expect("duplicate-only quantum runs");
+            assert!(
+                matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+                "duplicate-only quantum {attempt} must retain the intent"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pump.await;
+
+        let outcome = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect("quiet continuation runs");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
+            "worker-quantum yields must not unlock quiescence fallback"
+        );
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "an EOSE-unconfirmed continuation must retain the durable intent"
+        );
+
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let outcome = client
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await
+            .expect("EOSE-confirmed continuation runs");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Completed(_)
+        ));
+        assert!(!client.has_pending_epoch_backfill());
+
+        let rows = recorded_audit_rows(&app);
+        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
+        assert_eq!(
+            failed.len(),
+            crate::EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT as usize + 1
+        );
+        assert!(failed.iter().all(|row| {
+            row["kind"]["error_kind"].as_str() == Some("backfill_drain_no_progress_quantum_yield")
+        }));
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events")
+        );
+    });
+}
+
 /// Productive replays use the same worker quantum, but their checkpointed
-/// prefix survives the yield and they do not spend the no-progress fallback
-/// ordinal. A later EOSE-confirmed quantum can therefore finish the same arm.
+/// prefix survives the yield and they do not spend the EOSE fallback ordinal.
+/// A later EOSE-confirmed quantum can therefore finish the same arm.
 #[test]
 #[cfg(feature = "test-policy-overrides")]
 fn epoch_backfill_drain_continues_novel_history_across_worker_quanta() {

@@ -343,10 +343,11 @@ pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_sec
 /// production stream never spends it in one attempt: the 5 s execution quantum
 /// yields first and a later seam resubscribes. Production EOSE completion
 /// therefore requires the gate to report within that quantum (or before an
-/// adapter-closed result); a consistently slower EOSE degrades through paced
-/// resubscriptions to the explicitly weaker quiescence fallback. Keeping the
-/// budgets distinct makes long-replay slicing independent from that fallback
-/// policy, and test-policy builds can exercise either boundary directly.
+/// adapter-closed result). A worker-quantum yield is only a scheduling event:
+/// it paces a later resubscription but does not spend the EOSE-failure budget
+/// or unlock the weaker quiescence fallback. Keeping the budgets distinct
+/// makes long-replay slicing independent from that fallback policy, and
+/// test-policy builds can exercise either boundary directly.
 pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
 /// How long an epoch-gap backfill whose replay went unconfirmed waits before
 /// the automatic seams may try it again, doubling per attempt up to
