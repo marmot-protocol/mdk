@@ -8,9 +8,10 @@
 //! boundary and remains the source of truth for commit ordering, branch
 //! selection, and application-message validity.
 
+use crate::app_event::AppMessageRetentionDecision;
 use crate::engine_state::PendingStateRef;
 use crate::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use crate::types::{GroupId, MemberId, MessageId};
+use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -238,6 +239,10 @@ pub enum FanoutPendingKind {
 pub struct OutboundFanout {
     request: TransportPublishRequest,
     group_id: Option<GroupId>,
+    /// Durable app-layer identity needed to finalize an optimistic local row
+    /// when this exact frozen event is acknowledged by a later retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    application_message: Option<OutboundApplicationMessage>,
     #[serde(default)]
     pending_origin_message_id: Option<MessageId>,
     #[serde(default)]
@@ -261,6 +266,14 @@ pub struct OutboundFanout {
     post_confirmation_welcomes_pending: bool,
     mls_state: FanoutMlsState,
     created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundApplicationMessage {
+    pub group_id: GroupId,
+    pub app_event_id: String,
+    pub source_epoch: EpochId,
+    pub retention: AppMessageRetentionDecision,
 }
 
 impl OutboundFanout {
@@ -348,6 +361,7 @@ impl OutboundFanout {
         Ok(Self {
             request,
             group_id: target_group_id.or(pending_group_id),
+            application_message: None,
             pending_origin_message_id,
             pending_kind,
             published_message_id: None,
@@ -381,6 +395,31 @@ impl OutboundFanout {
 
     pub fn group_id(&self) -> Option<&GroupId> {
         self.group_id.as_ref()
+    }
+
+    pub fn application_message(&self) -> Option<&OutboundApplicationMessage> {
+        self.application_message.as_ref()
+    }
+
+    pub fn set_application_message(
+        &mut self,
+        application_message: OutboundApplicationMessage,
+    ) -> Result<(), TransportAdapterError> {
+        if self.group_id.as_ref() != Some(&application_message.group_id) {
+            return Err(TransportAdapterError::Other(
+                "application-message fanout group does not match publish target".into(),
+            ));
+        }
+        match &self.application_message {
+            None => {
+                self.application_message = Some(application_message);
+                Ok(())
+            }
+            Some(previous) if previous == &application_message => Ok(()),
+            Some(_) => Err(TransportAdapterError::Other(
+                "application-message fanout context changed".into(),
+            )),
+        }
     }
 
     /// Stored OpenMLS commit row used to restore this pending lifecycle.
@@ -634,6 +673,7 @@ impl OutboundFanout {
     pub fn validate_successor_of(&self, previous: &Self) -> Result<(), TransportAdapterError> {
         let immutable_matches = self.request == previous.request
             && self.group_id == previous.group_id
+            && self.application_message == previous.application_message
             && self.pending_origin_message_id == previous.pending_origin_message_id
             && self.pending_kind == previous.pending_kind
             && self.created_at_ms == previous.created_at_ms
@@ -1341,6 +1381,30 @@ mod tests {
         assert_eq!(restored.request().message.id, original_id);
         assert_eq!(restored.request().target.endpoints(), original_targets);
         assert_eq!(restored.outstanding_target_indexes(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn frozen_fanout_round_trip_preserves_application_message_context() {
+        let mut fanout = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();
+        let application = OutboundApplicationMessage {
+            group_id: GroupId::new(vec![0xD4; 16]),
+            app_event_id: "app-event-1".into(),
+            source_epoch: EpochId(7),
+            retention: AppMessageRetentionDecision::new(100, 30),
+        };
+        fanout.set_application_message(application.clone()).unwrap();
+
+        let encoded = serde_json::to_vec(&fanout).unwrap();
+        let restored: OutboundFanout = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.application_message(), Some(&application));
+
+        let mut legacy = serde_json::to_value(fanout).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("application_message");
+        let legacy: OutboundFanout = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.application_message().is_none());
     }
 
     #[test]

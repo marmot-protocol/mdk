@@ -24,6 +24,10 @@ use crate::{
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+/// Keep the SDK's own reconnect sleep aligned with MDK's durable transport
+/// retry budget. The SDK default adaptively grows to 60 seconds, which leaves
+/// queued messages idle long after mobile connectivity has returned.
+const SDK_RELAY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // nostr-sdk 0.44 waits up to 10s for each relay's OK response. Keep this
 // wrapper above that so SDK endpoint-level success/failure results surface
 // instead of a MDK-level timeout masking them.
@@ -1000,17 +1004,55 @@ impl NostrSdkRelayClient {
         }
     }
 
+    /// Recreate a just-added, not-yet-connected relay with all SDK-composed
+    /// options preserved except for the reconnect interval. `Client` has no
+    /// supported in-place relay-option update API, so this is intentionally
+    /// limited to the caller that observed `add_*_relay == true` while holding
+    /// `publish_relay_refs`, before any connection task can start.
+    async fn pin_new_relay_retry_interval(&self, endpoint: &RelayUrl) -> Result<(), ()> {
+        let options = self
+            .client
+            .relays()
+            .await
+            .get(endpoint)
+            .map(|relay| relay.opts().clone())
+            .ok_or(())?
+            .retry_interval(SDK_RELAY_RETRY_INTERVAL)
+            .adjust_retry_interval(false);
+        self.client
+            .remove_relay(endpoint.clone())
+            .await
+            .map_err(|_| ())?;
+        match self
+            .client
+            .pool()
+            .add_relay(endpoint.clone(), options)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(()),
+        }
+    }
+
     async fn add_subscription_relay(
         &self,
         endpoint: RelayUrl,
     ) -> Result<(), TransportAdapterError> {
         let _relay_lifecycle = self.publish_relay_refs.lock().await;
-        self.client
-            .add_relay(endpoint)
+        let added = self
+            .client
+            .add_relay(endpoint.clone())
             .await
             // The sdk error Display can carry the relay URL; keep the error
             // operation-only so `TransportAdapterError` Display stays URL-free.
             .map_err(|_| TransportAdapterError::Subscription("add relay failed".to_owned()))?;
+        if added {
+            self.pin_new_relay_retry_interval(&endpoint)
+                .await
+                .map_err(|_| {
+                    TransportAdapterError::Subscription("configure relay failed".to_owned())
+                })?;
+        }
         Ok(())
     }
 
@@ -1035,6 +1077,14 @@ impl NostrSdkRelayClient {
         // delivery.
         match self.client.add_write_relay(endpoint.clone()).await {
             Ok(true) => {
+                if self.pin_new_relay_retry_interval(endpoint).await.is_err() {
+                    return Err(TransportEndpointFailure {
+                        endpoint: transport_endpoint,
+                        reason: "configure publish relay failed".to_owned(),
+                        kind: TransportEndpointFailureKind::RetryableUnavailable,
+                        rejection_category: None,
+                    });
+                }
                 publish_relay_refs.insert(endpoint.clone(), 1);
                 Ok(true)
             }
@@ -1554,6 +1604,12 @@ fn relay_rejection_endpoint_failure(
             rejection_category: Some(category),
         };
     }
+    // `nostr-sdk` uses the same `output.failed` map for a relay's NIP-20
+    // rejection and for local socket/pool failures such as a disconnected
+    // relay. Only a machine-readable prefix proves the former. Treat an
+    // unclassified value as ambiguous transport failure so upper layers keep
+    // the durable send queued and retry it after connectivity returns. Keep
+    // the SDK string out of the reason: it can contain relay URLs.
     TransportEndpointFailure {
         endpoint,
         reason: "publish acknowledgement unknown".to_owned(),
@@ -2965,6 +3021,63 @@ mod tests {
         // The privacy invariant forbids relay URLs in error Display: the bad
         // endpoint itself must not be echoed back.
         assert!(!rendered.contains("not a relay url"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn subscription_relay_reconnects_within_durable_retry_budget() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let endpoint = RelayUrl::parse(&format!("ws://{addr}")).unwrap();
+        let client = Client::builder().build();
+        let sdk = NostrSdkRelayClient::new(client.clone());
+        sdk.add_subscription_relay(endpoint.clone()).await.unwrap();
+        client.connect_relay(endpoint.clone()).await.unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let status = client
+                    .relays()
+                    .await
+                    .get(&endpoint)
+                    .expect("relay remains in the pool")
+                    .status();
+                if status == RelayStatus::Disconnected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the first unavailable connection attempt must fail promptly");
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        timeout(Duration::from_secs(8), async {
+            loop {
+                let status = client
+                    .relays()
+                    .await
+                    .get(&endpoint)
+                    .expect("relay remains in the pool")
+                    .status();
+                if status == RelayStatus::Connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("relay must reconnect on the fixed five-second transport interval");
+
+        server.abort();
+        client.shutdown().await;
     }
 
     #[derive(Debug)]

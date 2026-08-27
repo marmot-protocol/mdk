@@ -423,7 +423,9 @@ impl AppClient {
             None => {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
-                } else if self.runtime.has_queued_outbound_intents(group_id)? {
+                } else if self.runtime.has_queued_outbound_intents(group_id)?
+                    || self.runtime.has_pending_outbound_fanouts(group_id)?
+                {
                     Ok(ConvergenceScheduleState::PendingOutbound)
                 } else {
                     match self.runtime.deferred_peel_cutoff_delay_ms(group_id)? {
@@ -561,16 +563,16 @@ impl AppClient {
     /// a device that recovered stays counted as stuck — so it is observed on the
     /// same side of the gate.
     ///
-    /// Recovery evidence only. `remember_pending_convergence_groups` is
-    /// deliberately not paired here the way it is at the convergence and inbound
-    /// seams: the callers of this gate do not remember pending convergence on
-    /// their success paths either, so recording it on the failure path alone
-    /// would invent a scheduling contract they do not otherwise hold.
+    /// Retained exact fanouts are non-failure effects, but they still require a
+    /// worker wake. Remember their engine-provided scheduling edge here so all
+    /// direct send operations (messages and group-state changes alike) retry
+    /// automatically after temporary transport loss.
     pub(crate) fn observe_recovery_evidence_then_fail_if_publish_failed(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         self.observe_recovery_evidence(effects);
+        self.remember_pending_convergence_groups(effects);
         fail_if_publish_failed(effects)
     }
 

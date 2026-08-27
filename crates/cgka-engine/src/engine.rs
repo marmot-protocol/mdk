@@ -767,6 +767,20 @@ impl<S: StorageProvider> Engine<S> {
             .collect())
     }
 
+    /// Read one live group's frozen fanouts in original staging order without
+    /// scanning every other group's durable outbox.
+    pub fn outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<OutboundFanout>, EngineError> {
+        if self.quarantined_groups.contains_key(group_id)
+            || self.unhydrated_groups.contains(group_id)
+        {
+            return Ok(Vec::new());
+        }
+        Ok(self.storage.list_outbound_fanouts_for_group(group_id)?)
+    }
+
     /// Delete a terminal fanout after its outcome has been returned.
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> Result<(), EngineError> {
         if let Some(group_id) = self

@@ -1160,6 +1160,13 @@ impl AccountDeviceSession {
         Ok(self.engine.outbound_fanouts()?)
     }
 
+    pub fn outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<OutboundFanout>> {
+        Ok(self.engine.outbound_fanouts_for_group(group_id)?)
+    }
+
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> SessionResult<()> {
         self.engine.delete_outbound_fanout(message_id)?;
         Ok(())
