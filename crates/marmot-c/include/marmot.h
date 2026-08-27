@@ -1539,6 +1539,36 @@ typedef struct MarmotChatListRowList {
 } MarmotChatListRowList;
 
 /**
+ * The account's pinned chats, in display order.
+ */
+typedef struct MarmotChatPinState {
+  /**
+   * Group ids in normalized zero-based display order.
+   */
+  char **ordered_group_ids;
+  uintptr_t ordered_group_ids_len;
+} MarmotChatPinState;
+
+/**
+ * One conversation's local mute state.
+ */
+typedef struct MarmotChatNotificationSettings {
+  char *account_ref;
+  char *account_id_hex;
+  char *group_id_hex;
+  bool muted;
+  /**
+   * Timed mute expiry; unset means muted indefinitely.
+   */
+  bool has_muted_until_ms;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  int64_t muted_until_ms;
+  int64_t updated_at_ms;
+} MarmotChatNotificationSettings;
+
+/**
  * One Nostr tag of the inner Marmot app event, as its string values.
  */
 typedef struct MarmotMessageTag {
@@ -3808,6 +3838,104 @@ MarmotStatus marmot_mark_timeline_message_read(const struct MarmotClient *client
                                                struct MarmotChatListRow **out);
 
 /**
+ * Mark a conversation manually unread (or clear that mark); writes
+ * the refreshed row, or NULL with `MARMOT_STATUS_OK` when the group
+ * has no row. Free with `marmot_chat_list_row_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_chat_manually_unread(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *group_id_hex,
+                                             uint8_t manually_unread,
+                                             struct MarmotChatListRow **out);
+
+/**
+ * Pin or unpin a conversation. Writes the account's full pin state.
+ * Free with `marmot_chat_pin_state_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_chat_pinned(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    const char *group_id_hex,
+                                    uint8_t pinned,
+                                    struct MarmotChatPinState **out);
+
+/**
+ * Replace the pinned-section order. `ordered_group_ids` lists every
+ * pinned group in display order. Free with
+ * `marmot_chat_pin_state_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_pinned_chat_order(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *const *ordered_group_ids,
+                                          uintptr_t ordered_group_ids_len,
+                                          struct MarmotChatPinState **out);
+
+/**
+ * The conversation's local mute state. Free with
+ * `marmot_chat_notification_settings_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chat_notification_settings(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               struct MarmotChatNotificationSettings **out);
+
+/**
+ * Mute a conversation. `has_muted_until_ms` plus `muted_until_ms`
+ * set a timed mute; leaving the flag unset mutes indefinitely. Free
+ * with `marmot_chat_notification_settings_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_chat_muted(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const char *group_id_hex,
+                                   uint8_t has_muted_until_ms,
+                                   int64_t muted_until_ms,
+                                   struct MarmotChatNotificationSettings **out);
+
+/**
+ * Unmute a conversation. Free with
+ * `marmot_chat_notification_settings_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_clear_chat_muted(const struct MarmotClient *client,
+                                     const char *account_ref,
+                                     const char *group_id_hex,
+                                     struct MarmotChatNotificationSettings **out);
+
+/**
  * Stored raw app messages for a group (`group_id_hex` non-NULL) or
  * the whole account (NULL), newest-last, capped by `limit` when
  * `has_limit`. Free with `marmot_app_message_record_list_free`.
@@ -4129,6 +4257,25 @@ MarmotStatus marmot_start_agent_text_stream(const struct MarmotClient *client,
                                             const char *const *quic_candidates,
                                             uintptr_t quic_candidates_len,
                                             struct MarmotAgentStreamStart **out);
+
+/**
+ * Encrypt `plaintext` (the raw image bytes, `media_type` e.g.
+ * `"image/jpeg"`), upload it to Blossom, and commit it as the group's
+ * avatar. Requires admin. The bytes are copied — the caller keeps
+ * ownership. Free with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid; `plaintext` must point
+ * to `plaintext_len` valid bytes (or be NULL with length 0); `out`
+ * valid.
+ */
+MarmotStatus marmot_update_group_image(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       const uint8_t *plaintext,
+                                       uintptr_t plaintext_len,
+                                       const char *media_type,
+                                       struct MarmotSendSummary **out);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
@@ -4915,6 +5062,26 @@ void marmot_audit_log_delete_result_free(struct MarmotAuditLogDeleteResult *ptr)
  * this library.
  */
 void marmot_audit_log_tracker_update_result_free(struct MarmotAuditLogTrackerUpdateResult *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_pin_state_free(struct MarmotChatPinState *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_notification_settings_free(struct MarmotChatNotificationSettings *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

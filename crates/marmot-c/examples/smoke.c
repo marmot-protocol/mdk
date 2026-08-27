@@ -188,6 +188,11 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
           "unknown account -> MARMOT_STATUS_UNKNOWN_ACCOUNT");
 
+    MarmotChatNotificationSettings *mute = NULL;
+    st = marmot_chat_notification_settings(client, "no-such-account", "aabb", &mute);
+    check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
+          "chat_notification_settings on unknown account -> UNKNOWN_ACCOUNT");
+
     uint64_t accepted = 0;
     st = marmot_rotate_key_package(client, "no-such-account", &accepted);
     check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,

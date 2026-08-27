@@ -32,7 +32,9 @@ use crate::types::audit::{
     MarmotAuditLogDeleteResult, MarmotAuditLogFileList, MarmotAuditLogSettings,
     MarmotAuditLogTrackerConfig, MarmotAuditLogTrackerUpdateResult, MarmotAuditLogUploadResult,
 };
-use crate::types::chat_list::{MarmotChatListRow, MarmotChatListRowList};
+use crate::types::chat_list::{
+    MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
+};
 use crate::types::common::MarmotStringList;
 use crate::types::group::{
     MarmotAppBlobEndpoint, MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState,
@@ -712,6 +714,33 @@ c_cmd! {
     /// with `MARMOT_STATUS_OK`. Free with `marmot_chat_list_row_free`.
     sync fn marmot_mark_timeline_message_read(account_ref: str, group_id_hex: str, message_id_hex: str) -> opt_rec(MarmotChatListRow) = mark_timeline_message_read;
 
+    /// Mark a conversation manually unread (or clear that mark); writes
+    /// the refreshed row, or NULL with `MARMOT_STATUS_OK` when the group
+    /// has no row. Free with `marmot_chat_list_row_free`.
+    sync fn marmot_set_chat_manually_unread(account_ref: str, group_id_hex: str, manually_unread: flag) -> opt_rec(MarmotChatListRow) = set_chat_manually_unread;
+
+    /// Pin or unpin a conversation. Writes the account's full pin state.
+    /// Free with `marmot_chat_pin_state_free`.
+    sync fn marmot_set_chat_pinned(account_ref: str, group_id_hex: str, pinned: flag) -> rec(MarmotChatPinState) = set_chat_pinned;
+
+    /// Replace the pinned-section order. `ordered_group_ids` lists every
+    /// pinned group in display order. Free with
+    /// `marmot_chat_pin_state_free`.
+    sync fn marmot_set_pinned_chat_order(account_ref: str, ordered_group_ids/ordered_group_ids_len: str_arr) -> rec(MarmotChatPinState) = set_pinned_chat_order;
+
+    /// The conversation's local mute state. Free with
+    /// `marmot_chat_notification_settings_free`.
+    sync fn marmot_chat_notification_settings(account_ref: str, group_id_hex: str) -> rec(MarmotChatNotificationSettings) = chat_notification_settings;
+
+    /// Mute a conversation. `has_muted_until_ms` plus `muted_until_ms`
+    /// set a timed mute; leaving the flag unset mutes indefinitely. Free
+    /// with `marmot_chat_notification_settings_free`.
+    sync fn marmot_set_chat_muted(account_ref: str, group_id_hex: str, has_muted_until_ms/muted_until_ms: opt_val i64) -> rec(MarmotChatNotificationSettings) = set_chat_muted;
+
+    /// Unmute a conversation. Free with
+    /// `marmot_chat_notification_settings_free`.
+    sync fn marmot_clear_chat_muted(account_ref: str, group_id_hex: str) -> rec(MarmotChatNotificationSettings) = clear_chat_muted;
+
     /// Stored raw app messages for a group (`group_id_hex` non-NULL) or
     /// the whole account (NULL), newest-last, capped by `limit` when
     /// `has_limit`. Free with `marmot_app_message_record_list_free`.
@@ -1291,6 +1320,59 @@ pub unsafe extern "C" fn marmot_start_agent_text_stream(
             )
         }
     })
+}
+
+/// Encrypt `plaintext` (the raw image bytes, `media_type` e.g.
+/// `"image/jpeg"`), upload it to Blossom, and commit it as the group's
+/// avatar. Requires admin. The bytes are copied — the caller keeps
+/// ownership. Free with `marmot_send_summary_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid; `plaintext` must point
+/// to `plaintext_len` valid bytes (or be NULL with length 0); `out`
+/// valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_update_group_image(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    plaintext: *const u8,
+    plaintext_len: usize,
+    media_type: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let media_type = try_arg!(unsafe { required_str(media_type) });
+        let plaintext = try_arg!(unsafe { byte_array(plaintext, plaintext_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.update_group_image(
+                    account_ref,
+                    group_id_hex,
+                    plaintext,
+                    media_type,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Copy a borrowed `(ptr, len)` byte buffer. `(NULL, 0)` is empty; NULL
+/// with a nonzero length is an error.
+unsafe fn byte_array(ptr: *const u8, len: usize) -> Result<Vec<u8>, MarmotStatus> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        crate::status::set_last_error("byte buffer was NULL with nonzero length");
+        return Err(MarmotStatus::NullPointer);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
 }
 
 /// Borrow-check a required input-struct pointer.

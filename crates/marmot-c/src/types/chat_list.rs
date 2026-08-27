@@ -3,13 +3,37 @@
 use marmot_uniffi::conversions::{
     ChatConversationKindFfi, ChatListAttachmentKindFfi, ChatListAvatarFfi,
     ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
-    ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi,
+    ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
+    ChatPinStateFfi,
 };
 
 use super::group::{MarmotDisbandRequest, MarmotGroupLifecycleState, MarmotSelfMembership};
 use super::markdown::MarmotMarkdownDocument;
 use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, free_vec, owned_c_string, owned_vec};
+
+c_mirror! {
+    /// The account's pinned chats, in display order.
+    MarmotChatPinState from ChatPinStateFfi,
+    free marmot_chat_pin_state_free {
+        /// Group ids in normalized zero-based display order.
+        str_vec ordered_group_ids/ordered_group_ids_len,
+    }
+}
+
+c_mirror! {
+    /// One conversation's local mute state.
+    MarmotChatNotificationSettings from ChatNotificationSettingsFfi,
+    free marmot_chat_notification_settings_free {
+        str account_ref,
+        str account_id_hex,
+        str group_id_hex,
+        copy muted: bool,
+        /// Timed mute expiry; unset means muted indefinitely.
+        opt_copy has_muted_until_ms/muted_until_ms: i64,
+        copy updated_at_ms: i64,
+    }
+}
 
 c_mirror! {
     /// Encrypted Blossom avatar reference for a chat row.
@@ -214,4 +238,58 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_update_free(
     update: *mut MarmotChatListSubscriptionUpdate,
 ) {
     crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(update) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::boxed;
+
+    #[test]
+    fn pin_state_deep_roundtrip() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let mirror: MarmotChatPinState = ChatPinStateFfi {
+            ordered_group_ids: vec!["aabb".into(), "ccdd".into()],
+        }
+        .into();
+        assert_eq!(mirror.ordered_group_ids_len, 2);
+
+        unsafe { marmot_chat_pin_state_free(boxed(mirror)) };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn notification_settings_carry_the_timed_mute_flag() {
+        let _guard = crate::memory::audit::test_lock();
+
+        let indefinite: MarmotChatNotificationSettings = ChatNotificationSettingsFfi {
+            account_ref: "npub1".into(),
+            account_id_hex: "00".into(),
+            group_id_hex: "aabb".into(),
+            muted: true,
+            muted_until_ms: None,
+            updated_at_ms: 7,
+        }
+        .into();
+        assert!(indefinite.muted && !indefinite.has_muted_until_ms);
+        assert_eq!(indefinite.muted_until_ms, 0);
+        unsafe { marmot_chat_notification_settings_free(boxed(indefinite)) };
+
+        let timed: MarmotChatNotificationSettings = ChatNotificationSettingsFfi {
+            account_ref: "npub1".into(),
+            account_id_hex: "00".into(),
+            group_id_hex: "aabb".into(),
+            muted: true,
+            muted_until_ms: Some(1_700_000_000_000),
+            updated_at_ms: 7,
+        }
+        .into();
+        assert!(timed.has_muted_until_ms);
+        assert_eq!(timed.muted_until_ms, 1_700_000_000_000);
+        unsafe { marmot_chat_notification_settings_free(boxed(timed)) };
+    }
 }
