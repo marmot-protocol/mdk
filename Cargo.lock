@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-c"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "libc",
  "marmot-uniffi",

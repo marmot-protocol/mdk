@@ -383,6 +383,7 @@ typedef enum MarmotTimelineUpdateTrigger {
   MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_ACTIVITY,
   MARMOT_TIMELINE_UPDATE_TRIGGER_AGENT_OPERATION,
   MARMOT_TIMELINE_UPDATE_TRIGGER_GROUP_SYSTEM,
+  MARMOT_TIMELINE_UPDATE_TRIGGER_CUSTOM_EVENT,
   MARMOT_TIMELINE_UPDATE_TRIGGER_DELIVERY_OR_SEND_STATE_CHANGED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_RECEIPT_CHANGED,
   MARMOT_TIMELINE_UPDATE_TRIGGER_SNAPSHOT_REFRESH,
@@ -3938,7 +3939,9 @@ MarmotStatus marmot_clear_chat_muted(const struct MarmotClient *client,
 /**
  * Stored raw app messages for a group (`group_id_hex` non-NULL) or
  * the whole account (NULL), newest-last, capped by `limit` when
- * `has_limit`. Free with `marmot_app_message_record_list_free`.
+ * `has_limit`. `kinds` restricts the result to those Nostr event
+ * kinds; pass NULL with length 0 for every kind. Free with
+ * `marmot_app_message_record_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -3951,6 +3954,8 @@ MarmotStatus marmot_messages(const struct MarmotClient *client,
                              const char *group_id_hex,
                              uint8_t has_limit,
                              uint32_t limit,
+                             const uint64_t *kinds,
+                             uintptr_t kinds_len,
                              struct MarmotAppMessageRecordList **out);
 
 /**
@@ -4718,18 +4723,22 @@ void marmot_messages_subscription_free(struct MarmotMessagesSubscription *sub);
 /**
  * Subscribe to messages for a specific group (`group_id_hex` non-NULL)
  * or every message across the account (NULL). `has_limit` + `limit` cap
- * the initial snapshot to the latest N rows. Free with
- * `marmot_messages_subscription_free`.
+ * the initial snapshot to the latest N rows. `kinds` restricts the
+ * stream to those Nostr event kinds; pass NULL with length 0 for every
+ * kind. Free with `marmot_messages_subscription_free`.
  *
  * # Safety
  * `client` must be a live handle; `account_ref` a valid string;
- * `group_id_hex` NULL or a valid string; `out_sub` valid.
+ * `group_id_hex` NULL or a valid string; `kinds` NULL with length 0, or
+ * a pointer to `kinds_len` valid values; `out_sub` valid.
  */
 MarmotStatus marmot_subscribe_messages(const struct MarmotClient *client,
                                        const char *account_ref,
                                        const char *group_id_hex,
                                        uint8_t has_limit,
                                        uint32_t limit,
+                                       const uint64_t *kinds,
+                                       uintptr_t kinds_len,
                                        struct MarmotMessagesSubscription **out_sub);
 
 /**

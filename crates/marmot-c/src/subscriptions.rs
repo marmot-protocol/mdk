@@ -786,12 +786,14 @@ c_subscription! {
 
 /// Subscribe to messages for a specific group (`group_id_hex` non-NULL)
 /// or every message across the account (NULL). `has_limit` + `limit` cap
-/// the initial snapshot to the latest N rows. Free with
-/// `marmot_messages_subscription_free`.
+/// the initial snapshot to the latest N rows. `kinds` restricts the
+/// stream to those Nostr event kinds; pass NULL with length 0 for every
+/// kind. Free with `marmot_messages_subscription_free`.
 ///
 /// # Safety
 /// `client` must be a live handle; `account_ref` a valid string;
-/// `group_id_hex` NULL or a valid string; `out_sub` valid.
+/// `group_id_hex` NULL or a valid string; `kinds` NULL with length 0, or
+/// a pointer to `kinds_len` valid values; `out_sub` valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_subscribe_messages(
     client: *const MarmotClient,
@@ -799,6 +801,8 @@ pub unsafe extern "C" fn marmot_subscribe_messages(
     group_id_hex: *const std::ffi::c_char,
     has_limit: u8,
     limit: u32,
+    kinds: *const u64,
+    kinds_len: usize,
     out_sub: *mut *mut MarmotMessagesSubscription,
 ) -> MarmotStatus {
     ffi_guard(|| {
@@ -807,11 +811,13 @@ pub unsafe extern "C" fn marmot_subscribe_messages(
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { optional_str(group_id_hex) });
         let limit = crate::memory::c_bool(has_limit).then_some(limit);
-        match client.block_on(
-            client
-                .marmot
-                .subscribe_messages(account_ref, group_id_hex, limit),
-        ) {
+        let kinds = try_arg!(unsafe { crate::memory::opt_num_array(kinds, kinds_len) });
+        match client.block_on(client.marmot.subscribe_messages(
+            account_ref,
+            group_id_hex,
+            limit,
+            kinds,
+        )) {
             Ok(inner) => unsafe {
                 write_handle(
                     MarmotMessagesSubscription {

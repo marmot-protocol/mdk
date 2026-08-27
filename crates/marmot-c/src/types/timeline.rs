@@ -196,6 +196,7 @@ c_enum! {
         AgentActivity,
         AgentOperation,
         GroupSystem,
+        CustomEvent,
         DeliveryOrSendStateChanged,
         ReceiptChanged,
         SnapshotRefresh,

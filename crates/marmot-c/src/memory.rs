@@ -249,6 +249,28 @@ pub(crate) unsafe fn str_array(
     Ok(out)
 }
 
+/// Read a nullable borrowed `(ptr, len)` array of scalars. NULL with
+/// length 0 is "unset" (`None`), not an empty list; NULL with a nonzero
+/// length is an error.
+///
+/// # Safety
+/// When non-NULL, `ptr` must point to `len` valid values.
+pub(crate) unsafe fn opt_num_array<T: Copy>(
+    ptr: *const T,
+    len: usize,
+) -> Result<Option<Vec<T>>, crate::MarmotStatus> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok(None);
+        }
+        crate::status::set_last_error("scalar array was NULL with nonzero length");
+        return Err(crate::MarmotStatus::NullPointer);
+    }
+    Ok(Some(
+        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

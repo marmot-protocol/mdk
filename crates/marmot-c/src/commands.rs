@@ -204,7 +204,9 @@ pub(crate) unsafe fn deliver_bytes(
 ///
 /// Arg kinds: `str` (required string), `opt_str` (nullable string),
 /// `str_arr` (string array + length pair), `val: T` (scalar by value),
-/// `flag` (boolean as `uint8_t` — see [`crate::memory::c_bool`]).
+/// `flag` (boolean as `uint8_t` — see [`crate::memory::c_bool`]),
+/// `f/f_len: opt_num_arr T` (nullable scalar array + length pair; NULL
+/// with length 0 means unset).
 /// Return kinds: `unit`, `scalar(T)`, `string`, `bytes`, `rec(Mirror)`,
 /// `opt_rec(Mirror)`. `sync`/`async` selects direct call vs `block_on`.
 macro_rules! c_cmd {
@@ -372,6 +374,13 @@ macro_rules! c_cmd {
         c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
             {$($p)* $f: $t,}
             {$($r)*}
+            {$($a)* $f,}
+            $($($rest)*)?);
+    };
+    (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, ($($ret:tt)+), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*} $f:ident/$fl:ident: opt_num_arr $t:ty $(, $($rest:tt)*)?) => {
+        c_cmd!(@munch [$($m)*] $mode, $cname, $method, ($($ret)+),
+            {$($p)* $f: *const $t, $fl: usize,}
+            {$($r)* let $f = try_arg!(unsafe { crate::memory::opt_num_array($f, $fl) });}
             {$($a)* $f,}
             $($($rest)*)?);
     };
@@ -743,8 +752,10 @@ c_cmd! {
 
     /// Stored raw app messages for a group (`group_id_hex` non-NULL) or
     /// the whole account (NULL), newest-last, capped by `limit` when
-    /// `has_limit`. Free with `marmot_app_message_record_list_free`.
-    sync fn marmot_messages(account_ref: str, group_id_hex: opt_str, has_limit/limit: opt_val u32) -> rec(MarmotAppMessageRecordList) = messages;
+    /// `has_limit`. `kinds` restricts the result to those Nostr event
+    /// kinds; pass NULL with length 0 for every kind. Free with
+    /// `marmot_app_message_record_list_free`.
+    sync fn marmot_messages(account_ref: str, group_id_hex: opt_str, has_limit/limit: opt_val u32, kinds/kinds_len: opt_num_arr u64) -> rec(MarmotAppMessageRecordList) = messages;
 
     /// Stored media records for the group, capped by `limit` when
     /// `has_limit`. Free with `marmot_media_record_list_free`.
