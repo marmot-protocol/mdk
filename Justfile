@@ -561,6 +561,11 @@ c-header:
 c-smoke:
     ./crates/marmot-c/c-smoke.sh
 
+# Keep the C ABI covering the same marmot-uniffi command surface Swift and
+# Kotlin get; deliberate omissions live in the script's allowlist.
+c-parity-gate:
+    python3 scripts/check_c_binding_parity.py
+
 # Keep convergence policy, resource, scheduler, and history-recovery constants
 # attached to reviewed convergence-constant ledger entries.
 convergence-ledger-gate:
@@ -578,6 +583,6 @@ test-convergence-policy-pin:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin test

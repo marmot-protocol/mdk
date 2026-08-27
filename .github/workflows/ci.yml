@@ -47,6 +47,9 @@ jobs:
       - name: Naming gate (retired legacy tokens)
         run: ./scripts/check_legacy_naming.sh
 
+      - name: C binding command-surface parity gate
+        run: python3 scripts/check_c_binding_parity.py
+
       - name: Install example SHA-256 gate
         run: |
           python3 scripts/check_install_example_sha256.py
