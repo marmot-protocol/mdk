@@ -98,6 +98,16 @@ impl CFree for MarmotDisbandRequest {
     unsafe fn free_in_place(&mut self) {}
 }
 
+/// Free a disband request returned by `marmot_disband_group`. NULL is a
+/// no-op. (Embedded copies inside a chat row are released by the row.)
+///
+/// # Safety
+/// `request` must be NULL or an unfreed pointer returned by this library.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_disband_request_free(request: *mut MarmotDisbandRequest) {
+    crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(request) });
+}
+
 c_mirror! {
     /// One default blob endpoint of the encrypted-media component. Also a
     /// borrowed input to `marmot_replace_encrypted_media_blob_endpoints`.

@@ -38,7 +38,7 @@ use crate::types::chat_list::{
 use crate::types::common::MarmotStringList;
 use crate::types::group::{
     MarmotAppBlobEndpoint, MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState,
-    MarmotAppGroupRecord, MarmotAppQuarantinedGroupList, MarmotGroupDetails,
+    MarmotAppGroupRecord, MarmotAppQuarantinedGroupList, MarmotDisbandRequest, MarmotGroupDetails,
     MarmotGroupInviteDeclineResult, MarmotGroupManagementState, MarmotGroupMutationResult,
     MarmotMemberRef,
 };
@@ -146,6 +146,28 @@ pub(crate) unsafe fn deliver_string(
     match result {
         Ok(value) => {
             let ptr = owned_c_string(value);
+            match unsafe { write_out(out, ptr) } {
+                Ok(()) => MarmotStatus::Ok,
+                Err(status) => {
+                    unsafe { crate::memory::free_c_string(ptr) };
+                    status
+                }
+            }
+        }
+        Err(err) => status_from_error(&err),
+    }
+}
+
+/// Deliver a fallible `Option<String>` result: `None` writes NULL and
+/// still returns `MARMOT_STATUS_OK` — callers distinguish "absent" from
+/// failure by the status code.
+pub(crate) unsafe fn deliver_opt_string(
+    result: Result<Option<String>, MarmotKitError>,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    match result {
+        Ok(value) => {
+            let ptr = crate::memory::owned_opt_c_string(value);
             match unsafe { write_out(out, ptr) } {
                 Ok(()) => MarmotStatus::Ok,
                 Err(status) => {
@@ -276,6 +298,28 @@ macro_rules! c_cmd {
                 let client = try_arg!(unsafe { client_ref(client) });
                 $($r)*
                 unsafe { deliver_string(c_cmd!(@call client, $mode, $method, $($a)*), out) }
+            })
+        }
+    };
+    (@munch [$($m:tt)*] $mode:ident, $cname:ident, $method:ident, (opt_string), {$($p:tt)*} {$($r:tt)*} {$($a:tt)*}) => {
+        $($m)*
+        ///
+        /// # Safety
+        /// `client` must be a live handle; string arguments must be valid
+        /// NUL-terminated strings (nullable ones may be NULL); array
+        /// arguments must hold their stated length (or be NULL with
+        /// length 0); out-pointers must be valid.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $cname(
+            client: *const MarmotClient,
+            $($p)*
+            out: *mut *mut c_char,
+        ) -> MarmotStatus {
+            ffi_guard(|| {
+                try_arg!(unsafe { crate::preflight_out_ptr(out) });
+                let client = try_arg!(unsafe { client_ref(client) });
+                $($r)*
+                unsafe { deliver_opt_string(c_cmd!(@call client, $mode, $method, $($a)*), out) }
             })
         }
     };
@@ -768,6 +812,90 @@ c_cmd! {
 
     /// Refresh the cached profile for an account id from `relays`.
     async fn marmot_refresh_profile(account_id_hex: str, relays/relays_len: str_arr) -> unit = refresh_profile;
+
+    /// The account ids this account follows (NIP-02). Free with
+    /// `marmot_string_list_free`.
+    sync fn marmot_account_follows(account_ref: str) -> rec(MarmotStringList) = account_follows;
+
+    /// Whether `user_ref` (`npub` or hex account id) is followed.
+    sync fn marmot_is_following(account_ref: str, user_ref: str) -> scalar(bool) = is_following;
+
+    /// Follow `user_ref` and publish the updated list. Writes the new
+    /// follow set. Free with `marmot_string_list_free`.
+    async fn marmot_follow_user(account_ref: str, user_ref: str) -> rec(MarmotStringList) = follow_user;
+
+    /// Unfollow `user_ref` and publish the updated list. Free with
+    /// `marmot_string_list_free`.
+    async fn marmot_unfollow_user(account_ref: str, user_ref: str) -> rec(MarmotStringList) = unfollow_user;
+
+    /// Discard the local state of an account whose setup never completed.
+    /// `acknowledge_possible_key_package_orphan` confirms the caller
+    /// accepts that a published KeyPackage may be left orphaned.
+    async fn marmot_reset_incomplete_account_setup(nsec: str, acknowledge_possible_key_package_orphan: flag) -> unit = reset_incomplete_account_setup;
+
+    /// Sign in and finish a setup that was interrupted partway. Free with
+    /// `marmot_account_summary_free`.
+    async fn marmot_login_recovering_incomplete_setup(nsec: str, default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr, acknowledge_possible_key_package_orphan: flag) -> rec(MarmotAccountSummary) = login_recovering_incomplete_setup;
+
+    /// Fetch a profile image by URL, refusing anything over `max_bytes`.
+    /// Free the buffer with `marmot_bytes_free`.
+    async fn marmot_download_profile_image(url: str, max_bytes: val u64) -> bytes = download_profile_image;
+
+    /// The durable chat-list row for one group; writes NULL with
+    /// `MARMOT_STATUS_OK` when the group has no row. Free with
+    /// `marmot_chat_list_row_free`.
+    sync fn marmot_chat_list_row(account_ref: str, group_id_hex: str) -> opt_rec(MarmotChatListRow) = chat_list_row;
+
+    /// The `website` field of a cached kind-0 profile; writes NULL with
+    /// `MARMOT_STATUS_OK` when unknown. Free with `marmot_string_free`.
+    sync fn marmot_user_profile_website(account_id_hex: str) -> opt_string = user_profile_website;
+
+    /// Discard the stored draft for a conversation. Absent is not an
+    /// error.
+    sync fn marmot_delete_message_draft(account_ref: str, group_id_hex: str) -> unit = delete_message_draft;
+
+    /// Clear the group's encrypted Blossom avatar by committing the
+    /// absent image component. Requires admin. Free with
+    /// `marmot_send_summary_free`.
+    async fn marmot_clear_group_image(account_ref: str, group_id_hex: str) -> rec(MarmotSendSummary) = clear_group_image;
+
+    /// Opt the group into disbanding, so a later `marmot_disband_group`
+    /// is accepted. Requires admin. Free with
+    /// `marmot_group_mutation_result_free`.
+    async fn marmot_enable_group_disbanding(account_ref: str, group_id_hex: str) -> rec(MarmotGroupMutationResult) = enable_group_disbanding;
+
+    /// Request terminal disbanding of the group. Writes this account's
+    /// durable request outcome; free it with
+    /// `marmot_disband_request_free`.
+    async fn marmot_disband_group(account_ref: str, group_id_hex: str) -> rec(MarmotDisbandRequest) = disband_group;
+
+    /// Acknowledge a failed disband request so the UI can stop surfacing
+    /// it. Writes whether a request was actually cleared.
+    async fn marmot_acknowledge_disband_failure(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_disband_failure;
+
+    /// `marmot_invite_members` where some invitees join as admins. Free
+    /// with `marmot_send_summary_free`.
+    async fn marmot_invite_members_with_initial_admins(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr, initial_admin_refs/initial_admin_refs_len: str_arr) -> rec(MarmotSendSummary) = invite_members_with_initial_admins;
+
+    /// `marmot_invite_members_with_initial_admins` plus refreshed details
+    /// and management state in one round trip. Free with
+    /// `marmot_group_mutation_result_free`.
+    async fn marmot_invite_members_detailed_with_initial_admins(account_ref: str, group_id_hex: str, member_refs/member_refs_len: str_arr, initial_admin_refs/initial_admin_refs_len: str_arr) -> rec(MarmotGroupMutationResult) = invite_members_detailed_with_initial_admins;
+
+    /// Queue an MLS self-update commit for the group. Writes the
+    /// scheduled job id; free it with `marmot_string_free`.
+    async fn marmot_schedule_group_self_update(account_ref: str, group_id_hex: str) -> string = schedule_group_self_update;
+
+    /// Pause the account's periodic maintenance loop.
+    async fn marmot_pause_maintenance(account_ref: str) -> unit = pause_maintenance;
+
+    /// Resume the account's periodic maintenance loop.
+    async fn marmot_resume_maintenance(account_ref: str) -> unit = resume_maintenance;
+
+    /// Shut the runtime down and release every local file lock, so a
+    /// host can suspend without leaving the database leased. The client
+    /// handle stays valid but the runtime is finished.
+    async fn marmot_client_shutdown_and_close() -> unit = shutdown_and_close;
 }
 
 /// Parse Markdown text into the display token tree. Infallible: malformed
@@ -1370,6 +1498,119 @@ pub unsafe extern "C" fn marmot_update_group_image(
                 out,
             )
         }
+    })
+}
+
+/// Publish the account's kind:0 profile using the account's own relay
+/// lists rather than caller-supplied ones. Free with
+/// `marmot_user_profile_metadata_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `account_ref` a valid string;
+/// `profile` a valid borrowed struct; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_publish_user_profile_using_account_relays(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    profile: *const MarmotUserProfileMetadata,
+    out: *mut *mut MarmotUserProfileMetadata,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let profile = try_arg!(unsafe { borrowed(profile) });
+        let profile = try_arg!(unsafe { profile.to_ffi() });
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .publish_user_profile_using_account_relays(account_ref, profile),
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Upload `data` (raw image bytes, `media_type` e.g. `"image/jpeg"`) to
+/// Blossom as the account's profile image. `blossom_server` overrides the
+/// default server; pass NULL to use it. The bytes are copied — the caller
+/// keeps ownership. Writes the image URL; free it with
+/// `marmot_string_free`.
+///
+/// # Safety
+/// `client` must be a live handle; strings valid (`blossom_server`
+/// nullable); `data` must point to `data_len` valid bytes (or be NULL
+/// with length 0); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_upload_profile_image(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    data: *const u8,
+    data_len: usize,
+    media_type: *const c_char,
+    blossom_server: *const c_char,
+    out: *mut *mut c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let media_type = try_arg!(unsafe { required_str(media_type) });
+        let blossom_server = try_arg!(unsafe { crate::memory::optional_str(blossom_server) });
+        let data = try_arg!(unsafe { byte_array(data, data_len) });
+        unsafe {
+            deliver_string(
+                client.block_on(client.marmot.upload_profile_image(
+                    account_ref,
+                    data,
+                    media_type,
+                    blossom_server,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Whether this client's storage has been closed (by
+/// `marmot_client_shutdown_and_close`). Writes to `out_closed`.
+///
+/// # Safety
+/// `client` must be a live handle; `out_closed` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_storage_is_closed(
+    client: *const MarmotClient,
+    out_closed: *mut bool,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out_closed) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let closed = client.marmot.storage_is_closed();
+        match unsafe { write_out(out_closed, closed) } {
+            Ok(()) => MarmotStatus::Ok,
+            Err(status) => status,
+        }
+    })
+}
+
+/// The centralized retired-relay denylist. These hosts must never be
+/// dialed or adopted. Free with `marmot_string_list_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_retired_relay_hosts(
+    client: *const MarmotClient,
+    out: *mut *mut MarmotStringList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let hosts = client.marmot.retired_relay_hosts();
+        unsafe { deliver(Ok::<_, MarmotKitError>(hosts), out) }
     })
 }
 

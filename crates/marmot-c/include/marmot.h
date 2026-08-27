@@ -3986,6 +3986,310 @@ MarmotStatus marmot_refresh_profile(const struct MarmotClient *client,
                                     uintptr_t relays_len);
 
 /**
+ * The account ids this account follows (NIP-02). Free with
+ * `marmot_string_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_follows(const struct MarmotClient *client,
+                                    const char *account_ref,
+                                    struct MarmotStringList **out);
+
+/**
+ * Whether `user_ref` (`npub` or hex account id) is followed.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_is_following(const struct MarmotClient *client,
+                                 const char *account_ref,
+                                 const char *user_ref,
+                                 bool *out);
+
+/**
+ * Follow `user_ref` and publish the updated list. Writes the new
+ * follow set. Free with `marmot_string_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_follow_user(const struct MarmotClient *client,
+                                const char *account_ref,
+                                const char *user_ref,
+                                struct MarmotStringList **out);
+
+/**
+ * Unfollow `user_ref` and publish the updated list. Free with
+ * `marmot_string_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_unfollow_user(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *user_ref,
+                                  struct MarmotStringList **out);
+
+/**
+ * Discard the local state of an account whose setup never completed.
+ * `acknowledge_possible_key_package_orphan` confirms the caller
+ * accepts that a published KeyPackage may be left orphaned.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reset_incomplete_account_setup(const struct MarmotClient *client,
+                                                   const char *nsec,
+                                                   uint8_t acknowledge_possible_key_package_orphan);
+
+/**
+ * Sign in and finish a setup that was interrupted partway. Free with
+ * `marmot_account_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_login_recovering_incomplete_setup(const struct MarmotClient *client,
+                                                      const char *nsec,
+                                                      const char *const *default_relays,
+                                                      uintptr_t default_relays_len,
+                                                      const char *const *bootstrap_relays,
+                                                      uintptr_t bootstrap_relays_len,
+                                                      uint8_t acknowledge_possible_key_package_orphan,
+                                                      struct MarmotAccountSummary **out);
+
+/**
+ * Fetch a profile image by URL, refusing anything over `max_bytes`.
+ * Free the buffer with `marmot_bytes_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_download_profile_image(const struct MarmotClient *client,
+                                           const char *url,
+                                           uint64_t max_bytes,
+                                           uint8_t **out_data,
+                                           uintptr_t *out_len);
+
+/**
+ * The durable chat-list row for one group; writes NULL with
+ * `MARMOT_STATUS_OK` when the group has no row. Free with
+ * `marmot_chat_list_row_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_chat_list_row(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *group_id_hex,
+                                  struct MarmotChatListRow **out);
+
+/**
+ * The `website` field of a cached kind-0 profile; writes NULL with
+ * `MARMOT_STATUS_OK` when unknown. Free with `marmot_string_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_user_profile_website(const struct MarmotClient *client,
+                                         const char *account_id_hex,
+                                         char **out);
+
+/**
+ * Discard the stored draft for a conversation. Absent is not an
+ * error.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_delete_message_draft(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *group_id_hex);
+
+/**
+ * Clear the group's encrypted Blossom avatar by committing the
+ * absent image component. Requires admin. Free with
+ * `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_clear_group_image(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      struct MarmotSendSummary **out);
+
+/**
+ * Opt the group into disbanding, so a later `marmot_disband_group`
+ * is accepted. Requires admin. Free with
+ * `marmot_group_mutation_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_enable_group_disbanding(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            struct MarmotGroupMutationResult **out);
+
+/**
+ * Request terminal disbanding of the group. Writes this account's
+ * durable request outcome; free it with
+ * `marmot_disband_request_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_disband_group(const struct MarmotClient *client,
+                                  const char *account_ref,
+                                  const char *group_id_hex,
+                                  struct MarmotDisbandRequest **out);
+
+/**
+ * Acknowledge a failed disband request so the UI can stop surfacing
+ * it. Writes whether a request was actually cleared.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_disband_failure(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                bool *out);
+
+/**
+ * `marmot_invite_members` where some invitees join as admins. Free
+ * with `marmot_send_summary_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_invite_members_with_initial_admins(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       const char *group_id_hex,
+                                                       const char *const *member_refs,
+                                                       uintptr_t member_refs_len,
+                                                       const char *const *initial_admin_refs,
+                                                       uintptr_t initial_admin_refs_len,
+                                                       struct MarmotSendSummary **out);
+
+/**
+ * `marmot_invite_members_with_initial_admins` plus refreshed details
+ * and management state in one round trip. Free with
+ * `marmot_group_mutation_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_invite_members_detailed_with_initial_admins(const struct MarmotClient *client,
+                                                                const char *account_ref,
+                                                                const char *group_id_hex,
+                                                                const char *const *member_refs,
+                                                                uintptr_t member_refs_len,
+                                                                const char *const *initial_admin_refs,
+                                                                uintptr_t initial_admin_refs_len,
+                                                                struct MarmotGroupMutationResult **out);
+
+/**
+ * Queue an MLS self-update commit for the group. Writes the
+ * scheduled job id; free it with `marmot_string_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_schedule_group_self_update(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               char **out);
+
+/**
+ * Pause the account's periodic maintenance loop.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_pause_maintenance(const struct MarmotClient *client, const char *account_ref);
+
+/**
+ * Resume the account's periodic maintenance loop.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_resume_maintenance(const struct MarmotClient *client, const char *account_ref);
+
+/**
+ * Shut the runtime down and release every local file lock, so a
+ * host can suspend without leaving the database leased. The client
+ * handle stays valid but the runtime is finished.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_client_shutdown_and_close(const struct MarmotClient *client);
+
+/**
  * Parse Markdown text into the display token tree. Infallible: malformed
  * input degrades inside the parser. Free with
  * `marmot_markdown_document_free`.
@@ -4262,6 +4566,59 @@ MarmotStatus marmot_update_group_image(const struct MarmotClient *client,
                                        uintptr_t plaintext_len,
                                        const char *media_type,
                                        struct MarmotSendSummary **out);
+
+/**
+ * Publish the account's kind:0 profile using the account's own relay
+ * lists rather than caller-supplied ones. Free with
+ * `marmot_user_profile_metadata_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `account_ref` a valid string;
+ * `profile` a valid borrowed struct; `out` valid.
+ */
+MarmotStatus marmot_publish_user_profile_using_account_relays(const struct MarmotClient *client,
+                                                              const char *account_ref,
+                                                              const struct MarmotUserProfileMetadata *profile,
+                                                              struct MarmotUserProfileMetadata **out);
+
+/**
+ * Upload `data` (raw image bytes, `media_type` e.g. `"image/jpeg"`) to
+ * Blossom as the account's profile image. `blossom_server` overrides the
+ * default server; pass NULL to use it. The bytes are copied — the caller
+ * keeps ownership. Writes the image URL; free it with
+ * `marmot_string_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; strings valid (`blossom_server`
+ * nullable); `data` must point to `data_len` valid bytes (or be NULL
+ * with length 0); `out` valid.
+ */
+MarmotStatus marmot_upload_profile_image(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const uint8_t *data,
+                                         uintptr_t data_len,
+                                         const char *media_type,
+                                         const char *blossom_server,
+                                         char **out);
+
+/**
+ * Whether this client's storage has been closed (by
+ * `marmot_client_shutdown_and_close`). Writes to `out_closed`.
+ *
+ * # Safety
+ * `client` must be a live handle; `out_closed` must be valid.
+ */
+MarmotStatus marmot_storage_is_closed(const struct MarmotClient *client, bool *out_closed);
+
+/**
+ * The centralized retired-relay denylist. These hosts must never be
+ * dialed or adopted. Free with `marmot_string_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `out` valid.
+ */
+MarmotStatus marmot_retired_relay_hosts(const struct MarmotClient *client,
+                                        struct MarmotStringList **out);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
@@ -5125,6 +5482,15 @@ void marmot_message_tag_free(struct MarmotMessageTag *ptr);
  * `event` must be NULL or an unfreed pointer returned by this library.
  */
 void marmot_event_free(struct MarmotEvent *event);
+
+/**
+ * Free a disband request returned by `marmot_disband_group`. NULL is a
+ * no-op. (Embedded copies inside a chat row are released by the row.)
+ *
+ * # Safety
+ * `request` must be NULL or an unfreed pointer returned by this library.
+ */
+void marmot_disband_request_free(struct MarmotDisbandRequest *request);
 
 /**
  * Free a value of this type returned by this library. NULL
