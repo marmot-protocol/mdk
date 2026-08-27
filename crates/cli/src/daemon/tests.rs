@@ -1590,12 +1590,64 @@ fn messages_subscribe_args_allow_all_groups() {
         command: crate::Command::Messages {
             command: crate::MessageCommand::Subscribe {
                 group: None,
+                kinds: Vec::new(),
                 limit: Some(250),
             },
         },
     };
 
-    assert_eq!(messages_subscribe_args(&cli), Ok((None, Some(200))));
+    assert_eq!(messages_subscribe_args(&cli), Ok((None, None, Some(200))));
+}
+
+#[test]
+fn messages_subscribe_args_passes_kind_filters_through() {
+    let cli = Cli {
+        home: None,
+        socket: None,
+        relay: None,
+        daemon_discovery_relays: Vec::new(),
+        daemon_default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+        account: None,
+        json: true,
+        command: crate::Command::Messages {
+            command: crate::MessageCommand::Subscribe {
+                group: None,
+                kinds: vec![30078, 30079],
+                limit: None,
+            },
+        },
+    };
+
+    assert_eq!(
+        messages_subscribe_args(&cli),
+        Ok((None, Some(vec![30078, 30079]), Some(50)))
+    );
+}
+
+#[test]
+fn message_subscription_kind_filter_applies_to_hub_broadcasts() {
+    let custom = DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": "MessageReceived",
+        "type": "message",
+        "message": { "message_id": "01", "kind": 30078 }
+    }));
+    let chat = DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": "MessageReceived",
+        "type": "message",
+        "message": { "message_id": "02", "kind": 9 }
+    }));
+    let kinds = [30078u64];
+    assert!(stream_response_matches_kinds(&custom, Some(&kinds)));
+    assert!(!stream_response_matches_kinds(&chat, Some(&kinds)));
+    assert!(stream_response_matches_kinds(&chat, None));
+    // Payloads with no app-event kind (stream previews, control rows) pass.
+    let preview = DaemonStreamResponse::ok(serde_json::json!({
+        "type": "stream_preview",
+        "stream_preview": { "group_id": "x", "stream_id": "y", "status": "running", "text": "hi" }
+    }));
+    assert!(stream_response_matches_kinds(&preview, Some(&kinds)));
 }
 
 #[test]

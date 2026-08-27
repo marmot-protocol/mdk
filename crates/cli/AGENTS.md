@@ -41,9 +41,11 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
   local chat projections/notification policy.
 - `group` and `groups`: create groups, list/show groups, list members/admins/relays, invite/add/remove members, update
   profile fields, and subscribe to runtime-owned group-state updates through the daemon.
-- `messages`: send text messages, list/search projected messages with Whitenoise-shaped cursor flags, subscribe to
-  runtime-owned typed message updates through the daemon, and the `timeline` subgroup (list/search/subscribe over the
-  materialized message timeline).
+- `messages`: send text messages, send app-defined custom events with any non-reserved kind (`messages send-event`,
+  repeatable `--tag` JSON arrays), list/search projected messages with Whitenoise-shaped cursor flags and repeatable
+  `--kind` filters, subscribe to runtime-owned typed message updates through the daemon (also `--kind`-filterable),
+  and the `timeline` subgroup (list/search/subscribe over the materialized message timeline). Reserved app-event
+  kinds stay rejected on the custom send path so the CLI cannot forge protocol-owned events.
 - `follows`, `profile`, `relays`, `settings`, and `users`: expose the current Nostr directory/settings behavior.
 - Reaction, delete, retry, encrypted media, and admin/member management commands have implemented CLI behavior; keep
   their JSON shapes aligned with the `Unreleased` changelog entries when changing them.

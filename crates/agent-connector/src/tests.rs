@@ -3355,6 +3355,7 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
             &agent.account.account_id_hex,
             crate::AppMessageQuery {
                 group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
                 limit: None,
             },
         )
@@ -4748,6 +4749,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
                 &agent.account.account_id_hex,
                 crate::AppMessageQuery {
                     group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
                     limit: None,
                 },
             )
@@ -4825,6 +4827,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
                 &agent.account.account_id_hex,
                 crate::AppMessageQuery {
                     group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
                     limit: None,
                 },
             )
@@ -4954,6 +4957,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
                 &human.account.account_id_hex,
                 crate::AppMessageQuery {
                     group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
                     limit: None,
                 },
             )
@@ -5103,6 +5107,7 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
             &agent.account.account_id_hex,
             crate::AppMessageQuery {
                 group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
                 limit: None,
             },
         )

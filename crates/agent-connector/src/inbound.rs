@@ -306,6 +306,7 @@ impl AgentConnector {
             // window a lagged subscription missed.
             let query = AppMessageQuery {
                 group_id_hex: group_filter.map(str::to_owned),
+                kinds: None,
                 limit: Some(crate::DELIVERED_INBOUND_CURSOR_CAPACITY),
             };
             let records = self.runtime.messages_with_query(&account.label, query)?;

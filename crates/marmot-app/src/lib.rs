@@ -178,7 +178,7 @@ pub use media::{
     MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
     MediaUploadRequest, MediaUploadResult, download_profile_image, media_attachment_from_imeta_tag,
 };
-pub use messages::{is_stream_final_event, tag_value, tag_values};
+pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
@@ -1032,6 +1032,9 @@ pub struct AppMessageRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppMessageQuery {
     pub group_id_hex: Option<String>,
+    /// Restrict to these inner app-event kinds (e.g. an app-defined custom
+    /// kind). `None` or an empty list applies no kind constraint.
+    pub kinds: Option<Vec<u64>>,
     pub limit: Option<usize>,
 }
 
@@ -2383,6 +2386,7 @@ impl MarmotApp {
             .account_storage(label)?
             .app_messages(StoredAppMessageQuery {
                 group_id_hex: query.group_id_hex,
+                kinds: query.kinds,
                 limit: query.limit,
             })?
             .into_iter()

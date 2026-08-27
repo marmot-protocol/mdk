@@ -3766,6 +3766,30 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
+    /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
+    /// edit, delete, agent, group system, push token) are rejected so an app
+    /// cannot forge protocol events.
+    pub async fn send_custom_event(
+        &mut self,
+        group_id: &GroupId,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Custom {
+                    kind,
+                    tags,
+                    content,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
     pub async fn retry_group_convergence(
         &mut self,
         group_id: &GroupId,
