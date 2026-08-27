@@ -20,6 +20,8 @@ alloc-audit = []
 marmot-uniffi.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 libc.workspace = true
+# Holds a host-supplied secret-key hex only as long as the boundary needs it.
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

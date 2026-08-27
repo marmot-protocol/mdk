@@ -3405,6 +3405,7 @@ dependencies = [
  "marmot-uniffi",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

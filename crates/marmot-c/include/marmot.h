@@ -587,6 +587,33 @@ typedef enum MarmotCursorPersistence {
 } MarmotCursorPersistence;
 
 /**
+ * Status a [`MarmotSecretStore`] callback returns. Crosses as
+ * `uint32_t`; an out-of-range value is rejected as
+ * `MARMOT_STATUS_INVALID_ARGUMENT`.
+ */
+typedef enum MarmotSecretStoreStatus {
+  /**
+   * The operation succeeded.
+   */
+  MARMOT_SECRET_STORE_STATUS_OK,
+  /**
+   * No credential is stored for this account. Only `load_secret`
+   * should report it; `remove_secret` on a missing credential
+   * succeeds.
+   */
+  MARMOT_SECRET_STORE_STATUS_NOT_FOUND,
+  /**
+   * The store exists but cannot be reached right now (locked vault,
+   * keystore unavailable). The runtime treats this as recoverable.
+   */
+  MARMOT_SECRET_STORE_STATUS_UNAVAILABLE,
+  /**
+   * Any other failure.
+   */
+  MARMOT_SECRET_STORE_STATUS_FAILED,
+} MarmotSecretStoreStatus;
+
+/**
  * Host-side operation a UI can time and report back.
  */
 typedef enum MarmotHostPerformanceOperation {
@@ -670,6 +697,77 @@ typedef struct MarmotTimelineSubscription MarmotTimelineSubscription;
  * at its next checkpoint.
  */
 typedef struct MarmotUserSearchSubscription MarmotUserSearchSubscription;
+
+/**
+ * `has_secret_for_label` / `has_secret_for_account_id`: write nonzero to
+ * `out_present` when a credential exists.
+ */
+typedef uint32_t (*MarmotSecretStoreHasFn)(void *user_data, const char *key, uint8_t *out_present);
+
+/**
+ * `write_secret`: persist `secret_key_hex`, replacing any existing
+ * credential for this account.
+ */
+typedef uint32_t (*MarmotSecretStoreWriteFn)(void *user_data,
+                                             const char *label,
+                                             const char *account_id_hex,
+                                             const char *secret_key_hex);
+
+/**
+ * `load_secret`: write a NUL-terminated secret-key hex string to
+ * `out_secret_key_hex`. The library copies it and returns the buffer to
+ * `free_secret`.
+ */
+typedef uint32_t (*MarmotSecretStoreLoadFn)(void *user_data,
+                                            const char *label,
+                                            const char *account_id_hex,
+                                            char **out_secret_key_hex);
+
+/**
+ * `remove_secret`: drop this account's credential. Removing a missing
+ * credential succeeds.
+ */
+typedef uint32_t (*MarmotSecretStoreRemoveFn)(void *user_data,
+                                              const char *label,
+                                              const char *account_id_hex);
+
+/**
+ * `free_secret`: release a buffer this store returned from `load_secret`.
+ */
+typedef void (*MarmotSecretStoreFreeSecretFn)(void *user_data, char *secret_key_hex);
+
+/**
+ * `destroy`: the library is done with `user_data`.
+ */
+typedef void (*MarmotSecretStoreDestroyFn)(void *user_data);
+
+/**
+ * Callback vtable for host-owned account-secret storage. Borrowed input:
+ * the fields are copied at construction and the struct itself is never
+ * retained or freed by the library. Every function pointer except
+ * `destroy` is required.
+ *
+ * See the module documentation for the thread-safety, re-entry, and
+ * ownership rules a host must honor.
+ */
+typedef struct MarmotSecretStore {
+  /**
+   * Opaque host context passed to every callback. Must outlive the
+   * client; released by `destroy`.
+   */
+  void *user_data;
+  MarmotSecretStoreHasFn has_secret_for_label;
+  MarmotSecretStoreHasFn has_secret_for_account_id;
+  MarmotSecretStoreWriteFn write_secret;
+  MarmotSecretStoreLoadFn load_secret;
+  MarmotSecretStoreRemoveFn remove_secret;
+  MarmotSecretStoreFreeSecretFn free_secret;
+  /**
+   * Optional; invoked once when the last runtime reference to the store
+   * is released. NULL means the host reclaims `user_data` itself.
+   */
+  MarmotSecretStoreDestroyFn destroy;
+} MarmotSecretStore;
 
 /**
  * One signed-in (or signed-out but known) account.
@@ -3528,6 +3626,32 @@ MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
                                                        uintptr_t relay_urls_len,
                                                        uint32_t cursor_persistence,
                                                        struct MarmotClient **out_client);
+
+/**
+ * Create a Marmot client whose account signing keys live in caller-owned
+ * storage instead of the platform keychain. Otherwise identical to
+ * `marmot_client_new`.
+ *
+ * `store` is borrowed for the duration of this call: its fields are
+ * copied, so the caller may free their struct as soon as it returns.
+ * `store->user_data` must stay alive until `store->destroy` fires. Every
+ * callback except `destroy` is required; a missing one is
+ * `MARMOT_STATUS_NULL_POINTER`.
+ *
+ * The callbacks run on runtime worker threads, possibly concurrently, and
+ * must not call any `marmot_*` function on this client — see the
+ * `MarmotSecretStore` documentation for the full contract.
+ *
+ * # Safety
+ * `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
+ * must point to `relay_urls_len` valid strings (or be NULL with length
+ * 0); `store` and `out_client` must be valid pointers.
+ */
+MarmotStatus marmot_client_new_with_secret_store(const char *root_path,
+                                                 const char *const *relay_urls,
+                                                 uintptr_t relay_urls_len,
+                                                 const struct MarmotSecretStore *store,
+                                                 struct MarmotClient **out_client);
 
 /**
  * Start the runtime (reconcile accounts, start workers, subscribe

@@ -278,6 +278,19 @@ macro_rules! c_list {
 /// `CFree`. Variant names must match the Ffi enum's.
 macro_rules! c_enum {
     ($(#[$m:meta])* $name:ident from $ffi:ty { $($(#[$vm:meta])* $v:ident),+ $(,)? }) => {
+        crate::macros::c_enum!($(#[$m])* $name { $($(#[$vm])* $v),+ });
+
+        impl From<$ffi> for $name {
+            fn from(value: $ffi) -> Self {
+                match value { $(<$ffi>::$v => Self::$v),+ }
+            }
+        }
+    };
+
+    // No `Ffi` source: a value only the *caller* produces (a callback's
+    // return status), so there is nothing to convert from — just the
+    // discriminant validation.
+    ($(#[$m:meta])* $name:ident { $($(#[$vm:meta])* $v:ident),+ $(,)? }) => {
         $(#[$m])*
         #[repr(C)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,12 +311,6 @@ macro_rules! c_enum {
                     ));
                     crate::MarmotStatus::InvalidArgument
                 })
-            }
-        }
-
-        impl From<$ffi> for $name {
-            fn from(value: $ffi) -> Self {
-                match value { $(<$ffi>::$v => Self::$v),+ }
             }
         }
 
