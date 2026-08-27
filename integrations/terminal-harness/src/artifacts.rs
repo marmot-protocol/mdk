@@ -29,6 +29,7 @@ fn default_artifact_grant_ttl_seconds() -> u64 {
 pub struct ArtifactExportConfig {
     enabled: bool,
     grants: Vec<ArtifactExportGrant>,
+    max_count: usize,
     staging_root: PathBuf,
     outbox_path: PathBuf,
 }
@@ -43,9 +44,15 @@ impl ArtifactExportConfig {
         Self {
             enabled,
             grants,
+            max_count: MAX_ARTIFACTS_PER_RESULT,
             staging_root,
             outbox_path,
         }
+    }
+
+    pub(crate) fn with_max_count(mut self, max_count: usize) -> Self {
+        self.max_count = max_count;
+        self
     }
 
     pub fn enabled(&self) -> bool {
@@ -54,6 +61,11 @@ impl ArtifactExportConfig {
 
     pub fn grants(&self) -> &[ArtifactExportGrant] {
         &self.grants
+    }
+
+    /// Maximum number of artifacts accepted from one backend result.
+    pub fn max_count(&self) -> usize {
+        self.max_count
     }
 
     pub(crate) fn staging_root(&self) -> &Path {
@@ -75,7 +87,7 @@ impl ArtifactExportConfig {
         let Some(grant) = self
             .grants
             .iter()
-            .find(|grant| grant.group_id_hex == group_ref)
+            .find(|grant| grant.group_id_hex.eq_ignore_ascii_case(group_ref))
         else {
             return Ok(None);
         };
@@ -118,6 +130,7 @@ impl Default for ArtifactExportConfig {
         Self {
             enabled: false,
             grants: Vec::new(),
+            max_count: MAX_ARTIFACTS_PER_RESULT,
             staging_root: PathBuf::new(),
             outbox_path: PathBuf::new(),
         }
@@ -130,6 +143,7 @@ impl fmt::Debug for ArtifactExportConfig {
             .debug_struct("ArtifactExportConfig")
             .field("enabled", &self.enabled)
             .field("grant_count", &self.grants.len())
+            .field("max_count", &self.max_count)
             .finish_non_exhaustive()
     }
 }
@@ -266,6 +280,8 @@ pub(crate) struct PendingArtifactBatch {
     pub(crate) group_ref: String,
     pub(crate) reply_to_message_ref: String,
     pub(crate) caption: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) remaining_text: Vec<String>,
     pub(crate) artifacts: Vec<StagedArtifact>,
 }
 
@@ -390,8 +406,8 @@ impl ArtifactOutbox {
     }
 }
 
-pub(crate) fn prepare_manifest_path(message_ref: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join("marmot-terminal-harness-artifacts");
+pub(crate) fn prepare_manifest_path(outbox_path: &Path, message_ref: &str) -> Result<PathBuf> {
+    let dir = outbox_path.with_extension("manifests");
     fs_private::create_dir_all_private(&dir)?;
     let name = format!(
         "{}.json",
@@ -442,6 +458,7 @@ pub(crate) struct ArtifactDeliveryContext<'a> {
     pub(crate) group_ref: &'a str,
     pub(crate) message_ref: &'a str,
     pub(crate) caption: Option<String>,
+    pub(crate) remaining_text: Vec<String>,
 }
 
 pub(crate) fn stage_artifacts(
@@ -453,7 +470,7 @@ pub(crate) fn stage_artifacts(
     if !config.enabled() {
         return Err(HarnessError::ArtifactExportsDisabled);
     }
-    if outputs.is_empty() || outputs.len() > MAX_ARTIFACTS_PER_RESULT {
+    if outputs.is_empty() || outputs.len() > config.max_count() {
         return Err(HarnessError::ArtifactLimitsExceeded);
     }
     let ArtifactDeliveryContext {
@@ -462,6 +479,7 @@ pub(crate) fn stage_artifacts(
         group_ref,
         message_ref,
         caption,
+        remaining_text,
     } = destination;
     fs_private::create_dir_all_private(config.staging_root())?;
     let staging_metadata = std::fs::symlink_metadata(config.staging_root())?;
@@ -533,6 +551,7 @@ pub(crate) fn stage_artifacts(
         group_ref: group_ref.to_owned(),
         reply_to_message_ref: message_ref.to_owned(),
         caption,
+        remaining_text,
         artifacts,
     })
 }
@@ -543,22 +562,53 @@ fn load_or_create_outbox_key(outbox_path: &Path) -> Result<[u8; 32]> {
         .ok_or_else(|| HarnessError::Config("artifact outbox path has no parent".to_owned()))?;
     fs_private::create_dir_all_private(parent)?;
     let key_path = outbox_path.with_extension("key");
-    match fs_private::create_new_private(&key_path) {
-        Ok(mut key_file) => {
-            let mut random = File::open("/dev/urandom")?;
-            let mut key = [0_u8; 32];
-            random.read_exact(&mut key)?;
-            key_file.write_all(&key)?;
-            key_file.sync_all()?;
+    match read_regular_file_limited(&key_path, 32) {
+        Ok(bytes) if bytes.len() == 32 => return Ok(bytes.try_into().unwrap()),
+        Ok(_) => {
+            let outbox_has_state =
+                match read_regular_file_limited(outbox_path, MAX_ARTIFACT_OUTBOX_BYTES) {
+                    Ok(bytes) => !bytes.is_empty(),
+                    Err(HarnessError::Io {
+                        kind: std::io::ErrorKind::NotFound,
+                    }) => false,
+                    Err(_) => true,
+                };
+            if outbox_has_state {
+                return Err(HarnessError::ArtifactUnsafeSource);
+            }
+            std::fs::remove_file(&key_path)?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+        Err(HarnessError::Io {
+            kind: std::io::ErrorKind::NotFound,
+        }) => {}
+        Err(error) => return Err(error),
     }
-    let bytes = read_regular_file_limited(&key_path, 32)?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| HarnessError::ArtifactUnsafeSource)?;
-    Ok(key)
+
+    let mut random = File::open("/dev/urandom")?;
+    let mut key = [0_u8; 32];
+    random.read_exact(&mut key)?;
+    let temp = key_path.with_extension(format!("key.{}.tmp", hex::encode(&key[..8])));
+    let mut key_file = fs_private::create_new_private(&temp)?;
+    key_file.write_all(&key)?;
+    key_file.sync_all()?;
+    match std::fs::hard_link(&temp, &key_path) {
+        Ok(()) => {
+            std::fs::remove_file(&temp)?;
+            let _ = File::open(parent).and_then(|directory| directory.sync_all());
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&temp);
+            let bytes = read_regular_file_limited(&key_path, 32)?;
+            bytes
+                .try_into()
+                .map_err(|_| HarnessError::ArtifactUnsafeSource)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error.into())
+        }
+    }
 }
 
 fn outbox_mac(key: &[u8; 32], batches: &[PendingArtifactBatch]) -> Result<String> {
@@ -811,6 +861,7 @@ fn batch_matches(left: &PendingArtifactBatch, right: &PendingArtifactBatch) -> b
         && left.group_ref == right.group_ref
         && left.reply_to_message_ref == right.reply_to_message_ref
         && left.caption == right.caption
+        && left.remaining_text == right.remaining_text
         && left.artifacts.len() == right.artifacts.len()
         && left
             .artifacts
@@ -999,10 +1050,40 @@ mod tests {
                 group_ref,
                 message_ref,
                 caption: None,
+                remaining_text: Vec::new(),
             },
             &authorization,
             &outputs,
         )
+    }
+
+    #[test]
+    fn operator_artifact_count_limit_is_enforced_before_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        let staging = temp.path().join("staging");
+        std::fs::create_dir(&root).unwrap();
+        let mut cfg = config(&root, &staging, &temp.path().join("outbox.json"));
+        cfg.max_count = 1;
+        let output = ArtifactOutput {
+            authorization_id: "auth".to_owned(),
+            path: PathBuf::from("report.pdf"),
+            media_type: "application/pdf".to_owned(),
+            file_name: "report.pdf".to_owned(),
+        };
+
+        assert!(matches!(
+            stage_artifacts(
+                &cfg,
+                "wn-test",
+                "account",
+                "group",
+                "message",
+                &[output.clone(), output],
+            ),
+            Err(HarnessError::ArtifactLimitsExceeded)
+        ));
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -1109,6 +1190,32 @@ mod tests {
                     .contains(temp.path().to_string_lossy().as_ref())
             );
         }
+    }
+
+    #[test]
+    fn outbox_recovers_an_interrupted_empty_key_before_any_intent_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let outbox_path = temp.path().join("state/outbox.json");
+        std::fs::create_dir_all(outbox_path.parent().unwrap()).unwrap();
+        fs_private::write_private(&outbox_path.with_extension("key"), b"").unwrap();
+
+        let outbox = ArtifactOutbox::load(outbox_path.clone()).unwrap();
+        assert!(outbox.pending().is_empty());
+        assert_eq!(
+            std::fs::read(outbox_path.with_extension("key"))
+                .unwrap()
+                .len(),
+            32
+        );
+    }
+
+    #[test]
+    fn manifest_path_is_scoped_to_the_private_outbox_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let outbox_path = temp.path().join("state/outbox.json");
+        let manifest = prepare_manifest_path(&outbox_path, "message").unwrap();
+        assert!(manifest.starts_with(outbox_path.with_extension("manifests")));
+        assert!(manifest.is_file());
     }
 
     #[test]
@@ -1246,6 +1353,7 @@ mod tests {
             group_ref: "group".to_owned(),
             reply_to_message_ref: "message".to_owned(),
             caption: None,
+            remaining_text: Vec::new(),
             artifacts: Vec::new(),
         };
         assert!(outbox.record(batch.clone()).is_err());
@@ -1409,6 +1517,7 @@ mod tests {
                     group_ref: "group",
                     message_ref: "message",
                     caption: Some("Report attached".to_owned()),
+                    remaining_text: Vec::new(),
                 },
                 &authorization,
                 std::slice::from_ref(&output),
@@ -1427,6 +1536,7 @@ mod tests {
                     group_ref: "group",
                     message_ref: "message",
                     caption: None,
+                    remaining_text: Vec::new(),
                 },
                 &wrong_turn,
                 std::slice::from_ref(&output),
@@ -1445,6 +1555,7 @@ mod tests {
                     group_ref: "group",
                     message_ref: "message",
                     caption: None,
+                    remaining_text: Vec::new(),
                 },
                 &expired,
                 &[output],

@@ -236,6 +236,18 @@ pub fn load_config_with(
             "{artifact_grants_name} must contain at least one exact group/root grant when artifact exports are enabled"
         )));
     }
+    let artifact_max_count_name = env_name("ARTIFACT_MAX_COUNT");
+    let artifact_max_count = parse_usize(
+        lookup(&artifact_max_count_name),
+        crate::artifacts::MAX_ARTIFACTS_PER_RESULT,
+        &artifact_max_count_name,
+    )?;
+    if !(1..=crate::artifacts::MAX_ARTIFACTS_PER_RESULT).contains(&artifact_max_count) {
+        return Err(config_error(format!(
+            "{artifact_max_count_name} must be between 1 and {}",
+            crate::artifacts::MAX_ARTIFACTS_PER_RESULT
+        )));
+    }
     let artifact_staging_root = lookup(&env_name("ARTIFACT_STAGING_ROOT"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("media-uploads"));
@@ -244,7 +256,8 @@ pub fn load_config_with(
         artifact_grants,
         artifact_staging_root,
         state_path.with_extension("artifact-outbox.json"),
-    );
+    )
+    .with_max_count(artifact_max_count);
 
     Ok(LoadedConfig {
         harness: Config {
@@ -331,13 +344,22 @@ fn parse_artifact_grants(name: &str, raw: &str) -> Result<Vec<ArtifactExportGran
         .map_err(|_| config_error(format!("{name} must be a JSON array of artifact grants")))?;
     let mut groups = HashSet::new();
     for grant in &mut grants {
-        grant.group_id_hex = normalize_hex(name, &grant.group_id_hex)?;
+        let normalized = grant.group_id_hex.trim().to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized.len() % 2 != 0
+            || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(config_error(format!(
+                "{name} grants require non-empty opaque hex group ids"
+            )));
+        }
+        grant.group_id_hex = normalized;
         if !grant.export_root.is_absolute()
             || !(1..=crate::artifacts::MAX_ARTIFACT_GRANT_TTL_SECONDS).contains(&grant.ttl_seconds)
             || !groups.insert(grant.group_id_hex.clone())
         {
             return Err(config_error(format!(
-                "{name} grants require a unique 64-character group id, absolute export_root, and ttl_seconds between 1 and 86400"
+                "{name} grants require a unique opaque hex group id, absolute export_root, and ttl_seconds between 1 and 86400"
             )));
         }
     }
@@ -386,6 +408,35 @@ mod tests {
         assert_eq!(loaded.harness.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
         assert_eq!(loaded.harness.execution_profile, ExecutionProfile::Inherit);
         assert!(!loaded.harness.artifact_exports.enabled());
+        assert_eq!(
+            loaded.harness.artifact_exports.max_count(),
+            crate::artifacts::MAX_ARTIFACTS_PER_RESULT
+        );
+    }
+
+    #[test]
+    fn artifact_max_count_is_operator_configurable_within_transport_bound() {
+        let base = [
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+        ];
+        let mut configured = base.to_vec();
+        configured.push(("WN_TEST_ARTIFACT_MAX_COUNT", "4"));
+        assert_eq!(
+            load(&configured)
+                .unwrap()
+                .harness
+                .artifact_exports
+                .max_count(),
+            4
+        );
+
+        for invalid in ["0", "11"] {
+            let mut values = base.to_vec();
+            values.push(("WN_TEST_ARTIFACT_MAX_COUNT", invalid));
+            let error = load(&values).unwrap_err();
+            assert!(error.to_string().contains("ARTIFACT_MAX_COUNT"));
+        }
     }
 
     #[test]
@@ -409,6 +460,24 @@ mod tests {
         .unwrap();
         assert!(loaded.harness.artifact_exports.enabled());
         assert_eq!(loaded.harness.artifact_exports.grants().len(), 1);
+    }
+
+    #[test]
+    fn artifact_exports_accept_16_byte_opaque_group_ids() {
+        let loaded = load(&[
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_TEST_ARTIFACT_EXPORTS_ENABLED", "true"),
+            (
+                "WN_TEST_ARTIFACT_GRANTS_JSON",
+                r#"[{"group_id_hex":"AABBCCDDEEFF00112233445566778899","export_root":"/home/test/output","ttl_seconds":300}]"#,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            loaded.harness.artifact_exports.grants()[0].group_id_hex,
+            "aabbccddeeff00112233445566778899"
+        );
     }
 
     #[test]

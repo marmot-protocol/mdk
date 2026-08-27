@@ -130,13 +130,14 @@ never retried automatically. Send `//reset-session` to pass the literal
 | `WN_CODEX_ACTIVATION` | `always` | Only supported activation mode |
 | `WN_CODEX_ARTIFACT_EXPORTS_ENABLED` | `false` | Opt in to typed Codex completion-file artifact delivery |
 | `WN_CODEX_ARTIFACT_GRANTS_JSON` | unset | Required JSON array of exact `group_id_hex`, absolute `export_root`, and positive `ttl_seconds` grants |
+| `WN_CODEX_ARTIFACT_MAX_COUNT` | `10` | Maximum artifacts accepted per result; configurable from 1 to 10 |
 | `WN_CODEX_ARTIFACT_STAGING_ROOT` | `$MARMOT_HOME/media-uploads` | Private staging root that must also be passed to `wn-agent --media-allowed-root` |
 
 Artifact export is fail-closed and Codex-only in the initial release. Enable it only with both layers configured:
 
 ```sh
 export WN_CODEX_ARTIFACT_EXPORTS_ENABLED=true
-export WN_CODEX_ARTIFACT_GRANTS_JSON='[{"group_id_hex":"<64-hex-group-id>","export_root":"'"$HOME"'/src/my-project/output","ttl_seconds":300}]'
+export WN_CODEX_ARTIFACT_GRANTS_JSON='[{"group_id_hex":"<opaque-hex-group-id>","export_root":"'"$HOME"'/src/my-project/output","ttl_seconds":300}]'
 export WN_CODEX_ARTIFACT_STAGING_ROOT="$MARMOT_HOME/media-uploads"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --media-allowed-root "$WN_CODEX_ARTIFACT_STAGING_ROOT" \

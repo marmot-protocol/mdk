@@ -108,11 +108,9 @@ async fn run_with_bin(
     if let Some(request) = artifact_output {
         let artifacts_result = read_artifact_output_manifest(request.manifest_path());
         let _ = std::fs::remove_file(request.manifest_path());
-        let artifacts = artifacts_result.map_err(|error| RunFailure {
-            error,
-            observed_session: outcome.observed_session.clone(),
-        })?;
-        if !artifacts.is_empty() {
+        if let Ok(artifacts) = artifacts_result
+            && !artifacts.is_empty()
+        {
             tx.send(RunnerEvent::Artifacts(artifacts))
                 .await
                 .map_err(|_| RunFailure {
@@ -397,6 +395,57 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
         assert_eq!(artifacts[0].path, std::path::PathBuf::from("report.pdf"));
         assert_eq!(artifacts[0].media_type, "application/pdf");
         assert_eq!(artifacts[0].file_name, "report.pdf");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_artifact_manifest_does_not_turn_text_success_into_backend_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("malformed-artifact-codex");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+prompt="$(cat)"
+manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+printf '%s' '{not-json' >"$manifest"
+printf '%s\n' '{"type":"thread.started","thread_id":"codex-text"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"text still succeeds"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let manifest = root.path().join("manifest.json");
+        fs::write(&manifest, br#"{"artifacts":[]}"#).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "complete without media".to_owned(),
+                artifact_output: Some(marmot_terminal_harness::ArtifactOutputRequest::new(
+                    manifest,
+                    "auth".to_owned(),
+                    root.path().to_path_buf(),
+                )),
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.observed_session.as_deref(), Some("codex-text"));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("text still succeeds".to_owned()))
+        );
         assert!(rx.recv().await.is_none());
     }
 

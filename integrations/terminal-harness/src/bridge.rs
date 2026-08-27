@@ -30,7 +30,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const SEND_RETRY_ATTEMPTS: usize = 3;
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
-pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
+pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
     let execution_support = backend.execution_support();
     validate_artifact_support(
         config.artifact_exports.enabled(),
@@ -65,7 +65,19 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
 
     let outbox_path = config.artifact_exports.outbox_path().to_path_buf();
     let outbox = if config.artifact_exports.enabled() {
-        ArtifactOutbox::load(outbox_path)?
+        match ArtifactOutbox::load(outbox_path.clone()) {
+            Ok(outbox) => outbox,
+            Err(err) => {
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "artifact_outbox_load",
+                    error_kind = err.privacy_safe_kind(),
+                    "artifact state is unavailable; continuing with text delivery"
+                );
+                config.artifact_exports = Default::default();
+                ArtifactOutbox::disabled(outbox_path)
+            }
+        }
     } else {
         ArtifactOutbox::disabled(outbox_path)
     };
@@ -86,9 +98,22 @@ pub async fn run<B: Backend>(config: Config, backend: B) -> Result<()> {
 
     if ctx.cfg.artifact_exports.enabled() {
         retry_pending_artifacts(&ctx).await;
+        tokio::select! {
+            result = subscribe_loop(ctx.clone()) => result,
+            _ = replay_pending_artifacts(ctx) => Ok(()),
+        }
+    } else {
+        subscribe_loop(ctx).await
     }
+}
 
-    subscribe_loop(ctx).await
+async fn replay_pending_artifacts(ctx: Arc<BridgeContext>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        retry_pending_artifacts(&ctx).await;
+    }
 }
 
 fn validate_artifact_support(enabled: bool, support: ArtifactSupport) -> Result<()> {
@@ -447,7 +472,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
         }
     };
     let artifact_output = if let Some(authorization) = artifact_authorization.as_ref() {
-        match prepare_manifest_path(&inbound.message_ref) {
+        match prepare_manifest_path(ctx.cfg.artifact_exports.outbox_path(), &inbound.message_ref) {
             Ok(path) => Some(ArtifactOutputRequest::from_authorization(
                 path,
                 authorization,
@@ -467,6 +492,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     };
     let artifact_setup_failed =
         artifact_setup_failed || (artifact_authorization.is_some() && artifact_output.is_none());
+    let buffer_text_for_artifacts = artifact_output.is_some();
     let invocation = Invocation {
         timeout: ctx.cfg.backend_timeout,
         idle_timeout: ctx.cfg.backend_idle_timeout,
@@ -480,10 +506,32 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let runner = tokio::spawn(async move { backend.run(invocation, tx).await });
     let mut buffered_text = Vec::new();
     let mut artifact_outputs: Vec<ArtifactOutput> = Vec::new();
+    let mut delivered_chunks = 0usize;
+    let mut delivery_failed = false;
     while let Some(event) = rx.recv().await {
         match event {
             RunnerEvent::Text(text) => {
-                buffered_text.push(text);
+                if buffer_text_for_artifacts {
+                    buffered_text.push(text);
+                } else if !delivery_failed {
+                    for chunk in split_reply_chunks(&text, ctx.cfg.max_reply_bytes) {
+                        delivered_chunks += 1;
+                        if send_reply(
+                            &ctx,
+                            &inbound.account_ref,
+                            &inbound.group_ref,
+                            &inbound.message_ref,
+                            chunk,
+                            delivered_chunks,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            delivery_failed = true;
+                            break;
+                        }
+                    }
+                }
             }
             RunnerEvent::Artifacts(outputs) => artifact_outputs.extend(outputs),
         }
@@ -491,8 +539,6 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
 
     match runner.await {
         Ok(Ok(outcome)) => {
-            let mut delivered_chunks = 0usize;
-            let mut delivery_failed = false;
             let artifact_delivery_attempted = artifact_setup_failed || !artifact_outputs.is_empty();
             let artifact_delivery = if artifact_setup_failed {
                 let _ = send_artifact_failure_activity(
@@ -640,6 +686,17 @@ async fn deliver_artifact_outputs(
     caption: Option<String>,
     outputs: &[ArtifactOutput],
 ) -> ArtifactDeliveryOutcome {
+    let text_chunks = caption
+        .as_deref()
+        .map(|text| {
+            split_reply_chunks(text, ctx.cfg.max_reply_bytes)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let caption = text_chunks.first().cloned();
+    let remaining_text = text_chunks.into_iter().skip(1).collect();
     let batch = match stage_artifacts(
         &ctx.cfg.artifact_exports,
         ArtifactDeliveryContext {
@@ -648,6 +705,7 @@ async fn deliver_artifact_outputs(
             group_ref: &inbound.group_ref,
             message_ref: &inbound.message_ref,
             caption,
+            remaining_text,
         },
         authorization,
         outputs,
@@ -681,7 +739,7 @@ async fn deliver_artifact_outputs(
         }
     };
 
-    if let Err(err) = ctx.outbox.lock().await.record(batch.clone()) {
+    if let Err(err) = record_artifact_batch(ctx, batch.clone()).await {
         warn!(
             target: TRACE_TARGET,
             method = "artifact_outbox_record",
@@ -696,9 +754,14 @@ async fn deliver_artifact_outputs(
             "rejected because durable delivery state could not be recorded",
         )
         .await;
-        for artifact in batch.artifacts {
-            let _ = std::fs::remove_file(artifact.path);
-        }
+        remove_staged_files(
+            &ctx.cfg.artifact_exports,
+            batch
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.path.clone())
+                .collect(),
+        );
         return ArtifactDeliveryOutcome::FallbackAllowed;
     }
 
@@ -770,6 +833,7 @@ async fn send_pending_artifact_batch(
         })
         .collect::<Vec<_>>();
     let mut last_error = None;
+    let mut sent = false;
     for attempt in 0..SEND_RETRY_ATTEMPTS {
         match ctx
             .client
@@ -782,7 +846,10 @@ async fn send_pending_artifact_batch(
             )
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                sent = true;
+                break;
+            }
             Err(err) if err.retryable() && attempt + 1 < SEND_RETRY_ATTEMPTS => {
                 last_error = Some(err);
                 sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
@@ -790,11 +857,40 @@ async fn send_pending_artifact_batch(
             Err(err) => return Err(err),
         }
     }
-    Err(last_error.unwrap_or(HarnessError::ControlClosed))
+    if !sent {
+        return Err(last_error.unwrap_or(HarnessError::ControlClosed));
+    }
+    for (index, chunk) in batch.remaining_text.iter().enumerate() {
+        send_reply(
+            ctx,
+            &batch.account_ref,
+            &batch.group_ref,
+            &batch.reply_to_message_ref,
+            chunk,
+            index + 1,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn record_artifact_batch(ctx: &BridgeContext, batch: PendingArtifactBatch) -> Result<()> {
+    let outbox = ctx.outbox.clone();
+    tokio::task::spawn_blocking(move || outbox.blocking_lock().record(batch))
+        .await
+        .map_err(HarnessError::from)?
+}
+
+async fn remove_artifact_batch(ctx: &BridgeContext, key: &str) -> Result<Vec<PathBuf>> {
+    let outbox = ctx.outbox.clone();
+    let key = key.to_owned();
+    tokio::task::spawn_blocking(move || outbox.blocking_lock().complete(&key))
+        .await
+        .map_err(HarnessError::from)?
 }
 
 async fn discard_artifact_batch(ctx: &BridgeContext, key: &str) {
-    match ctx.outbox.lock().await.complete(key) {
+    match remove_artifact_batch(ctx, key).await {
         Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
         Err(err) => {
             warn!(
@@ -808,7 +904,7 @@ async fn discard_artifact_batch(ctx: &BridgeContext, key: &str) {
 }
 
 async fn complete_artifact_batch(ctx: &BridgeContext, key: &str) {
-    match ctx.outbox.lock().await.complete(key) {
+    match remove_artifact_batch(ctx, key).await {
         Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
         Err(err) => {
             warn!(
@@ -1412,7 +1508,14 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let listener = tokio::net::UnixListener::from_std(listener).unwrap();
-        let expected = 1 + usize::from(invented_authorization && text.is_some());
+        let text_chunk_count = text
+            .map(|text| split_reply_chunks(text, 30_000).len())
+            .unwrap_or(0);
+        let expected = if invented_authorization {
+            1 + usize::from(text.is_some())
+        } else {
+            1 + text_chunk_count.saturating_sub(1)
+        };
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             for _ in 0..expected {
@@ -1543,6 +1646,17 @@ mod tests {
         assert_eq!(attachments[1].file_name, "chart.png");
         assert_eq!(caption.as_deref(), Some("completed text"));
         assert!(idempotency_key.as_ref().is_some_and(|key| !key.is_empty()));
+
+        let long_text = "x".repeat(30_005);
+        let long_success = run_artifact_delivery_case(Some(&long_text), false).await;
+        let agent_control::AgentControlRequest::SendMedia { caption, .. } = &long_success[0] else {
+            panic!("expected media before overflow text");
+        };
+        assert_eq!(caption.as_ref().map(String::len), Some(30_000));
+        let agent_control::AgentControlRequest::SendFinal { text, .. } = &long_success[1] else {
+            panic!("expected caption overflow as a text chunk");
+        };
+        assert_eq!(text, "xxxxx");
 
         let artifact_only_success = run_artifact_delivery_case(None, false).await;
         let agent_control::AgentControlRequest::SendMedia { caption, .. } =
@@ -1763,6 +1877,7 @@ mod tests {
                 group_ref: "group".to_owned(),
                 reply_to_message_ref: "inbound".to_owned(),
                 caption: Some("Report attached".to_owned()),
+                remaining_text: Vec::new(),
                 artifacts,
             })
             .unwrap();
