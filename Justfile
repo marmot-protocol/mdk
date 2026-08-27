@@ -556,9 +556,10 @@ naming-gate:
 convergence-ledger-gate:
     ./scripts/check_convergence_constant_ledger.sh
 
-# Keep the distributed campaign image on the workspace's pinned Rust toolchain.
+# Keep the distributed campaign and QUIC broker images on the pinned toolchain.
 campaign-toolchain-gate:
     ./scripts/check_campaign_toolchain.sh
+    ./scripts/tests/test_campaign_toolchain.sh
 
 # Prove the normal-build convergence policy pin (mdk#970). The broader test
 # matrix explicitly enables test-policy-overrides; this target must not.

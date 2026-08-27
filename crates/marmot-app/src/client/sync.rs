@@ -2207,7 +2207,9 @@ impl AppClient {
 
         match self.runtime.activate_transport(None).await {
             Ok(()) => {
-                if let Err(err) = self.sync_runtime_groups().await {
+                self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
+                if let Err(err) = self.runtime.sync_transport_groups(None).await {
+                    let err: AppError = err.into();
                     let terminal_error = err.privacy_safe_kind().to_string();
                     self.finish_epoch_backfill_execution(
                         execution,
@@ -2219,6 +2221,7 @@ impl AppClient {
                     );
                     return Err(err);
                 }
+                self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
                 self.record_subscription_rebuild(None).await;
                 let mut counts = DrainCounts::default();
                 let retry_ordinal = execution.retry_ordinal;
@@ -2437,13 +2440,23 @@ impl AppClient {
                     SyncFailureStage::TransportActivation,
                 )
             })?;
-        self.sync_runtime_groups().await.map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::GroupSubscriptionSync,
-            )
-        })?;
+        // Full-history repair must also rebuild every group subscription
+        // without the ordinary incremental floor. Using `sync_runtime_groups`
+        // here would reapply `last_transport_timestamp`, so retained group
+        // events can remain invisible even though the account-wide transport
+        // activation above was correctly unfloored.
+        self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
+        self.runtime
+            .sync_transport_groups(None)
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error.into(),
+                    SyncFailureStage::GroupSubscriptionSync,
+                )
+            })?;
+        self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut counts = DrainCounts::default();

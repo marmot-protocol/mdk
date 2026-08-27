@@ -787,23 +787,48 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
             .await;
     });
 
-    // Wait for the retry to mature several times over. Without the
-    // enumeration-failure floor, the matured retry deadline stays in the past
-    // and the worker would spin thousands of failing enumerations here.
+    // Establish the causal preconditions before measuring the no-spin window.
+    // On a saturated full-CI host, a fixed sleep can expire after the startup
+    // apply failure but before Tokio schedules the first retry enumeration.
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_policy_apply_failures
+        },
+        1,
+        Duration::from_secs(4),
+    )
+    .await;
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_enumerations_failed
+        },
+        1,
+        Duration::from_secs(4),
+    )
+    .await;
+
+    // Wait for the retry to remain matured several times over. Without the
+    // enumeration-failure floor, its deadline stays in the past and the worker
+    // would spin thousands of failing enumerations in this observation window.
+    let baseline = connector
+        .reconcile_telemetry
+        .snapshot()
+        .invite_enumerations_started;
     sleep(Duration::from_millis(1_600)).await;
-    let snapshot = connector.reconcile_telemetry.snapshot();
+    let attempts = connector
+        .reconcile_telemetry
+        .snapshot()
+        .invite_enumerations_started
+        .saturating_sub(baseline);
     assert!(
-        snapshot.invite_policy_apply_failures >= 1,
-        "the single successful enumeration must have armed a retry"
-    );
-    assert!(
-        snapshot.invite_enumerations_failed >= 1,
-        "later enumerations must be failing"
-    );
-    assert!(
-        snapshot.invite_enumerations_started <= 40,
-        "a failing enumeration with a matured retry must back off, not spin: {} attempts",
-        snapshot.invite_enumerations_started
+        attempts <= 14,
+        "a failing enumeration with a matured retry must back off, not spin: {attempts} attempts"
     );
     handle.abort();
 }

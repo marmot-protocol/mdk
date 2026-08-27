@@ -426,7 +426,9 @@ async fn relay_wide_removal_refuses_an_omitted_online_participant() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_reopen_recovers_quiet_offline_history_without_a_live_trigger() {
     let clients = vec!["alice".to_owned(), "bob".to_owned()];
-    let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+    let mut subject = AppRuntimeHarness::new_with_pinned_settlement(&clients)
+        .await
+        .unwrap();
     subject.select_scenario_group("main", true).unwrap();
     subject
         .create_group(cgka_conformance_simulator::SubjectCreateGroup {
