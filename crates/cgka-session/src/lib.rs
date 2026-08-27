@@ -1211,18 +1211,6 @@ impl AccountDeviceSession {
         self.engine.rotate_audit_recorder()
     }
 
-    /// Switch the live forensic recorder's audit data mode. A file-backed
-    /// recorder rotates on a real change so each file has one mode, writing an
-    /// `audit_data_mode_changed` boundary row. No-op when audit logging is off
-    /// or the mode is unchanged.
-    pub fn set_audit_data_mode(
-        &self,
-        mode: marmot_forensics::AuditDataMode,
-        reason: &str,
-    ) -> std::io::Result<()> {
-        self.engine.set_audit_recorder_data_mode(mode, reason)
-    }
-
     /// Install or replace the forensic recorder on the live engine, e.g. when
     /// the audit-logging switch is toggled. Pass a `NoopRecorder` to stop
     /// recording; dropping the prior recorder flushes and closes any file it

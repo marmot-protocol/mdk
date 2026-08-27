@@ -2,9 +2,9 @@
 //!
 //! Only the fields the classifier needs are modelled; every other field is
 //! ignored, so the parser tolerates the export growing new fields. The model is
-//! deliberately decoupled from `marmot-forensics`: it tracks the stable
-//! `marmot-forensics-audit/v2` wire shape that Goggles serialises, not the
-//! engine's internal `AuditEventKind` enum (which carries ~40 variants this
+//! deliberately decoupled from `marmot-forensics`: it tolerates the legacy
+//! `marmot-forensics-audit/v2` and safe-only v3 wire shapes that Goggles
+//! serialises, not the engine's internal `AuditEventKind` enum (which carries ~40 variants this
 //! adapter has no reason to depend on).
 
 use std::collections::BTreeMap;

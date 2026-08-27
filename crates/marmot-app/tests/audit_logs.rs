@@ -147,11 +147,8 @@ async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
     let server = tokio::spawn(capture_one_request(listener, tx));
 
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(app);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
@@ -215,11 +212,8 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
         ..MarmotServiceEndpoints::default()
     });
     let app = MarmotApp::with_relay_and_config(tmp.path(), "wss://relay.example", config);
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(app);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
@@ -278,11 +272,8 @@ async fn post_audit_log_tracker_update_continues_after_file_upload_failure() {
     let server = tokio::spawn(capture_requests(listener, tx, vec![500, 204]));
 
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let runtime = MarmotAppRuntime::new(app);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
@@ -330,11 +321,8 @@ async fn post_audit_log_tracker_update_skips_when_disabled_or_unconfigured() {
         Some("audit logging disabled")
     );
 
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let missing_endpoint = runtime.post_audit_log_tracker_update().await.unwrap();
     assert!(missing_endpoint.enabled);
     assert!(missing_endpoint.uploaded.is_empty());
@@ -480,11 +468,8 @@ async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
     );
     drop(client);
 
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     let _client = app.client(&account.label).await.unwrap();
 
     let files = app.audit_log_files().unwrap();
@@ -500,11 +485,8 @@ async fn local_group_action_writes_human_action_context() {
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
 
     let mut client = app.client(&account.label).await.unwrap();
     client.create_group("audit actions", &[]).await.unwrap();
@@ -565,11 +547,8 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
         relay_url,
         MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
-    app.set_audit_log_settings(AuditLogSettings {
-        enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
 
     let mut client = app.client(&account.label).await.unwrap();
     let group_id = client.create_group("audit actions", &[]).await.unwrap();

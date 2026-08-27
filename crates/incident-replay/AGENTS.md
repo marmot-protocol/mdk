@@ -13,8 +13,8 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
   - **Role:** Lenient, self-owned model of the export plus `parse`. Models only
     the fields the pipeline needs and ignores everything else, so it tolerates
     the export growing new fields. Deliberately decoupled from `marmot-forensics`:
-    it tracks the stable `marmot-forensics-audit/v2` wire shape Goggles
-    serialises, not the engine's internal `AuditEventKind` enum. The leniency is
+    it tolerates legacy `marmot-forensics-audit/v2` exports and the safe-only v3
+    wire shape Goggles serialises, not the engine's internal `AuditEventKind` enum. The leniency is
     bounded by one positive check: every modelled field defaults, so `parse`
     requires the object to carry at least one modelled top-level field
     (`events`, `derived_projections`, `normalized_scenario_history`) and rejects

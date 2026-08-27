@@ -1122,7 +1122,6 @@ impl<S: StorageProvider> Engine<S> {
                     policy.convergence.max_rewind_commits,
                     None,
                     Vec::new(),
-                    self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData,
                 ),
             );
             return Ok(settled_empty_result(previous_tip.0));
@@ -1202,7 +1201,6 @@ impl<S: StorageProvider> Engine<S> {
 
         let max_rewind_commits = policy.convergence.max_rewind_commits;
         let run_id = convergence_run_id(group_id, previous_tip.0);
-        let full_data = self.recorder.data_mode() == marmot_forensics::AuditDataMode::FullData;
         self.audit_group_with_context(
             group_id,
             convergence_run_context(&run_id, ConvergencePhase::Started),
@@ -1284,7 +1282,6 @@ impl<S: StorageProvider> Engine<S> {
                 max_rewind_commits,
                 result.selection_trace.as_ref(),
                 error_kinds.clone(),
-                full_data,
             ),
         );
         if matches!(
