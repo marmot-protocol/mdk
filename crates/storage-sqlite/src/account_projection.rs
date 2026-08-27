@@ -2,7 +2,7 @@ use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt, bool_i64,
     connection::retry_on_busy,
     encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, i64_to_usize,
-    tags_from_json, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
+    tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::MessageId;
@@ -222,6 +222,9 @@ impl fmt::Debug for StoredAccountGroupComponent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredAppMessageQuery {
     pub group_id_hex: Option<String>,
+    /// Restrict to these inner app-event kinds. `None` or an empty list
+    /// applies no kind constraint.
+    pub kinds: Option<Vec<u64>>,
     pub limit: Option<usize>,
 }
 
@@ -1576,42 +1579,44 @@ impl SqliteAccountStorage {
         let cols = APP_EVENT_REPLAY_COLUMNS;
         let asc = APP_EVENT_REPLAY_ORDER_ASC;
         let desc = APP_EVENT_REPLAY_ORDER_DESC;
-        let sql = match (&query.group_id_hex, query.limit) {
-            (Some(_), Some(_)) => format!(
-                "SELECT {cols} FROM (
-                    SELECT {cols} FROM app_events
-                    WHERE group_id_hex = ?1
-                    ORDER BY {desc} LIMIT ?2
-                 ) ORDER BY {asc}"
-            ),
-            (Some(_), None) => {
-                format!("SELECT {cols} FROM app_events WHERE group_id_hex = ?1 ORDER BY {asc}")
+        let mut conditions: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(group_id_hex) = &query.group_id_hex {
+            conditions.push("group_id_hex = ?".to_owned());
+            values.push(Value::Text(group_id_hex.clone()));
+        }
+        if let Some(kinds) = query.kinds.as_deref().filter(|kinds| !kinds.is_empty()) {
+            let placeholders = std::iter::repeat_n("?", kinds.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("kind IN ({placeholders})"));
+            for kind in kinds {
+                values.push(Value::Integer(u64_to_i64(*kind)?));
             }
-            (None, Some(_)) => format!(
+        }
+        let where_sql = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = match query.limit {
+            Some(_) => format!(
                 "SELECT {cols} FROM (
                     SELECT {cols} FROM app_events
-                    ORDER BY {desc} LIMIT ?1
+                    {where_sql}
+                    ORDER BY {desc} LIMIT ?
                  ) ORDER BY {asc}"
             ),
-            (None, None) => format!("SELECT {cols} FROM app_events ORDER BY {asc}"),
+            None => format!("SELECT {cols} FROM app_events {where_sql} ORDER BY {asc}"),
         };
+        if let Some(limit) = query.limit {
+            values.push(Value::Integer(usize_to_i64(limit)?));
+        }
         let conn = self.lock()?;
         let mut statement = conn.prepare(&sql).storage()?;
-        let rows = match (&query.group_id_hex, query.limit) {
-            (Some(group_id_hex), Some(limit)) => statement
-                .query_map(
-                    params![group_id_hex, usize_to_i64(limit)?],
-                    app_message_from_row,
-                )
-                .storage()?,
-            (Some(group_id_hex), None) => statement
-                .query_map(params![group_id_hex], app_message_from_row)
-                .storage()?,
-            (None, Some(limit)) => statement
-                .query_map(params![usize_to_i64(limit)?], app_message_from_row)
-                .storage()?,
-            (None, None) => statement.query_map([], app_message_from_row).storage()?,
-        };
+        let rows = statement
+            .query_map(params_from_iter(values.iter()), app_message_from_row)
+            .storage()?;
         rows.collect::<Result<Vec<_>, _>>().storage()
     }
 

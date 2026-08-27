@@ -53,7 +53,7 @@ async function effectiveWelcomers(
 
 /**
  * Reconcile wn-agent's welcomer allowlist for `accountIdHex` to exactly the hex
- * ids in `desired`, fail-closed:
+ * ids in `desired` using best-effort reconciliation:
  *
  * - revocations run first, so a security-critical shrink never waits behind a
  *   grow that may fail;
@@ -63,7 +63,8 @@ async function effectiveWelcomers(
  * - the effective set is read back and only an exact match sets `verified`.
  *
  * `wn-agent` exposes no atomic replace, so reconciliation is still a sequence of
- * single-entry mutations: a caller that sees `verified: false` knows the
+ * single-entry mutations: a failed removal leaves that entry authorized until
+ * a later successful sync. A caller that sees `verified: false` knows the
  * authoritative set diverges but cannot assume any particular intermediate
  * state. The read-back is also account-scoped, not connector-scoped, so a
  * concurrent writer on a shared account reads as divergence.

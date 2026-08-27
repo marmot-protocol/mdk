@@ -178,17 +178,44 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Send an app-defined event with an arbitrary non-reserved kind. `tags`
+    /// and `content` pass through verbatim; kinds MDK owns (chat, reaction,
+    /// edit, delete, agent, group system, push token) are rejected so an app
+    /// cannot forge protocol events. Custom events appear in the timeline as
+    /// standalone rows and can be fetched via [`Marmot::messages`] with a
+    /// `kinds` filter.
+    pub async fn send_custom_event(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .send_custom_event(&account_ref, &group_id, kind, tags, content)
+            .await?;
+        Ok(summary.into())
+    }
+
     /// Initial history fetch for a group (or, when `group_id_hex` is None,
     /// the account-wide tail). Used to populate the conversation view before
     /// the subscription stream takes over.
+    ///
+    /// `kinds` restricts to the listed inner app-event kinds (e.g. an
+    /// app-defined custom kind); `None` or an empty list returns all kinds.
     pub fn messages(
         &self,
         account_ref: String,
         group_id_hex: Option<String>,
         limit: Option<u32>,
+        kinds: Option<Vec<u64>>,
     ) -> Result<Vec<AppMessageRecordFfi>, MarmotKitError> {
         let query = AppMessageQuery {
             group_id_hex: optional_group_id_hex(group_id_hex)?,
+            kinds: kinds.filter(|kinds| !kinds.is_empty()),
             limit: limit.map(|n| n as usize),
         };
         let records = self.runtime.messages_with_query(&account_ref, query)?;

@@ -51,6 +51,7 @@ impl MarmotAppRuntime {
                 &account_ref_for_query,
                 AppMessageQuery {
                     group_id_hex: Some(group_id_hex_for_query),
+                    kinds: None,
                     limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
                 },
             )
@@ -158,6 +159,7 @@ impl MarmotAppRuntime {
                     &account_label,
                     AppMessageQuery {
                         group_id_hex: query_group_id_hex,
+                        kinds: None,
                         limit: None,
                     },
                 )

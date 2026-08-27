@@ -293,6 +293,35 @@ impl EpochStallDetector {
         }
     }
 
+    /// Clear the replay-suppression latch for the groups a completed replay
+    /// fetched history for and could not retain.
+    ///
+    /// Withholding [`Self::mark_replayed`] on a fruitless replay re-arms
+    /// *bystanders* only. It cannot re-arm the group that caused the replay:
+    /// that group latched `fired_at_epoch` itself in [`GroupStall::arm`], which
+    /// writes the same value `mark_replayed` would have. Nothing else clears it
+    /// — [`GroupStall::observe_epoch`] clears only on a *different* epoch, and
+    /// the epoch cannot move without the very commit the replay failed to
+    /// retain. So without this, one fruitless replay permanently ends automatic
+    /// repair for that group: the refused object is neither marked seen nor
+    /// allowed past the relay `since` floor, and the armed backfill is the only
+    /// automatic path that re-serves it.
+    ///
+    /// Scoped to the refusals *this* drain counted rather than swept
+    /// account-wide: a group the replay refused nothing for learned nothing from
+    /// it, and clearing its latch would re-arm on evidence that does not exist.
+    ///
+    /// The run itself is untouched — `armed_at_epoch`, `arms` and `escalated`
+    /// all survive — so a group that keeps re-arming still escalates exactly
+    /// once per unrecovered run rather than restarting its count.
+    pub(crate) fn rearm_refused_groups(&mut self, groups: &HashSet<GroupId>) {
+        for group_id in groups {
+            if let Some(stall) = self.groups.get_mut(group_id) {
+                stall.fired_at_epoch = None;
+            }
+        }
+    }
+
     /// Note the current local epoch of an already-tracked `group` from a
     /// delivery that carried no stall evidence. Groups with no stall history are
     /// deliberately left untracked: this only exists so a tracked group's

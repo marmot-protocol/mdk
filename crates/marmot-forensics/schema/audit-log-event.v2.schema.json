@@ -1661,6 +1661,9 @@
             "skipped": {
               "$ref": "#/$defs/u64"
             },
+            "refused": {
+              "$ref": "#/$defs/u64"
+            },
             "cursor_before_secs": {
               "$ref": "#/$defs/u64"
             },
@@ -1742,6 +1745,9 @@
             "skipped": {
               "$ref": "#/$defs/u64"
             },
+            "refused": {
+              "$ref": "#/$defs/u64"
+            },
             "local_epoch_before": {
               "$ref": "#/$defs/u64"
             },
@@ -1786,6 +1792,9 @@
               "$ref": "#/$defs/u64"
             },
             "skipped": {
+              "$ref": "#/$defs/u64"
+            },
+            "refused": {
               "$ref": "#/$defs/u64"
             },
             "local_epoch_before": {

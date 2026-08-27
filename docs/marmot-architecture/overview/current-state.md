@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-08-19
+updated: 2026-08-24
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -68,6 +68,12 @@ idempotent Blossom upload, and canonical group creation are separate host-visibl
 uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
+
+Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
+through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
+every message surface, and custom kinds materialize as standalone timeline rows under a dedicated `CustomEvent`
+update trigger. Kinds MDK owns (chat, reactions, edits, deletes, agent, group system, push token) are rejected on
+the custom send path, so apps cannot forge protocol events.
 
 The Codex, OpenCode, and Pi terminal harnesses share typed `inherit`,
 `autonomous`, and `unrestricted` execution intent while retaining

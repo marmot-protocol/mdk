@@ -287,6 +287,7 @@ fn prune_group_messages_before_removes_only_expired_group_rows() {
     let aa = db
         .messages(AppMessageQuery {
             group_id_hex: Some("aa".to_owned()),
+            kinds: None,
             limit: None,
         })
         .unwrap();
@@ -295,6 +296,7 @@ fn prune_group_messages_before_removes_only_expired_group_rows() {
     let bb = db
         .messages(AppMessageQuery {
             group_id_hex: Some("bb".to_owned()),
+            kinds: None,
             limit: None,
         })
         .unwrap();

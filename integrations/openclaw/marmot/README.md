@@ -322,6 +322,13 @@ for any plugin or tenant that is not in the same trust boundary.
   never merges or rewrites text across sends. A bounded retry reuses one
   per-send idempotency key so a transient control-socket failure does not create
   a second Marmot message.
+- **Live-preview retry contract**: `stream_append`, `stream_status`, and
+  `stream_progress` use the preview request's 8-second timeout and bounded
+  retries. Every retry of one logical mutation reuses its original idempotency
+  key and payload. `wn-agent` therefore applies a mutation at most once even
+  when it committed the record but its Ack was lost, while the plugin advances
+  its local transcript only after an Ack; the client and server transcript
+  hashes remain aligned for `stream_finalize`.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call
@@ -383,12 +390,14 @@ for any plugin or tenant that is not in the same trust boundary.
   managed directly on `wn-agent`). `wn-agent` still performs welcomer-based
   post-join accept/decline. With `allowFrom` set the mirror is *exact
   reconciliation* of an account-scoped list: entries another integration added
-  to the same `wn-agent` account are removed. It runs fail-closed — revocations
-  before additions, every step attempted even when an earlier one fails, and the
-  effective list read back afterwards. `wn-agent` has no atomic replace, so a
-  partial control-plane failure is reported, not repaired: the connector logs
-  `welcomer allowlist revocation failed …` (entries still authorized) or
-  `welcomer allowlist not reconciled …`, and startup continues.
+  to the same `wn-agent` account are removed. It performs best-effort
+  reconciliation: revocations run before additions, every step is attempted
+  even when an earlier one fails, and the effective list is read back afterward.
+  `wn-agent` has no atomic replace, so a partial control-plane failure is
+  reported, not repaired: the connector logs `welcomer allowlist revocation
+  failed …` (entries still authorized) or `welcomer allowlist not reconciled …`,
+  and startup continues. A failed revocation leaves that entry authorized until
+  a later successful sync.
 - **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
   disable with `profileNameOnboarding: false`): when the agent joins a group it
   asks, on its own, whether to publish a public Nostr profile (`kind:0`) name —

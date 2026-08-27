@@ -148,6 +148,11 @@ arrays. The exact encoded length is computed before allocating the zeroizing
 output buffer; the encoder cannot grow it. Temporary list bodies that can
 contain secret material also use zeroizing ownership.
 
+Temporary replay and branch probes use a canonical-state-only restore even when
+their retained anchor predates state-scoped capture and contains full message
+and queue images. This keeps legacy anchors readable without letting a probe
+rewrite live input or outbound-work rows.
+
 A blob without `MDKS` is decoded as the corresponding unversioned JSON v1
 snapshot or checkpoint. A blob with `MDKS` never falls back following a v2
 error. Full snapshots, state-scoped snapshots, and branch-addressed checkpoints

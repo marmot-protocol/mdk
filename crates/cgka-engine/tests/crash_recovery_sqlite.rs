@@ -2,10 +2,10 @@
 
 //! Process-kill coverage for convergence rewrite durability (#1025).
 //!
-//! The ignored child test drives the real retained-anchor late-commit path over
-//! encrypted file-backed SQLite. Parent tests stop it at fixed debug-only crash
-//! points, then reopen and hydrate the database without running child
-//! destructors.
+//! The ignored child test drives the real retained-anchor late-commit and
+//! deferred candidate-branch paths over encrypted file-backed SQLite. Parent
+//! tests stop it at fixed debug-only crash points, then reopen and hydrate the
+//! database without running child destructors.
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -28,7 +28,7 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     ConvergencePassStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
@@ -52,6 +52,7 @@ const DATABASE_KEY: &str = "cgka convergence crash recovery key";
 const READY_PREFIX: &str = "MDK_CGKA_TEST_CRASH_READY:";
 const H5_POINT: &str = "historical-apply-before-commit";
 const H6_POINT: &str = "retained-anchor-after-rewind";
+const CANDIDATE_BRANCH_POINT: &str = "candidate-branch-after-rewind";
 const DURABLE_TRANSITION_POINTS: &[&str] = &[
     "convergence-pass-collecting-durable",
     "convergence-pass-frozen-durable",
@@ -136,6 +137,11 @@ fn h5_kill_before_historical_apply_commit_preserves_live_inputs() {
 #[test]
 fn h6_kill_after_retained_anchor_rewind_recovers_live_snapshot() {
     run_parent_case(H6_POINT, EpochId(1), "openmls-retained-probe-");
+}
+
+#[test]
+fn candidate_branch_kill_after_rewind_recovers_live_state_and_work_rows() {
+    run_parent_case(CANDIDATE_BRANCH_POINT, EpochId(1), "openmls-branch-probe-");
 }
 
 #[test]
@@ -243,7 +249,7 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
     let group_id = group_ids[0].clone();
     let stranded_group = storage.get_group(&group_id).expect("stranded group");
     assert_eq!(stranded_group.epoch, stranded_epoch);
-    if point == H6_POINT {
+    if matches!(point, H6_POINT | CANDIDATE_BRANCH_POINT) {
         assert!(
             !stranded_group
                 .members
@@ -260,7 +266,7 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
             .any(|name| name.starts_with(snapshot_prefix)),
         "expected stranded snapshot prefix {snapshot_prefix}"
     );
-    if point == H5_POINT {
+    if matches!(point, H5_POINT | CANDIDATE_BRANCH_POINT) {
         assert_eq!(
             storage
                 .list_queued_outbound_intents(&group_id)
@@ -606,7 +612,8 @@ async fn run_child_case(database: &Path) {
         .expect("buffer late competing commit");
 
     let _ = alice_seed;
-    if std::env::var(CRASH_POINT_ENV).as_deref() == Ok(H5_POINT) {
+    let crash_point = std::env::var(CRASH_POINT_ENV).ok();
+    if crash_point.as_deref() == Some(H5_POINT) {
         let policy = CanonicalizationPolicy::default();
         let state = CanonicalizationState {
             current_tip_epoch: 2,
@@ -630,6 +637,37 @@ async fn run_child_case(database: &Path) {
             policy.convergence.max_rewind_commits,
         )
         .expect("historical apply reaches selected crash point");
+    } else if crash_point.as_deref() == Some(CANDIDATE_BRANCH_POINT) {
+        let deferred = TransportMessage {
+            id: MessageId::new(b"candidate-branch-deferred".to_vec()),
+            payload: b"opaque candidate-branch traffic".to_vec(),
+            timestamp: Timestamp(2_200),
+            causal_deps: Vec::new(),
+            source: TransportSource("crash-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        };
+        carol_storage
+            .put_message(&MessageRecord {
+                id: deferred.id.clone(),
+                group_id: group_id.clone(),
+                epoch: EpochId(2),
+                state: MessageState::PeelDeferred,
+                payload: StoredMessagePayload::raw_transport(deferred)
+                    .encode()
+                    .expect("encode deferred crash input"),
+                deferred_peel: None,
+            })
+            .expect("persist deferred crash input");
+        carol
+            .retry_deferred_peels(&group_id)
+            .await
+            .expect("normalize deferred crash input");
+        carol
+            .retry_deferred_peels(&group_id)
+            .await
+            .expect("candidate branch probe reaches selected crash point");
     } else {
         carol
             .converge_stored_openmls_messages_at(&group_id, 3_000_000)

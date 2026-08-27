@@ -1151,12 +1151,12 @@ async fn message_history_binding_methods_validate_group_hex() {
     // mdk#204: messages() previously passed the host string straight
     // into the query, silently yielding empty history).
     let invalid_group = kit
-        .messages("missing".into(), Some("not-hex".into()), Some(25))
+        .messages("missing".into(), Some("not-hex".into()), Some(25), None)
         .expect_err("invalid group hex should fail before account lookup");
     assert!(format!("{invalid_group}").contains("invalid hex"));
 
     let invalid_subscribe = match kit
-        .subscribe_messages("missing".into(), Some("not-hex".into()), Some(25))
+        .subscribe_messages("missing".into(), Some("not-hex".into()), Some(25), None)
         .await
     {
         Ok(_) => panic!("invalid group hex subscription should fail"),
@@ -1168,9 +1168,22 @@ async fn message_history_binding_methods_validate_group_hex() {
     // then fails on the missing account, proving the value was canonicalized
     // rather than treated as an opaque host string.
     let missing_account = kit
-        .messages("missing".into(), Some(" ABCD ".into()), Some(25))
+        .messages("missing".into(), Some(" ABCD ".into()), Some(25), None)
         .expect_err("missing account should fail after hex validation");
     assert!(format!("{missing_account}").contains("missing"));
+
+    // send_custom_event shares the group-hex-first validation order.
+    let invalid_send = kit
+        .send_custom_event(
+            "missing".into(),
+            "not-hex".into(),
+            30078,
+            Vec::new(),
+            String::new(),
+        )
+        .await
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_send}").contains("invalid hex"));
 }
 
 #[tokio::test]

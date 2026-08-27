@@ -296,6 +296,12 @@ pub struct CreateGroupEffects {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IngestEffects {
     pub outcome: IngestOutcome,
+    /// The engine kept no durable trace of this delivery's transport object, so
+    /// relay redelivery is the only path back to it. A caller holding its own
+    /// dedup index must not record the object as seen. See
+    /// `Engine::last_ingest_left_object_unpersisted` for why this cannot be
+    /// derived from `outcome`.
+    pub left_object_unpersisted: bool,
     pub effects: SessionEffects,
     /// Groups for which an authenticated standalone proposal was accepted.
     /// Commits are represented by `GroupEvent::EpochChanged`.
@@ -924,6 +930,7 @@ impl AccountDeviceSession {
             "ingesting transport message"
         );
         let outcome = self.engine.ingest(msg).await?;
+        let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest",
@@ -934,6 +941,7 @@ impl AccountDeviceSession {
         let effects = self.collect_effects(vec![]);
         Ok(IngestEffects {
             outcome,
+            left_object_unpersisted,
             effects,
             valid_proposal_groups,
         })
@@ -953,6 +961,7 @@ impl AccountDeviceSession {
             .engine
             .ingest_with_audit_context(delivery.message, Some(transport_context))
             .await?;
+        let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest_delivery",
@@ -963,6 +972,7 @@ impl AccountDeviceSession {
         let effects = self.collect_effects(vec![]);
         Ok(IngestEffects {
             outcome,
+            left_object_unpersisted,
             effects,
             valid_proposal_groups,
         })

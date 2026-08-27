@@ -149,6 +149,35 @@ pub(crate) fn merge_engine_metrics(
         &mut target.foreground_deferred_budget_overrun_ms,
         &source.foreground_deferred_budget_overrun_ms,
     );
+    target.deferred_peel_sweeps = target
+        .deferred_peel_sweeps
+        .saturating_add(source.deferred_peel_sweeps);
+    target.deferred_peel_candidate_enumerations = target
+        .deferred_peel_candidate_enumerations
+        .saturating_add(source.deferred_peel_candidate_enumerations);
+    target.deferred_peel_candidate_contexts = target
+        .deferred_peel_candidate_contexts
+        .saturating_add(source.deferred_peel_candidate_contexts);
+    merge_histogram(
+        &mut target.deferred_peel_candidate_context_depth,
+        &source.deferred_peel_candidate_context_depth,
+    );
+    target.deferred_peel_candidate_replay_probes = target
+        .deferred_peel_candidate_replay_probes
+        .saturating_add(source.deferred_peel_candidate_replay_probes);
+    target.deferred_peel_candidate_cache_hits = target
+        .deferred_peel_candidate_cache_hits
+        .saturating_add(source.deferred_peel_candidate_cache_hits);
+    target.deferred_peel_candidate_cache_misses = target
+        .deferred_peel_candidate_cache_misses
+        .saturating_add(source.deferred_peel_candidate_cache_misses);
+    target.deferred_peel_candidate_cache_invalidations = target
+        .deferred_peel_candidate_cache_invalidations
+        .saturating_add(source.deferred_peel_candidate_cache_invalidations);
+    merge_histogram(
+        &mut target.deferred_peel_candidate_enumeration_ms,
+        &source.deferred_peel_candidate_enumeration_ms,
+    );
     merge_histogram(
         &mut target.queued_outbound_wait_ms,
         &source.queued_outbound_wait_ms,
@@ -208,7 +237,16 @@ mod metric_tests {
             foreground_deferred_unchanged: 42,
             foreground_deferred_errors: 43,
             foreground_deferred_budget_overrun_ms: histogram(44, 45, 46),
-            queued_outbound_wait_ms: histogram(47, 48, 49),
+            deferred_peel_sweeps: 47,
+            deferred_peel_candidate_enumerations: 48,
+            deferred_peel_candidate_contexts: 49,
+            deferred_peel_candidate_context_depth: histogram(50, 51, 52),
+            deferred_peel_candidate_replay_probes: 53,
+            deferred_peel_candidate_cache_hits: 54,
+            deferred_peel_candidate_cache_misses: 55,
+            deferred_peel_candidate_cache_invalidations: 56,
+            deferred_peel_candidate_enumeration_ms: histogram(57, 58, 59),
+            queued_outbound_wait_ms: histogram(60, 61, 62),
         };
         let mut target = EngineMetricsSnapshot::default();
 

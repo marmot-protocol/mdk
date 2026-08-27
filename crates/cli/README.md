@@ -273,7 +273,11 @@ wn --account <npub-or-hex> messages react <group-hex> <message-id> +
 wn --account <npub-or-hex> messages unreact <group-hex> <message-id>
 wn --account <npub-or-hex> messages delete <group-hex> <message-id>
 wn --account <npub-or-hex> messages retry <group-hex> <event-id>
+wn --account <npub-or-hex> messages send-event <group-hex> <kind> [content]
+wn --account <npub-or-hex> messages send-event <group-hex> 30100 '{"cursor":7}' --tag '["e","<event-id-hex>"]'
+wn --account <npub-or-hex> messages list <group-hex> --kind 9 --kind 30100
 wn --account <npub-or-hex> messages subscribe <group-hex> --limit 50
+wn --account <npub-or-hex> messages subscribe <group-hex> --kind 30100
 wn --account <npub-or-hex> messages timeline list <group-hex> --limit 20
 wn --account <npub-or-hex> messages timeline search <group-hex> <query> --limit 20
 wn --account <npub-or-hex> messages timeline subscribe <group-hex>
@@ -295,6 +299,19 @@ longer be sent this way. The parent id is not required to
 exist locally; a reply to a message you have not yet synced is still sent (its preview hydrates once the parent
 arrives). The JSON response is the same shape as a plain send.
 
+`messages send-event <group-hex> <kind> [content]` sends an app-defined custom event. The kind, tags, and content
+pass through verbatim into the encrypted group message, so an app can ship its own payloads without waiting for an
+MDK release. Kinds MDK owns (chat, reactions, edits, deletes, agent activity, agent stream anchors, group system
+rows, push token records) are reserved: the send is rejected with `reserved_app_event_kind` so one component cannot
+forge another component's protocol events. Each `--tag` takes a JSON array of strings, and the flag is repeatable;
+a malformed tag fails with `invalid_event_tag`.
+
+Custom events land in the same stored event log and materialized timeline as chat messages. They project as
+standalone rows carrying their own kind and tags, and they never fold onto a target message the way reactions and
+deletes do. `messages list` and `messages subscribe` accept repeatable `--kind <KIND>` filters; with no filter they
+return every kind. On the subscribe feed a custom event arrives as a normal `message` type carrying its `kind` and
+`tags`, and on the timeline feed its change trigger is `CustomEvent`.
+
 The `messages timeline` subcommands list, search, and subscribe to the materialized message timeline (the projection
 that interleaves messages, media, and agent-stream anchors/finals in conversation order).
 
@@ -302,8 +319,9 @@ Projected history is ordered by recorded message time first, then local receipt/
 stream anchors and final markers in conversation order instead of relay catch-up order.
 
 `messages subscribe`, `chats subscribe`, and `groups subscribe-state` require `wnd`. With `--json`, they print
-newline-delimited stream responses as they arrive. Each response has a typed `result.type`; normal app messages use
-`message`, reactions use `reaction`, deletions use `message_delete`, media references use `media`, durable agent stream
+newline-delimited stream responses as they arrive. Each response has a typed `result.type`; normal app messages and
+app-defined custom kinds use `message`, reactions use `reaction`, deletions use `message_delete`, media references
+use `media`, durable agent stream
 anchors/finals use `agent_stream_start` and `agent_stream_final`, live brokered QUIC chunks use `agent_stream_delta`,
 runtime-owned QUIC preview summaries use `stream_preview`, chat rows use `chat`, and group state rows use `group_state`.
 

@@ -19,7 +19,8 @@ use crate::error::ConnectorError;
 use crate::quic::{broker_trust_for_candidate, parse_quic_candidate, resolve_quic_candidate_addr};
 use crate::stream_session::{
     ActiveStreamSession, FinalizedStream, SendIdempotencyAcquisition, SendIdempotencyLeader,
-    StreamBeginReceipt, StreamBeginReservation, normalize_stream_capability,
+    StreamBeginReceipt, StreamBeginReservation, StrictIdempotencyAcquisition,
+    normalize_stream_capability,
 };
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
 use crate::{
@@ -30,6 +31,7 @@ use crate::{
 /// Current schema version for persisted `stream_finalize` request fingerprints.
 pub(crate) const STREAM_FINALIZE_FINGERPRINT_VERSION: u8 = 2;
 pub(crate) const STREAM_BEGIN_FINGERPRINT_VERSION: u8 = 1;
+pub(crate) const STREAM_PREVIEW_FINGERPRINT_VERSION: u8 = 1;
 
 /// Server-derived fingerprint of a `stream_finalize` request. A retry can return
 /// cached message ids only when the stream id and sealed transcript exactly
@@ -89,6 +91,49 @@ fn begun_response(receipt: StreamBeginReceipt) -> AgentControlResponse {
 
 fn stream_finalize_idempotency_key(key: &str) -> String {
     format!("stream_finalize_v2:{key}")
+}
+
+fn stream_preview_fingerprint(
+    operation: &str,
+    stream_id_hex: &str,
+    stream_capability: &str,
+    payload_field: &str,
+    payload: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let preimage = serde_json::json!([
+        STREAM_PREVIEW_FINGERPRINT_VERSION,
+        operation,
+        stream_id_hex,
+        stream_capability,
+        payload_field,
+        payload,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("stream preview fingerprint cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn stream_preview_idempotency_key(operation: &str, key: String) -> Result<String, ConnectorError> {
+    let key = key.trim();
+    if key.is_empty() || key.len() > 128 {
+        return Err(ConnectorError::Stream(
+            "stream preview idempotency key must be 1..=128 bytes".into(),
+        ));
+    }
+    Ok(format!("stream_preview_v1:{operation}:{key}"))
+}
+
+struct StreamPreviewIdempotency {
+    key: String,
+    fingerprint: String,
+    reservation: SendIdempotencyLeader,
+}
+
+enum StreamPreviewReservation {
+    Legacy,
+    Completed,
+    Leader(StreamPreviewIdempotency),
 }
 
 struct StreamFinalizeIdempotency {
@@ -324,10 +369,24 @@ impl AgentConnector {
         stream_id_hex: &str,
         stream_capability: &str,
         append_text: String,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        let (stream_id_hex, stream_capability, reservation) = self
+            .reserve_stream_preview(
+                "append",
+                stream_id_hex,
+                stream_capability,
+                "append_text",
+                &append_text,
+                idempotency_key,
+            )
+            .await?;
+        if matches!(reservation, StreamPreviewReservation::Completed) {
+            return Ok(AgentControlResponse::Ack);
+        }
         let session = self
             .streams
-            .get_authorized(stream_id_hex, stream_capability)?;
+            .get_authorized(&stream_id_hex, &stream_capability)?;
         let (respond, response) = oneshot::channel();
         session
             .tx
@@ -341,6 +400,7 @@ impl AgentConnector {
             .await
             .map_err(|err| ConnectorError::Stream(err.to_string()))?
             .map_err(ConnectorError::Stream)?;
+        self.complete_stream_preview(reservation);
         Ok(AgentControlResponse::Ack)
     }
 
@@ -349,10 +409,24 @@ impl AgentConnector {
         stream_id_hex: &str,
         stream_capability: &str,
         status: String,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        let (stream_id_hex, stream_capability, reservation) = self
+            .reserve_stream_preview(
+                "status",
+                stream_id_hex,
+                stream_capability,
+                "status",
+                &status,
+                idempotency_key,
+            )
+            .await?;
+        if matches!(reservation, StreamPreviewReservation::Completed) {
+            return Ok(AgentControlResponse::Ack);
+        }
         let session = self
             .streams
-            .get_authorized(stream_id_hex, stream_capability)?;
+            .get_authorized(&stream_id_hex, &stream_capability)?;
         let (respond, response) = oneshot::channel();
         session
             .tx
@@ -363,6 +437,7 @@ impl AgentConnector {
             .await
             .map_err(|err| ConnectorError::Stream(err.to_string()))?
             .map_err(ConnectorError::Stream)?;
+        self.complete_stream_preview(reservation);
         Ok(AgentControlResponse::Ack)
     }
 
@@ -371,10 +446,24 @@ impl AgentConnector {
         stream_id_hex: &str,
         stream_capability: &str,
         text: String,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        let (stream_id_hex, stream_capability, reservation) = self
+            .reserve_stream_preview(
+                "progress",
+                stream_id_hex,
+                stream_capability,
+                "text",
+                &text,
+                idempotency_key,
+            )
+            .await?;
+        if matches!(reservation, StreamPreviewReservation::Completed) {
+            return Ok(AgentControlResponse::Ack);
+        }
         let session = self
             .streams
-            .get_authorized(stream_id_hex, stream_capability)?;
+            .get_authorized(&stream_id_hex, &stream_capability)?;
         let (respond, response) = oneshot::channel();
         session
             .tx
@@ -385,7 +474,74 @@ impl AgentConnector {
             .await
             .map_err(|err| ConnectorError::Stream(err.to_string()))?
             .map_err(ConnectorError::Stream)?;
+        self.complete_stream_preview(reservation);
         Ok(AgentControlResponse::Ack)
+    }
+
+    async fn reserve_stream_preview(
+        &self,
+        operation: &str,
+        stream_id_hex: &str,
+        stream_capability: &str,
+        payload_field: &str,
+        payload: &str,
+        idempotency_key: Option<String>,
+    ) -> Result<(String, String, StreamPreviewReservation), ConnectorError> {
+        let stream_id_hex = normalize_hex(stream_id_hex)?;
+        let stream_capability = normalize_stream_capability(stream_capability)?;
+        // Authenticate before consulting the preview-only dedup store, so possession
+        // of a key never bypasses or probes the stream capability boundary.
+        self.streams
+            .get_authorized(&stream_id_hex, &stream_capability)?;
+        let Some(key) = idempotency_key else {
+            return Ok((
+                stream_id_hex,
+                stream_capability,
+                StreamPreviewReservation::Legacy,
+            ));
+        };
+        let key = stream_preview_idempotency_key(operation, key)?;
+        let fingerprint = stream_preview_fingerprint(
+            operation,
+            &stream_id_hex,
+            &stream_capability,
+            payload_field,
+            payload,
+        );
+        match self
+            .preview_idempotency
+            .acquire_strict(&key, &fingerprint)
+            .await?
+        {
+            StrictIdempotencyAcquisition::Completed => Ok((
+                stream_id_hex,
+                stream_capability,
+                StreamPreviewReservation::Completed,
+            )),
+            StrictIdempotencyAcquisition::Conflict => {
+                Err(ConnectorError::StreamPreviewIdempotencyConflict)
+            }
+            StrictIdempotencyAcquisition::Leader(reservation) => Ok((
+                stream_id_hex,
+                stream_capability,
+                StreamPreviewReservation::Leader(StreamPreviewIdempotency {
+                    key,
+                    fingerprint,
+                    reservation,
+                }),
+            )),
+        }
+    }
+
+    fn complete_stream_preview(&self, reservation: StreamPreviewReservation) {
+        if let StreamPreviewReservation::Leader(idempotency) = reservation {
+            self.preview_idempotency
+                .record(idempotency.key, idempotency.fingerprint, Vec::new());
+            idempotency.reservation.complete(
+                Vec::new(),
+                agent_control::AgentControlSendMaintenanceDisposition::Ready,
+            );
+        }
     }
 
     pub(crate) async fn stream_finalize_response(

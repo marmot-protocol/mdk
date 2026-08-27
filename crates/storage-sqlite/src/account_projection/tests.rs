@@ -92,6 +92,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
     let records = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: Some("aa".to_owned()),
+            kinds: None,
             limit: None,
         })
         .unwrap();
@@ -120,6 +121,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
     let surviving_ids = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: None,
+            kinds: None,
             limit: None,
         })
         .unwrap()
@@ -206,6 +208,7 @@ fn optimistic_local_retention_is_finalized_once_from_matching_source_epoch() {
     let records = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: Some("aa".to_owned()),
+            kinds: None,
             limit: None,
         })
         .unwrap();
@@ -1172,6 +1175,7 @@ fn app_messages_list_raw_events_and_prune_updates_timeline() {
     let aa = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: Some("aa".to_owned()),
+            kinds: None,
             limit: None,
         })
         .unwrap();
@@ -1180,6 +1184,7 @@ fn app_messages_list_raw_events_and_prune_updates_timeline() {
     let bb = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: Some("bb".to_owned()),
+            kinds: None,
             limit: None,
         })
         .unwrap();
@@ -2007,6 +2012,7 @@ fn app_messages_tie_break_on_message_id_matches_cursor_order() {
         store
             .app_messages(StoredAppMessageQuery {
                 group_id_hex: Some("gg".to_owned()),
+                kinds: None,
                 limit,
             })
             .unwrap()
@@ -2022,6 +2028,56 @@ fn app_messages_tie_break_on_message_id_matches_cursor_order() {
     // The newest-N limited path takes the lexically-greatest ids, then returns
     // them in ascending message_id_hex order. With limit 2 that is bbb, ccc.
     assert_eq!(ordered_ids(Some(2)), vec!["bbb", "ccc"]);
+}
+
+#[test]
+fn app_messages_kinds_filter_restricts_to_listed_kinds() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut custom = app_event("custom-1", "gg", 110);
+    custom.kind = 30078;
+    custom.tags = vec![vec!["d".to_owned(), "game-1".to_owned()]];
+    let mut other_custom = app_event("custom-2", "gg", 120);
+    other_custom.kind = 30079;
+    for event in [app_event("chat-1", "gg", 100), custom, other_custom] {
+        store.record_app_event(&event).unwrap();
+    }
+
+    let ids = |kinds: Option<Vec<u64>>| {
+        store
+            .app_messages(StoredAppMessageQuery {
+                group_id_hex: Some("gg".to_owned()),
+                kinds,
+                limit: None,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|message| message.message_id_hex)
+            .collect::<Vec<_>>()
+    };
+
+    // `None` and an empty list both apply no kind constraint.
+    assert_eq!(ids(None), vec!["chat-1", "custom-1", "custom-2"]);
+    assert_eq!(
+        ids(Some(Vec::new())),
+        vec!["chat-1", "custom-1", "custom-2"]
+    );
+    assert_eq!(ids(Some(vec![30078])), vec!["custom-1"]);
+    assert_eq!(
+        ids(Some(vec![MARMOT_APP_EVENT_KIND_CHAT, 30079])),
+        vec!["chat-1", "custom-2"]
+    );
+    assert!(ids(Some(vec![1])).is_empty());
+
+    // The kind filter composes with the limited newest-first window.
+    let limited = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: Some("gg".to_owned()),
+            kinds: Some(vec![MARMOT_APP_EVENT_KIND_CHAT, 30078]),
+            limit: Some(1),
+        })
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].message_id_hex, "custom-1");
 }
 
 #[test]
@@ -3465,6 +3521,7 @@ fn app_messages_replay_order_matches_cursor_comparator() {
     let rows = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: None,
+            kinds: None,
             limit: None,
         })
         .unwrap();

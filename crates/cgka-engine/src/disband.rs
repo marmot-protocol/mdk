@@ -442,6 +442,7 @@ impl<S: StorageProvider> Engine<S> {
 
         let target_epoch = EpochId(source_epoch.0.saturating_add(1));
         let pending = self.epoch_manager.next_pending_ref();
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             source_epoch,
@@ -603,6 +604,7 @@ impl<S: StorageProvider> Engine<S> {
             .delete_transport_group_routes_for_group(group_id);
         self.route_backfill_pending.remove(group_id);
         self.pending_convergence_groups.remove(group_id);
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.engine_metrics.forget_group(group_id);
         self.leaving_groups.remove(group_id);
         self.drop_self_remove_auto_commit_schedules_for_group(group_id);

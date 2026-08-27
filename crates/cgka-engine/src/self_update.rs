@@ -200,6 +200,7 @@ impl<S: StorageProvider> Engine<S> {
         evolution.pending_ref = Some(pending_ref);
         self.maintenance_storage()?
             .put_group_evolution(&evolution)?;
+        self.invalidate_deferred_peel_candidate_cache(&group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             source_epoch,

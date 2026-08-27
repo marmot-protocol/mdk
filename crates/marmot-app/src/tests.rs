@@ -1685,6 +1685,504 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
     });
 }
 
+/// A tracked group stalled below the arm threshold, so `mark_replayed` is the
+/// only thing that can stop it from arming when its next undecryptable lands.
+///
+/// Returned by the disarm tests below as the probe they read the detector
+/// through: the armed group's own `arm()` has already latched its epoch, so a
+/// bystander is the only place the disarm rule is observable.
+fn bystander_stalled_below_threshold(
+    client: &mut crate::AppClient,
+    stalled_epoch: u64,
+) -> cgka_traits::GroupId {
+    let bystander = cgka_traits::GroupId::new(vec![7_u8; 32]);
+    for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD - 1 {
+        assert_eq!(
+            client.epoch_stall.observe_undecryptable(
+                bystander.clone(),
+                format!("bystander-{probe}"),
+                cgka_traits::EpochId(stalled_epoch),
+            ),
+            BackfillDecision::Skip,
+        );
+    }
+    bystander
+}
+
+/// The threshold-crossing undecryptable for [`bystander_stalled_below_threshold`].
+fn bystander_crosses_threshold(
+    client: &mut crate::AppClient,
+    bystander: cgka_traits::GroupId,
+    stalled_epoch: u64,
+) -> BackfillDecision {
+    client.epoch_stall.observe_undecryptable(
+        bystander,
+        "bystander-threshold".to_owned(),
+        cgka_traits::EpochId(stalled_epoch),
+    )
+}
+
+/// A replay that completed but recovered nothing must not disarm the detector.
+///
+/// `mark_replayed` latches `fired_at_epoch` for *every* tracked group, which is
+/// the right trade when one account-wide replay really did serve every group's
+/// history. A drain that ended at end-of-stored-events having ingested nothing,
+/// with no tracked group's epoch moving, served nothing — so latching on it ends
+/// all automatic recovery for the process lifetime, silently. The run is still
+/// recorded honestly and still consumes its intent; only the disarm is withheld.
+#[test]
+fn a_completed_backfill_that_recovered_nothing_does_not_disarm_the_detector() {
+    run_composed_app_runtime_test("backfill-fruitless-no-disarm", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the armed intent must begin execution");
+        client.test_complete_epoch_backfill_execution(execution, 0, 0);
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Arm,
+            "a replay that recovered nothing must not disarm a group it never recovered",
+        );
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "the completed run still consumes its intent; only the disarm is withheld",
+        );
+        drop(client);
+
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(
+            completed.len(),
+            1,
+            "a fruitless run is still recorded as the completed attempt it was",
+        );
+        assert_eq!(completed[0]["kind"]["deliveries"], 0);
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events"),
+        );
+    });
+}
+
+/// A replay whose every delivery was refused recovered nothing, and must not
+/// disarm the detector — the end-to-end shape of the review finding.
+///
+/// This is the drain that hurts most in the field: the relays serve the exact
+/// history the device is missing, the engine's retention cap is full, and every
+/// object is dropped unpersisted. `deliveries` counts them (a receive really was
+/// ingested, and #1553 pinned that meaning for the field exports), so keying the
+/// disarm on `deliveries` alone read a total loss as a productive replay.
+/// `deliveries - refused` is the count that answers "did anything land".
+#[test]
+fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
+    run_composed_app_runtime_test("backfill-all-refusals", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            backfill_drain_test_config(),
+            filled_through,
+        )
+        .await;
+        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        // Arm through the production seam rather than `apply_backfill_decision`:
+        // a refused delivery at the receive seam reaches `observe_resource_refusal`,
+        // so the armed group is tracked by the detector and its own re-arm is
+        // observable here alongside the bystander's.
+        client
+            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        let attempt_id = client
+            .pending_epoch_backfill
+            .as_ref()
+            .expect("the refusal must arm one recovery intent")
+            .attempt_id
+            .clone();
+
+        // The relays have the history and serve it; the engine's retention cap
+        // is full, so the replay fetches it and cannot keep any of it.
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 500,
+                "refused-during-the-replay",
+            ),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the armed replay must run");
+        assert!(
+            matches!(outcome, crate::EpochBackfillRunOutcome::Completed(_)),
+            "a served end-of-stored-events drain is a completed replay, fruitless or not",
+        );
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Arm,
+            "a replay that kept none of what it fetched must not disarm a bystander group",
+        );
+        assert!(
+            !client
+                .queued_epoch_backfills
+                .iter()
+                .chain(client.pending_epoch_backfill.iter())
+                .any(|pending| pending.attempt_id == attempt_id),
+            "the completed run still consumes its own intent; only the disarm is withheld",
+        );
+
+        drop(client);
+        let rows = recorded_audit_rows(&app);
+        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed");
+        assert_eq!(completed.len(), 1, "the run records one terminal row");
+        assert_eq!(
+            completed[0]["kind"]["completion_kind"].as_str(),
+            Some("end_of_stored_events"),
+            "the row stays honest about how the drain ended",
+        );
+        let deliveries = completed[0]["kind"]["deliveries"].as_u64();
+        assert_eq!(
+            (deliveries, completed[0]["kind"]["refused"].as_u64()),
+            (Some(1), Some(1)),
+            "the row must self-report cap saturation: every delivery refused",
+        );
+        // And the ordinary drain rows carry the same evidence, so a field export
+        // can read per-drain saturation without reconstructing it from raw
+        // `ingest_outcome` rows.
+        assert!(
+            recorded_rows_of_kind(&rows, "sync_drain")
+                .iter()
+                .any(|row| row["kind"]["refused"].as_u64() == Some(1)),
+            "the drain row must carry the refusal count too",
+        );
+    });
+}
+
+/// A group armed *through the detector* must be able to arm again after a
+/// replay that retained none of its history.
+///
+/// This is the shape the merged disarm tests could not observe. They armed with
+/// `apply_backfill_decision` directly, which never enters `EpochStallDetector`,
+/// so the armed group was untracked and only a bystander could show the disarm
+/// rule at work. Production arms through `observe_resource_refusal`, and that
+/// path latches `fired_at_epoch` in `GroupStall::arm` — the same value
+/// `mark_replayed` would have written. Withholding `mark_replayed` therefore did
+/// nothing for the group that caused the replay: its next same-epoch refusal
+/// still returned `Skip`, and because the refused commit is neither marked seen
+/// nor allowed past the `since` floor, the armed backfill is the *only*
+/// automatic path back to it. Nothing else clears the latch — `observe_epoch`
+/// clears it only on a different epoch, and the epoch cannot move without the
+/// commit the replay failed to retain. That is a permanent, silent end to
+/// automatic repair for that group.
+#[test]
+fn a_group_armed_through_the_detector_rearms_after_a_fruitless_replay() {
+    run_composed_app_runtime_test("backfill-fruitless-rearm", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            backfill_drain_test_config(),
+            filled_through,
+        )
+        .await;
+        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
+
+        // Arm the way production does: a refused delivery at the receive seam,
+        // which reaches `observe_resource_refusal` through `detect_epoch_stall`.
+        client
+            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "a resource refusal at the receive seam must arm one recovery intent",
+        );
+
+        // The relays serve the history; the cap is still full, so the replay
+        // fetches it and retains none of it.
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 500,
+                "refused-during-the-replay",
+            ),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        assert!(
+            matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .expect("the armed replay must run"),
+                crate::EpochBackfillRunOutcome::Completed(_)
+            ),
+            "a served end-of-stored-events drain is a completed replay, fruitless or not",
+        );
+
+        assert_eq!(
+            client.epoch_stall.observe_resource_refusal(
+                route.group_id.clone(),
+                cgka_traits::EpochId(stalled_epoch)
+            ),
+            BackfillDecision::Arm,
+            "a replay that retained none of this group's refused history must leave it \
+             able to arm again at the same epoch — nothing else can clear the latch",
+        );
+    });
+}
+
+/// The re-arm above must not become a spin.
+///
+/// A re-armable group facing a cap that is still full would otherwise run
+/// arm → drain → fruitless → re-arm at full speed: a fresh intent starts at
+/// `execution_attempts == 0`, and before this rule a *completed* run cleared
+/// `epoch_backfill_retry_not_before` unconditionally, so nothing paced the next
+/// attempt. A fruitless success now pays the same cooldown an unconfirmed drain
+/// does, which bounds the loop to one account-wide replay per backoff window
+/// while leaving caller-directed repair exempt.
+#[test]
+fn consecutive_fruitless_replays_are_paced_by_the_retry_cooldown() {
+    run_composed_app_runtime_test("backfill-fruitless-pacing", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        // A backoff long enough that the second attempt cannot slip past it
+        // inside this test, and a silence budget short enough to afford.
+        let config = MarmotAppConfig::default()
+            .with_dev_epoch_backfill_eose_wait_ms(300)
+            .with_dev_epoch_backfill_retry_backoff_ms(60_000);
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            config,
+            filled_through,
+        )
+        .await;
+
+        client
+            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 500,
+                "refused-during-the-replay",
+            ),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        assert!(
+            matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .expect("the armed replay must run"),
+                crate::EpochBackfillRunOutcome::Completed(_)
+            ),
+            "the first replay completes and is fruitless",
+        );
+        assert!(
+            client.epoch_backfill_retry_not_before.is_some(),
+            "a completed-but-fruitless replay must earn a retry cooldown, not clear it",
+        );
+
+        // The re-armed group arms a second intent, which the cooldown must hold.
+        client
+            .ingest_received_delivery(route.probe(filled_through + 900, "refusal-after-replay"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "the re-armed group must arm a fresh intent",
+        );
+        assert!(
+            matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .expect("the paced seam still returns Ok"),
+                crate::EpochBackfillRunOutcome::Deferred
+            ),
+            "the second fruitless cycle must wait out the cooldown instead of \
+             draining the account again immediately",
+        );
+        // A person asking for a repair is not a loop.
+        assert!(
+            !client.epoch_backfill_retry_is_paced(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
+            ),
+            "caller-directed catch-up stays exempt from the fruitless cooldown",
+        );
+    });
+}
+
+/// A fruitless replay re-arms only the groups whose refusals it counted.
+///
+/// The clear is scoped to this drain's attribution rather than swept
+/// account-wide: a group that never had history refused in this replay learned
+/// nothing from it, and clearing its latch would re-arm groups the replay says
+/// nothing about.
+#[test]
+fn a_fruitless_replay_rearms_only_the_groups_whose_refusals_it_counted() {
+    run_composed_app_runtime_test("backfill-fruitless-rearm-scope", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            backfill_drain_test_config(),
+            filled_through,
+        )
+        .await;
+        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
+
+        // An untouched group that armed at the same epoch but has no refusal in
+        // the replay below.
+        let untouched = cgka_traits::GroupId::new(vec![9_u8; 32]);
+        assert_eq!(
+            client
+                .epoch_stall
+                .observe_resource_refusal(untouched.clone(), cgka_traits::EpochId(stalled_epoch)),
+            BackfillDecision::Arm,
+        );
+
+        client
+            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 500,
+                "refused-during-the-replay",
+            ),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("the armed replay must run");
+
+        assert_eq!(
+            client.epoch_stall.observe_resource_refusal(
+                route.group_id.clone(),
+                cgka_traits::EpochId(stalled_epoch)
+            ),
+            BackfillDecision::Arm,
+            "the group whose refusal the replay counted re-arms",
+        );
+        assert_eq!(
+            client
+                .epoch_stall
+                .observe_resource_refusal(untouched, cgka_traits::EpochId(stalled_epoch)),
+            BackfillDecision::Skip,
+            "a group the replay refused nothing for keeps its latch",
+        );
+    });
+}
+
+/// A zero-delivery replay after which a tracked group's epoch moved is genuine
+/// success: the value of the replay was letting already-deferred rows converge,
+/// and that is exactly what the epoch delta reports.
+#[test]
+fn a_backfill_whose_epoch_moved_still_disarms_the_detector() {
+    run_composed_app_runtime_test("backfill-epoch-moved-disarms", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (_app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the armed intent must begin execution");
+        client
+            .update_group_profile(&group_id, Some("moved during the replay"), None)
+            .await
+            .expect("a solo group's commit confirms locally");
+        assert!(
+            client.group_mls_state(&group_id).unwrap().epoch > stalled_epoch,
+            "the armed group's epoch must have moved across the run",
+        );
+        client.test_complete_epoch_backfill_execution(execution, 0, 0);
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Skip,
+            "a replay that moved a tracked group's epoch has earned the account-wide disarm",
+        );
+    });
+}
+
+/// A replay that ingested deliveries has earned the disarm even with every
+/// tracked epoch still where it started.
+///
+/// The epoch is read the moment the drain returns, and a delivery it ingested
+/// can convert into an epoch long after that — one field run drained 376
+/// deliveries and moved its epoch a second *after* the terminal row was written.
+/// So a delivery count is never second-guessed by an epoch read taken this
+/// early: the deliveries are parked awaiting convergence, not lost.
+#[test]
+fn a_backfill_that_ingested_deliveries_still_disarms_the_detector() {
+    run_composed_app_runtime_test("backfill-deliveries-disarm", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (_app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
+
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .expect("the armed intent must begin execution");
+        // One delivery, none of it refused: a delivery the engine kept.
+        client.test_complete_epoch_backfill_execution(execution, 1, 0);
+
+        assert_eq!(
+            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
+            BackfillDecision::Skip,
+            "a delivery the engine kept is recovery in flight, not a fruitless run",
+        );
+    });
+}
+
 #[test]
 fn epoch_backfill_drain_needs_every_subscription_to_report() {
     run_composed_app_runtime_test("backfill-drain-partial-eose", || async {
@@ -9008,6 +9506,79 @@ fn group_system_intent_builds_kind_1210_json_payload() {
 }
 
 #[test]
+fn custom_intent_passes_kind_tags_and_content_through_verbatim() {
+    let event = build(AppMessageIntent::Custom {
+        kind: 30078,
+        tags: vec![
+            vec!["d".to_owned(), "game-1".to_owned()],
+            vec!["move".to_owned(), "e4".to_owned()],
+        ],
+        content: "{\"move\":\"e4\"}".to_owned(),
+    });
+    assert_eq!(event.kind, 30078);
+    assert_eq!(
+        event.tags,
+        vec![
+            vec!["d".to_owned(), "game-1".to_owned()],
+            vec!["move".to_owned(), "e4".to_owned()]
+        ]
+    );
+    assert_eq!(event.content, "{\"move\":\"e4\"}");
+    assert_eq!(event.pubkey, SENDER_HEX);
+}
+
+#[test]
+fn custom_intent_rejects_every_reserved_kind() {
+    use cgka_traits::app_event as kinds;
+    for kind in [
+        kinds::MARMOT_APP_EVENT_KIND_DELETE,
+        kinds::MARMOT_APP_EVENT_KIND_REACTION,
+        kinds::MARMOT_APP_EVENT_KIND_CHAT,
+        kinds::MARMOT_APP_EVENT_KIND_EDIT,
+        kinds::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+        kinds::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+        kinds::MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+        kinds::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+    ] {
+        assert!(crate::is_reserved_app_event_kind(kind));
+        let result = build_inner_event(
+            &AppMessageIntent::Custom {
+                kind,
+                tags: Vec::new(),
+                content: String::new(),
+            },
+            SENDER_HEX,
+            1,
+        );
+        assert!(
+            matches!(result, Err(AppError::InvalidAppMessagePayload(_))),
+            "reserved kind {kind} must be rejected"
+        );
+    }
+    assert!(!crate::is_reserved_app_event_kind(30078));
+}
+
+#[test]
+fn custom_intent_audit_action_is_send_custom_event() {
+    let context = AppClient::message_human_action_context(&AppMessageIntent::Custom {
+        kind: 30078,
+        tags: Vec::new(),
+        content: String::new(),
+    })
+    .expect("custom events are user-authored actions");
+    assert_eq!(
+        context
+            .human_action
+            .as_ref()
+            .map(|action| action.action.as_str()),
+        Some("send_custom_event")
+    );
+}
+
+#[test]
 fn received_event_decodes_when_id_and_sender_match() {
     let event = build(AppMessageIntent::Chat {
         content: "hi".to_owned(),
@@ -11469,6 +12040,454 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         vec!["must survive a failed ingest"],
         "the failed delivery's message must be durably projected exactly once",
     );
+}
+/// A group whose per-group retained-undecryptable backlog is exactly full, plus
+/// everything a test needs to mint one more undecryptable delivery for it.
+///
+/// `cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP` is the
+/// only way to reach `IngestOutcome::ResourceRefused`: the engine offers no
+/// knob for the cap, so the backlog is filled for real. Below the cap an
+/// unpeelable object is *retained* (`TransportDeferred`); at it the engine drops
+/// the object unpersisted and keeps its id out of its own seen cache, so
+/// transport redelivery is the only path back to it.
+struct UndecryptableProbeRoute {
+    account_id_hex: String,
+    group_id: cgka_traits::GroupId,
+    nostr_group_id_hex: String,
+}
+
+impl UndecryptableProbeRoute {
+    /// One kind-445 delivery for this group's route whose body cannot peel.
+    fn probe(&self, created_at: u64, marker: &str) -> cgka_traits::TransportDelivery {
+        cgka_traits::TransportDelivery {
+            account_id: MemberId::new(hex::decode(&self.account_id_hex).unwrap()),
+            group_id_hint: Some(self.group_id.clone()),
+            message: epoch_gap_probe(&self.nostr_group_id_hex, created_at, marker)
+                .to_transport_message()
+                .expect("probe converts to a transport message"),
+            received_at: cgka_traits::transport::Timestamp(created_at),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+                plane: cgka_traits::TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        }
+    }
+}
+
+/// Build [`UndecryptableProbeRoute`]'s group and fill its retained-undecryptable
+/// backlog to the cap, on an app whose relay plane accepts injected events.
+///
+/// Every filling probe is dated `filled_through` so a later probe's effect on
+/// the transport cursor is unambiguous, and each is ingested through the receive
+/// seam because that is the cheapest way to reach the engine 256 times.
+async fn group_at_the_undecryptable_retention_cap(
+    dir: &tempfile::TempDir,
+    filled_through: u64,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    group_at_the_undecryptable_retention_cap_with_config(
+        dir,
+        &relay,
+        MarmotAppConfig::default(),
+        filled_through,
+    )
+    .await
+}
+
+async fn group_at_the_undecryptable_retention_cap_with_config(
+    dir: &tempfile::TempDir,
+    relay: &Arc<ScriptedPushRelayClient>,
+    config: MarmotAppConfig,
+    filled_through: u64,
+) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
+    let account_id_hex = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let mut app =
+        MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
+            .with_test_relay_client(relay.clone());
+    app.set_audit_log_settings(crate::AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    app.relay_plane =
+        MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
+
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group_id = client
+        .create_group("undecryptable retention cap", &[])
+        .await
+        .unwrap();
+    let nostr_group_id_hex = app
+        .group("alice", &hex::encode(group_id.as_slice()))
+        .unwrap()
+        .expect("local group projection")
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route = UndecryptableProbeRoute {
+        account_id_hex,
+        group_id,
+        nostr_group_id_hex,
+    };
+
+    for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+        client
+            .ingest_received_delivery(route.probe(filled_through, &format!("cap-fill-{row}")))
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+    }
+    assert_eq!(
+        client.state.last_transport_timestamp,
+        Some(filled_through),
+        "the retained probes must have advanced the cursor to their own timestamp",
+    );
+    (app, client, route)
+}
+
+/// Every `ingest_outcome` audit row the engine recorded for `msg_id`.
+fn recorded_ingest_outcomes(app: &MarmotApp, msg_id: &str) -> Vec<String> {
+    recorded_audit_rows(app)
+        .iter()
+        .filter(|row| row["kind"]["type"] == "ingest_outcome")
+        .filter(|row| row["kind"]["msg_id"].as_str() == Some(msg_id))
+        .filter_map(|row| row["kind"]["outcome_kind"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+/// One kind-445 delivery for a route this device has no group row for.
+///
+/// The reachable production trigger is *not* a commit racing ahead of its
+/// Welcome — a device that is not in a group has no route for it, every 445
+/// filter is `#h`-scoped to a known `transport_group_id`, and the adapter
+/// re-gates every event against the route table before it becomes a delivery.
+/// It is the engine's route-backfill probe budget: on an index miss
+/// `resolve_or_backfill_group_id_for_transport` probes at most
+/// `ROUTE_BACKFILL_PROBES_PER_MISS` (4) of the groups whose durable route row
+/// was missing or stale at hydration, and otherwise falls back to the raw
+/// transport id, which misses `MlsGroup::load` and takes the unknown-group
+/// branch — for a group this device really does have. The app-side consequence
+/// is the same either way and is what these two tests pin; the engine's
+/// disposition contract is pinned in `cgka-engine`'s
+/// `ingest_unknown_group_message_leaves_the_object_unpersisted`.
+fn unknown_route_delivery(
+    account_id_hex: &str,
+    created_at: u64,
+    marker: &str,
+) -> cgka_traits::TransportDelivery {
+    cgka_traits::TransportDelivery {
+        account_id: MemberId::new(hex::decode(account_id_hex).unwrap()),
+        group_id_hint: None,
+        message: epoch_gap_probe(&"ab".repeat(32), created_at, marker)
+            .to_transport_message()
+            .expect("probe converts to a transport message"),
+        received_at: cgka_traits::transport::Timestamp(created_at),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+            plane: cgka_traits::TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    }
+}
+
+/// An object the engine kept no durable trace of must not enter `seen_events`,
+/// even when its outcome is an ordinary `Ignored`.
+///
+/// The engine sets `retryable_unpersisted_ingest_id` on the unknown-group
+/// branch and suppresses its own seen-cache insertion, precisely so relay
+/// redelivery can process the object once the route resolves. Recording it in
+/// `seen_events` defeats that permanently: the index is persisted, has no
+/// removal site short of ring overflow, and gates both
+/// `receive_next_delivery` and the catch-up drain — so the object becomes
+/// unfetchable across restarts and across `repair_full_history` alike.
+///
+/// The cursor still advances. Unknown-route input is exactly what #740 says
+/// must not consume local resources, and the `since` floor is one of them: an
+/// attacker minting 445s for routes we do not have could otherwise pin the
+/// whole account's floor in the past. Skipping the seen-mark is what actually
+/// restores the object, because the unfloored recovery replay re-serves it.
+#[test]
+fn an_unknown_route_delivery_is_not_marked_seen_but_still_advances_the_cursor() {
+    run_composed_app_runtime_test("unknown-route-receive-seam", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        let unknown = unknown_route_delivery(
+            &route.account_id_hex,
+            filled_through + 500,
+            "unknown-route-commit",
+        );
+        let event_id = hex::encode(unknown.message.id.as_slice());
+        client
+            .ingest_received_delivery(unknown.clone())
+            .await
+            .expect("an unknown-route ingest still completes its pass");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &event_id),
+            vec!["ignored".to_owned()],
+            "the engine classifies it as an ignore, which is why the app could not \
+             tell it apart from a durably dedup-marked one",
+        );
+        assert!(
+            !client.seen_events_index.contains(&event_id),
+            "an object the engine retained nothing for must stay fetchable",
+        );
+        assert!(
+            !client.state.seen_events.contains(&event_id),
+            "and must not be persisted into the seen ring either",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(filled_through + 500),
+            "but the `since` floor still advances: unknown-route input must not \
+             hold the whole account's cursor back (#740)",
+        );
+
+        // The contract the skipped seen-mark buys: redelivery is ingested again
+        // rather than dropped, so a later drain can present the object once the
+        // route resolves.
+        client
+            .ingest_received_delivery(unknown)
+            .await
+            .expect("redelivery still completes its pass");
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &event_id).len(),
+            2,
+            "same-id redelivery must reach the engine a second time",
+        );
+    });
+}
+
+/// Why the drain seam cannot be driven with an unknown route from here, and
+/// what the route-backfill miss actually looks like.
+///
+/// The relay plane route-gates every inbound event before it can become a
+/// `TransportDelivery`: an unknown `#h` routes to nobody. That is the same gate
+/// that makes "a commit racing ahead of its Welcome" unreachable — a device not
+/// in a group has no route for it, so no 445 for that group is ever delivered.
+/// The reachable trigger is narrower and lives one layer down: the *adapter*
+/// has the route (the device really is in the group) while the *engine's*
+/// in-memory route index misses it and the route-backfill probe budget runs out,
+/// so `resolve_or_backfill_group_id_for_transport` falls back to the raw
+/// transport id and takes the unknown-group branch.
+///
+/// The app-side rule that branch needs is `must_stay_fetchable`, which both
+/// seams read off the identical `DeliveryIngest` field — pinned at the receive
+/// seam above, and at the drain seam by
+/// `a_refused_delivery_is_neither_marked_seen_nor_allowed_to_advance_the_cursor`.
+/// What is pinned here is the gate itself, so the unreachability claim is a
+/// test rather than a comment.
+#[test]
+fn an_unknown_route_event_is_never_routed_to_a_delivery() {
+    run_composed_app_runtime_test("unknown-route-transport-gate", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, client, _route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        let delivered = app
+            .relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                subscription_id: Some("unknown-route-test".to_owned()),
+                event: epoch_gap_probe(
+                    &"ab".repeat(32),
+                    filled_through + 500,
+                    "unknown-route-commit",
+                ),
+            })
+            .await
+            .expect("routing an unknown-route event is not an error");
+        assert_eq!(
+            delivered, 0,
+            "a 445 for a route this device does not hold must not become a delivery",
+        );
+        drop(client);
+    });
+}
+
+/// A refused object must stay fetchable: the receive seam may neither mark it
+/// seen nor let it advance the relay `since` cursor.
+///
+/// `IngestOutcome::ResourceRefused` is an `Ok` the engine deliberately leaves
+/// unpersisted — it suppresses its own seen-cache insertion so "same-id
+/// redelivery is not a duplicate". Marking it seen here defeats that: the id is
+/// persisted in `seen_events` with no removal site short of ring overflow, and
+/// the advanced cursor puts the object below the next subscription's `since`
+/// floor, so the message becomes permanently unfetchable across restarts and
+/// even across `repair_full_history`.
+#[test]
+fn a_refused_delivery_is_neither_marked_seen_nor_allowed_to_advance_the_cursor() {
+    run_composed_app_runtime_test("refused-ingest-receive-seam", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        // Minted once and cloned, so the redelivery below is byte-identical:
+        // a re-minted probe would carry a fresh ephemeral key and a fresh id.
+        let refused = route.probe(filled_through + 500, "refused-at-the-cap");
+        let refused_id = hex::encode(refused.message.id.as_slice());
+        client
+            .ingest_received_delivery(refused.clone())
+            .await
+            .expect("a refused object still completes its ingest pass");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned()],
+            "the backlog must be full, so this object is refused rather than retained",
+        );
+        assert!(
+            !client.seen_events_index.contains(&refused_id),
+            "a refused object is not durably ingested, so it must not be marked seen",
+        );
+        assert!(
+            !client.state.seen_events.contains(&refused_id),
+            "nor persisted into the durable seen-events ring",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(filled_through),
+            "a refused object must not carry the relay `since` floor past itself",
+        );
+
+        // The unstick proof: the relay redelivers, and the reused client hands
+        // the object to the engine again instead of skipping it as seen. It is
+        // still refused — the backlog is still full — which is itself the
+        // evidence that the engine reclassified it rather than deduplicating it.
+        client
+            .ingest_received_delivery(refused)
+            .await
+            .expect("the redelivered object must reach the engine again");
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned(), "resource_refused".to_owned()],
+            "the redelivery must be reclassified, never deduplicated away",
+        );
+        assert!(
+            !client.seen_events_index.contains(&refused_id),
+            "and it stays fetchable for as long as the engine keeps refusing it",
+        );
+    });
+}
+
+/// The fence: a `TransportDeferred` object *is* durably retained by the engine,
+/// so marking it seen is correct dedupe and stays. Only the unpersisted refusal
+/// is exempt.
+#[test]
+fn a_transport_deferred_delivery_is_still_marked_seen() {
+    run_composed_app_runtime_test("transport-deferred-marks-seen", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let account_id_hex = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap()
+            .account_id_hex;
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.set_audit_log_settings(crate::AuditLogSettings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client.create_group("deferred fence", &[]).await.unwrap();
+        let route = UndecryptableProbeRoute {
+            account_id_hex,
+            nostr_group_id_hex: app
+                .group("alice", &hex::encode(group_id.as_slice()))
+                .unwrap()
+                .expect("local group projection")
+                .nostr_routing
+                .nostr_group_id_hex,
+            group_id,
+        };
+
+        let created_at = crate::unix_now_seconds() - 1_000;
+        let deferred = route.probe(created_at, "retained-below-the-cap");
+        let deferred_id = hex::encode(deferred.message.id.as_slice());
+        client
+            .ingest_received_delivery(deferred)
+            .await
+            .expect("a retained undecryptable object completes its ingest pass");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &deferred_id),
+            vec!["transport_deferred".to_owned()],
+            "below the cap the engine retains the object durably",
+        );
+        assert!(
+            client.seen_events_index.contains(&deferred_id),
+            "a durably retained object must still be deduplicated by the seen index",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(created_at),
+            "and it still carries the relay `since` floor forward",
+        );
+    });
+}
+
+/// The same rule at the catch-up drain seam: a refused delivery must leave both
+/// the seen index and the transport cursor untouched there too, so the relay
+/// re-serves it on the next drain instead of the app skipping it.
+#[test]
+fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
+    run_composed_app_runtime_test("refused-ingest-drain-seam", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let (app, mut client, route) =
+            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+
+        let refused = epoch_gap_probe(
+            &route.nostr_group_id_hex,
+            filled_through + 500,
+            "refused-in-the-drain",
+        );
+        let refused_id = refused.id.clone();
+        inject_epoch_gap_probe(&app, refused.clone()).await;
+        client.sync().await.expect("the drain must complete");
+
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned()],
+            "the backlog must be full, so the drain's object is refused",
+        );
+        assert!(
+            !client.seen_events_index.contains(&refused_id),
+            "the drain must not mark a refused object seen",
+        );
+        assert_eq!(
+            client.state.last_transport_timestamp,
+            Some(filled_through),
+            "nor carry the relay `since` floor past it",
+        );
+
+        // The relay re-serves it on the next drain, and the drain ingests it
+        // again rather than counting it as an already-seen skip.
+        inject_epoch_gap_probe(&app, refused).await;
+        client.sync().await.expect("the second drain must complete");
+        assert_eq!(
+            recorded_ingest_outcomes(&app, &refused_id),
+            vec!["resource_refused".to_owned(), "resource_refused".to_owned()],
+            "the re-served object must reach the engine again",
+        );
+    });
 }
 
 /// Every SQLite database this app can open, plus the root runtime lease, must

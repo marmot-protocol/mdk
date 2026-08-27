@@ -44,6 +44,8 @@ pub enum ConnectorError {
     InvalidStreamBeginRequestId,
     #[error("stream begin request id was reused with different inputs")]
     StreamBeginRequestConflict,
+    #[error("stream preview idempotency key was reused with different inputs")]
+    StreamPreviewIdempotencyConflict,
 }
 
 impl ConnectorError {
@@ -69,6 +71,7 @@ impl ConnectorError {
             Self::StreamCapabilityDenied => "stream_capability_denied",
             Self::InvalidStreamBeginRequestId => "invalid_stream_begin_request_id",
             Self::StreamBeginRequestConflict => "stream_begin_request_conflict",
+            Self::StreamPreviewIdempotencyConflict => "stream_preview_idempotency_conflict",
         }
     }
 
@@ -92,6 +95,9 @@ impl ConnectorError {
             Self::InvalidStreamBeginRequestId => "stream begin request id is invalid",
             Self::StreamBeginRequestConflict => {
                 "stream begin request id was reused with different inputs"
+            }
+            Self::StreamPreviewIdempotencyConflict => {
+                "stream preview idempotency key was reused with different inputs"
             }
             Self::Io(_) => "connector I/O failed",
             Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",

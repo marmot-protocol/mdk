@@ -1486,6 +1486,7 @@ impl<S: StorageProvider> Engine<S> {
                 let after_avatar = avatar_component_snapshot(&mls_group);
 
                 // Update our per-group state machine.
+                self.invalidate_deferred_peel_candidate_cache(&group_id);
                 self.epoch_manager.set_stable(group_id.clone(), after);
                 self.drop_self_remove_auto_commit_schedules_for_group(&group_id);
                 // Proposal-arrival schedule signals are source-epoch
@@ -2022,6 +2023,7 @@ impl<S: StorageProvider> Engine<S> {
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(group_id);
         self.epoch_manager.begin_pending(
             group_id.clone(),
             pre_commit_epoch,
@@ -2531,8 +2533,11 @@ impl<S: StorageProvider> Engine<S> {
             // (panic, early error, async cancel) so the live group
             // state never leaks past this scope as the past-snapshot
             // state.
-            let guard =
-                SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
+            let guard = SnapshotRollbackGuard::create_group_state(
+                &self.storage,
+                group_id.clone(),
+                restore_snapshot,
+            )?;
             let (ctx, message_retention_seconds) =
                 match self.context_from_group_snapshot(group_id, &snapshot_name) {
                     Ok(Some(context)) => context,
@@ -2613,10 +2618,14 @@ impl<S: StorageProvider> Engine<S> {
             current_epoch.0,
             hex::encode(&hasher.finalize()[..8])
         );
-        let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_name)?;
+        let guard = SnapshotRollbackGuard::create_group_state(
+            &self.storage,
+            group_id.clone(),
+            restore_name,
+        )?;
         let resolved = match self
             .storage
-            .rollback_group_to_snapshot(group_id, &snapshot_name)
+            .rollback_group_state_to_snapshot(group_id, &snapshot_name)
         {
             Ok(()) => {
                 let provider =
@@ -2683,7 +2692,7 @@ impl<S: StorageProvider> Engine<S> {
         EngineError,
     > {
         self.storage
-            .rollback_group_to_snapshot(group_id, snapshot_name)?;
+            .rollback_group_state_to_snapshot(group_id, snapshot_name)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mls_group = MlsGroup::load(
@@ -2856,6 +2865,7 @@ mod tests {
         let halted = CandidateBranchPeel {
             contested: true,
             contexts: Vec::new(),
+            replay_probe_count: 0,
         };
 
         let sweep = DeferredPeelSweep::over_branches(&halted);
@@ -2879,6 +2889,7 @@ mod tests {
         let uncontested = CandidateBranchPeel {
             contested: false,
             contexts: Vec::new(),
+            replay_probe_count: 0,
         };
 
         for sweep in [

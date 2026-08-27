@@ -262,6 +262,9 @@ pub enum TimelineUpdateTrigger {
     AgentActivity,
     AgentOperation,
     GroupSystem,
+    /// A row carrying an app-defined custom kind (one MDK assigns no typed
+    /// semantics to) was added or updated.
+    CustomEvent,
     DeliveryOrSendStateChanged,
     ReceiptChanged,
     SnapshotRefresh,
@@ -519,16 +522,13 @@ impl SqliteAccountStorage {
             // incremental path must reproject both the old projection dependents
             // and the new ones. Otherwise retargeting a reaction/delete/edit
             // would leave the old target materialized with stale modifier state.
+            // Every kind — typed or app-defined custom — has a complete affected
+            // set, so projection is always incremental; no full-group rebuild.
             let existing_event = app_event_projection_parts_tx(
                 &conn,
                 &event.group_id_hex,
                 &event.message_id_hex,
             )?;
-            let can_incrementally_project = can_project_record_app_event_incrementally(event.kind)
-                && existing_event
-                    .as_ref()
-                    .map(|(kind, _)| can_project_record_app_event_incrementally(*kind))
-                    .unwrap_or(true);
             let existing_affected_message_ids = if let Some((existing_kind, existing_tags)) =
                 &existing_event
             {
@@ -597,16 +597,12 @@ impl SqliteAccountStorage {
             .storage()?;
             replace_encrypted_media_secret_references_tx(&conn, event)?;
             upsert_message_modifier_edges_tx(&conn, event)?;
-            if can_incrementally_project {
-                for message_id in &affected_message_ids {
-                    upsert_message_timeline_projection_for_message_tx(
-                        &conn,
-                        &event.group_id_hex,
-                        message_id,
-                    )?;
-                }
-            } else {
-                rebuild_message_timeline_for_group_tx(&conn, &event.group_id_hex)?;
+            for message_id in &affected_message_ids {
+                upsert_message_timeline_projection_for_message_tx(
+                    &conn,
+                    &event.group_id_hex,
+                    message_id,
+                )?;
             }
             let messages = timeline_records_by_ids_tx(
                 &conn,
@@ -1397,20 +1393,6 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     Ok(())
 }
 
-fn can_project_record_app_event_incrementally(kind: u64) -> bool {
-    matches!(
-        kind,
-        MARMOT_APP_EVENT_KIND_CHAT
-            | MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-            | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-            | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-            | MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
-            | MARMOT_APP_EVENT_KIND_REACTION
-            | MARMOT_APP_EVENT_KIND_DELETE
-            | MARMOT_APP_EVENT_KIND_EDIT
-    )
-}
-
 fn app_event_projection_parts_tx(
     tx: &Connection,
     group_id_hex: &str,
@@ -1514,7 +1496,11 @@ fn project_single_message_timeline_tx(
             }
             timeline_row_from_stream_start(&event)
         }
-        _ => return Ok(None),
+        // Modifier kinds never get a row of their own: reactions aggregate onto
+        // their target and deletes tombstone it. Every other kind — including
+        // app-defined custom kinds — projects a generic row.
+        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE => return Ok(None),
+        _ => timeline_row_from_custom_event(&event),
     };
 
     if event.invalidated {
@@ -2225,7 +2211,13 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
                 }
             }
         }
-        _ => {}
+        // App-defined custom kinds project a standalone self row, and rows
+        // that replied to them re-render their hydrated preview, same as a
+        // chat-kind event.
+        _ => {
+            ids.insert(message_id_hex.to_owned());
+            reply_preview_targets.insert(message_id_hex.to_owned());
+        }
     }
     if include_reply_preview_dependents {
         let reply_targets = reply_preview_targets.into_iter().collect::<Vec<_>>();
@@ -2436,6 +2428,9 @@ fn timeline_trigger_for_event_row(
                 TimelineUpdateTrigger::ReactionRemoved
             }
         }
+        // The custom-kind row itself signals CustomEvent; any other row reached
+        // here is a dependent reprojection (e.g. a reply preview re-hydration).
+        _ if row.message_id_hex == event_message_id_hex => TimelineUpdateTrigger::CustomEvent,
         _ => TimelineUpdateTrigger::MessageEditedOrReprojected,
     }
 }
@@ -2863,7 +2858,16 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             // mutate canonical content, so they are skipped entirely.
             MARMOT_APP_EVENT_KIND_REACTION if !event.invalidated => reactions.push(event.clone()),
             MARMOT_APP_EVENT_KIND_DELETE if !event.invalidated => deletes.push(event.clone()),
-            _ => {}
+            // Modifier kinds never get a row of their own. Every other kind —
+            // including app-defined custom kinds — projects a generic row.
+            MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE => {}
+            _ => {
+                let mut row = timeline_row_from_custom_event(event);
+                if event.invalidated {
+                    row.invalidation_status = Some(invalidation_status(event));
+                }
+                timeline.insert(event.message_id_hex.clone(), row);
+            }
         }
     }
 
@@ -2997,6 +3001,17 @@ fn timeline_row_from_app_event(event: &RawAppEvent) -> TimelineRow {
         deleted: false,
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+    }
+}
+
+/// App-defined custom kinds own their tag semantics: an `e` tag may mean
+/// anything to the app, so it is never interpreted as MDK reply metadata.
+/// Ordinary chat replies can still target a custom row — reply linkage is
+/// derived from the replying event's own tags, not the target's.
+fn timeline_row_from_custom_event(event: &RawAppEvent) -> TimelineRow {
+    TimelineRow {
+        reply_to_message_id_hex: None,
+        ..timeline_row_from_app_event(event)
     }
 }
 

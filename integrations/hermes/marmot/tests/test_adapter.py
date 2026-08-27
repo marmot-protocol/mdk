@@ -1938,7 +1938,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
             async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
@@ -2028,7 +2028,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2099,7 +2099,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "policy_max_plaintext_frame_len": 4,
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2153,7 +2153,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2189,7 +2189,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2236,7 +2236,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2284,7 +2284,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
             async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
@@ -2329,7 +2329,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2394,7 +2394,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2499,7 +2499,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
             async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
@@ -2563,7 +2563,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -2665,7 +2665,7 @@ class _DeliveryRoutingFakeClient:
             "quic_candidates": list(quic_candidates),
         }
 
-    async def stream_append(self, stream_id_hex, stream_capability, append_text):
+    async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
         self.stream_appends.append((stream_id_hex, append_text))
         return {"type": "ack"}
 
@@ -3361,7 +3361,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 self.appends.append((stream_id_hex, append_text))
                 if self.fail_next:
                     self.fail_next = False
@@ -3460,6 +3460,95 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await adapter._inbound_queue.join()
 
         self.assertEqual(len(dispatched), 1)
+
+    async def test_shed_inbound_id_remains_replayable_after_queue_capacity_recovers(self):
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "retry me",
+            "mentions_self": True,
+        }
+        adapter = self._adapter(client=object())
+        adapter._inbound_queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=1)
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def blocking_turn():
+            blocker_started.set()
+            await release_blocker.wait()
+
+        adapter._inbound_queue.enqueue(event["group_id_hex"], blocking_turn)
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+
+        await adapter._handle_control_event(wire_event(event))
+        self.assertNotIn(event["message_id_hex"], adapter._recent_inbound_ids)
+
+        release_blocker.set()
+        await adapter._inbound_queue.join()
+        await adapter._handle_control_event(wire_event(event))
+        await adapter._inbound_queue.join()
+
+        self.assertEqual([message.text for message in adapter.events], ["retry me"])
+
+    async def test_debounced_shed_releases_every_source_id_for_replay(self):
+        event = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "retry batch",
+            "mentions_self": True,
+        }
+        sibling = dict(
+            event,
+            message_id_hex="55" * 32,
+            text="second source",
+        )
+        adapter = self._adapter(client=object(), extra={"debounce_ms": 60_000})
+        adapter._inbound_queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=1)
+        blocker_started = asyncio.Event()
+        release_blocker = asyncio.Event()
+
+        async def blocking_turn():
+            blocker_started.set()
+            await release_blocker.wait()
+
+        adapter._inbound_queue.enqueue(event["group_id_hex"], blocking_turn)
+        await asyncio.wait_for(blocker_started.wait(), timeout=1)
+
+        await adapter._handle_control_event(wire_event(event))
+        await adapter._handle_control_event(wire_event(sibling))
+        await adapter._handle_control_event(wire_event(event))
+        key = adapter._debounce_key(event)
+        self.assertEqual(len(adapter._debounce_pending[key]), 2)
+        timer = adapter._debounce_tasks[key]
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        await adapter._flush_debounced(key)
+
+        for source in (event, sibling):
+            self.assertNotIn(source["message_id_hex"], adapter._recent_inbound_ids)
+            self.assertNotIn(source["message_id_hex"], adapter._pending_inbound_ids)
+
+        release_blocker.set()
+        await adapter._inbound_queue.join()
+        await adapter._handle_control_event(wire_event(event))
+        await adapter._handle_control_event(wire_event(sibling))
+        timer = adapter._debounce_tasks[key]
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        await adapter._flush_debounced(key)
+        await adapter._inbound_queue.join()
+
+        self.assertEqual(len(adapter.events), 1)
+        self.assertIn("retry batch", adapter.events[0].text)
+        self.assertIn("second source", adapter.events[0].text)
+        for source in (event, sibling):
+            self.assertIn(source["message_id_hex"], adapter._recent_inbound_ids)
 
     # --- Behavior 3: stream_progress wire type --------------------------------
     async def test_stream_progress_sends_progress_wire_type(self):
@@ -4223,6 +4312,153 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.request_ids[1], client.request_ids[0])
         self.assertEqual(stream.stream_capability, "33" * 32)
 
+    async def test_preview_mutation_retries_reuse_keys_and_keep_finalize_aligned(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.attempt_keys = {"append": [], "status": [], "progress": []}
+                self.applied_keys = set()
+                self.records = []
+                self.finalize_calls = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def _preview(self, operation, record_type, text, idempotency_key):
+                self.attempt_keys[operation].append(idempotency_key)
+                if idempotency_key not in self.applied_keys:
+                    self.applied_keys.add(idempotency_key)
+                    self.records.append((record_type, text))
+                    raise adapter_module.AgentControlError(
+                        f"timed out waiting for {operation}",
+                        code="timeout",
+                        retryable=True,
+                    )
+                return {"type": "ack"}
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
+                return await self._preview("append", adapter_module.TEXT_DELTA_RECORD, append_text, idempotency_key)
+
+            async def stream_status(self, stream_id_hex, stream_capability, status_text, idempotency_key=None):
+                return await self._preview("status", adapter_module.STATUS_RECORD, status_text, idempotency_key)
+
+            async def stream_progress(self, stream_id_hex, stream_capability, progress_text, idempotency_key=None):
+                return await self._preview("progress", adapter_module.PROGRESS_DELTA_RECORD, progress_text, idempotency_key)
+
+            async def stream_finalize(
+                self,
+                stream_id_hex,
+                stream_capability,
+                final_text,
+                transcript_hash_hex,
+                chunk_count,
+                idempotency_key=None,
+            ):
+                self.finalize_calls.append((transcript_hash_hex, chunk_count, idempotency_key))
+                transcript = adapter_module.AgentTextStreamTranscript(
+                    stream_id_hex,
+                    "66" * 32,
+                    chunk_bytes=1024,
+                )
+                for record_type, text in self.records:
+                    transcript._append_record(record_type, text)
+                assert transcript.hash_hex == transcript_hash_hex
+                assert transcript.chunk_count == chunk_count
+                return {
+                    "type": "stream_finalized",
+                    "stream_id_hex": stream_id_hex,
+                    "message_ids_hex": ["77" * 32],
+                }
+
+        fake_client = FakeClient()
+        stream = await adapter_module.MarmotLiveStream.begin(
+            client=fake_client,
+            account_id_hex="11" * 32,
+            group_id_hex="22" * 32,
+            quic_candidates=["quic://127.0.0.1:4433"],
+            chunk_bytes=1024,
+        )
+        await stream.append_replacement("hello")
+        await stream.status("thinking")
+        await stream.progress(" halfway")
+        finalized = await stream.finalize("hello")
+
+        self.assertEqual(finalized["type"], "stream_finalized")
+        for operation in ("append", "status", "progress"):
+            self.assertEqual(len(fake_client.attempt_keys[operation]), 2)
+            self.assertTrue(fake_client.attempt_keys[operation][0])
+            self.assertEqual(
+                fake_client.attempt_keys[operation][1],
+                fake_client.attempt_keys[operation][0],
+            )
+        self.assertEqual(len(fake_client.records), 3)
+        self.assertEqual(len(fake_client.finalize_calls), 1)
+        self.assertTrue(fake_client.finalize_calls[0][2])
+
+    async def test_exhausted_preview_retry_blocks_a_different_pending_mutation(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.append_calls = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(
+                self,
+                stream_id_hex,
+                stream_capability,
+                append_text,
+                idempotency_key=None,
+            ):
+                self.append_calls.append((append_text, idempotency_key))
+                raise adapter_module.AgentControlError(
+                    "timed out waiting for append",
+                    code="timeout",
+                    retryable=True,
+                )
+
+        fake_client = FakeClient()
+        stream = await adapter_module.MarmotLiveStream.begin(
+            client=fake_client,
+            account_id_hex="11" * 32,
+            group_id_hex="22" * 32,
+            quic_candidates=(),
+            chunk_bytes=1024,
+        )
+
+        with unittest.mock.patch.object(adapter_module, "STREAM_PREVIEW_RETRY_BACKOFF_S", ()):
+            with self.assertRaises(adapter_module.AgentControlError):
+                await stream.append_replacement("first")
+            with self.assertRaises(adapter_module.AgentControlError) as raised:
+                await stream.append_replacement("different")
+
+        self.assertEqual(raised.exception.code, "preview_mutation_pending")
+        self.assertEqual(len(fake_client.append_calls), 1)
+        self.assertTrue(fake_client.append_calls[0][1])
+
     async def test_stream_finalize_retries_retryable_failure_with_same_idempotency_key(self):
         adapter_module = self.adapter_module
 
@@ -4240,7 +4476,7 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
             async def stream_finalize(
@@ -4309,7 +4545,7 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text, idempotency_key=None):
                 return {"type": "ack"}
 
             async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):

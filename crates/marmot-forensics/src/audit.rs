@@ -1070,6 +1070,18 @@ pub enum AuditEventKind {
         /// field existed stay readable; absent means "not recorded", not zero.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skipped: Option<u64>,
+        /// The subset of `deliveries` the engine refused under a local resource
+        /// bound (`IngestOutcome::ResourceRefused`) and therefore did not
+        /// retain. Counted inside `deliveries`, not beside it: the delivery was
+        /// received and ingested, and `deliveries` keeps its established
+        /// meaning. `deliveries - refused` is what the drain durably recovered,
+        /// so a run where the two are equal fetched history it could not keep —
+        /// per-drain cap saturation, readable straight off the row instead of
+        /// reconstructed from raw `ingest_outcome` rows. Optional only so rows
+        /// written before this field existed stay readable; absent means "not
+        /// recorded", not zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor_before_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1132,6 +1144,13 @@ pub enum AuditEventKind {
         /// field existed stay readable; absent means "not recorded", not zero.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skipped: Option<u64>,
+        /// The subset of `deliveries` the engine refused under a local resource
+        /// bound and therefore did not retain; see
+        /// [`Self::SyncDrain::refused`]. `deliveries - refused` is what this
+        /// replay durably recovered, so a replay whose two counts are equal
+        /// re-fetched history it could not keep and recovered nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<u64>,
         local_epoch_before: u64,
         local_epoch_after: u64,
         group_advanced: bool,
@@ -1155,6 +1174,13 @@ pub enum AuditEventKind {
         /// field existed stay readable; absent means "not recorded", not zero.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skipped: Option<u64>,
+        /// The subset of `deliveries` the engine refused under a local resource
+        /// bound and therefore did not retain; see
+        /// [`Self::SyncDrain::refused`]. `deliveries - refused` is what this
+        /// replay durably recovered, so a replay whose two counts are equal
+        /// re-fetched history it could not keep and recovered nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<u64>,
         local_epoch_before: u64,
         local_epoch_after: u64,
         group_advanced: bool,

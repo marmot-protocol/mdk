@@ -18,14 +18,37 @@ use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+#[derive(Clone, Copy)]
+enum RestoreScope {
+    Full,
+    GroupState,
+}
+
 pub(super) fn rollback(
     store: &SqliteAccountStorage,
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    rollback_with_scope(store, group_id, name, RestoreScope::Full)
+}
+
+pub(super) fn rollback_group_state(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
+    rollback_with_scope(store, group_id, name, RestoreScope::GroupState)
+}
+
+fn rollback_with_scope(
+    store: &SqliteAccountStorage,
+    group_id: &GroupId,
+    name: &str,
+    scope: RestoreScope,
+) -> StorageResult<()> {
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
-        return rollback_on_connection(&conn, group_id, name);
+        return rollback_on_connection(&conn, group_id, name, scope);
     }
 
     retry_on_busy(|| {
@@ -34,7 +57,7 @@ pub(super) fn rollback(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
-        rollback_snapshot(&tx, group_id, name, &mls_group_key)?;
+        rollback_snapshot(&tx, group_id, name, &mls_group_key, scope)?;
         tx.commit().storage()?;
         Ok(())
     })
@@ -44,9 +67,10 @@ fn rollback_on_connection(
     conn: &rusqlite::Connection,
     group_id: &GroupId,
     name: &str,
+    scope: RestoreScope,
 ) -> StorageResult<()> {
     let mls_group_key = mls_group_key(group_id)?;
-    rollback_snapshot(conn, group_id, name, &mls_group_key)
+    rollback_snapshot(conn, group_id, name, &mls_group_key, scope)
 }
 
 fn rollback_snapshot(
@@ -54,6 +78,7 @@ fn rollback_snapshot(
     group_id: &GroupId,
     name: &str,
     mls_group_key: &[u8],
+    scope: RestoreScope,
 ) -> StorageResult<()> {
     let snapshot_blob = SensitiveBytes::new(
         conn.query_row(
@@ -67,7 +92,7 @@ fn rollback_snapshot(
         .ok_or_else(|| StorageError::SnapshotMissing(name.to_string()))?,
     );
     let snapshot = snapshot_format::decode(snapshot_blob.as_slice())?;
-    restore_snapshot(conn, group_id, &snapshot, mls_group_key)
+    restore_snapshot(conn, group_id, &snapshot, mls_group_key, scope)
 }
 
 #[cfg(feature = "test-conformance-replay")]
@@ -94,7 +119,13 @@ pub(super) fn import(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .storage()?;
-        restore_snapshot(&tx, group_id, &snapshot.group, &mls_group_key)?;
+        restore_snapshot(
+            &tx,
+            group_id,
+            &snapshot.group,
+            &mls_group_key,
+            RestoreScope::Full,
+        )?;
         convergence_pass(&tx, group_id, snapshot.convergence_pass.as_ref())?;
         tx.commit().storage()?;
         Ok(())
@@ -127,16 +158,19 @@ fn restore_snapshot(
     group_id: &GroupId,
     snapshot: &Snapshot,
     mls_group_key: &[u8],
+    scope: RestoreScope,
 ) -> StorageResult<()> {
     group(conn, group_id, &snapshot.group)?;
-    // A state-scoped snapshot (`None`) never captured the message ledger or
-    // outbound queue, so rollback must leave the live rows alone rather than
-    // restore an empty image.
-    if let Some(snapshot_messages) = &snapshot.messages {
-        messages(conn, group_id, snapshot_messages)?;
-    }
-    if let Some(snapshot_queued) = &snapshot.queued_outbound {
-        queued_outbound(conn, group_id, snapshot_queued)?;
+    if matches!(scope, RestoreScope::Full) {
+        // A state-scoped snapshot (`None`) never captured the message ledger
+        // or outbound queue, so even full rollback leaves those live rows
+        // alone rather than restoring an empty image.
+        if let Some(snapshot_messages) = &snapshot.messages {
+            messages(conn, group_id, snapshot_messages)?;
+        }
+        if let Some(snapshot_queued) = &snapshot.queued_outbound {
+            queued_outbound(conn, group_id, snapshot_queued)?;
+        }
     }
     member_capabilities(conn, group_id, &snapshot.member_caps)?;
     convergence_policy(conn, group_id, snapshot.convergence_policy.as_deref())?;

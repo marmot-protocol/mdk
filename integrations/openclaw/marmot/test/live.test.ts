@@ -291,6 +291,73 @@ describe("MarmotLivePreview", () => {
     expect(live.isActive).toBe(false);
   });
 
+  it("does not commit an append whose response arrives after cancellation", async () => {
+    const calls = emptyCalls();
+    let releaseAppend: () => void = () => undefined;
+    let appendStarted: () => void = () => undefined;
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      appendStarted = resolve;
+    });
+    const client = {
+      ...stubStreamClient(calls),
+      async streamAppend(streamId: string, capability: string, text: string) {
+        calls.append.push({ streamId, capability, text });
+        appendStarted();
+        await appendGate;
+        return { type: "ack" };
+      },
+    } as unknown as StreamControlClient;
+    const live = previewWithClient(client);
+    await live.begin();
+
+    const updateCall = live.update("hello");
+    await started;
+    await live.cancel("superseded");
+    releaseAppend();
+
+    await expect(updateCall).rejects.toThrow(/finalized or cancelled/);
+    expect(calls.append).toHaveLength(1);
+    expect(live.currentText).toBe("");
+  });
+
+  it("does not retry stream_finalize after cancellation wins the backoff race", async () => {
+    const calls = emptyCalls();
+    let firstFinalizeFailed: () => void = () => undefined;
+    const failed = new Promise<void>((resolve) => {
+      firstFinalizeFailed = resolve;
+    });
+    const client = {
+      ...stubStreamClient(calls),
+      async streamFinalize(
+        streamId: string,
+        capability: string,
+        finalText: string,
+        hash: string,
+        count: number,
+        idempotencyKey?: string,
+      ) {
+        calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
+        firstFinalizeFailed();
+        throw new AgentControlError("timed out waiting for stream finalize", {
+          code: "timeout",
+          retryable: true,
+        });
+      },
+    } as unknown as StreamControlClient;
+    const live = previewWithClient(client);
+    await live.update("hello");
+
+    const finalizeCall = live.finalize("hello");
+    await failed;
+    await live.cancel("superseded");
+
+    await expect(finalizeCall).rejects.toThrow(/finalized or cancelled/);
+    expect(calls.finalize).toHaveLength(1);
+  });
+
   it.each([
     ["appendDelta", (live: MarmotLivePreview) => live.appendDelta("hi"), (calls: Calls) => calls.append],
     ["status", (live: MarmotLivePreview) => live.status("thinking"), (calls: Calls) => calls.status],
@@ -520,5 +587,96 @@ describe("MarmotLivePreview", () => {
     await live.finalize("hello world");
     expect(calls.append.map((a) => a.text)).toEqual(["hello world"]);
     expect(calls.finalize[0]).toMatchObject({ hash: SINGLE_TEXT_HASH, count: 1 });
+  });
+
+  it("deduplicates post-success timeout retries for append, status, and progress", async () => {
+    const calls = emptyCalls();
+    const serverTranscript = new AgentTextStreamTranscript(
+      Buffer.from(STREAM_ID, "hex"),
+      Buffer.from(START_ID, "hex"),
+    );
+    const appliedKeys = new Set<string>();
+    const attempts = new Map<string, string[]>();
+
+    const applyThenLoseFirstAck = async (
+      operation: string,
+      key: string | undefined,
+      apply: () => void,
+    ) => {
+      expect(key).toBeTruthy();
+      const normalizedKey = key!;
+      const operationAttempts = attempts.get(operation) ?? [];
+      operationAttempts.push(normalizedKey);
+      attempts.set(operation, operationAttempts);
+      const serverKey = `${operation}:${normalizedKey}`;
+      if (!appliedKeys.has(serverKey)) {
+        appliedKeys.add(serverKey);
+        apply();
+        // Model the 8s preview request timeout firing after wn-agent committed
+        // the record but before its Ack reached the client.
+        throw new AgentControlError("preview Ack lost after server apply", {
+          code: "request_timeout",
+          retryable: true,
+        });
+      }
+      return { type: "ack" };
+    };
+
+    const client = {
+      ...stubStreamClient(calls),
+      async streamAppend(streamId: string, capability: string, text: string, key?: string) {
+        return applyThenLoseFirstAck("append", key, () => {
+          calls.append.push({ streamId, capability, text });
+          serverTranscript.appendText(text);
+        });
+      },
+      async streamStatus(streamId: string, capability: string, text: string, key?: string) {
+        return applyThenLoseFirstAck("status", key, () => {
+          calls.status.push({ streamId, capability, text });
+          serverTranscript.appendStatus(text);
+        });
+      },
+      async streamProgress(streamId: string, capability: string, text: string, key?: string) {
+        return applyThenLoseFirstAck("progress", key, () => {
+          calls.progress.push({ streamId, capability, text });
+          serverTranscript.appendProgress(text);
+        });
+      },
+      async streamFinalize(
+        streamId: string,
+        capability: string,
+        finalText: string,
+        hash: string,
+        count: number,
+        idempotencyKey?: string,
+      ) {
+        calls.finalize.push({ streamId, capability, finalText, hash, count, idempotencyKey });
+        expect(hash).toBe(serverTranscript.hashHex);
+        expect(count).toBe(serverTranscript.chunkCount);
+        return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
+      },
+    } as unknown as StreamControlClient;
+    const live = previewWithClient(client);
+
+    await live.update("hello world");
+    await live.status("thinking");
+    await live.progress("searching");
+    await live.finalize("hello world");
+
+    for (const operation of ["append", "status", "progress"]) {
+      const operationAttempts = attempts.get(operation);
+      expect(operationAttempts).toHaveLength(2);
+      expect(operationAttempts?.[1]).toBe(operationAttempts?.[0]);
+    }
+    expect(calls.append.map((record) => record.text)).toEqual(["hello world"]);
+    expect(calls.status.map((record) => record.text)).toEqual(["thinking"]);
+    expect(calls.progress.map((record) => record.text)).toEqual(["searching"]);
+    expect(live.currentText).toBe("hello world");
+    expect(calls.finalize).toHaveLength(1);
+    expect(calls.finalize[0]).toMatchObject({
+      finalText: "hello world",
+      hash: serverTranscript.hashHex,
+      count: serverTranscript.chunkCount,
+    });
   });
 });
