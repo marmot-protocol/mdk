@@ -9,6 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Multi-relay full-history recovery now requires end-of-stored-events from
+  every endpoint in the activation's frozen route snapshot. A fast, empty
+  relay or repeated unavailability can no longer falsely complete replay and
+  clear its durable recovery intent.
+  ([#1578](https://github.com/marmot-protocol/mdk/issues/1578))
+
 ## [0.9.15] - 2026-08-25
 
 ### Added

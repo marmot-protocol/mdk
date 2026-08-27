@@ -344,10 +344,10 @@ pub(crate) const EPOCH_BACKFILL_EXECUTION_QUANTUM: Duration = Duration::from_sec
 /// yields first and a later seam resubscribes. Production EOSE completion
 /// therefore requires the gate to report within that quantum (or before an
 /// adapter-closed result). A worker-quantum yield is only a scheduling event:
-/// it paces a later resubscription but does not spend the EOSE-failure budget
-/// or unlock the weaker quiescence fallback. Keeping the budgets distinct
-/// makes long-replay slicing independent from that fallback policy, and
-/// test-policy builds can exercise either boundary directly.
+/// it paces a later resubscription but does not spend the EOSE-failure ordinal.
+/// An unavailable required relay leaves the durable intent pending; bounded
+/// worker quanta and paced retries preserve availability without weakening the
+/// proof that stored history was served.
 pub(crate) const EPOCH_BACKFILL_EOSE_WAIT: Duration = Duration::from_secs(30);
 /// How long an epoch-gap backfill whose replay went unconfirmed waits before
 /// the automatic seams may try it again, doubling per attempt up to
@@ -364,18 +364,6 @@ pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15
 /// intent is durable, so a five-minute floor between attempts costs nothing but
 /// leaves recovery responsive when the relay returns.
 pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
-/// Attempts an intent spends on the end-of-stored-events gate before its drain
-/// falls back to the quiescence contract.
-///
-/// The gate requires every subscription the replay issued to be served, and a
-/// group route may carry a single relay (group routing requires only a
-/// non-empty endpoint set). One unreachable relay would otherwise leave the
-/// gate permanently unclearable and the account permanently unhealed — a worse
-/// failure than the one the gate fixes. After this many unconfirmed attempts
-/// the replay drains on the pre-gate contract instead, which still recovers
-/// whatever the reachable relays send; the audit row records that weaker claim
-/// as `quiescence_fallback` rather than passing it off as a served history.
-pub(crate) const EPOCH_BACKFILL_EOSE_ATTEMPT_LIMIT: u64 = 3;
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 /// Local worker operations include SQLite's bounded busy retry but no relay or
 /// blob transfer. A missing response beyond this point indicates a wedged

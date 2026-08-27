@@ -254,13 +254,14 @@ pub enum EpochBackfillActivationOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpochBackfillCompletionKind {
-    /// Every subscription the replay issued was reported end-of-stored-events
-    /// by a relay: the account's stored history was served in full.
+    /// Every endpoint-scoped subscription attempt in the replay's frozen route
+    /// snapshot was reported end-of-stored-events: the account's stored
+    /// history was served in full.
     EndOfStoredEvents,
-    /// The end-of-stored-events gate never cleared within its attempt budget,
-    /// so this attempt fell back to draining until the relays went quiet. The
-    /// replay recovered whatever the relays sent, but nothing confirms that was
-    /// all of it — the weaker guarantee that shipped before the gate existed.
+    /// Legacy completion written by versions that converted a repeatedly
+    /// unconfirmed end-of-stored-events gate into a quiet-relay success. Kept
+    /// solely so historical audit rows remain readable; current recovery never
+    /// emits this weaker claim.
     QuiescenceFallback,
 }
 
@@ -1129,9 +1130,10 @@ pub enum AuditEventKind {
         retry_ordinal: u64,
         duration_ms: u64,
         activation_outcome: EpochBackfillActivationOutcome,
-        /// What ended the drain. A `quiescence_fallback` completion is a
-        /// weaker claim than an `end_of_stored_events` one and must not be read
-        /// as proof the account's stored history was served in full.
+        /// What ended the drain. Historical `quiescence_fallback` values are a
+        /// weaker claim than `end_of_stored_events` and must not be read as
+        /// proof the account's stored history was served in full; current
+        /// recovery emits only endpoint-covered `end_of_stored_events`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion_kind: Option<EpochBackfillCompletionKind>,
         deliveries: u64,

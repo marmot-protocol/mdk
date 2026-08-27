@@ -2876,13 +2876,13 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
 
 /// The account-wide end-of-stored-events gate an unfloored history drain reads.
 ///
-/// It must follow the *live* subscription set across route churn: count every
-/// subscription the current activation issued, stop counting one whose route is
-/// gone, and require a re-issued subscription to be confirmed again rather than
-/// inheriting the previous generation's confirmation. The tracked-subscription
-/// assertions pin the eviction that keeps churned-away ids from accumulating.
+/// A new activation replaces the prior replay snapshot and requires every
+/// re-issued subscription to be confirmed again rather than inheriting the
+/// previous generation's confirmation. The tracked-subscription assertions pin
+/// the separate telemetry eviction that keeps churned-away ids from
+/// accumulating.
 #[tokio::test]
-async fn account_subscription_eose_follows_the_live_subscription_set() {
+async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
     let account_id = MemberId::new(vec![0xB2; 32]);
@@ -2992,6 +2992,145 @@ async fn account_subscription_eose_follows_the_live_subscription_set() {
     assert!(
         !progress.complete(),
         "an account with nothing subscribed cannot have been served"
+    );
+}
+
+/// A whole-account replay is complete only after every endpoint in the route
+/// snapshot used to issue it has served every relevant subscription. A fast,
+/// empty relay must not stand in for a slower relay that holds the missing
+/// history, and a mid-attempt route shrink must not erase that obligation.
+#[tokio::test]
+async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let account_id = MemberId::new(vec![0xC3; 32]);
+    let inbox_a = TransportEndpoint("wss://inbox-a.example".to_owned());
+    let inbox_b = TransportEndpoint("wss://inbox-b.example".to_owned());
+    let group_a = TransportEndpoint("wss://group-a.example".to_owned());
+    let group_b = TransportEndpoint("wss://group-b.example".to_owned());
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0x33; 16]),
+        transport_group_id: vec![0x44; 32],
+        endpoints: vec![group_a.clone(), group_b.clone()],
+    };
+    let inbox_id = NostrSubscription::AccountInbox {
+        account_id: account_id.clone(),
+        endpoints: vec![inbox_a.clone(), inbox_b.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let group_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: group.endpoints.clone(),
+        since: None,
+    }
+    .subscription_id();
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![inbox_a.clone(), inbox_b.clone()],
+            group_subscriptions: vec![group.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    // Relay A is fast but empty. Its EOSE covers neither subscription on B.
+    adapter
+        .handle_relay_eose(inbox_a.clone(), inbox_id.clone())
+        .await;
+    adapter
+        .handle_relay_eose(group_a.clone(), group_id.clone())
+        .await;
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(progress.subscriptions, 2);
+    assert_eq!(progress.with_eose, 2);
+    assert_eq!(progress.relay_subscription_attempts, 4);
+    assert_eq!(progress.relay_subscription_attempts_with_eose, 2);
+    assert!(progress.any());
+    assert!(
+        !progress.complete(),
+        "EOSE from the fast, empty relay must not prove B served its history"
+    );
+
+    // Duplicate callbacks do not advance coverage. B can then serve the
+    // missing event before reporting its own EOSE.
+    adapter
+        .handle_relay_eose(group_a.clone(), group_id.clone())
+        .await;
+    assert_eq!(
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint: group_b.clone(),
+                subscription_id: Some(group_id.clone()),
+                event: group_event("relay-b-only", &group.transport_group_id),
+            })
+            .await
+            .expect("B's stored event is accepted"),
+        1
+    );
+    assert_eq!(
+        adapter
+            .receive()
+            .await
+            .expect("delivery receive succeeds")
+            .expect("B's event is delivered")
+            .source
+            .endpoint,
+        Some(group_b.clone())
+    );
+    adapter
+        .handle_relay_eose(inbox_b.clone(), inbox_id.clone())
+        .await;
+    assert!(
+        !adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete(),
+        "the group subscription still lacks B's EOSE"
+    );
+
+    // An explicit route update may affect the next replay attempt, but it
+    // cannot silently shrink the coverage snapshot of this one.
+    let shrunk_group = TransportGroupSubscription {
+        endpoints: vec![group_a.clone()],
+        ..group.clone()
+    };
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![shrunk_group.clone()],
+            since: None,
+        })
+        .await
+        .expect("route shrink succeeds");
+    let shrunk_group_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: shrunk_group.group_id,
+        transport_group_id: shrunk_group.transport_group_id,
+        endpoints: shrunk_group.endpoints,
+        since: None,
+    }
+    .subscription_id();
+    adapter.handle_relay_eose(group_a, shrunk_group_id).await;
+    assert!(
+        !adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete(),
+        "a route shrink must not complete an older replay attempt"
+    );
+
+    adapter.handle_relay_eose(group_b, group_id).await;
+    assert!(
+        adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete(),
+        "the frozen snapshot completes once B serves its relevant EOSE"
     );
 }
 
