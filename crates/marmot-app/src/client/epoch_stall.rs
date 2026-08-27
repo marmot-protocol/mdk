@@ -1859,6 +1859,39 @@ mod tests {
         );
     }
 
+    /// The durable latch is scoped to the epoch it was gathered at, which is
+    /// what makes a stale row harmless. Nothing persists the voiding
+    /// transitions — they happen on the delivery hot path — so a recovered
+    /// group leaves its last row behind; the first observation at any other
+    /// epoch has to discard it, latch included.
+    #[test]
+    fn a_restored_report_latch_does_not_survive_leaving_its_epoch() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(1);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: T0,
+            },
+        )]);
+
+        // The group moved on and later wedged somewhere else entirely.
+        detector.observe_epoch_passage(&g, EpochId(10), EpochId(11));
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(11), T0 + HOUR_MS);
+        assert_eq!(
+            detector.observe_fruitless_completion([&g]),
+            vec![FruitlessEscalation {
+                group_id: g.clone(),
+                stalled_epoch: 11,
+                completions: 1,
+            }],
+            "a report about the epoch it left cannot silence the epoch it is stuck at now",
+        );
+    }
+
     /// A clock that ran ahead must not wedge the gate for good.
     ///
     /// A mark taken under a dead RTC, a hand-set date, or a saturating
