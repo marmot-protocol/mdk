@@ -509,6 +509,12 @@ pub(crate) struct PendingEpochBackfill {
     pub(crate) groups: HashMap<GroupId, PendingEpochBackfillGroup>,
     /// How many execution tries have started for this pending intent.
     pub(crate) execution_attempts: u32,
+    /// How many drains ended because the EOSE gate timed out or could not be
+    /// observed. Worker-quantum yields do not unlock the weaker fallback.
+    pub(crate) eose_unconfirmed_attempts: u32,
+    /// Consecutive worker-quantum yields with no durable novel progress, used
+    /// only to pace retries without changing the drain-completion contract.
+    pub(crate) no_progress_attempts: u32,
     /// Last deferred audit evidence keyed by the exact deferral seam snapshot.
     pub(crate) last_deferred_audit: Option<EpochBackfillDeferredSnapshot>,
 }
@@ -519,6 +525,8 @@ impl PendingEpochBackfill {
             attempt_id: new_recovery_attempt_id(),
             groups: HashMap::new(),
             execution_attempts: 0,
+            eose_unconfirmed_attempts: 0,
+            no_progress_attempts: 0,
             last_deferred_audit: None,
         }
     }

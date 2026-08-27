@@ -130,6 +130,7 @@ impl Marmot {
             &account_ref,
             AppMessageQuery {
                 group_id_hex: Some(group_id_hex),
+                kinds: None,
                 limit: limit.map(|n| n as usize),
             },
         )?;

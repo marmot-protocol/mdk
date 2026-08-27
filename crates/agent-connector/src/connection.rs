@@ -344,25 +344,43 @@ impl AgentConnector {
                 stream_id_hex,
                 stream_capability,
                 append_text,
+                idempotency_key,
             } => {
-                self.stream_append_response(&stream_id_hex, &stream_capability, append_text)
-                    .await
+                self.stream_append_response(
+                    &stream_id_hex,
+                    &stream_capability,
+                    append_text,
+                    idempotency_key,
+                )
+                .await
             }
             AgentControlRequest::StreamStatus {
                 stream_id_hex,
                 stream_capability,
                 status,
+                idempotency_key,
             } => {
-                self.stream_status_response(&stream_id_hex, &stream_capability, status)
-                    .await
+                self.stream_status_response(
+                    &stream_id_hex,
+                    &stream_capability,
+                    status,
+                    idempotency_key,
+                )
+                .await
             }
             AgentControlRequest::StreamProgress {
                 stream_id_hex,
                 stream_capability,
                 text,
+                idempotency_key,
             } => {
-                self.stream_progress_response(&stream_id_hex, &stream_capability, text)
-                    .await
+                self.stream_progress_response(
+                    &stream_id_hex,
+                    &stream_capability,
+                    text,
+                    idempotency_key,
+                )
+                .await
             }
             AgentControlRequest::StreamFinalize {
                 stream_id_hex,

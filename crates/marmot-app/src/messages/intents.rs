@@ -16,7 +16,10 @@ use serde_json::{Map, Value, json};
 
 use crate::ids::parse_account_id_hex;
 use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
-use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE};
+use crate::{
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+};
 
 /// Nostr pubkey-reference (`p`) tag name.
 pub(crate) const PUBKEY_REF_TAG: &str = "p";
@@ -229,6 +232,15 @@ pub(crate) enum AppMessageIntent {
         content: String,
     },
     PushTokenRemoval {
+        content: String,
+    },
+    /// An app-defined event with an arbitrary non-reserved kind. Tags and
+    /// content pass through verbatim: the intent layer neither derives
+    /// `p`-tags from the content nor shapes the payload, so the caller owns
+    /// the event's semantics end to end.
+    Custom {
+        kind: u64,
+        tags: Vec<Vec<String>>,
         content: String,
     },
 }
@@ -548,7 +560,48 @@ pub(crate) fn build_inner_event(
             vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
             content.clone(),
         )),
+        AppMessageIntent::Custom {
+            kind,
+            tags,
+            content,
+        } => {
+            validate_custom_event_kind(*kind)?;
+            Ok(event(*kind, tags.clone(), content.clone()))
+        }
     }
+}
+
+/// Inner app-event kinds MDK assigns protocol semantics to. The custom-event
+/// path rejects these so an app cannot forge, e.g., a kind-5 delete or a
+/// kind-447 push-token update that other members' clients would act on under
+/// MDK's interpretation.
+const RESERVED_APP_EVENT_KINDS: &[u64] = &[
+    MARMOT_APP_EVENT_KIND_DELETE,
+    MARMOT_APP_EVENT_KIND_REACTION,
+    MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+];
+
+/// True when `kind` is one MDK owns (chat, reactions, edits, agent, group
+/// system, push token). Custom sends must use any other kind.
+pub fn is_reserved_app_event_kind(kind: u64) -> bool {
+    RESERVED_APP_EVENT_KINDS.contains(&kind)
+}
+
+fn validate_custom_event_kind(kind: u64) -> Result<(), AppError> {
+    if is_reserved_app_event_kind(kind) {
+        return Err(AppError::InvalidAppMessagePayload(format!(
+            "custom event kind {kind} is reserved for Marmot protocol use"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_reaction_content(emoji: &str) -> Result<(), AppError> {

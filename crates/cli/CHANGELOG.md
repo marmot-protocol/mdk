@@ -13,6 +13,16 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Apps can send custom chat events with any non-reserved kind and fetch them
+  again by kind. `wn messages send-event <group> <kind> [content]` publishes
+  one (with repeatable `--tag '["name","value"]'` options), while `messages
+  list` and `messages subscribe` take repeatable `--kind` filters. MarmotKit
+  adds `send_custom_event` and a `kinds` filter on `messages` and
+  `subscribe_messages`. Custom kinds materialize as standalone timeline rows
+  with the new `CustomEvent` update trigger; kinds MDK owns (chat, reactions,
+  edits, deletes, agent, group system, push token) are rejected so apps cannot
+  forge protocol events.
+  ([#1544](https://github.com/marmot-protocol/mdk/pull/1544))
 - Local notification projection and UniFFI `NotificationTrigger` now include
   `RemovedFromGroup`, `MadeAdmin`, and `RemovedAsAdmin` for authenticated
   self-affecting membership and admin-role changes. Kind 446 wake delivery

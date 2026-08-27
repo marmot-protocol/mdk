@@ -30,8 +30,6 @@ pub enum HarnessError {
     ControlRejected { method: &'static str, code: String },
     #[error("backend invocation timed out")]
     BackendTimedOut,
-    #[error("backend went idle without producing output")]
-    BackendIdle,
     #[error("backend stream error")]
     BackendStream,
     #[error("backend process failed to start")]
@@ -67,7 +65,6 @@ impl HarnessError {
             Self::UnexpectedResponse { .. } => "unexpected_response",
             Self::ControlRejected { .. } => "control_rejected",
             Self::BackendTimedOut => "backend_timeout",
-            Self::BackendIdle => "backend_idle",
             Self::BackendStream => "backend_stream",
             Self::BackendSpawn => "backend_spawn",
             Self::ArtifactExportsDisabled => "artifact_exports_disabled",

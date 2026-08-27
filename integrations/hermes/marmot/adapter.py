@@ -40,6 +40,7 @@ DEFAULT_SOCKET_HOME = "~/.marmot"
 DEFAULT_STREAM_CHUNK_BYTES = 1024
 AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN = 65519
 TEXT_DELTA_RECORD = 0x01
+PROGRESS_DELTA_RECORD = 0x02
 STATUS_RECORD = 0x03
 TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
@@ -60,6 +61,7 @@ SEND_MEDIA_RETRY_BACKOFF_S = (0.1, 0.3)
 SEND_MEDIA_COMPLETION_TIMEOUT_S = 15 * 60.0
 STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
+STREAM_PREVIEW_RETRY_BACKOFF_S = (0.1, 0.3)
 # Hermes albums and the native Telegram/Discord/Slack batch APIs share a
 # ten-item ceiling. Keeping one Marmot album within that bound also limits the
 # encrypted blobs an all-or-error upload can orphan before publication fails.
@@ -1038,6 +1040,9 @@ class AgentTextStreamTranscript:
     def append_status(self, status: str) -> None:
         self._append_record(STATUS_RECORD, status)
 
+    def append_progress(self, text: str) -> None:
+        self._append_record(PROGRESS_DELTA_RECORD, text)
+
     def _append_record(self, record_type: int, text: str) -> None:
         for chunk in split_text_deltas(text, self.chunk_bytes):
             hasher = hashlib.sha256()
@@ -1443,13 +1448,16 @@ class MarmotAgentControlClient:
         stream_id_hex: str,
         stream_capability: str,
         append_text: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_append",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "stream_capability": _normalize_stream_capability(stream_capability),
                 "append_text": str(append_text or ""),
+                **({"idempotency_key": key} if key else {}),
             },
             timeout=self.preview_request_timeout,
         )
@@ -1459,13 +1467,16 @@ class MarmotAgentControlClient:
         stream_id_hex: str,
         stream_capability: str,
         status: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_status",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "stream_capability": _normalize_stream_capability(stream_capability),
                 "status": str(status or ""),
+                **({"idempotency_key": key} if key else {}),
             },
             timeout=self.preview_request_timeout,
         )
@@ -1475,13 +1486,16 @@ class MarmotAgentControlClient:
         stream_id_hex: str,
         stream_capability: str,
         text: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_progress",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
                 "stream_capability": _normalize_stream_capability(stream_capability),
                 "text": str(text or ""),
+                **({"idempotency_key": key} if key else {}),
             },
             timeout=self.preview_request_timeout,
         )
@@ -1737,6 +1751,36 @@ class MarmotLiveStream:
         )
         self.finalize_idempotency_key = uuid.uuid4().hex
         self.finalized = False
+        self._mutation_lock = asyncio.Lock()
+        self._pending_preview_mutation: Optional[Tuple[str, str, str]] = None
+
+    async def _retry_preview_mutation(
+        self,
+        operation: str,
+        payload: str,
+        mutation: Callable[[str], Awaitable[Dict[str, Any]]],
+    ) -> None:
+        pending = self._pending_preview_mutation
+        if pending is not None and pending[:2] != (operation, payload):
+            raise AgentControlError(
+                "an ambiguous preview mutation must be reconciled first",
+                code="preview_mutation_pending",
+                retryable=True,
+            )
+        key = pending[2] if pending is not None else uuid.uuid4().hex
+        self._pending_preview_mutation = (operation, payload, key)
+        for attempt in range(len(STREAM_PREVIEW_RETRY_BACKOFF_S) + 1):
+            try:
+                await mutation(key)
+                self._pending_preview_mutation = None
+                return
+            except Exception as exc:
+                if not is_retryable(exc):
+                    self._pending_preview_mutation = None
+                    raise
+                if attempt >= len(STREAM_PREVIEW_RETRY_BACKOFF_S):
+                    raise
+                await asyncio.sleep(STREAM_PREVIEW_RETRY_BACKOFF_S[attempt])
 
     @classmethod
     async def begin(
@@ -1793,6 +1837,10 @@ class MarmotLiveStream:
         )
 
     async def append_replacement(self, next_text: str) -> None:
+        async with self._mutation_lock:
+            await self._append_replacement_locked(next_text)
+
+    async def _append_replacement_locked(self, next_text: str) -> None:
         next_text = str(next_text or "")
         suffix = self.text.pending_suffix_for(next_text)
         if not suffix:
@@ -1800,16 +1848,44 @@ class MarmotLiveStream:
         # Commit local transcript/append-only state only AFTER the remote append
         # succeeds, so a failed append leaves the stream consistent and the same
         # text re-appendable (mirrors live.ts update() lines 99-116).
-        await self.client.stream_append(self.stream_id_hex, self.stream_capability, suffix)
+        await self._retry_preview_mutation(
+            "append",
+            suffix,
+            lambda key: self.client.stream_append(
+                self.stream_id_hex, self.stream_capability, suffix, idempotency_key=key
+            )
+        )
         self.transcript.append_text(suffix)
         self.text.commit(next_text)
 
     async def status(self, status: str) -> None:
-        await self.client.stream_status(self.stream_id_hex, self.stream_capability, status)
-        self.transcript.append_status(status)
+        async with self._mutation_lock:
+            await self._retry_preview_mutation(
+                "status",
+                status,
+                lambda key: self.client.stream_status(
+                    self.stream_id_hex, self.stream_capability, status, idempotency_key=key
+                )
+            )
+            self.transcript.append_status(status)
+
+    async def progress(self, text: str) -> None:
+        async with self._mutation_lock:
+            await self._retry_preview_mutation(
+                "progress",
+                text,
+                lambda key: self.client.stream_progress(
+                    self.stream_id_hex, self.stream_capability, text, idempotency_key=key
+                ),
+            )
+            self.transcript.append_progress(text)
 
     async def finalize(self, final_text: str) -> Dict[str, Any]:
-        await self.append_replacement(final_text)
+        async with self._mutation_lock:
+            return await self._finalize_locked(final_text)
+
+    async def _finalize_locked(self, final_text: str) -> Dict[str, Any]:
+        await self._append_replacement_locked(final_text)
         response: Optional[Dict[str, Any]] = None
         for attempt in range(len(STREAM_FINALIZE_RETRY_BACKOFF_S) + 1):
             try:
@@ -1899,6 +1975,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # message (rapid catch-up after subscribe, or across a reconnect); drop
         # ids already seen so the same user message is not dispatched twice.
         self._recent_inbound_ids = _RecentKeys(DEFAULT_INBOUND_DEDUPE_WINDOW)
+        # Reserve ids while admission is being decided. A reservation prevents
+        # concurrent duplicates without making a shed message terminally seen.
+        self._pending_inbound_ids: set[str] = set()
         # Dedupe repeated ambient surfacings (deletion / group-state change) by a
         # context key (mirror inbound.ts contextKeys).
         self._recent_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
@@ -1982,6 +2061,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 task.cancel()
         self._debounce_tasks.clear()
         self._debounce_pending.clear()
+        self._pending_inbound_ids.clear()
 
     async def send(
         self,
@@ -3241,25 +3321,37 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         message_id_hex = event["message_id_hex"]
         # Client-side dedupe: the connector can re-emit the same inbound message
         # (rapid catch-up after subscribe, or across a reconnect). Drop a repeat
-        # silently so the same user message is not dispatched twice. Record the id
-        # BEFORE dispatching (an agent turn takes long enough that record-after
-        # would let a duplicate start a second concurrent turn). Dedupe the id
-        # once regardless of whether onboarding intercepts the message.
-        if message_id_hex in self._recent_inbound_ids:
+        # silently so the same user message is not dispatched twice. Reserve the
+        # id before queue admission so concurrent duplicates cannot race, but do
+        # not commit it to terminal dedupe until admission succeeds: a shed turn
+        # must remain replayable from connector storage.
+        if (
+            message_id_hex in self._recent_inbound_ids
+            or message_id_hex in self._pending_inbound_ids
+        ):
             return
-        self._recent_inbound_ids.add(message_id_hex)
+        self._pending_inbound_ids.add(message_id_hex)
 
         if self.debounce_ms > 0:
-            self._enqueue_debounced(event)
+            try:
+                self._enqueue_debounced(event)
+            except BaseException:
+                self._pending_inbound_ids.discard(message_id_hex)
+                raise
             return
 
         # Hand the turn off to the per-group queue and return immediately so the consume loop
         # keeps pulling events. Distinct groups dispatch concurrently; each group stays FIFO.
         group_id_hex = event["group_id_hex"]
-        self._inbound_queue.enqueue(
-            group_id_hex,
-            lambda evt=event: self._dispatch_inbound_message(evt),
-        )
+        try:
+            task = self._inbound_queue.enqueue(
+                group_id_hex,
+                lambda evt=event: self._dispatch_inbound_message(evt),
+            )
+            if task is not None:
+                self._recent_inbound_ids.add(message_id_hex)
+        finally:
+            self._pending_inbound_ids.discard(message_id_hex)
 
     async def _handle_group_invite(self, event: Dict[str, Any]) -> None:
         if not self.profile_name_onboarding_enabled or self.profile_name_onboarding is None:
@@ -3502,16 +3594,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._debounce_tasks.pop(key, None)
         if not items:
             return
+        message_ids = [str(item.get("message_id_hex") or "") for item in items]
         # Route the coalesced turn through the per-group queue too, so a debounced
         # batch stays FIFO-ordered with non-debounced messages in the same group
         # and a slow turn does not block the debounce-flush task (mirrors the
         # direct-dispatch path's per-group serialization).
-        merged = _coalesce_inbound_events(items)
-        group_id_hex = merged["group_id_hex"]
-        self._inbound_queue.enqueue(
-            group_id_hex,
-            lambda evt=merged: self._dispatch_inbound_message(evt),
-        )
+        try:
+            merged = _coalesce_inbound_events(items)
+            group_id_hex = merged["group_id_hex"]
+            task = self._inbound_queue.enqueue(
+                group_id_hex,
+                lambda evt=merged: self._dispatch_inbound_message(evt),
+            )
+            if task is not None:
+                for message_id_hex in message_ids:
+                    self._recent_inbound_ids.add(message_id_hex)
+        finally:
+            for message_id_hex in message_ids:
+                self._pending_inbound_ids.discard(message_id_hex)
 
     async def _handle_mutation(self, event: Dict[str, Any]) -> None:
         # Mutations are quiet next-turn context and never trigger an agent turn.

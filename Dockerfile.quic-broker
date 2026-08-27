@@ -1,20 +1,22 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.91-bookworm AS builder
+FROM rust:1.97.1-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS builder
 
 WORKDIR /workspace
-COPY . .
-ARG TARGETARCH
-RUN case "${TARGETARCH:-$(uname -m)}" in \
-        amd64|x86_64) rustup_toolchain="1.91.0-x86_64-unknown-linux-gnu" ;; \
-        arm64|aarch64) rustup_toolchain="1.91.0-aarch64-unknown-linux-gnu" ;; \
-        *) echo "unsupported build architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
-    esac \
-    && RUSTUP_TOOLCHAIN="$rustup_toolchain" cargo build --locked --release -p transport-quic-broker --bin marmot-quic-broker
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+COPY integrations ./integrations
+RUN cargo build --locked --release -p transport-quic-broker --bin marmot-quic-broker
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
-RUN apt-get update \
+ARG DEBIAN_SNAPSHOT=20260713T000000Z
+
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+    && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" \
+        > /etc/apt/sources.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin marmot

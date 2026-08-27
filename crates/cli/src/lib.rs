@@ -2142,6 +2142,70 @@ mod tests {
     }
 
     #[test]
+    fn message_send_event_parses_kind_tags_and_content() {
+        let cli = Cli::try_parse_from([
+            "wn",
+            "messages",
+            "send-event",
+            "GROUP",
+            "30078",
+            "--tag",
+            "[\"d\",\"game-1\"]",
+            "{\"move\":\"e4\"}",
+        ])
+        .expect("send-event args parse");
+        match cli.command {
+            Command::Messages {
+                command:
+                    crate::MessageCommand::SendEvent {
+                        group_id,
+                        kind,
+                        tags,
+                        content,
+                    },
+            } => {
+                assert_eq!(group_id, "GROUP");
+                assert_eq!(kind, 30078);
+                assert_eq!(tags, vec!["[\"d\",\"game-1\"]".to_owned()]);
+                assert_eq!(content, vec!["{\"move\":\"e4\"}".to_owned()]);
+            }
+            other => panic!("expected a messages send-event command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_list_and_subscribe_parse_repeatable_kind_filters() {
+        let cli = Cli::try_parse_from([
+            "wn", "messages", "list", "GROUP", "--kind", "9", "--kind", "30078",
+        ])
+        .expect("list args parse");
+        match cli.command {
+            Command::Messages {
+                command: crate::MessageCommand::List { kinds, .. },
+            } => assert_eq!(kinds, vec![9, 30078]),
+            other => panic!("expected a messages list command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["wn", "messages", "subscribe", "--kind", "30078"])
+            .expect("subscribe args parse");
+        match cli.command {
+            Command::Messages {
+                command:
+                    crate::MessageCommand::Subscribe {
+                        group,
+                        kinds,
+                        limit,
+                    },
+            } => {
+                assert_eq!(group, None);
+                assert_eq!(kinds, vec![30078]);
+                assert_eq!(limit, None);
+            }
+            other => panic!("expected a messages subscribe command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn message_send_reply_to_after_group_flag_text_is_literal_text() {
         // The `--group` form carries the same footgun as the positional-group form
         // above: the trailing message args use `allow_hyphen_values`, so a

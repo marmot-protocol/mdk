@@ -105,15 +105,23 @@ async fn run_with_bin(
     if let Some(request) = artifact_output {
         let artifacts_result = read_artifact_output_manifest(request.manifest_path());
         let _ = std::fs::remove_file(request.manifest_path());
-        if let Ok(artifacts) = artifacts_result
-            && !artifacts.is_empty()
-        {
-            tx.send(RunnerEvent::Artifacts(artifacts))
-                .await
-                .map_err(|_| RunFailure {
-                    error: HarnessError::BackendStream,
-                    observed_session: outcome.observed_session.clone(),
-                })?;
+        match artifacts_result {
+            Ok(artifacts) if !artifacts.is_empty() => {
+                tx.send(RunnerEvent::Artifacts(artifacts))
+                    .await
+                    .map_err(|_| RunFailure {
+                        error: HarnessError::BackendStream,
+                        observed_session: outcome.observed_session.clone(),
+                    })?;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    target: "codex",
+                    method = "run_with_bin",
+                    "artifact manifest unreadable; falling back to text"
+                );
+            }
         }
     }
     Ok(outcome)

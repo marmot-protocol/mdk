@@ -951,9 +951,10 @@ fn open_authorized_source(relative_path: &Path, root: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn opened_file_path(file: &File, _fallback: &Path) -> Result<PathBuf> {
+fn opened_file_path(file: &File, fallback: &Path) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
+        let _ = fallback;
         use std::os::fd::AsRawFd;
         Ok(std::fs::canonicalize(format!(
             "/proc/self/fd/{}",
@@ -962,7 +963,8 @@ fn opened_file_path(file: &File, _fallback: &Path) -> Result<PathBuf> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(std::fs::canonicalize(_fallback)?)
+        let _ = file;
+        Ok(std::fs::canonicalize(fallback)?)
     }
 }
 

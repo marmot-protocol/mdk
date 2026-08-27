@@ -88,6 +88,7 @@ impl AppClient {
             AppMessageIntent::Media { attachments, .. } => {
                 ("send_media", Some(attachments.len() as u64))
             }
+            AppMessageIntent::Custom { .. } => ("send_custom_event", None),
             AppMessageIntent::StreamStart { .. }
             | AppMessageIntent::StreamFinal { .. }
             | AppMessageIntent::AgentActivity { .. }

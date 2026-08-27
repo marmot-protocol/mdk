@@ -4,7 +4,7 @@ use cgka_traits::transport_adapter::{
     TransportPublishFailure,
 };
 
-use super::subscriptions::chat_list_mute_expiries;
+use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
 use super::*;
 use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
@@ -274,6 +274,14 @@ fn live_message_subscription_emits_each_empty_id_without_storing_it() {
     assert!(seen.should_emit(String::new()));
     assert_eq!(seen.len(), 0);
     assert!(!seen.contains(""));
+}
+
+#[test]
+fn message_kind_filter_treats_none_and_empty_as_unrestricted() {
+    assert!(message_kind_filter_allows(None, 9));
+    assert!(message_kind_filter_allows(Some(&[]), 9));
+    assert!(message_kind_filter_allows(Some(&[30100]), 30100));
+    assert!(!message_kind_filter_allows(Some(&[30100]), 9));
 }
 
 #[test]
@@ -1734,6 +1742,7 @@ fn messages_recovery_query_drops_initial_replay_limit() {
     let group_id_hex = "cd".repeat(32);
     let query = AppMessageQuery {
         group_id_hex: Some(group_id_hex.clone()),
+        kinds: None,
         limit: Some(1),
     };
     let recovery = messages_recovery_query(&query);
@@ -1754,6 +1763,7 @@ fn messages_recovery_query_preserves_absent_group_filter() {
     // all groups, still without a limit.
     let query = AppMessageQuery {
         group_id_hex: None,
+        kinds: None,
         limit: Some(10),
     };
     let recovery = messages_recovery_query(&query);

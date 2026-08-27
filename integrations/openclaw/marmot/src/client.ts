@@ -705,6 +705,7 @@ export class MarmotAgentControlClient {
     streamIdHex: string,
     streamCapability: string,
     appendText: string,
+    idempotencyKey?: string,
   ): Promise<Envelope> {
     return this.request(
       {
@@ -712,6 +713,7 @@ export class MarmotAgentControlClient {
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
         stream_capability: normalizeStreamCapability(streamCapability),
         append_text: String(appendText ?? ""),
+        ...(idempotencyKey?.trim() ? { idempotency_key: idempotencyKey.trim() } : {}),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );
@@ -721,6 +723,7 @@ export class MarmotAgentControlClient {
     streamIdHex: string,
     streamCapability: string,
     status: string,
+    idempotencyKey?: string,
   ): Promise<Envelope> {
     return this.request(
       {
@@ -728,6 +731,7 @@ export class MarmotAgentControlClient {
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
         stream_capability: normalizeStreamCapability(streamCapability),
         status: String(status ?? ""),
+        ...(idempotencyKey?.trim() ? { idempotency_key: idempotencyKey.trim() } : {}),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );
@@ -737,6 +741,7 @@ export class MarmotAgentControlClient {
     streamIdHex: string,
     streamCapability: string,
     text: string,
+    idempotencyKey?: string,
   ): Promise<Envelope> {
     return this.request(
       {
@@ -744,6 +749,7 @@ export class MarmotAgentControlClient {
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
         stream_capability: normalizeStreamCapability(streamCapability),
         text: String(text ?? ""),
+        ...(idempotencyKey?.trim() ? { idempotency_key: idempotencyKey.trim() } : {}),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );

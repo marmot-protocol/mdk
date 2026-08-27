@@ -4,8 +4,12 @@ on:
   pull_request:
     paths:
       - Dockerfile.quic-broker
+      - Dockerfile.convergence-campaign
       - Cargo.lock
       - Cargo.toml
+      - rust-toolchain.toml
+      - scripts/check_campaign_toolchain.sh
+      - scripts/tests/test_campaign_toolchain.sh
       - crates/traits/**
       - crates/transport-quic-stream/**
       - crates/transport-quic-broker/**
@@ -40,6 +44,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}/marmot-quic-broker" >> "$GITHUB_ENV"
+
+      - name: Verify release image toolchain contract
+        run: |
+          ./scripts/check_campaign_toolchain.sh
+          ./scripts/tests/test_campaign_toolchain.sh
 
       - name: Build image
         run: docker build -f Dockerfile.quic-broker -t "$IMAGE_NAME:ci" .

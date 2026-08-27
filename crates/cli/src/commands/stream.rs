@@ -426,6 +426,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 &account.label,
                 AppMessageQuery {
                     group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
                     limit: None,
                 },
             )?;
@@ -512,6 +513,7 @@ where
         &account.label,
         AppMessageQuery {
             group_id_hex: Some(group_id_hex.clone()),
+            kinds: None,
             limit: Some(AGENT_STREAM_START_LOOKBACK_LIMIT),
         },
     )?;

@@ -625,6 +625,7 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::AgentActivity { .. }
         | AppMessageIntent::AgentOperation { .. }
         | AppMessageIntent::GroupSystem { .. }
+        | AppMessageIntent::Custom { .. }
         | AppMessageIntent::PushTokenUpdate { .. }
         | AppMessageIntent::PushTokenRemoval { .. } => None,
     }

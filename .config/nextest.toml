@@ -42,6 +42,14 @@ test-group = 'cli-e2e'
 filter = 'package(cgka-conformance-simulator) & binary(process_orchestrator)'
 test-group = 'process-orchestrator'
 
+# These cross-process recovery cases each launch several runtimes and local
+# relays. Reserve the full nextest worker budget so CPU pressure cannot turn a
+# stable-checkpoint deadline into a convergence failure.
+[[profile.default.overrides]]
+filter = 'binary(process_orchestrator) & (test(=app_runtime_and_process_adapters_recover_the_same_offline_projection) | test(=four_party_cross_route_recovery_processes_match_unified_route) | test(=four_party_cross_route_recovery_app_runtime_matches_unified_route))'
+threads-required = "num-cpus"
+priority = 90
+
 # CI profile (`cargo nextest run --profile ci`).
 #
 # Retries are a safety net for transient infrastructure hiccups (mock-relay bind
