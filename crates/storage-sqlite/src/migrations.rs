@@ -925,7 +925,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 54,
+                found: 55,
                 latest_supported: 46,
             }
         ));
@@ -981,7 +981,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 54,
+                found: 55,
                 latest_supported: 46,
             }
         ));
@@ -1285,7 +1285,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 54,
+                found: 55,
                 latest_supported: 46,
             }
         ));
