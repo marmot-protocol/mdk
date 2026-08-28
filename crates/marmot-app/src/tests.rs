@@ -9677,6 +9677,155 @@ fn account_worker_reconnect_backoff_doubles_caps_and_resets() {
 }
 
 #[test]
+fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
+    run_composed_app_runtime_test("connectivity-recovery-wake", || async {
+        tokio::time::pause();
+
+        async fn wait_for_inbox_subscriptions(
+            relay: &ScriptedPushRelayClient,
+            account_id: &MemberId,
+            minimum: usize,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let observed = relay.inbox_subscription_count(account_id);
+                if observed >= minimum {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "account inbox subscription count did not reach {minimum}; observed {observed}"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+
+        const ACCOUNT: &str = "alice";
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account(ACCOUNT).unwrap();
+        let account_id =
+            MemberId::new(hex::decode(home.account(ACCOUNT).unwrap().account_id_hex).unwrap());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let runtime = MarmotAppRuntime::new(app);
+        runtime.start().await.unwrap();
+
+        wait_for_inbox_subscriptions(&relay, &account_id, 1).await;
+
+        // Preserve the bounded exponential policy and deterministically drive
+        // the worker through 2, 4, 8, 16, and 32 second reconnect sleeps. The
+        // next receive failure therefore arms the production 60 second cap.
+        for delay in [2_u64, 4, 8, 16, 32] {
+            let subscriptions_before = relay.inbox_subscription_count(&account_id);
+            runtime
+                .shared_services()
+                .relay_plane()
+                .simulate_notification_recovery_for_test(1);
+            let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
+                    Err(AppError::TransportClosed) => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+                }
+                assert!(
+                    std::time::Instant::now() < backoff_deadline,
+                    "account worker did not enter reconnect backoff"
+                );
+            }
+            tokio::time::advance(
+                Duration::from_secs(delay)
+                    + Duration::from_millis(ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS + 500),
+            )
+            .await;
+            wait_for_inbox_subscriptions(&relay, &account_id, subscriptions_before + 1).await;
+        }
+
+        let subscriptions_before_wake = relay.inbox_subscription_count(&account_id);
+        let telemetry_before = runtime.app_performance_snapshot();
+        runtime
+            .shared_services()
+            .relay_plane()
+            .simulate_notification_recovery_for_test(1);
+        let max_backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
+                Err(AppError::TransportClosed) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected max-backoff probe error: {error:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < max_backoff_deadline,
+                "account worker did not enter maximum reconnect backoff"
+            );
+        }
+
+        // Repeated host recovery edges are idempotent: both callers join the
+        // same reopened worker and coalesce onto its one catch-up pass.
+        relay.block_next_subscribe();
+        let recovery_a = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.catch_up_accounts().await })
+        };
+        let recovery_b = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.catch_up_accounts().await })
+        };
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if relay
+                .blocked_subscribe_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < reconnect_deadline,
+                "connectivity recovery did not start a reconnect subscription"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            relay
+                .blocked_subscribe_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "connectivity recovery must start the reconnect subscription within three seconds"
+        );
+        assert!(!recovery_a.is_finished());
+        assert!(!recovery_b.is_finished());
+        relay.release_subscribe();
+
+        recovery_a.await.unwrap().unwrap();
+        recovery_b.await.unwrap().unwrap();
+        assert_eq!(
+            relay.inbox_subscription_count(&account_id),
+            subscriptions_before_wake + 2,
+            "two recovery signals must coalesce into one catch-up transport refresh after reconnect"
+        );
+
+        let telemetry_after = runtime.app_performance_snapshot();
+        assert!(
+            telemetry_after.account_transport_activation.attempts
+                >= telemetry_before.account_transport_activation.attempts + 2,
+            "reconnect and the one coalesced catch-up must each record a privacy-safe activation phase"
+        );
+        assert!(
+            telemetry_after.account_subscription_registration.attempts
+                >= telemetry_before.account_subscription_registration.attempts + 2,
+            "reconnect and the one coalesced catch-up must each record subscription readiness"
+        );
+
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
 fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups() {
     run_composed_app_runtime_test(
         "reconnect-deferred-hydration",

@@ -59,3 +59,4 @@ zeroize.workspace = true
 keyring-core.workspace = true
 nostr-relay-builder.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

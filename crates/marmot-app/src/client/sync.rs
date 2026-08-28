@@ -591,7 +591,7 @@ impl AppClient {
         self.prepare_transport_with_telemetry(None).await
     }
 
-    async fn prepare_transport_with_telemetry(
+    pub(crate) async fn prepare_transport_with_telemetry(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<(), AppError> {
@@ -673,7 +673,7 @@ impl AppClient {
         }
     }
 
-    pub(crate) async fn sync_with_startup_stage_telemetry(
+    pub(crate) async fn sync_with_stage_telemetry(
         &mut self,
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
