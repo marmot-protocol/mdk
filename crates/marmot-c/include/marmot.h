@@ -195,11 +195,15 @@ typedef enum MarmotGroupLifecycleState {
 } MarmotGroupLifecycleState;
 
 /**
- * Whether the send published immediately or was accepted pending.
+ * Whether the send published immediately, was accepted pending
+ * convergence, or has a frozen transport event whose acknowledgement is
+ * still unknown. Neither retained state is an error: show it as still
+ * sending, and never re-send for `CompletionUnknown`.
  */
 typedef enum MarmotSendAcceptDisposition {
   MARMOT_SEND_ACCEPT_DISPOSITION_PUBLISHED,
   MARMOT_SEND_ACCEPT_DISPOSITION_ACCEPTED_PENDING,
+  MARMOT_SEND_ACCEPT_DISPOSITION_COMPLETION_UNKNOWN,
 } MarmotSendAcceptDisposition;
 
 /**
