@@ -501,6 +501,80 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_runner_passes_ordered_images_to_one_codex_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("000-first.png");
+        let second = root.path().join("001-second.jpg");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let script = root.path().join("image-codex");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 9 ] || [ "$1" != "exec" ] || [ "$2" != "resume" ] || \
+   [ "$3" != "--image" ] || [ "$4" != "{}" ] || \
+   [ "$5" != "--image" ] || [ "$6" != "{}" ] || \
+   [ "$7" != "--json" ] || [ "$8" != "thread-123" ] || [ "$9" != "-" ]; then
+  printf 'unexpected args:' >&2
+  printf ' <%s>' "$@" >&2
+  exit 64
+fi
+prompt="$(cat)"
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread-123"}}'
+printf '{{"type":"item.completed","item":{{"type":"agent_message","text":"images:%s"}}}}\n' "$prompt"
+"#,
+                first.display(),
+                second.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: Some("thread-123".to_owned()),
+                prompt: "inspect".to_owned(),
+                artifact_output: None,
+            },
+            vec![
+                Attachment {
+                    path: first,
+                    media_type: "image/png".to_owned(),
+                    file_name: "000-first.png".to_owned(),
+                    size_bytes: 5,
+                },
+                Attachment {
+                    path: second,
+                    media_type: "image/jpeg".to_owned(),
+                    file_name: "001-second.jpg".to_owned(),
+                    size_bytes: 6,
+                },
+            ],
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.observed_session.as_deref(), Some("thread-123"));
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("images:inspect".to_owned()))
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
     #[test]
     fn parser_emits_thread_and_completed_agent_messages_only() {
         assert_eq!(

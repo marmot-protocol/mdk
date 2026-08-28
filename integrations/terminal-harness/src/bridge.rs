@@ -2942,6 +2942,65 @@ mod tests {
         invocations: Mutex<Vec<Invocation>>,
     }
 
+    #[derive(Debug)]
+    struct AttachmentSnapshot {
+        path: PathBuf,
+        file_name: String,
+        bytes: Vec<u8>,
+        is_file: bool,
+        is_symlink: bool,
+        mode: u32,
+    }
+
+    #[derive(Default)]
+    struct RecordingAttachmentBackend {
+        batches: Mutex<Vec<Vec<AttachmentSnapshot>>>,
+    }
+
+    #[async_trait]
+    impl Backend for RecordingAttachmentBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            unreachable!("attachment test must use run_with_attachments")
+        }
+
+        async fn run_with_attachments(
+            &self,
+            _invocation: Invocation,
+            attachments: Vec<Attachment>,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let snapshots = attachments
+                .into_iter()
+                .map(|attachment| {
+                    let metadata = fs::symlink_metadata(&attachment.path).unwrap();
+                    AttachmentSnapshot {
+                        bytes: fs::read(&attachment.path).unwrap(),
+                        is_file: metadata.is_file(),
+                        is_symlink: metadata.file_type().is_symlink(),
+                        mode: metadata.permissions().mode() & 0o777,
+                        path: attachment.path,
+                        file_name: attachment.file_name,
+                    }
+                })
+                .collect();
+            self.batches.lock().await.push(snapshots);
+            Ok(Outcome {
+                observed_session: None,
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
     #[async_trait]
     impl Backend for RecordingBackend {
         async fn run(
@@ -3135,6 +3194,57 @@ mod tests {
         })
     }
 
+    fn spawn_attachment_server(
+        socket: &std::path::Path,
+        downloads: Vec<DownloadedMedia>,
+    ) -> tokio::task::JoinHandle<Vec<AgentControlRequest>> {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut downloads = downloads.into_iter();
+            let mut requests = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                let (response, complete) = match &request.payload {
+                    AgentControlRequest::DownloadMedia { .. } => {
+                        let downloaded = downloads.next().expect("unexpected media download");
+                        (
+                            AgentControlResponse::MediaDownloaded {
+                                path: downloaded.path.to_string_lossy().into_owned(),
+                                media_type: downloaded.media_type,
+                                file_name: downloaded.file_name,
+                                size_bytes: downloaded.size_bytes,
+                            },
+                            false,
+                        )
+                    }
+                    AgentControlRequest::SendFinal { .. } => (
+                        AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["reply".to_owned()],
+                            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                        },
+                        true,
+                    ),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(
+                    &mut write_half,
+                    &AgentControlEnvelope::request(request.id.clone(), response),
+                )
+                .await
+                .unwrap();
+                requests.push(request.payload);
+                if complete {
+                    assert!(downloads.next().is_none(), "missing media download request");
+                    return requests;
+                }
+            }
+        })
+    }
+
     fn test_context(
         root: &std::path::Path,
         home: &std::path::Path,
@@ -3143,6 +3253,18 @@ mod tests {
         std::fs::create_dir_all(home).unwrap();
         let config = test_config(root);
         let server = spawn_final_server(&config.socket);
+        let ctx = test_context_with_backend(root, home, config, backend);
+        (ctx, server)
+    }
+
+    fn test_context_with_backend(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        config: Config,
+        backend: Arc<dyn Backend>,
+    ) -> Arc<BridgeContext> {
+        std::fs::create_dir_all(home).unwrap();
+        reconcile_attachment_staging(&config.attachment_staging_root).unwrap();
         let sessions = Arc::new(SessionStore::load(config.state_path.clone(), home).unwrap());
         let recovery = Arc::new(
             RecoveryStore::load(config.state_path.with_extension("recovery.json")).unwrap(),
@@ -3150,7 +3272,7 @@ mod tests {
         let deliveries = Arc::new(
             FinalDeliveryStore::load(config.state_path.with_extension("delivery.json")).unwrap(),
         );
-        let ctx = Arc::new(BridgeContext {
+        Arc::new(BridgeContext {
             client: ControlClient::new(
                 config.socket.clone(),
                 None,
@@ -3170,11 +3292,19 @@ mod tests {
                 ArtifactOutbox::load(root.join("outbox.json")).unwrap(),
             )),
             home: home.to_path_buf(),
-        });
-        (ctx, server)
+        })
     }
 
     async fn dispatch_test_message(ctx: Arc<BridgeContext>, message_ref: &str, text: &str) -> bool {
+        dispatch_test_message_with_media(ctx, message_ref, text, Vec::new()).await
+    }
+
+    async fn dispatch_test_message_with_media(
+        ctx: Arc<BridgeContext>,
+        message_ref: &str,
+        text: &str,
+        media: Vec<AgentControlMediaRef>,
+    ) -> bool {
         let disposition = classify_prompt(text);
         let Some(permit) = acquire_dispatch_permit(&ctx.queues, "group", &disposition).await else {
             return false;
@@ -3186,12 +3316,27 @@ mod tests {
                 group_ref: "group".to_owned(),
                 message_ref: message_ref.to_owned(),
                 text: text.to_owned(),
-                media: Vec::new(),
+                media,
             },
             permit,
         )
         .await;
         true
+    }
+
+    fn test_media_ref(file_name: &str) -> AgentControlMediaRef {
+        AgentControlMediaRef {
+            media_type: "image/png".to_owned(),
+            file_name: file_name.to_owned(),
+            ciphertext_sha256: "cipher".to_owned(),
+            plaintext_sha256: "plain".to_owned(),
+            nonce_hex: "nonce".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 7,
+            locators: Vec::new(),
+            dim: None,
+            thumbhash: None,
+        }
     }
 
     #[tokio::test]
@@ -3348,6 +3493,152 @@ mod tests {
         );
         assert!(ctx.sessions.get("group").await.is_none());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_attachment_turn_preserves_order_privacy_and_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source_one = root.path().join("source-one.png");
+        let source_two = root.path().join("source-two.png");
+        fs::write(&source_one, b"first").unwrap();
+        fs::write(&source_two, b"second").unwrap();
+        let mut source_permissions = fs::metadata(&source_one).unwrap().permissions();
+        source_permissions.set_mode(0o644);
+        fs::set_permissions(&source_one, source_permissions.clone()).unwrap();
+        fs::set_permissions(&source_two, source_permissions).unwrap();
+        let config = test_config(root.path());
+        let server = spawn_attachment_server(
+            &config.socket,
+            vec![
+                DownloadedMedia {
+                    path: source_one,
+                    media_type: "image/png".to_owned(),
+                    file_name: "first image.png".to_owned(),
+                    size_bytes: 5,
+                },
+                DownloadedMedia {
+                    path: source_two,
+                    media_type: "image/png".to_owned(),
+                    file_name: "../second.png".to_owned(),
+                    size_bytes: 6,
+                },
+            ],
+        );
+        let backend = Arc::new(RecordingAttachmentBackend::default());
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+
+        assert!(
+            dispatch_test_message_with_media(
+                ctx.clone(),
+                "message",
+                "inspect images",
+                vec![test_media_ref("first"), test_media_ref("second")],
+            )
+            .await
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, AgentControlRequest::DownloadMedia { .. }))
+                .count(),
+            2
+        );
+        let batches = backend.batches.lock().await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(
+            batches[0][0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("000-first_image.png")
+        );
+        assert!(
+            batches[0][0]
+                .path
+                .starts_with(&ctx.cfg.attachment_staging_root)
+        );
+        assert!(batches[0][0].is_file);
+        assert!(!batches[0][0].is_symlink);
+        assert_eq!(batches[0][0].file_name, "000-first_image.png");
+        assert_eq!(batches[0][0].bytes, b"first");
+        assert_eq!(batches[0][0].mode, 0o600);
+        assert_eq!(
+            batches[0][1]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("001-second.png")
+        );
+        assert!(
+            batches[0][1]
+                .path
+                .starts_with(&ctx.cfg.attachment_staging_root)
+        );
+        assert!(batches[0][1].is_file);
+        assert!(!batches[0][1].is_symlink);
+        assert_eq!(batches[0][1].file_name, "001-second.png");
+        assert_eq!(batches[0][1].bytes, b"second");
+        assert_eq!(batches[0][1].mode, 0o600);
+        assert!(!batches[0][0].path.exists());
+        assert!(!batches[0][1].path.exists());
+        assert!(ctx.recovery.get("group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_attachment_backend_replies_without_persisting_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source = root.path().join("source.png");
+        fs_private::write_private(&source, b"image").unwrap();
+        let config = test_config(root.path());
+        let server = spawn_attachment_server(
+            &config.socket,
+            vec![DownloadedMedia {
+                path: source,
+                media_type: "image/png".to_owned(),
+                file_name: "image.png".to_owned(),
+                size_bytes: 5,
+            }],
+        );
+        let backend = Arc::new(RecordingBackend::default());
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        ctx.sessions
+            .record_session("group", "session".to_owned(), repo)
+            .await
+            .unwrap();
+
+        assert!(
+            dispatch_test_message_with_media(
+                ctx.clone(),
+                "message",
+                "inspect image",
+                vec![test_media_ref("image")],
+            )
+            .await
+        );
+        let requests = server.await.unwrap();
+        let reply = requests
+            .iter()
+            .find_map(|request| match request {
+                AgentControlRequest::SendFinal { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("unsupported backend must send a final reply");
+        assert_eq!(
+            reply,
+            "[wn-opencode] opencode does not support this attachment batch; no backend turn was started."
+        );
+        assert!(backend.invocations.lock().await.is_empty());
+        assert!(ctx.recovery.get("group").await.is_none());
     }
 
     #[tokio::test]
