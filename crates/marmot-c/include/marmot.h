@@ -3792,8 +3792,8 @@ MarmotStatus marmot_sign_out(const struct MarmotClient *client,
                              struct MarmotSignOutOutcome **out);
 
 /**
- * Create a brand-new Nostr identity, store its secret in the platform
- * keychain, and publish initial relay lists + key package. Free with
+ * Create a brand-new Nostr identity, store its secret in the account
+ * secret store, and publish initial relay lists + key package. Free with
  * `marmot_account_summary_free`.
  *
  * # Safety
