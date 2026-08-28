@@ -209,11 +209,21 @@ commit inside the rollback horizon — the input branch selection most needs to 
 Two layers address this:
 
 - **Timestamp backfill** stays as the fast path for honestly-recent late delivery on queried relays.
-- **Set reconciliation** (Nostr Negentropy, NIP-77) is the correctness backstop: it is content-addressed and
-  time-independent, so a backdated-but-present event is reconciled regardless of `created_at`. It cannot recover events
-  on relays the client never queries — nothing can — but it converts a silent backdated miss into a detected-and-fetched
-  one. It composes cleanly because the engine already treats transport order as advisory; reconciliation just feeds more
-  candidate bytes into the same convergence pass.
+- **Set reconciliation** (Nostr Negentropy, NIP-77) is the correctness backstop inside a configured route-local
+  retention boundary: it is content-addressed, so a backdated-but-present event inside that boundary is reconciled
+  regardless of its position relative to the ordinary `since` floor. It cannot recover events on relays the client
+  never queries — nothing can — but it converts a silent backdated miss into a detected-and-fetched one. It composes
+  cleanly because the engine already treats transport order as advisory; reconciliation just feeds more candidate
+  bytes into the same convergence pass.
+
+The implementation keeps at most 16,384 exact ids per inbox or group route and advances a persisted completeness floor
+when it compacts an authored-time bucket. It also applies a rolling 30-day lower bound and the same item limit to the
+relay filter, so storage, set exchange, and startup memory remain bounded. Events below the persisted floor are outside
+the automatic late-publication repair contract. A first start after the inventory migration begins empty and therefore
+discovers the relay-held difference inside that bounded window; it fetches at most 128 deterministic ids per route pass,
+then durable ingestion removes that subset from the next dry-run comparison. The account attempts at most four routes
+per startup pass, using a durable rotating cursor and a two-second per-route deadline, so a slow or unsupported route
+cannot permanently hide later routes. Retiring a group transport route deletes its inventory and route state.
 
 A signed, in-payload **per-sender monotonic counter** is an optional further hint: a client that holds sender A's #5 and
 #7 but not #6 knows to delay settling and re-fetch. It is protocol evidence (inside the MLS payload, signed), so it is

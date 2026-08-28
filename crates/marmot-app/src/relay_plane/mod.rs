@@ -1743,6 +1743,7 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         endpoints: Vec<TransportEndpoint>,
         local_items: &[NostrReconciliationItem],
+        reconcile_since: u64,
         reconcile_until: u64,
     ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
@@ -1767,16 +1768,14 @@ impl MarmotRelayPlaneAccountAdapter {
                     since: None,
                 },
                 local_items,
+                reconcile_since,
                 reconcile_until,
             )
             .await;
-        let metric = match &result {
-            Ok((summary, _)) => summary.clone(),
-            Err(_) => NostrReconciliationSummary {
-                relays_failed: 1,
-                ..NostrReconciliationSummary::default()
-            },
-        };
+        let metric = result
+            .as_ref()
+            .map(|(summary, _)| summary.clone())
+            .unwrap_or_default();
         self.relay_plane
             .inner
             .transport
@@ -1799,6 +1798,7 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         group: TransportGroupSubscription,
         local_items: &[NostrReconciliationItem],
+        reconcile_since: u64,
         reconcile_until: u64,
     ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
@@ -1829,16 +1829,14 @@ impl MarmotRelayPlaneAccountAdapter {
                     since: None,
                 },
                 local_items,
+                reconcile_since,
                 reconcile_until,
             )
             .await;
-        let metric = match &result {
-            Ok((summary, _)) => summary.clone(),
-            Err(_) => NostrReconciliationSummary {
-                relays_failed: 1,
-                ..NostrReconciliationSummary::default()
-            },
-        };
+        let metric = result
+            .as_ref()
+            .map(|(summary, _)| summary.clone())
+            .unwrap_or_default();
         self.relay_plane
             .inner
             .transport

@@ -46,12 +46,67 @@ use crate::config::CursorPersistence;
 /// account worker indefinitely and the next sync can resume from a smaller
 /// difference.
 const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
+/// Four two-second route passes leave margin inside the account-wide quantum.
+/// The durable cursor starts the next pass after the last attempted route.
+const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
+
+enum TransportReconciliationWork {
+    Inbox(Vec<cgka_traits::TransportEndpoint>),
+    Group(cgka_traits::TransportGroupSubscription),
+}
+
+impl TransportReconciliationWork {
+    fn route(&self) -> Option<TransportReconciliationRoute> {
+        match self {
+            Self::Inbox(_) => Some(TransportReconciliationRoute::Inbox),
+            Self::Group(group) => <[u8; 32]>::try_from(group.transport_group_id.as_slice())
+                .ok()
+                .map(TransportReconciliationRoute::Group),
+        }
+    }
+}
 
 fn nostr_reconciliation_item(item: TransportReconciliationItem) -> AdapterReconciliationItem {
     AdapterReconciliationItem {
         event_id: item.event_id,
         created_at: item.created_at,
     }
+}
+
+fn reconciliation_start_after_cursor(
+    routes: &[TransportReconciliationRoute],
+    cursor: Option<&TransportReconciliationRoute>,
+) -> usize {
+    cursor
+        .and_then(|cursor| routes.iter().position(|route| route > cursor))
+        .unwrap_or(0)
+}
+
+fn transport_reconciliation_record(
+    account_id: &cgka_traits::MemberId,
+    delivery: &cgka_traits::TransportDelivery,
+) -> Option<(TransportReconciliationRoute, TransportReconciliationItem)> {
+    let route = match &delivery.message.envelope {
+        TransportEnvelope::Welcome { recipient } if recipient == account_id => {
+            TransportReconciliationRoute::Inbox
+        }
+        TransportEnvelope::GroupMessage { transport_group_id }
+            if delivery.group_id_hint.is_some() =>
+        {
+            TransportReconciliationRoute::Group(
+                <[u8; 32]>::try_from(transport_group_id.as_slice()).ok()?,
+            )
+        }
+        _ => return None,
+    };
+    let event_id = <[u8; 32]>::try_from(delivery.message.id.as_slice()).ok()?;
+    Some((
+        route,
+        TransportReconciliationItem {
+            event_id,
+            created_at: delivery.message.timestamp.0,
+        },
+    ))
 }
 
 /// In-flight epoch-gap replay bookkeeping shared by begin/finish helpers.
@@ -548,54 +603,79 @@ impl AppClient {
     async fn reconcile_transport_history(&self, reconcile_until: u64) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let routing = self.routing.snapshot();
-        let inbox_items = storage
-            .transport_reconciliation_items(&TransportReconciliationRoute::Inbox)?
-            .into_iter()
-            .map(nostr_reconciliation_item)
+        let mut work = Vec::with_capacity(routing.group_routes.len().saturating_add(1));
+        if !routing.local_inbox_endpoints.is_empty() {
+            work.push(TransportReconciliationWork::Inbox(
+                routing.local_inbox_endpoints,
+            ));
+        }
+        work.extend(
+            routing
+                .group_routes
+                .into_iter()
+                .filter(|route| route.transport_group_id.len() == 32)
+                .map(TransportReconciliationWork::Group),
+        );
+        work.sort_unstable_by_key(TransportReconciliationWork::route);
+        let cursor = storage.transport_reconciliation_route_cursor()?;
+        let route_keys = work
+            .iter()
+            .filter_map(TransportReconciliationWork::route)
             .collect::<Vec<_>>();
+        let start = reconciliation_start_after_cursor(&route_keys, cursor.as_ref());
+        if start > 0 {
+            work.rotate_left(start);
+        }
+        work.truncate(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+
         let mut attempted_routes = 0usize;
+        let mut routes_failed = 0usize;
         let mut relays_succeeded = 0usize;
         let mut relays_failed = 0usize;
         let mut remote_items = 0usize;
         let mut received_items = 0usize;
 
-        if !routing.local_inbox_endpoints.is_empty() {
-            attempted_routes += 1;
-            match self
-                .adapter
-                .reconcile_inbox_history(
-                    routing.local_inbox_endpoints,
-                    &inbox_items,
-                    reconcile_until,
-                )
-                .await
-            {
-                Ok(Some(summary)) => {
-                    relays_succeeded += summary.relays_succeeded;
-                    relays_failed += summary.relays_failed;
-                    remote_items += summary.remote_items;
-                    received_items += summary.received_items;
-                }
-                Ok(None) => {}
-                Err(_) => relays_failed += 1,
-            }
-        }
-
-        for route in routing.group_routes {
-            let Ok(route_id) = <[u8; 32]>::try_from(route.transport_group_id.as_slice()) else {
+        for route_work in work {
+            let Some(route) = route_work.route() else {
                 continue;
             };
-            let local_items = storage
-                .transport_reconciliation_items(&TransportReconciliationRoute::Group(route_id))?
+            // Advance before network I/O. Cancellation or process death can
+            // defer this route until the next rotation, but cannot pin every
+            // subsequent route behind it on each restart.
+            storage.advance_transport_reconciliation_route_cursor(&route)?;
+            let inventory = storage.transport_reconciliation_inventory(&route, reconcile_until)?;
+            if inventory.since > reconcile_until {
+                continue;
+            }
+            let local_items = inventory
+                .items
                 .into_iter()
                 .map(nostr_reconciliation_item)
                 .collect::<Vec<_>>();
             attempted_routes += 1;
-            match self
-                .adapter
-                .reconcile_group_history(route, &local_items, reconcile_until)
-                .await
-            {
+            let result = match route_work {
+                TransportReconciliationWork::Inbox(endpoints) => {
+                    self.adapter
+                        .reconcile_inbox_history(
+                            endpoints,
+                            &local_items,
+                            inventory.since,
+                            reconcile_until,
+                        )
+                        .await
+                }
+                TransportReconciliationWork::Group(group) => {
+                    self.adapter
+                        .reconcile_group_history(
+                            group,
+                            &local_items,
+                            inventory.since,
+                            reconcile_until,
+                        )
+                        .await
+                }
+            };
+            match result {
                 Ok(Some(summary)) => {
                     relays_succeeded += summary.relays_succeeded;
                     relays_failed += summary.relays_failed;
@@ -603,7 +683,7 @@ impl AppClient {
                     received_items += summary.received_items;
                 }
                 Ok(None) => {}
-                Err(_) => relays_failed += 1,
+                Err(_) => routes_failed += 1,
             }
         }
 
@@ -611,6 +691,7 @@ impl AppClient {
             target: "marmot_app::relay_plane",
             method = "reconcile_transport_history",
             attempted_routes,
+            routes_failed,
             relays_succeeded,
             relays_failed,
             remote_items,
@@ -1232,9 +1313,11 @@ impl AppClient {
             };
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
+                self.record_durable_transport_reconciliation_delivery(&delivery);
                 continue;
             }
             if self.seen_events_index.contains(&event_id) {
+                self.record_durable_transport_reconciliation_delivery(&delivery);
                 continue;
             }
             return Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(
@@ -1710,6 +1793,7 @@ impl AppClient {
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index)
                 || self.seen_events_index.contains(&event_id)
             {
+                self.record_durable_transport_reconciliation_delivery(&delivery);
                 counts.skipped = counts.skipped.saturating_add(1);
                 // Liveness, but not progress. It must not outlast the moment
                 // the relays confirm they served this account's history.
@@ -1946,6 +2030,46 @@ impl AppClient {
         }
     }
 
+    fn record_transport_reconciliation_item(
+        &self,
+        route: &TransportReconciliationRoute,
+        item: &TransportReconciliationItem,
+    ) {
+        let recorded = self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| {
+                storage
+                    .record_transport_reconciliation_item(route, item)
+                    .map_err(AppError::from)
+            });
+        if recorded.is_err() {
+            // The event remains absent from the advertised local set, so a
+            // later reconciliation safely re-fetches it. Do not fail an
+            // ingest the engine already retained merely because this
+            // optimization checkpoint failed.
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "record_transport_reconciliation_item",
+                "could not persist transport reconciliation item"
+            );
+        }
+    }
+
+    fn record_durable_transport_reconciliation_delivery(
+        &self,
+        delivery: &cgka_traits::TransportDelivery,
+    ) {
+        if let Some((route, item)) =
+            transport_reconciliation_record(self.adapter.account_id(), delivery)
+        {
+            // Own relay echoes and seen-index hits are skipped precisely because
+            // the event is already durable. Recording them here closes the
+            // migration/echo seam without replaying them through the engine.
+            self.record_transport_reconciliation_item(&route, &item);
+        }
+    }
+
     async fn ingest_delivery(
         &mut self,
         delivery: cgka_traits::TransportDelivery,
@@ -1956,48 +2080,13 @@ impl AppClient {
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
-        let reconciliation_route = match &delivery.message.envelope {
-            TransportEnvelope::Welcome { recipient } if recipient == self.adapter.account_id() => {
-                Some(TransportReconciliationRoute::Inbox)
-            }
-            TransportEnvelope::GroupMessage { transport_group_id } if group_id_hint.is_some() => {
-                <[u8; 32]>::try_from(transport_group_id.as_slice())
-                    .ok()
-                    .map(TransportReconciliationRoute::Group)
-            }
-            _ => None,
-        };
-        let reconciliation_item = <[u8; 32]>::try_from(delivery.message.id.as_slice())
-            .ok()
-            .map(|event_id| TransportReconciliationItem {
-                event_id,
-                created_at: outer_transport_at,
-            });
+        let reconciliation_record =
+            transport_reconciliation_record(self.adapter.account_id(), &delivery);
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         let must_stay_fetchable = effects.left_object_unpersisted;
-        if !must_stay_fetchable
-            && let (Some(route), Some(item)) = (&reconciliation_route, &reconciliation_item)
-        {
-            let recorded = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    storage
-                        .record_transport_reconciliation_item(route, item)
-                        .map_err(AppError::from)
-                });
-            if recorded.is_err() {
-                // The event remains absent from the advertised local set, so a
-                // later reconciliation safely re-fetches it. Do not fail an
-                // ingest the engine already retained merely because this
-                // optimization checkpoint failed.
-                tracing::warn!(
-                    target: "marmot_app::relay_plane",
-                    method = "record_transport_reconciliation_item",
-                    "could not persist transport reconciliation item"
-                );
-            }
+        if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
+            self.record_transport_reconciliation_item(route, item);
         }
         let refused_group = match &effects.outcome {
             IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
@@ -4056,7 +4145,8 @@ fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
 mod tests {
     use super::{
         DrainVerdict, backfill_drain_verdict, incomplete_full_history_repair,
-        retry_backoff_for_ordinal,
+        reconciliation_start_after_cursor, retry_backoff_for_ordinal,
+        transport_reconciliation_record,
     };
     use crate::tests::{
         ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -4069,6 +4159,68 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+
+    #[test]
+    fn reconciliation_cursor_rotates_past_a_slow_route_and_wraps() {
+        let routes = vec![
+            storage_sqlite::TransportReconciliationRoute::Inbox,
+            storage_sqlite::TransportReconciliationRoute::Group([0x01; 32]),
+            storage_sqlite::TransportReconciliationRoute::Group([0x02; 32]),
+        ];
+        assert_eq!(
+            reconciliation_start_after_cursor(&routes, Some(&routes[0])),
+            1
+        );
+        assert_eq!(
+            reconciliation_start_after_cursor(&routes, Some(&routes[1])),
+            2
+        );
+        assert_eq!(
+            reconciliation_start_after_cursor(&routes, Some(&routes[2])),
+            0
+        );
+    }
+
+    #[test]
+    fn durable_skip_record_requires_a_validated_route_hint() {
+        let account = cgka_traits::MemberId::new(vec![0x11; 32]);
+        let route_id = [0x22; 32];
+        let mut delivery = cgka_traits::TransportDelivery {
+            account_id: account.clone(),
+            group_id_hint: Some(cgka_traits::GroupId::new(vec![0x33; 16])),
+            message: cgka_traits::transport::TransportMessage {
+                id: cgka_traits::MessageId::new(vec![0x44; 32]),
+                payload: vec![0x55],
+                timestamp: cgka_traits::transport::Timestamp(1_700_000_000),
+                causal_deps: Vec::new(),
+                source: cgka_traits::transport::TransportSource("nostr".to_owned()),
+                envelope: cgka_traits::transport::TransportEnvelope::GroupMessage {
+                    transport_group_id: route_id.to_vec(),
+                },
+            },
+            received_at: cgka_traits::transport::Timestamp(1_700_000_001),
+            source: cgka_traits::TransportDeliverySource {
+                transport: cgka_traits::transport::TransportSource("nostr".to_owned()),
+                plane: cgka_traits::TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        };
+
+        assert_eq!(
+            transport_reconciliation_record(&account, &delivery),
+            Some((
+                storage_sqlite::TransportReconciliationRoute::Group(route_id),
+                storage_sqlite::TransportReconciliationItem {
+                    event_id: [0x44; 32],
+                    created_at: 1_700_000_000,
+                },
+            ))
+        );
+        delivery.group_id_hint = None;
+        assert_eq!(transport_reconciliation_record(&account, &delivery), None);
+    }
 
     #[test]
     fn the_retry_backoff_doubles_from_its_base_and_caps() {

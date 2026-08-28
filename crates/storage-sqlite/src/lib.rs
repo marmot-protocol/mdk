@@ -65,7 +65,10 @@ pub use timeline::{
     TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason,
     TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
-pub use transport_reconciliation::{TransportReconciliationItem, TransportReconciliationRoute};
+pub use transport_reconciliation::{
+    TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
+    TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
+};
 
 pub use agent_stream_sequences::{
     AgentStreamPublisherReservation, AgentStreamPublisherReservationRequest,
