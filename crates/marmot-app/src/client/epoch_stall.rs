@@ -193,6 +193,12 @@ pub(crate) const EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_
 /// confirmed they had served the account's stored history
 /// (`EpochBackfillCompletionKind::EndOfStoredEvents`) and the replay still
 /// recovered nothing for the group (`AppClient::replay_recovered_something`).
+/// That second check is account-wide, not per group: one kept delivery, or one
+/// tracked group advancing anywhere in that replay, suppresses the count for
+/// every group the replay was armed for. So the evidence this threshold
+/// accumulates is conservative by construction — a busy account raises the bar
+/// for reporting any of its groups, which delays a report rather than
+/// inventing one.
 /// A drain that gave up unconfirmed proves only that the drain gave up, and the
 /// legacy `quiescence_fallback` completion is a deliberately weaker claim — so
 /// neither counts. That restriction is what preserves the property

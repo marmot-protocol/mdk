@@ -2358,7 +2358,7 @@ impl AppClient {
         // rule and this names the count it reached.
         tracing::warn!(
             target: "marmot_app::epoch_stall",
-            method,
+            method = method,
             arms,
             decided_by_threshold,
             "epoch-gap backfill armed repeatedly without recovering a group; escalating"
@@ -4271,6 +4271,12 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
 /// Doubling backoff from `base`, capped at [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`]
 /// (or `base` itself when a test override exceeds the cap). Pure so the
 /// schedule is table-testable without a client.
+fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
+    let doubling = 1_u32 << retry_ordinal.min(8);
+    base.saturating_mul(doubling)
+        .min(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.max(base))
+}
+
 /// Wall clock for the epoch-stall detector's two time gates.
 ///
 /// Wall clock rather than [`Instant`] because both gates have to survive a
@@ -4280,12 +4286,6 @@ fn backfill_drain_verdict(eose: AccountSubscriptionEose) -> DrainVerdict {
 /// policy can be unit-tested in isolation.
 pub(crate) fn epoch_stall_now_ms() -> u64 {
     crate::notifications::unix_now_ms().max(0) as u64
-}
-
-fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
-    let doubling = 1_u32 << retry_ordinal.min(8);
-    base.saturating_mul(doubling)
-        .min(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.max(base))
 }
 
 #[cfg(test)]
