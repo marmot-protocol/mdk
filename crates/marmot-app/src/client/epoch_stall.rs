@@ -873,8 +873,8 @@ impl EpochStallDetector {
     /// from erasing hours of confirmed relay verdicts, while persisting
     /// `last_arm_at_ms` as wall-clock is what stops the restart from *becoming*
     /// the re-arm clock — a force-killed daemon must not buy a re-arm it had
-    /// not waited for. `escalated` rides along so a restart cannot re-report a
-    /// group whose evidence is already at the threshold.
+    /// not waited for. `fruitless_reported` rides along so a restart cannot
+    /// re-report frozen-epoch evidence that already earned its report.
     ///
     /// A restored group starts with an empty undecryptable set, so it must
     /// re-earn the stall threshold before it can spend a paced re-arm. An entry
