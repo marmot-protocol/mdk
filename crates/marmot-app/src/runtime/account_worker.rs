@@ -1341,10 +1341,20 @@ async fn run_app_runtime_account_worker(
                                                 // A host connectivity-restored edge is the one
                                                 // command that is meaningful without an engine
                                                 // session: retain its response and use it to end
-                                                // only this stale sleep. If the network is still
-                                                // unavailable, the failed reopen below advances
-                                                // the same bounded backoff instead of spinning.
+                                                // only this stale sleep. Coalesce an already
+                                                // queued burst into the same reopen attempt; new
+                                                // signals can still interrupt later sleeps, so
+                                                // extra attempts remain bounded by host signal
+                                                // rate while the network stays unavailable.
                                                 pending.push_back(command);
+                                                while let Ok(command) = commands.try_recv() {
+                                                    match command {
+                                                        command @ AccountWorkerCommand::CatchUp { .. } => {
+                                                            pending.push_back(command);
+                                                        }
+                                                        command => drop(command),
+                                                    }
+                                                }
                                                 tracing::debug!(
                                                     target: "marmot_app::runtime",
                                                     method = "account_worker_reconnect",
