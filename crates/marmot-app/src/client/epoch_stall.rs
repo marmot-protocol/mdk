@@ -417,11 +417,7 @@ impl GroupStall {
     /// length: the field shape this counter exists for ran for hours, and
     /// bounding total length would lose it.
     fn arm(&mut self, now_ms: u64, escalation_arm_threshold: u32) -> BackfillDecision {
-        if self.last_arm_at_ms.is_some_and(|last| {
-            now_ms.saturating_sub(last) > EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
-        }) {
-            self.end_run();
-        }
+        self.expire_run_if_stale(now_ms);
         self.armed_at_epoch = Some(self.epoch);
         self.arms = self.arms.saturating_add(1);
         self.note_arm(now_ms);
@@ -443,9 +439,35 @@ impl GroupStall {
     /// to do instead is run one more full-history replay, and the relays'
     /// verdict on that replay is the evidence that escalates
     /// ([`EpochStallDetector::observe_fruitless_completion`]).
+    ///
+    /// It expires a stale run exactly as [`Self::arm`] does. Pacing keeps
+    /// consecutive re-arms an interval apart, which is well inside
+    /// [`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`], but nothing keeps them
+    /// *close*: a wedged group hears from its relays only when traffic arrives,
+    /// so one message after a quiet week is a re-arm the window has already
+    /// outlived. Without the check here that message would extend a run whose
+    /// last arm was days ago and count its evidence toward the next report.
     fn rearm_wedged(&mut self, now_ms: u64) -> BackfillDecision {
+        self.expire_run_if_stale(now_ms);
         self.note_arm(now_ms);
         BackfillDecision::Arm
+    }
+
+    /// End the run when this arm lands more than
+    /// [`EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS`] after the previous one.
+    ///
+    /// Reads the mark through [`elapsed_since_mark_ms`], like the pacing gate
+    /// beside it: a mark in the future of `now` is a clock that was wrong when
+    /// it was taken, and calling that zero elapsed would let a corrected clock
+    /// carry a dead run's arms and evidence into the next report. `end_run`
+    /// leaves `armed_at_epoch` alone, so a fresh run does not cost this group
+    /// the paced re-arm it just qualified for.
+    fn expire_run_if_stale(&mut self, now_ms: u64) {
+        if self.last_arm_at_ms.is_some_and(|last| {
+            elapsed_since_mark_ms(now_ms, last) > EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
+        }) {
+            self.end_run();
+        }
     }
 
     /// Whether this group may spend a paced re-arm now.
@@ -457,10 +479,12 @@ impl GroupStall {
     /// suppression.
     ///
     /// There is no separate "fresh traffic arrived" conjunct because this is
-    /// only ever asked from [`EpochStallDetector::observe_undecryptable`]: the
-    /// call *is* the fresh undecryptable. Liveness without leverage — the
-    /// traffic decides when the question is asked, the clock decides the
-    /// answer, and the relays decide what it is worth.
+    /// only ever asked from the two calls a message arriving *is*:
+    /// [`EpochStallDetector::observe_undecryptable`] and
+    /// [`EpochStallDetector::observe_resource_refusal`], which are the two
+    /// answers the engine gives a message it cannot read. Liveness without
+    /// leverage — the traffic decides when the question is asked, the clock
+    /// decides the answer, and the relays decide what it is worth.
     fn may_rearm_wedged(&self, now_ms: u64, interval_ms: u64) -> bool {
         self.armed_at_epoch == Some(self.epoch)
             && self
@@ -757,7 +781,19 @@ impl EpochStallDetector {
     /// of one. Refusal arms count toward escalation exactly like threshold arms:
     /// both mean "a full-history replay was armed for this group", and a run of
     /// refusals is the stronger evidence that replay cannot recover the group,
-    /// since the objects it needs were not retained at all.
+    /// since the objects it needs were not retained at all. The paced
+    /// same-epoch re-arm below is the one exception, and it is the same
+    /// exception [`EpochStallDetector::observe_undecryptable`] makes: it is not
+    /// an arm of the run, only of the replay, because the flood cap a refusal
+    /// reports is one minted traffic can saturate by itself (mdk#339). What
+    /// reports a group re-arming off refusals alone is
+    /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
+    ///
+    /// That re-arm is not a nicety for symmetry's sake. A group whose
+    /// deferred-peel cap is full is answered `ResourceRefused` for *every*
+    /// further message, undecryptable ones included, so this is the only
+    /// `observe_*` call it makes — and its cap is durable, so a restart
+    /// restores the latch without restoring any other way past it.
     pub(crate) fn observe_resource_refusal(
         &mut self,
         group: GroupId,
@@ -769,11 +805,13 @@ impl EpochStallDetector {
             .entry(group)
             .or_insert_with(|| GroupStall::new(epoch));
         stall.observe_epoch(epoch);
-        if stall.fired_at_epoch == Some(epoch) {
-            BackfillDecision::Skip
-        } else {
-            stall.arm(now_ms, self.escalation_arm_threshold)
+        if stall.fired_at_epoch != Some(epoch) {
+            return stall.arm(now_ms, self.escalation_arm_threshold);
         }
+        if stall.may_rearm_wedged(now_ms, self.wedge_rearm_interval_ms) {
+            return stall.rearm_wedged(now_ms);
+        }
+        BackfillDecision::Skip
     }
 
     /// Count one replay completion that reached end-of-stored-events and
