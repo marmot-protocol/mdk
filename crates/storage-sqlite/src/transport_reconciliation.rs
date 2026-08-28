@@ -181,64 +181,67 @@ impl SqliteAccountStorage {
             )
         })?;
         let (route_kind, route_id) = route.storage_key();
-        let mut conn = self.connection.lock()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .storage()?;
-        let inventory_since = route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
-        compact_route_tx(&tx, route_kind, route_id)?;
-        let inventory_since = tx
-            .query_row(
-                "SELECT inventory_since
-                 FROM transport_reconciliation_route_state
-                 WHERE route_kind = ?1 AND route_id = ?2",
-                params![route_kind, route_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .storage()?
-            .max(inventory_since);
-        let mut statement = tx
-            .prepare(
-                "SELECT event_id, created_at
-                 FROM transport_reconciliation_items
-                 WHERE route_kind = ?1 AND route_id = ?2 AND created_at >= ?3
-                 ORDER BY created_at, event_id",
-            )
-            .storage()?;
-        let items = statement
-            .query_map(params![route_kind, route_id, inventory_since], |row| {
-                let event_id = row.get::<_, Vec<u8>>(0)?;
-                let created_at = row.get::<_, i64>(1)?;
-                Ok((event_id, created_at))
-            })
-            .storage()?
-            .map(|row| {
-                let (event_id, created_at) = row.storage()?;
-                let event_id = event_id.try_into().map_err(|_| {
-                    StorageError::Serialization(
-                        "invalid transport reconciliation event id".to_owned(),
-                    )
-                })?;
-                let created_at = u64::try_from(created_at).map_err(|_| {
-                    StorageError::Serialization(
-                        "invalid transport reconciliation timestamp".to_owned(),
-                    )
-                })?;
-                Ok(TransportReconciliationItem {
-                    event_id,
-                    created_at,
-                })
-            })
-            .collect::<StorageResult<Vec<_>>>()?;
-        drop(statement);
-        tx.commit().storage()?;
-        Ok(TransportReconciliationInventory {
-            since: u64::try_from(inventory_since).map_err(|_| {
-                StorageError::Serialization(
-                    "invalid transport reconciliation inventory floor".to_owned(),
+        retry_on_busy(|| {
+            let mut conn = self.connection.lock()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
+            let inventory_since =
+                route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
+            compact_route_tx(&tx, route_kind, route_id)?;
+            let inventory_since = tx
+                .query_row(
+                    "SELECT inventory_since
+                     FROM transport_reconciliation_route_state
+                     WHERE route_kind = ?1 AND route_id = ?2",
+                    params![route_kind, route_id],
+                    |row| row.get::<_, i64>(0),
                 )
-            })?,
-            items,
+                .storage()?
+                .max(inventory_since);
+            let mut statement = tx
+                .prepare(
+                    "SELECT event_id, created_at
+                     FROM transport_reconciliation_items
+                     WHERE route_kind = ?1 AND route_id = ?2 AND created_at >= ?3
+                     ORDER BY created_at, event_id",
+                )
+                .storage()?;
+            let items = statement
+                .query_map(params![route_kind, route_id, inventory_since], |row| {
+                    let event_id = row.get::<_, Vec<u8>>(0)?;
+                    let created_at = row.get::<_, i64>(1)?;
+                    Ok((event_id, created_at))
+                })
+                .storage()?
+                .map(|row| {
+                    let (event_id, created_at) = row.storage()?;
+                    let event_id = event_id.try_into().map_err(|_| {
+                        StorageError::Serialization(
+                            "invalid transport reconciliation event id".to_owned(),
+                        )
+                    })?;
+                    let created_at = u64::try_from(created_at).map_err(|_| {
+                        StorageError::Serialization(
+                            "invalid transport reconciliation timestamp".to_owned(),
+                        )
+                    })?;
+                    Ok(TransportReconciliationItem {
+                        event_id,
+                        created_at,
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            drop(statement);
+            tx.commit().storage()?;
+            Ok(TransportReconciliationInventory {
+                since: u64::try_from(inventory_since).map_err(|_| {
+                    StorageError::Serialization(
+                        "invalid transport reconciliation inventory floor".to_owned(),
+                    )
+                })?,
+                items,
+            })
         })
     }
 

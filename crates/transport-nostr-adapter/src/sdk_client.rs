@@ -300,8 +300,8 @@ impl NostrSdkRelayClient {
         .map_err(|_| {
             TransportAdapterError::Subscription("NIP-77 reconciliation timed out".to_owned())
         })?
-        .map_err(|error| {
-            TransportAdapterError::Subscription(format!("NIP-77 reconciliation failed: {error}"))
+        .map_err(|_| {
+            TransportAdapterError::Subscription("NIP-77 reconciliation failed".to_owned())
         })?;
         let newly_unsupported = output
             .failed
@@ -335,10 +335,10 @@ impl NostrSdkRelayClient {
                 .database()
                 .event_by_id(&event_id)
                 .await
-                .map_err(|error| {
-                    TransportAdapterError::Subscription(format!(
-                        "read reconciled event from SDK database: {error}"
-                    ))
+                .map_err(|_| {
+                    TransportAdapterError::Subscription(
+                        "read reconciled event from SDK database failed".to_owned(),
+                    )
                 })? {
                 Some(event) => sdk_events.push(event),
                 None => missing_ids.push(event_id),
@@ -360,10 +360,10 @@ impl NostrSdkRelayClient {
                 self.client
                     .fetch_events_from(endpoints, Filter::new().ids(missing_ids), remaining)
                     .await
-                    .map_err(|error| {
-                        TransportAdapterError::Subscription(format!(
-                            "fetch reconciled event batch: {error}"
-                        ))
+                    .map_err(|_| {
+                        TransportAdapterError::Subscription(
+                            "fetch reconciled event batch failed".to_owned(),
+                        )
                     })?
                     .len()
             }
