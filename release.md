@@ -30,7 +30,8 @@ When multiple tracks correspond to the same source snapshot, create the tags on 
 git tag -a v0.9.0 -m "mdk v0.9.0"
 git tag -a wn-agent-v0.9.0 -m "WN Agent v0.9.0"
 git tag -a marmotkit-v0.9.0 -m "MarmotKit v0.9.0"
-git push origin v0.9.0 wn-agent-v0.9.0 marmotkit-v0.9.0
+git tag -a marmotc-v0.9.0 -m "Marmot C v0.9.0"
+git push origin v0.9.0 wn-agent-v0.9.0 marmotkit-v0.9.0 marmotc-v0.9.0
 ```
 
 The workspace is not published to crates.io today. The root `Cargo.toml` has `publish = false`, and the crates depend
@@ -51,6 +52,7 @@ Use the same version number in:
 - `v<version>` for the whole workspace;
 - `wn-agent-v<version>` for WN Agent binary and adapter-install releases;
 - `marmotkit-v<version>` for generated app binding bundles;
+- `marmotc-v<version>` for the C ABI bundle;
 - `crates/cli/CHANGELOG.md` for CLI-visible changes.
 
 The tag prefix names the artifact track. The numeric version names the compatibility cohort. It is fine for one track to
@@ -60,18 +62,19 @@ Title GitHub Releases with the version first so release lists group artifacts by
 
 - whole-workspace source releases: `v0.9.3 - MDK`;
 - WN Agent releases: `v0.9.3 - wn-agent`;
-- MarmotKit binding releases: `v0.9.3 - MarmotKit`.
+- MarmotKit binding releases: `v0.9.3 - MarmotKit`;
+- Marmot C binding releases: `v0.9.3 - Marmot C`.
 
-For a full cohort release across all three current tracks, use the coordinator:
+For a full cohort release across all four current tracks, use the coordinator:
 
 ```sh
 just release-all 0.9.3
 ```
 
-This creates `v<version>`, `wn-agent-v<version>`, and `marmotkit-v<version>` on the same `origin/master` commit,
-creates the MDK source GitHub Release with generated notes starting from the previous `v*` tag, pushes the artifact
-tags, waits for the WN Agent and MarmotKit release workflows, verifies expected release metadata/assets, and marks the
-MDK source release as Latest.
+This creates `v<version>`, `wn-agent-v<version>`, `marmotkit-v<version>`, and `marmotc-v<version>` on the same
+`origin/master` commit, creates the MDK source GitHub Release with generated notes starting from the previous `v*` tag,
+pushes the artifact tags, waits for the WN Agent, MarmotKit, and Marmot C release workflows, verifies expected release
+metadata/assets, and marks the MDK source release as Latest.
 
 To stage the same cohort for manual review, leave every GitHub Release draft:
 

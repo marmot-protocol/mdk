@@ -33,6 +33,7 @@ pub use status::MarmotStatus;
 
 use memory::{owned_c_string, required_str, str_array};
 use status::set_last_error;
+use types::notification::MarmotCursorPersistence;
 
 /// Opaque handle to a running Marmot client: the app runtime plus the
 /// tokio runtime that drives it. Create with `marmot_client_new`, destroy
@@ -141,49 +142,120 @@ pub unsafe extern "C" fn marmot_client_new(
     relay_urls_len: usize,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
+    ffi_guard(|| unsafe {
+        open_client(
+            root_path,
+            relay_urls,
+            relay_urls_len,
+            out_client,
+            Marmot::new,
+        )
+    })
+}
+
+/// Create a Marmot client with an explicit durable transport-cursor
+/// policy. Identical to `marmot_client_new`, which is
+/// `MARMOT_CURSOR_PERSISTENCE_ADVANCE`.
+///
+/// Wake-collection processes (a push-triggered pass around
+/// `marmot_collect_notifications_after_wake`) construct with
+/// `MARMOT_CURSOR_PERSISTENCE_FROZEN`: the pass still ingests, decrypts,
+/// and projects, but a sub-second drain on cold sockets can never ratchet
+/// the durable `since` floor past events it did not receive.
+///
+/// `cursor_persistence` is a `MarmotCursorPersistence` discriminant; an
+/// out-of-range value is `MARMOT_STATUS_INVALID_ARGUMENT`.
+///
+/// # Safety
+/// Same argument contract as `marmot_client_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    cursor_persistence: u32,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
     ffi_guard(|| {
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
         }
-        let root_path = match unsafe { required_str(root_path) } {
-            Ok(v) => v,
+        let cursor_persistence = match MarmotCursorPersistence::from_c(cursor_persistence) {
+            Ok(value) => value,
             Err(status) => return status,
         };
-        let relay_urls = match unsafe { str_array(relay_urls, relay_urls_len) } {
-            Ok(v) => v,
-            Err(status) => return status,
-        };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(err) => {
-                set_last_error(format!("failed to build tokio runtime: {err}"));
-                return MarmotStatus::Runtime;
-            }
-        };
-        // Constructor is sync but spawns onto the runtime internally, so
-        // enter the runtime context for the duration of the call.
-        let guard = runtime.enter();
-        let marmot = match Marmot::new(root_path, relay_urls) {
-            Ok(m) => m,
-            Err(err) => {
-                drop(guard);
-                return status::status_from_error(&err);
-            }
-        };
-        drop(guard);
-        let client = memory::boxed(MarmotClient { runtime, marmot });
-        match unsafe { write_out(out_client, client) } {
-            Ok(()) => MarmotStatus::Ok,
-            Err(status) => {
-                // Out-pointer was NULL; reclaim the handle we just made.
-                unsafe { free_client(client) };
-                status
-            }
+        unsafe {
+            open_client(
+                root_path,
+                relay_urls,
+                relay_urls_len,
+                out_client,
+                move |root_path, relay_urls| {
+                    Marmot::new_with_cursor_persistence(
+                        root_path,
+                        relay_urls,
+                        cursor_persistence.into(),
+                    )
+                },
+            )
         }
     })
+}
+
+/// Shared body of the client constructors: read the borrowed arguments,
+/// build the embedded runtime, run `construct` inside it, and hand the
+/// handle out.
+///
+/// # Safety
+/// Same argument contract as the public constructors.
+unsafe fn open_client(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    out_client: *mut *mut MarmotClient,
+    construct: impl FnOnce(String, Vec<String>) -> Result<Arc<Marmot>, marmot_uniffi::MarmotKitError>,
+) -> MarmotStatus {
+    if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+        return status;
+    }
+    let root_path = match unsafe { required_str(root_path) } {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let relay_urls = match unsafe { str_array(relay_urls, relay_urls_len) } {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            set_last_error(format!("failed to build tokio runtime: {err}"));
+            return MarmotStatus::Runtime;
+        }
+    };
+    // Constructor is sync but spawns onto the runtime internally, so
+    // enter the runtime context for the duration of the call.
+    let guard = runtime.enter();
+    let marmot = match construct(root_path, relay_urls) {
+        Ok(m) => m,
+        Err(err) => {
+            drop(guard);
+            return status::status_from_error(&err);
+        }
+    };
+    drop(guard);
+    let client = memory::boxed(MarmotClient { runtime, marmot });
+    match unsafe { write_out(out_client, client) } {
+        Ok(()) => MarmotStatus::Ok,
+        Err(status) => {
+            // Out-pointer was NULL; reclaim the handle we just made.
+            unsafe { free_client(client) };
+            status
+        }
+    }
 }
 
 /// Start the runtime (reconcile accounts, start workers, subscribe

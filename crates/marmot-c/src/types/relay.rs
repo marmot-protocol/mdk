@@ -88,8 +88,7 @@ impl MarmotRelayTelemetrySettings {
 
 c_mirror! {
     /// OTLP resource attributes for relay-telemetry export. Borrowed input.
-    MarmotRelayTelemetryResource from RelayTelemetryResourceFfi,
-    free marmot_relay_telemetry_resource_free {
+    MarmotRelayTelemetryResource from RelayTelemetryResourceFfi {
         str service_version,
         str service_instance_id,
         str deployment_environment,
@@ -119,8 +118,7 @@ impl MarmotRelayTelemetryResource {
 c_mirror! {
     /// Runtime OTLP route config for relay telemetry. Borrowed input to
     /// `marmot_set_relay_telemetry_runtime_config`.
-    MarmotRelayTelemetryRuntimeConfig from RelayTelemetryRuntimeConfigFfi,
-    free marmot_relay_telemetry_runtime_config_free {
+    MarmotRelayTelemetryRuntimeConfig from RelayTelemetryRuntimeConfigFfi {
         opt_str otlp_endpoint,
         opt_str authorization_bearer_token,
         opt_rec resource: MarmotRelayTelemetryResource,

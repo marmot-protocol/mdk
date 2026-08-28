@@ -571,6 +571,22 @@ typedef enum MarmotNotificationWakeSource {
 } MarmotNotificationWakeSource;
 
 /**
+ * Whether a pass may ratchet the durable transport `since` floor.
+ * Caller-supplied to `marmot_client_new_with_cursor_persistence`.
+ */
+typedef enum MarmotCursorPersistence {
+  /**
+   * Advance the durable floor as events arrive (foreground apps).
+   */
+  MARMOT_CURSOR_PERSISTENCE_ADVANCE,
+  /**
+   * Ingest without moving the floor: a sub-second drain on cold
+   * sockets must not skip events it never received.
+   */
+  MARMOT_CURSOR_PERSISTENCE_FROZEN,
+} MarmotCursorPersistence;
+
+/**
  * Host-side operation a UI can time and report back.
  */
 typedef enum MarmotHostPerformanceOperation {
@@ -3489,6 +3505,29 @@ MarmotStatus marmot_client_new(const char *root_path,
                                const char *const *relay_urls,
                                uintptr_t relay_urls_len,
                                struct MarmotClient **out_client);
+
+/**
+ * Create a Marmot client with an explicit durable transport-cursor
+ * policy. Identical to `marmot_client_new`, which is
+ * `MARMOT_CURSOR_PERSISTENCE_ADVANCE`.
+ *
+ * Wake-collection processes (a push-triggered pass around
+ * `marmot_collect_notifications_after_wake`) construct with
+ * `MARMOT_CURSOR_PERSISTENCE_FROZEN`: the pass still ingests, decrypts,
+ * and projects, but a sub-second drain on cold sockets can never ratchet
+ * the durable `since` floor past events it did not receive.
+ *
+ * `cursor_persistence` is a `MarmotCursorPersistence` discriminant; an
+ * out-of-range value is `MARMOT_STATUS_INVALID_ARGUMENT`.
+ *
+ * # Safety
+ * Same argument contract as `marmot_client_new`.
+ */
+MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
+                                                       const char *const *relay_urls,
+                                                       uintptr_t relay_urls_len,
+                                                       uint32_t cursor_persistence,
+                                                       struct MarmotClient **out_client);
 
 /**
  * Start the runtime (reconcile accounts, start workers, subscribe
@@ -7404,26 +7443,6 @@ void marmot_relay_health_free(struct MarmotRelayHealth *ptr);
  * this library.
  */
 void marmot_relay_telemetry_settings_free(struct MarmotRelayTelemetrySettings *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_relay_telemetry_resource_free(struct MarmotRelayTelemetryResource *ptr);
-
-/**
- * Free a value of this type returned by this library. NULL
- * is a no-op.
- *
- * # Safety
- * The pointer must be NULL or an unfreed pointer returned by
- * this library.
- */
-void marmot_relay_telemetry_runtime_config_free(struct MarmotRelayTelemetryRuntimeConfig *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

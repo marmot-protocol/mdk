@@ -44,7 +44,11 @@ int main(void) {
         return 1;
     }
     /* ... */
-    marmot_client_shutdown(client);
+    if (marmot_client_shutdown(client) != MARMOT_STATUS_OK) {
+        report("client_shutdown");
+        marmot_client_free(client);
+        return 1;
+    }
     marmot_client_free(client);
     return 0;
 }

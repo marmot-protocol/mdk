@@ -36,12 +36,6 @@ DELIBERATELY_UNEXPORTED = {
     "login_external_signer": (
         "Same host-implemented signer trait as register_external_signer."
     ),
-    "new": ("Constructor; exposed as marmot_client_new."),
-    "new_with_cursor_persistence": (
-        "Constructor variant for wake-collection processes (NSE / notification "
-        "actions), which are UniFFI hosts. Exposed as "
-        "marmot_client_new_with_cursor_persistence."
-    ),
 }
 
 
@@ -81,7 +75,9 @@ def c_coverage() -> set[str]:
         # c_cmd! `fn marmot_x(..) -> rec(T) = method;` — anchor on the return
         # form so a plain assignment cannot pass as coverage.
         | set(re.findall(r"->[\w()]+=(\w+);", src))
-        | set(re.findall(r"Marmot::(\w+)\(", src))
+        # Called, or handed to `open_client` as a bare function item
+        # (`Marmot::new,`).
+        | set(re.findall(r"Marmot::(\w+)[(,]", src))
     )
 
 

@@ -24,11 +24,18 @@ trap 'rm -rf "$WORK"' EXIT
 
 CFLAGS=(-std=c11 -Wall -Wextra -Werror -I"$CRATE_DIR/include")
 
+# Darwin has no libdl (dlopen lives in libSystem) and looks up shared
+# libraries through DYLD_LIBRARY_PATH.
+case "$(uname -s)" in
+  Darwin) STATIC_LIBS=(-lm -pthread); LIB_PATH_VAR="DYLD_LIBRARY_PATH" ;;
+  *) STATIC_LIBS=(-lm -pthread -ldl); LIB_PATH_VAR="LD_LIBRARY_PATH" ;;
+esac
+
 run() {
     local bin="$1"; shift
     local home
     home="$(mktemp -d "$WORK/home.XXXXXX")"
-    LD_LIBRARY_PATH="$TARGET_DIR/release" "$@" "$bin" "$home"
+    env "$LIB_PATH_VAR=$TARGET_DIR/release" "$@" "$bin" "$home"
     rm -rf "$home"
 }
 
@@ -39,7 +46,7 @@ for cc in "${COMPILERS[@]}"; do
 
     echo "==> [$cc] Compiling smoke.c against the static archive"
     "$cc" "${CFLAGS[@]}" "$CRATE_DIR/examples/smoke.c" \
-        "$TARGET_DIR/release/libmarmot_c.a" -lm -pthread -ldl -o "$WORK/smoke-static-$cc"
+        "$TARGET_DIR/release/libmarmot_c.a" "${STATIC_LIBS[@]}" -o "$WORK/smoke-static-$cc"
 
     echo "==> [$cc] Running smoke (shared)"
     run "$WORK/smoke-shared-$cc"

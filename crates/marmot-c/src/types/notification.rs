@@ -1,12 +1,33 @@
 //! C mirrors of the notification pipeline conversions.
 
 use marmot_uniffi::conversions::{
-    BackgroundNotificationCollectionFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
-    NotificationTrafficClassFfi, NotificationTriggerFfi, NotificationUpdateFfi,
-    NotificationUserFfi, NotificationWakeSourceFfi,
+    BackgroundNotificationCollectionFfi, CursorPersistenceFfi, NotificationCollectionStatusFfi,
+    NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
+
+c_enum! {
+    /// Whether a pass may ratchet the durable transport `since` floor.
+    /// Caller-supplied to `marmot_client_new_with_cursor_persistence`.
+    MarmotCursorPersistence from CursorPersistenceFfi {
+        /// Advance the durable floor as events arrive (foreground apps).
+        Advance,
+        /// Ingest without moving the floor: a sub-second drain on cold
+        /// sockets must not skip events it never received.
+        Frozen,
+    }
+}
+
+impl From<MarmotCursorPersistence> for CursorPersistenceFfi {
+    fn from(value: MarmotCursorPersistence) -> Self {
+        match value {
+            MarmotCursorPersistence::Advance => Self::Advance,
+            MarmotCursorPersistence::Frozen => Self::Frozen,
+        }
+    }
+}
 
 c_enum! {
     /// What woke the background collection.

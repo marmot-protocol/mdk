@@ -36,6 +36,7 @@ prefix = ""
 # by any signature, so cbindgen would drop the constants consumers need.
 include = [
     "MarmotNotificationWakeSource",
+    "MarmotCursorPersistence",
     "MarmotHostPerformanceOperation",
     "MarmotHostPerformanceOutcome",
 ]

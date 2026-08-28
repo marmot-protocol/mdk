@@ -9,9 +9,10 @@ Create the full MDK release cohort:
   - v<version> source release
   - wn-agent-v<version> binary/adapter release
   - marmotkit-v<version> generated bindings release
+  - marmotc-v<version> C ABI bundle release
 
 By default this pushes all tags, creates the MDK source release with generated
-GitHub notes, waits for the WN Agent and MarmotKit workflows, verifies the
+GitHub notes, waits for the WN Agent, MarmotKit, and Marmot C workflows, verifies the
 resulting releases, and marks the MDK source release as Latest.
 
 Options:
@@ -124,7 +125,8 @@ fi
 run git fetch --no-tags origin master \
     'refs/tags/v*:refs/tags/v*' \
     'refs/tags/wn-agent-v*:refs/tags/wn-agent-v*' \
-    'refs/tags/marmotkit-v*:refs/tags/marmotkit-v*'
+    'refs/tags/marmotkit-v*:refs/tags/marmotkit-v*' \
+    'refs/tags/marmotc-v*:refs/tags/marmotc-v*'
 
 head_sha="$(git rev-parse HEAD)"
 origin_master_sha="$(git rev-parse origin/master)"
@@ -148,6 +150,7 @@ fi
 mdk_tag="v$version"
 wn_tag="wn-agent-v$version"
 marmotkit_tag="marmotkit-v$version"
+marmotc_tag="marmotc-v$version"
 
 previous_tag() {
     local pattern="$1"
@@ -158,6 +161,7 @@ previous_tag() {
 previous_mdk_tag="$(previous_tag 'v[0-9]*' "$mdk_tag")"
 previous_wn_tag="$(previous_tag 'wn-agent-v[0-9]*' "$wn_tag")"
 previous_marmotkit_tag="$(previous_tag 'marmotkit-v[0-9]*' "$marmotkit_tag")"
+previous_marmotc_tag="$(previous_tag 'marmotc-v[0-9]*' "$marmotc_tag")"
 
 check_tag_available() {
     local tag="$1"
@@ -183,6 +187,7 @@ check_tag_available() {
 check_tag_available "$mdk_tag"
 check_tag_available "$wn_tag"
 check_tag_available "$marmotkit_tag"
+check_tag_available "$marmotc_tag"
 
 create_tag() {
     local tag="$1"
@@ -321,12 +326,13 @@ echo "  version:    $version"
 echo "  commit:     $release_sha"
 echo "  mode:       $([ "$draft" -eq 1 ] && echo draft || echo publish)"
 echo "  wait:       $([ "$wait" -eq 1 ] && echo yes || echo no)"
-echo "  tags:       $mdk_tag, $wn_tag, $marmotkit_tag"
-echo "  previous:   ${previous_mdk_tag:-none}, ${previous_wn_tag:-none}, ${previous_marmotkit_tag:-none}"
+echo "  tags:       $mdk_tag, $wn_tag, $marmotkit_tag, $marmotc_tag"
+echo "  previous:   ${previous_mdk_tag:-none}, ${previous_wn_tag:-none}, ${previous_marmotkit_tag:-none}, ${previous_marmotc_tag:-none}"
 
 create_tag "$mdk_tag" "mdk v$version"
 create_tag "$wn_tag" "WN Agent v$version"
 create_tag "$marmotkit_tag" "MarmotKit v$version"
+create_tag "$marmotc_tag" "Marmot C v$version"
 
 push_tag "$mdk_tag"
 verify_remote_tag "$mdk_tag"
@@ -346,9 +352,16 @@ if [ "$push" -eq 1 ] && [ "$draft" -eq 1 ]; then
     create_generated_release "$marmotkit_tag" "v$version - MarmotKit" "$previous_marmotkit_tag" 0 false
 fi
 
+push_tag "$marmotc_tag"
+verify_remote_tag "$marmotc_tag"
+if [ "$push" -eq 1 ] && [ "$draft" -eq 1 ]; then
+    create_generated_release "$marmotc_tag" "v$version - Marmot C" "$previous_marmotc_tag" 0 false
+fi
+
 if [ "$push" -eq 1 ] && [ "$wait" -eq 1 ]; then
     wait_for_workflow "wn-agent Binaries" "$wn_tag"
     wait_for_workflow "MarmotKit Bindings" "$marmotkit_tag"
+    wait_for_workflow "Marmot C Bindings" "$marmotc_tag"
 
     if [ "$draft" -eq 0 ]; then
         run gh release edit "$mdk_tag" --repo "$repo" --latest
@@ -357,6 +370,7 @@ if [ "$push" -eq 1 ] && [ "$wait" -eq 1 ]; then
     verify_release "$mdk_tag" "v$version - MDK" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 0
     verify_release "$wn_tag" "v$version - wn-agent" "$([ "$draft" -eq 1 ] && echo true || echo false)" true 14
     verify_release "$marmotkit_tag" "v$version - MarmotKit" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 4
+    verify_release "$marmotc_tag" "v$version - Marmot C" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 2
 elif [ "$push" -eq 1 ]; then
     echo "pushed release tags; artifact workflows will finish asynchronously"
     if [ "$draft" -eq 0 ]; then
