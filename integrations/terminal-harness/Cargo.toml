@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [features]
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dependencies]
 agent-control.workspace = true
@@ -22,7 +22,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
-tempfile = { workspace = true, optional = true }
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

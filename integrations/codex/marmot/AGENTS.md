@@ -9,7 +9,9 @@ Rust Codex harness for Marmot through the local `wn-agent` control socket. Read
   durable sends, and invite handling; this crate invokes Codex and parses its
   JSONL event stream.
 - Every message from an allowed sender is a prompt. Do not add gateway,
-  mention-activation, media, profile, or QUIC preview behavior here.
+  mention-activation, profile, or QUIC preview behavior here. The shared
+  terminal harness owns inbound media download, validation, staging, limits,
+  and cleanup; this adapter may map validated image paths to Codex CLI flags.
 - Send prompts over stdin, emit only completed `agent_message` text, and never
   expose reasoning, command output, tool output, or partial items.
 - Preserve the shared workdir/session mapping rules. One Marmot group maps to

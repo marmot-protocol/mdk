@@ -1,11 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_control::{AgentControlAccount, AgentControlEvent, AgentControlMediaUpload};
+use agent_control::{
+    AgentControlAccount, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
+};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::AbortHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
@@ -15,7 +20,7 @@ use crate::artifacts::{
 };
 use crate::chunking::split_reply_chunks;
 use crate::commands::{self, ChatCommand, Routed};
-use crate::control::ControlClient;
+use crate::control::{ControlClient, DownloadedMedia};
 use crate::error::{HarnessError, Result};
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{
@@ -23,8 +28,8 @@ use crate::store::{
     RecoveryStore, SessionRecord, SessionStore,
 };
 use crate::{
-    ArtifactOutput, ArtifactOutputRequest, ArtifactSupport, Backend, Config, Invocation, Outcome,
-    RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
+    ArtifactOutput, ArtifactOutputRequest, ArtifactSupport, Attachment, Backend, Config,
+    Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
 };
 
 const DEDUPE_LIMIT: usize = 2048;
@@ -38,6 +43,7 @@ const INCOMPLETE_FINAL_TEXT: &str = "The backend finished, but the connector cou
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
+    reconcile_attachment_staging(&config.attachment_staging_root)?;
     let execution_support = backend.execution_support();
     validate_artifact_support(
         config.artifact_exports.enabled(),
@@ -397,6 +403,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 group_ref: group_id_hex,
                 message_ref: message.message_id_hex,
                 text: message.text,
+                media: message.media,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
             DispatchOutcome::Continue
@@ -437,6 +444,7 @@ struct InboundPrompt {
     group_ref: String,
     message_ref: String,
     text: String,
+    media: Vec<AgentControlMediaRef>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -678,6 +686,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 }
             };
             retrying = true;
+            inbound.media = record.media.clone();
             Some((record.cwd, Some(record.session_id), record.prompt))
         }
         PromptDisposition::Forward {
@@ -743,6 +752,39 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         "handling inbound prompt"
     );
 
+    let attachment_batch = match prepare_attachment_batch(&ctx, &inbound).await {
+        Ok(batch) => batch,
+        Err(err) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "prepare_attachments",
+                error_kind = err.privacy_safe_kind(),
+                attachment_count = inbound.media.len(),
+                "failed to prepare inbound attachments"
+            );
+            if retrying && let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "retry_recovery",
+                    error_kind = reset_err.privacy_safe_kind(),
+                    "failed to restore retryable recovery state"
+                );
+            }
+            let _ = send_reply(
+                &ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                &attachment_failure_reply(&ctx.cfg, &err),
+                0,
+            )
+            .await;
+            return;
+        }
+    };
+    let attachments = attachment_batch
+        .as_ref()
+        .map_or_else(Vec::new, |batch| batch.attachments.clone());
     let (artifact_authorization, artifact_setup_failed) = match ctx
         .cfg
         .artifact_exports
@@ -791,7 +833,17 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
-    let runner = tokio::spawn(async move { backend.run(invocation, tx).await });
+    let runner = tokio::spawn(async move {
+        // The staging lease lives in the backend task so its paths cannot
+        // disappear while that task still has access to them.
+        let _attachment_batch = attachment_batch;
+        backend
+            .run_with_attachments(invocation, attachments, tx)
+            .await
+    });
+    // Dropping a JoinHandle detaches its task. Abort explicitly when this
+    // message handler is cancelled so the task drops its staging lease too.
+    let _runner_abort = AbortBackendOnDrop(runner.abort_handle());
     let mut buffered_text = Vec::new();
     let mut artifact_outputs: Vec<ArtifactOutput> = Vec::new();
     let mut artifact_declaration_failed = false;
@@ -1013,6 +1065,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 known_session.as_ref(),
                 cwd,
                 recovery_prompt,
+                inbound.media.clone(),
                 &failure,
             )
             .await;
@@ -1393,6 +1446,187 @@ async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
         || ctx.outbox.lock().await.has_pending_group(group_ref)
 }
 
+struct AttachmentBatch {
+    _directory: tempfile::TempDir,
+    attachments: Vec<Attachment>,
+}
+
+struct AbortBackendOnDrop(AbortHandle);
+
+impl Drop for AbortBackendOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn validate_attachment_count(count: usize, maximum: usize) -> Result<()> {
+    if count > maximum {
+        return Err(HarnessError::AttachmentCountLimit);
+    }
+    Ok(())
+}
+
+fn add_attachment_bytes(current: u64, next: u64, maximum: u64) -> Result<u64> {
+    let total = current
+        .checked_add(next)
+        .ok_or(HarnessError::AttachmentBytesLimit)?;
+    if total > maximum {
+        return Err(HarnessError::AttachmentBytesLimit);
+    }
+    Ok(total)
+}
+
+fn staged_attachment_name(index: usize, file_name: &str) -> String {
+    let leaf = std::path::Path::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let mut sanitized = String::with_capacity(leaf.len().min(128));
+    for character in leaf.chars().take(128) {
+        sanitized.push(
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    let sanitized = sanitized.trim_matches(['.', '_']);
+    let sanitized = if sanitized.is_empty() {
+        "attachment"
+    } else {
+        sanitized
+    };
+    format!("{index:03}-{sanitized}")
+}
+
+fn reconcile_attachment_staging(root: &std::path::Path) -> Result<()> {
+    fs_private::create_dir_all_private(root)?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("batch-") || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        fs::remove_dir_all(entry.path())?;
+    }
+    Ok(())
+}
+
+async fn prepare_attachment_batch(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+) -> Result<Option<AttachmentBatch>> {
+    validate_attachment_count(inbound.media.len(), ctx.cfg.max_attachments)?;
+    if inbound.media.is_empty() {
+        return Ok(None);
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("batch-")
+        .tempdir_in(&ctx.cfg.attachment_staging_root)?;
+    let mut attachments = Vec::with_capacity(inbound.media.len());
+    let mut aggregate_bytes = 0_u64;
+    for (index, media) in inbound.media.iter().cloned().enumerate() {
+        let downloaded = ctx
+            .client
+            .download_media(&inbound.account_ref, &inbound.group_ref, media)
+            .await?;
+        aggregate_bytes = add_attachment_bytes(
+            aggregate_bytes,
+            downloaded.size_bytes,
+            ctx.cfg.max_attachment_bytes,
+        )?;
+        attachments.push(stage_downloaded_attachment(
+            directory.path(),
+            index,
+            downloaded,
+        )?);
+    }
+    Ok(Some(AttachmentBatch {
+        _directory: directory,
+        attachments,
+    }))
+}
+
+fn stage_downloaded_attachment(
+    directory: &std::path::Path,
+    index: usize,
+    downloaded: DownloadedMedia,
+) -> Result<Attachment> {
+    let metadata =
+        fs::symlink_metadata(&downloaded.path).map_err(|_| HarnessError::AttachmentInvalid)?;
+    if !metadata.file_type().is_file() || !owner_can_read(&metadata) {
+        return Err(HarnessError::AttachmentInvalid);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut source = options
+        .open(&downloaded.path)
+        .map_err(|_| HarnessError::AttachmentInvalid)?;
+    let opened_metadata = source
+        .metadata()
+        .map_err(|_| HarnessError::AttachmentInvalid)?;
+    if !opened_metadata.is_file()
+        || !owner_can_read(&opened_metadata)
+        || opened_metadata.len() != downloaded.size_bytes
+    {
+        return Err(HarnessError::AttachmentInvalid);
+    }
+
+    let file_name = staged_attachment_name(index, &downloaded.file_name);
+    let destination_path = directory.join(&file_name);
+    let mut destination = fs_private::create_new_private(&destination_path)?;
+    let copied = {
+        let mut bounded_source = (&mut source).take(downloaded.size_bytes);
+        io::copy(&mut bounded_source, &mut destination)?
+    };
+    let mut extra = [0_u8; 1];
+    let has_extra = source.read(&mut extra)? != 0;
+    destination.sync_all()?;
+    if copied != downloaded.size_bytes || has_extra {
+        return Err(HarnessError::AttachmentInvalid);
+    }
+    Ok(Attachment {
+        path: destination_path,
+        media_type: downloaded.media_type,
+        file_name,
+        size_bytes: copied,
+    })
+}
+
+#[cfg(unix)]
+fn owner_can_read(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o400 != 0
+}
+
+#[cfg(not(unix))]
+fn owner_can_read(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn attachment_failure_reply(config: &Config, error: &HarnessError) -> String {
+    let detail = match error {
+        HarnessError::AttachmentCountLimit => "too many attachments",
+        HarnessError::AttachmentBytesLimit => "the attachment batch is too large",
+        HarnessError::AttachmentUnsupported => "one or more attachment types are unsupported",
+        _ => "an attachment could not be downloaded and validated",
+    };
+    format!(
+        "[{}] could not process this turn because {detail}; no backend turn was started.",
+        config.spec.reply_prefix
+    )
+}
+
 async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: ChatCommand) {
     let record = ctx.sessions.get(&inbound.group_ref).await;
     let body =
@@ -1626,6 +1860,7 @@ async fn finish_success(
                 &ctx.recovery,
                 &inbound.group_ref,
                 recovery_prompt,
+                inbound.media.clone(),
                 cwd,
                 session_id,
                 kind,
@@ -1670,6 +1905,7 @@ async fn finish_success(
                 &ctx.recovery,
                 &inbound.group_ref,
                 recovery_prompt,
+                inbound.media.clone(),
                 cwd,
                 session_id,
                 RecoveryKind::UncertainOutcome,
@@ -1771,6 +2007,7 @@ async fn persist_recovery_record(
     recovery: &RecoveryStore,
     group_ref: &str,
     prompt: String,
+    media: Vec<AgentControlMediaRef>,
     cwd: PathBuf,
     session_id: String,
     kind: RecoveryKind,
@@ -1780,6 +2017,7 @@ async fn persist_recovery_record(
             group_ref,
             RecoveryRecord {
                 prompt,
+                media,
                 cwd,
                 session_id,
                 kind,
@@ -1801,6 +2039,7 @@ async fn handle_backend_run_failure(
     known_session: Option<&SessionRecord>,
     cwd: PathBuf,
     prompt: String,
+    media: Vec<AgentControlMediaRef>,
     failure: &RunFailure,
 ) -> String {
     let FailureRecoveryContext {
@@ -1835,6 +2074,7 @@ async fn handle_backend_run_failure(
             if let Some(session_id) = resumable_session {
                 let record = RecoveryRecord {
                     prompt,
+                    media,
                     cwd,
                     session_id,
                     kind: RecoveryKind::PolicyLimit,
@@ -1862,12 +2102,17 @@ async fn handle_backend_run_failure(
                 config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
             )
         }
+        HarnessError::AttachmentUnsupported => format!(
+            "[{}] {} does not support this attachment batch; no backend turn was started.",
+            config.spec.reply_prefix, config.spec.display_name
+        ),
         _ => {
             if let Some(session_id) = resumable_session {
                 if let Err(err) = persist_recovery_record(
                     recovery,
                     group_ref,
                     prompt,
+                    media,
                     cwd,
                     session_id,
                     RecoveryKind::UncertainOutcome,
@@ -2397,6 +2642,153 @@ mod tests {
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
 
+    #[test]
+    fn attachment_names_are_sanitized_and_keep_stable_ordering() {
+        assert_eq!(
+            staged_attachment_name(0, "../../screen shot.PNG"),
+            "000-screen_shot.PNG"
+        );
+        assert_eq!(
+            staged_attachment_name(1, "\u{0000}\u{0001}"),
+            "001-attachment"
+        );
+    }
+
+    #[test]
+    fn attachment_count_limit_rejects_before_download() {
+        assert!(validate_attachment_count(8, 8).is_ok());
+        let error = validate_attachment_count(9, 8).unwrap_err();
+        assert_eq!(error.privacy_safe_kind(), "attachment_count_limit");
+    }
+
+    #[test]
+    fn attachment_byte_limit_is_checked_without_overflow() {
+        assert_eq!(add_attachment_bytes(3, 4, 7).unwrap(), 7);
+        assert!(matches!(
+            add_attachment_bytes(4, 4, 7),
+            Err(HarnessError::AttachmentBytesLimit)
+        ));
+        assert!(matches!(
+            add_attachment_bytes(u64::MAX, 1, u64::MAX),
+            Err(HarnessError::AttachmentBytesLimit)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_files_are_copied_privately_and_batch_drop_cleans_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let borrowed = root.path().join("borrowed.png");
+        fs_private::write_private(&borrowed, b"image-one").unwrap();
+        let staging = root.path().join("staging");
+        reconcile_attachment_staging(&staging).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("batch-")
+            .tempdir_in(&staging)
+            .unwrap();
+        let batch_path = directory.path().to_path_buf();
+        let first = stage_downloaded_attachment(
+            directory.path(),
+            0,
+            DownloadedMedia {
+                path: borrowed,
+                media_type: "image/png".to_owned(),
+                file_name: "../first image.png".to_owned(),
+                size_bytes: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.file_name, "000-first_image.png");
+        assert_eq!(fs::read(&first.path).unwrap(), b"image-one");
+        assert_eq!(
+            fs::metadata(&first.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(directory);
+        assert!(!batch_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_symlink_sources_and_restart_removes_stale_batches() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let borrowed = root.path().join("borrowed.txt");
+        fs_private::write_private(&borrowed, b"private").unwrap();
+        let link = root.path().join("link.txt");
+        symlink(&borrowed, &link).unwrap();
+        let fifo = root.path().join("pipe");
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        }
+        let staging = root.path().join("staging");
+        reconcile_attachment_staging(&staging).unwrap();
+        let stale = staging.join("batch-stale");
+        fs_private::create_dir_all_private(&stale).unwrap();
+        fs_private::write_private(&stale.join("copy"), b"private").unwrap();
+        assert!(matches!(
+            stage_downloaded_attachment(
+                &staging,
+                0,
+                DownloadedMedia {
+                    path: link,
+                    media_type: "text/plain".to_owned(),
+                    file_name: "link.txt".to_owned(),
+                    size_bytes: 7,
+                },
+            ),
+            Err(HarnessError::AttachmentInvalid)
+        ));
+        assert!(matches!(
+            stage_downloaded_attachment(
+                &staging,
+                1,
+                DownloadedMedia {
+                    path: fifo,
+                    media_type: "application/octet-stream".to_owned(),
+                    file_name: "pipe".to_owned(),
+                    size_bytes: 0,
+                },
+            ),
+            Err(HarnessError::AttachmentInvalid)
+        ));
+        reconcile_attachment_staging(&staging).unwrap();
+        assert!(fs::read_dir(staging).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn reconcile_removes_only_connector_owned_batch_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        reconcile_attachment_staging(&staging).unwrap();
+        let stale = staging.join("batch-stale");
+        fs_private::create_dir_all_private(&stale).unwrap();
+        fs_private::write_private(&stale.join("copy"), b"private").unwrap();
+        let keep_dir = staging.join("other-dir");
+        fs_private::create_dir_all_private(&keep_dir).unwrap();
+        fs_private::write_private(&keep_dir.join("keep"), b"keep").unwrap();
+        let keep_file = staging.join("notes.txt");
+        fs_private::write_private(&keep_file, b"notes").unwrap();
+        reconcile_attachment_staging(&staging).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(fs::read(&keep_file).unwrap(), b"notes");
+        assert_eq!(fs::read(keep_dir.join("keep")).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn abort_guard_cancels_detached_backend_task() {
+        let runner = tokio::spawn(std::future::pending::<()>());
+        let guard = AbortBackendOnDrop(runner.abort_handle());
+        drop(guard);
+        assert!(runner.await.unwrap_err().is_cancelled());
+    }
+
     fn test_config(root: &std::path::Path) -> Config {
         Config {
             socket: root.join("socket"),
@@ -2406,6 +2798,9 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             max_reply_bytes: 30_000,
             max_pending_per_group: 4,
+            max_attachments: 8,
+            max_attachment_bytes: 64 * 1024 * 1024,
+            attachment_staging_root: root.join("attachments"),
             state_path: root.join("sessions.json"),
             backend_timeout: Duration::from_secs(60),
             backend_idle_timeout: Duration::from_secs(45),
@@ -2545,6 +2940,65 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         invocations: Mutex<Vec<Invocation>>,
+    }
+
+    #[derive(Debug)]
+    struct AttachmentSnapshot {
+        path: PathBuf,
+        file_name: String,
+        bytes: Vec<u8>,
+        is_file: bool,
+        is_symlink: bool,
+        mode: u32,
+    }
+
+    #[derive(Default)]
+    struct RecordingAttachmentBackend {
+        batches: Mutex<Vec<Vec<AttachmentSnapshot>>>,
+    }
+
+    #[async_trait]
+    impl Backend for RecordingAttachmentBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            unreachable!("attachment test must use run_with_attachments")
+        }
+
+        async fn run_with_attachments(
+            &self,
+            _invocation: Invocation,
+            attachments: Vec<Attachment>,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let snapshots = attachments
+                .into_iter()
+                .map(|attachment| {
+                    let metadata = fs::symlink_metadata(&attachment.path).unwrap();
+                    AttachmentSnapshot {
+                        bytes: fs::read(&attachment.path).unwrap(),
+                        is_file: metadata.is_file(),
+                        is_symlink: metadata.file_type().is_symlink(),
+                        mode: metadata.permissions().mode() & 0o777,
+                        path: attachment.path,
+                        file_name: attachment.file_name,
+                    }
+                })
+                .collect();
+            self.batches.lock().await.push(snapshots);
+            Ok(Outcome {
+                observed_session: None,
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
     }
 
     #[async_trait]
@@ -2707,6 +3161,7 @@ mod tests {
                 group_ref: "group".to_owned(),
                 message_ref: "message".to_owned(),
                 text: "create artifacts".to_owned(),
+                media: Vec::new(),
             },
             permit,
         )
@@ -2739,6 +3194,57 @@ mod tests {
         })
     }
 
+    fn spawn_attachment_server(
+        socket: &std::path::Path,
+        downloads: Vec<DownloadedMedia>,
+    ) -> tokio::task::JoinHandle<Vec<AgentControlRequest>> {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut downloads = downloads.into_iter();
+            let mut requests = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                let (response, complete) = match &request.payload {
+                    AgentControlRequest::DownloadMedia { .. } => {
+                        let downloaded = downloads.next().expect("unexpected media download");
+                        (
+                            AgentControlResponse::MediaDownloaded {
+                                path: downloaded.path.to_string_lossy().into_owned(),
+                                media_type: downloaded.media_type,
+                                file_name: downloaded.file_name,
+                                size_bytes: downloaded.size_bytes,
+                            },
+                            false,
+                        )
+                    }
+                    AgentControlRequest::SendFinal { .. } => (
+                        AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["reply".to_owned()],
+                            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                        },
+                        true,
+                    ),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(
+                    &mut write_half,
+                    &AgentControlEnvelope::request(request.id.clone(), response),
+                )
+                .await
+                .unwrap();
+                requests.push(request.payload);
+                if complete {
+                    assert!(downloads.next().is_none(), "missing media download request");
+                    return requests;
+                }
+            }
+        })
+    }
+
     fn test_context(
         root: &std::path::Path,
         home: &std::path::Path,
@@ -2747,6 +3253,18 @@ mod tests {
         std::fs::create_dir_all(home).unwrap();
         let config = test_config(root);
         let server = spawn_final_server(&config.socket);
+        let ctx = test_context_with_backend(root, home, config, backend);
+        (ctx, server)
+    }
+
+    fn test_context_with_backend(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        config: Config,
+        backend: Arc<dyn Backend>,
+    ) -> Arc<BridgeContext> {
+        std::fs::create_dir_all(home).unwrap();
+        reconcile_attachment_staging(&config.attachment_staging_root).unwrap();
         let sessions = Arc::new(SessionStore::load(config.state_path.clone(), home).unwrap());
         let recovery = Arc::new(
             RecoveryStore::load(config.state_path.with_extension("recovery.json")).unwrap(),
@@ -2754,7 +3272,7 @@ mod tests {
         let deliveries = Arc::new(
             FinalDeliveryStore::load(config.state_path.with_extension("delivery.json")).unwrap(),
         );
-        let ctx = Arc::new(BridgeContext {
+        Arc::new(BridgeContext {
             client: ControlClient::new(
                 config.socket.clone(),
                 None,
@@ -2774,11 +3292,19 @@ mod tests {
                 ArtifactOutbox::load(root.join("outbox.json")).unwrap(),
             )),
             home: home.to_path_buf(),
-        });
-        (ctx, server)
+        })
     }
 
     async fn dispatch_test_message(ctx: Arc<BridgeContext>, message_ref: &str, text: &str) -> bool {
+        dispatch_test_message_with_media(ctx, message_ref, text, Vec::new()).await
+    }
+
+    async fn dispatch_test_message_with_media(
+        ctx: Arc<BridgeContext>,
+        message_ref: &str,
+        text: &str,
+        media: Vec<AgentControlMediaRef>,
+    ) -> bool {
         let disposition = classify_prompt(text);
         let Some(permit) = acquire_dispatch_permit(&ctx.queues, "group", &disposition).await else {
             return false;
@@ -2790,11 +3316,27 @@ mod tests {
                 group_ref: "group".to_owned(),
                 message_ref: message_ref.to_owned(),
                 text: text.to_owned(),
+                media,
             },
             permit,
         )
         .await;
         true
+    }
+
+    fn test_media_ref(file_name: &str) -> AgentControlMediaRef {
+        AgentControlMediaRef {
+            media_type: "image/png".to_owned(),
+            file_name: file_name.to_owned(),
+            ciphertext_sha256: "cipher".to_owned(),
+            plaintext_sha256: "plain".to_owned(),
+            nonce_hex: "nonce".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 7,
+            locators: Vec::new(),
+            dim: None,
+            thumbhash: None,
+        }
     }
 
     #[tokio::test]
@@ -2901,6 +3443,7 @@ mod tests {
                     prompt: "private prompt".to_owned(),
                     cwd: repo.clone(),
                     session_id: "session".to_owned(),
+                    media: Vec::new(),
                     kind: RecoveryKind::UncertainOutcome,
                     status: RecoveryStatus::Pending,
                 },
@@ -2950,6 +3493,269 @@ mod tests {
         );
         assert!(ctx.sessions.get("group").await.is_none());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_attachment_turn_preserves_order_privacy_and_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source_one = root.path().join("source-one.png");
+        let source_two = root.path().join("source-two.png");
+        fs::write(&source_one, b"first").unwrap();
+        fs::write(&source_two, b"second").unwrap();
+        let mut source_permissions = fs::metadata(&source_one).unwrap().permissions();
+        source_permissions.set_mode(0o644);
+        fs::set_permissions(&source_one, source_permissions.clone()).unwrap();
+        fs::set_permissions(&source_two, source_permissions).unwrap();
+        let config = test_config(root.path());
+        let server = spawn_attachment_server(
+            &config.socket,
+            vec![
+                DownloadedMedia {
+                    path: source_one,
+                    media_type: "image/png".to_owned(),
+                    file_name: "first image.png".to_owned(),
+                    size_bytes: 5,
+                },
+                DownloadedMedia {
+                    path: source_two,
+                    media_type: "image/png".to_owned(),
+                    file_name: "../second.png".to_owned(),
+                    size_bytes: 6,
+                },
+            ],
+        );
+        let backend = Arc::new(RecordingAttachmentBackend::default());
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+
+        assert!(
+            dispatch_test_message_with_media(
+                ctx.clone(),
+                "message",
+                "inspect images",
+                vec![test_media_ref("first"), test_media_ref("second")],
+            )
+            .await
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, AgentControlRequest::DownloadMedia { .. }))
+                .count(),
+            2
+        );
+        let batches = backend.batches.lock().await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(
+            batches[0][0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("000-first_image.png")
+        );
+        assert!(
+            batches[0][0]
+                .path
+                .starts_with(&ctx.cfg.attachment_staging_root)
+        );
+        assert!(batches[0][0].is_file);
+        assert!(!batches[0][0].is_symlink);
+        assert_eq!(batches[0][0].file_name, "000-first_image.png");
+        assert_eq!(batches[0][0].bytes, b"first");
+        assert_eq!(batches[0][0].mode, 0o600);
+        assert_eq!(
+            batches[0][1]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("001-second.png")
+        );
+        assert!(
+            batches[0][1]
+                .path
+                .starts_with(&ctx.cfg.attachment_staging_root)
+        );
+        assert!(batches[0][1].is_file);
+        assert!(!batches[0][1].is_symlink);
+        assert_eq!(batches[0][1].file_name, "001-second.png");
+        assert_eq!(batches[0][1].bytes, b"second");
+        assert_eq!(batches[0][1].mode, 0o600);
+        assert!(!batches[0][0].path.exists());
+        assert!(!batches[0][1].path.exists());
+        assert!(ctx.recovery.get("group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_attachment_backend_replies_without_persisting_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let source = root.path().join("source.png");
+        fs_private::write_private(&source, b"image").unwrap();
+        let config = test_config(root.path());
+        let server = spawn_attachment_server(
+            &config.socket,
+            vec![DownloadedMedia {
+                path: source,
+                media_type: "image/png".to_owned(),
+                file_name: "image.png".to_owned(),
+                size_bytes: 5,
+            }],
+        );
+        let backend = Arc::new(RecordingBackend::default());
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        ctx.sessions
+            .record_session("group", "session".to_owned(), repo)
+            .await
+            .unwrap();
+
+        assert!(
+            dispatch_test_message_with_media(
+                ctx.clone(),
+                "message",
+                "inspect image",
+                vec![test_media_ref("image")],
+            )
+            .await
+        );
+        let requests = server.await.unwrap();
+        let reply = requests
+            .iter()
+            .find_map(|request| match request {
+                AgentControlRequest::SendFinal { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("unsupported backend must send a final reply");
+        assert_eq!(
+            reply,
+            "[wn-opencode] opencode does not support this attachment batch; no backend turn was started."
+        );
+        assert!(backend.invocations.lock().await.is_empty());
+        assert!(ctx.recovery.get("group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_attachment_download_failure_restores_pending_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut config = test_config(root.path());
+        let socket = root.path().join("retry-attachment.sock");
+        config.socket = socket.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                let (response, completed) = match request.payload {
+                    AgentControlRequest::DownloadMedia { .. } => (
+                        AgentControlResponse::Error {
+                            code: "download_failed".to_owned(),
+                            message: "unavailable".to_owned(),
+                        },
+                        false,
+                    ),
+                    AgentControlRequest::SendFinal { .. } => (
+                        AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["reply".to_owned()],
+                            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                        },
+                        true,
+                    ),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(
+                    &mut write_half,
+                    &AgentControlEnvelope::request(request.id, response),
+                )
+                .await
+                .unwrap();
+                if completed {
+                    break;
+                }
+            }
+        });
+        let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &home).unwrap());
+        let recovery = Arc::new(
+            RecoveryStore::load(config.state_path.with_extension("recovery.json")).unwrap(),
+        );
+        let deliveries = Arc::new(
+            FinalDeliveryStore::load(config.state_path.with_extension("delivery.json")).unwrap(),
+        );
+        let backend = Arc::new(RecordingBackend::default());
+        let ctx = Arc::new(BridgeContext {
+            client: ControlClient::new(
+                config.socket.clone(),
+                None,
+                Duration::from_secs(1),
+                "wn-test",
+            ),
+            cfg: Arc::new(config),
+            account_ref: "account".to_owned(),
+            sessions,
+            recovery: recovery.clone(),
+            deliveries,
+            reconciliation_slot: ReconciliationSlot::new(),
+            queues: Arc::new(GroupQueues::new(4)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: backend.clone(),
+            outbox: Arc::new(Mutex::new(
+                ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
+            )),
+            home: home.clone(),
+        });
+        let media = AgentControlMediaRef {
+            media_type: "image/png".to_owned(),
+            file_name: "screen.png".to_owned(),
+            ciphertext_sha256: "cipher".to_owned(),
+            plaintext_sha256: "plain".to_owned(),
+            nonce_hex: "nonce".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 7,
+            locators: Vec::new(),
+            dim: None,
+            thumbhash: None,
+        };
+        recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    media: vec![media],
+                    cwd: repo,
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(dispatch_test_message(ctx, "retry", "/retry-last").await);
+        server.await.unwrap();
+        assert!(backend.invocations.lock().await.is_empty());
+        assert_eq!(
+            recovery.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(
+            begin_validated_retry(&recovery, "group", &home)
+                .await
+                .unwrap()
+                .is_some(),
+            "attachment preparation failure must remain retryable"
+        );
     }
 
     #[tokio::test]
@@ -3161,6 +3967,7 @@ mod tests {
                 group_ref: "group".to_owned(),
                 message_ref: "message".to_owned(),
                 text: "complete then fail".to_owned(),
+                media: Vec::new(),
             },
             permit,
         )
@@ -3303,6 +4110,7 @@ mod tests {
                 group_ref: "group".to_owned(),
                 message_ref: "message".to_owned(),
                 text: "create artifact".to_owned(),
+                media: Vec::new(),
             },
             permit,
         )
@@ -3626,6 +4434,7 @@ mod tests {
             &store,
             "group",
             "private prompt".to_owned(),
+            Vec::new(),
             dir.path().join("repo"),
             "session".to_owned(),
             RecoveryKind::UncertainOutcome,
@@ -3767,6 +4576,7 @@ mod tests {
         let recovery = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
+            media: Vec::new(),
             cwd: home.join("repo").join("..").join("repo"),
             session_id: "session".to_owned(),
             kind: RecoveryKind::PolicyLimit,
@@ -3825,6 +4635,7 @@ mod tests {
             None,
             home.clone(),
             "private prompt".to_owned(),
+            Vec::new(),
             &failure,
         )
         .await;
@@ -3855,6 +4666,37 @@ mod tests {
                 observed_session: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn default_backend_rejects_non_empty_attachment_batch_without_running() {
+        let root = tempfile::tempdir().unwrap();
+        let invocation = Invocation {
+            timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+            cwd: root.path().to_path_buf(),
+            session_id: Some("existing-session".to_owned()),
+            prompt: "text accompanying a file".to_owned(),
+            artifact_output: None,
+        };
+        let attachment = Attachment {
+            path: root.path().join("staged.png"),
+            media_type: "image/png".to_owned(),
+            file_name: "000-staged.png".to_owned(),
+            size_bytes: 1,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        let failure = UnusedBackend
+            .run_with_attachments(invocation, vec![attachment], tx)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure.error, HarnessError::AttachmentUnsupported));
+        assert_eq!(
+            failure.observed_session.as_deref(),
+            Some("existing-session")
+        );
     }
 
     fn test_bridge_context(root: &std::path::Path) -> BridgeContext {
@@ -3985,6 +4827,18 @@ mod tests {
             error: HarnessError::BackendStream,
             observed_session: Some("ses_stream".to_owned()),
         };
+        let media = vec![AgentControlMediaRef {
+            media_type: "image/png".to_owned(),
+            file_name: "screen.png".to_owned(),
+            ciphertext_sha256: "cipher".to_owned(),
+            plaintext_sha256: "plain".to_owned(),
+            nonce_hex: "nonce".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 7,
+            locators: Vec::new(),
+            dim: None,
+            thumbhash: None,
+        }];
         let config = test_config(&home);
         let reply = handle_backend_run_failure(
             FailureRecoveryContext {
@@ -3996,6 +4850,7 @@ mod tests {
             store.get("group1").await.as_ref(),
             home.join("repo"),
             "private prompt".to_owned(),
+            media.clone(),
             &failure,
         )
         .await;
@@ -4009,6 +4864,7 @@ mod tests {
         assert_eq!(record.kind, RecoveryKind::UncertainOutcome);
         assert_eq!(record.status, RecoveryStatus::Pending);
         assert_eq!(record.session_id, "ses_stream");
+        assert_eq!(record.media, media);
 
         let retried = begin_validated_retry(&recovery, "group1", &home)
             .await
@@ -4016,6 +4872,7 @@ mod tests {
             .unwrap();
         assert_eq!(retried.status, RecoveryStatus::Retrying);
         assert_eq!(retried.session_id, "ses_stream");
+        assert_eq!(retried.media, media);
 
         let streaming = handle_backend_run_failure(
             FailureRecoveryContext {
@@ -4027,6 +4884,7 @@ mod tests {
             None,
             home.clone(),
             "private prompt".to_owned(),
+            Vec::new(),
             &RunFailure {
                 error: HarnessError::BackendStream,
                 observed_session: None,
@@ -4046,6 +4904,7 @@ mod tests {
                 "group",
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
+                    media: Vec::new(),
                     cwd: dir.path().join("repo"),
                     session_id: "session".to_owned(),
                     kind: RecoveryKind::UncertainOutcome,

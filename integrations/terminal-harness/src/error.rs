@@ -34,6 +34,14 @@ pub enum HarnessError {
     BackendStream,
     #[error("backend process failed to start")]
     BackendSpawn,
+    #[error("inbound attachment count exceeds the configured limit")]
+    AttachmentCountLimit,
+    #[error("inbound attachment bytes exceed the configured limit")]
+    AttachmentBytesLimit,
+    #[error("inbound attachment staging failed validation")]
+    AttachmentInvalid,
+    #[error("backend does not support this attachment type")]
+    AttachmentUnsupported,
     #[error("artifact exports are disabled")]
     ArtifactExportsDisabled,
     #[error("artifact authorization is missing, expired, or does not match this turn")]
@@ -67,6 +75,10 @@ impl HarnessError {
             Self::BackendTimedOut => "backend_timeout",
             Self::BackendStream => "backend_stream",
             Self::BackendSpawn => "backend_spawn",
+            Self::AttachmentCountLimit => "attachment_count_limit",
+            Self::AttachmentBytesLimit => "attachment_bytes_limit",
+            Self::AttachmentInvalid => "attachment_invalid",
+            Self::AttachmentUnsupported => "attachment_unsupported",
             Self::ArtifactExportsDisabled => "artifact_exports_disabled",
             Self::ArtifactAuthorizationInvalid => "artifact_authorization_invalid",
             Self::ArtifactOutsideAllowedRoots => "artifact_outside_allowed_roots",

@@ -8,8 +8,11 @@ Rust Pi harness for Marmot through the local `wn-agent` control socket. Read
 - A control-plane-only harness. `wn-agent` owns Marmot state, MLS, Nostr,
   durable sends, and invite handling; this crate invokes Pi and parses its JSON
   event stream.
-- Every message from an allowed sender is a prompt. Do not add gateway,
-  mention-activation, media, profile, or QUIC preview behavior here.
+- Every text-only message from an allowed sender is a prompt. Do not add gateway,
+  mention-activation, backend attachment support, profile, or QUIC preview behavior here.
+  For a non-empty attachment batch, the shared harness enforces its count/aggregate-byte
+  limits and stages the complete batch, then the default backend contract rejects the
+  whole turn before Pi is spawned; accompanying text is not forwarded.
 - Send prompts over stdin, emit only completed assistant text, and never expose
   thinking or tool output.
 - Keep Pi sessions in the configured private session directory and preserve the

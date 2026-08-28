@@ -104,7 +104,10 @@ All connectors:
   barrier;
 - reconcile text-only final-delivery acknowledgements idempotently before later
   FIFO work, without replaying the backend invocation;
-- keep diagnostics free of identifiers, paths, prompts, and backend output.
+- preserve every inbound media reference in message order, download the complete batch through `wn-agent`, and expose one validated private staging copy per item at the backend boundary;
+- reject a complete attachment batch before backend invocation when any download, regular-file/ownership check, count limit, or aggregate-byte limit fails;
+- remove batch copies after every terminal path and reconcile stale connector-owned batch directories on startup;
+- keep diagnostics free of identifiers, paths, prompts, attachment names, and backend output.
 
 ## Chat Commands
 

@@ -3,7 +3,9 @@
 `wn-codex` is a terminal-harness connector that sends authorized Marmot group
 messages to [Codex](https://learn.chatgpt.com/) through the local
 `wn-agent` control socket. It is intentionally a thin harness: no mention
-activation, profile onboarding, live previews, MLS, or relay logic. Optional
+activation, profile onboarding, live previews, MLS, or relay logic. The shared
+terminal harness downloads and privately stages inbound files; this adapter
+maps ordered image batches to repeated Codex `--image` arguments. Optional
 artifact export reuses `wn-agent`'s existing encrypted `send_media` path.
 
 For the current guided install, runtime chooser, and steps to finish in White Noise, use the canonical
@@ -136,6 +138,8 @@ instruction alive across thread resets and Codex-side context compaction.
 | `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
 | `WN_CODEX_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
 | `WN_CODEX_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
+| `WN_CODEX_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |
+| `WN_CODEX_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate plaintext bytes in one inbound batch |
 | `WN_CODEX_STATE_PATH` | `$XDG_STATE_HOME/wn-codex/sessions.json` | Group thread/workdir map |
 | `WN_CODEX_ACTIVATION` | `always` | Only supported activation mode |
 | `WN_CODEX_ARTIFACT_EXPORTS_ENABLED` | `false` | Opt in to typed Codex completion-file artifact delivery |
@@ -165,6 +169,10 @@ See the shared
 [execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
 Prompts are written to Codex over stdin, and only completed `agent_message`
 text is returned to Marmot.
+
+## Inbound attachments
+
+All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. Codex currently accepts image attachments only; a non-image, failed download, invalid local file, count-limit breach, or aggregate-size breach rejects the complete batch before Codex starts. Batch copies are removed after success, failure, timeout, or cancellation, and stale batch directories are reconciled when the connector starts.
 
 The optional bearer token grants the complete `wn-agent` control API for every
 account in its home; the sender allowlist does not narrow that authority. Use a
