@@ -106,6 +106,8 @@ mod migration_0052_epoch_backfill_intents;
 mod migration_0053_account_delivery_recovery;
 #[path = "migrations/0054_transport_reconciliation_items.rs"]
 mod migration_0054_transport_reconciliation_items;
+#[path = "migrations/0055_epoch_stall_evidence.rs"]
+mod migration_0055_epoch_stall_evidence;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -390,6 +392,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 54,
         name: "0054_transport_reconciliation_items",
         apply: migration_0054_transport_reconciliation_items::apply,
+    },
+    Migration {
+        version: 55,
+        name: "0055_epoch_stall_evidence",
+        apply: migration_0055_epoch_stall_evidence::apply,
     },
 ];
 
@@ -918,7 +925,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 54,
+                found: 55,
                 latest_supported: 46,
             }
         ));
@@ -974,7 +981,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 54,
+                found: 55,
                 latest_supported: 46,
             }
         ));
@@ -1278,7 +1285,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 54,
+                found: 55,
                 latest_supported: 46,
             }
         ));
@@ -2259,6 +2266,11 @@ mod tests {
             foreign_key(&conn, "app_epoch_backfill_intents", "group_id"),
             Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
             "durable recovery intent must survive projection deletion but cascade with its protocol group"
+        );
+        assert_eq!(
+            foreign_key(&conn, "app_epoch_stall_evidence", "group_id"),
+            Some(("cgka_groups".to_owned(), "CASCADE".to_owned())),
+            "frozen-epoch evidence is bounded by its protocol group and cascades with it"
         );
     }
 

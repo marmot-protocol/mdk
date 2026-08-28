@@ -128,6 +128,25 @@ pub struct AccountDeliveryRecovery {
     pub dropped_count: u64,
 }
 
+/// Durable per-group evidence that full-history replay is not moving a group
+/// off one stalled epoch, carried across restarts.
+///
+/// One row per group at most, cascading with the protocol group, so the table
+/// is bounded by the account's group count rather than by stall history. The
+/// arm run itself stays process-local; only the relay-confirmed evidence and
+/// the wall-clock arm mark that paces the next attempt are durable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEpochStallEvidence {
+    pub group_id_hex: String,
+    pub stalled_epoch: u64,
+    pub fruitless_completions: u32,
+    /// Whether the run that gathered this evidence already reported it, so a
+    /// restart cannot re-report a group already reported. Scoped to
+    /// `stalled_epoch`: a group observed at any other epoch discards it.
+    pub fruitless_reported: bool,
+    pub last_arm_at_ms: u64,
+}
+
 /// Minimal outline of a group still pending the local device's join
 /// confirmation, for invite-policy reconciliation. Deliberately carries no
 /// profile/component payload: the policy decision needs only the group id and
@@ -612,6 +631,111 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         Ok(cleared > 0)
+    }
+
+    /// Record a group's frozen-epoch evidence, replacing any earlier row.
+    ///
+    /// A plain replace rather than the monotonic merge
+    /// [`Self::arm_epoch_backfill_intents`] uses: the in-memory detector is the
+    /// single writer and already owns the reset rules, so a stale row losing to
+    /// the live one is the intended outcome at every stalled epoch.
+    pub fn record_epoch_stall_evidence(
+        &self,
+        evidence: &[StoredEpochStallEvidence],
+    ) -> StorageResult<()> {
+        if evidence.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now_seconds_i64();
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for entry in evidence {
+                let group_id = hex::decode(&entry.group_id_hex).map_err(|error| {
+                    StorageError::Serialization(format!("invalid epoch stall group id: {error}"))
+                })?;
+                conn.execute(
+                    "INSERT INTO app_epoch_stall_evidence
+                        (group_id, stalled_epoch, fruitless_completions, fruitless_reported,
+                         last_arm_at_ms, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(group_id) DO UPDATE SET
+                        stalled_epoch = excluded.stalled_epoch,
+                        fruitless_completions = excluded.fruitless_completions,
+                        fruitless_reported = excluded.fruitless_reported,
+                        last_arm_at_ms = excluded.last_arm_at_ms,
+                        updated_at = excluded.updated_at",
+                    params![
+                        group_id,
+                        u64_to_i64(entry.stalled_epoch)?,
+                        i64::from(entry.fruitless_completions),
+                        i64::from(entry.fruitless_reported),
+                        u64_to_i64(entry.last_arm_at_ms)?,
+                        now
+                    ],
+                )
+                .storage()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Every group's frozen-epoch evidence, for account-open restore.
+    ///
+    /// Rows are written when evidence is gathered, never when it is voided:
+    /// nothing persists the resets, because they happen on the delivery hot
+    /// path and a group that recovers has no further reason to touch storage.
+    /// A recovered group therefore leaves its last row behind. That is bounded
+    /// and inert by construction — one row per group, cascading with the
+    /// protocol group — and the restore path discards it on the first
+    /// observation at any other epoch.
+    pub fn epoch_stall_evidence(&self) -> StorageResult<Vec<StoredEpochStallEvidence>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT group_id, stalled_epoch, fruitless_completions, fruitless_reported, last_arm_at_ms
+                 FROM app_epoch_stall_evidence
+                 ORDER BY updated_at, group_id",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        rows.into_iter()
+            .map(
+                |(
+                    group_id,
+                    stalled_epoch,
+                    fruitless_completions,
+                    fruitless_reported,
+                    last_arm_at_ms,
+                )| {
+                    Ok(StoredEpochStallEvidence {
+                        group_id_hex: hex::encode(group_id),
+                        stalled_epoch: i64_to_u64(stalled_epoch)?,
+                        // Errors rather than saturating: a corrupt count must
+                        // not clamp toward the escalation threshold.
+                        fruitless_completions: u32::try_from(i64_to_u64(fruitless_completions)?)
+                            .map_err(|error| {
+                                StorageError::Serialization(format!(
+                                    "invalid epoch stall completion count: {error}"
+                                ))
+                            })?,
+                        fruitless_reported: fruitless_reported != 0,
+                        last_arm_at_ms: i64_to_u64(last_arm_at_ms)?,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Read only the pending-confirmation, non-archived group outlines.

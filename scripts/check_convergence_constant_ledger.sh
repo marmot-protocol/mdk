@@ -9,7 +9,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 inventory_path="docs/marmot-architecture/convergence-constant-inventory.txt"
 plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
-expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 A1 A2 A3 A4 A5 A6 A7 A8 A9)
+expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10)
 inventory_pairs=("__inventory_sentinel__")
 inventory_ids=()
 fail=0

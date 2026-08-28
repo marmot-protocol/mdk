@@ -477,6 +477,38 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 }
 
 #[test]
+fn epoch_stall_evidence_round_trips_and_replaces_in_place() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    insert_protocol_group_marker(&store, &[0xaa]);
+    let group = "aa".to_owned();
+    let first = StoredEpochStallEvidence {
+        group_id_hex: group.clone(),
+        stalled_epoch: 7,
+        fruitless_completions: 1,
+        fruitless_reported: false,
+        last_arm_at_ms: 1_700_000_000_000,
+    };
+    store
+        .record_epoch_stall_evidence(std::slice::from_ref(&first))
+        .unwrap();
+    assert_eq!(store.epoch_stall_evidence().unwrap(), vec![first.clone()]);
+
+    // The in-memory detector is the single writer and owns the reset rules, so
+    // a later row replaces the earlier one outright rather than merging.
+    let later = StoredEpochStallEvidence {
+        stalled_epoch: 8,
+        fruitless_completions: 3,
+        fruitless_reported: true,
+        last_arm_at_ms: 1_700_000_600_000,
+        ..first
+    };
+    store
+        .record_epoch_stall_evidence(std::slice::from_ref(&later))
+        .unwrap();
+    assert_eq!(store.epoch_stall_evidence().unwrap(), vec![later]);
+}
+
+#[test]
 fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);

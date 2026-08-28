@@ -71,6 +71,8 @@ use push::notification_trigger_for_intent;
 // Re-exported so the crate's `tests` module can keep calling
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
 #[cfg(test)]
+pub(crate) use sync::epoch_stall_now_ms;
+#[cfg(test)]
 pub(crate) use sync::is_own_relay_echo;
 pub(crate) use sync::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,

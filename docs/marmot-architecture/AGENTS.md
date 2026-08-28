@@ -100,6 +100,14 @@ Agent map for the Marmot architecture docs.
   components in `github.com/marmot-protocol/marmot`.
 - If Tamarin or Rust tests add a named scenario, mirror the name in the docs when that scenario becomes part of the
   contract.
-- When adding or changing a convergence policy, resource, scheduler, or history-recovery constant, update
-  `convergence-reliability-plan.md` and `convergence-constant-inventory.txt`, then run
-  `just convergence-ledger-gate`.
+- When adding or changing a convergence policy, resource, scheduler, or history-recovery constant, register it on all
+  five ledger surfaces: a row per symbol in `convergence-constant-inventory.txt`; a Table 1 row, a Table 2 ownership
+  row, and a progress-log row in `convergence-reliability-plan.md`; the `expected_ids` allowlist in
+  `scripts/check_convergence_constant_ledger.sh`; and a `decision(...)` entry (one per ledger id, array length bumped)
+  in `crates/cgka-conformance-simulator/src/policy_contract.rs`. One ledger id may own several symbols that answer one
+  decision (A3, E7, A10 do). Enforcement is split and disjoint, so run both gates — `just fast-ci` runs only the first:
+
+  ```sh
+  just convergence-ledger-gate
+  cargo test -p cgka-conformance-simulator --test protocol_decision_gate
+  ```

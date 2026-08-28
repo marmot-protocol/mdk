@@ -1005,9 +1005,11 @@ pub enum AuditEventKind {
     /// A group armed `arms` epoch-gap backfills in one run with nothing in
     /// between to show the device had caught up: full-history replay keeps
     /// recovering some backlog, and nothing this device can see says it is
-    /// reaching the group. Emitted once per unrecovered run, at the arm that
+    /// reaching the group. Emitted once per unrecovered run: at the arm that
     /// reached `arm_threshold`, alongside that arm's
-    /// `epoch_stall_backfill_armed` row.
+    /// `epoch_stall_backfill_armed` row, or — for a group wedged at one epoch —
+    /// at the replay completion that reached the fruitless-completion
+    /// threshold, alongside that replay's `epoch_stall_backfill_completed` row.
     ///
     /// This is the durable record of the escalation the runtime reports to the
     /// app, which decides whether to run the stronger repair (key-package
@@ -1015,13 +1017,27 @@ pub enum AuditEventKind {
     /// it is what makes each escalation permanent evidence, and the field-evidence
     /// loop that tunes `arm_threshold`.
     ///
-    /// Reading it needs care in both directions, because the run counter behind
-    /// `arms` is in-memory. A second row for one group is not necessarily a second
-    /// independent failure: a restart clears the counter, so it can be the same
-    /// unresolved condition re-earning a whole run of arms. And the absence of a
-    /// second row is not recovery: re-escalating needs the device's own epoch to
-    /// keep moving, so a group whose local epoch stops moving escalates at most
-    /// once however long it sits there.
+    /// Reading it needs care in both directions. A second row for one group is
+    /// not necessarily a second independent failure: the arm-run counter behind
+    /// `arms` is in-memory, so a restart clears it and the same unresolved
+    /// condition can re-earn a whole run of arms. And the absence of a second
+    /// row is not recovery: re-escalating a group whose epoch is still moving
+    /// needs that movement to continue, and a group wedged at one epoch reports
+    /// once per run — it must gather a whole fresh run's worth of confirmed
+    /// evidence before it can report that epoch again.
+    ///
+    /// A group wedged at one epoch reaches this row by a different route, worth
+    /// knowing when reading `arms`. It cannot re-arm on epoch movement, so it
+    /// arms on a paced clock instead and escalates on how many of those replays
+    /// came back with the relays confirming they had served the account's stored
+    /// history and it held nothing. `arms` then counts those confirmed
+    /// completions rather than arms — a stricter count, never a larger one.
+    /// `arm_threshold` stays the arm-run threshold on every row, including the
+    /// ones the fruitless rule decided, so it is the field's constant meaning
+    /// and not a record of which rule fired; the emitting warn log names the
+    /// deciding threshold. Unlike the arm
+    /// run, that evidence is durable, so a restart neither erases it nor
+    /// re-reports a group already reported.
     ///
     /// Group-scoped: the group id is on the enclosing [`AuditEvent::group_ref`],
     /// exactly as `epoch_stall_backfill_armed` carries it. `stalled_epoch` is the

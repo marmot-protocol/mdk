@@ -1670,6 +1670,17 @@ impl MarmotApp {
             .cloned()
             .collect::<std::collections::HashSet<_>>();
         let checkpointed_transport_timestamp = open.state.last_transport_timestamp;
+        // The wedge clock is the one detector threshold a test has to be able
+        // to shorten: its production value is an hour, and reading a clock
+        // inside the detector instead would cost the I/O-freedom the policy
+        // module is built on.
+        let wedge_rearm_interval_ms = if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.config.dev_epoch_stall_wedge_rearm_interval_ms
+        {
+            ms
+        } else {
+            crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
+        };
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
@@ -1697,7 +1708,8 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             unpublished_welcome_delivery: None,
-            epoch_stall: Default::default(),
+            epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
+                .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
             queued_epoch_backfills: std::collections::VecDeque::new(),
@@ -1707,6 +1719,8 @@ impl MarmotApp {
         };
         let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
         client.restore_persisted_epoch_backfill_intents(persisted_backfills);
+        let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
+        client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
@@ -3198,6 +3212,25 @@ impl MarmotApp {
         self.account_storage(label)?
             .clear_epoch_backfill_intents(intents)?;
         Ok(())
+    }
+
+    pub(crate) fn record_epoch_stall_evidence(
+        &self,
+        label: &str,
+        evidence: &[storage_sqlite::StoredEpochStallEvidence],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .record_epoch_stall_evidence(evidence)?;
+        Ok(())
+    }
+
+    pub(crate) fn epoch_stall_evidence(
+        &self,
+        label: &str,
+    ) -> Result<Vec<storage_sqlite::StoredEpochStallEvidence>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.account_storage(label)?.epoch_stall_evidence()?)
     }
 
     /// `group_id_hex` of every `account_groups` row still carrying the migration
