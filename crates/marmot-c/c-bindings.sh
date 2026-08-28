@@ -26,11 +26,12 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/lib/pkgconfig" "$OUT_DIR/include"
 
 echo "==> Building release cdylib + staticlib"
-cargo build --release -p "$CRATE_NAME"
+cargo build --release --locked -p "$CRATE_NAME"
 
+# Darwin has no libdl: dlopen lives in libSystem.
 case "$(uname -s)" in
-  Darwin) DYLIB_EXT="dylib" ;;
-  *) DYLIB_EXT="so" ;;
+  Darwin) DYLIB_EXT="dylib"; LIBS_PRIVATE="-lm -lpthread" ;;
+  *) DYLIB_EXT="so"; LIBS_PRIVATE="-lm -lpthread -ldl" ;;
 esac
 
 cp "$TARGET_DIR/release/lib$LIB_BASENAME.$DYLIB_EXT" "$OUT_DIR/lib/"
@@ -39,6 +40,7 @@ cp "$CRATE_DIR/include/marmot.h" "$OUT_DIR/include/"
 
 echo "==> Generating pkg-config file"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_DIR/Cargo.toml" | head -n 1)"
-sed -e "s|@VERSION@|$version|" "$CRATE_DIR/marmot-c.pc.in" > "$OUT_DIR/lib/pkgconfig/marmot-c.pc"
+sed -e "s|@VERSION@|$version|" -e "s|@LIBS_PRIVATE@|$LIBS_PRIVATE|" \
+    "$CRATE_DIR/marmot-c.pc.in" > "$OUT_DIR/lib/pkgconfig/marmot-c.pc"
 
 echo "==> Done: $OUT_DIR"

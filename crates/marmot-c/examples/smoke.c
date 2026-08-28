@@ -149,6 +149,11 @@ int main(int argc, char **argv) {
         "```rust\nfn main() {}\n```\n";
     st = marmot_parse_markdown(client, md, &doc);
     check(st == MARMOT_STATUS_OK && doc != NULL, "markdown parsed");
+    /* check() counts a failure without aborting, so bail before the reads
+     * below dereference a document that was never produced. */
+    if (doc == NULL) {
+        return 1;
+    }
     check(!doc->truncated, "markdown not truncated");
     check(doc->blocks_len >= 4, "markdown has heading + paragraph + list + code");
     int headings = walk_markdown(doc);
@@ -159,6 +164,9 @@ int main(int argc, char **argv) {
     MarmotAccountSummaryList *accounts = NULL;
     st = marmot_list_accounts(client, &accounts);
     check(st == MARMOT_STATUS_OK && accounts != NULL, "list_accounts");
+    if (accounts == NULL) {
+        return 1;
+    }
     check(accounts->len == 0, "fresh home has no accounts");
     marmot_account_summary_list_free(accounts);
 

@@ -8,5 +8,5 @@ Name: marmot-c
 Description: C ABI bindings for the Marmot app runtime
 Version: @VERSION@
 Libs: -L${libdir} -lmarmot_c
-Libs.private: -lm -lpthread -ldl
+Libs.private: @LIBS_PRIVATE@
 Cflags: -I${includedir}

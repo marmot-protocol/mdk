@@ -63,8 +63,9 @@ across the boundary. That deserves its own focused design + tests rather than a 
 - No `tracing`/logging in this crate; error detail strings carry only what `MarmotKitError` Display already exposes.
 - Keep this crate in lockstep with `marmot-uniffi` surface changes; bump the workspace version when mirrors,
   commands, status codes, or callback signatures change. `just c-parity-gate` enforces the command half of that
-  lockstep; new *fields* on an existing record are still silent (`c_mirror!` ignores what its spec does not name), so
-  re-read the record when upstream touches it.
+  lockstep, for `impl Marmot` and for the subscription handles. Two things stay silent: new *fields* on an existing
+  record (`c_mirror!` ignores what its spec does not name), and a new subscription method whose name another handle
+  already mirrors (handle methods are matched by name, not per type). Re-read the record when upstream touches it.
 
 ## Verification
 

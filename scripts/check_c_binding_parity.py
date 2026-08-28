@@ -5,9 +5,12 @@
 gives Swift/Kotlin. Nothing enforced that, so a command added upstream
 could sit unexported indefinitely and nobody would notice.
 
-This compares every method exported from a `#[uniffi::export] impl Marmot`
-block against the methods `marmot-c` actually calls, and fails on any
-difference the allowlist below does not explain.
+This compares every method exported from a `#[uniffi::export]` block —
+`impl Marmot` and the subscription handles — against the methods
+`marmot-c` actually calls, and fails on any difference the allowlist below
+does not explain. Subscription methods are matched by name, not per
+handle type: a new method whose name another handle already mirrors slips
+through, everything else is caught.
 
 Usage:
     scripts/check_c_binding_parity.py            # gate (exit 1 on drift)
@@ -40,16 +43,20 @@ DELIBERATELY_UNEXPORTED = {
 
 
 def uniffi_exports() -> dict[str, str]:
-    """Method name -> defining file, for every `#[uniffi::export] impl Marmot`."""
+    """Exported name -> defining file, for every `#[uniffi::export]` block.
+
+    `impl Marmot` methods key on the bare name; a subscription handle's
+    methods key as `Handle::method`, since names repeat across handles.
+    """
     exports: dict[str, str] = {}
     for path in sorted(UNIFFI_SRC.rglob("*.rs")):
         src = path.read_text()
         for match in re.finditer(r"#\[uniffi::export[^\]]*\]\s*\nimpl\s+(\w+)\s*\{", src):
-            if match.group(1) != "Marmot":
-                continue
+            impl = match.group(1)
             body = _braced_block(src, src.index("{", match.end() - 1))
             for fn in re.finditer(r"\n    pub (?:async )?fn (\w+)\s*\(", body):
-                exports.setdefault(fn.group(1), path.name)
+                name = fn.group(1) if impl == "Marmot" else f"{impl}::{fn.group(1)}"
+                exports.setdefault(name, path.name)
     return exports
 
 
@@ -65,8 +72,8 @@ def _braced_block(src: str, start: int) -> str:
     raise ValueError("unbalanced braces")
 
 
-def c_coverage() -> set[str]:
-    """Runtime methods `marmot-c` calls, however the call is line-wrapped."""
+def _c_source() -> str:
+    """Every `marmot-c` source, comment-stripped and whitespace-collapsed."""
     src = "".join(p.read_text() for p in C_SRC.rglob("*.rs"))
     # Comments go first, while newlines still delimit them: a doc comment
     # naming a method would otherwise register as coverage for a wrapper
@@ -75,7 +82,12 @@ def c_coverage() -> set[str]:
     src = re.sub(r"//[^\n]*", "", src)
     # Whitespace is stripped wholesale so rustfmt's multi-line call chains
     # (`client\n    .marmot\n    .method(...)`) collapse to one token.
-    src = re.sub(r"\s+", "", src)
+    return re.sub(r"\s+", "", src)
+
+
+def c_coverage() -> set[str]:
+    """Runtime methods `marmot-c` calls, however the call is line-wrapped."""
+    src = _c_source()
     return (
         set(re.findall(r"\.marmot\.(\w+)\(", src))
         # c_cmd! `fn marmot_x(..) -> rec(T) = method;` — anchor on the return
@@ -87,10 +99,26 @@ def c_coverage() -> set[str]:
     )
 
 
+def subscription_coverage() -> set[str]:
+    """Subscription-handle methods `marmot-c` mirrors.
+
+    Looser than `c_coverage`: a handle method is called on an inner handle
+    whose type is not in the token stream, so any method call counts. The
+    strict form would need per-handle typing for no added drift signal.
+    """
+    src = _c_source()
+    return set(re.findall(r"\.(\w+)\(", src)) | set(re.findall(r"read(\w+),", src))
+
+
 def main() -> int:
     exports = uniffi_exports()
     covered = c_coverage()
-    missing = sorted(n for n in exports if n not in covered)
+    sub_covered = subscription_coverage()
+    def mirrored(name: str) -> bool:
+        handle, sep, method = name.rpartition("::")
+        return method in sub_covered if sep else name in covered
+
+    missing = sorted(n for n in exports if not mirrored(n))
 
     stale = sorted(n for n in DELIBERATELY_UNEXPORTED if n not in exports)
     gaps = [n for n in missing if n not in DELIBERATELY_UNEXPORTED]
@@ -128,7 +156,7 @@ def main() -> int:
             print(f"    {name}", file=sys.stderr)
 
     if ok:
-        print(f"c-binding parity: {len(exports)} commands, all exported or explained")
+        print(f"c-binding parity: {len(exports)} exports, all mirrored or explained")
     return 0 if ok else 1
 
 
