@@ -5373,15 +5373,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_history_repair_resolves_overflow_after_prearmed_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_id = client
+            .create_group("combined full-history repair", &[])
+            .await
+            .unwrap();
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client.apply_backfill_decision(
+            &group_id,
+            stalled_epoch,
+            BackfillDecision::Arm,
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        let marker_token = 7;
+        app.account_storage("alice")
+            .unwrap()
+            .mark_account_delivery_recovery("alice", marker_token, 1)
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(marker_token);
+
+        client
+            .repair_full_history()
+            .await
+            .expect("both EOSE-confirmed recovery obligations must complete");
+
+        assert!(!client.has_pending_epoch_backfill());
+        assert!(!client.delivery_overflow_recovery_pending);
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none(),
+            "success must clear the durable overflow marker",
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_full_history_repair_retains_incomplete_overflow_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let marker_token = 7;
+        app.account_storage("alice")
+            .unwrap()
+            .mark_account_delivery_recovery("alice", marker_token, 1)
+            .unwrap();
+        client.delivery_overflow_recovery_pending = true;
+        client.delivery_overflow_recovery_marker_token = Some(marker_token);
+
+        let failure = client
+            .repair_full_history()
+            .await
+            .expect_err("relay silence cannot resolve the durable delivery gap");
+
+        assert_eq!(
+            failure.classification().failure_stage,
+            SyncFailureStage::RelayReceive
+        );
+        assert!(
+            failure
+                .source
+                .to_string()
+                .contains("account_delivery_queue_overflow"),
+            "the public failure must identify the unresolved durable gap",
+        );
+        assert!(
+            client.delivery_overflow_recovery_pending,
+            "an unconfirmed recovery must remain armed",
+        );
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some(),
+            "an unconfirmed recovery must retain its durable marker",
+        );
+    }
+
+    #[tokio::test]
     async fn full_history_repair_falls_back_when_every_pending_intent_defers() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
-        let mut client = app.client("alice").await.unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay.clone());
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client
             .create_group("deferred full-history repair", &[])
             .await

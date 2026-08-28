@@ -194,6 +194,25 @@ impl DrainVerdict {
     }
 }
 
+/// Turn the end-of-stored-events gate into the public outcome of an explicit
+/// full-history repair. A quiet unfloored subscription is not proof that the
+/// relay served all stored events, so retain everything that was ingested in
+/// the partial summary while failing the repair closed.
+fn incomplete_full_history_repair(
+    summary: SyncSummary,
+    verdict: DrainVerdict,
+) -> ClassifiedSyncFailure {
+    debug_assert_ne!(verdict, DrainVerdict::Complete);
+    let error_kind = verdict
+        .error_kind()
+        .unwrap_or("full_history_repair_unconfirmed");
+    ClassifiedSyncFailure::at_stage(
+        summary,
+        AppError::BlockingTask(format!("full-history repair incomplete: {error_kind}")),
+        SyncFailureStage::RelayReceive,
+    )
+}
+
 /// What one delivery's ingest settled, for the two seams that decide whether the
 /// delivery may be dropped from the fetch path.
 struct DeliveryIngest {
@@ -2695,7 +2714,19 @@ impl AppClient {
                             SyncFailureStage::Unknown,
                         )
                     })? {
-                    EpochBackfillRunOutcome::Completed(summary) => return Ok(summary),
+                    EpochBackfillRunOutcome::Completed(mut summary) => {
+                        if self.delivery_overflow_recovery_pending {
+                            self.recover_delivery_overflow_and_merge(&mut summary)
+                                .await?;
+                            if self.delivery_overflow_recovery_pending {
+                                return Err(incomplete_full_history_repair(
+                                    summary,
+                                    DrainVerdict::Overflow,
+                                ));
+                            }
+                        }
+                        return Ok(summary);
+                    }
                     // The intent's own replay could not confirm it served this
                     // account's history. Retain what it did ingest and fall
                     // through to the caller-directed unfloored repair below
@@ -2739,10 +2770,15 @@ impl AppClient {
         self.pending_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut counts = DrainCounts::default();
-        let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
-        if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
+        let (mut summary, mut verdict) = self.backfill_sdk_relay(&mut counts).await?;
+        if verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
             self.recover_delivery_overflow_and_merge(&mut summary)
                 .await?;
+            verdict = if self.delivery_overflow_recovery_pending {
+                DrainVerdict::Overflow
+            } else {
+                DrainVerdict::Complete
+            };
         }
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
@@ -2756,7 +2792,11 @@ impl AppClient {
             }
         };
         summary.merge(drained);
-        Ok(summary)
+        if verdict == DrainVerdict::Complete {
+            Ok(summary)
+        } else {
+            Err(incomplete_full_history_repair(summary, verdict))
+        }
     }
 
     pub(crate) async fn advance_convergence_after_runtime_sync(
@@ -3851,8 +3891,19 @@ fn retry_backoff_for_ordinal(base: Duration, retry_ordinal: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrainVerdict, backfill_drain_verdict, retry_backoff_for_ordinal};
-    use crate::{EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP};
+    use super::{
+        DrainVerdict, backfill_drain_verdict, incomplete_full_history_repair,
+        retry_backoff_for_ordinal,
+    };
+    use crate::tests::{
+        ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
+    };
+    use crate::{
+        EPOCH_BACKFILL_RETRY_BACKOFF, EPOCH_BACKFILL_RETRY_BACKOFF_CAP, MarmotApp,
+        SyncFailureStage, SyncSummary,
+    };
+    use marmot_account::AccountHome;
+    use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
 
@@ -3914,6 +3965,69 @@ mod tests {
             backfill_drain_verdict(progress(2, 2, 4, 2)),
             DrainVerdict::EoseTimeout,
             "EOSE on every logical subscription is insufficient while another relay remains uncovered"
+        );
+    }
+
+    #[test]
+    fn explicit_full_history_repair_requires_end_of_stored_events() {
+        for verdict in [
+            DrainVerdict::NoRelayEose,
+            DrainVerdict::EoseTimeout,
+            DrainVerdict::NovelProgressQuantumYield,
+            DrainVerdict::NoProgressQuantumYield,
+            DrainVerdict::Overflow,
+        ] {
+            let partial = SyncSummary {
+                joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
+                ..SyncSummary::default()
+            };
+            let error = incomplete_full_history_repair(partial.clone(), verdict);
+            assert_eq!(error.partial_summary, partial);
+            assert!(
+                error
+                    .source
+                    .to_string()
+                    .contains(verdict.error_kind().unwrap()),
+                "the caller must be able to distinguish why the repair stayed incomplete",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_full_history_repair_preserves_ingested_prefix_without_eose() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let ingested = SyncSummary {
+            joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
+            ..SyncSummary::default()
+        };
+        client.pending_failed_sync_summary.merge(ingested.clone());
+
+        let failure = client
+            .repair_full_history()
+            .await
+            .expect_err("relay silence cannot prove that full history was served");
+
+        assert_eq!(failure.partial_summary, ingested);
+        assert_eq!(
+            failure.classification().failure_stage,
+            SyncFailureStage::RelayReceive
+        );
+        let source = failure.source.to_string();
+        assert!(
+            source.contains("backfill_drain_no_relay_eose")
+                || source.contains("backfill_drain_no_progress_quantum_yield"),
+            "the public failure must preserve the incomplete-drain cause; actual: {source}"
         );
     }
 }
