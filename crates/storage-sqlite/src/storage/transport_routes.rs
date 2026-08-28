@@ -69,14 +69,33 @@ pub(super) fn delete_route(
     store: &SqliteAccountStorage,
     transport_group_id: &[u8],
 ) -> StorageResult<()> {
-    store
-        .lock()?
-        .execute(
+    store.connection.with_transaction(|| {
+        let conn = store.lock()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_items
+         WHERE route_kind = 1 AND route_id = ?1",
+            params![transport_group_id],
+        )
+        .storage()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_route_state
+         WHERE route_kind = 1 AND route_id = ?1",
+            params![transport_group_id],
+        )
+        .storage()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_scheduler
+         WHERE singleton = 1 AND route_kind = 1 AND route_id = ?1",
+            params![transport_group_id],
+        )
+        .storage()?;
+        conn.execute(
             "DELETE FROM cgka_transport_group_routes WHERE transport_group_id = ?1",
             params![transport_group_id],
         )
         .storage()?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(super) fn delete_below_epoch(
@@ -84,27 +103,89 @@ pub(super) fn delete_below_epoch(
     group_id: &GroupId,
     cutoff: EpochId,
 ) -> StorageResult<()> {
-    store
-        .lock()?
-        .execute(
+    store.connection.with_transaction(|| {
+        let conn = store.lock()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_items
+         WHERE route_kind = 1 AND route_id IN (
+             SELECT transport_group_id
+             FROM cgka_transport_group_routes
+             WHERE group_id = ?1 AND source_epoch < ?2
+         )",
+            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
+        )
+        .storage()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_route_state
+         WHERE route_kind = 1 AND route_id IN (
+             SELECT transport_group_id
+             FROM cgka_transport_group_routes
+             WHERE group_id = ?1 AND source_epoch < ?2
+         )",
+            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
+        )
+        .storage()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_scheduler
+         WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
+             SELECT transport_group_id
+             FROM cgka_transport_group_routes
+             WHERE group_id = ?1 AND source_epoch < ?2
+         )",
+            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
+        )
+        .storage()?;
+        conn.execute(
             "DELETE FROM cgka_transport_group_routes
              WHERE group_id = ?1 AND source_epoch < ?2",
             params![group_id.as_slice(), epoch_to_i64(cutoff)?],
         )
         .storage()?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(super) fn delete_for_group(
     store: &SqliteAccountStorage,
     group_id: &GroupId,
 ) -> StorageResult<()> {
-    store
-        .lock()?
-        .execute(
+    store.connection.with_transaction(|| {
+        let conn = store.lock()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_items
+         WHERE route_kind = 1 AND route_id IN (
+             SELECT transport_group_id
+             FROM cgka_transport_group_routes
+             WHERE group_id = ?1
+         )",
+            params![group_id.as_slice()],
+        )
+        .storage()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_route_state
+         WHERE route_kind = 1 AND route_id IN (
+             SELECT transport_group_id
+             FROM cgka_transport_group_routes
+             WHERE group_id = ?1
+         )",
+            params![group_id.as_slice()],
+        )
+        .storage()?;
+        conn.execute(
+            "DELETE FROM transport_reconciliation_scheduler
+         WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
+             SELECT transport_group_id
+             FROM cgka_transport_group_routes
+             WHERE group_id = ?1
+         )",
+            params![group_id.as_slice()],
+        )
+        .storage()?;
+        conn.execute(
             "DELETE FROM cgka_transport_group_routes WHERE group_id = ?1",
             params![group_id.as_slice()],
         )
         .storage()?;
-    Ok(())
+        Ok(())
+    })
 }

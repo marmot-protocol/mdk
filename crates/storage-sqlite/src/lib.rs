@@ -19,6 +19,7 @@ mod prepared_group_image_upload;
 mod shared;
 mod storage;
 mod timeline;
+mod transport_reconciliation;
 
 pub use account_projection::{
     AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushToken,
@@ -63,6 +64,10 @@ pub use timeline::{
     TimelineMessageQuery, TimelineMessageRecord, TimelineMessageTarget, TimelinePage,
     TimelinePagination, TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason,
     TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
+};
+pub use transport_reconciliation::{
+    TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
+    TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
 };
 
 pub use agent_stream_sequences::{

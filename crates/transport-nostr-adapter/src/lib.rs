@@ -82,7 +82,8 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
+    NostrReconciliationItem, NostrReconciliationSummary, NostrSdkRelayClient, NostrSdkRelayHealth,
+    NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
 };
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
@@ -273,6 +274,19 @@ pub struct NostrAdapterMetrics {
     pub publish_attempts: usize,
     pub publish_successes: usize,
     pub publish_failures: usize,
+    /// Route-level NIP-77 passes attempted after ordinary subscription rebuilds.
+    #[serde(default)]
+    pub reconciliation_attempts: usize,
+    #[serde(default)]
+    pub reconciliation_relays_succeeded: usize,
+    #[serde(default)]
+    pub reconciliation_relays_failed: usize,
+    /// Event ids the relays reported absent from the durable local route sets.
+    #[serde(default)]
+    pub reconciliation_remote_items: usize,
+    /// Missing events successfully downloaded by reconciliation.
+    #[serde(default)]
+    pub reconciliation_received_items: usize,
 }
 
 /// Successful/failed endpoint-level result from a relay client publish.
@@ -482,6 +496,18 @@ impl NostrTransportAdapter {
         metrics
     }
 
+    /// Record one privacy-safe aggregate NIP-77 result. These counters are
+    /// diagnostic only and never feed routing, convergence, or cursor policy.
+    #[cfg(feature = "sdk")]
+    pub async fn record_reconciliation(&self, summary: &NostrReconciliationSummary) {
+        let mut state = self.state.write().await;
+        state.metrics.reconciliation_attempts += 1;
+        state.metrics.reconciliation_relays_succeeded += summary.relays_succeeded;
+        state.metrics.reconciliation_relays_failed += summary.relays_failed;
+        state.metrics.reconciliation_remote_items += summary.remote_items;
+        state.metrics.reconciliation_received_items += summary.received_items;
+    }
+
     async fn subscribe_all(
         &self,
         caller: &'static str,
@@ -680,15 +706,39 @@ impl NostrTransportAdapter {
         &self,
         relay_event: NostrRelayEvent,
     ) -> Result<usize, TransportAdapterError> {
+        self.handle_relay_event_scoped(relay_event, None).await
+    }
+
+    /// Route a reconciliation result only to the account whose exact set was
+    /// compared. The SDK database is shared across local accounts, so relying
+    /// on its global duplicate suppression would otherwise let one account's
+    /// cached copy mask another account's missing delivery.
+    pub async fn handle_reconciled_event(
+        &self,
+        account_id: &MemberId,
+        relay_event: NostrRelayEvent,
+    ) -> Result<usize, TransportAdapterError> {
+        self.handle_relay_event_scoped(relay_event, Some(account_id))
+            .await
+    }
+
+    async fn handle_relay_event_scoped(
+        &self,
+        relay_event: NostrRelayEvent,
+        account_id: Option<&MemberId>,
+    ) -> Result<usize, TransportAdapterError> {
         let message = relay_event
             .event
             .to_transport_message()
             .map_err(map_inbound_event_error)?;
         let received_at = Timestamp(unix_now_seconds());
-        let routes = {
+        let mut routes = {
             let state = self.state.read().await;
             state.routes_for(&message, &relay_event.endpoint)
         };
+        if let Some(account_id) = account_id {
+            routes.retain(|route| &route.account_id == account_id);
+        }
 
         let mut delivered = 0;
         for route in routes {

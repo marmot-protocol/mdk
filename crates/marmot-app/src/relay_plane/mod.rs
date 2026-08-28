@@ -22,9 +22,10 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
-    AccountSubscriptionEose, NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient,
-    NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter, RelayExportConsent,
-    RelayLabelResolution, RelayRegistrationOutcome,
+    AccountSubscriptionEose, NostrPublishOutcome, NostrReconciliationItem,
+    NostrReconciliationSummary, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
+    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
+    RelayRegistrationOutcome,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -1736,6 +1737,122 @@ impl MarmotRelayPlaneAccountAdapter {
     /// attributed to exactly the account whose subscribes produced it.
     pub(crate) fn account_id(&self) -> &MemberId {
         &self.account_id
+    }
+
+    pub(crate) async fn reconcile_inbox_history(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        local_items: &[NostrReconciliationItem],
+        reconcile_since: u64,
+        reconcile_until: u64,
+    ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
+        let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
+            return Ok(None);
+        };
+        let activation = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_activation(TransportAccountActivation {
+                account_id: self.account_id.clone(),
+                inbox_endpoints: endpoints,
+                group_subscriptions: Vec::new(),
+                since: None,
+            })
+            .map_err(TransportAdapterError::Subscription)?;
+        let result = client
+            .reconcile_subscription(
+                NostrSubscription::AccountInbox {
+                    account_id: self.account_id.clone(),
+                    endpoints: activation.inbox_endpoints,
+                    since: None,
+                },
+                local_items,
+                reconcile_since,
+                reconcile_until,
+            )
+            .await;
+        let metric = result
+            .as_ref()
+            .map(|(summary, _)| summary.clone())
+            .unwrap_or_default();
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .record_reconciliation(&metric)
+            .await;
+        let (summary, events) = result?;
+        for event in events {
+            self.relay_plane
+                .inner
+                .transport
+                .adapter
+                .handle_reconciled_event(&self.account_id, event)
+                .await?;
+        }
+        Ok(Some(summary))
+    }
+
+    pub(crate) async fn reconcile_group_history(
+        &self,
+        group: TransportGroupSubscription,
+        local_items: &[NostrReconciliationItem],
+        reconcile_since: u64,
+        reconcile_until: u64,
+    ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
+        let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
+            return Ok(None);
+        };
+        let sync = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_group_sync(TransportGroupSync {
+                account_id: self.account_id.clone(),
+                group_subscriptions: vec![group],
+                since: None,
+            })
+            .map_err(TransportAdapterError::Subscription)?;
+        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
+            TransportAdapterError::Subscription(
+                "reconciliation group subscription was empty".to_owned(),
+            )
+        })?;
+        let result = client
+            .reconcile_subscription(
+                NostrSubscription::Group {
+                    account_id: self.account_id.clone(),
+                    group_id: group.group_id,
+                    transport_group_id: group.transport_group_id,
+                    endpoints: group.endpoints,
+                    since: None,
+                },
+                local_items,
+                reconcile_since,
+                reconcile_until,
+            )
+            .await;
+        let metric = result
+            .as_ref()
+            .map(|(summary, _)| summary.clone())
+            .unwrap_or_default();
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .record_reconciliation(&metric)
+            .await;
+        let (summary, events) = result?;
+        for event in events {
+            self.relay_plane
+                .inner
+                .transport
+                .adapter
+                .handle_reconciled_event(&self.account_id, event)
+                .await?;
+        }
+        Ok(Some(summary))
     }
 
     pub(crate) async fn install_group_maintenance_subscription(

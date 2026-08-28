@@ -42,6 +42,36 @@ impl GroupStorage for SqliteAccountStorage {
         let mls_group_key = mls_group_key(id)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
+        tx.execute(
+            "DELETE FROM transport_reconciliation_items
+             WHERE route_kind = 1 AND route_id IN (
+                 SELECT transport_group_id
+                 FROM cgka_transport_group_routes
+                 WHERE group_id = ?1
+             )",
+            params![id.as_slice()],
+        )
+        .storage()?;
+        tx.execute(
+            "DELETE FROM transport_reconciliation_route_state
+             WHERE route_kind = 1 AND route_id IN (
+                 SELECT transport_group_id
+                 FROM cgka_transport_group_routes
+                 WHERE group_id = ?1
+             )",
+            params![id.as_slice()],
+        )
+        .storage()?;
+        tx.execute(
+            "DELETE FROM transport_reconciliation_scheduler
+             WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
+                 SELECT transport_group_id
+                 FROM cgka_transport_group_routes
+                 WHERE group_id = ?1
+             )",
+            params![id.as_slice()],
+        )
+        .storage()?;
         let deleted = tx
             .execute(
                 "DELETE FROM cgka_groups WHERE id = ?1",
@@ -121,10 +151,10 @@ impl GroupStorage for SqliteAccountStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteAccountStorage;
     use crate::storage::test_support::{
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
+    use crate::{SqliteAccountStorage, TransportReconciliationItem, TransportReconciliationRoute};
     use cgka_traits::capabilities::GroupCapabilities;
     use cgka_traits::engine::GroupEvent;
     use cgka_traits::group::ProtocolProfile;
@@ -164,6 +194,27 @@ mod tests {
         let mut routes = store.list_transport_group_routes().unwrap();
         routes.sort_by(|a, b| a.transport_group_id.cmp(&b.transport_group_id));
         routes
+    }
+
+    fn reconciliation_row_counts(store: &SqliteAccountStorage, route_id: [u8; 32]) -> (i64, i64) {
+        let conn = store.lock().unwrap();
+        let items = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transport_reconciliation_items
+                 WHERE route_kind = 1 AND route_id = ?1",
+                [route_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transport_reconciliation_route_state
+                 WHERE route_kind = 1 AND route_id = ?1",
+                [route_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (items, state)
     }
 
     #[test]
@@ -229,6 +280,21 @@ mod tests {
         store
             .put_transport_group_route(&[0x04; 32], &bystander.id, EpochId(1))
             .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for route_id in [[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]] {
+            store
+                .record_transport_reconciliation_item(
+                    &TransportReconciliationRoute::Group(route_id),
+                    &TransportReconciliationItem {
+                        event_id: route_id,
+                        created_at: now,
+                    },
+                )
+                .unwrap();
+        }
 
         // Bulk retirement below the retention cutoff touches only the named
         // group; the bystander's old route survives.
@@ -243,6 +309,8 @@ mod tests {
                 route([0x04; 32], &bystander.id, 1),
             ]
         );
+        assert_eq!(reconciliation_row_counts(&store, [0x01; 32]), (0, 0));
+        assert_eq!(reconciliation_row_counts(&store, [0x04; 32]), (1, 1));
 
         // Single-route retirement.
         store.delete_transport_group_route(&[0x02; 32]).unwrap();
@@ -253,6 +321,40 @@ mod tests {
                 route([0x04; 32], &bystander.id, 1),
             ]
         );
+        assert_eq!(reconciliation_row_counts(&store, [0x02; 32]), (0, 0));
+        assert_eq!(reconciliation_row_counts(&store, [0x03; 32]), (1, 1));
+    }
+
+    #[test]
+    fn transport_group_route_retirement_joins_the_callers_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 1, 1);
+        store.put_group(&group).unwrap();
+        store
+            .put_transport_group_route(&[0xAA; 32], &group.id, EpochId(1))
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store
+            .record_transport_reconciliation_item(
+                &TransportReconciliationRoute::Group([0xAA; 32]),
+                &TransportReconciliationItem {
+                    event_id: [0xBB; 32],
+                    created_at: now,
+                },
+            )
+            .unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.delete_transport_group_route(&[0xAA; 32])?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+
+        assert!(matches!(result, Err(StorageError::Backend(_))));
+        assert_eq!(sorted_routes(&store), vec![route([0xAA; 32], &group.id, 1)]);
+        assert_eq!(reconciliation_row_counts(&store, [0xAA; 32]), (1, 1));
     }
 
     #[test]
@@ -263,8 +365,22 @@ mod tests {
         store
             .put_transport_group_route(&[0xCC; 32], &group.id, EpochId(1))
             .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store
+            .record_transport_reconciliation_item(
+                &TransportReconciliationRoute::Group([0xCC; 32]),
+                &TransportReconciliationItem {
+                    event_id: [0xDD; 32],
+                    created_at: now,
+                },
+            )
+            .unwrap();
         store.delete_group(&group.id).unwrap();
         assert!(store.list_transport_group_routes().unwrap().is_empty());
+        assert_eq!(reconciliation_row_counts(&store, [0xCC; 32]), (0, 0));
     }
 
     #[test]
