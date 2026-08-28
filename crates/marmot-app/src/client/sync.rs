@@ -1576,9 +1576,9 @@ impl AppClient {
     /// Whether this seam must leave a pending intent alone for now.
     ///
     /// The receive seam runs pending recovery after every inbound ingest, so an
-    /// intent that keeps failing to confirm its replay would spend the drain's
-    /// whole silence budget per delivery on the serial account worker, with
-    /// user commands queued behind it. Pacing skips those attempts outright
+    /// intent that keeps failing -- outright, or by not confirming its replay
+    /// -- would spend the drain's whole silence budget per delivery on the
+    /// serial account worker, with user commands queued behind it. Pacing skips those attempts outright
     /// rather than queueing them: the intent is already durable and the next
     /// seam past the cooldown runs it. Caller-directed catch-up is exempt — a
     /// person asking for a repair is not a loop.
@@ -2733,6 +2733,34 @@ impl AppClient {
             },
         );
         if !succeeded {
+            // Every error exit of `run_pending_epoch_backfill` lands here
+            // without ever producing a drain verdict, so none of the
+            // verdict-derived pacing rules in that function runs for it. Pace
+            // here instead, beside the requeue, which makes the rule structural
+            // rather than per-exit: an intent that goes back on the queue is
+            // always paced. Unpaced, the receive seam re-enters a whole-account
+            // replay on the very next inbound batch, and every attempt that
+            // gets as far as the drain spends the full silence budget before
+            // failing again. The verdict paths reach this branch too and
+            // overwrite the value immediately afterwards with their own richer
+            // rule, including clearing it outright for a quantum yield that
+            // made novel progress.
+            //
+            // `retry_ordinal` is the right ordinal for a failure.
+            // `begin_epoch_backfill_execution` already burned it, and what it
+            // counts is how many times this intent has spent the one
+            // account-wide replay budget -- exactly what the cooldown rations.
+            // The verdict counters stay untouched: an execution that never
+            // reached a verdict is no evidence about whether the relays serve
+            // this account's stored history, so inflating
+            // `eose_unconfirmed_attempts` would mis-shape the unconfirmed
+            // schedule, and inflating `no_progress_attempts` would defeat its
+            // reset-on-progress rule. Burning `retry_ordinal` costs nothing
+            // beyond a longer wait: no attempt limit degrades or abandons an
+            // intent, and a caller-directed repair stays exempt from the
+            // cooldown entirely.
+            let backoff = self.epoch_backfill_retry_backoff(execution.retry_ordinal);
+            self.epoch_backfill_retry_not_before = Some(Instant::now() + backoff);
             self.requeue_failed_epoch_backfill_intent(execution.pending);
             return false;
         }
