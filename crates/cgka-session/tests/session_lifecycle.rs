@@ -886,3 +886,88 @@ fn open_rejects_invalid_convergence_policy_before_storage_open() {
         "rejected open must not create the database file"
     );
 }
+
+/// A disband request is intent persistence, not Commit preparation, so its
+/// batch carries no publish work and no events.
+///
+/// `Engine::do_send` short-circuits `SendIntent::Disband` straight to
+/// `do_request_disband` before any commit or queue machinery runs, and
+/// `collect_effects` maps the resulting `SendResult::DisbandRequested` to
+/// nothing. That is what makes the app layer's publish gate provably vacuous on
+/// `AppClient::disband_group`: with an always-empty `publish`, that seam can
+/// never produce a `PublishFailure` to gate on. The disband Commit is prepared
+/// later by `prepare_pending_disband` on the convergence seam, which does
+/// publish and does gate. Pin the emptiness here so that if the engine ever
+/// gives a disband request publish work of its own, this fails loudly and the
+/// gate decision at that seam gets made deliberately rather than by omission.
+#[tokio::test]
+async fn a_disband_request_carries_no_publish_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-disband.sqlite");
+    let key = SqlCipherKey::new("session disband request key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-disband").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "disband-publish-vacuity".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+
+    // Disbanding is only requestable once lifecycle-v1 is installed and Active,
+    // so land that Commit first.
+    let enabled = alice
+        .send(SendIntent::EnableDisbanding {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    // A solo group merges that install without staging publish work; a Commit
+    // only appears once there is another member to publish it to.
+    assert!(enabled.publish.is_empty());
+    let _ = alice.drain();
+
+    let requested = alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        requested.publish.is_empty(),
+        "a disband request must stage no Commit and publish nothing, got {:?}",
+        requested.publish
+    );
+    assert!(
+        requested.events.is_empty(),
+        "a disband request must emit no events of its own, got {:?}",
+        requested.events
+    );
+    assert_eq!(
+        requested.pending_convergence,
+        vec![group_id.clone()],
+        "the request must schedule the convergence pass that prepares its Commit"
+    );
+    // The control: the request really did take `do_request_disband`'s full
+    // path, so the emptiness above is vacuity by design and not a no-op send.
+    assert!(
+        matches!(
+            alice.disband_request(&group_id).unwrap(),
+            Some(cgka_traits::storage::DisbandRequest {
+                status: cgka_traits::storage::DisbandRequestStatus::Pending,
+                ..
+            })
+        ),
+        "the disband request must be durably persisted as Pending"
+    );
+}

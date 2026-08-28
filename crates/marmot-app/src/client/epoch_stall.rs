@@ -344,17 +344,24 @@ impl GroupStall {
     /// The app routes that passage from every effects batch whose events it
     /// gates or projects (`AppClient::observe_recovery_evidence`) — the
     /// convergence folds a trailing device usually catches up by, and the
-    /// maintenance tick's own confirmed evolution, included. Two publishing
-    /// seams stay outside that routing. `AppClient::redeliver_welcome` is an
-    /// empty exception: it re-publishes a stored envelope without re-committing
-    /// and never drains the engine, so its batch carries no events to observe.
-    /// `AppClient::disband_group` is a real one — the engine does emit an
-    /// `EpochChanged` when it confirms a disband — and it is accepted rather
-    /// than pre-existing: passage reporting is a new contract, and this is a new
-    /// hole in it, taken because a run whose group is being destroyed has
-    /// nothing left to recover. Arming from an observed batch is conditional on
-    /// it carrying a `TransportObjectResourceRefused`; observing a passage is
-    /// not.
+    /// maintenance tick's own confirmed evolution, included. Two send-path
+    /// seams sit outside that routing, and both are empty exceptions rather
+    /// than holes. `AppClient::redeliver_welcome` re-publishes a stored
+    /// envelope without re-committing and never drains the engine, so its batch
+    /// carries no events to observe. `AppClient::disband_group` is the same
+    /// shape for a different reason: `Engine::do_send` short-circuits
+    /// `SendIntent::Disband` straight to `do_request_disband`, which persists
+    /// the durable request without staging a Commit, so that batch carries no
+    /// publish work and no events of its own
+    /// (`a_disband_request_carries_no_publish_work` pins that at the session
+    /// layer). The `EpochChanged` the engine emits when a disband Commit
+    /// confirms belongs to the later convergence pass `prepare_pending_disband`
+    /// prepares that Commit on, and that batch does reach
+    /// `observe_recovery_evidence`, through
+    /// `AppClient::observe_scheduled_convergence_effects`. So the disband
+    /// passage is reported like any other, and the same seam gates its publish.
+    /// Arming from an observed batch is conditional on it carrying a
+    /// `TransportObjectResourceRefused`; observing a passage is not.
     ///
     /// A batch that reports neither leaves the run exactly as it was: an advance
     /// nobody reports is invisible here, as
