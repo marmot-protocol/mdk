@@ -180,8 +180,8 @@ pub(crate) const EPOCH_STALL_WEDGE_REARM_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 ///
 /// Invariant: this window must exceed
 /// [`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`], or a wedged group's own paced
-/// re-arms would age out the very run they are continuing. Asserted by
-/// `the_rearm_interval_is_shorter_than_the_run_continuation_window`.
+/// re-arms would age out the very run they are continuing. Enforced by the
+/// compile-time `const` assertion beside these constants.
 pub(crate) const EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Replay completions that reached end-of-stored-events and recovered nothing,
