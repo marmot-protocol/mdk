@@ -78,7 +78,9 @@ def c_coverage() -> set[str]:
     src = re.sub(r"\s+", "", "".join(p.read_text() for p in C_SRC.rglob("*.rs")))
     return (
         set(re.findall(r"\.marmot\.(\w+)\(", src))
-        | set(re.findall(r"=(\w+);", src))  # c_cmd! `... = method;`
+        # c_cmd! `fn marmot_x(..) -> rec(T) = method;` — anchor on the return
+        # form so a plain assignment cannot pass as coverage.
+        | set(re.findall(r"->[\w()]+=(\w+);", src))
         | set(re.findall(r"Marmot::(\w+)\(", src))
     )
 

@@ -567,6 +567,22 @@ typedef enum MarmotNotificationWakeSource {
 } MarmotNotificationWakeSource;
 
 /**
+ * Host-side operation a UI can time and report back.
+ */
+typedef enum MarmotHostPerformanceOperation {
+  MARMOT_HOST_PERFORMANCE_OPERATION_SPLASH_READY,
+  MARMOT_HOST_PERFORMANCE_OPERATION_FOREGROUND_LOCAL_READY,
+} MarmotHostPerformanceOperation;
+
+/**
+ * How a reported host operation ended.
+ */
+typedef enum MarmotHostPerformanceOutcome {
+  MARMOT_HOST_PERFORMANCE_OUTCOME_SUCCESS,
+  MARMOT_HOST_PERFORMANCE_OUTCOME_FAILURE,
+} MarmotHostPerformanceOutcome;
+
+/**
  * Opaque handle to a live agent-text-stream watch: incremental
  * `Chunk`s, then a terminal `Finished` / `Failed`, after which the
  * stream closes. Created by `marmot_watch_agent_text_stream`; the

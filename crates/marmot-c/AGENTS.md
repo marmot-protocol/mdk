@@ -28,7 +28,8 @@ across the boundary. That deserves its own focused design + tests rather than a 
   unions: markdown tree, events, subscription deltas) are written by hand in their type modules. cbindgen sees the
   expanded items because `just c-header` enables macro expansion (`RUSTC_BOOTSTRAP=1` on stable).
 - `src/commands.rs` holds the `extern "C"` wrappers. `c_cmd!` generates the uniform ones from a one-line spec
-  (`ffi_guard`, borrowed-input readers, `block_on` onto the embedded tokio runtime, mirror conversion, out-pointer);
+  (`ffi_guard`, borrowed-input readers, `MarmotClient::block_on` onto the embedded tokio runtime, mirror conversion,
+  out-pointer);
   commands with struct/byte inputs are hand-written below the macro block.
 - `src/subscriptions.rs` wraps the 8 subscription objects as opaque handles. `c_subscription!` generates the shared
   surface (handle, callback type, blocking `*_next` with timeout → `MARMOT_STATUS_TIMEOUT`, shutdown →
@@ -51,8 +52,9 @@ across the boundary. That deserves its own focused design + tests rather than a 
 - Required out-pointers are validated and cleared at wrapper entry (`preflight_out_ptr` / `preflight_out`), before
   any async call, mutation, or subscription dequeue — a late NULL check reports failure after the side effect landed,
   so a retry duplicates a send and a consumed subscription item is lost.
-- Blocking calls go through `block_on_handle`, never a bare `block_on`: a C consumer may call the ABI from a
-  subscription callback, which runs on the embedded runtime's own worker threads.
+- Blocking calls go through `block_on_handle` — directly, or via `MarmotClient::block_on`, which is a thin call to it.
+  Never `Runtime::block_on`/`Handle::block_on` directly: a C consumer may call the ABI from a subscription callback,
+  which runs on the embedded runtime's own worker threads.
 - `MarmotStatus` values are stable ABI: append, never renumber. Keep the variant set in lockstep with
   `marmot_uniffi::MarmotKitError`.
 - `include/marmot.h` is generated, never hand-edited; regenerate with `just c-header`. CI diff-gates it.

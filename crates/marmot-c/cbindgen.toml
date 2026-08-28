@@ -34,7 +34,11 @@ header = """/*
 prefix = ""
 # Enums a caller passes as a uint32_t discriminant are no longer referenced
 # by any signature, so cbindgen would drop the constants consumers need.
-include = ["MarmotNotificationWakeSource"]
+include = [
+    "MarmotNotificationWakeSource",
+    "MarmotHostPerformanceOperation",
+    "MarmotHostPerformanceOutcome",
+]
 
 [enum]
 rename_variants = "ScreamingSnakeCase"
