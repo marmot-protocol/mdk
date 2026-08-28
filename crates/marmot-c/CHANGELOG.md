@@ -18,6 +18,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   bundle. ([#1545](https://github.com/marmot-protocol/mdk/pull/1545))
 - `alloc-audit` test feature proving deep-free completeness; C smoke
   example run under gcc, clang, and valgrind in CI. ([#1545](https://github.com/marmot-protocol/mdk/pull/1545))
+- `marmot_client_new_with_secret_store` plus the `MarmotSecretStore`
+  callback vtable and `MarmotSecretStoreStatus`: a host can hold account
+  signing keys in its own storage (an encrypted vault, a custom keystore)
+  instead of the platform keychain. `marmot_client_new` is unchanged.
+  ([#1575](https://github.com/marmot-protocol/mdk/pull/1575))
 - `marmot_rotate_key_package`: rotate the account's KeyPackage under its
   proper name (with a matching `rotate_key_package` on the UniFFI
   surface); `marmot_publish_new_key_package` stays as the legacy alias.

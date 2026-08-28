@@ -530,8 +530,8 @@ c_cmd! {
     /// NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
-    /// Create a brand-new Nostr identity, store its secret in the platform
-    /// keychain, and publish initial relay lists + key package. Free with
+    /// Create a brand-new Nostr identity, store its secret in the account
+    /// secret store, and publish initial relay lists + key package. Free with
     /// `marmot_account_summary_free`.
     async fn marmot_create_identity(default_relays/default_relays_len: str_arr, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountSummary) = create_identity;
 

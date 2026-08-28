@@ -25,6 +25,7 @@ use marmot_uniffi::Marmot;
 pub mod commands;
 pub(crate) mod macros;
 pub mod memory;
+pub mod secret_store;
 pub mod status;
 pub mod subscriptions;
 pub mod types;
@@ -32,6 +33,7 @@ pub mod types;
 pub use status::MarmotStatus;
 
 use memory::{owned_c_string, required_str, str_array};
+use secret_store::{CSecretStore, MarmotSecretStore};
 use status::set_last_error;
 use types::notification::MarmotCursorPersistence;
 
@@ -199,6 +201,59 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
                 },
             )
         }
+    })
+}
+
+/// Create a Marmot client whose account signing keys live in caller-owned
+/// storage instead of the platform keychain. Otherwise identical to
+/// `marmot_client_new`.
+///
+/// `store` is borrowed for the duration of this call: its fields are
+/// copied, so the caller may free their struct as soon as it returns.
+/// `store->user_data` must stay alive until `store->destroy` fires. Every
+/// callback except `destroy` is required; a missing one is
+/// `MARMOT_STATUS_NULL_POINTER`. On any status but `MARMOT_STATUS_OK` this
+/// call takes no ownership and never invokes `destroy`; reclaiming
+/// `user_data` stays the caller's job.
+///
+/// The callbacks run on runtime worker threads, possibly concurrently, and
+/// must not call any `marmot_*` function on this client — see the
+/// `MarmotSecretStore` documentation for the full contract.
+///
+/// # Safety
+/// `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
+/// must point to `relay_urls_len` valid strings (or be NULL with length
+/// 0); `store` and `out_client` must be valid pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_secret_store(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    store: *const MarmotSecretStore,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
+        let store = match unsafe { CSecretStore::from_c(store) } {
+            Ok(store) => Arc::new(store),
+            Err(status) => return status,
+        };
+        let status = unsafe {
+            open_client(root_path, relay_urls, relay_urls_len, out_client, {
+                let store = Arc::clone(&store);
+                move |root_path, relay_urls| {
+                    Marmot::new_with_secret_store(root_path, relay_urls, store)
+                }
+            })
+        };
+        // Ownership of `user_data` transfers only once the caller holds a
+        // handle: until then a failure leaves the host's store untouched.
+        if status == MarmotStatus::Ok {
+            store.arm();
+        }
+        status
     })
 }
 

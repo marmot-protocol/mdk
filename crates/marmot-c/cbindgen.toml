@@ -37,6 +37,7 @@ prefix = ""
 include = [
     "MarmotNotificationWakeSource",
     "MarmotCursorPersistence",
+    "MarmotSecretStoreStatus",
     "MarmotHostPerformanceOperation",
     "MarmotHostPerformanceOutcome",
 ]

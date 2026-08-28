@@ -31,6 +31,7 @@ pub mod conversions;
 mod errors;
 mod external_signer;
 mod markdown;
+mod secret_store;
 pub mod subscriptions;
 
 use conversions::group_id_from_hex;
@@ -41,6 +42,7 @@ pub use markdown::{
     MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
     MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
 };
+pub use secret_store::SecretStore;
 
 uniffi::setup_scaffolding!();
 
@@ -169,7 +171,36 @@ impl Marmot {
     /// to events.
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
-        Self::open(root_path, relay_urls, MarmotAppConfig::default())
+        Self::open(root_path, relay_urls, MarmotAppConfig::default(), None)
+    }
+
+    /// Open the Marmot app with host-supplied account-secret storage instead
+    /// of the platform keychain. Identical to [`Marmot::new`] except that
+    /// every read, write, and removal of an account signing key goes through
+    /// `secret_store`.
+    ///
+    /// For hosts that already own an encrypted store: a desktop client with a
+    /// password-sealed vault, an iOS host that wants its own Keychain
+    /// access-control flags, an Android host layering policy over the
+    /// Keystore. The key crosses the boundary as secret-key hex, so the store
+    /// is responsible for protecting it at rest.
+    ///
+    /// `secret_store` is called from runtime worker threads and may be called
+    /// concurrently; implementations must be thread-safe.
+    #[uniffi::constructor]
+    pub fn new_with_secret_store(
+        root_path: String,
+        relay_urls: Vec<String>,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        Self::open(
+            root_path,
+            relay_urls,
+            MarmotAppConfig::default(),
+            Some(Arc::new(secret_store::ForeignSecretStore::new(
+                secret_store,
+            ))),
+        )
     }
 
     /// Open the Marmot app with an explicit durable transport-cursor policy.
@@ -196,6 +227,7 @@ impl Marmot {
             root_path,
             relay_urls,
             MarmotAppConfig::default().with_cursor_persistence(cursor_persistence.into()),
+            None,
         )
     }
 
@@ -285,15 +317,20 @@ impl Marmot {
 }
 
 impl Marmot {
-    /// Shared open path behind the exported constructors: keychain-backed
-    /// account home, app configured by `config`, runtime pair.
+    /// Shared open path behind the exported constructors: account home backed
+    /// by `secret_store` (the platform keychain when `None`), app configured
+    /// by `config`, runtime pair.
     fn open(
         root_path: String,
         relay_urls: Vec<String>,
         config: MarmotAppConfig,
+        secret_store: Option<Arc<dyn marmot_account::AccountSecretStore>>,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
-            .map_err(marmot_app::AppError::from)?;
+        let account_home = match secret_store {
+            Some(store) => marmot_account::AccountHome::open_with_secret_store(&root_path, store),
+            None => marmot_account::AccountHome::open_with_default_keychain(&root_path)
+                .map_err(marmot_app::AppError::from)?,
+        };
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
             &root_path,
             relay_urls,
