@@ -2619,6 +2619,86 @@ fn consecutive_fruitless_replays_are_paced_by_the_retry_cooldown() {
     });
 }
 
+/// An execution that ends in `Err` must earn the same cooldown a fruitless or
+/// unconfirmed one does.
+///
+/// Every error exit of `run_pending_epoch_backfill` requeues its intent and
+/// returns without a verdict, so none of the verdict-derived pacing rules ever
+/// runs for it. Unpaced, the receive seam re-enters a whole-account replay on
+/// the very next inbound batch, and each attempt that gets as far as the drain
+/// spends the full silence budget before failing again. The intent is durable;
+/// the next seam past the cooldown runs it.
+#[test]
+fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
+    run_composed_app_runtime_test("backfill-error-pacing", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        // A backoff long enough that the second batch cannot slip past it
+        // inside this test, and a silence budget short enough to afford.
+        let config = MarmotAppConfig::default()
+            .with_dev_epoch_backfill_eose_wait_ms(300)
+            .with_dev_epoch_backfill_retry_backoff_ms(60_000);
+        let (_app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            config,
+            filled_through,
+        )
+        .await;
+
+        // First inbound batch: a refused delivery arms the intent.
+        client
+            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "the refused ingest must arm an epoch-gap replay",
+        );
+
+        relay.fail_next_subscribe();
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect_err("the injected activation failure must surface");
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "a failed execution must retain its intent",
+        );
+        assert!(
+            client.epoch_backfill_retry_not_before.is_some(),
+            "an execution that ended in an error must earn a retry cooldown",
+        );
+
+        // Second inbound batch, immediately behind the first.
+        client
+            .ingest_received_delivery(route.probe(filled_through + 900, "refusal-after-failure"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        assert!(
+            matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .expect("the paced seam still returns Ok"),
+                crate::EpochBackfillRunOutcome::Deferred
+            ),
+            "the batch behind a failed execution must wait out the cooldown instead of \
+             re-entering the whole-account replay immediately",
+        );
+        // A person asking for a repair is not a loop.
+        assert!(
+            !client.epoch_backfill_retry_is_paced(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
+            ),
+            "caller-directed catch-up stays exempt from the failure cooldown",
+        );
+    });
+}
+
 /// A fruitless replay re-arms only the groups whose refusals it counted.
 ///
 /// The clear is scoped to this drain's attribution rather than swept
