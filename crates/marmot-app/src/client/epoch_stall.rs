@@ -1658,6 +1658,88 @@ mod tests {
         );
     }
 
+    /// The same guard on the refusal path. `mark_replayed` latches
+    /// `fired_at_epoch` for every tracked group without setting
+    /// `armed_at_epoch`, and a refusal reaching that latch must read it as
+    /// another group's suppression rather than as an arm of its own.
+    #[test]
+    fn storm_collapse_suppression_does_not_unlock_a_refused_rearm() {
+        let mut detector = EpochStallDetector::new(2, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        detector.mark_replayed();
+
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS * 5),
+            BackfillDecision::Skip,
+            "a group that never armed has no arm to pace a re-arm from",
+        );
+    }
+
+    /// The shape a restart leaves a cap-saturated group in. Its deferred-peel
+    /// cap is full, so the engine answers every further message with
+    /// `ResourceRefused` rather than deferring it — the undecryptable path is
+    /// never called at all, and the restored `fired_at_epoch` skips the refusal
+    /// path. Without a paced re-arm here that group never replays again, which
+    /// is the one shape the restored evidence exists to report on.
+    #[test]
+    fn a_restored_refusal_only_group_still_earns_its_paced_rearm() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 1,
+                fruitless_reported: false,
+                last_arm_at_ms: T0,
+            },
+        )]);
+
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS - 1),
+            BackfillDecision::Skip,
+            "the clock paces the refusal path exactly as it paces the other one",
+        );
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS),
+            BackfillDecision::Arm,
+            "a restored latch must not end this group's recovery for good",
+        );
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + HOUR_MS + 1),
+            BackfillDecision::Skip,
+            "and the re-arm resets its own clock rather than opening a window",
+        );
+    }
+
+    /// A refused re-arm is paced, so it must not be counted either: the flood
+    /// cap a refusal reports is one minted traffic can saturate on its own
+    /// (mdk#339), which would otherwise buy an arm run for the price of
+    /// waiting.
+    #[test]
+    fn paced_refused_rearms_never_escalate_by_themselves() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 0,
+                fruitless_reported: false,
+                last_arm_at_ms: T0,
+            },
+        )]);
+
+        for hour in 1..=10 {
+            assert_eq!(
+                detector.observe_resource_refusal(g.clone(), EpochId(10), T0 + hour * HOUR_MS),
+                BackfillDecision::Arm,
+                "hour {hour}: a paced re-arm is an arm of the replay, never of the run",
+            );
+        }
+    }
+
     /// A run is unbounded in wall-clock without this: an unrelated stall weeks
     /// after a single arm would land as arm two of a long-dead run.
     #[test]
@@ -1917,6 +1999,66 @@ mod tests {
             detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
             BackfillDecision::Arm,
             "a mark the clock cannot have produced reads as elapsed, not as zero",
+        );
+    }
+
+    /// The run window has to read that same corrected clock. A mark in the
+    /// future is not zero elapsed there either: a run whose last arm cannot
+    /// have happened is over, and its evidence has to be re-earned rather than
+    /// counted toward the next report.
+    #[test]
+    fn a_mark_from_a_clock_that_ran_ahead_expires_the_run_it_marked() {
+        let mut detector = EpochStallDetector::new(1, 3)
+            .with_wedge_rearm_interval_ms(HOUR_MS)
+            .with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        detector.restore_wedge_evidence([(
+            g.clone(),
+            EpochStallEvidence {
+                stalled_epoch: 10,
+                fruitless_completions: 2,
+                fruitless_reported: false,
+                last_arm_at_ms: T0 + 365 * 24 * HOUR_MS,
+            },
+        )]);
+        // A fruitless replay that refused this group's history clears the
+        // latch, which is what lets the next refusal reach `arm` rather than
+        // the paced re-arm.
+        detector.rearm_refused_groups(&HashSet::from([g.clone()]));
+        assert_eq!(
+            detector.observe_resource_refusal(g.clone(), EpochId(10), T0),
+            BackfillDecision::Arm,
+        );
+
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "evidence from a run that ended cannot complete the next run's report",
+        );
+    }
+
+    /// Nothing paces a wedged group but the clock, so its re-arms have to read
+    /// the run window too. A group that went quiet for a week and then received
+    /// one message is starting a new run, not continuing one whose last arm was
+    /// days ago.
+    #[test]
+    fn a_paced_rearm_past_the_run_continuation_window_starts_a_fresh_run() {
+        let mut detector = EpochStallDetector::new(1, 3)
+            .with_wedge_rearm_interval_ms(HOUR_MS)
+            .with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+        let _ = detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0);
+        let _ = detector.observe_fruitless_completion([&g]);
+        let _ = detector.observe_fruitless_completion([&g]);
+
+        let a_week_later = T0 + 7 * 24 * HOUR_MS;
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), a_week_later),
+            BackfillDecision::Arm,
+            "the interval has long elapsed, so the re-arm itself is due",
+        );
+        assert!(
+            detector.observe_fruitless_completion([&g]).is_empty(),
+            "week-old evidence belongs to a run the window already ended",
         );
     }
 
