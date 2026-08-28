@@ -67,9 +67,15 @@ def _braced_block(src: str, start: int) -> str:
 
 def c_coverage() -> set[str]:
     """Runtime methods `marmot-c` calls, however the call is line-wrapped."""
+    src = "".join(p.read_text() for p in C_SRC.rglob("*.rs"))
+    # Comments go first, while newlines still delimit them: a doc comment
+    # naming a method would otherwise register as coverage for a wrapper
+    # that does not exist.
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    src = re.sub(r"//[^\n]*", "", src)
     # Whitespace is stripped wholesale so rustfmt's multi-line call chains
     # (`client\n    .marmot\n    .method(...)`) collapse to one token.
-    src = re.sub(r"\s+", "", "".join(p.read_text() for p in C_SRC.rglob("*.rs")))
+    src = re.sub(r"\s+", "", src)
     return (
         set(re.findall(r"\.marmot\.(\w+)\(", src))
         # c_cmd! `fn marmot_x(..) -> rec(T) = method;` — anchor on the return
