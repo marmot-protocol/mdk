@@ -212,7 +212,9 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
 /// copied, so the caller may free their struct as soon as it returns.
 /// `store->user_data` must stay alive until `store->destroy` fires. Every
 /// callback except `destroy` is required; a missing one is
-/// `MARMOT_STATUS_NULL_POINTER`.
+/// `MARMOT_STATUS_NULL_POINTER`. On any status but `MARMOT_STATUS_OK` this
+/// call takes no ownership and never invokes `destroy`; reclaiming
+/// `user_data` stays the caller's job.
 ///
 /// The callbacks run on runtime worker threads, possibly concurrently, and
 /// must not call any `marmot_*` function on this client — see the
@@ -238,17 +240,20 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
             Ok(store) => Arc::new(store),
             Err(status) => return status,
         };
-        unsafe {
-            open_client(
-                root_path,
-                relay_urls,
-                relay_urls_len,
-                out_client,
+        let status = unsafe {
+            open_client(root_path, relay_urls, relay_urls_len, out_client, {
+                let store = Arc::clone(&store);
                 move |root_path, relay_urls| {
                     Marmot::new_with_secret_store(root_path, relay_urls, store)
-                },
-            )
+                }
+            })
+        };
+        // Ownership of `user_data` transfers only once the caller holds a
+        // handle: until then a failure leaves the host's store untouched.
+        if status == MarmotStatus::Ok {
+            store.arm();
         }
+        status
     })
 }
 

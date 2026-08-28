@@ -588,8 +588,12 @@ typedef enum MarmotCursorPersistence {
 
 /**
  * Status a [`MarmotSecretStore`] callback returns. Crosses as
- * `uint32_t`; an out-of-range value is rejected as
- * `MARMOT_STATUS_INVALID_ARGUMENT`.
+ * `uint32_t`. An out-of-range value is rejected, and surfaces to the
+ * caller as the store failure it is (`MARMOT_STATUS_RUNTIME`, detail
+ * text in `marmot_last_error_message`) — a callback's return travels
+ * back through the runtime's typed errors, so it cannot become
+ * `MARMOT_STATUS_INVALID_ARGUMENT`, which is reserved for values the
+ * caller passes *in*.
  */
 typedef enum MarmotSecretStoreStatus {
   /**
@@ -3636,7 +3640,9 @@ MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
  * copied, so the caller may free their struct as soon as it returns.
  * `store->user_data` must stay alive until `store->destroy` fires. Every
  * callback except `destroy` is required; a missing one is
- * `MARMOT_STATUS_NULL_POINTER`.
+ * `MARMOT_STATUS_NULL_POINTER`. On any status but `MARMOT_STATUS_OK` this
+ * call takes no ownership and never invokes `destroy`; reclaiming
+ * `user_data` stays the caller's job.
  *
  * The callbacks run on runtime worker threads, possibly concurrently, and
  * must not call any `marmot_*` function on this client — see the

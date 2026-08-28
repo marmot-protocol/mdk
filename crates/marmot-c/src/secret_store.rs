@@ -28,10 +28,13 @@
 //!   construction, so the caller may free their copy as soon as the call
 //!   returns. `user_data` must stay alive until `destroy` fires, which
 //!   happens when the last runtime reference is released (at or shortly
-//!   after `marmot_client_free`).
+//!   after `marmot_client_free`). A constructor that returns anything but
+//!   `MARMOT_STATUS_OK` never calls `destroy` — construction took no
+//!   ownership, and reclaiming `user_data` stays the host's job.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use marmot_uniffi::{MarmotKitError, SecretStore};
 use zeroize::Zeroizing;
@@ -42,8 +45,12 @@ use crate::status::set_last_error;
 
 c_enum! {
     /// Status a [`MarmotSecretStore`] callback returns. Crosses as
-    /// `uint32_t`; an out-of-range value is rejected as
-    /// `MARMOT_STATUS_INVALID_ARGUMENT`.
+    /// `uint32_t`. An out-of-range value is rejected, and surfaces to the
+    /// caller as the store failure it is (`MARMOT_STATUS_RUNTIME`, detail
+    /// text in `marmot_last_error_message`) — a callback's return travels
+    /// back through the runtime's typed errors, so it cannot become
+    /// `MARMOT_STATUS_INVALID_ARGUMENT`, which is reserved for values the
+    /// caller passes *in*.
     MarmotSecretStoreStatus {
         /// The operation succeeded.
         Ok,
@@ -136,6 +143,11 @@ pub struct MarmotSecretStore {
 /// invokes them from worker threads, possibly concurrently.
 pub(crate) struct CSecretStore {
     vtable: MarmotSecretStore,
+    /// Set once the client handle reaches the caller. Construction can
+    /// still fail after the vtable is accepted (bad `root_path`, runtime
+    /// build, store open); `destroy` must not fire on that path, or a host
+    /// that reclaims `user_data` after the failed call frees it twice.
+    armed: AtomicBool,
 }
 
 unsafe impl Send for CSecretStore {}
@@ -176,12 +188,24 @@ impl CSecretStore {
             }
         }
 
-        Ok(Self { vtable })
+        Ok(Self {
+            vtable,
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    /// Take ownership of `user_data`: from here on `destroy` fires when the
+    /// last runtime reference goes away.
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
     }
 }
 
 impl Drop for CSecretStore {
     fn drop(&mut self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
         let Some(destroy) = self.vtable.destroy else {
             return;
         };
@@ -507,8 +531,19 @@ mod tests {
     #[test]
     fn destroy_fires_once_when_the_store_is_released() {
         let host = HostState::default();
-        drop(store(&host));
+        let store = store(&host);
+        store.arm();
+        drop(store);
         assert!(*host.destroyed.lock().unwrap());
+    }
+
+    #[test]
+    fn destroy_is_suppressed_when_construction_never_armed_the_store() {
+        // A constructor that fails after accepting the vtable drops the
+        // store unarmed; the host still owns user_data.
+        let host = HostState::default();
+        drop(store(&host));
+        assert!(!*host.destroyed.lock().unwrap());
     }
 
     #[test]
