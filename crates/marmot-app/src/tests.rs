@@ -9686,13 +9686,18 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
             account_id: &MemberId,
             minimum: usize,
         ) {
-            for _ in 0..10_000 {
-                if relay.inbox_subscription_count(account_id) >= minimum {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let observed = relay.inbox_subscription_count(account_id);
+                if observed >= minimum {
                     return;
                 }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "account inbox subscription count did not reach {minimum}; observed {observed}"
+                );
                 tokio::task::yield_now().await;
             }
-            panic!("account inbox subscription count did not reach {minimum}");
         }
 
         const ACCOUNT: &str = "alice";
@@ -9718,14 +9723,15 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
                 .shared_services()
                 .relay_plane()
                 .simulate_notification_recovery_for_test(1);
-            for probe in 0..10_000 {
+            let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
                 match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
                     Err(AppError::TransportClosed) => break,
                     Ok(_) => tokio::task::yield_now().await,
                     Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
                 }
                 assert!(
-                    probe < 9_999,
+                    std::time::Instant::now() < backoff_deadline,
                     "account worker did not enter reconnect backoff"
                 );
             }
@@ -9743,14 +9749,15 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
             .shared_services()
             .relay_plane()
             .simulate_notification_recovery_for_test(1);
-        for probe in 0..10_000 {
+        let max_backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
             match runtime.unhydrated_group_count_for_test(ACCOUNT).await {
                 Err(AppError::TransportClosed) => break,
                 Ok(_) => tokio::task::yield_now().await,
                 Err(error) => panic!("unexpected max-backoff probe error: {error:?}"),
             }
             assert!(
-                probe < 9_999,
+                std::time::Instant::now() < max_backoff_deadline,
                 "account worker did not enter maximum reconnect backoff"
             );
         }
@@ -9768,7 +9775,8 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
         };
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        for _ in 0..10_000 {
+        let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
             if relay
                 .blocked_subscribe_count
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -9776,6 +9784,10 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
             {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < reconnect_deadline,
+                "connectivity recovery did not start a reconnect subscription"
+            );
             tokio::task::yield_now().await;
         }
         assert_eq!(
