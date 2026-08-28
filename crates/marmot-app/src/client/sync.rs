@@ -1576,12 +1576,14 @@ impl AppClient {
     /// Whether this seam must leave a pending intent alone for now.
     ///
     /// The receive seam runs pending recovery after every inbound ingest, so an
-    /// intent that keeps failing -- outright, or by not confirming its replay
-    /// -- would spend the drain's whole silence budget per delivery on the
-    /// serial account worker, with user commands queued behind it. Pacing skips those attempts outright
-    /// rather than queueing them: the intent is already durable and the next
-    /// seam past the cooldown runs it. Caller-directed catch-up is exempt — a
-    /// person asking for a repair is not a loop.
+    /// intent that keeps failing would re-run the workflow per delivery on the
+    /// serial account worker, with user commands queued behind it — and a
+    /// failure that reaches the relay drain (outright, or by not confirming
+    /// its replay) spends the drain's whole silence budget each time. Pacing
+    /// skips those attempts outright rather than queueing them: the intent is
+    /// already durable and the next seam past the cooldown runs it.
+    /// Caller-directed catch-up is exempt — a person asking for a repair is
+    /// not a loop.
     pub(crate) fn epoch_backfill_retry_is_paced(&self, seam: EpochBackfillExecutionSeam) -> bool {
         if matches!(seam, EpochBackfillExecutionSeam::ExplicitCatchUp) {
             return false;
