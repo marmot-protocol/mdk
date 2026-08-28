@@ -388,6 +388,14 @@ impl Marmot {
         Ok(self.runtime.publish_new_key_package(&account_ref).await? as u64)
     }
 
+    /// Rotate the account's KeyPackage: mint and publish a fresh one,
+    /// superseding the current slot. This is the sanctioned repair for an
+    /// epoch-stalled group. `publish_new_key_package` is the same
+    /// operation under its legacy name.
+    pub async fn rotate_key_package(&self, account_ref: String) -> Result<u64, MarmotKitError> {
+        Ok(self.runtime.rotate_key_package(&account_ref).await? as u64)
+    }
+
     /// Re-publish the latest cached KeyPackage when possible, otherwise
     /// publish a fresh one.
     pub async fn republish_key_package(&self, account_ref: String) -> Result<u64, MarmotKitError> {

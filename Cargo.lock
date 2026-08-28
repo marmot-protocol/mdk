@@ -3398,6 +3398,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "marmot-c"
+version = "0.9.15"
+dependencies = [
+ "libc",
+ "marmot-uniffi",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "marmot-forensics"
 version = "0.9.15"
 dependencies = [

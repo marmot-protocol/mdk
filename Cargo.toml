@@ -21,6 +21,7 @@ members = [
     "crates/marmot-account",
     "crates/marmot-app",
     "crates/marmot-uniffi",
+    "crates/marmot-c",
     "crates/cli",
     "integrations/terminal-harness",
     "integrations/codex/marmot",
@@ -136,6 +137,7 @@ marmot-forensics = { path = "crates/marmot-forensics" }
 marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
+marmot-c = { path = "crates/marmot-c" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
 wn-cli = { path = "crates/cli" }
 marmot-terminal-harness = { path = "integrations/terminal-harness" }
