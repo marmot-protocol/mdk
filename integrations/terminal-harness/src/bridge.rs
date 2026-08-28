@@ -762,6 +762,14 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 attachment_count = inbound.media.len(),
                 "failed to prepare inbound attachments"
             );
+            if retrying && let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "retry_recovery",
+                    error_kind = reset_err.privacy_safe_kind(),
+                    "failed to restore retryable recovery state"
+                );
+            }
             let _ = send_reply(
                 &ctx,
                 &inbound.account_ref,
@@ -3340,6 +3348,123 @@ mod tests {
         );
         assert!(ctx.sessions.get("group").await.is_none());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_attachment_download_failure_restores_pending_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut config = test_config(root.path());
+        let socket = root.path().join("retry-attachment.sock");
+        config.socket = socket.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                let (response, completed) = match request.payload {
+                    AgentControlRequest::DownloadMedia { .. } => (
+                        AgentControlResponse::Error {
+                            code: "download_failed".to_owned(),
+                            message: "unavailable".to_owned(),
+                        },
+                        false,
+                    ),
+                    AgentControlRequest::SendFinal { .. } => (
+                        AgentControlResponse::FinalSent {
+                            message_ids_hex: vec!["reply".to_owned()],
+                            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                        },
+                        true,
+                    ),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                write_frame(
+                    &mut write_half,
+                    &AgentControlEnvelope::request(request.id, response),
+                )
+                .await
+                .unwrap();
+                if completed {
+                    break;
+                }
+            }
+        });
+        let sessions = Arc::new(SessionStore::load(config.state_path.clone(), &home).unwrap());
+        let recovery = Arc::new(
+            RecoveryStore::load(config.state_path.with_extension("recovery.json")).unwrap(),
+        );
+        let deliveries = Arc::new(
+            FinalDeliveryStore::load(config.state_path.with_extension("delivery.json")).unwrap(),
+        );
+        let backend = Arc::new(RecordingBackend::default());
+        let ctx = Arc::new(BridgeContext {
+            client: ControlClient::new(
+                config.socket.clone(),
+                None,
+                Duration::from_secs(1),
+                "wn-test",
+            ),
+            cfg: Arc::new(config),
+            account_ref: "account".to_owned(),
+            sessions,
+            recovery: recovery.clone(),
+            deliveries,
+            reconciliation_slot: ReconciliationSlot::new(),
+            queues: Arc::new(GroupQueues::new(4)),
+            dedupe: Arc::new(InboundDedupe::new(8)),
+            backend: backend.clone(),
+            outbox: Arc::new(Mutex::new(
+                ArtifactOutbox::load(root.path().join("outbox.json")).unwrap(),
+            )),
+            home: home.clone(),
+        });
+        let media = AgentControlMediaRef {
+            media_type: "image/png".to_owned(),
+            file_name: "screen.png".to_owned(),
+            ciphertext_sha256: "cipher".to_owned(),
+            plaintext_sha256: "plain".to_owned(),
+            nonce_hex: "nonce".to_owned(),
+            version: "encrypted-media-v1".to_owned(),
+            source_epoch: 7,
+            locators: Vec::new(),
+            dim: None,
+            thumbhash: None,
+        };
+        recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    media: vec![media],
+                    cwd: repo,
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(dispatch_test_message(ctx, "retry", "/retry-last").await);
+        server.await.unwrap();
+        assert!(backend.invocations.lock().await.is_empty());
+        assert_eq!(
+            recovery.get("group").await.unwrap().status,
+            RecoveryStatus::Pending
+        );
+        assert!(
+            begin_validated_retry(&recovery, "group", &home)
+                .await
+                .unwrap()
+                .is_some(),
+            "attachment preparation failure must remain retryable"
+        );
     }
 
     #[tokio::test]
