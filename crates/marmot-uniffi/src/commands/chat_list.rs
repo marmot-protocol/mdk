@@ -794,6 +794,9 @@ mod tests {
             )
             .await
             .expect("create first direct conversation");
+        kit.publish_new_key_package(peer_ref.clone())
+            .await
+            .expect("publish fresh peer KeyPackage for duplicate conversation");
         let second = kit
             .create_group(
                 account_ref.clone(),

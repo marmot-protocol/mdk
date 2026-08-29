@@ -1,6 +1,6 @@
 //! `sync` command namespace handler and output helpers.
 
-use marmot_app::{MarmotApp, ReceivedMessage, SyncFailure, SyncSummary};
+use marmot_app::{MarmotApp, MarmotAppRuntime, ReceivedMessage, SyncFailure, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
@@ -18,6 +18,27 @@ pub(crate) async fn sync_command(
         Ok(summary) => summary,
         Err(failure) => return Err(sync_failure_error(app, account, failure)),
     };
+    sync_command_output(app, account, summary)
+}
+
+pub(crate) async fn sync_command_with_runtime(
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    account: marmot_account::AccountSummary,
+) -> Result<CommandOutput, WnError> {
+    app.status(&account.label)?;
+    let summary = match runtime.sync_with_partial_progress(&account.label).await {
+        Ok(summary) => summary,
+        Err(failure) => return Err(sync_failure_error(app, account, failure)),
+    };
+    sync_command_output(app, account, summary)
+}
+
+fn sync_command_output(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+    summary: SyncSummary,
+) -> Result<CommandOutput, WnError> {
     Ok(CommandOutput {
         plain: sync_plain(&summary),
         json: sync_json(app, account, summary)?,

@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-08-24
+updated: 2026-08-29
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -154,13 +154,26 @@ messages, emit application-visible group events, model losing-branch invalidatio
 variants.
 
 Generated-account creation now has an explicit durable local-ready entry point. The identity, default profile, setup
-journal, stable KeyPackage slot, private KeyPackage material, and exact signed initial publication are persisted before
-that entry point returns. Bootstrap/profile/KeyPackage publication then continues as restart-resumable background work;
-the compatibility `create_identity` entry point still waits for `NetworkReady`. Hosts using the local-ready entry point
+journal, stable KeyPackage slot, private KeyPackage material, and exact signed initial publication revision are
+persisted before that entry point returns. Bootstrap/profile/KeyPackage publication then continues as
+restart-resumable background work. A transport with a bounded event-timestamp window may durably re-author that same
+replaceable KeyPackage coordinate before retrying a stale revision; the private KeyPackage and stable slot do not
+change, and the newer signed revision is persisted before network exposure. Possible exposure is journaled before
+network I/O, and superseded exact event ids retain bounded per-relay deletion obligations until a kind-5 acknowledgement
+or an exact recognized relay target-absence response clears each endpoint. Live endpoints are cleaned only after acknowledging a strictly
+newer revision; expiry, consumption, and policy removal make cleanup immediately eligible. The compatibility `create_identity` entry
+point still waits for `NetworkReady`. Hosts using the local-ready entry point
 must honor `AccountSetupReadiness`: `LocalReady` is sufficient for local reads and profile rendering, while only
 `NetworkReady` means the account may be presented as invite-receivable. `Initializing` means local setup has not yet
 reached durable local readiness. `Publishing` includes bounded in-session retry and restart-resumable publication, and
 `RecoveryRequired` requires an explicit recovery flow.
+
+Destructive removal of a locally signing account persists an immutable private tombstone for its stable KeyPackage slot
+before deleting the account home. Directory reads, cache writes, relay ingestion, and final publication all reject a
+tombstoned slot; shared and per-account projections are scrubbed immediately and reconciled again during warmup after a
+crash. Re-importing the identity creates a new stable slot, while legacy account state that cannot prove its old slot is
+covered by a fail-closed account-wide marker that admits only a different slot proven by the active local signing
+lifecycle.
 
 ## Known gaps
 

@@ -1176,7 +1176,8 @@ impl TuiApp {
     }
 
     /// Log out (permanently remove) an account via `wn logout <pubkey>`, then
-    /// reload accounts and chats. `wn logout` is destructive: it removes the
+    /// reload accounts and chats. `wn logout` is destructive: the owning runtime
+    /// quiesces the account and attempts relay cleanup before removing the
     /// account's local data and signing key from this device. Because the
     /// selected account is usually its own target, it is gone from `account list`
     /// afterward, so this reuses the `/refresh` helper to reload accounts + chats

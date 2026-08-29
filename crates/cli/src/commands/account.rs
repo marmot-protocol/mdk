@@ -4,7 +4,7 @@ use cgka_traits::TransportEndpoint;
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListStatus, AccountSetupRequest, AccountSetupResult, AppError, AppStatus,
-    MarmotApp, MissingRelayListKind,
+    MarmotApp, MarmotAppRuntime, MissingRelayListKind,
 };
 use serde_json::{Value, json};
 
@@ -122,18 +122,58 @@ pub(crate) fn whoami_command(
     })
 }
 
-pub(crate) fn logout_command(
-    account_home: &AccountHome,
+pub(crate) async fn logout_command(
+    app: &MarmotApp,
+    pubkey: String,
+) -> Result<CommandOutput, WnError> {
+    logout_command_with_runtime(&app.runtime(), pubkey).await
+}
+
+pub(crate) async fn logout_command_with_runtime(
+    runtime: &MarmotAppRuntime,
     pubkey: String,
 ) -> Result<CommandOutput, WnError> {
     let account_id = parse_public_key(&pubkey)?;
-    account_home.remove_account(&account_id)?;
+    let accounts = runtime.accounts();
+    let account = accounts.resolve(&account_id)?;
+    let outcome = if account.can_sign() {
+        runtime.sign_out_and_wipe(&account_id).await?
+    } else {
+        // A tracked-only npub has no signer, so it could never join an MLS
+        // group or publish a KeyPackage from this device. There are no remote
+        // privacy obligations to abandon, but removal must still run through
+        // the owning runtime's teardown serialization rather than mutating
+        // AccountHome beside a live worker.
+        accounts.remove_account(&account_id).await?;
+        let mut outcome = marmot_app::WipeOutcome::default();
+        outcome.local_cleanup.completed = true;
+        outcome
+    };
+    if !outcome.local_cleanup.completed {
+        let reason = outcome
+            .local_cleanup
+            .reason
+            .clone()
+            .unwrap_or_else(|| "local cleanup did not complete".to_owned());
+        return Err(WnError::LogoutIncomplete {
+            reason,
+            outcome: Box::new(outcome),
+        });
+    }
+    let npub = npub_for_account_id(&account_id)?;
     Ok(CommandOutput {
-        plain: format!("logged out {}", npub_for_account_id(&account_id)?),
+        plain: format!(
+            "logged out {npub} groups-left={} key-packages-deleted={} group-leave-failures={} key-package-failures={}",
+            outcome.groups_left,
+            outcome.key_packages_deleted,
+            outcome.group_leave_failures.len(),
+            outcome.key_package_failures.len(),
+        ),
         json: json!({
             "account_id": account_id,
-            "npub": npub_for_account_id(&account_id)?,
+            "npub": npub,
             "logged_out": true,
+            "cleanup": outcome,
         }),
     })
 }

@@ -201,7 +201,7 @@ pub(crate) async fn key_package_command_with_runtime(
                 return Err(WnError::ConfirmationRequired {
                     command: "keys delete-all",
                     flag: "--confirm",
-                    reason: "pass --confirm to publish deletion events for every relay-published KeyPackage",
+                    reason: "pass --confirm to publish deletion events for every known KeyPackage revision",
                 });
             }
             let account = resolve_account(account_home, account_flag)?;
@@ -214,7 +214,15 @@ pub(crate) async fn key_package_command_with_runtime(
             let mut failed = Vec::new();
             let mut seen_event_ids = HashSet::new();
             let mut accepted_relays = 0_usize;
-            for record in records.into_iter().filter(|record| record.relay) {
+            // `relay` means this exact event was re-fetched, not that a local
+            // publish was acknowledged. A possibly exposed authored revision
+            // can therefore be `relay: false` and still require explicit
+            // deletion. The durable event id and endpoint journal are the
+            // cleanup authority.
+            for record in records
+                .into_iter()
+                .filter(|record| !record.key_package_event_id.is_empty())
+            {
                 if !seen_event_ids.insert(record.key_package_event_id.clone()) {
                     continue;
                 }

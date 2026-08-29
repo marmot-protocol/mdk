@@ -92,18 +92,18 @@ pub(crate) struct StreamComposeSession {
 pub(crate) async fn start_stream_watch(
     cli: Cli,
     defaults: &DaemonDefaults,
-    runtime: Option<&marmot_app::MarmotAppRuntime>,
+    owner: Option<&OwnedAppRuntime>,
     workers: &StreamWatchWorkers,
 ) -> CliOutput {
     let json = cli.json;
-    let Some(runtime) = runtime else {
+    let Some(owner) = owner else {
         return daemon_error(
             json,
             "stream_watch_failed",
             "app runtime is not running".to_owned(),
         );
     };
-    let stream_manager = runtime.shared_services().agent_streams();
+    let stream_manager = owner.runtime.shared_services().agent_streams();
     let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
         Ok(secret_store) => secret_store,
         Err(err) => return daemon_error(json, "stream_watch_failed", err.to_string()),
@@ -114,20 +114,16 @@ pub(crate) async fn start_stream_watch(
             Ok(account_home) => account_home,
             Err(err) => return daemon_error(json, "stream_watch_failed", err.to_string()),
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
+    let (report, handle) = match spawn_stream_watch(
+        cli,
+        account_home,
+        owner.app.clone(),
+        owner.runtime.clone(),
+        stream_manager,
     ) {
-        Ok(app) => app,
-        Err(err) => return crate::command_output_result(json, Err(err)),
+        Ok(spawned) => spawned,
+        Err(message) => return daemon_error(json, "stream_watch_failed", message),
     };
-    let (report, handle) =
-        match spawn_stream_watch(cli, account_home, app, runtime.clone(), stream_manager) {
-            Ok(spawned) => spawned,
-            Err(message) => return daemon_error(json, "stream_watch_failed", message),
-        };
     let watch_id = report.watch_id.clone();
     workers.replace(watch_id, handle);
 
@@ -169,6 +165,7 @@ pub(crate) fn spawn_stream_watch(
                 &runtime,
                 command,
                 account_flag,
+                crate::commands::stream::StreamRootLifetime::Retain,
                 move |delta| {
                     worker_stream_manager.record_delta(delta.clone());
                 },
@@ -439,7 +436,7 @@ pub(crate) async fn open_stream_compose(
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
     let (crypto, policy_max_plaintext_frame_len) = {
-        let Some(runtime) = runtime_host.runtime.as_ref() else {
+        let Some(owner) = runtime_host.owner.as_ref() else {
             return daemon_error(
                 cli.json,
                 "stream_compose_failed",
@@ -447,7 +444,7 @@ pub(crate) async fn open_stream_compose(
             );
         };
         match crate::commands::stream::stream_crypto_for_start_event(
-            runtime,
+            &owner.runtime,
             Some(&start_account_id),
             Some(group_id.as_str()),
             Some(stream_id.as_str()),

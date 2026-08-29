@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_event::{
@@ -40,6 +40,8 @@ pub(crate) use secret::ImportNsec;
 pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+const STREAM_ROOT_HANDOFF_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+const STREAM_ROOT_HANDOFF_BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
@@ -394,7 +396,23 @@ fn is_notifications_subscribe(cli: &Cli) -> bool {
 }
 
 pub(crate) async fn run_cli_local(cli: Cli, import_nsec: Option<ImportNsec>) -> CliOutput {
-    match execute(cli, import_nsec).await {
+    match execute(cli, import_nsec, AppRoot::Exclusive).await {
+        Ok((json_output, output)) => command_output_result(json_output, Ok(output)),
+        Err((json_output, err)) => command_output_result(json_output, Err(err)),
+    }
+}
+
+/// Execute inside a daemon that already owns this Marmot root exclusively.
+///
+/// `app` must be a clone of the exact application graph from which the daemon
+/// runtime was derived. Independently scheduled foreground clients must use
+/// [`run_cli_local`] instead.
+pub(crate) async fn run_cli_root_coordinated(
+    cli: Cli,
+    import_nsec: Option<ImportNsec>,
+    app: MarmotApp,
+) -> CliOutput {
+    match execute(cli, import_nsec, AppRoot::Coordinated(app)).await {
         Ok((json_output, output)) => command_output_result(json_output, Ok(output)),
         Err((json_output, err)) => command_output_result(json_output, Err(err)),
     }
@@ -445,17 +463,41 @@ pub(crate) fn command_output_result(
 async fn execute(
     cli: Cli,
     import_nsec: Option<ImportNsec>,
+    root: AppRoot,
 ) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
-    execute_inner(cli, import_nsec)
+    execute_inner(cli, import_nsec, root)
         .await
         .map(|output| (json_output, output))
         .map_err(|err| (json_output, err))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppRootOwnership {
+    /// Independently scheduled foreground process: acquire the root lease.
+    Exclusive,
+    /// Daemon-internal helper: the caller retains the daemon runtime lease.
+    Coordinated,
+}
+
+enum AppRoot {
+    Exclusive,
+    Coordinated(MarmotApp),
+}
+
+impl AppRoot {
+    const fn ownership(&self) -> AppRootOwnership {
+        match self {
+            Self::Exclusive => AppRootOwnership::Exclusive,
+            Self::Coordinated(_) => AppRootOwnership::Coordinated,
+        }
+    }
+}
+
 async fn execute_inner(
     cli: Cli,
     mut import_nsec: Option<ImportNsec>,
+    root: AppRoot,
 ) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
@@ -475,6 +517,13 @@ async fn execute_inner(
     {
         return commands::stream::stream_command_local(stream_command.clone()).await;
     }
+    if let Command::Reset { confirm } = &command {
+        // Reset has its own explicit destructive confirmation and predates the
+        // Marmot root lease. Keep it out of app construction: deleting a root
+        // while holding its stable lock-file inode would violate the lease
+        // contract. A live daemon is refused earlier by the socket path.
+        return reset_command(&home, *confirm);
+    }
     let secret_store = resolve_secret_store(cli.secret_store)?;
     let keychain_service = resolve_keychain_service(cli.keychain_service);
     let runtime_info = CliRuntimeInfo {
@@ -487,15 +536,27 @@ async fn execute_inner(
         _ => cli.relay.clone(),
     };
     let relay = resolve_relay(command_relay)?;
-    let app = app_for(
-        home.clone(),
-        relay
-            .clone()
-            .or_else(|| cli.daemon_discovery_relays.first().cloned())
-            .or_else(|| cli.daemon_default_account_relays.first().cloned()),
-        cli.daemon_discovery_relays.clone(),
-        account_home.clone(),
-    )?;
+    let app_relay = relay
+        .clone()
+        .or_else(|| cli.daemon_discovery_relays.first().cloned())
+        .or_else(|| cli.daemon_default_account_relays.first().cloned());
+    let stream_root_lifetime = match &command {
+        Command::Stream { command } => stream_root_lifetime(command, root.ownership()),
+        _ => commands::stream::StreamRootLifetime::Retain,
+    };
+    let app = match root {
+        AppRoot::Exclusive => {
+            exclusive_app_for_with_stream_handoff_retry(
+                home.clone(),
+                app_relay,
+                cli.daemon_discovery_relays.clone(),
+                account_home.clone(),
+                stream_root_lifetime,
+            )
+            .await?
+        }
+        AppRoot::Coordinated(app) => app,
+    };
     match command {
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
@@ -530,7 +591,7 @@ async fn execute_inner(
         Command::Whoami => {
             commands::account::whoami_command(&account_home, &app, runtime_info, account_flag)
         }
-        Command::Logout { pubkey } => commands::account::logout_command(&account_home, pubkey),
+        Command::Logout { pubkey } => commands::account::logout_command(&app, pubkey).await,
         Command::ExportNsec { pubkey } => commands::account::export_nsec_command(pubkey),
         Command::Account { command } => {
             commands::account::account_command(
@@ -598,7 +659,14 @@ async fn execute_inner(
             commands::notifications::notifications_command(command)
         }
         Command::Stream { command } => {
-            commands::stream::stream_command_app(&account_home, &app, command, account_flag).await
+            commands::stream::stream_command_app(
+                &account_home,
+                &app,
+                command,
+                account_flag,
+                stream_root_lifetime,
+            )
+            .await
         }
         Command::Daemon { .. } => Ok(CommandOutput {
             plain: "daemon command is handled by wn".to_owned(),
@@ -614,7 +682,29 @@ async fn execute_inner(
             commands::sync::sync_command(&app, account).await
         }
         Command::RelayStats => commands::relay_stats::relay_stats_command(&app).await,
-        Command::Reset { confirm } => reset_command(&home, confirm),
+        Command::Reset { .. } => unreachable!("reset returns before app construction"),
+    }
+}
+
+fn stream_root_lifetime(
+    command: &StreamCommand,
+    root_ownership: AppRootOwnership,
+) -> commands::stream::StreamRootLifetime {
+    if root_ownership == AppRootOwnership::Exclusive
+        && matches!(
+            command,
+            StreamCommand::Watch {
+                background: false,
+                ..
+            } | StreamCommand::Send {
+                start_event_id: Some(_),
+                ..
+            }
+        )
+    {
+        commands::stream::StreamRootLifetime::ReleaseBeforeNetwork
+    } else {
+        commands::stream::StreamRootLifetime::Retain
     }
 }
 
@@ -627,9 +717,6 @@ fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
 
     let socket = daemon_socket_path_for_client(cli, home);
     let explicit_daemon_socket = cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
-    if matches!(cli.command, Command::Logout { .. }) && !explicit_daemon_socket {
-        return None;
-    }
     if explicit_daemon_socket || socket.exists() {
         Some(socket)
     } else {
@@ -1111,12 +1198,55 @@ pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
     })
 }
 
-fn app_for(
+fn exclusive_app_for(
     home: PathBuf,
     relay: Option<String>,
     directory_relays: Vec<String>,
     account_home: AccountHome,
 ) -> Result<MarmotApp, WnError> {
+    MarmotApp::try_with_relays_and_account_home_and_config(
+        home,
+        relay.into_iter().collect(),
+        account_home,
+        app_config(directory_relays)?,
+    )
+    .map_err(|error| match error {
+        AppError::RuntimeBusy => WnError::RuntimeBusy,
+        error => error.into(),
+    })
+}
+
+async fn exclusive_app_for_with_stream_handoff_retry(
+    home: PathBuf,
+    relay: Option<String>,
+    directory_relays: Vec<String>,
+    account_home: AccountHome,
+    root_lifetime: commands::stream::StreamRootLifetime,
+) -> Result<MarmotApp, WnError> {
+    let deadline = Instant::now() + STREAM_ROOT_HANDOFF_BUSY_RETRY_TIMEOUT;
+    loop {
+        match exclusive_app_for(
+            home.clone(),
+            relay.clone(),
+            directory_relays.clone(),
+            account_home.clone(),
+        ) {
+            Err(WnError::RuntimeBusy)
+                if root_lifetime == commands::stream::StreamRootLifetime::ReleaseBeforeNetwork
+                    && Instant::now() < deadline =>
+            {
+                // Complementary standalone stream processes may start in either
+                // scheduler order. Both terminally hand off the root after
+                // deriving crypto, so a bounded retry lets the losing process
+                // acquire that released lease without weakening exclusivity.
+                tokio::time::sleep(STREAM_ROOT_HANDOFF_BUSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn app_config(directory_relays: Vec<String>) -> Result<MarmotAppConfig, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
@@ -1130,12 +1260,7 @@ fn app_for(
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
-    Ok(MarmotApp::with_relays_and_account_home_and_config(
-        home,
-        relay.into_iter().collect(),
-        account_home,
-        config,
-    ))
+    Ok(config)
 }
 
 fn wn_allow_loopback_blob_endpoints() -> bool {
@@ -1319,13 +1444,14 @@ mod tests {
     };
     use super::commands::relay_stats::{relay_stats_output, relay_stats_plain};
     use super::commands::stream::{
-        broker_trust_for_candidate, first_quic_candidate_is_loopback, parse_quic_candidate,
-        quic_candidate_host, resolve_quic_candidate_addr,
+        StreamRootLifetime, broker_trust_for_candidate, first_quic_candidate_is_loopback,
+        handoff_stream_root_before_network, parse_quic_candidate, quic_candidate_host,
+        resolve_quic_candidate_addr,
     };
     use super::{
-        Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
+        AppRootOwnership, Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
         default_home_from_env, insert_chat_projection, npub_for_account_id, relay_endpoints,
-        resolve_dev_settlement_quiescence_ms, resolve_relay, run_from,
+        resolve_dev_settlement_quiescence_ms, resolve_relay, run_from, stream_root_lifetime,
     };
 
     use serde_json::json;
@@ -1547,6 +1673,157 @@ mod tests {
     }
 
     #[test]
+    fn only_exclusive_peer_stream_commands_release_root_before_network() {
+        let foreground = StreamCommand::Watch {
+            group: "aa".repeat(32),
+            stream_id: None,
+            server_cert_der_hex: None,
+            insecure_local: true,
+            background: false,
+        };
+        assert_eq!(
+            stream_root_lifetime(&foreground, AppRootOwnership::Exclusive),
+            StreamRootLifetime::ReleaseBeforeNetwork
+        );
+        assert_eq!(
+            stream_root_lifetime(&foreground, AppRootOwnership::Coordinated),
+            StreamRootLifetime::Retain
+        );
+
+        let background = StreamCommand::Watch {
+            group: "aa".repeat(32),
+            stream_id: None,
+            server_cert_der_hex: None,
+            insecure_local: true,
+            background: true,
+        };
+        assert_eq!(
+            stream_root_lifetime(&background, AppRootOwnership::Exclusive),
+            StreamRootLifetime::Retain
+        );
+
+        let anchored_send = StreamCommand::Send {
+            broker: true,
+            connect: loopback_stream_addr(),
+            server_name: "localhost".to_owned(),
+            server_cert_der_hex: None,
+            insecure_local: true,
+            stream_id: None,
+            start_event_id: Some("bb".repeat(32)),
+            chunk_bytes: 1024,
+            chunk_delay_ms: 0,
+            text: vec!["hello".to_owned()],
+        };
+        assert_eq!(
+            stream_root_lifetime(&anchored_send, AppRootOwnership::Exclusive),
+            StreamRootLifetime::ReleaseBeforeNetwork
+        );
+        assert_eq!(
+            stream_root_lifetime(&anchored_send, AppRootOwnership::Coordinated),
+            StreamRootLifetime::Retain
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_stream_handoff_closes_storage_and_transfers_root_ownership() {
+        let released_root = tempfile::tempdir().expect("released root");
+        let released_app = super::exclusive_app_for(
+            released_root.path().to_path_buf(),
+            None,
+            Vec::new(),
+            marmot_account::AccountHome::open(released_root.path()),
+        )
+        .expect("foreground watch owns root while deriving crypto");
+        let released_runtime = released_app.runtime();
+        assert!(matches!(
+            marmot_app::MarmotRootRuntimeLease::try_acquire(released_root.path()),
+            Err(marmot_app::AppError::RuntimeBusy)
+        ));
+
+        handoff_stream_root_before_network(
+            &released_runtime,
+            StreamRootLifetime::ReleaseBeforeNetwork,
+        )
+        .await
+        .expect("foreground watch root handoff");
+
+        assert!(released_runtime.storage_is_closed());
+        drop(
+            marmot_app::MarmotRootRuntimeLease::try_acquire(released_root.path())
+                .expect("anchored sender can own root during the network-only watch"),
+        );
+
+        let retained_root = tempfile::tempdir().expect("retained root");
+        let retained_app = super::exclusive_app_for(
+            retained_root.path().to_path_buf(),
+            None,
+            Vec::new(),
+            marmot_account::AccountHome::open(retained_root.path()),
+        )
+        .expect("daemon watch owner");
+        let retained_runtime = retained_app.runtime();
+        handoff_stream_root_before_network(&retained_runtime, StreamRootLifetime::Retain)
+            .await
+            .expect("daemon watch keeps root");
+        assert!(!retained_runtime.storage_is_closed());
+        assert!(matches!(
+            marmot_app::MarmotRootRuntimeLease::try_acquire(retained_root.path()),
+            Err(marmot_app::AppError::RuntimeBusy)
+        ));
+        retained_runtime
+            .shutdown_and_close()
+            .await
+            .expect("test cleanup releases retained root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complementary_stream_process_retries_until_peer_hands_off_root() {
+        let root = tempfile::tempdir().expect("stream root");
+        let owner = super::exclusive_app_for(
+            root.path().to_path_buf(),
+            None,
+            Vec::new(),
+            marmot_account::AccountHome::open(root.path()),
+        )
+        .expect("first stream process owns root");
+
+        let retained = super::exclusive_app_for_with_stream_handoff_retry(
+            root.path().to_path_buf(),
+            None,
+            Vec::new(),
+            marmot_account::AccountHome::open(root.path()),
+            StreamRootLifetime::Retain,
+        )
+        .await;
+        assert!(matches!(retained, Err(WnError::RuntimeBusy)));
+
+        let owner_runtime = owner.runtime();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            owner_runtime
+                .shutdown_and_close()
+                .await
+                .expect("first stream process hands off root");
+        });
+        let next = super::exclusive_app_for_with_stream_handoff_retry(
+            root.path().to_path_buf(),
+            None,
+            Vec::new(),
+            marmot_account::AccountHome::open(root.path()),
+            StreamRootLifetime::ReleaseBeforeNetwork,
+        )
+        .await
+        .expect("complementary stream process acquires handed-off root");
+        release.await.expect("handoff task");
+        next.runtime()
+            .shutdown_and_close()
+            .await
+            .expect("test cleanup releases next root owner");
+    }
+
+    #[test]
     fn daemon_execute_socket_skips_stream_commands_that_must_run_in_client() {
         let home = Path::new("/tmp/wn-home");
         let commands = [
@@ -1582,10 +1859,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_execute_socket_skips_implicit_logout() {
+    fn daemon_execute_socket_routes_implicit_logout_to_live_daemon_owner() {
         // WN_SOCKET makes the socket selection explicit; this regression covers
-        // the auto-discovered daemon socket path that previously forwarded
-        // `wn logout` even though the user did not pass `--socket`.
+        // the auto-discovered daemon path. Logout must reach the daemon-owned
+        // runtime instead of silently opening a second root writer beside it.
         if std::env::var_os("WN_SOCKET").is_some() {
             return;
         }
@@ -1601,7 +1878,10 @@ mod tests {
         });
         cli.socket = None;
 
-        assert_eq!(daemon_socket_for_client(&cli, home.path()), None);
+        assert_eq!(
+            daemon_socket_for_client(&cli, home.path()).as_deref(),
+            Some(socket.as_path())
+        );
     }
 
     #[test]
@@ -1615,6 +1895,62 @@ mod tests {
         assert_eq!(
             daemon_socket_for_client(&cli, home).as_deref(),
             Some(socket)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_logout_refuses_a_live_root_owner_then_fails_closed_without_relay_proof() {
+        let home = tempfile::tempdir().expect("temp home");
+        let account_home = marmot_account::AccountHome::open(home.path());
+        let account = account_home
+            .create_nostr_account()
+            .expect("create local account");
+        let owner = super::exclusive_app_for(
+            home.path().to_path_buf(),
+            None,
+            Vec::new(),
+            marmot_account::AccountHome::open(home.path()),
+        )
+        .expect("first runtime owns root");
+
+        let logout_cli = || {
+            let mut cli = test_cli(Command::Logout {
+                pubkey: account.account_id_hex.clone(),
+            });
+            cli.home = Some(home.path().to_path_buf());
+            cli.socket = None;
+            cli.secret_store = Some(super::SecretStoreKind::File);
+            cli
+        };
+
+        let blocked = super::run_cli_local(logout_cli(), None).await;
+        assert_eq!(blocked.code, 1);
+        let blocked_json: serde_json::Value =
+            serde_json::from_str(blocked.stdout.trim()).expect("busy error JSON");
+        assert_eq!(blocked_json["error"]["code"], "runtime_busy");
+        assert!(
+            account_home.account(&account.account_id_hex).is_ok(),
+            "a rejected second writer must leave the account intact"
+        );
+
+        drop(owner);
+        let wiped = super::run_cli_local(logout_cli(), None).await;
+        assert_eq!(
+            wiped.code, 1,
+            "logout must reach fail-closed teardown after owner exit: {wiped:?}"
+        );
+        let wiped_json: serde_json::Value =
+            serde_json::from_str(wiped.stdout.trim()).expect("logout JSON");
+        assert_eq!(wiped_json["error"]["code"], "logout_incomplete");
+        assert_eq!(
+            wiped_json["error"]["cleanup"]["local_cleanup"]["completed"],
+            false
+        );
+        assert_eq!(wiped_json["error"]["safe_to_retry"], true);
+        assert!(
+            account_home.account(&account.account_id_hex).is_ok(),
+            "failed relay-history proof must retain local recovery state"
         );
     }
 

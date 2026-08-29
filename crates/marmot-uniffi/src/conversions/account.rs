@@ -401,4 +401,20 @@ mod tests {
             SendAcceptDispositionFfi::CompletionUnknown
         ));
     }
+
+    #[test]
+    fn transport_deactivation_failure_is_privacy_safe_across_ffi() {
+        let sentinel = "wss://private-relay.invalid/account-token-sentinel";
+        let app_failure = GroupLeaveFailure::from_transport_deactivation_error(
+            cgka_traits::TransportAdapterError::Subscription(sentinel.to_owned()),
+        );
+
+        let ffi = GroupLeaveFailureFfi::from(app_failure);
+
+        assert_eq!(
+            ffi.reason,
+            "quiesced group-leave transport deactivation failed: transport error"
+        );
+        assert!(!ffi.reason.contains(sentinel));
+    }
 }

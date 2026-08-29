@@ -18,7 +18,7 @@ use transport_quic_broker::{
 };
 use transport_quic_stream::{
     AgentTextStreamReceiveLimits, QuicTextStreamReceiver, SendTextStream, ServerTrust,
-    send_text_stream,
+    prepare_text_stream_crypto_for_network_handoff, send_text_stream,
 };
 
 use crate::{
@@ -28,6 +28,28 @@ use crate::{
 };
 
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamRootLifetime {
+    /// A daemon-owned stream command shares the already-exclusive runtime with
+    /// every other command and must not terminally close it.
+    Retain,
+    /// A standalone foreground watch or anchored send needs the root only
+    /// while it resolves the durable start and derives its MLS-bound crypto.
+    /// Release every root lock before network I/O so its peer can derive the
+    /// complementary state without overlapping hydrated runtimes.
+    ReleaseBeforeNetwork,
+}
+
+pub(crate) async fn handoff_stream_root_before_network(
+    runtime: &MarmotAppRuntime,
+    root_lifetime: StreamRootLifetime,
+) -> Result<(), WnError> {
+    if root_lifetime == StreamRootLifetime::ReleaseBeforeNetwork {
+        runtime.shutdown_and_close().await?;
+    }
+    Ok(())
+}
 
 pub(crate) async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, WnError> {
     match command {
@@ -174,9 +196,18 @@ pub(crate) async fn stream_command_app(
     app: &MarmotApp,
     command: StreamCommand,
     account_flag: Option<String>,
+    root_lifetime: StreamRootLifetime,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
-    stream_command_app_with_runtime(account_home, app, &runtime, command, account_flag).await
+    stream_command_app_with_runtime_and_lifetime(
+        account_home,
+        app,
+        &runtime,
+        command,
+        account_flag,
+        root_lifetime,
+    )
+    .await
 }
 
 pub(crate) async fn stream_command_app_with_runtime(
@@ -185,6 +216,25 @@ pub(crate) async fn stream_command_app_with_runtime(
     runtime: &MarmotAppRuntime,
     command: StreamCommand,
     account_flag: Option<String>,
+) -> Result<CommandOutput, WnError> {
+    stream_command_app_with_runtime_and_lifetime(
+        account_home,
+        app,
+        runtime,
+        command,
+        account_flag,
+        StreamRootLifetime::Retain,
+    )
+    .await
+}
+
+async fn stream_command_app_with_runtime_and_lifetime(
+    account_home: &AccountHome,
+    app: &MarmotApp,
+    runtime: &MarmotAppRuntime,
+    command: StreamCommand,
+    account_flag: Option<String>,
+    root_lifetime: StreamRootLifetime,
 ) -> Result<CommandOutput, WnError> {
     match command {
         StreamCommand::Start {
@@ -248,6 +298,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                     background,
                 },
                 account_flag,
+                root_lifetime,
                 |_| {},
             )
             .await
@@ -290,6 +341,23 @@ pub(crate) async fn stream_command_app_with_runtime(
             let start_event_id = MessageId::new(hex::decode(normalize_hex(&start_event_id_hex)?)?);
             if broker {
                 let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
+                let crypto = prepare_sender_crypto_for_root_handoff(
+                    crypto,
+                    &stream_id,
+                    &start_event_id,
+                    &text,
+                    chunk_bytes,
+                    policy_max_plaintext_frame_len,
+                    root_lifetime,
+                )?;
+                // The exporter secret and all authenticated stream coordinates
+                // are now in memory, and its exact publisher sequence range is
+                // durably consumed behind a one-shot detached capability. A
+                // standalone sender must release its exclusive root before the
+                // broker waits for the complementary subscriber, or a
+                // sender-first schedule blocks the watcher from deriving its
+                // receiver state.
+                handoff_stream_root_before_network(runtime, root_lifetime).await?;
                 let sent = publish_text_to_broker(PublishTextToBroker {
                     broker_addr: connect,
                     server_name: server_name.clone(),
@@ -323,6 +391,16 @@ pub(crate) async fn stream_command_app_with_runtime(
                 });
             }
             let trust = stream_trust(connect, server_cert_der_hex, insecure_local)?;
+            let crypto = prepare_sender_crypto_for_root_handoff(
+                crypto,
+                &stream_id,
+                &start_event_id,
+                &text,
+                chunk_bytes,
+                policy_max_plaintext_frame_len,
+                root_lifetime,
+            )?;
+            handoff_stream_root_before_network(runtime, root_lifetime).await?;
             let sent = send_text_stream(SendTextStream {
                 server_addr: connect,
                 server_name: server_name.clone(),
@@ -483,12 +561,35 @@ pub(crate) async fn stream_command_app_with_runtime(
     }
 }
 
+fn prepare_sender_crypto_for_root_handoff(
+    crypto: transport_quic_stream::AgentTextStreamCrypto,
+    stream_id: &[u8],
+    start_event_id: &MessageId,
+    text: &str,
+    max_chunk_bytes: usize,
+    max_plaintext_frame_len: Option<u32>,
+    root_lifetime: StreamRootLifetime,
+) -> Result<transport_quic_stream::AgentTextStreamCrypto, WnError> {
+    if root_lifetime == StreamRootLifetime::Retain {
+        return Ok(crypto);
+    }
+    Ok(prepare_text_stream_crypto_for_network_handoff(
+        crypto,
+        stream_id,
+        start_event_id,
+        text,
+        max_chunk_bytes,
+        max_plaintext_frame_len,
+    )?)
+}
+
 pub(crate) async fn stream_watch_command_app_with_runtime<F>(
     account_home: &AccountHome,
     app: &MarmotApp,
     runtime: &MarmotAppRuntime,
     command: StreamCommand,
     account_flag: Option<String>,
+    root_lifetime: StreamRootLifetime,
     mut on_delta: F,
 ) -> Result<CommandOutput, WnError>
 where
@@ -548,6 +649,11 @@ where
     let delta_stream_id = stream_id_hex.clone();
     let mut receiver_state =
         BrokerTextReceiverState::new(stream_id.clone(), start_event_id.clone(), limits);
+    // Everything below is QUIC-only and uses the captured start metadata,
+    // receiver state, and in-memory exporter secret. An exclusive foreground
+    // watch terminally closes its old runtime here so it cannot reopen SQLite,
+    // then releases the root lease before DNS or the unbounded broker receive.
+    handoff_stream_root_before_network(runtime, root_lifetime).await?;
     let mut last_error = None;
     let mut selected = None;
     let mut received = None;

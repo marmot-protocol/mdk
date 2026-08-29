@@ -9,6 +9,23 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Legacy `wn account create` stays a compatibility/repair surface and does not
+  force initial KeyPackage publication. `wn create-identity` and `wn login`
+  still publish the initial KeyPackage.
+- `wnd` now owns the Marmot data root exclusively and executes `wn logout`
+  through that owned runtime. With no daemon, the foreground CLI acquires the
+  same exclusive lease. Logout uses the runtime wipe path to quiesce account
+  work, attempt group and per-relay KeyPackage cleanup, and only then remove
+  local state; its JSON result reports every best-effort failure separately.
+- Account storage advances to schema 58 as a compatibility fence for the new
+  KeyPackage deletion and multi-consumption journals (upstream occupied schema
+  52-55; privacy/visibility/epoch-intent-journal migrations are 56-58). Older
+  schema-51 builds refuse an upgraded database instead of silently dropping
+  privacy obligations from lifecycle JSON; back up or export account data
+  before upgrading if rollback to 0.9.15 may be required.
+
 ### Fixed
 
 - Multi-relay full-history recovery now requires end-of-stored-events from
@@ -16,6 +33,22 @@ versioning through the workspace version in the root `Cargo.toml`.
   relay or repeated unavailability can no longer falsely complete replay and
   clear its durable recovery intent.
   ([#1578](https://github.com/marmot-protocol/mdk/issues/1578))
+- Standalone foreground `stream watch` and anchored `stream send` now release
+  their exclusive Marmot root after deriving MLS-bound stream state and before
+  QUIC network I/O. Anchored sends durably consume their exact bounded sequence
+  range first, then use a one-shot detached capability so closing SQLCipher
+  cannot reuse a nonce or strand the send. Either process may start first
+  without blocking its peer's state derivation, while daemon-owned commands
+  retain their coordinated root owner.
+- KeyPackage publication now reauthors stale signed revisions at the same
+  replaceable-event coordinate before retrying bounded-timestamp relays, while
+  preserving the MLS KeyPackage and durable private material. Superseded exact
+  revisions retain bounded, restart-safe per-relay deletion obligations, and
+  account sign-out now remains quiesced through relay deletion even when its
+  caller is cancelled.
+- `keys delete-all` now includes every durable local KeyPackage revision with
+  a known event id, even when that exact event cannot be re-fetched from a
+  relay. The `relay` inventory flag means “re-fetched,” not “was published.”
 
 ## [0.9.15] - 2026-08-25
 
