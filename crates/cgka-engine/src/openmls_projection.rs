@@ -1762,6 +1762,23 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     contexts.map(CandidateBranchPeel::contested_over)
 }
 
+/// Whether this group's stored commit graph is contested: two retained commits
+/// at or above the retained anchor fork from the same source epoch.
+///
+/// The replay-free half of [`candidate_branch_peel`], and deliberately the
+/// same predicate over the same seeded inputs — a second, privately restated
+/// notion of "forked" would drift from the one branch enumeration acts on
+/// without any test noticing. Costs the seeding scan and nothing more: no
+/// snapshot, no rewind, no OpenMLS replay.
+pub(crate) fn stored_graph_is_contested<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    retained_anchor_epoch: u64,
+) -> Result<bool, OpenMlsProjectionError> {
+    let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)?;
+    Ok(commits_share_a_source_epoch(&inputs.commit_messages))
+}
+
 /// Whether two distinct stored commits fork from the same source epoch — the
 /// structural precondition for more than one candidate branch.
 fn commits_share_a_source_epoch(commits: &[StoredCommitMessage]) -> bool {

@@ -20,7 +20,7 @@ use cgka_traits::engine::{
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::{
-    InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
+    DeferralLineage, InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
 };
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
@@ -458,7 +458,10 @@ fn snapshot_ingest_outcomes() {
     );
     insta::assert_json_snapshot!(
         "transport_deferred",
-        IngestOutcome::TransportDeferred { group_id: gid() }
+        IngestOutcome::TransportDeferred {
+            group_id: gid(),
+            lineage: DeferralLineage::Uncontested
+        }
     );
     insta::assert_json_snapshot!(
         "resource_refused_deferred_capacity",

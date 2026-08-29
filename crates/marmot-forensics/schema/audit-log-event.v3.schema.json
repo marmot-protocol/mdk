@@ -521,7 +521,7 @@
       ]
     },
     "epochStallBackfillTrigger": {
-      "enum": ["undecryptable_threshold", "resource_refusal"]
+      "enum": ["undecryptable_threshold", "contested_fork_deferral", "resource_refusal"]
     },
     "epochBackfillExecutionSeam": {
       "enum": ["startup", "receive", "explicit_catch_up", "maintenance"]

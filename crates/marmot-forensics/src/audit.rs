@@ -167,6 +167,15 @@ pub enum ConvergencePhase {
 #[serde(rename_all = "snake_case")]
 pub enum EpochStallBackfillTrigger {
     UndecryptableThreshold,
+    /// The undecryptable threshold was crossed on a group whose stored commit
+    /// graph is contested, so the traffic driving the arm is sealed under a
+    /// branch this device has not adopted. Recorded apart from
+    /// [`Self::UndecryptableThreshold`] because it changes what the replay can
+    /// possibly achieve, not whether it ran: the objects are already retained
+    /// locally, so no amount of relay history supplies the adoption they need —
+    /// convergence adjudication does. An incident that keeps arming under this
+    /// trigger is a fork to resolve, not a device to re-sync.
+    ContestedForkDeferral,
     ResourceRefusal,
 }
 

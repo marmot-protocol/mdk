@@ -35,7 +35,14 @@ pub enum IngestOutcome {
     /// currently available transport context, but a later canonical epoch,
     /// retained candidate, staged state, or repair may make it recoverable.
     /// The object remains outside convergence until peeling succeeds.
-    TransportDeferred { group_id: GroupId },
+    ///
+    /// `lineage` says which recovery can possibly help. See
+    /// [`DeferralLineage`] for what that claim is and — importantly — what it
+    /// is not.
+    TransportDeferred {
+        group_id: GroupId,
+        lineage: DeferralLineage,
+    },
     /// A local resource bound prevented the engine from retaining or
     /// processing an otherwise unclassified transport object. This is not a
     /// protocol rejection and must not make same-id redelivery a duplicate.
@@ -49,6 +56,42 @@ pub enum IngestOutcome {
     /// A standalone or commit-carried MLS proposal failed Marmot semantic
     /// admission before it could enter pending state or affect group state.
     Rejected { category: ProposalRejectionCategory },
+}
+
+/// Which recovery can make a [`IngestOutcome::TransportDeferred`] object
+/// readable.
+///
+/// **This is a claim about the group, not about the message.** At the deferral
+/// point decryption failed under the live context, every retained snapshot, and
+/// every candidate branch the engine had materialized, so nothing observable
+/// separates one unreadable object from another. What the engine can still
+/// state soundly is the shape of the group's stored commit graph, and that is
+/// what decides whether fetching more history from relays is even the right
+/// kind of answer.
+///
+/// The discriminator is deliberately one-way, in the same sense as the
+/// candidate-branch context set it is derived from: [`Self::ContestedFork`] is
+/// positive evidence, while [`Self::Uncontested`] is the absence of evidence
+/// rather than proof of its opposite.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeferralLineage {
+    /// No two retained commits fork from the same source epoch, so this device
+    /// holds no evidence that any of this group's traffic is sealed under a
+    /// branch it has not adopted.
+    ///
+    /// Not a positive claim that the object is merely ahead of this device. A
+    /// fork whose rival commit never reached this device looks exactly like no
+    /// fork at all — and that case is precisely the one a relay backfill is the
+    /// right answer for, because the commit it needs really is missing history.
+    #[default]
+    Uncontested,
+    /// Two retained commits fork from the same source epoch: part of this
+    /// group's traffic is sealed under a branch this device has not adopted.
+    ///
+    /// A relay backfill cannot help such an object. The bytes already arrived;
+    /// what is missing is not history but adoption, and only convergence
+    /// adjudication over the commits already stored can supply it.
+    ContestedFork,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

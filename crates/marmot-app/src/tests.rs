@@ -13496,6 +13496,97 @@ fn an_epoch_passage(
     effects
 }
 
+/// One convergence pass that adjudicated a fork: the losing commit is rolled
+/// back and every state notification it produced is withdrawn.
+///
+/// The epoch on the withdrawal is the fork's SOURCE epoch — the epoch the
+/// superseded commit branched from — which is deliberately behind where the
+/// device sits. A same-epoch reorg emits no `EpochChanged` at all, so this pair
+/// is the only announcement the app ever gets that convergence moved the
+/// canonical branch under it.
+fn a_convergence_reorg(
+    group_id: &cgka_traits::GroupId,
+    fork_source_epoch: u64,
+) -> marmot_account::AccountDeviceEffects {
+    let invalidated_commit_id = cgka_traits::MessageId::new(vec![7u8; 32]);
+    let mut effects = marmot_account::AccountDeviceEffects::default();
+    effects
+        .events
+        .push(cgka_traits::engine::GroupEvent::CommitRolledBack {
+            group_id: group_id.clone(),
+            invalidated_commit_id: invalidated_commit_id.clone(),
+        });
+    effects
+        .events
+        .push(cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(fork_source_epoch),
+            invalidated_commit_id,
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        });
+    effects
+}
+
+/// A convergence reorg is liveness evidence and must end the unrecovered arm
+/// run, exactly as a spanning epoch passage does.
+///
+/// Nothing else can carry it. A same-epoch reorg leaves `previous_tip ==
+/// selected_tip`, so no `EpochChanged` is emitted, and the device's own epoch
+/// does not move — every other signal this detector reads is identical to a
+/// device that saw nothing at all. Without this the arms that accumulated
+/// while convergence was busy adjudicating a fork read as one unrecovered run
+/// and escalate a device onto the wrong recovery: relay backfill cannot supply
+/// the branch adoption that fork-side traffic is waiting for.
+#[tokio::test]
+async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://convergence-reorg.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("convergence reorg", &[]).await.unwrap();
+
+    // Two arms of one run, at two epochs the device armed at.
+    assert_eq!(
+        client.epoch_stall.observe_resource_refusal(
+            group_id.clone(),
+            cgka_traits::EpochId(10),
+            epoch_stall_test_now_ms()
+        ),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+    assert_eq!(
+        client.epoch_stall.observe_resource_refusal(
+            group_id.clone(),
+            cgka_traits::EpochId(11),
+            epoch_stall_test_now_ms()
+        ),
+        crate::client::epoch_stall::BackfillDecision::Arm
+    );
+
+    // Convergence then resolves a fork this device was on the wrong side of.
+    client
+        .observe_recovery_evidence_then_fail_if_publish_failed(&a_convergence_reorg(&group_id, 9))
+        .expect("a batch carrying only a convergence reorg passes the publish gate");
+
+    // Without the reorg this third arm is the run's escalating one
+    // (`escalates_when_arms_repeat_without_passing_cleanly_through_an_epoch`
+    // pins that shape). With it, the arms before the reorg are not one
+    // unrecovered run.
+    assert_eq!(
+        client.epoch_stall.observe_resource_refusal(
+            group_id,
+            cgka_traits::EpochId(12),
+            epoch_stall_test_now_ms()
+        ),
+        crate::client::epoch_stall::BackfillDecision::Arm,
+        "a group whose fork convergence just adjudicated is alive; the arms it took to get there are not evidence that a replay is failing to recover it"
+    );
+}
+
 /// A maintenance tick's own epoch advance must reach the stall detector.
 ///
 /// A tick drains a recovered staged evolution and confirms it, which emits

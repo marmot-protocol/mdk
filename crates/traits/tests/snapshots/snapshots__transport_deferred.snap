@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "IngestOutcome::TransportDeferred { group_id: gid() }"
+expression: "IngestOutcome::TransportDeferred { group_id: gid(), lineage: DeferralLineage::Uncontested }"
 ---
 {
   "TransportDeferred": {
@@ -9,6 +9,7 @@ expression: "IngestOutcome::TransportDeferred { group_id: gid() }"
       170,
       170,
       170
-    ]
+    ],
+    "lineage": "Uncontested"
   }
 }

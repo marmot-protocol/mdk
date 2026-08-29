@@ -453,8 +453,8 @@ impl AppClient {
     }
 
     /// Feed one effects batch's epoch-gap recovery evidence to the stall
-    /// detector: a resource refusal arms a replay, and an epoch passage reports
-    /// the movement that can end an unrecovered run.
+    /// detector: a resource refusal arms a replay, and an epoch passage or a
+    /// convergence reorg reports the activity that can end an unrecovered run.
     ///
     /// Both directions matter, and only this seam carries the second one. A
     /// delivery reports the epoch it was *read* at, which is where the device
@@ -510,6 +510,34 @@ impl AppClient {
                         decision,
                         EpochStallBackfillTrigger::ResourceRefusal,
                     );
+                }
+                // A convergence reorg is the third kind of recovery evidence,
+                // and the only one that never moves an epoch. Branch selection
+                // superseded an authenticated commit this device had applied;
+                // when the two branches carry the same epoch number the engine
+                // emits no `EpochChanged` for it at all, so without this arm a
+                // device that just crossed a fork resolution is indistinguishable
+                // from one that saw nothing.
+                //
+                // Matching the withdrawal rather than its `CommitRolledBack`
+                // twin is not a choice about which is better evidence: the
+                // engine pushes the pair back to back, once per rolled-back
+                // commit, with nothing fallible between them, so the two arms
+                // would decide identically and the second would only re-decide
+                // what the first already did.
+                cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+                    group_id,
+                    reason:
+                        cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+                    ..
+                } => {
+                    // Deliberately not fed the carried `epoch`: that is the
+                    // source epoch of the fork the superseded commit lost, which
+                    // sits *behind* where this device is now. The detector's
+                    // observed epoch only ever moves forward, and handing it a
+                    // backward position would walk the per-epoch suppression
+                    // back with it.
+                    self.epoch_stall.observe_convergence_reorg(group_id);
                 }
                 _ => {}
             }
@@ -2216,7 +2244,11 @@ impl AppClient {
     /// Feed an unavailable group delivery to the epoch-stall detector.
     /// Transport-deferred input arms a backfill after the stalled-epoch
     /// threshold; resource refusal arms it immediately because it directly
-    /// proves the fetched history was not fully retained. Repeated arming that
+    /// proves the fetched history was not fully retained. A deferral whose
+    /// engine-reported lineage is fork-side arms on the same threshold and
+    /// carries its own trigger — see
+    /// [`backfill_trigger_for`](super::epoch_stall::backfill_trigger_for) for
+    /// why the label moves and the decision does not. Repeated arming that
     /// never recovers the group escalates onto the next successful sync summary,
     /// the seam every worker surface already publishes. Only observed under
     /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
@@ -2271,13 +2303,7 @@ impl AppClient {
             &group_id,
             record.epoch.0,
             decision,
-            match outcome {
-                IngestOutcome::TransportDeferred { .. } => {
-                    EpochStallBackfillTrigger::UndecryptableThreshold
-                }
-                IngestOutcome::ResourceRefused { .. } => EpochStallBackfillTrigger::ResourceRefusal,
-                _ => EpochStallBackfillTrigger::UndecryptableThreshold,
-            },
+            crate::client::epoch_stall::backfill_trigger_for(outcome),
         );
     }
 

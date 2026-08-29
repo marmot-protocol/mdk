@@ -20,7 +20,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{DeferralLineage, IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -9683,5 +9683,140 @@ async fn ingest_does_not_log_decrypted_message_content() {
             .unwrap()
             .contains("secret hello"),
         "audit output must never contain decrypted application content"
+    );
+}
+
+/// Build a group where Alice and Bob fork epoch 1 with competing invite
+/// commits, then hand back Carol (an epoch-gated observer still at epoch 1),
+/// both rival commits, and an epoch-2 application message Carol's peeler
+/// cannot read. The caller decides how much of the fork Carol gets to store,
+/// which is exactly what the deferral's lineage claim is derived from.
+async fn forked_epoch_with_an_unreadable_witness(
+    tag: &str,
+) -> (
+    Engine<SqliteAccountStorage>,
+    GroupId,
+    [TransportMessage; 2],
+    TransportMessage,
+) {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, _carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: tag.into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let commits = [route(alice_commit, &group_id), route(bob_commit, &group_id)];
+
+    // Alice adopts her own branch and speaks on it. The result is sealed under
+    // an epoch Carol has not reached, so Carol's peeler defers it.
+    alice.confirm_published(alice_pending).await.unwrap();
+    let witness = send_app(&mut alice, &group_id, b"unreadable on carol".to_vec()).await;
+    assert_eq!(
+        project_mls_message(&witness.payload)
+            .expect("witness projects")
+            .source_epoch,
+        Some(2)
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    (carol, group_id, commits, witness)
+}
+
+/// A transport-deferred object on a group whose stored commit graph is
+/// contested must say so. The message itself proves nothing — decryption
+/// failed under every context this device holds — but two retained commits
+/// forking from one source epoch prove that part of this group's traffic is
+/// sealed under a branch this device has not adopted, and that is the fact
+/// deciding whether fetching more relay history can help at all.
+#[tokio::test]
+async fn a_deferral_on_a_contested_stored_graph_reports_contested_fork_lineage() {
+    let (mut carol, group_id, commits, witness) =
+        forked_epoch_with_an_unreadable_witness("deferral-lineage-contested").await;
+
+    for commit in &commits {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 1_000)
+            .expect("rival commit buffered");
+    }
+
+    let outcome = carol.ingest(witness).await.unwrap();
+    assert_eq!(
+        outcome,
+        IngestOutcome::TransportDeferred {
+            group_id: group_id.clone(),
+            lineage: DeferralLineage::ContestedFork,
+        },
+        "both sides of the fork are retained, so the deferral is fork-side: no relay backfill can supply the adoption it is missing"
+    );
+}
+
+/// The same message, the same unreadable peel, one branch retained instead of
+/// two: nothing here evidences a fork, so the deferral keeps the claim that
+/// admits a relay backfill. This is the pair that makes the discriminator
+/// mean something — without it the lineage could be a constant.
+#[tokio::test]
+async fn a_deferral_with_only_one_retained_branch_reports_uncontested_lineage() {
+    let (mut carol, group_id, commits, witness) =
+        forked_epoch_with_an_unreadable_witness("deferral-lineage-uncontested").await;
+
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, commits[0].clone(), 1_000)
+        .expect("single commit buffered");
+
+    let outcome = carol.ingest(witness).await.unwrap();
+    assert_eq!(
+        outcome,
+        IngestOutcome::TransportDeferred {
+            group_id: group_id.clone(),
+            lineage: DeferralLineage::Uncontested,
+        },
+        "one retained commit cannot fork with itself; an absent rival looks exactly like missing history, which is what a backfill is for"
     );
 }

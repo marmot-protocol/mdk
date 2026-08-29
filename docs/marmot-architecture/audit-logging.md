@@ -835,15 +835,16 @@ Metadata notes:
 
 Emitted when the app runtime's epoch-stall detector reads a group as stuck — traffic it cannot decrypt keeps arriving
 while the device's own epoch does not move — and arms one account-wide full-history transport replay to recover the
-commit it missed. Two triggers reach it: the group accumulated
-`threshold` distinct undecryptable messages while its own epoch did not move, or an inbound object was refused outright
+commit it missed. Three triggers reach it: the group accumulated
+`threshold` distinct undecryptable messages while its own epoch did not move, the same threshold was crossed on a group
+whose stored commit graph is contested, or an inbound object was refused outright
 (direct proof that the fetched history was not fully retained).
 
 | Field | Meaning |
 | --- | --- |
 | `stalled_epoch` | The device's own group epoch when the replay was armed. |
 | `threshold` | Distinct-undecryptable count in force in this build, so the row is self-describing when the constant is retuned. |
-| `trigger` | Which of the two triggers armed this replay: `undecryptable_threshold` or `resource_refusal`. Absent on rows written before the field existed. |
+| `trigger` | Which trigger armed this replay: `undecryptable_threshold`, `contested_fork_deferral`, or `resource_refusal`. Absent on rows written before the field existed. |
 
 Metadata notes:
 

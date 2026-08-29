@@ -106,7 +106,7 @@ pub(crate) fn ingest_outcome_epoch(outcome: &IngestOutcome) -> Option<u64> {
 pub(crate) fn ingest_outcome_group_ref(outcome: &IngestOutcome) -> Option<String> {
     match outcome {
         IngestOutcome::Buffered { group_id, .. }
-        | IngestOutcome::TransportDeferred { group_id }
+        | IngestOutcome::TransportDeferred { group_id, .. }
         | IngestOutcome::ResourceRefused { group_id, .. } => Some(hex::encode(group_id.as_slice())),
         _ => None,
     }
