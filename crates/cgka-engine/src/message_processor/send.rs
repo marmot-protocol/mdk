@@ -705,6 +705,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id: group_id.clone(),
             requested_at_ms,
             last_proposed_epoch: None,
+            last_proposed_message_id: None,
         });
         request.last_proposed_epoch = Some(proposed_epoch);
         self.record_sent_openmls_message_with_leave_request(
