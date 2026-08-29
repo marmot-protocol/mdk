@@ -3468,13 +3468,13 @@ impl AppClient {
                 "ignored malformed durable epoch-gap recovery markers"
             );
         }
-        // Local app projection is the liveness check. A local wipe does not
-        // delete protocol `cgka_groups` rows, so restart must not treat a
-        // retained protocol record as a live backfill owner.
+        // Live engine groups keep their backfill intent even when the app
+        // projection is still torn. Locally deleted groups keep a durable
+        // frontier and must not re-arm the journal off the protocol record.
         let journal_restored = self.pending_epoch_backfill.is_some()
             || self.active_epoch_backfill.is_some()
             || !self.queued_epoch_backfills.is_empty();
-        table_groups.retain(|group_id, _| self.local_projection_contains_group(group_id));
+        table_groups.retain(|group_id, _| self.epoch_backfill_group_is_live(group_id));
         if journal_restored {
             let journal_ids = self
                 .pending_epoch_backfill
@@ -3485,7 +3485,7 @@ impl AppClient {
                 .collect::<Vec<_>>();
             let mut live = table_groups.keys().cloned().collect::<HashSet<_>>();
             for group_id in journal_ids {
-                if self.local_projection_contains_group(&group_id) {
+                if self.epoch_backfill_group_is_live(&group_id) {
                     live.insert(group_id);
                 }
             }
@@ -3845,6 +3845,20 @@ impl AppClient {
             .groups
             .iter()
             .any(|group| group.group_id_hex == group_id_hex)
+    }
+
+    fn epoch_backfill_group_is_live(&self, group_id: &cgka_traits::GroupId) -> bool {
+        if self
+            .has_local_group_deletion_frontier(group_id)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        self.runtime
+            .live_group_ids()
+            .ok()
+            .is_some_and(|ids| ids.iter().any(|live| live == group_id))
+            || self.local_projection_contains_group(group_id)
     }
 
     fn capture_pending_group_epochs(

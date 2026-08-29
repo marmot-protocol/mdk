@@ -8551,20 +8551,173 @@ async fn terminal_leave_publish_failure_is_durable_and_does_not_authorize_left()
 }
 
 #[tokio::test]
-async fn terminal_m1_failure_ack_then_m2_success_records_published_true() {
+async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new("marmot m1 ack m2 leave key").unwrap();
+    let key = SqlCipherKey::new("marmot zero ack leave key").unwrap();
     let (bob, bob_path, bob_identity, group_id) =
-        joined_selfremove_member(dir.path(), &key, "m1-ack-m2-leave").await;
+        joined_selfremove_member(dir.path(), &key, "zero-ack-leave").await;
     let adapter = RecordingAdapter::default();
-    let group_endpoint = TransportEndpoint("wss://m1-ack-m2-group.example".into());
+    let group_endpoint = TransportEndpoint("wss://zero-ack-leave-group.example".into());
     adapter.fail_endpoints_as(
         vec![group_endpoint.clone()],
         TransportEndpointFailureKind::TerminalRejected,
     );
     let route = || {
         StaticTransportRouting::new(vec![TransportEndpoint(
-            "wss://m1-ack-m2-inbox.example".into(),
+            "wss://zero-ack-leave-inbox.example".into(),
+        )])
+        .required_acks(0)
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![group_endpoint.clone()],
+        )
+    };
+    let mut runtime =
+        AccountDeviceRuntime::new(bob, adapter, route(), RecordingKeyPackages::default());
+    runtime.pause_maintenance();
+    let leased = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        leased
+            .effects
+            .action_outcomes
+            .iter()
+            .all(|outcome| !outcome.published),
+        "required_acks=0 still needs at least one accept"
+    );
+    drop(runtime);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    if let Some(replayed) = restarted.replay_visibility_leased().unwrap() {
+        assert!(
+            flatten_visibility_batches(&replayed.batches)
+                .action_outcomes
+                .iter()
+                .all(|outcome| !outcome.published),
+            "restart must not upgrade a zero-accept Leave to published:true"
+        );
+        assert!(restarted.acknowledge_visibility_lease(replayed.lease));
+    }
+    let drained = restarted.drain_leased().await.unwrap();
+    assert!(
+        drained
+            .effects
+            .action_outcomes
+            .iter()
+            .all(|outcome| !outcome.published),
+        "resuming a terminal zero-accept Leave must not authorize Left"
+    );
+}
+
+#[tokio::test]
+async fn leave_m1_to_m2_repair_persists_every_row_so_cleared_request_does_not_split_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot torn leave source key").unwrap();
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, "torn-leave-source").await;
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://torn-leave-inbox.example".into(),
+        )])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://torn-leave-group.example".into())],
+        )
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    runtime.pause_maintenance();
+    let _leased = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let later_id = MessageId::new(b"leave-m2-torn-source".to_vec());
+    let mut request = runtime
+        .session()
+        .storage_handle()
+        .leave_request(&group_id)
+        .unwrap()
+        .expect("accepted Leave writes a durable request");
+    request.last_proposed_message_id = Some(later_id);
+    runtime
+        .session()
+        .storage_handle()
+        .put_leave_request(&request)
+        .unwrap();
+    drop(runtime);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut repaired = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    repaired.pause_maintenance();
+    let replayed = repaired
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("unacked Leave remains crash-visible for M1→M2 repair");
+    drop(replayed);
+    drop(repaired);
+
+    let storage_session =
+        session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    storage_session
+        .storage_handle()
+        .clear_leave_request(&group_id)
+        .unwrap();
+    drop(storage_session);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    restarted
+        .replay_visibility_leased()
+        .expect("Header+suffix M2 repair must persist every row so reopen cannot split source");
+}
+
+#[tokio::test]
+async fn terminal_m1_failure_ack_then_engine_m2_records_published_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot m1 ack engine m2 leave key").unwrap();
+    let tag = "engine-m2-leave";
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, tag).await;
+    let bob_id = bob.self_id();
+    let adapter = RecordingAdapter::default();
+    let group_endpoint = TransportEndpoint("wss://engine-m2-group.example".into());
+    adapter.fail_endpoints_as(
+        vec![group_endpoint.clone()],
+        TransportEndpointFailureKind::TerminalRejected,
+    );
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://engine-m2-inbox.example".into(),
         )])
         .with_group_route(
             group_id.clone(),
@@ -8591,19 +8744,38 @@ async fn terminal_m1_failure_ack_then_m2_success_records_published_true() {
     assert!(runtime.acknowledge_visibility_lease(leased.lease));
     drop(runtime);
 
-    let storage_session =
-        session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
-    let mut request = storage_session
-        .storage_handle()
-        .leave_request(&group_id)
-        .unwrap()
-        .expect("LeaveRequest outlives Header ACK");
-    request.last_proposed_epoch = Some(EpochId(0));
-    storage_session
-        .storage_handle()
-        .put_leave_request(&request)
-        .unwrap();
-    drop(storage_session);
+    let alice_identity = format!("alice-{tag}").into_bytes();
+    let alice_path = dir.path().join(format!("alice-{tag}.sqlite"));
+    let alice = session_with_registry(&alice_path, &key, &alice_identity, selfremove_registry());
+    let alice_adapter = RecordingAdapter::default();
+    let mut alice_runtime = AccountDeviceRuntime::new(
+        alice,
+        alice_adapter.clone(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    alice_runtime.pause_maintenance();
+    alice_runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("engine m2 epoch".to_owned()),
+            description: None,
+        })
+        .await
+        .expect("alice must advance the epoch so Bob's LeaveRequest can auto-repropose");
+    let commit = alice_adapter
+        .publishes()
+        .into_iter()
+        .map(|publish| publish.message)
+        .find(|message| matches!(message.envelope, TransportEnvelope::GroupMessage { .. }))
+        .expect("alice epoch-advancing commit is published");
+    let commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    drop(alice_runtime);
 
     let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
     let recovered_adapter = RecordingAdapter::default();
@@ -8618,20 +8790,61 @@ async fn terminal_m1_failure_ack_then_m2_success_records_published_true() {
         restarted.replay_visibility_leased().unwrap().is_none(),
         "terminal M1 Header ACK must drop Leave provenance from the journal"
     );
-    let m2 = restarted
-        .send_leased(SendIntent::Leave {
-            group_id: group_id.clone(),
+    let ingested = restarted
+        .ingest_delivery_leased(TransportDelivery {
+            account_id: bob_id,
+            group_id_hint: Some(group_id.clone()),
+            message: commit,
+            received_at: Timestamp(0),
+            source: TransportDeliverySource {
+                transport: TransportSource("marmot-account-test".into()),
+                plane: TransportDeliveryPlane::Group,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
         })
         .await
-        .expect("an epoch-moved LeaveRequest must author M2 after M1 Header ACK");
-    assert!(
-        m2.effects
+        .expect("bob must ingest alice's epoch-advancing commit");
+    let mut published = ingested
+        .effects
+        .action_outcomes
+        .iter()
+        .any(|outcome| outcome.published);
+    if matches!(
+        ingested.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ) || restarted.has_pending_convergence_inputs(&group_id).unwrap()
+        || ingested
+            .effects
+            .pending_convergence
+            .iter()
+            .any(|pending| pending == &group_id)
+    {
+        tokio::time::sleep(Duration::from_millis(
+            cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS + 50,
+        ))
+        .await;
+        let converged = restarted
+            .advance_convergence_leased(&group_id)
+            .await
+            .expect("buffered epoch-advancing commit must converge");
+        published |= converged
+            .effects
             .action_outcomes
             .iter()
-            .any(|outcome| outcome.published),
-        "M2 success must record published:true even with no surviving M1 Header"
+            .any(|outcome| outcome.published);
+    }
+    let drained = restarted.drain_leased().await.unwrap();
+    published |= drained
+        .effects
+        .action_outcomes
+        .iter()
+        .any(|outcome| outcome.published);
+    assert!(
+        published,
+        "engine-driven M2 success must record published:true even with no surviving M1 Header"
     );
-    assert!(!recovered_adapter.publishes().is_empty());
 }
 
 #[tokio::test]

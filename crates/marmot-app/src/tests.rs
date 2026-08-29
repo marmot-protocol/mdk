@@ -4361,6 +4361,55 @@ fn deleted_group_crash_before_journal_prune_does_not_restore_poison() {
 }
 
 #[test]
+fn live_engine_group_keeps_backfill_when_projection_is_torn() {
+    run_composed_app_runtime_test("torn-projection-backfill", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_a = client
+            .create_group("torn projection backfill group", &[])
+            .await
+            .unwrap();
+        let stalled_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client
+            .apply_backfill_decision(
+                &group_a,
+                stalled_a,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        let group_a_hex = hex::encode(group_a.as_slice());
+        client
+            .state
+            .groups
+            .retain(|group| group.group_id_hex != group_a_hex);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        drop(client);
+
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened
+                .pending_epoch_backfill
+                .as_ref()
+                .is_some_and(|pending| pending.groups.contains_key(&group_a)),
+            "a live engine group with a torn app projection must keep its backfill intent"
+        );
+    });
+}
+
+#[test]
 fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
     run_composed_app_runtime_test("epoch-backfill-deferral", || async {
         let dir = tempfile::tempdir().unwrap();

@@ -316,6 +316,11 @@ const KEY_PACKAGE_REAUTHOR_AT_AGE_SECS: u64 = 10 * 60;
 const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_DIR: &str = "removed-local-slots-v1";
+const REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_JOURNAL: &str = "slots.json";
+/// Exact retired-slot identities kept in the per-account tombstone journal.
+/// A further distinct locally-removed slot fails closed rather than evicting
+/// anti-resurrection proof.
+const MAX_REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_SLOTS: usize = 256;
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 /// Maximum wall-clock quantum one epoch-gap backfill drain owns the serial
@@ -1511,6 +1516,15 @@ struct RemovedLocalKeyPackageTombstone {
     /// `None` is the explicit legacy fail-closed fallback used only when the
     /// removed account's durable NIP-33 slot can no longer be proven.
     stable_slot_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct RemovedLocalKeyPackageTombstoneJournal {
+    account_id_hex: String,
+    #[serde(default)]
+    retired_stable_slot_ids: Vec<String>,
+    #[serde(default)]
+    account_wide: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7995,17 +8009,113 @@ impl MarmotApp {
             .join(file_name))
     }
 
-    /// Exact-slot markers are intentionally never reclaimed. An account-wide
-    /// `all.json` is only written when the removed lifecycle cannot prove a
-    /// stable slot (`RemovedLocalKeyPackageScope::AccountWideLegacy`).
-    ///
-    /// Collapsing distinct slots into `all.json` would delete the proof that
-    /// `runtime-state-bounds.md` requires to keep a retired slot retired after
-    /// restore or re-admission of that same lifecycle.
+    fn removed_local_key_package_tombstone_journal_path(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<PathBuf, AppError> {
+        Ok(self
+            .removed_local_key_package_account_tombstone_dir(account_id_hex)?
+            .join(REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_JOURNAL))
+    }
+
+    fn load_removed_local_key_package_tombstone_journal(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<RemovedLocalKeyPackageTombstoneJournal, AppError> {
+        let mut journal = RemovedLocalKeyPackageTombstoneJournal {
+            account_id_hex: account_id_hex.to_owned(),
+            retired_stable_slot_ids: Vec::new(),
+            account_wide: false,
+        };
+        let journal_path = self.removed_local_key_package_tombstone_journal_path(account_id_hex)?;
+        if journal_path.try_exists()? {
+            journal = read_json(&journal_path)?;
+            if journal.account_id_hex != account_id_hex {
+                return Err(AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "removed-local KeyPackage tombstone journal does not match its path",
+                )));
+            }
+        }
+        let dir = self.removed_local_key_package_account_tombstone_dir(account_id_hex)?;
+        if dir.try_exists()? {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name == "all.json" {
+                    self.validate_removed_local_key_package_tombstone(&path, account_id_hex, None)?;
+                    journal.account_wide = true;
+                } else if name.starts_with("slot-") && name.ends_with(".json") {
+                    let marker: RemovedLocalKeyPackageTombstone = read_json(&path)?;
+                    if marker.account_id_hex != account_id_hex {
+                        return Err(AppError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "removed-local KeyPackage tombstone does not match its path",
+                        )));
+                    }
+                    if let Some(slot) = marker.stable_slot_id
+                        && !journal.retired_stable_slot_ids.contains(&slot)
+                    {
+                        journal.retired_stable_slot_ids.push(slot);
+                    }
+                }
+            }
+        }
+        Ok(journal)
+    }
+
+    fn admit_removed_local_key_package_tombstone_slot(
+        journal: &mut RemovedLocalKeyPackageTombstoneJournal,
+        stable_slot_id: &str,
+    ) -> Result<(), AppError> {
+        if journal
+            .retired_stable_slot_ids
+            .iter()
+            .any(|slot| slot == stable_slot_id)
+        {
+            return Ok(());
+        }
+        if journal.retired_stable_slot_ids.len() >= MAX_REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_SLOTS {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "removed-local KeyPackage tombstone slot capacity reached",
+            )));
+        }
+        journal
+            .retired_stable_slot_ids
+            .push(stable_slot_id.to_owned());
+        Ok(())
+    }
+
+    /// Compact exact-slot files into the bounded per-account journal after the
+    /// journal itself is durable. Exact identities stay in
+    /// `retired_stable_slot_ids`; leftover files are unlinked with parent
+    /// fsync.
     fn coalesce_removed_local_key_package_tombstones(
         &self,
-        _account_id_hex: &str,
+        account_id_hex: &str,
+        journal: &RemovedLocalKeyPackageTombstoneJournal,
     ) -> Result<(), AppError> {
+        let dir = self.removed_local_key_package_account_tombstone_dir(account_id_hex)?;
+        if !dir.try_exists()? {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name == REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_JOURNAL {
+                continue;
+            }
+            let compact_legacy_all = name == "all.json" && journal.account_wide;
+            let compact_slot_file = name.starts_with("slot-") && name.ends_with(".json");
+            if compact_legacy_all || compact_slot_file {
+                remove_file_if_present(&path)?;
+            }
+        }
         Ok(())
     }
 
@@ -8079,32 +8189,16 @@ impl MarmotApp {
         local_signing_account: Option<&AccountSummary>,
     ) -> Result<bool, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
-        let account_tombstone_dir =
-            self.removed_local_key_package_account_tombstone_dir(&account_id_hex)?;
-        if !account_tombstone_dir.try_exists()? {
-            return Ok(false);
-        }
-        let exact =
-            self.removed_local_key_package_tombstone_path(&account_id_hex, Some(stable_slot_id))?;
-        if exact.try_exists()? {
-            self.validate_removed_local_key_package_tombstone(
-                &exact,
-                &account_id_hex,
-                Some(stable_slot_id),
-            )?;
-            return Ok(true);
-        }
-        let account_wide = self.removed_local_key_package_tombstone_path(&account_id_hex, None)?;
-        if !account_wide.try_exists()? {
-            return Ok(false);
-        }
-        self.validate_removed_local_key_package_tombstone(&account_wide, &account_id_hex, None)?;
-        Ok(
-            !self.active_local_key_package_slot_is_authorized_for_admitted_account(
-                &account_id_hex,
-                stable_slot_id,
-                local_signing_account,
-            )?,
+        self.removed_local_key_package_slot_is_retired_with_active_check(
+            &account_id_hex,
+            stable_slot_id,
+            |slot| {
+                self.active_local_key_package_slot_is_authorized_for_admitted_account(
+                    &account_id_hex,
+                    slot,
+                    local_signing_account,
+                )
+            },
         )
     }
 
@@ -8120,27 +8214,51 @@ impl MarmotApp {
         stable_slot_id: &str,
     ) -> Result<bool, AppError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        self.removed_local_key_package_slot_is_retired_with_active_check(
+            &account_id_hex,
+            stable_slot_id,
+            |slot| self.active_local_key_package_slot_is_authorized(&account_id_hex, slot),
+        )
+    }
+
+    fn removed_local_key_package_slot_is_retired_with_active_check(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: &str,
+        active_authorized: impl Fn(&str) -> Result<bool, AppError>,
+    ) -> Result<bool, AppError> {
         let account_tombstone_dir =
-            self.removed_local_key_package_account_tombstone_dir(&account_id_hex)?;
+            self.removed_local_key_package_account_tombstone_dir(account_id_hex)?;
         if !account_tombstone_dir.try_exists()? {
             return Ok(false);
         }
+        let journal = self.load_removed_local_key_package_tombstone_journal(account_id_hex)?;
+        if journal
+            .retired_stable_slot_ids
+            .iter()
+            .any(|slot| slot == stable_slot_id)
+        {
+            return Ok(true);
+        }
         let exact =
-            self.removed_local_key_package_tombstone_path(&account_id_hex, Some(stable_slot_id))?;
+            self.removed_local_key_package_tombstone_path(account_id_hex, Some(stable_slot_id))?;
         if exact.try_exists()? {
             self.validate_removed_local_key_package_tombstone(
                 &exact,
-                &account_id_hex,
+                account_id_hex,
                 Some(stable_slot_id),
             )?;
             return Ok(true);
         }
-        let account_wide = self.removed_local_key_package_tombstone_path(&account_id_hex, None)?;
-        if !account_wide.try_exists()? {
-            return Ok(false);
+        if !journal.account_wide {
+            let account_wide =
+                self.removed_local_key_package_tombstone_path(account_id_hex, None)?;
+            if !account_wide.try_exists()? {
+                return Ok(false);
+            }
+            self.validate_removed_local_key_package_tombstone(&account_wide, account_id_hex, None)?;
         }
-        self.validate_removed_local_key_package_tombstone(&account_wide, &account_id_hex, None)?;
-        Ok(!self.active_local_key_package_slot_is_authorized(&account_id_hex, stable_slot_id)?)
+        Ok(!active_authorized(stable_slot_id)?)
     }
 
     fn removed_local_key_package_scope(
@@ -8238,27 +8356,20 @@ impl MarmotApp {
             let account_dir =
                 self.removed_local_key_package_account_tombstone_dir(&account.account_id_hex)?;
             self.ensure_private_directory_entry_durable(&account_dir)?;
-            let tombstone_path = self.removed_local_key_package_tombstone_path(
-                &account.account_id_hex,
-                stable_slot_id,
-            )?;
-            if tombstone_path.try_exists()? {
-                self.validate_removed_local_key_package_tombstone(
-                    &tombstone_path,
-                    &account.account_id_hex,
-                    stable_slot_id,
-                )?;
-            } else {
-                self.write_private_json(
-                    &tombstone_path,
-                    &RemovedLocalKeyPackageTombstone {
-                        account_id_hex: account.account_id_hex.clone(),
-                        stable_slot_id: stable_slot_id.map(str::to_owned),
-                    },
-                    "removed-local KeyPackage tombstone",
-                )?;
+            let mut journal =
+                self.load_removed_local_key_package_tombstone_journal(&account.account_id_hex)?;
+            match stable_slot_id {
+                Some(slot) => {
+                    Self::admit_removed_local_key_package_tombstone_slot(&mut journal, slot)?
+                }
+                None => journal.account_wide = true,
             }
-            self.coalesce_removed_local_key_package_tombstones(&account.account_id_hex)?;
+            self.write_private_json(
+                &self.removed_local_key_package_tombstone_journal_path(&account.account_id_hex)?,
+                &journal,
+                "removed-local KeyPackage tombstone journal",
+            )?;
+            self.coalesce_removed_local_key_package_tombstones(&account.account_id_hex, &journal)?;
         }
         // The immutable marker now gates every writer. Release the mutation
         // mutex before opening caches: one-time legacy migration takes that

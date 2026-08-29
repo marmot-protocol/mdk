@@ -4848,31 +4848,65 @@ where
                 };
                 if action_message_id != &desired {
                     *action_message_id = desired;
-                    if matches!(
-                        batches[header.index].kind,
-                        AccountVisibilityRecordKind::Header
-                    ) {
-                        repaired.push(header.index);
-                    }
+                    repaired.push(header.index);
                 }
             }
         }
-        for index in repaired {
-            let batch = &batches[index];
-            let operation_id =
-                <[u8; 16]>::try_from(batch.operation_id.as_slice()).map_err(|_| {
-                    account_visibility_error("visibility operation id has invalid length")
-                })?;
-            let record = StoredAccountVisibilityRecordV1 {
-                version: ACCOUNT_VISIBILITY_RECORD_VERSION,
-                source: batch.source.clone(),
-                payload: StoredAccountVisibilityPayloadV1::Header {
-                    maintenance_disposition: batch.effects.maintenance_disposition,
-                },
-            };
-            self.upsert_visibility_record(&operation_id, 0, &record)?;
-        }
+        self.persist_repaired_leave_sources(&batches, &repaired)?;
         Ok(batches)
+    }
+
+    fn persist_repaired_leave_sources(
+        &self,
+        batches: &[AccountVisibilityBatch],
+        repaired: &[usize],
+    ) -> AccountResult<()> {
+        if repaired.is_empty() {
+            return Ok(());
+        }
+        let repaired_ids = repaired
+            .iter()
+            .map(|&index| batches[index].batch_id.clone())
+            .collect::<HashSet<_>>();
+        let rows = self
+            .visibility_storage
+            .load_account_visibility_journal()
+            .map_err(|error| AccountError::Session(SessionError::Storage(error)))?;
+        let mut upserts = Vec::new();
+        for row in rows {
+            if !repaired_ids.contains(&row.batch_id) {
+                continue;
+            }
+            let live = batches
+                .iter()
+                .find(|batch| batch.batch_id == row.batch_id)
+                .ok_or_else(|| {
+                    account_visibility_error("repaired visibility batch is missing from memory")
+                })?;
+            let mut record: StoredAccountVisibilityRecordV1 = serde_json::from_slice(&row.record)
+                .map_err(|error| {
+                account_visibility_error(format!("decode account visibility record: {error}"))
+            })?;
+            if record.source == live.source {
+                continue;
+            }
+            record.source = live.source.clone();
+            let encoded = serde_json::to_vec(&record).map_err(|error| {
+                account_visibility_error(format!("serialize account visibility record: {error}"))
+            })?;
+            upserts.push(AccountVisibilityJournalUpsert {
+                operation_id: row.operation_id,
+                ordinal: row.ordinal,
+                batch_id: row.batch_id,
+                record: encoded,
+            });
+        }
+        if !upserts.is_empty() {
+            self.visibility_storage
+                .upsert_account_visibility_journal_records(&upserts)
+                .map_err(|error| AccountError::Session(SessionError::Storage(error)))?;
+        }
+        Ok(())
     }
 
     fn record_terminal_outbound_action_outcome(
@@ -4956,14 +4990,13 @@ where
         published: bool,
     ) -> AccountResult<Option<AccountVisibilityActionOutcome>> {
         let mut group_ids = Vec::new();
-        if let Ok(fanouts) = self.session.outbound_fanouts() {
-            for fanout in fanouts {
-                if fanout.message_id() == message_id
-                    && let Some(group_id) = fanout.group_id()
-                    && !group_ids.contains(group_id)
-                {
-                    group_ids.push(group_id.clone());
-                }
+        let fanouts = self.session.outbound_fanouts()?;
+        for fanout in fanouts {
+            if fanout.message_id() == message_id
+                && let Some(group_id) = fanout.group_id()
+                && !group_ids.contains(group_id)
+            {
+                group_ids.push(group_id.clone());
             }
         }
         if let Some(operation_id) = self.active_visibility_operation
@@ -5001,6 +5034,19 @@ where
             }));
         }
         Ok(None)
+    }
+
+    fn leave_fanout_requires_action_outcome(&self, fanout: &OutboundFanout) -> AccountResult<bool> {
+        let Some(group_id) = fanout.group_id() else {
+            return Ok(false);
+        };
+        Ok(self
+            .visibility_storage
+            .leave_request(group_id)
+            .map_err(|error| AccountError::Session(SessionError::Storage(error)))?
+            .and_then(|request| request.last_proposed_message_id)
+            .as_ref()
+            == Some(fanout.message_id()))
     }
 
     async fn publish_queue(
@@ -5171,12 +5217,20 @@ where
                 .await?;
                 self.checkpoint_current_publish_visibility(visibility_handoff, &output)?;
             } else {
-                let published = outcome.accepted_targets >= fanout.request().required_acks;
+                let published = outcome.accepted_targets >= fanout.request().required_acks.max(1);
+                let outcomes_before = output.action_outcomes.len();
                 self.record_terminal_outbound_action_outcome(
                     fanout.message_id(),
                     published,
                     &mut output,
                 )?;
+                if self.leave_fanout_requires_action_outcome(&fanout)?
+                    && output.action_outcomes.len() == outcomes_before
+                {
+                    return Err(account_visibility_error(
+                        "leave fanout produced no durable action outcome",
+                    ));
+                }
                 self.checkpoint_current_publish_visibility(visibility_handoff, &output)?;
                 self.session.delete_outbound_fanout(fanout.message_id())?;
             }
@@ -6353,10 +6407,19 @@ where
         // can land while an optional target stays retryable, so emit durable
         // true at quorum rather than waiting for complete fanout. `published:
         // false` stays terminal: only a finished fanout that missed quorum.
+        let outcomes_before = output.action_outcomes.len();
         if status.met_required_acks {
             self.record_terminal_outbound_action_outcome(fanout.message_id(), true, output)?;
         } else if fanout_outcome.fanout_complete {
             self.record_terminal_outbound_action_outcome(fanout.message_id(), false, output)?;
+        }
+        if fanout_outcome.fanout_complete
+            && self.leave_fanout_requires_action_outcome(&fanout)?
+            && output.action_outcomes.len() == outcomes_before
+        {
+            return Err(account_visibility_error(
+                "leave fanout produced no durable action outcome",
+            ));
         }
         self.checkpoint_optional_publish_visibility(visibility_handoff, output)?;
         if fanout_outcome.fanout_complete

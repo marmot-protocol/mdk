@@ -173,8 +173,9 @@ fn exact_removed_local_slot_is_durable_and_scrubs_every_projection() {
     );
 
     let marker = app
-        .removed_local_key_package_tombstone_path(&removed.account_id_hex, Some("removed-slot"))
-        .unwrap();
+        .removed_local_key_package_account_tombstone_dir(&removed.account_id_hex)
+        .unwrap()
+        .join("slots.json");
     assert!(marker.exists());
     #[cfg(unix)]
     {
@@ -278,8 +279,9 @@ async fn account_manager_commits_slot_tombstone_before_account_home_removal() {
             .unwrap()
     );
     assert!(
-        app.removed_local_key_package_tombstone_path(&account.account_id_hex, Some("manager-slot"))
+        app.removed_local_key_package_account_tombstone_dir(&account.account_id_hex)
             .unwrap()
+            .join("slots.json")
             .exists()
     );
     runtime.shutdown().await;
@@ -448,8 +450,9 @@ async fn mismatched_legacy_key_package_cannot_choose_an_exact_removed_slot() {
         .unwrap();
 
     assert!(
-        app.removed_local_key_package_tombstone_path(&removed.account_id_hex, None)
+        app.removed_local_key_package_account_tombstone_dir(&removed.account_id_hex)
             .unwrap()
+            .join("slots.json")
             .exists(),
         "an unverifiable compatibility record must fall back to account-wide retirement"
     );
@@ -559,10 +562,10 @@ fn distinct_slot_tombstones_keep_exact_retired_slot_proof() {
         .unwrap();
     app.persist_removed_local_key_package_tombstone(&account)
         .unwrap();
-    let first = app
-        .removed_local_key_package_tombstone_path(&account.account_id_hex, Some("first-slot"))
-        .unwrap();
-    assert!(first.exists());
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "first-slot")
+            .unwrap()
+    );
 
     let second = app
         .removed_local_key_package_tombstone_path(&account.account_id_hex, Some("second-slot"))
@@ -586,12 +589,25 @@ fn distinct_slot_tombstones_keep_exact_retired_slot_proof() {
         "a second exact slot must not collapse retired-slot proof into all.json"
     );
     assert!(
-        first.exists() && second.exists(),
-        "exact retired-slot markers must survive a later distinct-slot tombstone"
-    );
-    assert!(
         app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "first-slot")
             .unwrap()
+            && app
+                .removed_local_key_package_slot_is_retired(&account.account_id_hex, "second-slot")
+                .unwrap(),
+        "exact retired-slot identities must survive compaction into the bounded journal"
+    );
+    let tombstone_dir = app
+        .removed_local_key_package_account_tombstone_dir(&account.account_id_hex)
+        .unwrap();
+    let leftover = std::fs::read_dir(&tombstone_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        leftover.len(),
+        1,
+        "compaction must leave one journal file, got {leftover:?}"
     );
 
     app.account_storage(&account.label)
@@ -604,6 +620,47 @@ fn distinct_slot_tombstones_keep_exact_retired_slot_proof() {
         app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "first-slot")
             .unwrap(),
         "re-admitting a retired lifecycle must not resurrect it without an exact marker"
+    );
+}
+
+#[test]
+fn removed_local_key_package_tombstone_journal_fails_closed_at_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("tombstone-cap")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let journal_dir = app
+        .removed_local_key_package_account_tombstone_dir(&account.account_id_hex)
+        .unwrap();
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let retired = (0..256)
+        .map(|index| format!("filled-slot-{index}"))
+        .collect::<Vec<_>>();
+    write_json(
+        journal_dir.join("slots.json"),
+        &serde_json::json!({
+            "account_id_hex": account.account_id_hex,
+            "retired_stable_slot_ids": retired,
+            "account_wide": false,
+        }),
+    )
+    .unwrap();
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "overflow-slot".to_owned(),
+        ))
+        .unwrap();
+    assert!(
+        app.persist_removed_local_key_package_tombstone(&account)
+            .is_err(),
+        "a 257th distinct retired slot must fail closed"
+    );
+    assert!(
+        !app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "overflow-slot")
+            .unwrap(),
+        "a rejected overflow slot must not be recorded as retired"
     );
 }
 
