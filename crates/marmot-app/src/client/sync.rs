@@ -977,6 +977,13 @@ impl AppClient {
     /// reference a not-yet-live (quarantined) group must not abort the drain —
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
+        if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_fail_pending_session_event_drain
+        {
+            return Err(AppError::BlockingTask(
+                "injected pending session event drain failure".to_owned(),
+            ));
+        }
         let effects = self.runtime.drain().await?;
         self.observe_drained_session_events(&effects).await
     }

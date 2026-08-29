@@ -2699,6 +2699,52 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
     });
 }
 
+/// The drain step's `Err` arm owes the same summary hand-off both its siblings
+/// make.
+///
+/// `run_pending_epoch_backfill` accumulates the relay drain's summary — which
+/// includes anything a previous failed pass deferred, folded in by
+/// `checkpoint_sync_prefix` — and then drains the engine's no-inbound events.
+/// The relay-drain arm above it merges `err.partial_summary` on failure and the
+/// clear-intent arm below it merges `summary`; this one returned `Err` and
+/// dropped it. The rows are durable either way, but `account_worker` publishes a
+/// summary only on `Ok`, so what the drop costs is the runtime event stream:
+/// projected state that persists in storage and never surfaces to a subscriber.
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn a_failed_event_drain_retains_the_backfill_prefix_for_the_next_seam() {
+    run_composed_app_runtime_test("backfill-drain-error-summary", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (_app, mut client, _group_id) = armed_epoch_backfill(
+            &dir,
+            &relay,
+            backfill_drain_test_config().with_dev_fail_pending_session_event_drain(),
+        )
+        .await;
+
+        // Progress this execution inherits: a prefix an earlier failed pass
+        // deferred, which the drain's own checkpoint folds into the summary the
+        // failing step below is holding.
+        let deferred = crate::SyncSummary {
+            joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
+            ..Default::default()
+        };
+        client.pending_failed_sync_summary.merge(deferred.clone());
+
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect_err("the injected event-drain failure must surface");
+
+        assert_eq!(
+            client.pending_failed_sync_summary, deferred,
+            "a drain-step failure must hand its accumulated prefix back for the next \
+             successful seam instead of dropping it off the runtime event stream",
+        );
+    });
+}
+
 /// A fruitless replay re-arms only the groups whose refusals it counted.
 ///
 /// The clear is scoped to this drain's attribution rather than swept
