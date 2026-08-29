@@ -54,7 +54,8 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, EventBuilder, Kind, PublicKey, RelayUrl, Tag,
+    Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -1523,11 +1524,10 @@ struct RemovedLocalKeyPackageTombstone {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct RemovedLocalKeyPackageTombstoneJournal {
     account_id_hex: String,
-    #[serde(default)]
     retired_stable_slot_ids: Vec<String>,
-    #[serde(default)]
     account_wide: bool,
 }
 
@@ -6141,14 +6141,7 @@ impl MarmotApp {
                     return false;
                 }
             };
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        let source_relays = match self.sanitize_key_package_deletion_endpoints(source_relays) {
+        let source_relays = match self.effective_nip65_key_package_endpoints(&relay_lists.nip65) {
             Ok(source_relays) if !source_relays.is_empty() => source_relays,
             Ok(_) | Err(_) => return false,
         };
@@ -7265,8 +7258,10 @@ impl MarmotApp {
 
     /// Canonicalize each NIP-65 compatibility/directional endpoint vector for
     /// semantic authority comparisons. Persisted event order and URL aliases
-    /// must not make the same relay declaration look different, while a
-    /// malformed or unsafe alias still fails closed.
+    /// must not make the same relay declaration look different. This is
+    /// deliberately structural rather than a dial-policy check: a signed
+    /// declaration remains the same authority when the local denylist,
+    /// loopback policy, or configured fallback changes.
     fn canonical_nip65_route_state(
         &self,
         state: &AccountRelayListState,
@@ -7276,14 +7271,17 @@ impl MarmotApp {
                 "NIP-65 authority comparison received the wrong event kind".into(),
             ));
         }
-        let canonicalize = |relays: &[String]| {
-            self.sanitize_key_package_deletion_endpoints(
-                relays
-                    .iter()
-                    .cloned()
-                    .map(TransportEndpoint)
-                    .collect::<Vec<_>>(),
-            )
+        let canonicalize = |relays: &[String]| -> Result<Vec<TransportEndpoint>, AppError> {
+            let mut canonical = Vec::with_capacity(relays.len());
+            for relay in relays {
+                let relay_url = RelayUrl::parse(relay.trim()).map_err(|_| {
+                    AppError::Publish("NIP-65 authority contains an invalid relay endpoint".into())
+                })?;
+                canonical.push(TransportEndpoint(relay_url.to_string()));
+            }
+            canonical.sort();
+            canonical.dedup();
+            Ok(canonical)
         };
         Ok((
             canonicalize(&state.relays)?,
@@ -7307,20 +7305,24 @@ impl MarmotApp {
                 "durable NIP-65 route generation has an invalid event id".into(),
             ));
         }
-        let endpoints = generation
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        let endpoints = self.sanitize_key_package_deletion_endpoints(endpoints)?;
+        let endpoints = self.canonical_nip65_route_state(&generation.nip65)?.0;
         if endpoints.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
                 MissingRelayListKind::Nip65,
             ]));
         }
         Ok(endpoints)
+    }
+
+    /// Select the safe endpoints this device may use for one exact durable
+    /// generation. Generation validation remains configuration-independent;
+    /// only this operational step may filter or fall back.
+    fn effective_nip65_route_generation_endpoints(
+        &self,
+        generation: &Nip65RouteGeneration,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        self.validate_nip65_route_generation(generation)?;
+        self.effective_nip65_key_package_endpoints(&generation.nip65)
     }
 
     fn next_locally_authored_nip65_created_at(&self, label: &str) -> Result<u64, AppError> {
@@ -7394,7 +7396,7 @@ impl MarmotApp {
                 "local NIP-65 route authority is unavailable".into(),
             ));
         };
-        self.validate_nip65_route_generation(&generation)
+        self.effective_nip65_route_generation_endpoints(&generation)
     }
 
     async fn sign_account_transport_event(
@@ -7458,19 +7460,7 @@ impl MarmotApp {
                 "pending NIP-65 route generation has an invalid event id".into(),
             ));
         }
-        let proposed = pending
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        let proposed = self.sanitize_key_package_deletion_endpoints(proposed)?;
-        if proposed.is_empty() {
-            return Err(AppError::MissingRelayLists(vec![
-                MissingRelayListKind::Nip65,
-            ]));
-        }
+        let proposed = self.validate_nip65_route_generation(&pending.generation)?;
         if let Some(event) = pending.signed_event.as_ref() {
             event
                 .to_verified_nostr_event()
@@ -7651,7 +7641,15 @@ impl MarmotApp {
                     .into(),
             ));
         }
-        let proposed = self.validate_pending_nip65_route_mutation(label, &pending)?;
+        let declared = self.validate_pending_nip65_route_mutation(label, &pending)?;
+        let proposed = if pending.source == Nip65RouteMutationSource::GeneratedAccountBootstrap {
+            // A generated identity's prepared KeyPackage is bound to the
+            // caller-requested exact authority. A later local policy change
+            // must fail recovery rather than silently substitute defaults.
+            self.sanitize_key_package_deletion_endpoints(declared)?
+        } else {
+            self.effective_nip65_key_package_endpoints(&pending.nip65)?
+        };
         // Always re-evaluate the marker before recovery I/O. Only the exact
         // generated-account bootstrap intent may retain a fresh-identity
         // proof; every legacy or ordinary intent re-arms the SQL gate. This
@@ -7752,19 +7750,8 @@ impl MarmotApp {
         {
             return self.account_relay_list_status(label);
         }
-        let proposed = self.sanitize_key_package_deletion_endpoints(
-            nip65
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect(),
-        )?;
-        if proposed.is_empty() {
-            return Err(AppError::MissingRelayLists(vec![
-                MissingRelayListKind::Nip65,
-            ]));
-        }
+        self.validate_nip65_route_generation(&generation)?;
+        let proposed = self.effective_nip65_key_package_endpoints(&generation.nip65)?;
         let pending = PendingNip65RouteMutation {
             account_id_hex: account.account_id_hex,
             nip65,
@@ -7872,7 +7859,7 @@ impl MarmotApp {
             return Ok(BTreeSet::new());
         };
         Ok(self
-            .validate_nip65_route_generation(&generation)?
+            .effective_nip65_route_generation_endpoints(&generation)?
             .into_iter()
             .collect())
     }
@@ -8584,7 +8571,8 @@ impl MarmotApp {
         else {
             return false;
         };
-        let Ok(authoritative_endpoints) = self.validate_nip65_route_generation(&current_generation)
+        let Ok(authoritative_endpoints) =
+            self.effective_nip65_route_generation_endpoints(&current_generation)
         else {
             return false;
         };
@@ -8630,7 +8618,7 @@ impl MarmotApp {
                 )
             })?;
         let mut generation_relays = self
-            .validate_nip65_route_generation(&generation)?
+            .effective_nip65_route_generation_endpoints(&generation)?
             .into_iter()
             .map(|endpoint| endpoint.0)
             .collect::<Vec<_>>();
@@ -10750,10 +10738,16 @@ impl MarmotApp {
         // list. Fall back to the configured default relays when the account has
         // no usable NIP-65 relay. This runtime fallback is not published as a
         // replacement for the account's relay list.
-        let offered = relay_lists.nip65.relays.len();
+        self.select_nip65_key_package_endpoints(&relay_lists.nip65)
+    }
+
+    fn select_nip65_key_package_endpoints(
+        &self,
+        nip65: &AccountRelayListState,
+    ) -> Vec<TransportEndpoint> {
+        let offered = nip65.relays.len();
         let safe = self.retain_safe_discovered_endpoints(
-            relay_lists
-                .nip65
+            nip65
                 .relays
                 .iter()
                 .cloned()
@@ -10775,6 +10769,22 @@ impl MarmotApp {
             );
         }
         fallback
+    }
+
+    /// Resolve an untrusted signed NIP-65 declaration to the endpoints this
+    /// device may actually use without rewriting the signed declaration.
+    /// Unsafe discovered routes are filtered; when none remain, configured
+    /// defaults retain the existing key-package routing fallback contract.
+    pub(crate) fn effective_nip65_key_package_endpoints(
+        &self,
+        nip65: &AccountRelayListState,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        // Reject a structurally malformed signed declaration even when a
+        // configured fallback exists. Retired or otherwise policy-prohibited
+        // but well-formed URLs remain durable and are filtered below.
+        self.canonical_nip65_route_state(nip65)?;
+        let endpoints = self.select_nip65_key_package_endpoints(nip65);
+        self.sanitize_key_package_deletion_endpoints(endpoints)
     }
 
     fn transport_label(&self) -> &'static str {

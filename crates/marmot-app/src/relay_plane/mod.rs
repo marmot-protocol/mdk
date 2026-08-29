@@ -1672,25 +1672,24 @@ async fn handle_relay_notification(
                     event,
                 },
         } => {
-            // Raw per-relay copy (not deduplicated): telemetry
-            // only, so cross-relay arrival spread and per-relay
-            // first-event timing see every relay's copy. Delivery
-            // happens on the deduplicated `Event` arm above. Keep
-            // this in sync with the relay plane's own tap; the
-            // SDK client's standalone forwarder is unused here.
+            // Raw per-relay copy (not deduplicated): always retain it for
+            // telemetry. An active post-join maintenance subscription also
+            // needs its account-scoped copy: nostr-sdk suppresses the ordinary
+            // deduplicated Event when another local account already cached the
+            // stored replay. Ordinary raw copies remain telemetry-only.
             if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
                 tracing::trace!(
                     target: "marmot_app::relay_plane",
                     method = "handle_relay_notification",
                     "observing per-relay event copy"
                 );
-                adapter
-                    .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
-                        endpoint: TransportEndpoint(relay_url.to_string()),
-                        subscription_id: Some(subscription_id.to_string()),
-                        event,
-                    })
-                    .await;
+                let relay_event = transport_nostr_adapter::NostrRelayEvent {
+                    endpoint: TransportEndpoint(relay_url.to_string()),
+                    subscription_id: Some(subscription_id.to_string()),
+                    event,
+                };
+                adapter.observe_relay_event(relay_event.clone()).await;
+                let _ = adapter.handle_group_maintenance_replay(relay_event).await;
             }
             false
         }

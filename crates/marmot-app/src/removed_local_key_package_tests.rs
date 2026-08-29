@@ -713,6 +713,76 @@ fn oversized_tombstone_journal_fails_closed_without_cleanup() {
 }
 
 #[test]
+fn partial_or_typoed_tombstone_journal_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("tombstone-partial")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let journal_path = app
+        .removed_local_key_package_tombstone_journal_path(&account.account_id_hex)
+        .unwrap();
+    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "fresh-slot".to_owned(),
+        ))
+        .unwrap();
+
+    let cases = [
+        (
+            "account-id only",
+            serde_json::json!({
+                "account_id_hex": account.account_id_hex,
+            }),
+        ),
+        (
+            "missing retired slots",
+            serde_json::json!({
+                "account_id_hex": account.account_id_hex,
+                "account_wide": false,
+            }),
+        ),
+        (
+            "missing account-wide proof",
+            serde_json::json!({
+                "account_id_hex": account.account_id_hex,
+                "retired_stable_slot_ids": ["retired-slot"],
+            }),
+        ),
+        (
+            "typoed proof field",
+            serde_json::json!({
+                "account_id_hex": account.account_id_hex,
+                "retired_stable_slot_id": ["retired-slot"],
+                "account_wide": false,
+            }),
+        ),
+    ];
+
+    for (label, value) in cases {
+        write_json(&journal_path, &value).unwrap();
+        let before = std::fs::read(&journal_path).unwrap();
+        assert!(
+            app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "retired-slot",)
+                .is_err(),
+            "{label} must not deserialize as an empty retirement proof"
+        );
+        assert!(
+            app.persist_removed_local_key_package_tombstone(&account)
+                .is_err(),
+            "{label} must abort removal before rewriting tombstone state"
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            before,
+            "{label} must remain untouched for explicit recovery"
+        );
+    }
+}
+
+#[test]
 fn malformed_legacy_exact_slot_tombstone_is_not_deleted_on_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())

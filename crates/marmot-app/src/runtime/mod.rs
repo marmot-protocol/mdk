@@ -7033,6 +7033,14 @@ impl AccountManager {
         if account.signed_out {
             return Err(AppError::RelayDirectory("account is signed out".into()));
         }
+        if account.external_signing
+            && !account.local_signing
+            && !self.app.has_external_signer(&account.account_id_hex)
+        {
+            return Err(AppError::ExternalSignerUnavailable(
+                account.account_id_hex.clone(),
+            ));
+        }
         self.reconcile().await?;
         let workers = self.workers.lock().await;
         workers

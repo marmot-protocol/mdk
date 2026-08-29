@@ -1326,6 +1326,23 @@ impl AppClient {
                 .unwrap_or(false)
     }
 
+    /// Forget this client's ephemeral ownership even when relay-side cleanup
+    /// fails. The adapter commits the matching local teardown before awaiting
+    /// its fallible unsubscribe, so retaining this entry on `Err` would make a
+    /// later maintenance pass mistake a dead registration for a live one.
+    async fn remove_post_join_maintenance_subscription(
+        &mut self,
+        group_id: &GroupId,
+        route: &cgka_traits::TransportGroupSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let result = self
+            .adapter
+            .remove_group_maintenance_subscription(route)
+            .await;
+        self.post_join_maintenance_subscriptions.remove(group_id);
+        result
+    }
+
     /// Install, poll, and retire temporary post-join full-history
     /// subscriptions. A restart reconstructs this ephemeral map from durable
     /// CatchUp obligations; the EOSE deadline itself remains persisted.
@@ -1342,8 +1359,7 @@ impl AppClient {
                 .collect::<Vec<_>>();
             for (group_id, route) in active {
                 if let Err(_error) = self
-                    .adapter
-                    .remove_group_maintenance_subscription(&route)
+                    .remove_post_join_maintenance_subscription(&group_id, &route)
                     .await
                 {
                     tracing::warn!(
@@ -1354,11 +1370,41 @@ impl AppClient {
                     );
                     continue;
                 }
-                self.post_join_maintenance_subscriptions.remove(&group_id);
             }
             return Ok(());
         }
         let routes = self.routing.snapshot().group_routes;
+        // A post-join history REQ can return group traffic immediately. The
+        // adapter routes those deliveries through the ordinary group-route
+        // snapshot rather than through the maintenance subscription id, so
+        // installing or polling it while that snapshot is stale can consume
+        // and deduplicate an event the app cannot yet route. Quiesce every
+        // temporary subscription first and do not poll stale EOSE state; the
+        // worker-owned route retry re-enters this method after a successful
+        // rebuild and installs each waiting group on its current route.
+        let ordinary_routes_ready = !self.has_pending_runtime_group_subscription_refresh();
+        if !ordinary_routes_ready {
+            let active = self
+                .post_join_maintenance_subscriptions
+                .iter()
+                .map(|(group_id, (_, route))| (group_id.clone(), route.clone()))
+                .collect::<Vec<_>>();
+            for (group_id, route) in active {
+                if let Err(_error) = self
+                    .remove_post_join_maintenance_subscription(&group_id, &route)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "stale_route_subscription_remove_failed",
+                        "could not quiesce post-join maintenance subscription before route refresh"
+                    );
+                    continue;
+                }
+            }
+            return Ok(());
+        }
         let mut waiting = HashSet::new();
 
         for group in self.state.groups.clone() {
@@ -1386,6 +1432,24 @@ impl AppClient {
                     continue;
                 }
             };
+
+            // Account activation replaces every relay subscription, including
+            // temporary maintenance REQs, and clears their adapter-owned EOSE
+            // state. The AppClient survives that activation, so discard a
+            // same-route entry whose adapter registration disappeared; the
+            // normal install block below then reissues it on the current route.
+            if let Some((subscription_id, _)) = self
+                .post_join_maintenance_subscriptions
+                .get(&group_id)
+                .cloned()
+                && self
+                    .adapter
+                    .group_maintenance_any_eose(&subscription_id)
+                    .await
+                    .is_none()
+            {
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+            }
             let needs_subscription = status.obligations.iter().any(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
@@ -1400,23 +1464,58 @@ impl AppClient {
             }
             waiting.insert(group_id.clone());
 
+            let Some(route) = routes
+                .iter()
+                .find(|route| route.group_id == group_id)
+                .cloned()
+            else {
+                if let Some((_, active_route)) = self
+                    .post_join_maintenance_subscriptions
+                    .get(&group_id)
+                    .cloned()
+                    && let Err(_error) = self
+                        .remove_post_join_maintenance_subscription(&group_id, &active_route)
+                        .await
+                {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "missing_route_subscription_remove_failed",
+                        "could not remove post-join maintenance subscription whose route disappeared"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "missing_route",
+                    "skipping post-join maintenance group without a route"
+                );
+                continue;
+            };
+
+            if let Some((_, active_route)) = self
+                .post_join_maintenance_subscriptions
+                .get(&group_id)
+                .cloned()
+                && active_route != route
+                && let Err(_error) = self
+                    .remove_post_join_maintenance_subscription(&group_id, &active_route)
+                    .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "rotated_route_subscription_remove_failed",
+                    "could not rotate post-join maintenance subscription to the current route"
+                );
+                continue;
+            }
+
             if !self
                 .post_join_maintenance_subscriptions
                 .contains_key(&group_id)
             {
-                let Some(route) = routes
-                    .iter()
-                    .find(|route| route.group_id == group_id)
-                    .cloned()
-                else {
-                    tracing::warn!(
-                        target: "marmot_app::maintenance",
-                        method = "advance_post_join_maintenance_subscriptions",
-                        error_kind = "missing_route",
-                        "skipping post-join maintenance group without a route"
-                    );
-                    continue;
-                };
                 let subscription_id = match self
                     .adapter
                     .install_group_maintenance_subscription(route.clone())
@@ -1486,8 +1585,7 @@ impl AppClient {
                 .get(&group_id)
                 .cloned()
                 && let Err(_error) = self
-                    .adapter
-                    .remove_group_maintenance_subscription(&route)
+                    .remove_post_join_maintenance_subscription(&group_id, &route)
                     .await
             {
                 tracing::warn!(
@@ -1498,7 +1596,6 @@ impl AppClient {
                 );
                 continue;
             }
-            self.post_join_maintenance_subscriptions.remove(&group_id);
         }
         Ok(())
     }

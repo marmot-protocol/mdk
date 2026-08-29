@@ -3249,7 +3249,23 @@ async fn handle_account_worker_command(
                 .retry_pending_runtime_group_subscription_refresh()
                 .await
             {
-                Ok(pending) => pending,
+                Ok(pending) => {
+                    if !pending
+                        && let Err(error) =
+                            client.advance_post_join_maintenance_subscriptions().await
+                    {
+                        publish_app_runtime_account_error(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            account_error_message(
+                                "post-join maintenance subscription failed",
+                                &error,
+                            ),
+                        );
+                    }
+                    pending
+                }
                 Err(error) => {
                     publish_app_runtime_account_error(
                         events,

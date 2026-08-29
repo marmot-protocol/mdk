@@ -407,14 +407,7 @@ impl MarmotApp {
         let winner_state = relay_list_state_from_event(&winner_event).ok_or_else(|| {
             AppError::RelayDirectory("strict setup NIP-65 winner has no relay-list state".into())
         })?;
-        let safe_write_relays = self.sanitize_key_package_deletion_endpoints(
-            winner_state
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect(),
-        )?;
+        let safe_write_relays = self.effective_nip65_key_package_endpoints(&winner_state)?;
         if safe_write_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
                 MissingRelayListKind::Nip65,

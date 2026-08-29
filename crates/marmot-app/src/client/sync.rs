@@ -5642,6 +5642,208 @@ mod runtime_group_subscription_refresh_tests {
     }
 
     #[tokio::test]
+    async fn pending_route_refresh_quiesces_and_rotates_post_join_maintenance_subscription() {
+        let (_dir, relay, _alice, mut bob_client, group_id) =
+            pending_welcome_fixture("post-join maintenance route rotation").await;
+
+        let joined = bob_client.sync().await.unwrap();
+        assert_eq!(joined.joined_groups, vec![group_id.clone()]);
+        assert!(!bob_client.has_pending_runtime_group_subscription_refresh());
+
+        let route_a = bob_client
+            .routing
+            .snapshot()
+            .group_routes
+            .into_iter()
+            .find(|route| route.group_id == group_id)
+            .expect("the joined group must have an ordinary route");
+        bob_client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let (subscription_a, active_route_a) = bob_client
+            .post_join_maintenance_subscriptions
+            .get(&group_id)
+            .cloned()
+            .expect("the CatchUp obligation must install route A maintenance");
+        assert_eq!(active_route_a, route_a);
+
+        for endpoint in &route_a.endpoints {
+            bob_client
+                .relay_plane
+                .handle_relay_eose_for_test(endpoint.clone(), subscription_a.clone())
+                .await;
+        }
+        assert_eq!(
+            bob_client
+                .adapter
+                .group_maintenance_any_eose(&subscription_a)
+                .await,
+            Some(true),
+            "route A must hold stale EOSE evidence before the refresh starts",
+        );
+
+        // Adapter teardown is local-first. Even if relay-side unsubscribe
+        // fails, the client must forget route A so the successful refresh can
+        // install route B instead of retaining a dead ownership record.
+        relay.fail_next_unsubscribe();
+        bob_client.pending_runtime_group_subscription_refresh = true;
+        bob_client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(
+            !bob_client
+                .post_join_maintenance_subscriptions
+                .contains_key(&group_id),
+            "a pending ordinary-route refresh must quiesce route A maintenance",
+        );
+        assert_eq!(
+            bob_client
+                .adapter
+                .group_maintenance_any_eose(&subscription_a)
+                .await,
+            None,
+            "quiescing route A must forget its stale EOSE evidence",
+        );
+        let status = bob_client.runtime.maintenance_status(&group_id).unwrap();
+        let post_join = status
+            .obligations
+            .iter()
+            .find(|obligation| obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+            .expect("the post-join obligation must remain durable while routes refresh");
+        assert_eq!(
+            post_join.phase,
+            cgka_traits::MaintenancePhase::CatchUp,
+            "stale route A EOSE must not advance the obligation",
+        );
+
+        let mut route_b = route_a;
+        route_b.endpoints = vec![crate::TransportEndpoint("wss://relay-b.example".to_owned())];
+        assert!(
+            bob_client
+                .routing
+                .replace_group_routes(&group_id, vec![route_b.clone()]),
+            "route B must differ from the installed ordinary route",
+        );
+        bob_client.pending_runtime_group_subscription_refresh = false;
+        bob_client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+
+        let (subscription_b, active_route_b) = bob_client
+            .post_join_maintenance_subscriptions
+            .get(&group_id)
+            .cloned()
+            .expect("the refreshed route must reinstall post-join maintenance");
+        assert_eq!(active_route_b, route_b);
+        assert_ne!(
+            subscription_b, subscription_a,
+            "the endpoint change must produce a fresh maintenance subscription id",
+        );
+        assert_eq!(
+            bob_client
+                .adapter
+                .group_maintenance_any_eose(&subscription_b)
+                .await,
+            Some(false),
+            "route B must start with fresh EOSE state",
+        );
+    }
+
+    #[tokio::test]
+    async fn account_reactivation_reinstalls_same_route_post_join_maintenance_subscription() {
+        let (_dir, relay, _alice, mut bob_client, group_id) =
+            pending_welcome_fixture("post-join maintenance account reactivation").await;
+
+        let joined = bob_client.sync().await.unwrap();
+        assert_eq!(joined.joined_groups, vec![group_id.clone()]);
+        bob_client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let (subscription_before, route_before) = bob_client
+            .post_join_maintenance_subscriptions
+            .get(&group_id)
+            .cloned()
+            .expect("the CatchUp obligation must install maintenance");
+        let accepted_before = relay
+            .accepted_subscriptions()
+            .into_iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    transport_nostr_adapter::NostrSubscription::GroupMaintenance {
+                        group_id: subscribed_group,
+                        ..
+                    } if subscribed_group == &group_id
+                )
+            })
+            .count();
+
+        // Account activation replaces every SDK subscription and clears the
+        // adapter's maintenance ownership/EOSE state, while this AppClient and
+        // its same-route ephemeral entry survive.
+        bob_client.runtime.activate_transport(None).await.unwrap();
+        assert_eq!(
+            bob_client
+                .adapter
+                .group_maintenance_any_eose(&subscription_before)
+                .await,
+            None,
+            "reactivation must retire the old adapter registration",
+        );
+        assert!(
+            bob_client
+                .post_join_maintenance_subscriptions
+                .contains_key(&group_id),
+            "the regression requires a surviving same-route client entry",
+        );
+
+        bob_client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let (subscription_after, route_after) = bob_client
+            .post_join_maintenance_subscriptions
+            .get(&group_id)
+            .cloned()
+            .expect("maintenance must reinstall after account activation");
+        assert_eq!(route_after, route_before);
+        assert_eq!(
+            subscription_after, subscription_before,
+            "same account/group/route intentionally reuses its deterministic id",
+        );
+        assert_eq!(
+            bob_client
+                .adapter
+                .group_maintenance_any_eose(&subscription_after)
+                .await,
+            Some(false),
+            "the reused id must own a fresh adapter registration",
+        );
+        let accepted_after = relay
+            .accepted_subscriptions()
+            .into_iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    transport_nostr_adapter::NostrSubscription::GroupMaintenance {
+                        group_id: subscribed_group,
+                        ..
+                    } if subscribed_group == &group_id
+                )
+            })
+            .count();
+        assert_eq!(
+            accepted_after,
+            accepted_before + 1,
+            "maintenance must be reissued instead of polling a forgotten id",
+        );
+    }
+
+    #[tokio::test]
     async fn catch_up_checkpoint_defers_subscription_refresh_after_durable_save() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())

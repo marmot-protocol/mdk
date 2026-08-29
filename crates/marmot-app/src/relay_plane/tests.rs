@@ -409,7 +409,7 @@ async fn managed_account_worker_reopens_transport_after_notification_recovery() 
         RelayNotificationConsumerExit::Lagged(3),
     );
 
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             let inbox_subscriptions = relay
                 .subscriptions

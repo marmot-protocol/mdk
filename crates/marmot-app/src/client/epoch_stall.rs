@@ -583,6 +583,15 @@ impl EpochStallDetector {
         self
     }
 
+    /// Override the same-epoch re-arm interval without rebuilding restored
+    /// detector state. Unit tests use this after reopen so their wall-clock
+    /// pacing scenarios stay testable even when the production-policy feature
+    /// set deliberately ignores development config overrides.
+    #[cfg(test)]
+    pub(crate) fn set_wedge_rearm_interval_ms_for_test(&mut self, interval_ms: u64) {
+        self.wedge_rearm_interval_ms = interval_ms;
+    }
+
     /// Escalate a wedged group after `threshold` fruitless end-of-stored-events
     /// completions instead of the production
     /// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
