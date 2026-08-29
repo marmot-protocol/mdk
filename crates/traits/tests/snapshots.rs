@@ -464,6 +464,13 @@ fn snapshot_ingest_outcomes() {
         }
     );
     insta::assert_json_snapshot!(
+        "transport_deferred_contested_fork",
+        IngestOutcome::TransportDeferred {
+            group_id: gid(),
+            lineage: DeferralLineage::ContestedFork
+        }
+    );
+    insta::assert_json_snapshot!(
         "resource_refused_deferred_capacity",
         IngestOutcome::ResourceRefused {
             group_id: gid(),

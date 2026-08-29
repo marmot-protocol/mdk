@@ -73,7 +73,7 @@ pub enum IngestOutcome {
 /// candidate-branch context set it is derived from: [`Self::ContestedFork`] is
 /// positive evidence, while [`Self::Uncontested`] is the absence of evidence
 /// rather than proof of its opposite.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeferralLineage {
     /// No two retained commits fork from the same source epoch, so this device
     /// holds no evidence that any of this group's traffic is sealed under a
@@ -83,7 +83,6 @@ pub enum DeferralLineage {
     /// fork whose rival commit never reached this device looks exactly like no
     /// fork at all — and that case is precisely the one a relay backfill is the
     /// right answer for, because the commit it needs really is missing history.
-    #[default]
     Uncontested,
     /// Two retained commits fork from the same source epoch: part of this
     /// group's traffic is sealed under a branch this device has not adopted.

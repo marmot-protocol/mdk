@@ -1,0 +1,15 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "IngestOutcome::TransportDeferred\n{ group_id: gid(), lineage: DeferralLineage::ContestedFork }"
+---
+{
+  "TransportDeferred": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "lineage": "ContestedFork"
+  }
+}
