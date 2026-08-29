@@ -4501,9 +4501,26 @@ where
         let Some(batch_ids) = self.visibility_lease_batch_ids(lease) else {
             return false;
         };
-        let Ok(batches) = self.load_visibility_batches() else {
-            return false;
-        };
+        self.delete_visibility_batches_acking_engine_outbox(&batch_ids)
+            .is_ok()
+            && self
+                .forget_durably_acknowledged_visibility_lease(lease)
+                .unwrap_or(false)
+    }
+
+    /// Delete visibility rows and ACK any engine application-event ids they
+    /// carry in one storage transaction. Legacy `drain` / `ingest_delivery`
+    /// transfer ownership synchronously; without this ACK a returned
+    /// `MessageReceived` / `GroupJoined` is hydrated back into the engine
+    /// outbox on every reopen.
+    fn delete_visibility_batches_acking_engine_outbox(
+        &self,
+        batch_ids: &[Vec<u8>],
+    ) -> AccountResult<()> {
+        if batch_ids.is_empty() {
+            return Ok(());
+        }
+        let batches = self.load_visibility_batches()?;
         let engine_outbox_ids = batches
             .iter()
             .filter(|batch| batch_ids.contains(&batch.batch_id))
@@ -4518,16 +4535,14 @@ where
             .flat_map(|batch| batch.effects.events.iter())
             .filter_map(engine_outbox_event_id)
             .collect::<Vec<_>>();
-        let deleted = self.visibility_storage.with_transaction(|storage| {
-            storage.delete_pending_application_events(&engine_outbox_ids)?;
-            storage.delete_account_visibility_journal_batches(&batch_ids)?;
-            Ok::<_, StorageError>(())
-        });
-        if deleted.is_err() {
-            return false;
-        }
-        self.forget_durably_acknowledged_visibility_lease(lease)
-            .unwrap_or(false)
+        self.visibility_storage
+            .with_transaction(|storage| {
+                storage.delete_pending_application_events(&engine_outbox_ids)?;
+                storage.delete_account_visibility_journal_batches(batch_ids)?;
+                Ok::<_, StorageError>(())
+            })
+            .map_err(|error| AccountError::Session(SessionError::Storage(error)))?;
+        Ok(())
     }
 
     /// Forget a lease only after its rows were durably deleted, normally inside
@@ -4613,9 +4628,7 @@ where
             .filter(|row| row.operation_id.as_slice() == operation_id)
             .map(|row| row.batch_id)
             .collect::<Vec<_>>();
-        self.visibility_storage
-            .delete_account_visibility_journal_batches(&batch_ids)
-            .map_err(|error| AccountError::Session(SessionError::Storage(error)))?;
+        self.delete_visibility_batches_acking_engine_outbox(&batch_ids)?;
         self.durable_visibility_operations.remove(&operation_id);
         Ok(())
     }
@@ -4721,6 +4734,21 @@ where
             .map(decode_account_visibility_row)
             .collect::<AccountResult<Vec<_>>>()?;
         let mut accepted_leave_messages = HashMap::<GroupId, Option<MessageId>>::new();
+        let mut latest_leave_header_seq = HashMap::<GroupId, u64>::new();
+        for batch in &batches {
+            let AccountVisibilitySource::Outbound {
+                group_id: Some(group_id),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                ..
+            } = &batch.source
+            else {
+                continue;
+            };
+            latest_leave_header_seq
+                .entry(group_id.clone())
+                .and_modify(|sequence| *sequence = (*sequence).max(batch.sequence))
+                .or_insert(batch.sequence);
+        }
         for batch in &mut batches {
             let AccountVisibilitySource::Outbound {
                 group_id: Some(group_id),
@@ -4731,16 +4759,15 @@ where
             else {
                 continue;
             };
-            if action_message_id.is_some() {
-                continue;
-            }
             let accepted_message_id = match accepted_leave_messages.get(group_id) {
                 Some(message_id) => message_id.clone(),
                 None => {
                     // The engine atomically writes this exact id in the
                     // LeaveRequest with the sent SelfRemove row. Its absence
                     // distinguishes a crash after the tentative Header from
-                    // one after acceptance.
+                    // one after acceptance. Auto-reproposal may later move
+                    // that id from M1 to M2; Headers already bound to M1
+                    // follow so the terminal outcome still reaches the app.
                     let message_id = self
                         .visibility_storage
                         .leave_request(group_id)
@@ -4750,7 +4777,23 @@ where
                     message_id
                 }
             };
-            *action_message_id = accepted_message_id;
+            let Some(current_id) = accepted_message_id else {
+                continue;
+            };
+            match action_message_id {
+                Some(bound_id) if bound_id != &current_id => {
+                    *bound_id = current_id;
+                }
+                None => {
+                    // Only the newest pre-acceptance Header for this group
+                    // may inherit the current LeaveRequest id. An older
+                    // unacknowledged None Header must not bind a later Leave.
+                    if latest_leave_header_seq.get(group_id) == Some(&batch.sequence) {
+                        *action_message_id = Some(current_id);
+                    }
+                }
+                Some(_) => {}
+            }
         }
         Ok(batches)
     }
@@ -6170,12 +6213,14 @@ where
             }
         }
         output.fanout.push(fanout_outcome.clone());
-        if fanout_outcome.fanout_complete {
-            self.record_terminal_outbound_action_outcome(
-                fanout.message_id(),
-                status.met_required_acks,
-                output,
-            )?;
+        // Leave membership is authorized by `published: true`. Required ACKs
+        // can land while an optional target stays retryable, so emit durable
+        // true at quorum rather than waiting for complete fanout. `published:
+        // false` stays terminal: only a finished fanout that missed quorum.
+        if status.met_required_acks {
+            self.record_terminal_outbound_action_outcome(fanout.message_id(), true, output)?;
+        } else if fanout_outcome.fanout_complete {
+            self.record_terminal_outbound_action_outcome(fanout.message_id(), false, output)?;
         }
         self.checkpoint_optional_publish_visibility(visibility_handoff, output)?;
         if fanout_outcome.fanout_complete

@@ -316,7 +316,7 @@ pub(crate) async fn account_command(
                 default_relays,
                 bootstrap_relays,
                 publish_missing_relay_lists,
-                true,
+                false,
                 nsec_stdin,
                 runtime_info,
                 relay,

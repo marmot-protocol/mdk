@@ -1,4 +1,4 @@
-//! Migration 0053: durable per-account epoch-backfill intent state.
+//! Migration 0057: durable per-account epoch-backfill intent state.
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;

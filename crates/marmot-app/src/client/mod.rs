@@ -443,9 +443,9 @@ pub struct AppClient {
     /// Earliest instant an automatic seam may retry a pending epoch-gap
     /// backfill whose last attempt could not confirm its replay.
     ///
-    /// Process-local on purpose: the intent it paces is durable, so a restart
-    /// costs at most one unpaced attempt, while persisting a monotonic deadline
-    /// would mean durable schema for a scheduling hint.
+    /// Restored from the singleton intent journal so a restart cannot spin a
+    /// fruitless replay at full speed. The remaining duration is stored as a
+    /// wall-clock deadline beside the durable intent set.
     pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
@@ -3039,6 +3039,7 @@ impl AppClient {
                 }
             }
         }
+        self.prune_deleted_epoch_backfill_group(group_id);
         Ok(was_live || result)
     }
 

@@ -11,6 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Legacy `wn account create` stays a compatibility/repair surface and does not
+  force initial KeyPackage publication. `wn create-identity` and `wn login`
+  still publish the initial KeyPackage.
 - `wnd` now owns the Marmot data root exclusively and executes `wn logout`
   through that owned runtime. With no daemon, the foreground CLI acquires the
   same exclusive lease. Logout uses the runtime wipe path to quiesce account

@@ -2068,7 +2068,9 @@ impl<S: StorageProvider> Engine<S> {
                 if request.last_proposed_epoch.is_none() {
                     request.last_proposed_epoch = Some(group.epoch);
                 }
-                request.last_proposed_message_id = Some(message_id);
+                if request.last_proposed_message_id.is_none() {
+                    request.last_proposed_message_id = Some(message_id);
+                }
                 self.storage.put_leave_request(&request)?;
             }
             return Ok(Some(request));

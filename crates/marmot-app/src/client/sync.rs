@@ -122,6 +122,25 @@ pub(crate) struct EpochBackfillExecution {
 
 const EPOCH_BACKFILL_INTENT_JOURNAL_VERSION: u32 = 1;
 
+fn epoch_backfill_retry_deadline_unix_ms(not_before: Option<Instant>) -> Option<u64> {
+    let remaining = not_before?.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(
+        crate::unix_now_seconds()
+            .saturating_mul(1_000)
+            .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)),
+    )
+}
+
+fn restore_epoch_backfill_retry_deadline(deadline_unix_ms: Option<u64>) -> Option<Instant> {
+    let deadline_unix_ms = deadline_unix_ms?;
+    let now_unix_ms = crate::unix_now_seconds().saturating_mul(1_000);
+    let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
+    (remaining_ms > 0).then(|| Instant::now() + Duration::from_millis(remaining_ms))
+}
+
 /// App-owned representation stored as one encrypted account-DB blob. Groups
 /// are a vector rather than a JSON map because `GroupId` is opaque bytes and
 /// JSON object keys must be strings.
@@ -132,6 +151,11 @@ struct PersistedEpochBackfillIntentJournal {
     pending: Option<PersistedEpochBackfillIntent>,
     active: Option<PersistedEpochBackfillIntent>,
     queued: Vec<PersistedEpochBackfillIntent>,
+    /// Wall-clock deadline for the account-wide replay cooldown. Restored as
+    /// a remaining `Instant` duration so a restart cannot spin a fruitless
+    /// backfill at full speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_not_before_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -576,6 +600,8 @@ impl AppClient {
             if self.pending_epoch_backfill.is_none()
                 && self.active_epoch_backfill.is_none()
                 && self.queued_epoch_backfills.is_empty()
+                && epoch_backfill_retry_deadline_unix_ms(self.epoch_backfill_retry_not_before)
+                    .is_none()
             {
                 storage.clear_epoch_backfill_intent_journal()?;
                 return Ok(());
@@ -595,6 +621,9 @@ impl AppClient {
                     .iter()
                     .map(PersistedEpochBackfillIntent::from)
                     .collect(),
+                retry_not_before_unix_ms: epoch_backfill_retry_deadline_unix_ms(
+                    self.epoch_backfill_retry_not_before,
+                ),
             };
             storage.store_epoch_backfill_intent_journal(&serde_json::to_vec(&journal)?)?;
             Ok(())
@@ -636,6 +665,8 @@ impl AppClient {
             .into_iter()
             .map(TryInto::try_into)
             .collect::<Result<_, _>>()?;
+        self.epoch_backfill_retry_not_before =
+            restore_epoch_backfill_retry_deadline(persisted.retry_not_before_unix_ms);
 
         // A process cannot still own the replay represented by an active row.
         // Restore it with the same ordering used by an ordinary failed attempt:
@@ -3420,35 +3451,130 @@ impl AppClient {
                 "ignored malformed durable epoch-gap recovery markers"
             );
         }
-        if table_groups.is_empty() {
-            return;
-        }
-        // The singleton journal owns execution order and attempt ids. The
-        // per-group table is only the liveness floor when that journal is empty.
+        // Local group existence is the liveness check. A local wipe does not
+        // delete protocol `cgka_groups` rows, so the per-group table may still
+        // hold a deleted group; those rows must not re-arm the journal.
         let journal_restored = self.pending_epoch_backfill.is_some()
             || self.active_epoch_backfill.is_some()
             || !self.queued_epoch_backfills.is_empty();
+        table_groups.retain(|group_id, _| self.local_epoch_for_group(group_id).is_some());
         if journal_restored {
+            let journal_ids = self
+                .pending_epoch_backfill
+                .iter()
+                .chain(self.active_epoch_backfill.iter())
+                .chain(self.queued_epoch_backfills.iter())
+                .flat_map(|intent| intent.groups.keys().cloned())
+                .collect::<Vec<_>>();
+            let mut live = table_groups.keys().cloned().collect::<HashSet<_>>();
+            for group_id in journal_ids {
+                if self.local_epoch_for_group(&group_id).is_some() {
+                    live.insert(group_id);
+                }
+            }
+            let mut pruned = self.retain_live_epoch_backfill_groups(&live);
             let known = self
                 .pending_epoch_backfill
                 .iter()
                 .chain(self.active_epoch_backfill.iter())
                 .chain(self.queued_epoch_backfills.iter())
                 .flat_map(|intent| intent.groups.keys().cloned())
-                .collect::<std::collections::HashSet<_>>();
-            let pending = self
-                .pending_epoch_backfill
-                .get_or_insert_with(PendingEpochBackfill::new);
+                .collect::<HashSet<_>>();
             for (group_id, group) in table_groups {
                 if !known.contains(&group_id) {
+                    let pending = self
+                        .pending_epoch_backfill
+                        .get_or_insert_with(PendingEpochBackfill::new);
                     pending.groups.entry(group_id).or_insert(group);
+                    pruned = true;
                 }
             }
+            if pruned {
+                let _ = self.persist_epoch_backfill_intent_journal();
+            }
+            return;
+        }
+        if table_groups.is_empty() {
             return;
         }
         let mut pending = PendingEpochBackfill::new();
         pending.groups = table_groups;
         self.pending_epoch_backfill = Some(pending);
+    }
+
+    fn retain_live_epoch_backfill_groups(&mut self, live: &HashSet<cgka_traits::GroupId>) -> bool {
+        let mut pruned = false;
+        let retain = |intent: &mut PendingEpochBackfill| {
+            let before = intent.groups.len();
+            intent.groups.retain(|group_id, _| live.contains(group_id));
+            intent.groups.len() != before
+        };
+        if let Some(pending) = self.pending_epoch_backfill.as_mut() {
+            pruned |= retain(pending);
+        }
+        if let Some(active) = self.active_epoch_backfill.as_mut() {
+            pruned |= retain(active);
+        }
+        for queued in &mut self.queued_epoch_backfills {
+            pruned |= retain(queued);
+        }
+        if self
+            .pending_epoch_backfill
+            .as_ref()
+            .is_some_and(|intent| intent.groups.is_empty())
+        {
+            self.pending_epoch_backfill = None;
+            pruned = true;
+        }
+        if self
+            .active_epoch_backfill
+            .as_ref()
+            .is_some_and(|intent| intent.groups.is_empty())
+        {
+            self.active_epoch_backfill = None;
+            pruned = true;
+        }
+        let queued_before = self.queued_epoch_backfills.len();
+        self.queued_epoch_backfills
+            .retain(|intent| !intent.groups.is_empty());
+        if self.queued_epoch_backfills.len() != queued_before {
+            pruned = true;
+        }
+        if self.pending_epoch_backfill.is_none()
+            && let Some(next) = self.queued_epoch_backfills.pop_front()
+        {
+            self.pending_epoch_backfill = Some(next);
+            pruned = true;
+        }
+        pruned
+    }
+
+    pub(crate) fn prune_deleted_epoch_backfill_group(&mut self, group_id: &cgka_traits::GroupId) {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if let Ok(intents) = self.app.pending_epoch_backfill_intents(&self.state.label) {
+            let stale = intents
+                .into_iter()
+                .filter(|intent| intent.group_id_hex == group_id_hex)
+                .collect::<Vec<_>>();
+            if !stale.is_empty() {
+                let _ = self
+                    .app
+                    .clear_epoch_backfill_intents(&self.state.label, &stale);
+            }
+        }
+        let mut live = HashSet::new();
+        for intent in self
+            .pending_epoch_backfill
+            .iter()
+            .chain(self.active_epoch_backfill.iter())
+            .chain(self.queued_epoch_backfills.iter())
+        {
+            live.extend(intent.groups.keys().cloned());
+        }
+        live.remove(group_id);
+        if self.retain_live_epoch_backfill_groups(&live) {
+            let _ = self.persist_epoch_backfill_intent_journal();
+        }
     }
 
     /// Write the detector's frozen-epoch evidence for `groups` to durable
@@ -4131,6 +4257,7 @@ impl AppClient {
                         };
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(pacing_ordinal))
                     };
+                    self.persist_epoch_backfill_intent_journal()?;
                     return Ok(EpochBackfillRunOutcome::Incomplete(
                         self.take_checkpointed_sync_summary_or_default(),
                     ));
@@ -4152,6 +4279,7 @@ impl AppClient {
                     self.epoch_backfill_retry_not_before =
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
                 }
+                self.persist_epoch_backfill_intent_journal()?;
                 Ok(EpochBackfillRunOutcome::Completed(
                     self.take_checkpointed_sync_summary_or_default(),
                 ))

@@ -51,6 +51,7 @@ async fn mock_relay() -> (MockRelay, String) {
 }
 
 async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+    install_mock_keyring();
     let (relay, url) = mock_relay().await;
     // The test harness exercises encrypted-media upload/download against a
     // loopback MockBlossom server, which is exactly the dev/test scenario the

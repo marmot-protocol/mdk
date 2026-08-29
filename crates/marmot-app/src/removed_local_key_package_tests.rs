@@ -545,6 +545,53 @@ fn tombstone_persistence_failure_leaves_account_bytes_intact() {
 }
 
 #[test]
+fn distinct_slot_tombstones_coalesce_into_one_account_wide_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("coalesce-slots")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "first-slot".to_owned(),
+        ))
+        .unwrap();
+    app.persist_removed_local_key_package_tombstone(&account)
+        .unwrap();
+    let first = app
+        .removed_local_key_package_tombstone_path(&account.account_id_hex, Some("first-slot"))
+        .unwrap();
+    assert!(first.exists());
+
+    let second = app
+        .removed_local_key_package_tombstone_path(&account.account_id_hex, Some("second-slot"))
+        .unwrap();
+    write_json(
+        &second,
+        &serde_json::json!({
+            "account_id_hex": account.account_id_hex,
+            "stable_slot_id": "second-slot",
+        }),
+    )
+    .unwrap();
+    app.persist_removed_local_key_package_tombstone(&account)
+        .unwrap();
+
+    let account_wide = app
+        .removed_local_key_package_tombstone_path(&account.account_id_hex, None)
+        .unwrap();
+    assert!(
+        account_wide.exists(),
+        "a second distinct slot must coalesce into one account-wide tombstone"
+    );
+    assert!(
+        !first.exists() && !second.exists(),
+        "coalesced slot files must be reclaimed"
+    );
+}
+
+#[test]
 fn tracked_only_removal_does_not_create_local_slot_authority() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

@@ -418,7 +418,7 @@ pub(crate) fn app_runtime_account_setup_request(
                 bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 publish_missing_relay_lists: *publish_missing_relay_lists,
-                publish_initial_key_package: true,
+                publish_initial_key_package: false,
             }))
         }
         _ => Ok(None),
@@ -953,13 +953,15 @@ mod tests {
     }
 
     #[test]
-    fn account_create_requests_initial_key_package_publication() {
+    fn account_create_does_not_force_initial_key_package_publication() {
         let cli = cli(&["wn", "account", "create"]);
         let request = app_runtime_account_setup_request(&cli, None)
             .expect("account create request is valid")
             .expect("account create builds a setup request");
 
-        assert!(request.publish_initial_key_package);
+        // Legacy `account create` is the compatibility/repair surface.
+        // `create-identity` and `login` publish the initial KeyPackage.
+        assert!(!request.publish_initial_key_package);
     }
 
     /// Streaming subscriptions have their own socket entry points; routing them

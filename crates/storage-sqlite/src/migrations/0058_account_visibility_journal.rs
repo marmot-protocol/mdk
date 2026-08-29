@@ -1,4 +1,4 @@
-//! Migration 0054: durable ordered account-runtime visibility outbox.
+//! Migration 0058: durable ordered account-runtime visibility outbox.
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;

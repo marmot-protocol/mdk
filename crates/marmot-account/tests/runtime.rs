@@ -20,7 +20,10 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage, OutboundFanoutStorage};
+use cgka_traits::storage::{
+    KeyPackageBundleStorage, LeaveRequestStorage, MaintenanceStorage, MessageStorage,
+    OutboundFanoutStorage,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -8648,6 +8651,389 @@ async fn cancelled_leave_fanout_recovery_emits_outcome_for_original_operation() 
     );
     assert!(restarted.acknowledge_visibility_lease(recovered.lease));
     assert!(restarted.replay_visibility_leased().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn legacy_ingest_delivery_acks_engine_outbox_so_reopen_does_not_redeliver() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot legacy ingest ack key").unwrap();
+    let alice_path = dir.path().join("alice-legacy-ingest.sqlite");
+    let bob_path = dir.path().join("bob-legacy-ingest.sqlite");
+    let mut alice = session_with_registry(
+        &alice_path,
+        &key,
+        b"alice-legacy-ingest",
+        selfremove_registry(),
+    );
+    let mut bob =
+        session_with_registry(&bob_path, &key, b"bob-legacy-ingest", selfremove_registry());
+    let bob_id = bob.self_id();
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "legacy ingest ack".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match created.effects.publish.as_slice() {
+        [PublishWork::GroupCreated { pending, welcomes }] => (*pending, welcomes[0].clone()),
+        other => panic!("expected one GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://legacy-ingest-inbox.example".into(),
+        )]),
+        RecordingKeyPackages::default(),
+    );
+    runtime.pause_maintenance();
+    let ingested = runtime
+        .ingest_delivery(TransportDelivery {
+            account_id: bob_id,
+            group_id_hint: None,
+            message: welcome,
+            received_at: Timestamp(0),
+            source: TransportDeliverySource {
+                transport: TransportSource("marmot-account-test".into()),
+                plane: TransportDeliveryPlane::AccountInbox,
+                endpoint: None,
+                subscription_id: None,
+                wire: None,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        ingested
+            .effects
+            .events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupJoined { .. })),
+        "legacy ingest must return the Welcome application event"
+    );
+    assert!(
+        runtime
+            .session()
+            .storage_handle()
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty(),
+        "legacy ingest must ACK engine outbox ids with the visibility discard"
+    );
+    drop(runtime);
+
+    let reopened =
+        session_with_registry(&bob_path, &key, b"bob-legacy-ingest", selfremove_registry());
+    assert!(
+        reopened
+            .storage_handle()
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty(),
+        "reopen must not hydrate a returned Welcome back into the engine outbox"
+    );
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://legacy-ingest-inbox.example".into(),
+        )]),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    let drained = restarted.drain().await.unwrap();
+    assert!(
+        drained
+            .events
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::GroupJoined { .. })),
+        "a returned GroupJoined must not reappear after every reopen"
+    );
+}
+
+#[tokio::test]
+async fn leave_quorum_records_published_true_while_optional_target_stays_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot leave quorum outcome key").unwrap();
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, "leave-quorum-outcome").await;
+    let required = TransportEndpoint("wss://leave-quorum-required.example".into());
+    let optional = TransportEndpoint("wss://leave-quorum-optional.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![optional.clone()],
+        TransportEndpointFailureKind::RetryableUnavailable,
+    );
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://leave-quorum-inbox.example".into(),
+        )])
+        .required_acks(1)
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![required.clone(), optional.clone()],
+        )
+    };
+    let mut runtime =
+        AccountDeviceRuntime::new(bob, adapter, route(), RecordingKeyPackages::default());
+    runtime.pause_maintenance();
+    let leased = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(leased.effects.action_outcomes.len(), 1);
+    assert!(
+        leased.effects.action_outcomes[0].published,
+        "meeting required ACKs must authorize Left even if an optional target is still retryable"
+    );
+    assert!(
+        leased
+            .effects
+            .fanout
+            .iter()
+            .any(|outcome| outcome.outstanding_targets > 0 && !outcome.fanout_complete),
+        "the optional target must remain outstanding so this is not the complete-fanout path"
+    );
+    drop(runtime);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    let replayed = restarted
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("quorum Leave outcome survives restart");
+    assert_eq!(
+        flatten_visibility_batches(&replayed.batches)
+            .action_outcomes
+            .iter()
+            .filter(|outcome| outcome.published)
+            .count(),
+        1
+    );
+    assert!(restarted.acknowledge_visibility_lease(replayed.lease));
+}
+
+#[tokio::test]
+async fn leave_reproposal_rebinds_header_to_the_new_self_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot leave reproposal provenance key").unwrap();
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, "leave-reproposal-provenance").await;
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://leave-reproposal-inbox.example".into(),
+        )])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint(
+                "wss://leave-reproposal-group.example".into(),
+            )],
+        )
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    runtime.pause_maintenance();
+    let leased = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let original = leased
+        .effects
+        .action_outcomes
+        .first()
+        .expect("the original Leave binds an exact SelfRemove");
+    let first_id = original.message_id.clone();
+    let later_id = MessageId::new(b"leave-reproposal-m2".to_vec());
+    assert_ne!(first_id, later_id);
+    let mut request = runtime
+        .session()
+        .storage_handle()
+        .leave_request(&group_id)
+        .unwrap()
+        .expect("accepted Leave writes a durable request");
+    request.last_proposed_message_id = Some(later_id.clone());
+    runtime
+        .session()
+        .storage_handle()
+        .put_leave_request(&request)
+        .unwrap();
+    drop(runtime);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    let replayed = restarted
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("Leave Header survives the message-id move");
+    assert!(replayed.batches.iter().any(|batch| {
+        matches!(
+            &batch.source,
+            AccountVisibilitySource::Outbound {
+                group_id: Some(source_group),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                action_message_id: Some(bound),
+                ..
+            } if source_group == &group_id && bound == &later_id
+        )
+    }));
+    assert!(restarted.acknowledge_visibility_lease(replayed.lease));
+}
+
+#[tokio::test]
+async fn older_pre_acceptance_leave_header_does_not_bind_a_later_leave_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot stale leave header key").unwrap();
+    let database = dir.path().join("stale-leave-header.sqlite");
+    let mut alice = session_with_registry(
+        &database,
+        &key,
+        b"stale-leave-header",
+        selfremove_registry(),
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "stale leave header".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let pending = match created.effects.publish.as_slice() {
+        [PublishWork::GroupCreated { pending, .. }] => *pending,
+        other => panic!("expected one GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://stale-leave-header.example".into(),
+        )])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint(
+                "wss://stale-leave-header-group.example".into(),
+            )],
+        )
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    runtime.pause_maintenance();
+    assert!(
+        runtime
+            .send_leased(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .is_err(),
+        "an admin SelfRemove must fail before engine acceptance"
+    );
+    assert!(
+        runtime
+            .send_leased(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .is_err(),
+        "a second pre-acceptance Leave must leave a newer Header"
+    );
+    let later_id = MessageId::new(b"later-leave".to_vec());
+    runtime
+        .session()
+        .storage_handle()
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 1,
+            last_proposed_epoch: None,
+            last_proposed_message_id: Some(later_id.clone()),
+        })
+        .unwrap();
+    drop(runtime);
+
+    let reopened = session_with_registry(
+        &database,
+        &key,
+        b"stale-leave-header",
+        selfremove_registry(),
+    );
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    let replayed = restarted
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("both pre-acceptance Headers remain crash-visible");
+    let leave_headers = replayed
+        .batches
+        .iter()
+        .filter_map(|batch| match &batch.source {
+            AccountVisibilitySource::Outbound {
+                group_id: Some(source_group),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                action_message_id,
+                ..
+            } if source_group == &group_id => Some((batch.sequence, action_message_id.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(leave_headers.len(), 2);
+    let max_seq = leave_headers
+        .iter()
+        .map(|(sequence, _)| *sequence)
+        .max()
+        .unwrap();
+    for (sequence, bound) in &leave_headers {
+        if *sequence == max_seq {
+            assert_eq!(bound.as_ref(), Some(&later_id));
+        } else {
+            assert_eq!(
+                bound, &None,
+                "an older unacknowledged pre-acceptance Header must not inherit a later Leave id"
+            );
+        }
+    }
+    assert!(restarted.acknowledge_visibility_lease(replayed.lease));
 }
 
 // A startup drain can contain both a one-shot hydration/application event and

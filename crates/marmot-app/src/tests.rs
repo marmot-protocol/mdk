@@ -2881,6 +2881,59 @@ fn consecutive_fruitless_replays_are_paced_by_the_retry_cooldown() {
     });
 }
 
+#[test]
+fn earned_epoch_backfill_retry_pacing_survives_reopen() {
+    run_composed_app_runtime_test("backfill-pacing-reopen", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let filled_through = crate::unix_now_seconds() - 1_000;
+        let config = MarmotAppConfig::default()
+            .with_dev_epoch_backfill_eose_wait_ms(300)
+            .with_dev_epoch_backfill_retry_backoff_ms(60_000);
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            config,
+            filled_through,
+        )
+        .await;
+        client
+            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
+            .await
+            .expect("a refused ingest still completes its pass");
+        inject_epoch_gap_probe(
+            &app,
+            epoch_gap_probe(
+                &route.nostr_group_id_hex,
+                filled_through + 500,
+                "refused-during-the-replay",
+            ),
+        )
+        .await;
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        assert!(
+            matches!(
+                client
+                    .run_pending_epoch_backfill(
+                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                    )
+                    .await
+                    .expect("the armed replay must run"),
+                crate::EpochBackfillRunOutcome::Completed(_)
+            ),
+            "the first replay completes and is fruitless",
+        );
+        assert!(client.epoch_backfill_retry_not_before.is_some());
+        drop(client);
+
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened.epoch_backfill_retry_not_before.is_some(),
+            "earned epoch-backfill retry pacing must survive restart"
+        );
+    });
+}
+
 /// An execution that ends in `Err` must earn the same cooldown a fruitless or
 /// unconfirmed one does.
 ///
@@ -4169,6 +4222,73 @@ fn active_epoch_backfill_intent_reopens_as_retryable_pending_work() {
                 .is_none(),
             "both terminal intents clear the durable singleton",
         );
+    });
+}
+
+#[test]
+fn deleted_group_does_not_poison_epoch_backfill_journal_across_reopen() {
+    run_composed_app_runtime_test("deleted-backfill-group", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_a = client
+            .create_group("deleted backfill group", &[])
+            .await
+            .unwrap();
+        let group_b = client
+            .create_group("live backfill group", &[])
+            .await
+            .unwrap();
+        let stalled_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client
+            .apply_backfill_decision(
+                &group_a,
+                stalled_a,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        assert!(client.delete_group_local(&group_a).await.unwrap());
+        drop(client);
+
+        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened
+                .pending_epoch_backfill
+                .as_ref()
+                .is_none_or(|pending| !pending.groups.contains_key(&group_a)),
+            "deleted group A must not remain in the singleton journal"
+        );
+        let stalled_b = reopened.group_mls_state(&group_b).unwrap().epoch;
+        reopened
+            .apply_backfill_decision(
+                &group_b,
+                stalled_b,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        let execution = reopened
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .expect("live group B must execute after deleted A is pruned");
+        assert!(execution.pending.groups.contains_key(&group_b));
+        assert!(!execution.pending.groups.contains_key(&group_a));
+        reopened
+            .test_finish_epoch_backfill_execution(execution, true)
+            .unwrap();
+        assert!(!reopened.has_pending_epoch_backfill());
     });
 }
 
