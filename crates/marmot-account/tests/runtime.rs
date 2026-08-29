@@ -8551,6 +8551,175 @@ async fn terminal_leave_publish_failure_is_durable_and_does_not_authorize_left()
 }
 
 #[tokio::test]
+async fn terminal_m1_failure_ack_then_m2_success_records_published_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot m1 ack m2 leave key").unwrap();
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, "m1-ack-m2-leave").await;
+    let adapter = RecordingAdapter::default();
+    let group_endpoint = TransportEndpoint("wss://m1-ack-m2-group.example".into());
+    adapter.fail_endpoints_as(
+        vec![group_endpoint.clone()],
+        TransportEndpointFailureKind::TerminalRejected,
+    );
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://m1-ack-m2-inbox.example".into(),
+        )])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![group_endpoint.clone()],
+        )
+    };
+    let mut runtime =
+        AccountDeviceRuntime::new(bob, adapter, route(), RecordingKeyPackages::default());
+    runtime.pause_maintenance();
+    let leased = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        leased
+            .effects
+            .action_outcomes
+            .iter()
+            .all(|outcome| !outcome.published)
+    );
+    assert!(runtime.acknowledge_visibility_lease(leased.lease));
+    drop(runtime);
+
+    let storage_session =
+        session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut request = storage_session
+        .storage_handle()
+        .leave_request(&group_id)
+        .unwrap()
+        .expect("LeaveRequest outlives Header ACK");
+    request.last_proposed_epoch = Some(EpochId(0));
+    storage_session
+        .storage_handle()
+        .put_leave_request(&request)
+        .unwrap();
+    drop(storage_session);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let recovered_adapter = RecordingAdapter::default();
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        recovered_adapter.clone(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    assert!(
+        restarted.replay_visibility_leased().unwrap().is_none(),
+        "terminal M1 Header ACK must drop Leave provenance from the journal"
+    );
+    let m2 = restarted
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .expect("an epoch-moved LeaveRequest must author M2 after M1 Header ACK");
+    assert!(
+        m2.effects
+            .action_outcomes
+            .iter()
+            .any(|outcome| outcome.published),
+        "M2 success must record published:true even with no surviving M1 Header"
+    );
+    assert!(!recovered_adapter.publishes().is_empty());
+}
+
+#[tokio::test]
+async fn mixed_leave_headers_select_one_owner_without_duplicate_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot mixed leave header key").unwrap();
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, "mixed-leave-header").await;
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://mixed-leave-inbox.example".into(),
+        )])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://mixed-leave-group.example".into())],
+        )
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    runtime.pause_maintenance();
+    let first = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let first_id = first.effects.action_outcomes[0].message_id.clone();
+    let second = runtime
+        .send_leased(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await;
+    assert!(
+        second.is_err(),
+        "a second Leave in the same epoch must fail closed as already requested"
+    );
+    drop(runtime);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    let replayed = restarted
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("mixed Leave Headers remain crash-visible");
+    let leave_bindings = replayed
+        .batches
+        .iter()
+        .filter_map(|batch| match &batch.source {
+            AccountVisibilitySource::Outbound {
+                group_id: Some(source_group),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                action_message_id,
+                ..
+            } if source_group == &group_id => {
+                Some((batch.operation_id.clone(), action_message_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let bound_operations = leave_bindings
+        .iter()
+        .filter(|(_, bound)| bound.as_ref() == Some(&first_id))
+        .map(|(operation_id, _)| operation_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        bound_operations.len(),
+        1,
+        "exactly one visibility operation may own the live Leave id; mixed Some(M1)+None must not duplicate: {leave_bindings:?}"
+    );
+    let recovered = restarted
+        .drain_leased()
+        .await
+        .expect("mixed Some(M1)+None Headers must not hard-fail terminal outcome recording");
+    assert!(restarted.acknowledge_visibility_lease(recovered.lease));
+}
+
+#[tokio::test]
 async fn cancelled_leave_fanout_recovery_emits_outcome_for_original_operation() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot cancelled leave outcome key").unwrap();
@@ -8651,6 +8820,78 @@ async fn cancelled_leave_fanout_recovery_emits_outcome_for_original_operation() 
     );
     assert!(restarted.acknowledge_visibility_lease(recovered.lease));
     assert!(restarted.replay_visibility_leased().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn legacy_cancelled_operation_drain_acks_recovered_rows_so_reopen_does_not_redeliver() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot cancelled drain ack key").unwrap();
+    let (bob, bob_path, bob_identity, group_id) =
+        joined_selfremove_member(dir.path(), &key, "cancelled-drain-ack").await;
+    let adapter = RecordingAdapter::default();
+    let gate = adapter.gate_all_publishes();
+    let route = || {
+        StaticTransportRouting::new(vec![TransportEndpoint(
+            "wss://cancelled-drain-inbox.example".into(),
+        )])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint(
+                "wss://cancelled-drain-group.example".into(),
+            )],
+        )
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        adapter.clone(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    runtime.pause_maintenance();
+    let mut cancelled = Box::pin(runtime.send_leased(SendIntent::Leave {
+        group_id: group_id.clone(),
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut cancelled => panic!("Leave returned before cancellation boundary: {result:?}"),
+            () = async {
+                while adapter.publishes().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+    })
+    .await
+    .expect("Leave reaches the blocked relay publish");
+    drop(cancelled);
+    gate.release.add_permits(1);
+    let drained = runtime.drain().await.unwrap();
+    assert!(
+        !drained.events.is_empty()
+            || !drained.action_outcomes.is_empty()
+            || !drained.reports.is_empty(),
+        "legacy drain must hand off the cancelled Leave effects"
+    );
+    drop(runtime);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut restarted = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    restarted.pause_maintenance();
+    assert!(
+        restarted.replay_visibility_leased().unwrap().is_none(),
+        "legacy drain must ACK every handed-off cancelled operation"
+    );
+    let second = restarted.drain().await.unwrap();
+    assert!(
+        second.action_outcomes.is_empty(),
+        "reopen must not redeliver a cancelled Leave already returned by drain"
+    );
 }
 
 #[tokio::test]

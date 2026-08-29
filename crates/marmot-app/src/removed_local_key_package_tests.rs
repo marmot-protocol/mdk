@@ -545,7 +545,7 @@ fn tombstone_persistence_failure_leaves_account_bytes_intact() {
 }
 
 #[test]
-fn distinct_slot_tombstones_coalesce_into_one_account_wide_marker() {
+fn distinct_slot_tombstones_keep_exact_retired_slot_proof() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
         .create_account("coalesce-slots")
@@ -582,12 +582,28 @@ fn distinct_slot_tombstones_coalesce_into_one_account_wide_marker() {
         .removed_local_key_package_tombstone_path(&account.account_id_hex, None)
         .unwrap();
     assert!(
-        account_wide.exists(),
-        "a second distinct slot must coalesce into one account-wide tombstone"
+        !account_wide.exists(),
+        "a second exact slot must not collapse retired-slot proof into all.json"
     );
     assert!(
-        !first.exists() && !second.exists(),
-        "coalesced slot files must be reclaimed"
+        first.exists() && second.exists(),
+        "exact retired-slot markers must survive a later distinct-slot tombstone"
+    );
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "first-slot")
+            .unwrap()
+    );
+
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "first-slot".to_owned(),
+        ))
+        .unwrap();
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "first-slot")
+            .unwrap(),
+        "re-admitting a retired lifecycle must not resurrect it without an exact marker"
     );
 }
 

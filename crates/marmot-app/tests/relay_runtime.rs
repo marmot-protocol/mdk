@@ -1182,6 +1182,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
 async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() {
     use nostr::prelude::ToBech32;
 
+    install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let keys = Keys::generate();

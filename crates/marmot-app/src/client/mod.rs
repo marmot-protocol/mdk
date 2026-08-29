@@ -428,6 +428,10 @@ pub struct AppClient {
     /// before the method returns to its worker.
     #[cfg(test)]
     pub(crate) fail_after_convergence_retry_finalize: bool,
+    /// Skip singleton-journal prune after a committed local delete so tests can
+    /// inject the crash window between wipe and backfill cleanup.
+    #[cfg(test)]
+    pub(crate) skip_epoch_backfill_prune_on_delete: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -3038,6 +3042,10 @@ impl AppClient {
                     );
                 }
             }
+        }
+        #[cfg(test)]
+        if self.skip_epoch_backfill_prune_on_delete {
+            return Ok(was_live || result);
         }
         self.prune_deleted_epoch_backfill_group(group_id);
         Ok(was_live || result)

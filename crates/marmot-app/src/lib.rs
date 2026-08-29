@@ -2490,6 +2490,8 @@ impl MarmotApp {
             block_after_sync_prefix_checkpoint: None,
             #[cfg(test)]
             fail_after_convergence_retry_finalize: false,
+            #[cfg(test)]
+            skip_epoch_backfill_prune_on_delete: false,
             pending_welcome_delivery_events: Vec::new(),
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
@@ -7993,48 +7995,17 @@ impl MarmotApp {
             .join(file_name))
     }
 
-    /// Bound tombstones to one file per account identity.
+    /// Exact-slot markers are intentionally never reclaimed. An account-wide
+    /// `all.json` is only written when the removed lifecycle cannot prove a
+    /// stable slot (`RemovedLocalKeyPackageScope::AccountWideLegacy`).
     ///
-    /// Exact-slot files stay while they are the only marker. A second distinct
-    /// slot, or an existing account-wide marker, is coalesced into `all.json`
-    /// and the slot files are removed so retired slots cannot accumulate.
+    /// Collapsing distinct slots into `all.json` would delete the proof that
+    /// `runtime-state-bounds.md` requires to keep a retired slot retired after
+    /// restore or re-admission of that same lifecycle.
     fn coalesce_removed_local_key_package_tombstones(
         &self,
-        account_id_hex: &str,
+        _account_id_hex: &str,
     ) -> Result<(), AppError> {
-        let dir = self.removed_local_key_package_account_tombstone_dir(account_id_hex)?;
-        if !dir.try_exists()? {
-            return Ok(());
-        }
-        let mut slot_files = Vec::new();
-        let mut has_account_wide = false;
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name == "all.json" {
-                has_account_wide = true;
-            } else if name.starts_with("slot-") && name.ends_with(".json") {
-                slot_files.push(path);
-            }
-        }
-        if slot_files.len() <= 1 && !has_account_wide {
-            return Ok(());
-        }
-        if !has_account_wide {
-            self.write_private_json(
-                &self.removed_local_key_package_tombstone_path(account_id_hex, None)?,
-                &RemovedLocalKeyPackageTombstone {
-                    account_id_hex: account_id_hex.to_owned(),
-                    stable_slot_id: None,
-                },
-                "removed-local KeyPackage tombstone",
-            )?;
-        }
-        for path in slot_files {
-            let _ = std::fs::remove_file(path);
-        }
         Ok(())
     }
 

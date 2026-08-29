@@ -4293,6 +4293,74 @@ fn deleted_group_does_not_poison_epoch_backfill_journal_across_reopen() {
 }
 
 #[test]
+fn deleted_group_crash_before_journal_prune_does_not_restore_poison() {
+    run_composed_app_runtime_test("deleted-backfill-crash-window", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_a = client
+            .create_group("deleted crash backfill group", &[])
+            .await
+            .unwrap();
+        let group_b = client
+            .create_group("live crash backfill group", &[])
+            .await
+            .unwrap();
+        let stalled_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client
+            .apply_backfill_decision(
+                &group_a,
+                stalled_a,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        client.skip_epoch_backfill_prune_on_delete = true;
+        assert!(client.delete_group_local(&group_a).await.unwrap());
+        drop(client);
+
+        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened
+                .pending_epoch_backfill
+                .as_ref()
+                .is_none_or(|pending| !pending.groups.contains_key(&group_a)),
+            "a crash after local wipe and before journal prune must not restore deleted A"
+        );
+        let stalled_b = reopened.group_mls_state(&group_b).unwrap().epoch;
+        reopened
+            .apply_backfill_decision(
+                &group_b,
+                stalled_b,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        let execution = reopened
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .unwrap()
+            .expect("live group B must execute after a torn deleted-A prune");
+        assert!(execution.pending.groups.contains_key(&group_b));
+        assert!(!execution.pending.groups.contains_key(&group_a));
+        reopened
+            .test_finish_epoch_backfill_execution(execution, true)
+            .unwrap();
+        assert!(!reopened.has_pending_epoch_backfill());
+    });
+}
+
+#[test]
 fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
     run_composed_app_runtime_test("epoch-backfill-deferral", || async {
         let dir = tempfile::tempdir().unwrap();

@@ -192,6 +192,7 @@ struct CompletedWelcomePublish {
 /// cancelled later publish from losing an earlier report, application-message
 /// acceptance, pending resolution, or session event.
 struct RetainedSessionVisibilityBatch {
+    operation_id: Option<[u8; 16]>,
     effects: AccountDeviceEffects,
 }
 
@@ -3950,12 +3951,14 @@ where
     /// to trigger a drain (mdk#426). Publishes any incidental transport
     /// work the same way `ingest_delivery` does.
     pub async fn drain(&mut self) -> AccountResult<AccountDeviceEffects> {
-        let effects = self.drain_recording_visibility().await?;
-        self.discard_active_visibility_operation()?;
+        let (effects, recovered_operation_ids) = self.drain_recording_visibility().await?;
+        self.discard_visibility_operations(&recovered_operation_ids)?;
         Ok(effects)
     }
 
-    async fn drain_recording_visibility(&mut self) -> AccountResult<AccountDeviceEffects> {
+    async fn drain_recording_visibility(
+        &mut self,
+    ) -> AccountResult<(AccountDeviceEffects, Vec<[u8; 16]>)> {
         self.start_account_visibility_operation(AccountVisibilitySource::Drain {
             observed_at: self.wall_clock.now(),
         })?;
@@ -3965,12 +3968,13 @@ where
             .await?;
         let resumed = self.resume_outbound_fanouts_in_current_operation().await?;
         output.extend(resumed);
-        self.finish_drain_visibility_handoff(current_visibility_batch, &mut output);
-        Ok(output)
+        let recovered_operation_ids =
+            self.finish_drain_visibility_handoff(current_visibility_batch, &mut output);
+        Ok((output, recovered_operation_ids))
     }
 
     pub async fn drain_leased(&mut self) -> AccountResult<LeasedAccountDeviceEffects> {
-        let effects = self.drain_recording_visibility().await?;
+        let (effects, _) = self.drain_recording_visibility().await?;
         self.lease_current_returned_visibility(effects)
     }
 
@@ -4187,6 +4191,7 @@ where
         );
         self.retained_session_visibility
             .push_back(RetainedSessionVisibilityBatch {
+                operation_id: Some(handoff.operation_id),
                 effects: AccountDeviceEffects::default(),
             });
     }
@@ -4322,6 +4327,7 @@ where
 
         self.retained_session_visibility
             .push_back(RetainedSessionVisibilityBatch {
+                operation_id: Some(handoff.operation_id),
                 effects: AccountDeviceEffects {
                     events: effects.events.clone(),
                     queued: effects.queued.clone(),
@@ -4339,6 +4345,7 @@ where
 
         self.retained_session_visibility
             .push_back(RetainedSessionVisibilityBatch {
+                operation_id: self.active_visibility_operation,
                 effects: effects.clone(),
             });
     }
@@ -4419,19 +4426,33 @@ where
     /// earlier failed or cancelled operation. Exclude the current batch (it is
     /// already at the front of `output`) and prepend every older batch in its
     /// original order. No await may follow this handoff.
+    ///
+    /// Returns the cancelled operations whose effects were actually prepended
+    /// so a legacy `drain` can ACK them in the same transaction as the current
+    /// operation.
     fn finish_drain_visibility_handoff(
         &mut self,
         handoff: SessionVisibilityHandoff,
         output: &mut AccountDeviceEffects,
-    ) {
+    ) -> Vec<[u8; 16]> {
         self.finish_current_visibility_handoff(handoff);
+        let mut recovered_operation_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in &self.retained_session_visibility {
+            if let Some(operation_id) = batch.operation_id
+                && seen.insert(operation_id)
+            {
+                recovered_operation_ids.push(operation_id);
+            }
+        }
         if self.retained_session_visibility.is_empty() {
-            return;
+            return recovered_operation_ids;
         }
 
         let mut recovered = self.take_retained_visibility();
         recovered.extend(std::mem::take(output));
         *output = recovered;
+        recovered_operation_ids
     }
 
     fn lease_current_returned_visibility(
@@ -4617,19 +4638,40 @@ where
     /// ownership synchronously to its caller, so only that operation's rows
     /// are removed; older failed/cancelled operations remain replayable.
     fn discard_active_visibility_operation(&mut self) -> AccountResult<()> {
-        let Some(operation_id) = self.active_visibility_operation.take() else {
+        self.discard_visibility_operations(&[])
+    }
+
+    /// ACK the current operation plus every recovered operation whose effects
+    /// were actually handed off, in one storage transaction. Used by legacy
+    /// `drain`, which prepends cancelled batches and must not leave their
+    /// journal rows and engine outbox ids live across reopen.
+    fn discard_visibility_operations(
+        &mut self,
+        recovered_operation_ids: &[[u8; 16]],
+    ) -> AccountResult<()> {
+        let mut operation_ids = recovered_operation_ids.to_vec();
+        if let Some(operation_id) = self.active_visibility_operation.take() {
+            operation_ids.push(operation_id);
+        }
+        if operation_ids.is_empty() {
             return Ok(());
-        };
+        }
         let batch_ids = self
             .visibility_storage
             .load_account_visibility_journal()
             .map_err(|error| AccountError::Session(SessionError::Storage(error)))?
             .into_iter()
-            .filter(|row| row.operation_id.as_slice() == operation_id)
+            .filter(|row| {
+                operation_ids
+                    .iter()
+                    .any(|operation_id| row.operation_id.as_slice() == operation_id)
+            })
             .map(|row| row.batch_id)
             .collect::<Vec<_>>();
         self.delete_visibility_batches_acking_engine_outbox(&batch_ids)?;
-        self.durable_visibility_operations.remove(&operation_id);
+        for operation_id in operation_ids {
+            self.durable_visibility_operations.remove(&operation_id);
+        }
         Ok(())
     }
 
@@ -4733,67 +4775,102 @@ where
             .into_iter()
             .map(decode_account_visibility_row)
             .collect::<AccountResult<Vec<_>>>()?;
-        let mut accepted_leave_messages = HashMap::<GroupId, Option<MessageId>>::new();
-        let mut latest_leave_header_seq = HashMap::<GroupId, u64>::new();
-        for batch in &batches {
-            let AccountVisibilitySource::Outbound {
-                group_id: Some(group_id),
-                action: Some(AccountVisibilityOutboundAction::Leave),
-                ..
-            } = &batch.source
-            else {
-                continue;
-            };
-            latest_leave_header_seq
-                .entry(group_id.clone())
-                .and_modify(|sequence| *sequence = (*sequence).max(batch.sequence))
-                .or_insert(batch.sequence);
+        struct LeaveHeaderRef {
+            index: usize,
+            sequence: u64,
+            operation_id: Vec<u8>,
+            bound: Option<MessageId>,
         }
-        for batch in &mut batches {
+        let mut by_group = HashMap::<GroupId, Vec<LeaveHeaderRef>>::new();
+        for (index, batch) in batches.iter().enumerate() {
             let AccountVisibilitySource::Outbound {
                 group_id: Some(group_id),
                 action: Some(AccountVisibilityOutboundAction::Leave),
                 action_message_id,
                 ..
-            } = &mut batch.source
+            } = &batch.source
             else {
                 continue;
             };
-            let accepted_message_id = match accepted_leave_messages.get(group_id) {
-                Some(message_id) => message_id.clone(),
-                None => {
-                    // The engine atomically writes this exact id in the
-                    // LeaveRequest with the sent SelfRemove row. Its absence
-                    // distinguishes a crash after the tentative Header from
-                    // one after acceptance. Auto-reproposal may later move
-                    // that id from M1 to M2; Headers already bound to M1
-                    // follow so the terminal outcome still reaches the app.
-                    let message_id = self
-                        .visibility_storage
-                        .leave_request(group_id)
-                        .map_err(|error| AccountError::Session(SessionError::Storage(error)))?
-                        .and_then(|request| request.last_proposed_message_id);
-                    accepted_leave_messages.insert(group_id.clone(), message_id.clone());
-                    message_id
-                }
-            };
-            let Some(current_id) = accepted_message_id else {
+            by_group
+                .entry(group_id.clone())
+                .or_default()
+                .push(LeaveHeaderRef {
+                    index,
+                    sequence: batch.sequence,
+                    operation_id: batch.operation_id.clone(),
+                    bound: action_message_id.clone(),
+                });
+        }
+        let mut repaired = Vec::new();
+        for (group_id, mut headers) in by_group {
+            headers.sort_by_key(|header| header.sequence);
+            let current_id = self
+                .visibility_storage
+                .leave_request(&group_id)
+                .map_err(|error| AccountError::Session(SessionError::Storage(error)))?
+                .and_then(|request| request.last_proposed_message_id);
+            let Some(current_id) = current_id else {
                 continue;
             };
-            match action_message_id {
-                Some(bound_id) if bound_id != &current_id => {
-                    *bound_id = current_id;
-                }
-                None => {
-                    // Only the newest pre-acceptance Header for this group
-                    // may inherit the current LeaveRequest id. An older
-                    // unacknowledged None Header must not bind a later Leave.
-                    if latest_leave_header_seq.get(group_id) == Some(&batch.sequence) {
-                        *action_message_id = Some(current_id);
+            // One semantic owner per group. Prefer a Header already bound to
+            // the live Leave id, else the newest previously bound Header so
+            // M1 follows to M2, else the newest unbound pre-acceptance Header.
+            // A later LeaveAlreadyRequested Header must not also inherit.
+            let owner_operation_id = headers
+                .iter()
+                .find(|header| header.bound.as_ref() == Some(&current_id))
+                .map(|header| header.operation_id.clone())
+                .or_else(|| {
+                    headers
+                        .iter()
+                        .rev()
+                        .find(|header| header.bound.is_some())
+                        .map(|header| header.operation_id.clone())
+                })
+                .or_else(|| headers.last().map(|header| header.operation_id.clone()));
+            let Some(owner_operation_id) = owner_operation_id else {
+                continue;
+            };
+            for header in &headers {
+                let AccountVisibilitySource::Outbound {
+                    action_message_id, ..
+                } = &mut batches[header.index].source
+                else {
+                    continue;
+                };
+                let desired = if header.operation_id == owner_operation_id {
+                    Some(current_id.clone())
+                } else if action_message_id.as_ref() == Some(&current_id) {
+                    None
+                } else {
+                    continue;
+                };
+                if action_message_id != &desired {
+                    *action_message_id = desired;
+                    if matches!(
+                        batches[header.index].kind,
+                        AccountVisibilityRecordKind::Header
+                    ) {
+                        repaired.push(header.index);
                     }
                 }
-                Some(_) => {}
             }
+        }
+        for index in repaired {
+            let batch = &batches[index];
+            let operation_id =
+                <[u8; 16]>::try_from(batch.operation_id.as_slice()).map_err(|_| {
+                    account_visibility_error("visibility operation id has invalid length")
+                })?;
+            let record = StoredAccountVisibilityRecordV1 {
+                version: ACCOUNT_VISIBILITY_RECORD_VERSION,
+                source: batch.source.clone(),
+                payload: StoredAccountVisibilityPayloadV1::Header {
+                    maintenance_disposition: batch.effects.maintenance_disposition,
+                },
+            };
+            self.upsert_visibility_record(&operation_id, 0, &record)?;
         }
         Ok(batches)
     }
@@ -4861,10 +4938,69 @@ where
                 None => pending = Some(candidate),
             }
         }
+        if pending.is_none() {
+            // Provenance must outlive Header ACK. Terminal M1 failure deletes
+            // the Leave Header; an epoch-driven M2 still has the LeaveRequest
+            // naming this exact SelfRemove.
+            pending = self.leave_request_outcome_for_message(message_id, published)?;
+        }
         if let Some(outcome) = pending {
             output.action_outcomes.push(outcome);
         }
         Ok(())
+    }
+
+    fn leave_request_outcome_for_message(
+        &self,
+        message_id: &MessageId,
+        published: bool,
+    ) -> AccountResult<Option<AccountVisibilityActionOutcome>> {
+        let mut group_ids = Vec::new();
+        if let Ok(fanouts) = self.session.outbound_fanouts() {
+            for fanout in fanouts {
+                if fanout.message_id() == message_id
+                    && let Some(group_id) = fanout.group_id()
+                    && !group_ids.contains(group_id)
+                {
+                    group_ids.push(group_id.clone());
+                }
+            }
+        }
+        if let Some(operation_id) = self.active_visibility_operation
+            && let Some(operation) = self.durable_visibility_operations.get(&operation_id)
+            && let AccountVisibilitySource::Outbound {
+                group_id: Some(group_id),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                ..
+            } = &operation.source
+            && !group_ids.contains(group_id)
+        {
+            group_ids.push(group_id.clone());
+        }
+        for group_id in group_ids {
+            let owns_message = self
+                .visibility_storage
+                .leave_request(&group_id)
+                .map_err(|error| AccountError::Session(SessionError::Storage(error)))?
+                .and_then(|request| request.last_proposed_message_id)
+                .as_ref()
+                == Some(message_id);
+            if !owns_message {
+                continue;
+            }
+            let operation_id = self
+                .active_visibility_operation
+                .map(|operation_id| operation_id.to_vec())
+                .unwrap_or_else(|| message_id.as_slice().to_vec());
+            return Ok(Some(AccountVisibilityActionOutcome {
+                operation_id,
+                group_id,
+                message_id: message_id.clone(),
+                action: AccountVisibilityOutboundAction::Leave,
+                published,
+            }));
+        }
+        Ok(None)
     }
 
     async fn publish_queue(

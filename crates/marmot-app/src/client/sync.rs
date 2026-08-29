@@ -138,7 +138,12 @@ fn restore_epoch_backfill_retry_deadline(deadline_unix_ms: Option<u64>) -> Optio
     let deadline_unix_ms = deadline_unix_ms?;
     let now_unix_ms = crate::unix_now_seconds().saturating_mul(1_000);
     let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
-    (remaining_ms > 0).then(|| Instant::now() + Duration::from_millis(remaining_ms))
+    if remaining_ms == 0 {
+        return None;
+    }
+    let cap_ms = u64::try_from(EPOCH_BACKFILL_RETRY_BACKOFF_CAP.as_millis()).unwrap_or(u64::MAX);
+    let remaining_ms = remaining_ms.min(cap_ms);
+    Instant::now().checked_add(Duration::from_millis(remaining_ms))
 }
 
 /// App-owned representation stored as one encrypted account-DB blob. Groups
@@ -164,6 +169,10 @@ struct PersistedEpochBackfillIntent {
     attempt_id: String,
     groups: Vec<PersistedEpochBackfillGroup>,
     execution_attempts: u32,
+    #[serde(default)]
+    eose_unconfirmed_attempts: u32,
+    #[serde(default)]
+    no_progress_attempts: u32,
     last_deferred_audit: Option<PersistedEpochBackfillDeferredSnapshot>,
 }
 
@@ -241,6 +250,12 @@ fn merge_account_visibility_effects(
 /// intent and its audit trail. Explicit full-history repair instead uses this
 /// distinction to try any queued runnable intent before falling back to its
 /// ordinary unfloored account-wide replay.
+#[derive(Debug)]
+enum EpochBackfillFinish {
+    Succeeded,
+    Failed { preserve_pacing: bool },
+}
+
 #[derive(Debug)]
 pub(crate) enum EpochBackfillRunOutcome {
     NotPending,
@@ -513,6 +528,8 @@ impl From<&PendingEpochBackfill> for PersistedEpochBackfillIntent {
             attempt_id: pending.attempt_id.clone(),
             groups,
             execution_attempts: pending.execution_attempts,
+            eose_unconfirmed_attempts: pending.eose_unconfirmed_attempts,
+            no_progress_attempts: pending.no_progress_attempts,
             last_deferred_audit: pending.last_deferred_audit.as_ref().map(|snapshot| {
                 PersistedEpochBackfillDeferredSnapshot {
                     reason: snapshot.reason,
@@ -586,8 +603,8 @@ impl TryFrom<PersistedEpochBackfillIntent> for PendingEpochBackfill {
             attempt_id: persisted.attempt_id,
             groups,
             execution_attempts: persisted.execution_attempts,
-            eose_unconfirmed_attempts: 0,
-            no_progress_attempts: 0,
+            eose_unconfirmed_attempts: persisted.eose_unconfirmed_attempts,
+            no_progress_attempts: persisted.no_progress_attempts,
             last_deferred_audit,
         })
     }
@@ -3451,13 +3468,13 @@ impl AppClient {
                 "ignored malformed durable epoch-gap recovery markers"
             );
         }
-        // Local group existence is the liveness check. A local wipe does not
-        // delete protocol `cgka_groups` rows, so the per-group table may still
-        // hold a deleted group; those rows must not re-arm the journal.
+        // Local app projection is the liveness check. A local wipe does not
+        // delete protocol `cgka_groups` rows, so restart must not treat a
+        // retained protocol record as a live backfill owner.
         let journal_restored = self.pending_epoch_backfill.is_some()
             || self.active_epoch_backfill.is_some()
             || !self.queued_epoch_backfills.is_empty();
-        table_groups.retain(|group_id, _| self.local_epoch_for_group(group_id).is_some());
+        table_groups.retain(|group_id, _| self.local_projection_contains_group(group_id));
         if journal_restored {
             let journal_ids = self
                 .pending_epoch_backfill
@@ -3468,7 +3485,7 @@ impl AppClient {
                 .collect::<Vec<_>>();
             let mut live = table_groups.keys().cloned().collect::<HashSet<_>>();
             for group_id in journal_ids {
-                if self.local_epoch_for_group(&group_id).is_some() {
+                if self.local_projection_contains_group(&group_id) {
                     live.insert(group_id);
                 }
             }
@@ -3779,7 +3796,13 @@ impl AppClient {
             },
             succeeded.then_some(EpochBackfillCompletionKind::EndOfStoredEvents),
             DrainCounts::default(),
-            succeeded,
+            if succeeded {
+                EpochBackfillFinish::Succeeded
+            } else {
+                EpochBackfillFinish::Failed {
+                    preserve_pacing: false,
+                }
+            },
         )
         .map(|_| ())
     }
@@ -3804,7 +3827,7 @@ impl AppClient {
                 refused,
                 ..DrainCounts::default()
             },
-            true,
+            EpochBackfillFinish::Succeeded,
         )
         .expect("test epoch-backfill completion must persist its intent journal");
     }
@@ -3814,6 +3837,14 @@ impl AppClient {
             .group_record(group_id)
             .ok()
             .map(|record| record.epoch.0)
+    }
+
+    fn local_projection_contains_group(&self, group_id: &cgka_traits::GroupId) -> bool {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.state
+            .groups
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
     }
 
     fn capture_pending_group_epochs(
@@ -3899,8 +3930,12 @@ impl AppClient {
         error_kind: Option<String>,
         completion_kind: Option<EpochBackfillCompletionKind>,
         counts: DrainCounts,
-        succeeded: bool,
+        finish: EpochBackfillFinish,
     ) -> Result<bool, AppError> {
+        let (succeeded, preserve_pacing) = match finish {
+            EpochBackfillFinish::Succeeded => (true, false),
+            EpochBackfillFinish::Failed { preserve_pacing } => (false, preserve_pacing),
+        };
         if self
             .active_epoch_backfill
             .as_ref()
@@ -3936,6 +3971,7 @@ impl AppClient {
         let previous_pending = self.pending_epoch_backfill.clone();
         let previous_active = self.active_epoch_backfill.clone();
         let previous_queued = self.queued_epoch_backfills.clone();
+        let previous_retry_not_before = self.epoch_backfill_retry_not_before;
         self.active_epoch_backfill = None;
         let recovered = if !succeeded {
             // Every error exit of `run_pending_epoch_backfill` lands here
@@ -3964,13 +4000,18 @@ impl AppClient {
             // beyond a longer wait: no attempt limit degrades or abandons an
             // intent, and a caller-directed repair stays exempt from the
             // cooldown entirely.
-            let backoff = self.epoch_backfill_retry_backoff(execution.retry_ordinal);
-            self.epoch_backfill_retry_not_before = Some(Instant::now() + backoff);
+            if !preserve_pacing {
+                let backoff = self.epoch_backfill_retry_backoff(execution.retry_ordinal);
+                self.epoch_backfill_retry_not_before = Some(Instant::now() + backoff);
+            }
             self.requeue_failed_epoch_backfill_intent(execution.pending);
             false
         } else if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, &counts)
         {
             self.epoch_stall.mark_replayed();
+            if !preserve_pacing {
+                self.epoch_backfill_retry_not_before = None;
+            }
             true
         } else {
             // Fruitless. An end-of-stored-events completion is the relays saying
@@ -4004,12 +4045,18 @@ impl AppClient {
             // epoch.
             self.epoch_stall
                 .rearm_refused_groups(&counts.refused_groups);
+            if !preserve_pacing {
+                self.epoch_backfill_retry_not_before = Some(
+                    Instant::now() + self.epoch_backfill_retry_backoff(execution.retry_ordinal),
+                );
+            }
             false
         };
         if let Err(error) = self.persist_epoch_backfill_intent_journal() {
             self.pending_epoch_backfill = previous_pending;
             self.active_epoch_backfill = previous_active;
             self.queued_epoch_backfills = previous_queued;
+            self.epoch_backfill_retry_not_before = previous_retry_not_before;
             return Err(error);
         }
         Ok(recovered)
@@ -4132,7 +4179,9 @@ impl AppClient {
                 Some(terminal_error),
                 None,
                 DrainCounts::default(),
-                false,
+                EpochBackfillFinish::Failed {
+                    preserve_pacing: false,
+                },
             )?;
             return Err(error);
         }
@@ -4149,7 +4198,9 @@ impl AppClient {
                         Some(terminal_error),
                         None,
                         DrainCounts::default(),
-                        false,
+                        EpochBackfillFinish::Failed {
+                            preserve_pacing: false,
+                        },
                     )?;
                     return Err(err);
                 }
@@ -4168,7 +4219,9 @@ impl AppClient {
                         Some(terminal_error),
                         None,
                         DrainCounts::default(),
-                        false,
+                        EpochBackfillFinish::Failed {
+                            preserve_pacing: false,
+                        },
                     )?;
                     return Err(err);
                 }
@@ -4191,7 +4244,9 @@ impl AppClient {
                             Some(terminal_error),
                             None,
                             counts,
-                            false,
+                            EpochBackfillFinish::Failed {
+                                preserve_pacing: false,
+                            },
                         )?;
                         return Err(err.source);
                     }
@@ -4224,18 +4279,12 @@ impl AppClient {
                         Some(terminal_error),
                         None,
                         counts,
-                        false,
+                        EpochBackfillFinish::Failed {
+                            preserve_pacing: false,
+                        },
                     )?;
                     return Err(error);
                 }
-                let recovered = self.finish_epoch_backfill_execution(
-                    execution,
-                    EpochBackfillActivationOutcome::Succeeded,
-                    error_kind.map(str::to_owned),
-                    verdict.completion_kind(),
-                    counts.clone(),
-                    error_kind.is_none(),
-                )?;
                 if let Some(error_kind) = error_kind {
                     tracing::warn!(
                         target: "marmot_app::epoch_stall",
@@ -4257,29 +4306,30 @@ impl AppClient {
                         };
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(pacing_ordinal))
                     };
-                    self.persist_epoch_backfill_intent_journal()?;
+                    self.finish_epoch_backfill_execution(
+                        execution,
+                        EpochBackfillActivationOutcome::Succeeded,
+                        Some(error_kind.to_owned()),
+                        verdict.completion_kind(),
+                        counts.clone(),
+                        EpochBackfillFinish::Failed {
+                            preserve_pacing: true,
+                        },
+                    )?;
                     return Ok(EpochBackfillRunOutcome::Incomplete(
                         self.take_checkpointed_sync_summary_or_default(),
                     ));
                 }
-                if recovered {
-                    self.epoch_backfill_retry_not_before = None;
-                } else {
-                    // A completed-but-fruitless replay just re-armed the groups
-                    // whose history it could not retain. Clearing the cooldown
-                    // here would let that re-arm drain the whole account again
-                    // immediately, against a cap that is still full — an
-                    // unpaced arm -> drain -> clear -> re-arm loop, because a
-                    // fresh intent starts at `execution_attempts == 0`. A
-                    // fruitless success pays the same backoff an unconfirmed
-                    // drain does, which bounds the loop to one account-wide
-                    // replay per window. `epoch_backfill_retry_is_paced`
-                    // exempts caller-directed catch-up, so a person asking for
-                    // a repair still never waits on it.
-                    self.epoch_backfill_retry_not_before =
-                        Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
-                }
-                self.persist_epoch_backfill_intent_journal()?;
+                // Terminal intent and earned cooldown persist together so a
+                // crash cannot re-arm an unpaced retry.
+                let _recovered = self.finish_epoch_backfill_execution(
+                    execution,
+                    EpochBackfillActivationOutcome::Succeeded,
+                    None,
+                    verdict.completion_kind(),
+                    counts.clone(),
+                    EpochBackfillFinish::Succeeded,
+                )?;
                 Ok(EpochBackfillRunOutcome::Completed(
                     self.take_checkpointed_sync_summary_or_default(),
                 ))
@@ -4293,7 +4343,9 @@ impl AppClient {
                     Some(terminal_error),
                     None,
                     DrainCounts::default(),
-                    false,
+                    EpochBackfillFinish::Failed {
+                        preserve_pacing: false,
+                    },
                 )?;
                 Err(app_err)
             }
@@ -6147,8 +6199,8 @@ pub(crate) fn epoch_stall_now_ms() -> u64 {
 mod tests {
     use super::{
         DrainVerdict, backfill_drain_verdict, incomplete_full_history_repair,
-        reconciliation_start_after_cursor, retry_backoff_for_ordinal,
-        transport_reconciliation_record,
+        reconciliation_start_after_cursor, restore_epoch_backfill_retry_deadline,
+        retry_backoff_for_ordinal, transport_reconciliation_record,
     };
     use crate::tests::{
         ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -6247,6 +6299,20 @@ mod tests {
         // than being shrunk by the cap.
         let oversized = EPOCH_BACKFILL_RETRY_BACKOFF_CAP * 2;
         assert_eq!(retry_backoff_for_ordinal(oversized, 0), oversized);
+    }
+
+    #[test]
+    fn restored_epoch_backfill_deadlines_are_capped_and_checked() {
+        assert!(restore_epoch_backfill_retry_deadline(None).is_none());
+        let now_ms = crate::unix_now_seconds().saturating_mul(1_000);
+        assert!(restore_epoch_backfill_retry_deadline(Some(now_ms)).is_none());
+        let restored = restore_epoch_backfill_retry_deadline(Some(now_ms.saturating_add(u64::MAX)))
+            .expect("a far-future deadline must restore as a capped delay");
+        let cap = EPOCH_BACKFILL_RETRY_BACKOFF_CAP + Duration::from_secs(1);
+        assert!(
+            restored.saturating_duration_since(std::time::Instant::now()) <= cap,
+            "restored wall-clock delay must not exceed the retry cap"
+        );
     }
 
     #[test]

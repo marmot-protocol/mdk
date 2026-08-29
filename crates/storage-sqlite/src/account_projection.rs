@@ -1465,6 +1465,13 @@ impl SqliteAccountStorage {
                     )
                     .storage()?,
                 );
+                deleted = deleted.saturating_add(
+                    tx.execute(
+                        "DELETE FROM app_epoch_backfill_intents WHERE group_id = ?1",
+                        params![&group_id],
+                    )
+                    .storage()?,
+                );
                 for table in [
                     "app_events",
                     "message_timeline",
