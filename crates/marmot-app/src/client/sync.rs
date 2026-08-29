@@ -1122,6 +1122,17 @@ impl AppClient {
                 .retain(|message| !gossip_message_ids.contains(&message.message_id_hex));
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
+        // Synthesize durable kind-1210 system rows from the replayed
+        // authenticated state changes, the same tail the live seam runs. A
+        // replayed event carries no envelope of its own — that is why this seam
+        // derives a synthetic source id from the durable outbox key above — so
+        // the rows are stamped with `source_received_at`, this drain's
+        // observation time, exactly like every other projection in the loop.
+        // The row id is derived from the change and its epoch, never from the
+        // stamp, so a crash that replays the batch re-upserts the same row.
+        summary
+            .projection_updates
+            .extend(self.project_group_system_rows(&effects.events, source_received_at));
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
