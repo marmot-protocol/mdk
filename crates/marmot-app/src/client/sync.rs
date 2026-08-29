@@ -3004,6 +3004,7 @@ impl AppClient {
                             counts,
                             false,
                         );
+                        self.pending_failed_sync_summary.merge(summary);
                         return Err(err);
                     }
                 };
