@@ -4410,6 +4410,174 @@ fn live_engine_group_keeps_backfill_when_projection_is_torn() {
 }
 
 #[test]
+fn epoch_backfill_liveness_uncertainty_does_not_persist_on_eager_or_deferred_open() {
+    run_composed_app_runtime_test("backfill-liveness-uncertainty", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_a = client
+            .create_group("uncertain live backfill group", &[])
+            .await
+            .unwrap();
+        let stalled_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client
+            .apply_backfill_decision(
+                &group_a,
+                stalled_a,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        let group_a_hex = hex::encode(group_a.as_slice());
+        client
+            .state
+            .groups
+            .retain(|group| group.group_id_hex != group_a_hex);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        drop(client);
+
+        let before = app
+            .account_storage("alice")
+            .unwrap()
+            .load_epoch_backfill_intent_journal()
+            .unwrap();
+        app.inject_epoch_backfill_liveness_failures(true, false);
+        assert!(
+            app.client_with_relay_plane("alice", &app.relay_plane, None)
+                .await
+                .is_err(),
+            "eager open must fail closed when live-group listing is uncertain"
+        );
+        assert!(
+            app.local_client_with_deferred_hydration_for_test("alice", &app.relay_plane)
+                .await
+                .is_err(),
+            "deferred open must fail closed when live-group listing is uncertain"
+        );
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .load_epoch_backfill_intent_journal()
+                .unwrap(),
+            before,
+            "listing uncertainty must leave the durable journal unchanged"
+        );
+
+        app.inject_epoch_backfill_liveness_failures(false, true);
+        assert!(
+            app.client_with_relay_plane("alice", &app.relay_plane, None)
+                .await
+                .is_err(),
+            "eager open must fail closed when the deletion frontier is uncertain"
+        );
+        assert!(
+            app.local_client_with_deferred_hydration_for_test("alice", &app.relay_plane)
+                .await
+                .is_err(),
+            "deferred open must fail closed when the deletion frontier is uncertain"
+        );
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .load_epoch_backfill_intent_journal()
+                .unwrap(),
+            before,
+            "frontier uncertainty must leave the durable journal unchanged"
+        );
+
+        app.inject_epoch_backfill_liveness_failures(false, false);
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened
+                .pending_epoch_backfill
+                .as_ref()
+                .is_some_and(|pending| pending.groups.contains_key(&group_a)),
+            "a later successful open must still see the live torn-projection intent"
+        );
+    });
+}
+
+#[test]
+fn epoch_backfill_frontier_uncertainty_does_not_rearm_a_deleted_group() {
+    run_composed_app_runtime_test("backfill-frontier-uncertainty", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example".to_owned(),
+            bounded_epoch_backfill_config(),
+        )
+        .with_test_relay_client(relay);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group_a = client
+            .create_group("uncertain deleted backfill group", &[])
+            .await
+            .unwrap();
+        let stalled_a = client.group_mls_state(&group_a).unwrap().epoch;
+        client
+            .apply_backfill_decision(
+                &group_a,
+                stalled_a,
+                BackfillDecision::Arm,
+                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        client.skip_epoch_backfill_prune_on_delete = true;
+        assert!(client.delete_group_local(&group_a).await.unwrap());
+        drop(client);
+
+        let before = app
+            .account_storage("alice")
+            .unwrap()
+            .load_epoch_backfill_intent_journal()
+            .unwrap();
+        app.inject_epoch_backfill_liveness_failures(false, true);
+        assert!(
+            app.client_with_relay_plane("alice", &app.relay_plane, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            app.local_client_with_deferred_hydration_for_test("alice", &app.relay_plane)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.account_storage("alice")
+                .unwrap()
+                .load_epoch_backfill_intent_journal()
+                .unwrap(),
+            before,
+            "frontier uncertainty must not persist a rearmed deleted group"
+        );
+
+        app.inject_epoch_backfill_liveness_failures(false, false);
+        let reopened = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            reopened
+                .pending_epoch_backfill
+                .as_ref()
+                .is_none_or(|pending| !pending.groups.contains_key(&group_a)),
+            "a later successful open must still prune the deleted group"
+        );
+    });
+}
+
+#[test]
 fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
     run_composed_app_runtime_test("epoch-backfill-deferral", || async {
         let dir = tempfile::tempdir().unwrap();

@@ -5049,6 +5049,57 @@ where
             == Some(fanout.message_id()))
     }
 
+    fn leave_action_outcome_is_recorded(
+        &self,
+        message_id: &MessageId,
+        published: bool,
+        output: &AccountDeviceEffects,
+    ) -> AccountResult<bool> {
+        if let Some(existing) = output
+            .action_outcomes
+            .iter()
+            .find(|outcome| &outcome.message_id == message_id)
+        {
+            if existing.published != published {
+                return Err(account_visibility_error(
+                    "outbound action changed its terminal publish outcome",
+                ));
+            }
+            return Ok(true);
+        }
+        let batches = self.load_visibility_batches()?;
+        if let Some(existing) = batches
+            .iter()
+            .flat_map(|batch| &batch.effects.action_outcomes)
+            .find(|outcome| &outcome.message_id == message_id)
+        {
+            if existing.published != published {
+                return Err(account_visibility_error(
+                    "durable outbound action changed its terminal publish outcome",
+                ));
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn ensure_leave_fanout_outcome_recorded(
+        &self,
+        fanout: &OutboundFanout,
+        published: bool,
+        output: &AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        if !self.leave_fanout_requires_action_outcome(fanout)? {
+            return Ok(());
+        }
+        if self.leave_action_outcome_is_recorded(fanout.message_id(), published, output)? {
+            return Ok(());
+        }
+        Err(account_visibility_error(
+            "leave fanout produced no durable action outcome",
+        ))
+    }
+
     async fn publish_queue(
         &mut self,
         output: &mut AccountDeviceEffects,
@@ -5218,19 +5269,12 @@ where
                 self.checkpoint_current_publish_visibility(visibility_handoff, &output)?;
             } else {
                 let published = outcome.accepted_targets >= fanout.request().required_acks.max(1);
-                let outcomes_before = output.action_outcomes.len();
                 self.record_terminal_outbound_action_outcome(
                     fanout.message_id(),
                     published,
                     &mut output,
                 )?;
-                if self.leave_fanout_requires_action_outcome(&fanout)?
-                    && output.action_outcomes.len() == outcomes_before
-                {
-                    return Err(account_visibility_error(
-                        "leave fanout produced no durable action outcome",
-                    ));
-                }
+                self.ensure_leave_fanout_outcome_recorded(&fanout, published, &output)?;
                 self.checkpoint_current_publish_visibility(visibility_handoff, &output)?;
                 self.session.delete_outbound_fanout(fanout.message_id())?;
             }
@@ -6407,19 +6451,14 @@ where
         // can land while an optional target stays retryable, so emit durable
         // true at quorum rather than waiting for complete fanout. `published:
         // false` stays terminal: only a finished fanout that missed quorum.
-        let outcomes_before = output.action_outcomes.len();
         if status.met_required_acks {
             self.record_terminal_outbound_action_outcome(fanout.message_id(), true, output)?;
         } else if fanout_outcome.fanout_complete {
             self.record_terminal_outbound_action_outcome(fanout.message_id(), false, output)?;
         }
-        if fanout_outcome.fanout_complete
-            && self.leave_fanout_requires_action_outcome(&fanout)?
-            && output.action_outcomes.len() == outcomes_before
-        {
-            return Err(account_visibility_error(
-                "leave fanout produced no durable action outcome",
-            ));
+        if fanout_outcome.fanout_complete {
+            let published = status.met_required_acks;
+            self.ensure_leave_fanout_outcome_recorded(&fanout, published, output)?;
         }
         self.checkpoint_optional_publish_visibility(visibility_handoff, output)?;
         if fanout_outcome.fanout_complete

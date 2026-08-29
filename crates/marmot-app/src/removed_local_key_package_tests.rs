@@ -665,6 +665,186 @@ fn removed_local_key_package_tombstone_journal_fails_closed_at_capacity() {
 }
 
 #[test]
+fn oversized_tombstone_journal_fails_closed_without_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("tombstone-oversized")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let journal_dir = app
+        .removed_local_key_package_account_tombstone_dir(&account.account_id_hex)
+        .unwrap();
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let retired = (0..257)
+        .map(|index| format!("oversized-slot-{index}"))
+        .collect::<Vec<_>>();
+    write_json(
+        journal_dir.join("slots.json"),
+        &serde_json::json!({
+            "account_id_hex": account.account_id_hex,
+            "retired_stable_slot_ids": retired,
+            "account_wide": false,
+        }),
+    )
+    .unwrap();
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "fresh-slot".to_owned(),
+        ))
+        .unwrap();
+    assert!(
+        app.persist_removed_local_key_package_tombstone(&account)
+            .is_err(),
+        "an oversized slots.json must fail closed before write or cleanup"
+    );
+    let loaded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal_dir.join("slots.json")).unwrap()).unwrap();
+    assert_eq!(
+        loaded["retired_stable_slot_ids"].as_array().map(Vec::len),
+        Some(257),
+        "rejection must preserve the oversized journal"
+    );
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "oversized-slot-0")
+            .is_err(),
+        "an oversized journal must not be treated as a successful retirement read"
+    );
+}
+
+#[test]
+fn malformed_legacy_exact_slot_tombstone_is_not_deleted_on_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("tombstone-malformed")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let journal_dir = app
+        .removed_local_key_package_account_tombstone_dir(&account.account_id_hex)
+        .unwrap();
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let none_path = app
+        .removed_local_key_package_tombstone_path(&account.account_id_hex, Some("slot-a"))
+        .unwrap();
+    write_json(
+        &none_path,
+        &serde_json::json!({
+            "account_id_hex": account.account_id_hex,
+            "stable_slot_id": serde_json::Value::Null,
+        }),
+    )
+    .unwrap();
+    let mismatched_path = app
+        .removed_local_key_package_tombstone_path(&account.account_id_hex, Some("slot-c"))
+        .unwrap();
+    write_json(
+        &mismatched_path,
+        &RemovedLocalKeyPackageTombstone {
+            account_id_hex: account.account_id_hex.clone(),
+            stable_slot_id: Some("slot-b".to_owned()),
+        },
+    )
+    .unwrap();
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "sibling-slot".to_owned(),
+        ))
+        .unwrap();
+    app.persist_removed_local_key_package_tombstone(&account)
+        .unwrap();
+
+    assert!(
+        none_path.exists(),
+        "a None payload on slot-A's filename must survive compaction"
+    );
+    assert!(
+        mismatched_path.exists(),
+        "a slot-C file carrying slot-B must survive compaction"
+    );
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "sibling-slot")
+            .unwrap()
+    );
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "slot-a")
+            .is_err(),
+        "the remaining None marker must keep slot-A fail-closed"
+    );
+    assert!(
+        app.removed_local_key_package_slot_is_retired(&account.account_id_hex, "slot-c")
+            .is_err(),
+        "the remaining mismatched marker must keep slot-C fail-closed"
+    );
+    let journal: RemovedLocalKeyPackageTombstoneJournal = read_json(
+        app.removed_local_key_package_tombstone_journal_path(&account.account_id_hex)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !journal
+            .retired_stable_slot_ids
+            .iter()
+            .any(|slot| slot == "slot-a" || slot == "slot-c" || slot == "slot-b"),
+        "malformed legacy markers must not be imported as retired identities"
+    );
+}
+
+#[test]
+fn merged_legacy_tombstones_fail_closed_before_exceeding_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("tombstone-merged-cap")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let journal_dir = app
+        .removed_local_key_package_account_tombstone_dir(&account.account_id_hex)
+        .unwrap();
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let retired = (0..256)
+        .map(|index| format!("filled-slot-{index}"))
+        .collect::<Vec<_>>();
+    write_json(
+        journal_dir.join("slots.json"),
+        &serde_json::json!({
+            "account_id_hex": account.account_id_hex,
+            "retired_stable_slot_ids": retired,
+            "account_wide": false,
+        }),
+    )
+    .unwrap();
+    let extra_path = app
+        .removed_local_key_package_tombstone_path(
+            &account.account_id_hex,
+            Some("imported-overflow"),
+        )
+        .unwrap();
+    write_json(
+        &extra_path,
+        &RemovedLocalKeyPackageTombstone {
+            account_id_hex: account.account_id_hex.clone(),
+            stable_slot_id: Some("imported-overflow".to_owned()),
+        },
+    )
+    .unwrap();
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "fresh-slot".to_owned(),
+        ))
+        .unwrap();
+    assert!(
+        app.persist_removed_local_key_package_tombstone(&account)
+            .is_err(),
+        "importing a 257th legacy slot must fail before write or cleanup"
+    );
+    assert!(
+        extra_path.exists(),
+        "capacity rejection must preserve the unimported legacy proof"
+    );
+}
+
+#[test]
 fn tracked_only_removal_does_not_create_local_slot_authority() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

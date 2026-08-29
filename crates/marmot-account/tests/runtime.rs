@@ -8610,6 +8610,17 @@ async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
         );
         assert!(restarted.acknowledge_visibility_lease(replayed.lease));
     }
+    assert!(
+        restarted
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .iter()
+            .all(|fanout| {
+                fanout.outcome().accepted_targets < fanout.request().required_acks.max(1)
+            }),
+        "a surviving terminal zero-accept fanout must still miss required_acks.max(1)"
+    );
     let drained = restarted.drain_leased().await.unwrap();
     assert!(
         drained
@@ -8618,6 +8629,10 @@ async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
             .iter()
             .all(|outcome| !outcome.published),
         "resuming a terminal zero-accept Leave must not authorize Left"
+    );
+    assert!(
+        restarted.session().outbound_fanouts().unwrap().is_empty(),
+        "terminal zero-accept resume must finish the Leave fanout without publishing"
     );
 }
 
@@ -8657,7 +8672,7 @@ async fn leave_m1_to_m2_repair_persists_every_row_so_cleared_request_does_not_sp
         .leave_request(&group_id)
         .unwrap()
         .expect("accepted Leave writes a durable request");
-    request.last_proposed_message_id = Some(later_id);
+    request.last_proposed_message_id = Some(later_id.clone());
     runtime
         .session()
         .storage_handle()
@@ -8677,6 +8692,39 @@ async fn leave_m1_to_m2_repair_persists_every_row_so_cleared_request_does_not_sp
         .replay_visibility_leased()
         .unwrap()
         .expect("unacked Leave remains crash-visible for M1→M2 repair");
+    let leave_sources = replayed
+        .batches
+        .iter()
+        .filter_map(|batch| match &batch.source {
+            AccountVisibilitySource::Outbound {
+                group_id: Some(source_group),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                action_message_id,
+                ..
+            } if source_group == &group_id => {
+                Some((batch.operation_id.clone(), action_message_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut unique_source_by_operation =
+        std::collections::HashMap::<Vec<u8>, Option<MessageId>>::new();
+    for (operation_id, action_message_id) in &leave_sources {
+        if let Some(existing) = unique_source_by_operation.get(operation_id) {
+            assert_eq!(
+                existing, action_message_id,
+                "M1→M2 repair must persist one source per operation, got {leave_sources:?}"
+            );
+        } else {
+            unique_source_by_operation.insert(operation_id.clone(), action_message_id.clone());
+        }
+    }
+    assert!(
+        unique_source_by_operation
+            .values()
+            .any(|bound| bound.as_ref() == Some(&later_id)),
+        "repaired Leave source must name the live M2 id: {leave_sources:?}"
+    );
     drop(replayed);
     drop(repaired);
 
@@ -8696,9 +8744,44 @@ async fn leave_m1_to_m2_repair_persists_every_row_so_cleared_request_does_not_sp
         RecordingKeyPackages::default(),
     );
     restarted.pause_maintenance();
-    restarted
+    let replayed = restarted
         .replay_visibility_leased()
-        .expect("Header+suffix M2 repair must persist every row so reopen cannot split source");
+        .expect("Header+suffix M2 repair must persist every row so reopen cannot split source")
+        .expect("repaired Leave source must survive LeaveRequest clear");
+    let leave_sources = replayed
+        .batches
+        .iter()
+        .filter_map(|batch| match &batch.source {
+            AccountVisibilitySource::Outbound {
+                group_id: Some(source_group),
+                action: Some(AccountVisibilityOutboundAction::Leave),
+                action_message_id,
+                ..
+            } if source_group == &group_id => {
+                Some((batch.operation_id.clone(), action_message_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut unique_source_by_operation =
+        std::collections::HashMap::<Vec<u8>, Option<MessageId>>::new();
+    for (operation_id, action_message_id) in &leave_sources {
+        if let Some(existing) = unique_source_by_operation.get(operation_id) {
+            assert_eq!(
+                existing, action_message_id,
+                "cleared LeaveRequest must not resurrect a split M1/M2 source: {leave_sources:?}"
+            );
+        } else {
+            unique_source_by_operation.insert(operation_id.clone(), action_message_id.clone());
+        }
+    }
+    assert!(
+        !unique_source_by_operation.is_empty()
+            && unique_source_by_operation
+                .values()
+                .all(|bound| bound.is_some()),
+        "cleared LeaveRequest must not resurrect a split or unbound Leave source: {leave_sources:?}"
+    );
 }
 
 #[tokio::test]
@@ -8734,6 +8817,13 @@ async fn terminal_m1_failure_ack_then_engine_m2_records_published_true() {
         })
         .await
         .unwrap();
+    let m1_id = leased
+        .effects
+        .action_outcomes
+        .iter()
+        .find(|outcome| !outcome.published)
+        .map(|outcome| outcome.message_id.clone())
+        .expect("terminal M1 Header failure records unpublished Leave");
     assert!(
         leased
             .effects
@@ -8806,11 +8896,7 @@ async fn terminal_m1_failure_ack_then_engine_m2_records_published_true() {
         })
         .await
         .expect("bob must ingest alice's epoch-advancing commit");
-    let mut published = ingested
-        .effects
-        .action_outcomes
-        .iter()
-        .any(|outcome| outcome.published);
+    let mut published_outcomes = ingested.effects.action_outcomes.clone();
     if matches!(
         ingested.outcome,
         cgka_traits::ingest::IngestOutcome::Buffered { .. }
@@ -8829,22 +8915,42 @@ async fn terminal_m1_failure_ack_then_engine_m2_records_published_true() {
             .advance_convergence_leased(&group_id)
             .await
             .expect("buffered epoch-advancing commit must converge");
-        published |= converged
-            .effects
-            .action_outcomes
-            .iter()
-            .any(|outcome| outcome.published);
+        published_outcomes.extend(converged.effects.action_outcomes);
     }
     let drained = restarted.drain_leased().await.unwrap();
-    published |= drained
-        .effects
-        .action_outcomes
-        .iter()
-        .any(|outcome| outcome.published);
-    assert!(
-        published,
-        "engine-driven M2 success must record published:true even with no surviving M1 Header"
+    published_outcomes.extend(drained.effects.action_outcomes.clone());
+    let m2 = published_outcomes
+        .into_iter()
+        .find(|outcome| outcome.published)
+        .expect(
+            "engine-driven M2 success must record published:true even with no surviving M1 Header",
+        );
+    assert_ne!(
+        m2.message_id, m1_id,
+        "engine-driven Leave success must bind the new SelfRemove, not the failed M1 Header"
     );
+    drop(restarted);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut recovered = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    recovered.pause_maintenance();
+    let replayed = recovered
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("engine-driven M2 published outcome must survive restart");
+    assert!(
+        flatten_visibility_batches(&replayed.batches)
+            .action_outcomes
+            .iter()
+            .any(|outcome| outcome.published && outcome.message_id == m2.message_id),
+        "restart must replay the exact engine-driven M2 Leave"
+    );
+    assert!(recovered.acknowledge_visibility_lease(replayed.lease));
 }
 
 #[tokio::test]
@@ -9281,7 +9387,21 @@ async fn leave_quorum_records_published_true_while_optional_target_stays_retryab
             .count(),
         1
     );
-    assert!(restarted.acknowledge_visibility_lease(replayed.lease));
+    let drained = restarted
+        .drain_leased()
+        .await
+        .expect("optional Leave completion must accept an already-durable published outcome");
+    assert!(
+        drained
+            .effects
+            .action_outcomes
+            .iter()
+            .all(|outcome| outcome.published),
+        "completing the optional target must not rewrite the durable published:true outcome"
+    );
+    if !restarted.acknowledge_visibility_lease(replayed.lease) {
+        assert!(restarted.acknowledge_visibility_lease(drained.lease));
+    }
 }
 
 #[tokio::test]

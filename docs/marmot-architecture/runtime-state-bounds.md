@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-08-28
+updated: 2026-08-29
 tags: [marmot, architecture, runtime, daemon, broker, memory, key-package]
 ---
 

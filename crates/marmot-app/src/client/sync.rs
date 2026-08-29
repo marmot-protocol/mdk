@@ -3445,7 +3445,7 @@ impl AppClient {
     pub(crate) fn restore_persisted_epoch_backfill_intents(
         &mut self,
         intents: Vec<storage_sqlite::StoredEpochBackfillIntent>,
-    ) {
+    ) -> Result<(), AppError> {
         let mut table_groups = std::collections::HashMap::new();
         let mut malformed = 0_u64;
         for intent in intents {
@@ -3471,24 +3471,29 @@ impl AppClient {
         // Live engine groups keep their backfill intent even when the app
         // projection is still torn. Locally deleted groups keep a durable
         // frontier and must not re-arm the journal off the protocol record.
+        // Snapshot engine/projected IDs once; any storage uncertainty leaves
+        // both durable representations unchanged.
+        let (live_engine_ids, projected_ids) = self.epoch_backfill_liveness_snapshot()?;
         let journal_restored = self.pending_epoch_backfill.is_some()
             || self.active_epoch_backfill.is_some()
             || !self.queued_epoch_backfills.is_empty();
-        table_groups.retain(|group_id, _| self.epoch_backfill_group_is_live(group_id));
-        if journal_restored {
-            let journal_ids = self
-                .pending_epoch_backfill
-                .iter()
-                .chain(self.active_epoch_backfill.iter())
-                .chain(self.queued_epoch_backfills.iter())
-                .flat_map(|intent| intent.groups.keys().cloned())
-                .collect::<Vec<_>>();
-            let mut live = table_groups.keys().cloned().collect::<HashSet<_>>();
-            for group_id in journal_ids {
-                if self.epoch_backfill_group_is_live(&group_id) {
-                    live.insert(group_id);
-                }
+        let journal_ids = self
+            .pending_epoch_backfill
+            .iter()
+            .chain(self.active_epoch_backfill.iter())
+            .chain(self.queued_epoch_backfills.iter())
+            .flat_map(|intent| intent.groups.keys().cloned())
+            .collect::<Vec<_>>();
+        let mut candidates = table_groups.keys().cloned().collect::<HashSet<_>>();
+        candidates.extend(journal_ids);
+        let mut live = HashSet::new();
+        for group_id in &candidates {
+            if self.epoch_backfill_group_is_live(group_id, &live_engine_ids, &projected_ids)? {
+                live.insert(group_id.clone());
             }
+        }
+        table_groups.retain(|group_id, _| live.contains(group_id));
+        if journal_restored {
             let mut pruned = self.retain_live_epoch_backfill_groups(&live);
             let known = self
                 .pending_epoch_backfill
@@ -3507,16 +3512,17 @@ impl AppClient {
                 }
             }
             if pruned {
-                let _ = self.persist_epoch_backfill_intent_journal();
+                self.persist_epoch_backfill_intent_journal()?;
             }
-            return;
+            return Ok(());
         }
         if table_groups.is_empty() {
-            return;
+            return Ok(());
         }
         let mut pending = PendingEpochBackfill::new();
         pending.groups = table_groups;
         self.pending_epoch_backfill = Some(pending);
+        Ok(())
     }
 
     fn retain_live_epoch_backfill_groups(&mut self, live: &HashSet<cgka_traits::GroupId>) -> bool {
@@ -3839,26 +3845,58 @@ impl AppClient {
             .map(|record| record.epoch.0)
     }
 
-    fn local_projection_contains_group(&self, group_id: &cgka_traits::GroupId) -> bool {
-        let group_id_hex = hex::encode(group_id.as_slice());
-        self.state
+    fn epoch_backfill_liveness_snapshot(
+        &self,
+    ) -> Result<(HashSet<cgka_traits::GroupId>, HashSet<cgka_traits::GroupId>), AppError> {
+        #[cfg(test)]
+        if self
+            .app
+            .fail_epoch_backfill_live_group_ids
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other(
+                "injected epoch-backfill live-group listing failure",
+            )
+            .into());
+        }
+        let live_engine_ids = self
+            .runtime
+            .live_group_ids()?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let projected_ids = self
+            .state
             .groups
             .iter()
-            .any(|group| group.group_id_hex == group_id_hex)
+            .filter_map(|group| {
+                hex::decode(&group.group_id_hex)
+                    .ok()
+                    .map(cgka_traits::GroupId::new)
+            })
+            .collect::<HashSet<_>>();
+        Ok((live_engine_ids, projected_ids))
     }
 
-    fn epoch_backfill_group_is_live(&self, group_id: &cgka_traits::GroupId) -> bool {
+    fn epoch_backfill_group_is_live(
+        &self,
+        group_id: &cgka_traits::GroupId,
+        live_engine_ids: &HashSet<cgka_traits::GroupId>,
+        projected_ids: &HashSet<cgka_traits::GroupId>,
+    ) -> Result<bool, AppError> {
+        #[cfg(test)]
         if self
-            .has_local_group_deletion_frontier(group_id)
-            .unwrap_or(false)
+            .app
+            .fail_epoch_backfill_deletion_frontier
+            .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return false;
+            return Err(
+                std::io::Error::other("injected epoch-backfill deletion-frontier failure").into(),
+            );
         }
-        self.runtime
-            .live_group_ids()
-            .ok()
-            .is_some_and(|ids| ids.iter().any(|live| live == group_id))
-            || self.local_projection_contains_group(group_id)
+        if self.has_local_group_deletion_frontier(group_id)? {
+            return Ok(false);
+        }
+        Ok(live_engine_ids.contains(group_id) || projected_ids.contains(group_id))
     }
 
     fn capture_pending_group_epochs(

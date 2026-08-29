@@ -648,6 +648,10 @@ pub struct MarmotApp {
     legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
+    #[cfg(test)]
+    fail_epoch_backfill_live_group_ids: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_epoch_backfill_deletion_frontier: Arc<AtomicBool>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
@@ -1895,6 +1899,10 @@ impl MarmotApp {
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
+            #[cfg(test)]
+            fail_epoch_backfill_live_group_ids: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_epoch_backfill_deletion_frontier: Arc::new(AtomicBool::new(false)),
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
@@ -1978,6 +1986,10 @@ impl MarmotApp {
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
+            #[cfg(test)]
+            fail_epoch_backfill_live_group_ids: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_epoch_backfill_deletion_frontier: Arc::new(AtomicBool::new(false)),
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
@@ -2037,6 +2049,18 @@ impl MarmotApp {
         let label = self.account_home().account(account_ref)?.label;
         self.local_open_gates.install(label, reached, proceed);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_epoch_backfill_liveness_failures(
+        &self,
+        live_group_ids: bool,
+        deletion_frontier: bool,
+    ) {
+        self.fail_epoch_backfill_live_group_ids
+            .store(live_group_ids, Ordering::SeqCst);
+        self.fail_epoch_backfill_deletion_frontier
+            .store(deletion_frontier, Ordering::SeqCst);
     }
 
     fn next_account_session_admission_generation(&self) -> Result<u64, AppError> {
@@ -2335,6 +2359,16 @@ impl MarmotApp {
         Ok(client)
     }
 
+    #[cfg(test)]
+    async fn local_client_with_deferred_hydration_for_test(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+    ) -> Result<AppClient, AppError> {
+        self.local_client_with_relay_plane_and_hydration(label, relay_plane, None, true)
+            .await
+    }
+
     async fn local_client_with_relay_plane(
         &self,
         label: &str,
@@ -2522,7 +2556,7 @@ impl MarmotApp {
         client.ensure_session_account()?;
         client.restore_epoch_backfill_intent_journal()?;
         let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
-        client.restore_persisted_epoch_backfill_intents(persisted_backfills);
+        client.restore_persisted_epoch_backfill_intents(persisted_backfills)?;
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
         client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         if !defer_group_hydration {
@@ -8030,12 +8064,10 @@ impl MarmotApp {
         let journal_path = self.removed_local_key_package_tombstone_journal_path(account_id_hex)?;
         if journal_path.try_exists()? {
             journal = read_json(&journal_path)?;
-            if journal.account_id_hex != account_id_hex {
-                return Err(AppError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "removed-local KeyPackage tombstone journal does not match its path",
-                )));
-            }
+            Self::canonicalize_removed_local_key_package_tombstone_journal(
+                &mut journal,
+                account_id_hex,
+            )?;
         }
         let dir = self.removed_local_key_package_account_tombstone_dir(account_id_hex)?;
         if dir.try_exists()? {
@@ -8047,23 +8079,76 @@ impl MarmotApp {
                 if name == "all.json" {
                     self.validate_removed_local_key_package_tombstone(&path, account_id_hex, None)?;
                     journal.account_wide = true;
-                } else if name.starts_with("slot-") && name.ends_with(".json") {
-                    let marker: RemovedLocalKeyPackageTombstone = read_json(&path)?;
-                    if marker.account_id_hex != account_id_hex {
-                        return Err(AppError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "removed-local KeyPackage tombstone does not match its path",
-                        )));
-                    }
-                    if let Some(slot) = marker.stable_slot_id
-                        && !journal.retired_stable_slot_ids.contains(&slot)
-                    {
-                        journal.retired_stable_slot_ids.push(slot);
-                    }
+                } else if name.starts_with("slot-")
+                    && name.ends_with(".json")
+                    && let Some(slot) =
+                        self.legacy_exact_slot_tombstone_identity(&path, account_id_hex)?
+                {
+                    Self::admit_removed_local_key_package_tombstone_slot(&mut journal, &slot)?;
                 }
             }
         }
+        Self::canonicalize_removed_local_key_package_tombstone_journal(
+            &mut journal,
+            account_id_hex,
+        )?;
         Ok(journal)
+    }
+
+    fn canonicalize_removed_local_key_package_tombstone_journal(
+        journal: &mut RemovedLocalKeyPackageTombstoneJournal,
+        account_id_hex: &str,
+    ) -> Result<(), AppError> {
+        if journal.account_id_hex != account_id_hex {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "removed-local KeyPackage tombstone journal does not match its path",
+            )));
+        }
+        let mut seen = HashSet::new();
+        let mut canonical = Vec::new();
+        for slot in std::mem::take(&mut journal.retired_stable_slot_ids) {
+            if slot.is_empty() {
+                return Err(AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "removed-local KeyPackage tombstone journal contains an empty slot",
+                )));
+            }
+            if seen.insert(slot.clone()) {
+                canonical.push(slot);
+            }
+        }
+        if canonical.len() > MAX_REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_SLOTS {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "removed-local KeyPackage tombstone slot capacity reached",
+            )));
+        }
+        journal.retired_stable_slot_ids = canonical;
+        Ok(())
+    }
+
+    fn legacy_exact_slot_tombstone_identity(
+        &self,
+        path: &Path,
+        account_id_hex: &str,
+    ) -> Result<Option<String>, AppError> {
+        let marker: RemovedLocalKeyPackageTombstone = read_json(path)?;
+        if marker.account_id_hex != account_id_hex {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "removed-local KeyPackage tombstone does not match its path",
+            )));
+        }
+        let Some(slot) = marker.stable_slot_id else {
+            return Ok(None);
+        };
+        let expected_name = format!("slot-{}.json", hex::encode(Sha256::digest(slot.as_bytes())));
+        let actual_name = path.file_name().and_then(|name| name.to_str());
+        if actual_name != Some(expected_name.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(slot))
     }
 
     fn admit_removed_local_key_package_tombstone_slot(
@@ -8110,10 +8195,25 @@ impl MarmotApp {
             if name == REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_JOURNAL {
                 continue;
             }
-            let compact_legacy_all = name == "all.json" && journal.account_wide;
-            let compact_slot_file = name.starts_with("slot-") && name.ends_with(".json");
-            if compact_legacy_all || compact_slot_file {
-                remove_file_if_present(&path)?;
+            if name == "all.json" {
+                if journal.account_wide {
+                    remove_file_if_present(&path)?;
+                }
+                continue;
+            }
+            if name.starts_with("slot-") && name.ends_with(".json") {
+                let Some(slot) =
+                    self.legacy_exact_slot_tombstone_identity(&path, account_id_hex)?
+                else {
+                    continue;
+                };
+                if journal
+                    .retired_stable_slot_ids
+                    .iter()
+                    .any(|retired| retired == &slot)
+                {
+                    remove_file_if_present(&path)?;
+                }
             }
         }
         Ok(())
@@ -8133,6 +8233,16 @@ impl MarmotApp {
                 std::io::ErrorKind::InvalidData,
                 "removed-local KeyPackage tombstone does not match its path",
             )));
+        }
+        if let Some(slot) = stable_slot_id {
+            let expected_name =
+                format!("slot-{}.json", hex::encode(Sha256::digest(slot.as_bytes())));
+            if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+                return Err(AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "removed-local KeyPackage tombstone does not match its path",
+                )));
+            }
         }
         Ok(())
     }
