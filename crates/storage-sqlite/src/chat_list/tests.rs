@@ -15,7 +15,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
 };
 use cgka_traits::storage::{GroupStorage, LeaveRequest, LeaveRequestStorage};
-use cgka_traits::types::{EpochId, GroupId};
+use cgka_traits::types::{EpochId, GroupId, MessageId};
 
 const LOCAL: &str = "aa";
 const REMOTE: &str = "bb";
@@ -231,6 +231,243 @@ fn created_group_projection_and_chat_list_row_commit_atomically() {
         .unwrap()
         .expect("created chat-list row");
     assert_eq!(store.chat_list_row(GROUP).unwrap(), Some(committed));
+}
+
+#[test]
+fn created_group_visibility_transfer_and_chat_list_row_commit_atomically() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let deletion_frontier = 7_u64;
+    let application_event_id = MessageId::new(vec![0x42; 32]);
+    let operation_id = b"created-chat-visibility-operation";
+    let acknowledged_batch_id = b"created-chat-acknowledged-batch".to_vec();
+    let retained_batch_id = b"created-chat-retained-batch".to_vec();
+    {
+        let connection = store.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO local_group_deletion_frontiers
+                    (group_id_hex, message_insert_order, prior_nostr_routes_json)
+                 VALUES (?1, ?2, '[]')",
+                params![GROUP, i64::try_from(deletion_frontier).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pending_application_events
+                    (message_id, group_id, message_insert_order, record)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    application_event_id.as_slice(),
+                    &[0x11_u8],
+                    i64::try_from(deletion_frontier + 1).unwrap(),
+                    b"opaque-pending-application-event",
+                ],
+            )
+            .unwrap();
+    }
+    store
+        .upsert_account_visibility_journal(
+            operation_id,
+            1,
+            &acknowledged_batch_id,
+            b"created-chat-effects",
+        )
+        .unwrap();
+    store
+        .upsert_account_visibility_journal(
+            operation_id,
+            2,
+            &retained_batch_id,
+            b"unrelated-effects",
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_created_chat_list_visibility_row
+             BEFORE INSERT ON chat_list_rows
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected created visibility row failure');
+             END;",
+        )
+        .unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        groups: vec![group()],
+        ..StoredAccountState::default()
+    };
+    let save = || {
+        store.save_account_projection_delta_and_refresh_chat_list_row_acking_application_events_and_visibility_batches(
+            &state,
+            256,
+            MAX_FUTURE_SKEW_SECS,
+            &[(GROUP.to_owned(), deletion_frontier)],
+            std::slice::from_ref(&application_event_id),
+            std::slice::from_ref(&acknowledged_batch_id),
+            LOCAL,
+            GROUP,
+            &no_mentions,
+        )
+    };
+    let pending_application_event_count = || {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pending_application_events WHERE message_id = ?1",
+                params![application_event_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let visibility_batch_ids = || {
+        store
+            .load_account_visibility_journal()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.batch_id)
+            .collect::<Vec<_>>()
+    };
+
+    save().expect_err("the chat-list failure must roll back the visibility transfer");
+    assert!(
+        store
+            .load_account_projection_state("alice", 256)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "the failed outer transaction must roll back the projection delta",
+    );
+    assert_eq!(store.chat_list_row(GROUP).unwrap(), None);
+    assert_eq!(
+        store.local_group_deletion_frontier(GROUP).unwrap(),
+        Some(deletion_frontier),
+        "the failed row refresh must roll back the frontier clear",
+    );
+    assert_eq!(
+        pending_application_event_count(),
+        1,
+        "the failed row refresh must roll back the application-event acknowledgement",
+    );
+    assert_eq!(
+        visibility_batch_ids(),
+        vec![acknowledged_batch_id.clone(), retained_batch_id.clone()],
+        "the failed row refresh must retain every lower visibility batch",
+    );
+
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_created_chat_list_visibility_row")
+        .unwrap();
+    let committed = save().unwrap().expect("created chat-list row");
+
+    assert_eq!(store.chat_list_row(GROUP).unwrap(), Some(committed));
+    assert_eq!(
+        store
+            .load_account_projection_state("alice", 256)
+            .unwrap()
+            .groups,
+        state.groups,
+    );
+    assert_eq!(store.local_group_deletion_frontier(GROUP).unwrap(), None);
+    assert_eq!(
+        pending_application_event_count(),
+        0,
+        "success must acknowledge the application event with the created row",
+    );
+    assert_eq!(
+        visibility_batch_ids(),
+        vec![retained_batch_id],
+        "success must delete exactly the passed visibility batch",
+    );
+}
+
+#[test]
+fn missing_created_chat_list_row_rolls_back_projection_and_outbox_acks() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let missing_group_id_hex = "22";
+    let application_event_id = MessageId::new(vec![0x43; 32]);
+    let visibility_batch_id = b"missing-created-chat-visibility-batch".to_vec();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO pending_application_events
+                (message_id, group_id, message_insert_order, record)
+             VALUES (?1, ?2, 1, ?3)",
+            params![
+                application_event_id.as_slice(),
+                &[0x22_u8],
+                b"opaque-pending-application-event",
+            ],
+        )
+        .unwrap();
+    store
+        .upsert_account_visibility_journal(
+            b"missing-created-chat-operation",
+            1,
+            &visibility_batch_id,
+            b"missing-created-chat-effects",
+        )
+        .unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        groups: vec![group()],
+        ..StoredAccountState::default()
+    };
+
+    let error = store
+        .save_account_projection_delta_and_refresh_chat_list_row_acking_application_events_and_visibility_batches(
+            &state,
+            256,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            std::slice::from_ref(&application_event_id),
+            std::slice::from_ref(&visibility_batch_id),
+            LOCAL,
+            missing_group_id_hex,
+            &no_mentions,
+        )
+        .expect_err("a missing created-chat row must abort its enclosing transaction");
+
+    assert!(matches!(
+        error,
+        cgka_traits::storage::StorageError::NotFound
+    ));
+    assert!(
+        store
+            .load_account_projection_state("alice", 256)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "the missing-row error must roll back the projection delta",
+    );
+    assert_eq!(store.chat_list_row(GROUP).unwrap(), None);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pending_application_events WHERE message_id = ?1",
+                params![application_event_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the missing-row error must roll back the application-event acknowledgement",
+    );
+    assert_eq!(
+        store
+            .load_account_visibility_journal()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.batch_id)
+            .collect::<Vec<_>>(),
+        vec![visibility_batch_id],
+        "the missing-row error must roll back the visibility-batch deletion",
+    );
 }
 
 /// Operational mdk#1487 benchmark for the post-canonical app-local tail.
@@ -3519,6 +3756,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
             group_id: group_id.clone(),
             requested_at_ms: 1_700_000_000_123,
             last_proposed_epoch: Some(EpochId(3)),
+            last_proposed_message_id: None,
         })
         .unwrap();
 

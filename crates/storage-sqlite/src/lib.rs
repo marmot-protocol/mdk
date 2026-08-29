@@ -6,11 +6,13 @@
 //! layers.
 
 mod account_projection;
+mod account_visibility_journal;
 mod agent_stream_sequences;
 mod chat_list;
 mod codec;
 mod connection;
 mod encrypted_media_secrets;
+mod epoch_backfill_intent_journal;
 mod message_drafts;
 mod migrations;
 mod openmls_storage;
@@ -29,6 +31,7 @@ pub use account_projection::{
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
+pub use account_visibility_journal::{AccountVisibilityJournalRow, AccountVisibilityJournalUpsert};
 pub use chat_list::{
     AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,

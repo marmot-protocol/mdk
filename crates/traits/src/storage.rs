@@ -403,6 +403,11 @@ pub struct LeaveRequest {
     pub group_id: GroupId,
     pub requested_at_ms: u64,
     pub last_proposed_epoch: Option<EpochId>,
+    /// Exact engine message id of the most recently accepted SelfRemove.
+    /// Older records predate this attribution and hydrate it from the paired
+    /// durable sent-message row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_proposed_message_id: Option<MessageId>,
 }
 
 pub trait LeaveRequestStorage {
