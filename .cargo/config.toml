@@ -2,5 +2,6 @@
 # Unoptimized OpenMLS group construction and tree deserialization can exceed
 # Rust's platform-default 2 MiB spawned-thread stack once composed through the
 # app runtime. Keep Cargo-launched tests, binaries, and local development on the
-# same 4 MiB stack contract as CI.
-RUST_MIN_STACK = "4194304"
+# same 8 MiB stack contract as CI. 4 MiB still overflows macOS debug for
+# composed directory-search and concurrent-invite chains.
+RUST_MIN_STACK = "8388608"
