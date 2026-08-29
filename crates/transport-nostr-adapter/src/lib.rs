@@ -92,6 +92,7 @@ pub use telemetry::{
 };
 
 const DELIVERY_BUFFER: usize = 1024;
+const GROUP_MAINTENANCE_SUBSCRIPTION_ID_PREFIX: &str = "marmot:group-maintenance:";
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
@@ -672,12 +673,14 @@ impl NostrTransportAdapter {
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
         let _subscription_guard = self.subscription_lock.lock().await;
-        self.relay_client.unsubscribe(subscription.clone()).await?;
+        // Local teardown is authoritative even when relay cleanup fails or is
+        // cancelled: once the caller removes this temporary subscription, a
+        // late raw relay copy must no longer be an account delivery path.
         self.state
             .write()
             .await
             .forget_subscription_starts(std::slice::from_ref(&subscription));
-        Ok(())
+        self.relay_client.unsubscribe(subscription).await
     }
 
     /// Resolve opaque relay indices to relay endpoints for the opt-in export
@@ -722,6 +725,37 @@ impl NostrTransportAdapter {
             .await
     }
 
+    /// Route a raw SDK relay copy only when it belongs to an active temporary
+    /// group-maintenance subscription.
+    ///
+    /// The SDK's database is shared by every local account. When another
+    /// account has already cached an event, a later full-history REQ emits only
+    /// the raw per-subscription copy; the SDK's ordinary deduplicated `Event`
+    /// notification is suppressed. Subscription ownership restores that replay
+    /// for the requesting account without turning ordinary raw copies into a
+    /// second, cross-account delivery path.
+    #[cfg(feature = "sdk")]
+    pub async fn handle_group_maintenance_replay(
+        &self,
+        relay_event: NostrRelayEvent,
+    ) -> Result<usize, TransportAdapterError> {
+        let Some(subscription_id) = relay_event.subscription_id.as_deref() else {
+            return Ok(0);
+        };
+        let account_id = self
+            .state
+            .read()
+            .await
+            .group_maintenance_accounts
+            .get(subscription_id)
+            .cloned();
+        let Some(account_id) = account_id else {
+            return Ok(0);
+        };
+        self.handle_relay_event_scoped(relay_event, Some(&account_id))
+            .await
+    }
+
     async fn handle_relay_event_scoped(
         &self,
         relay_event: NostrRelayEvent,
@@ -734,6 +768,27 @@ impl NostrTransportAdapter {
         let received_at = Timestamp(unix_now_seconds());
         let mut routes = {
             let state = self.state.read().await;
+            if let Some(subscription_id) = relay_event.subscription_id.as_deref()
+                && subscription_id.starts_with(GROUP_MAINTENANCE_SUBSCRIPTION_ID_PREFIX)
+                && state
+                    .group_maintenance_accounts
+                    .get(subscription_id)
+                    .is_none_or(|owner| account_id.is_some_and(|account_id| owner != account_id))
+            {
+                // nostr-relay-pool does not verify subscription existence by
+                // default. A relay can therefore race a queued EVENT behind
+                // CLOSE (or keep sending after failed remote teardown), and
+                // the SDK may surface that stale maintenance copy as its
+                // deduplicated Event. Once local ownership is gone, fail
+                // closed instead of letting the stale temporary REQ re-enter
+                // ordinary group routing.
+                tracing::debug!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "handle_relay_event_scoped",
+                    "ignored event for inactive maintenance subscription"
+                );
+                return Ok(0);
+            }
             state.routes_for(&message, &relay_event.endpoint)
         };
         if let Some(account_id) = account_id {
@@ -1296,6 +1351,15 @@ struct AdapterState {
     /// sync may append only missing pre-REQ routes while a subscribe batch is in
     /// flight; both success and failure rebuild the index before returning.
     by_transport_group: HashMap<Vec<u8>, Vec<GroupRouteEntry>>,
+    /// Account ownership for active full-history post-join subscriptions.
+    ///
+    /// `nostr-sdk` suppresses its deduplicated `Event` notification when a
+    /// relay replays an event already present in the shared SDK database, but
+    /// still emits the raw per-subscription copy. Keeping this ownership map
+    /// lets that raw maintenance replay use the ordinary signed-routing table
+    /// while remaining scoped to the account that requested it. Ordinary raw
+    /// subscription copies remain telemetry-only.
+    group_maintenance_accounts: HashMap<String, MemberId>,
     /// Unconfirmed relay unsubscribes retained until teardown succeeds.
     /// Routing state (`accounts`/`by_transport_group`) already reflects the
     /// removal; these are relay-side cleanups only, drained on later
@@ -1486,13 +1550,18 @@ impl AdapterState {
 
     fn record_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
         for subscription in subscriptions {
+            let subscription_id = subscription.subscription_id();
+            if let NostrSubscription::GroupMaintenance { account_id, .. } = subscription {
+                self.group_maintenance_accounts
+                    .insert(subscription_id.clone(), account_id.clone());
+            }
             let relays: Vec<RelayIndex> = subscription
                 .endpoints()
                 .iter()
                 .map(|endpoint| self.relay_index.index_for(endpoint))
                 .collect();
             self.sync
-                .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
+                .record_subscription_start(&subscription_id, &relays, now_ms);
         }
     }
 
@@ -1541,8 +1610,11 @@ impl AdapterState {
     /// telemetry map tracks live subscriptions rather than historical churn.
     fn forget_subscription_starts(&mut self, subscriptions: &[NostrSubscription]) {
         for subscription in subscriptions {
-            self.sync
-                .forget_subscription(&subscription.subscription_id());
+            let subscription_id = subscription.subscription_id();
+            self.sync.forget_subscription(&subscription_id);
+            if matches!(subscription, NostrSubscription::GroupMaintenance { .. }) {
+                self.group_maintenance_accounts.remove(&subscription_id);
+            }
         }
     }
 
@@ -1579,6 +1651,17 @@ impl AdapterState {
     fn forget_account_subscription_starts(&mut self, account_id: &MemberId) {
         for id in self.account_subscription_ids(account_id) {
             self.sync.forget_subscription(&id);
+        }
+        let maintenance_ids = self
+            .group_maintenance_accounts
+            .iter()
+            .filter_map(|(subscription_id, owner)| {
+                (owner == account_id).then_some(subscription_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for subscription_id in maintenance_ids {
+            self.group_maintenance_accounts.remove(&subscription_id);
+            self.sync.forget_subscription(&subscription_id);
         }
     }
 

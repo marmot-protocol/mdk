@@ -478,23 +478,31 @@ impl NostrSdkRelayClient {
                                         event,
                                     },
                             } => {
-                                // Raw per-relay copy (not deduplicated): telemetry
-                                // only, so cross-relay spread sees every relay's
-                                // copy. Delivery happens on the deduplicated
-                                // `Event` notification above.
+                                // Raw per-relay copy (not deduplicated): always
+                                // retain it for telemetry, so cross-relay spread
+                                // sees every relay's copy. Normally delivery
+                                // happens on the deduplicated `Event`
+                                // notification above. One exception is an active
+                                // full-history group-maintenance subscription:
+                                // nostr-sdk suppresses `Event` when another local
+                                // account already cached the replayed event in
+                                // the shared database, while this verified raw
+                                // copy is still emitted. The adapter registry
+                                // scopes that replay to the requesting account.
                                 if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
                                     tracing::trace!(
                                         target: "transport_nostr_adapter::sdk_client",
                                         method = "spawn_notification_forwarder",
                                         "observing per-relay event copy"
                                     );
-                                    adapter
-                                        .observe_relay_event(NostrRelayEvent {
-                                            endpoint: TransportEndpoint(relay_url.to_string()),
-                                            subscription_id: Some(subscription_id.to_string()),
-                                            event,
-                                        })
-                                        .await;
+                                    let relay_event = NostrRelayEvent {
+                                        endpoint: TransportEndpoint(relay_url.to_string()),
+                                        subscription_id: Some(subscription_id.to_string()),
+                                        event,
+                                    };
+                                    adapter.observe_relay_event(relay_event.clone()).await;
+                                    let _ =
+                                        adapter.handle_group_maintenance_replay(relay_event).await;
                                 }
                                 Ok(false)
                             }
@@ -1577,8 +1585,10 @@ fn relay_rejection_endpoint_failure(
 mod tests {
     use super::*;
     use crate::NostrKeyPackagePublication;
-    use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
+    use cgka_traits::{
+        Timestamp, TransportAccountActivation, TransportAdapter, TransportGroupSubscription,
+    };
     use futures::{SinkExt, StreamExt};
     use nostr_relay_builder::MockRelay;
     use nostr_sdk::prelude::{DatabaseEventStatus, EventBuilder, Keys, Kind, Tag};
@@ -1600,6 +1610,204 @@ mod tests {
             .sign_with_keys(&ephemeral)
             .expect("sign ephemeral 445");
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
+    }
+
+    #[tokio::test]
+    async fn shared_sdk_cache_replays_group_history_only_to_maintenance_owner() {
+        let relay = timeout(Duration::from_secs(5), MockRelay::run())
+            .await
+            .expect("local relay starts within the test budget")
+            .expect("start relay");
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        // Let the spawned task install its notification receiver before the
+        // first subscription can produce stored-event notifications.
+        tokio::task::yield_now().await;
+
+        let alice = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let bob = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let group = TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0xAB; 32]),
+            transport_group_id: vec![0xCC; 32],
+            endpoints: vec![endpoint.clone()],
+        };
+        timeout(
+            Duration::from_secs(5),
+            adapter.activate_account(TransportAccountActivation {
+                account_id: alice.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![group.clone()],
+                since: None,
+            }),
+        )
+        .await
+        .expect("account A activation finishes within the test budget")
+        .expect("activate account A");
+
+        let event = signed_group_event_dto();
+        // Use a distinct client/database for the remote sender. Publishing
+        // through the recipient client would pre-cache the outgoing event and
+        // suppress A's initial deduplicated Event notification too, which is a
+        // different scenario from A caching a genuinely received event.
+        let publisher = NostrSdkRelayClient::new(Client::builder().build());
+        timeout(
+            Duration::from_secs(5),
+            publisher.publish_event(std::slice::from_ref(&endpoint), &event, 1),
+        )
+        .await
+        .expect("publish finishes within the test budget")
+        .expect("publish event for account A's live subscription");
+        let alice_delivery = timeout(Duration::from_secs(5), adapter.receive())
+            .await
+            .expect("account A receives the live event")
+            .expect("delivery queue remains open")
+            .expect("account A delivery exists");
+        assert_eq!(alice_delivery.account_id, alice);
+
+        // Account B shares the same nostr-sdk client/database. Its ordinary
+        // group REQ gets the relay's raw stored copy, but nostr-sdk suppresses
+        // the deduplicated Event notification because A already cached it.
+        timeout(
+            Duration::from_secs(5),
+            adapter.activate_account(TransportAccountActivation {
+                account_id: bob.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![group.clone()],
+                since: None,
+            }),
+        )
+        .await
+        .expect("account B activation finishes within the test budget")
+        .expect("activate account B");
+        assert!(
+            timeout(Duration::from_millis(250), adapter.receive())
+                .await
+                .is_err(),
+            "ordinary raw replays must remain telemetry-only"
+        );
+
+        let maintenance_id = timeout(
+            Duration::from_secs(5),
+            adapter.install_group_maintenance_subscription(&bob, &group),
+        )
+        .await
+        .expect("maintenance install finishes within the test budget")
+        .expect("install account B maintenance subscription");
+        let bob_delivery = timeout(Duration::from_secs(5), adapter.receive())
+            .await
+            .expect("maintenance REQ recovers the shared-cache event")
+            .expect("delivery queue remains open")
+            .expect("account B delivery exists");
+        assert_eq!(bob_delivery.account_id, bob);
+        assert_eq!(bob_delivery.group_id_hint, Some(group.group_id.clone()));
+        assert_eq!(
+            bob_delivery.source.subscription_id.as_deref(),
+            Some(maintenance_id.as_str())
+        );
+        assert!(
+            timeout(Duration::from_millis(250), adapter.receive())
+                .await
+                .is_err(),
+            "account B's maintenance replay must not fan out to account A"
+        );
+
+        let maintenance = NostrSubscription::GroupMaintenance {
+            account_id: bob.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+        };
+        timeout(
+            Duration::from_secs(5),
+            adapter.remove_group_maintenance_subscription(maintenance.clone()),
+        )
+        .await
+        .expect("maintenance removal finishes within the test budget")
+        .expect("remove maintenance subscription");
+        let replay_after_remove = adapter
+            .handle_group_maintenance_replay(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some(maintenance_id.clone()),
+                event: event.clone(),
+            })
+            .await
+            .expect("removed replay is ignored");
+        assert_eq!(replay_after_remove, 0);
+
+        // Account teardown is also authoritative for an otherwise-live
+        // maintenance registration.
+        timeout(
+            Duration::from_secs(5),
+            adapter.install_group_maintenance_subscription(&bob, &group),
+        )
+        .await
+        .expect("maintenance reinstall finishes within the test budget")
+        .expect("reinstall maintenance subscription");
+        assert_eq!(
+            adapter
+                .state
+                .read()
+                .await
+                .group_maintenance_accounts
+                .get(&maintenance_id),
+            Some(&bob)
+        );
+        timeout(Duration::from_secs(5), adapter.deactivate_account(&bob))
+            .await
+            .expect("account B teardown finishes within the test budget")
+            .expect("deactivate account B");
+        assert!(
+            !adapter
+                .state
+                .read()
+                .await
+                .group_maintenance_accounts
+                .contains_key(&maintenance_id),
+            "account teardown must remove raw-replay ownership"
+        );
+
+        publisher.client().shutdown().await;
+        sdk.client().shutdown().await;
+        timeout(Duration::from_secs(5), forwarder)
+            .await
+            .expect("notification forwarder shuts down")
+            .expect("notification forwarder does not panic");
+    }
+
+    #[tokio::test]
+    async fn failed_maintenance_subscribe_rolls_back_raw_replay_scope() {
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk));
+        let account_id = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let group = TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0x11; 32]),
+            transport_group_id: vec![0x22; 32],
+            endpoints: vec![TransportEndpoint("not a relay URL".into())],
+        };
+        let maintenance_id = NostrSubscription::GroupMaintenance {
+            account_id: account_id.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+        }
+        .subscription_id();
+
+        adapter
+            .install_group_maintenance_subscription(&account_id, &group)
+            .await
+            .expect_err("invalid endpoint rejects the maintenance REQ");
+
+        assert!(
+            !adapter
+                .state
+                .read()
+                .await
+                .group_maintenance_accounts
+                .contains_key(&maintenance_id),
+            "failed subscribe must not leave raw-replay ownership active"
+        );
     }
 
     #[test]

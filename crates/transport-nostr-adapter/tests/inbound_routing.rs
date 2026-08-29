@@ -704,6 +704,95 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
 }
 
 #[tokio::test]
+async fn failed_maintenance_unsubscribe_blocks_late_deduplicated_event() {
+    let relay = Arc::new(FlakyUnsubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+    let group = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![group.clone()],
+            since: None,
+        })
+        .await
+        .expect("activate account");
+
+    let maintenance_id = adapter
+        .install_group_maintenance_subscription(&account_id, &group)
+        .await
+        .expect("install maintenance subscription");
+    let maintenance = NostrSubscription::GroupMaintenance {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+    };
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(maintenance_id.clone()),
+            event: group_event("active-maintenance", &transport_group_id),
+        })
+        .await
+        .expect("active maintenance event remains routable");
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        adapter.receive().await.unwrap().unwrap().account_id,
+        account_id
+    );
+
+    relay.fail_next_unsubscribes.store(1, Ordering::SeqCst);
+    adapter
+        .remove_group_maintenance_subscription(maintenance)
+        .await
+        .expect_err("inject relay-side unsubscribe failure");
+
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(maintenance_id),
+            event: group_event("retired-maintenance", &transport_group_id),
+        })
+        .await
+        .expect("late maintenance event is handled fail-closed");
+    assert_eq!(
+        delivered, 0,
+        "a retired maintenance REQ must not re-enter ordinary group routing"
+    );
+
+    let ordinary_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id,
+        transport_group_id: transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+    }
+    .subscription_id();
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some(ordinary_id),
+            event: group_event("ordinary-live", &transport_group_id),
+        })
+        .await
+        .expect("ordinary group event remains routable");
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        adapter.receive().await.unwrap().unwrap().account_id,
+        account_id
+    );
+}
+
+#[tokio::test]
 async fn reconciled_group_event_routes_only_to_the_compared_account() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
