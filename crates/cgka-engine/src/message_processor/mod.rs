@@ -174,17 +174,6 @@ pub(crate) struct DeferredPeelGroupState {
     /// logged, or copied into durable generation state, and process restart
     /// drops it naturally.
     candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
-    /// Last replay-free verdict on whether this group's stored commit graph is
-    /// contested, as reported to a transport-deferred outcome's
-    /// [`cgka_traits::ingest::DeferralLineage`].
-    ///
-    /// Memoized for the same reason the candidate contexts beside it are: the
-    /// probe is a stored-message scan, and the input that asks for it is
-    /// attacker-mintable, so a redelivery storm must not turn one scan per
-    /// group into one scan per message. Dropped wherever the candidate cache
-    /// is, since every site that can change the stored commit graph already
-    /// invalidates that.
-    contested_graph: Option<bool>,
 }
 
 struct DeferredPeelCandidateCacheEntry {
@@ -1968,47 +1957,39 @@ impl<S: StorageProvider> Engine<S> {
     /// retained-anchor window branch enumeration uses, so this label and the
     /// branch work it describes cannot disagree.
     ///
-    /// `reprobe_stored_graph` is false only for redelivery of a row this group
-    /// already retains. Every distinct undecryptable object still probes —
-    /// distinctness is what the consumer counts — while a repeat of one already
-    /// retained reuses the last verdict rather than paying a second
-    /// stored-message scan for input whose identity is attacker-mintable.
+    /// Deliberately unmemoized. A cached verdict would have to be validated
+    /// against `deferred_peel_context_fingerprint` to be trustworthy — the
+    /// candidate cache beside it is safe precisely because it is self-validating
+    /// that way — and that fingerprint folds `stored_convergence_commit_digests`,
+    /// which is the same full stored-message scan this probe is. So a correct
+    /// cache costs what it saves, while an uncorroborated one buys speed with
+    /// exactly the wrong error: a stale verdict here reads `Uncontested` on a
+    /// group that has since forked, which is the inversion this whole
+    /// discriminator exists to prevent.
+    ///
+    /// The scan is therefore paid per deferral, and bounded by where it sits.
+    /// It runs only after the per-group retained-row cap has admitted the row
+    /// (`has_peel_deferred_capacity`), so a flood of attacker-minted
+    /// undecryptable input is answered `ResourceRefused` without ever reaching
+    /// here; and it runs on the seam that already pays a durable message write
+    /// plus a forensic audit write for the same object.
     pub(crate) fn deferral_lineage(
         &mut self,
         group_id: &GroupId,
-        reprobe_stored_graph: bool,
     ) -> Result<DeferralLineage, EngineError> {
-        let memo = self
-            .deferred_peel
-            .get(group_id)
-            .and_then(|state| state.contested_graph);
-        let contested = match memo {
-            Some(contested) if !reprobe_stored_graph => contested,
-            _ => {
-                let group = self.storage.get_group(group_id)?;
-                let policy = self
-                    .convergence_policy_for_group_ungated(group_id)
-                    .map_err(|error| {
-                        EngineError::Backend(format!("load convergence policy: {error}"))
-                    })?;
-                let contested = crate::openmls_projection::stored_graph_is_contested(
-                    &self.storage,
-                    group_id,
-                    group
-                        .epoch
-                        .0
-                        .saturating_sub(policy.convergence.max_rewind_commits),
-                )
-                .map_err(|error| {
-                    EngineError::Backend(format!("stored graph contested probe: {error}"))
-                })?;
-                self.deferred_peel
-                    .entry(group_id.clone())
-                    .or_default()
-                    .contested_graph = Some(contested);
-                contested
-            }
-        };
+        let group = self.storage.get_group(group_id)?;
+        let policy = self
+            .convergence_policy_for_group_ungated(group_id)
+            .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
+        let contested = crate::openmls_projection::stored_graph_is_contested(
+            &self.storage,
+            group_id,
+            group
+                .epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        )
+        .map_err(|error| EngineError::Backend(format!("stored graph contested probe: {error}")))?;
         Ok(if contested {
             DeferralLineage::ContestedFork
         } else {
@@ -2308,14 +2289,10 @@ impl<S: StorageProvider> Engine<S> {
     /// group, fingerprint, generation, and branch identities never leave
     /// engine memory.
     pub(crate) fn invalidate_deferred_peel_candidate_cache(&mut self, group_id: &GroupId) {
-        let invalidated = self.deferred_peel.get_mut(group_id).is_some_and(|state| {
-            // The contested verdict is derived from the same stored commit
-            // graph these contexts are, so it goes stale on exactly the same
-            // events. Dropping it here rather than at its own set of sites is
-            // what keeps the two from drifting apart.
-            state.contested_graph = None;
-            state.candidate_cache.take().is_some()
-        });
+        let invalidated = self
+            .deferred_peel
+            .get_mut(group_id)
+            .is_some_and(|state| state.candidate_cache.take().is_some());
         if invalidated {
             self.engine_metrics
                 .note_deferred_peel_candidate_cache_invalidation();

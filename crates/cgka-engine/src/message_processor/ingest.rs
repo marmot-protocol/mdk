@@ -611,7 +611,7 @@ impl<S: StorageProvider> Engine<S> {
                             crate::message_disposition::MessageDisposition::RetryPending.tag(),
                         ),
                     );
-                    let lineage = self.deferral_lineage(&group_id, !already_retained)?;
+                    let lineage = self.deferral_lineage(&group_id)?;
                     return Ok(IngestOutcome::TransportDeferred { group_id, lineage });
                 }
             }
