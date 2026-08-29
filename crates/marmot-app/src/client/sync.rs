@@ -1140,6 +1140,18 @@ impl AppClient {
         if (routes_dirty || routes_changed)
             && let Err(error) = self.sync_runtime_groups().await
         {
+            // Retain an explicit retry edge, as the catch-up checkpoint does
+            // after its own post-persistence rebuild failure. Neither edge that
+            // reached this rebuild survives the failure: `drain()` emptied the
+            // engine's event buffer one-shot, so the `routes_dirty` event is
+            // gone, and `refresh_group_routes` reports a change only while the
+            // in-memory routing table is actually mutating, which it already
+            // did. Without this the account keeps stale group subscriptions
+            // until unrelated traffic dirties the routes again — traffic those
+            // same stale subscriptions are what stop from arriving. The save
+            // below owes no arm: when either edge was set the rebuild above
+            // already succeeded, and when neither was set nothing is owed.
+            self.pending_runtime_group_subscription_refresh = true;
             self.pending_failed_sync_summary.merge(summary);
             return Err(error);
         }
