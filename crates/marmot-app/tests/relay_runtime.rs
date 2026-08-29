@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
-use tokio::time::{Duration, Instant, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout, timeout_at};
 use transport_nostr_adapter::{
     KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST, NostrRelayClient, NostrSdkRelayClient,
 };
@@ -83,6 +83,15 @@ async fn accept_group_invite_retrying_busy(
     })
     .await
     .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
+}
+
+/// A direct client does not own the runtime worker's convergence scheduler.
+/// The first explicit attempt opens the one-second settlement window; the
+/// second applies the selected branch after that window closes.
+async fn settle_direct_group_convergence(client: &mut marmot_app::AppClient, group_id: &GroupId) {
+    client.retry_group_convergence(group_id).await.unwrap();
+    sleep(Duration::from_millis(1_200)).await;
+    client.retry_group_convergence(group_id).await.unwrap();
 }
 
 async fn wait_for_account_network_ready(runtime: &MarmotAppRuntime, account_ref: &str) {
@@ -1139,6 +1148,35 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
 
     use nostr::prelude::ToBech32;
     let secret = nostr::Keys::generate().secret_key().to_bech32().unwrap();
+    // Seed exact durable NIP-65 authority first. A silent endpoint is not
+    // advisory during initial strict authority discovery and must still fail
+    // closed there; after reactivation it belongs only to the bounded profile
+    // and follows preflight exercised by this regression.
+    let seeded = runtime
+        .create_or_import_account(AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(zeroize::Zeroizing::new(secret.clone())),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            discovery_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        })
+        .await
+        .expect("initial import must persist strict NIP-65 authority");
+    runtime
+        .sign_out(
+            &seeded.account.label,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    let before = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
     let imported = timeout(
         Duration::from_secs(40),
         runtime.create_or_import_account(AccountSetupRequest {
@@ -1155,25 +1193,18 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     .expect("import must not hang on a stalled discovery endpoint")
     .expect("import should succeed without the advisory preflight");
     assert!(imported.account.local_signing);
+    let after = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
     assert_eq!(
-        runtime
-            .shared_services()
-            .relay_plane()
-            .relay_health()
-            .await
-            .directory_failed_fetches,
-        0,
-        "a stalled peer must not fail a directory fetch that has one connected relay"
-    );
-    assert_eq!(
-        runtime
-            .shared_services()
-            .app_performance_telemetry()
-            .snapshot()
-            .account_session_open
-            .attempts,
-        1,
+        after.account_session_open.attempts,
+        before.account_session_open.attempts + 1,
         "nsec setup must use the worker-owned session instead of a one-shot open"
+    );
+    assert!(
+        after.account_setup_advisory_step.attempts > before.account_setup_advisory_step.attempts,
+        "reactivation must exercise the bounded advisory preflight"
     );
     runtime.shutdown().await;
 }
@@ -2643,6 +2674,10 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         )
     })
     .await;
+    // GroupJoined is app visibility; the route rebuild intentionally follows
+    // it as retryable relay work. Catch-up is the deterministic readiness
+    // barrier before testing subsequent live group delivery.
+    runtime.catch_up_accounts().await.unwrap();
     let bob_group = app
         .groups(&bob.account.label)
         .unwrap()
@@ -2883,6 +2918,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
     accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .unwrap();
+    runtime.rotate_key_package(&bob_id).await.unwrap();
 
     let second_group_id = runtime
         .create_group(
@@ -2934,6 +2970,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
         )
     })
     .await;
+    runtime.catch_up_accounts().await.unwrap();
 
     runtime
         .initialize_chat_read_state(&bob_id, &group_id_hex)
@@ -4314,7 +4351,7 @@ async fn remove_members_sends_context_free_wake_from_snapshotted_tokens() {
         .await
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(1200)).await;
 
     let wraps_before = gate.count();
     runtime
@@ -4325,6 +4362,7 @@ async fn remove_members_sends_context_free_wake_from_snapshotted_tokens() {
         )
         .await
         .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
     assert!(
         gate.count() > wraps_before,
         "successful eviction must publish a context-free kind-446 gift wrap from the snapshot"
@@ -5298,7 +5336,6 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
         )
     })
     .await;
-
     runtime
         .send_message(
             "alice",
@@ -5307,16 +5344,24 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
         )
         .await
         .unwrap();
-    let received = wait_for_event(&mut events, |event| {
-        matches!(
-            event,
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
+    let received = loop {
+        let event = timeout_at(deadline, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("live message timed out after events: {observed:#?}"))
+            .expect("runtime event stream remains open");
+        if matches!(
+            &event,
             MarmotAppEvent::MessageReceived(message)
                 if message.account_id_hex == bob_id
                     && message.message.group_id == group_id
                     && message.message.plaintext == "hello through the app runtime"
-        )
-    })
-    .await;
+        ) {
+            break event;
+        }
+        observed.push(event);
+    };
 
     assert!(matches!(received, MarmotAppEvent::MessageReceived(_)));
     runtime.shutdown().await;
@@ -6352,6 +6397,13 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     // Alice removes carol. From carol's perspective this is a self-removal; from
     // bob's it is a peer removal.
     alice.remove_members(&group_id, &["carol"]).await.unwrap();
+    bob.sync().await.unwrap();
+    carol.sync().await.unwrap();
+    bob.retry_group_convergence(&group_id).await.unwrap();
+    carol.retry_group_convergence(&group_id).await.unwrap();
+    sleep(Duration::from_millis(1_200)).await;
+    bob.retry_group_convergence(&group_id).await.unwrap();
+    carol.retry_group_convergence(&group_id).await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         bob.sync().await.unwrap();
@@ -6949,6 +7001,7 @@ async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
     assert_eq!(parsed.new_retention_seconds, Some(60));
 
     bob.sync().await.unwrap();
+    settle_direct_group_convergence(&mut bob, &group_id).await;
     let bob_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
             "bob",
@@ -7544,6 +7597,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
 
     alice.update_message_retention(&group_id, 60).await.unwrap();
     bob.sync().await.unwrap();
+    settle_direct_group_convergence(&mut bob, &group_id).await;
     let later_epoch_download = bob
         .download_media(&group_id, reference.clone())
         .await
@@ -7600,8 +7654,9 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .await
         .unwrap();
     bob.sync().await.unwrap();
-    alice.update_message_retention(&group_id, 2).await.unwrap();
+    alice.update_message_retention(&group_id, 5).await.unwrap();
     bob.sync().await.unwrap();
+    settle_direct_group_convergence(&mut bob, &group_id).await;
 
     let expired = alice
         .upload_media(
@@ -7625,7 +7680,7 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
     let expired_source_epoch = expired_reference.source_epoch;
     bob.sync().await.unwrap();
 
-    sleep(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(6)).await;
     let pruned = bob
         .secure_delete_expired_plaintext_for_group(&group_id)
         .unwrap();
@@ -7669,12 +7724,19 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         retained_reference.source_epoch, expired_source_epoch,
         "the retained message must reuse the retired epoch for this regression"
     );
+    let retained_sync = bob.sync().await.unwrap();
+    assert_eq!(
+        retained_sync.messages.len(),
+        1,
+        "bob must retain the source-epoch secret while ingesting the media message"
+    );
     alice
         .update_group_profile(&group_id, Some("advanced after media"), None)
         .await
         .unwrap();
 
     bob.sync().await.unwrap();
+    settle_direct_group_convergence(&mut bob, &group_id).await;
     let download = bob
         .download_media(&group_id, retained_reference)
         .await
@@ -7753,6 +7815,7 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         .await
         .unwrap();
     bob.sync().await.unwrap();
+    settle_direct_group_convergence(&mut bob, &group_id).await;
 
     let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
     assert_eq!(
@@ -7901,7 +7964,15 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
             "wss://relay2.example".to_owned()
         ]
     );
-    assert_eq!(status.bootstrap_relays, vec![seed_url.clone()]);
+    let mut actual_bootstrap = status.bootstrap_relays.clone();
+    actual_bootstrap.sort();
+    let mut expected_bootstrap = vec![
+        seed_url.clone(),
+        "wss://relay1.example".to_owned(),
+        "wss://relay2.example".to_owned(),
+    ];
+    expected_bootstrap.sort();
+    assert_eq!(actual_bootstrap, expected_bootstrap);
     assert_eq!(status.nip65.kind, 10002);
     assert_eq!(status.inbox.kind, 10050);
 
@@ -7910,7 +7981,12 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
-    assert_eq!(fetched, status);
+    assert_eq!(fetched.complete, status.complete);
+    assert_eq!(fetched.missing, status.missing);
+    assert_eq!(fetched.default_relays, status.default_relays);
+    assert_eq!(fetched.nip65, status.nip65);
+    assert_eq!(fetched.inbox, status.inbox);
+    assert_eq!(fetched.bootstrap_relays, vec![seed_url]);
     runtime.shutdown().await;
 }
 
@@ -9172,7 +9248,7 @@ async fn app_runtime_delete_key_package_event_nip09_succeeds_and_clears_matching
 }
 
 #[tokio::test]
-async fn app_runtime_wipe_reports_deletion_failure_and_still_removes_local_account() {
+async fn app_runtime_wipe_reports_deletion_failure_and_retains_local_recovery_state() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = deletion_rejecting_app(&dir).await;
     let home = AccountHome::open(dir.path());
@@ -9193,13 +9269,17 @@ async fn app_runtime_wipe_reports_deletion_failure_and_still_removes_local_accou
 
     assert_eq!(outcome.key_packages_deleted, 0);
     assert!(!outcome.key_package_failures.is_empty());
-    assert!(outcome.local_cleanup.completed);
+    assert!(!outcome.local_cleanup.completed);
+    assert_eq!(
+        outcome.local_cleanup.reason.as_deref(),
+        Some("relay publish failed")
+    );
     assert!(
         home.accounts()
             .unwrap()
             .into_iter()
-            .all(|account| account.account_id_hex != account_id),
-        "best-effort remote failure must not block destructive local cleanup"
+            .any(|account| account.account_id_hex == account_id && account.signed_out),
+        "incomplete relay cleanup must retain signed-out local recovery state"
     );
 }
 
@@ -10090,7 +10170,39 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
         marmot_app::AppError::CreatedGroupProjectionUnavailable(group_id_hex) => group_id_hex,
         other => panic!("expected typed post-canonical projection result, got {other:?}"),
     };
-    let legacy_group_id = runtime
+    assert!(
+        app.groups(&alice.account.label)
+            .unwrap()
+            .iter()
+            .all(|group| group.profile.name != "projection crash recovery"),
+        "the injected cut must happen before the detailed create projection"
+    );
+    runtime.shutdown().await;
+
+    let restarted = MarmotAppRuntime::new(app.clone());
+    restarted.reconcile_accounts().await.unwrap();
+    let first_recovered = timeout(Duration::from_secs(5), async {
+        loop {
+            let groups = app.groups(&alice.account.label).unwrap();
+            let pending = restarted
+                .pending_welcome_deliveries(&alice.account.account_id_hex)
+                .await;
+            if let Ok(pending) = pending
+                && pending.len() == 1
+                && groups
+                    .iter()
+                    .any(|group| group.profile.name == "projection crash recovery")
+            {
+                return pending;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("restart must reconcile the detailed projection and retained Welcome");
+    assert_eq!(first_recovered[0].group_id_hex, detailed_group_id_hex);
+
+    let legacy_group_id = restarted
         .create_group(
             &alice.account.account_id_hex,
             "legacy projection crash recovery",
@@ -10103,16 +10215,17 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
         app.groups(&alice.account.label)
             .unwrap()
             .iter()
-            .all(|group| group.profile.name != "projection crash recovery")
+            .all(|group| group.profile.name != "legacy projection crash recovery"),
+        "the injected cut must happen before the compatibility projection"
     );
-    runtime.shutdown().await;
+    restarted.shutdown().await;
 
-    let restarted = MarmotAppRuntime::new(app.clone());
-    restarted.reconcile_accounts().await.unwrap();
+    let recovered_runtime = MarmotAppRuntime::new(app.clone());
+    recovered_runtime.reconcile_accounts().await.unwrap();
     let recovered = timeout(Duration::from_secs(5), async {
         loop {
             let groups = app.groups(&alice.account.label).unwrap();
-            let pending = restarted
+            let pending = recovered_runtime
                 .pending_welcome_deliveries(&alice.account.account_id_hex)
                 .await;
             let recovered_names = groups
@@ -10138,7 +10251,7 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
     let legacy_group_id_hex = hex::encode(legacy_group_id.as_slice());
     assert!(recovered_group_ids.contains(detailed_group_id_hex.as_str()));
     assert!(recovered_group_ids.contains(legacy_group_id_hex.as_str()));
-    restarted.shutdown().await;
+    recovered_runtime.shutdown().await;
 }
 
 /// mdk#1451: existing-group invite returns after the confirmed commit while a

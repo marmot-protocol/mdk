@@ -288,6 +288,7 @@ pub(crate) struct ScriptedPushRelayClient {
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
     block_next_unsubscribe: std::sync::atomic::AtomicBool,
+    fail_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_account_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     block_publish_kind: std::sync::Mutex<Option<u64>>,
@@ -608,6 +609,11 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub(crate) fn fail_next_unsubscribe(&self) {
+        self.fail_next_unsubscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn wait_for_blocked_unsubscribe(&self) {
         self.unsubscribe_started.notified().await;
     }
@@ -847,6 +853,14 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             self.unsubscribe_started.notify_one();
             self.unsubscribe_release.notified().await;
         }
+        if self
+            .fail_next_unsubscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected unsubscribe failure".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -1075,7 +1089,7 @@ async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTransportEvent) {
 fn explicit_catch_up_arms_and_replays_without_later_traffic() {
     run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
+        let account = AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -1092,6 +1106,7 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
             relay.clone(),
             true,
         );
+        prepare_push_lifecycle_test_account(&app, &account).await;
 
         let cursor = crate::unix_now_seconds();
         let group_id = {
@@ -1352,8 +1367,13 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             "failed activation must retain pending recovery"
         );
 
+        // The failed activation earned an automatic retry cooldown. Explicit
+        // catch-up is exempt, so this correlation test can exercise the retry
+        // immediately under both production and test policy feature sets.
         let retry = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("retained recovery must retry");
         assert!(
@@ -3112,10 +3132,12 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
         // third re-arm with the dev override rather than with wall-clock.
         let config = backfill_drain_test_config().with_dev_epoch_stall_wedge_rearm_interval_ms(0);
         let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        client.epoch_stall.set_wedge_rearm_interval_ms_for_test(0);
         let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let probe_base = crate::unix_now_seconds() - 1_000;
 
+        let mut reported = Vec::new();
         for round in
             0..u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD)
         {
@@ -3132,18 +3154,19 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
                 client.has_pending_epoch_backfill(),
                 "round {round}: undecryptable traffic at a frozen epoch must arm a replay",
             );
-            assert!(
-                matches!(
-                    client
-                        .run_pending_epoch_backfill(
-                            marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                        )
-                        .await
-                        .expect("the armed replay must run"),
-                    crate::EpochBackfillRunOutcome::Completed(_)
+            let summary = match client
+                .run_pending_epoch_backfill(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+                )
+                .await
+                .expect("the armed replay must run")
+            {
+                crate::EpochBackfillRunOutcome::Completed(summary) => summary,
+                other => panic!(
+                    "round {round}: a served end-of-stored-events drain must complete, got {other:?}"
                 ),
-                "round {round}: a served end-of-stored-events drain is a completed replay",
-            );
+            };
+            reported.extend(summary.epoch_stall_escalations);
             assert_eq!(
                 client.group_mls_state(&route.group_id).unwrap().epoch,
                 stalled_epoch,
@@ -3153,15 +3176,14 @@ fn three_fruitless_end_of_stored_events_replays_at_one_epoch_escalate() {
                 < u64::from(crate::client::epoch_stall::EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD)
             {
                 assert!(
-                    client.pending_epoch_stall_escalations.is_empty(),
+                    reported.is_empty(),
                     "round {round}: evidence short of the threshold must not report",
                 );
             }
         }
 
         assert_eq!(
-            client
-                .pending_epoch_stall_escalations
+            reported
                 .iter()
                 .map(|escalation| (escalation.group_id.clone(), escalation.stalled_epoch))
                 .collect::<Vec<_>>(),
@@ -3197,6 +3219,7 @@ fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let config = backfill_drain_test_config().with_dev_epoch_stall_wedge_rearm_interval_ms(0);
         let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
+        client.epoch_stall.set_wedge_rearm_interval_ms_for_test(0);
         let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let probe_base = crate::unix_now_seconds() - 1_000;
@@ -3214,12 +3237,20 @@ fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
                     .await
                     .expect("a retained undecryptable object completes its ingest pass");
             }
-            client
+            let summary = match client
                 .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
                 )
                 .await
-                .expect("the armed replay must run");
+                .expect("the armed replay must run")
+            {
+                crate::EpochBackfillRunOutcome::Completed(summary) => summary,
+                other => panic!("the served replay must complete, got {other:?}"),
+            };
+            assert!(
+                summary.epoch_stall_escalations.is_empty(),
+                "evidence short of the threshold must not report"
+            );
         }
         assert!(
             client.pending_epoch_stall_escalations.is_empty(),
@@ -3228,6 +3259,7 @@ fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
         drop(client);
 
         let mut reopened = client_on_app_relay_plane(&app, "alice").await;
+        reopened.epoch_stall.set_wedge_rearm_interval_ms_for_test(0);
         for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
             reopened
                 .ingest_received_delivery(route.probe(
@@ -3241,14 +3273,20 @@ fn frozen_epoch_evidence_outlives_the_process_that_gathered_it() {
             reopened.has_pending_epoch_backfill(),
             "the restored arm mark must still allow a paced re-arm",
         );
-        reopened
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+        let summary = match reopened
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
-            .expect("the armed replay must run");
+            .expect("the armed replay must run")
+        {
+            crate::EpochBackfillRunOutcome::Completed(summary) => summary,
+            other => panic!("the served replay must complete, got {other:?}"),
+        };
 
         assert_eq!(
-            reopened
-                .pending_epoch_stall_escalations
+            summary
+                .epoch_stall_escalations
                 .iter()
                 .map(|escalation| (escalation.group_id.clone(), escalation.stalled_epoch))
                 .collect::<Vec<_>>(),
@@ -3351,8 +3389,12 @@ fn drains_that_never_confirmed_stored_history_are_not_evidence() {
             assert!(
                 matches!(
                     client
+                        // Repeated unconfirmed drains earn an automatic retry
+                        // cooldown. Explicit catch-up is exempt, which keeps
+                        // this test focused on whether those drains count as
+                        // escalation evidence rather than on pacing.
                         .run_pending_epoch_backfill(
-                            marmot_forensics::EpochBackfillExecutionSeam::Maintenance
+                            marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
                         )
                         .await
                         .expect("the armed replay must run"),
@@ -4017,8 +4059,13 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             "the failed operation must be queued instead of orphaned"
         );
 
+        // Operation A's failed attempt paced automatic replay for the whole
+        // account. Explicit catch-up bypasses that cooldown while preserving
+        // the queue-order invariant this test exercises.
         let operation_b_retry = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("operation b must retry");
         assert!(
@@ -4198,9 +4245,10 @@ fn active_epoch_backfill_intent_reopens_as_retryable_pending_work() {
             .expect("newer primary runs first");
         assert_eq!(newer.pending.attempt_id, newer_attempt_id);
         assert_eq!(newer.retry_ordinal, 0);
-        reopened
-            .test_finish_epoch_backfill_execution(newer, true)
-            .unwrap();
+        // Model a replay that kept one durable delivery so this queue-order
+        // regression terminates without deliberately earning the fruitless
+        // retry cooldown exercised by the pacing tests below.
+        reopened.test_complete_epoch_backfill_execution(newer, 1, 0);
 
         let retry = reopened
             .begin_epoch_backfill_execution(
@@ -4210,9 +4258,7 @@ fn active_epoch_backfill_intent_reopens_as_retryable_pending_work() {
             .expect("interrupted intent retries after the newer primary");
         assert_eq!(retry.pending.attempt_id, attempt_id);
         assert_eq!(retry.retry_ordinal, 1);
-        reopened
-            .test_finish_epoch_backfill_execution(retry, true)
-            .unwrap();
+        reopened.test_complete_epoch_backfill_execution(retry, 1, 0);
         assert!(!reopened.has_pending_epoch_backfill());
         assert!(
             app.account_storage("alice")
@@ -4838,8 +4884,13 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
             "the deferred newer operation must rotate behind the queued older work"
         );
 
+        // The failed first operation deliberately earned an automatic retry
+        // cooldown. Explicit catch-up is exempt, so this fairness regression
+        // can exercise queue rotation without waiting on the pacing policy.
         let older_retry = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .run_pending_epoch_backfill(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
             .await
             .expect("the queued older operation must retry");
         assert!(
@@ -4905,7 +4956,8 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
 
 /// Run app-runtime integration chains on a stack large enough for debug
 /// OpenMLS group creation. Libtest's default 2 MiB stack is too small once a
-/// test composes the account worker with maintenance and push lifecycle work.
+/// test composes the account worker with maintenance and push lifecycle work,
+/// and 4 MiB still overflows macOS debug for concurrent-invite catch-up.
 fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -4913,7 +4965,7 @@ where
 {
     let test_thread = std::thread::Builder::new()
         .name(thread_name.to_owned())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let test_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -6482,6 +6534,20 @@ async fn runtime_local_ready_before_directory_subscribe_body() {
     runtime.shutdown().await;
 }
 
+async fn prepare_push_lifecycle_test_account(
+    app: &MarmotApp,
+    account: &marmot_account::AccountSummary,
+) {
+    // Direct AccountHome fixtures bypass product setup. Seed the exact relay
+    // authority and current KeyPackage that setup normally establishes so the
+    // worker's immediately-ready maintenance tick cannot start an unrelated
+    // 15-second catch-up while these tests script the next push publish.
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    remember_fresh_test_account_route(app, account, std::slice::from_ref(&endpoint));
+    let mut client = app.client(&account.label).await.unwrap();
+    client.publish_key_package().await.unwrap();
+}
+
 #[test]
 fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
     run_composed_app_runtime_test(
@@ -6492,12 +6558,13 @@ fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
 
 async fn push_registration_idle_retry_body() {
     let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
+    let account = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    prepare_push_lifecycle_test_account(&app, &account).await;
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime
@@ -6554,12 +6621,13 @@ fn push_registration_local_projection_advances_only_after_publish() {
 
 async fn push_registration_local_projection_body() {
     let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
+    let account = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    prepare_push_lifecycle_test_account(&app, &account).await;
     let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
     runtime.reconcile_accounts().await.unwrap();
     let group_id = runtime
@@ -6617,12 +6685,13 @@ fn local_group_wipe_keeps_and_drains_durable_push_removal() {
 
 async fn local_group_wipe_push_removal_body() {
     let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
+    let account = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    prepare_push_lifecycle_test_account(&app, &account).await;
     let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
     runtime.reconcile_accounts().await.unwrap();
     let group_id = runtime
@@ -6693,12 +6762,13 @@ fn failed_leave_restores_push_registration_after_removal_publishes() {
 
 async fn failed_leave_push_compensation_body() {
     let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
+    let account = AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    prepare_push_lifecycle_test_account(&app, &account).await;
     let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
     runtime.reconcile_accounts().await.unwrap();
     let group_id = runtime
@@ -15110,6 +15180,75 @@ fn relay_list_declaration_validation_does_not_apply_the_dial_route_cap() {
 }
 
 #[test]
+fn durable_nip65_authority_is_config_independent_while_operational_routes_fall_back() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let app_a = MarmotApp::with_relay(dir_a.path(), "wss://fallback-a.example");
+    let app_b = MarmotApp::with_relay(dir_b.path(), "wss://fallback-b.example");
+    let mut published = AccountRelayListState {
+        kind: KIND_NIP65_RELAY_LIST,
+        relays: vec![
+            "wss://relay.damus.io".to_owned(),
+            "wss://safe.example".to_owned(),
+        ],
+        read_relays: Vec::new(),
+        write_relays: Vec::new(),
+    };
+    let exact_published = published.clone();
+
+    let effective = app_a
+        .effective_nip65_key_package_endpoints(&published)
+        .unwrap();
+    assert_eq!(effective.len(), 1);
+    assert_eq!(effective[0].0.trim_end_matches('/'), "wss://safe.example");
+    assert_eq!(
+        published, exact_published,
+        "routing must not rewrite signed state"
+    );
+
+    published.relays = vec!["wss://relay.damus.io".to_owned()];
+    published.read_relays = published.relays.clone();
+    published.write_relays = published.relays.clone();
+    let generation = Nip65RouteGeneration {
+        created_at: 42,
+        event_id: "42".repeat(32),
+        nip65: published.clone(),
+    };
+    let exact_authority_a = app_a.validate_nip65_route_generation(&generation).unwrap();
+    let exact_authority_b = app_b.validate_nip65_route_generation(&generation).unwrap();
+    assert_eq!(exact_authority_a, exact_authority_b);
+    assert_eq!(exact_authority_a.len(), 1);
+    assert_eq!(
+        exact_authority_a[0].0.trim_end_matches('/'),
+        "wss://relay.damus.io",
+        "durable authority must retain the exact well-formed signed route"
+    );
+    assert_eq!(
+        app_a
+            .effective_nip65_route_generation_endpoints(&generation)
+            .unwrap(),
+        app_a.relay_endpoints(),
+        "an all-unsafe discovered route must use configured defaults"
+    );
+    assert_eq!(
+        app_b
+            .effective_nip65_route_generation_endpoints(&generation)
+            .unwrap(),
+        app_b.relay_endpoints(),
+        "each device may select its own safe operational fallback"
+    );
+    assert_ne!(
+        app_a.relay_endpoints(),
+        app_b.relay_endpoints(),
+        "the regression requires distinct operational configurations"
+    );
+    assert_eq!(
+        published, generation.nip65,
+        "routing must not rewrite signed state"
+    );
+}
+
+#[test]
 fn newer_all_read_nip65_list_clears_stale_write_targets() {
     let account_id = "11".repeat(32);
     let mut older = NostrTransportEvent::new_unsigned(
@@ -19502,7 +19641,8 @@ fn reopening_account_restores_current_and_prior_group_routes() {
 }
 
 #[tokio::test]
-async fn local_delete_compensation_preserves_primary_error_and_attempts_route_restore() {
+async fn local_delete_compensation_preserves_primary_error_without_relay_work_after_terminal_close()
+{
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -19513,6 +19653,7 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("compensation", &[]).await.unwrap();
     let routes_before = client.routing.snapshot().group_routes;
+    let subscribe_attempts_before_close = relay.group_subscribe_attempts();
 
     relay.block_next_unsubscribe();
     let delete = tokio::spawn(async move {
@@ -19526,7 +19667,6 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     .await
     .unwrap();
     app.close_storage().unwrap();
-    relay.fail_next_subscribe();
     relay.release_unsubscribe();
 
     let (result, routes_after) = delete.await.unwrap();
@@ -19536,11 +19676,10 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
         "the original storage-delete failure must win over compensation failures: {error}"
     );
     assert_eq!(routes_after, routes_before);
-    assert!(
-        !relay
-            .fail_next_subscribe
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "runtime route restoration must still be attempted after storage compensation fails"
+    assert_eq!(
+        relay.group_subscribe_attempts(),
+        subscribe_attempts_before_close,
+        "terminal storage close must prevent compensation from overtaking pending visibility with new relay work"
     );
 }
 

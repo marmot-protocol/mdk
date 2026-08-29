@@ -165,10 +165,11 @@ fn rows_of_kind<'rows>(
 fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
     // This integration path composes three app-runtime boots, MLS group
     // creation, maintenance enrollment, and cursor recovery. Debug builds
-    // need more than libtest's default 2 MiB stack while polling that chain.
+    // need the same 8 MiB debug stack as the other composed app-runtime tests
+    // while polling that chain.
     let test_thread = std::thread::Builder::new()
         .name("frozen-cursor-persistence".to_owned())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let test_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
