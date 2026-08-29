@@ -726,11 +726,45 @@ impl AppClient {
     /// the inbound delivery path (peer commits) and our own send path (local
     /// commits). Failures are logged, not propagated: a missing system row must
     /// never fail message delivery.
+    ///
+    /// A change whose `origin_commit_id` the same batch withdraws is skipped.
+    /// Every seam runs this once at its tail, *after* its projection loop has
+    /// already dispatched each `GroupStateInvalidated` through
+    /// [`MarmotApp::projection_update_for_invalidation_event`] — so by the time
+    /// the upsert below runs, the batch's withdrawals are all applied and it
+    /// would be the last writer. The storage upsert clears `invalidated` on
+    /// conflict, so without this filter the tail either revives a row the batch
+    /// just tombstoned or synthesizes one for a change that canonically never
+    /// happened (the withdrawal swept a row that did not exist yet).
+    ///
+    /// One batch carries both because the engine buffers convergence passes:
+    /// `events_buf` has a single take site and
+    /// `advance_convergence_inputs_with_execution` runs up to
+    /// `MAX_CONVERGENCE_REPROCESSING_PASSES` passes without one, so an earlier
+    /// pass's accepted commit can be superseded by a later pass's reorg before
+    /// anything drains. Within a *single* pass the two are disjoint by
+    /// construction — the change's origin is the accepted commit and the
+    /// superseded emitter skips accepted commits — so the single-pass shape is
+    /// not what this guards.
+    ///
+    /// Membership is the test rather than event order: a batch may carry the
+    /// withdrawal before or after the change it names, and neither ordering
+    /// makes the change canonical.
     pub(crate) fn project_group_system_rows(
         &self,
         events: &[cgka_traits::engine::GroupEvent],
         recorded_at: u64,
     ) -> Vec<crate::AppProjectionUpdate> {
+        let superseded_commits: std::collections::HashSet<&[u8]> = events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+                    invalidated_commit_id,
+                    ..
+                } => Some(invalidated_commit_id.as_slice()),
+                _ => None,
+            })
+            .collect();
         let mut updates = Vec::new();
         for event in events {
             if let cgka_traits::engine::GroupEvent::GroupStateChanged {
@@ -741,6 +775,14 @@ impl AppClient {
                 origin_commit_id,
             } = event
             {
+                // An unattributed change carries no commit link, so nothing in
+                // this batch can name it and it is never withheld here.
+                if origin_commit_id
+                    .as_ref()
+                    .is_some_and(|id| superseded_commits.contains(id.as_slice()))
+                {
+                    continue;
+                }
                 let projection = match build_group_system_projection(
                     group_id,
                     epoch.0,
