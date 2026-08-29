@@ -12058,6 +12058,364 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     );
 }
 
+/// Issue #1177 follow-up: the drained seam owes the live seam's kind-1210
+/// system-row synthesis too.
+///
+/// `observe_account_device_effects` ends by synthesizing a durable system row
+/// for every authenticated `GroupStateChanged`; the drained seam ran its own
+/// projection loop and never called the synthesizer. Nothing else writes those
+/// rows, and a drained batch is one-shot, so a crash-replayed rename or
+/// membership change lost its timeline row permanently and silently.
+#[tokio::test]
+async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-system-rows.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("drained system rows", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    // One authenticated rename, twice: the row id is derived from the change
+    // and its epoch, so the two seams take one epoch each rather than
+    // converging on the same deterministic row.
+    let rename = |epoch: u64, name: &str| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(epoch),
+            actor: Some(actor.clone()),
+            change: cgka_traits::engine::GroupStateChange::GroupRenamed {
+                name: name.to_owned(),
+                previous_name: Some("drained system rows".to_owned()),
+            },
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+
+    // Control: the live seam, which has always synthesized the row.
+    client
+        .observe_send_applied_effects(&rename(2, "live rename"))
+        .await
+        .unwrap();
+
+    let drained = client
+        .observe_drained_session_events(&rename(3, "replayed rename"))
+        .await
+        .unwrap();
+    // Crash replay is not exclusive with the first pass: the synthesizer is a
+    // deterministic upsert, so a second drain of the same batch must converge.
+    client
+        .observe_drained_session_events(&rename(3, "replayed rename"))
+        .await
+        .expect("re-observing a replayed batch must not error");
+
+    let rows = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let system_rows = |epoch: u64| {
+        rows.iter()
+            .filter(|row| {
+                row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM && row.source_epoch == Some(epoch)
+            })
+            .count()
+    };
+    assert_eq!(
+        system_rows(2),
+        1,
+        "control: the live seam synthesizes one kind-1210 row for the rename; got {rows:?}"
+    );
+    assert_eq!(
+        system_rows(3),
+        1,
+        "a crash-replayed rename owes the same durable kind-1210 row, once; got {rows:?}"
+    );
+    assert!(
+        drained.projection_updates.iter().any(|update| {
+            update.timeline_messages.iter().any(|row| {
+                row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM && row.source_epoch == Some(3)
+            })
+        }),
+        "and must surface it to runtime subscribers on the same summary the seam returns"
+    );
+}
+
+/// A batch that supersedes a commit must not leave that commit's kind-1210 row
+/// standing, whichever seam projects the batch.
+///
+/// Both seams invalidate per event inside their projection loop and synthesize
+/// system rows once at the tail, so every `GroupStateInvalidated` in a batch has
+/// already been applied by the time the tail upserts. The storage upsert clears
+/// `invalidated` on conflict, so an unfiltered tail either revives a row the
+/// same batch just withdrew or creates one the batch never should have had.
+///
+/// The engine reaches this by buffering two convergence passes into one batch:
+/// `events_buf` has a single take site, and
+/// `advance_convergence_inputs_with_execution` runs up to
+/// `MAX_CONVERGENCE_REPROCESSING_PASSES` passes without one. An earlier pass
+/// accepts the commit and emits its `GroupStateChanged`; a later pass reorgs and
+/// emits `GroupStateInvalidated` for that same commit. Within a *single* pass
+/// the two are disjoint by construction, so the single-pass shape is not the one
+/// under test here.
+mod superseded_system_row_shapes {
+    use super::*;
+
+    pub(super) const SUPERSEDED: &str = "SupersededByBranchSelection";
+
+    pub(super) fn renamed(
+        group_id: &GroupId,
+        actor: &MemberId,
+        epoch: u64,
+        name: &str,
+        origin_commit_id: Option<&MessageId>,
+    ) -> cgka_traits::engine::GroupEvent {
+        cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(epoch),
+            actor: Some(actor.clone()),
+            change: cgka_traits::engine::GroupStateChange::GroupRenamed {
+                name: name.to_owned(),
+                previous_name: None,
+            },
+            origin_commit_id: origin_commit_id.cloned(),
+        }
+    }
+
+    pub(super) fn superseded(
+        group_id: &GroupId,
+        epoch: u64,
+        invalidated_commit_id: &MessageId,
+    ) -> cgka_traits::engine::GroupEvent {
+        cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(epoch),
+            invalidated_commit_id: invalidated_commit_id.clone(),
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        }
+    }
+
+    pub(super) fn batch(
+        events: Vec<cgka_traits::engine::GroupEvent>,
+    ) -> marmot_account::AccountDeviceEffects {
+        marmot_account::AccountDeviceEffects {
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// The kind-1210 row for `epoch`, as `(exists, invalidation_status)`.
+    pub(super) fn system_row(
+        app: &MarmotApp,
+        group_id_hex: &str,
+        epoch: u64,
+    ) -> Option<Option<String>> {
+        app.timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.to_owned()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .iter()
+        .find(|row| {
+            row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM && row.source_epoch == Some(epoch)
+        })
+        .map(|row| row.invalidation_status.clone())
+    }
+}
+
+/// The drained seam owes the filter: a batch carrying both a commit's
+/// `GroupStateChanged` and that commit's `GroupStateInvalidated` must leave no
+/// live kind-1210 row for it — whether or not an earlier batch already
+/// synthesized the row.
+///
+/// See [`superseded_system_row_shapes`] for why one batch can carry both.
+#[tokio::test]
+async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() {
+    use superseded_system_row_shapes::{SUPERSEDED, batch, renamed, superseded, system_row};
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-superseded-rows.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("drained superseded rows", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    // Shape 1 — no pre-existing row. The earlier pass's change and the later
+    // pass's withdrawal arrive together, so the invalidation sweep runs against
+    // a row that does not exist yet and the tail is the only writer left. An
+    // unfiltered tail creates a row for a change that canonically never
+    // happened.
+    let unsynthesized = MessageId::new(vec![0xBE; 32]);
+    client
+        .observe_drained_session_events(&batch(vec![
+            renamed(
+                &group_id,
+                &actor,
+                2,
+                "superseded rename",
+                Some(&unsynthesized),
+            ),
+            superseded(&group_id, 2, &unsynthesized),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 2),
+        None,
+        "a commit withdrawn by its own batch must not get a kind-1210 row at all"
+    );
+
+    // Shape 2 — the row already exists from an earlier batch. Here the sweep
+    // does withdraw it, and the tail's upsert would clear `invalidated` again.
+    let synthesized = MessageId::new(vec![0xA1; 32]);
+    client
+        .observe_drained_session_events(&batch(vec![renamed(
+            &group_id,
+            &actor,
+            3,
+            "revived rename",
+            Some(&synthesized),
+        )]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 3),
+        Some(None),
+        "control: the first batch synthesizes a live row"
+    );
+    client
+        .observe_drained_session_events(&batch(vec![
+            renamed(&group_id, &actor, 3, "revived rename", Some(&synthesized)),
+            superseded(&group_id, 3, &synthesized),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 3),
+        Some(Some(SUPERSEDED.to_owned())),
+        "the tail must not revive the row the same batch's withdrawal tombstoned"
+    );
+
+    // Guard against over-filtering: a withdrawal only silences the commit it
+    // names. A bystander change riding the same batch keeps its live row.
+    client
+        .observe_drained_session_events(&batch(vec![
+            renamed(
+                &group_id,
+                &actor,
+                4,
+                "surviving rename",
+                Some(&MessageId::new(vec![0xCF; 32])),
+            ),
+            superseded(&group_id, 3, &synthesized),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 4),
+        Some(None),
+        "a change attributed to a commit the batch did not withdraw stays live"
+    );
+}
+
+/// The live seam's tail is the same shared synthesizer, reached through
+/// `observe_account_device_effects`, and carries the identical defect today.
+/// Fixing it at the call site would leave this failing, which is why the filter
+/// belongs in `project_group_system_rows`.
+#[tokio::test]
+async fn a_live_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() {
+    use superseded_system_row_shapes::{SUPERSEDED, batch, renamed, superseded, system_row};
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://live-superseded-rows.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("live superseded rows", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    let unsynthesized = MessageId::new(vec![0xBE; 32]);
+    client
+        .observe_send_applied_effects(&batch(vec![
+            renamed(
+                &group_id,
+                &actor,
+                2,
+                "superseded rename",
+                Some(&unsynthesized),
+            ),
+            superseded(&group_id, 2, &unsynthesized),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 2),
+        None,
+        "the live seam owes the same withholding as the drained one"
+    );
+
+    let synthesized = MessageId::new(vec![0xA1; 32]);
+    client
+        .observe_send_applied_effects(&batch(vec![renamed(
+            &group_id,
+            &actor,
+            3,
+            "revived rename",
+            Some(&synthesized),
+        )]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 3),
+        Some(None),
+        "control: the first batch synthesizes a live row"
+    );
+    client
+        .observe_send_applied_effects(&batch(vec![
+            renamed(&group_id, &actor, 3, "revived rename", Some(&synthesized)),
+            superseded(&group_id, 3, &synthesized),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 3),
+        Some(Some(SUPERSEDED.to_owned())),
+        "the live tail must not revive the row the same batch's withdrawal tombstoned"
+    );
+}
+
 #[test]
 fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {

@@ -1122,6 +1122,17 @@ impl AppClient {
                 .retain(|message| !gossip_message_ids.contains(&message.message_id_hex));
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
+        // Synthesize durable kind-1210 system rows from the replayed
+        // authenticated state changes, the same tail the live seam runs. A
+        // replayed event carries no envelope of its own — that is why this seam
+        // derives a synthetic source id from the durable outbox key above — so
+        // the rows are stamped with `source_received_at`, this drain's
+        // observation time, exactly like every other projection in the loop.
+        // The row id is derived from the change and its epoch, never from the
+        // stamp, so a crash that replays the batch re-upserts the same row.
+        summary
+            .projection_updates
+            .extend(self.project_group_system_rows(&effects.events, source_received_at));
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
@@ -1129,6 +1140,18 @@ impl AppClient {
         if (routes_dirty || routes_changed)
             && let Err(error) = self.sync_runtime_groups().await
         {
+            // Retain an explicit retry edge, as the catch-up checkpoint does
+            // after its own post-persistence rebuild failure. Neither edge that
+            // reached this rebuild survives the failure: `drain()` emptied the
+            // engine's event buffer one-shot, so the `routes_dirty` event is
+            // gone, and `refresh_group_routes` reports a change only while the
+            // in-memory routing table is actually mutating, which it already
+            // did. Without this the account keeps stale group subscriptions
+            // until unrelated traffic dirties the routes again — traffic those
+            // same stale subscriptions are what stop from arriving. The save
+            // below owes no arm: when either edge was set the rebuild above
+            // already succeeded, and when neither was set nothing is owed.
+            self.pending_runtime_group_subscription_refresh = true;
             self.pending_failed_sync_summary.merge(summary);
             return Err(error);
         }
@@ -4150,6 +4173,90 @@ mod runtime_group_subscription_refresh_tests {
                 .unwrap()
         );
         assert!(!client.has_pending_runtime_group_subscription_refresh());
+    }
+
+    /// The drained seam's subscription rebuild owes the same retry edge.
+    ///
+    /// Both edges that could re-fire the rebuild are spent by the pass that
+    /// failed: `drain()` empties the engine's in-memory event buffer one-shot,
+    /// so the `routes_dirty` event is gone, and `refresh_group_routes` reports
+    /// `routing_changed` only while the in-memory routing table is actually
+    /// mutating. Without an explicit arm the account's ordinary group
+    /// subscriptions stay stale until some unrelated delivery happens to dirty
+    /// the routes again — and a stale group subscription is exactly what stops
+    /// those deliveries from arriving.
+    #[tokio::test]
+    async fn drained_epilogue_arms_refresh_after_failed_subscription_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        // The managed-runtime create, which defers the relay-side subscription
+        // install to a later refresh (the worker performs it after replying).
+        // The second group is that outstanding install: the drained disband
+        // below dirties the routes, and the rebuild it triggers is the one the
+        // relay refuses.
+        let created = client
+            .create_group_with_options_and_telemetry(
+                "drained retry intent",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "drained retry bystander",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: created.group_id,
+                epoch: cgka_traits::EpochId(2),
+                actor: Some(cgka_traits::MemberId::new(
+                    hex::decode(&account.account_id_hex).unwrap(),
+                )),
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                origin_commit_id: None,
+            }],
+            ..Default::default()
+        };
+        relay.fail_next_subscribe();
+        client
+            .observe_drained_session_events(&effects)
+            .await
+            .expect_err("the injected group subscription rebuild must fail the drain");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        // Nothing is left to re-derive the intent from: the drained batch that
+        // dirtied the routes is consumed, and the routing table reports no
+        // further change, so the armed flag is the only surviving re-fire edge.
+        assert!(!client.refresh_group_routes().unwrap().routing_changed);
+
+        let subscriptions_before = relay.subscription_count();
+        assert!(
+            !client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap()
+        );
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            relay.subscription_count() > subscriptions_before,
+            "the armed retry must actually re-issue the rebuild the drain lost"
+        );
     }
 }
 
