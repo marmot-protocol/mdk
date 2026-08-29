@@ -1280,26 +1280,30 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
-    let activity_filter = crate::chat_list::chat_list_activity_filter_sql("");
+    let activity_filter = crate::chat_list::chat_list_activity_filter_sql("preview.");
+    let preview_order = crate::chat_list::chat_list_preview_order_desc("preview.");
     let sql = format!(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                media_json,
+        "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
+                preview.kind, preview.timeline_at, preview.deleted,
+                preview.media_json,
                 CASE
-                    WHEN direction != 'sent' THEN 'not_applicable'
-                    WHEN invalidation_status = 'local_publish_failed' THEN 'failed'
-                    WHEN source_message_id_hex IS NULL THEN 'pending'
+                    WHEN preview.direction != 'sent' THEN 'not_applicable'
+                    WHEN preview.invalidation_status = 'local_publish_failed' THEN 'failed'
+                    WHEN preview.source_message_id_hex IS NULL THEN 'pending'
                     ELSE 'delivered'
                 END
-         FROM message_timeline
-         WHERE group_id_hex = ?1
+         FROM message_timeline AS preview
+         WHERE preview.group_id_hex = ?1
            AND {activity_filter}
            AND (
-               invalidation_status IS NULL
-               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+               preview.invalidation_status IS NULL
+               OR (
+                   preview.direction = 'sent'
+                   AND preview.invalidation_status = 'local_publish_failed'
+               )
            )
-         ORDER BY {}
+         ORDER BY {preview_order}
          LIMIT 1",
-        crate::chat_list::CHAT_LIST_PREVIEW_ORDER_DESC,
     );
     let latest = tx
         .query_row(&sql, params![group_id_hex], |row| {

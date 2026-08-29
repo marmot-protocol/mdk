@@ -1851,6 +1851,117 @@ fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
 }
 
 #[test]
+fn newer_authenticated_message_replaces_older_pending_preview() {
+    let store = setup_store();
+    let mut pending = chat("pending", LOCAL, 100, "older pending send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+
+    let mut delivered = chat("delivered", LOCAL, 100, "newer delivered send");
+    delivered.source_epoch = Some(7);
+    store.record_app_event(&delivered).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    let preview = row.last_message.expect("latest preview");
+    assert_eq!(preview.message_id_hex, "delivered");
+    assert_eq!(
+        preview.delivery_state,
+        ChatListMessageDeliveryState::Delivered
+    );
+}
+
+#[test]
+fn newer_pending_message_replaces_older_authenticated_preview() {
+    let store = setup_store();
+    let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
+    delivered.source_epoch = Some(7);
+    store.record_app_event(&delivered).unwrap();
+
+    let mut pending = chat("pending", LOCAL, 100, "newer pending send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    let preview = row.last_message.expect("latest preview");
+    assert_eq!(preview.message_id_hex, "pending");
+    assert_eq!(
+        preview.delivery_state,
+        ChatListMessageDeliveryState::Pending
+    );
+}
+
+#[test]
+fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview() {
+    let store = setup_store();
+    let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
+    delivered.source_epoch = Some(7);
+    store.record_app_event(&delivered).unwrap();
+
+    let mut pending = chat("pending", LOCAL, 150, "newer pending send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+
+    delivered.received_at = 200;
+    store.record_app_event(&delivered).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        row.last_message
+            .as_ref()
+            .map(|message| message.message_id_hex.as_str()),
+        Some("pending")
+    );
+}
+
+#[test]
+fn ensure_repairs_a_stale_pending_preview_after_newer_authenticated_activity() {
+    let store = setup_store();
+    let mut pending = chat("pending", LOCAL, 100, "older pending send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let mut delivered = chat("delivered", LOCAL, 100, "newer delivered send");
+    delivered.source_epoch = Some(7);
+    store.record_app_event(&delivered).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .and_then(|row| row.last_message)
+            .map(|message| message.message_id_hex),
+        Some("pending".to_owned()),
+        "the fixture must start with the stale persisted preview"
+    );
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .and_then(|row| row.last_message)
+            .map(|message| message.message_id_hex),
+        Some("delivered".to_owned())
+    );
+}
+
+#[test]
 fn group_system_read_marker_preserves_same_epoch_canonical_phase() {
     let store = setup_store();
     store
