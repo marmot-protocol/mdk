@@ -10,7 +10,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{
-    read_json, validate_account_label, write_json, write_secret_bytes, write_secret_json,
+    read_json, sync_directory, validate_account_label, write_json, write_secret_bytes,
+    write_secret_json,
 };
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
@@ -586,6 +587,7 @@ impl AccountHome {
 
     pub fn complete_account_setup(&self, account_ref: &str) -> AccountHomeResult<()> {
         let account = self.account(account_ref)?;
+        let account_dir = self.account_dir(&account.label);
         for path in [
             self.account_setup_state_path(&account.label),
             self.account_setup_context_path(&account.label),
@@ -596,6 +598,10 @@ impl AccountHome {
                 Err(err) => return Err(err.into()),
             }
         }
+        // Setup completion is the durable commit record for restart. Persist
+        // both unlinks before reporting success so a crash cannot resurrect
+        // only one side of the state/context pair.
+        sync_directory(&account_dir)?;
         Ok(())
     }
 
