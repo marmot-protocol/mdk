@@ -160,6 +160,14 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides`; this exercises retention of the already-applied
     /// event summary when a later step in the same delivery fails.
     pub dev_fail_ingest_after_application_event_ack: bool,
+    /// Dev/test-only fault injected at the no-inbound engine-event drain
+    /// (`drain_pending_session_events`). Honored only with
+    /// `test-policy-overrides`. The production failures of that step —
+    /// a resumed outbound fanout whose publish never lands, a storage read
+    /// behind its projection loop — all originate below the app boundary and
+    /// have no external driver, so this stands in for them when a caller's
+    /// handling of that error is what is under test.
+    pub dev_fail_pending_session_event_drain: bool,
     /// Accounts to search outward from when the searcher's own web of trust is
     /// empty, as pubkey hex.
     ///
@@ -224,6 +232,7 @@ impl Default for MarmotAppConfig {
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
             dev_fail_ingest_after_application_event_ack: false,
+            dev_fail_pending_session_event_drain: false,
             directory_search_fallback_seeds: Vec::new(),
         }
     }
@@ -391,6 +400,13 @@ impl MarmotAppConfig {
     /// test-policy builds. Normal builds ignore this field.
     pub fn with_dev_fail_ingest_after_application_event_ack(mut self) -> Self {
         self.dev_fail_ingest_after_application_event_ack = true;
+        self
+    }
+
+    /// Fail the no-inbound engine-event drain in test-policy builds. Normal
+    /// builds ignore this field.
+    pub fn with_dev_fail_pending_session_event_drain(mut self) -> Self {
+        self.dev_fail_pending_session_event_drain = true;
         self
     }
 }

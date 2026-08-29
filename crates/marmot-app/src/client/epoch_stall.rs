@@ -117,18 +117,36 @@ pub(crate) const EPOCH_STALL_BACKFILL_THRESHOLD: usize = 8;
 /// another stalled epoch, each of which needs a genuine commit plus a fresh
 /// stall run, so it delays the report by the same hours the field devices lost.
 ///
-/// Safety is structural on both sides: escalation only *reports*, it never
+/// Safety on the output side is structural: escalation only *reports*, it never
 /// changes recovery behavior — the stronger heal (key-package rotation plus full
-/// re-activation) stays an app decision — and an arm run cannot be inflated by
-/// minted traffic. Each additional arm needs either a real epoch advance, which
-/// only an authenticated commit produces, or a replay that came back having
-/// refused this group's own history, which is the engine reporting a local
-/// resource bound rather than anything a sender chose. The paced same-epoch
-/// re-arm a wedged group spends
-/// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) is the one arm minted traffic can
-/// reach, and it deliberately does not count here, so the property survives it
-/// intact; what reports a wedged group instead is
-/// [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
+/// re-activation) stays an app decision.
+///
+/// Safety on the input side is weaker than it looks, and the weakness is
+/// recorded here rather than argued away. Each counted arm needs either a real
+/// epoch advance, which only an authenticated commit produces, or a replay that
+/// came back having refused this group's own history. Counting the refusal is
+/// right: it is genuine local evidence that the deferred-peel cap is full and
+/// that a replay could not retain what this group needs. But that cap is one
+/// minted traffic can saturate by itself (mdk#339 — a fresh wrap yields a fresh
+/// raw transport id, so a flood costs a sender nothing), and a saturated cap
+/// answers `ResourceRefused` to the account-wide replay's own fetch for the
+/// group too. That refusal lands in the drain's refused set, so
+/// [`EpochStallDetector::rearm_refused_groups`] clears the very latch the arm
+/// just set, and the next refusal takes the counted
+/// [`GroupStall::arm`] branch instead of the paced one. A flood therefore walks
+/// a group to this threshold in a run of retry backoffs rather than a run of
+/// real stalls. What it buys is a false report and nothing else — the arm run
+/// changes no recovery behavior — so the exposure is telemetry integrity, not
+/// amplification. It is bounded, known, and tracked with the cap itself
+/// (mdk#339); the loop is pinned by
+/// `a_saturated_cap_can_drive_counted_arms_through_the_refusal_loop`, and the
+/// remedy under discussion is a rate bound on refusal-driven re-arms, not
+/// dropping the count.
+///
+/// The paced same-epoch re-arm a wedged group spends
+/// ([`EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]) is a different path and does keep
+/// its property: it deliberately does not count here, and what reports a wedged
+/// group instead is [`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`].
 pub(crate) const EPOCH_STALL_ESCALATION_ARM_THRESHOLD: u32 = 3;
 
 /// How long a group wedged at one stalled epoch must wait between paced
@@ -1789,6 +1807,57 @@ mod tests {
                 "hour {hour}: a paced re-arm is an arm of the replay, never of the run",
             );
         }
+    }
+
+    /// The exposure the test above does *not* cover, pinned as documentation.
+    ///
+    /// Deliberately green: this records today's behavior while the design
+    /// question is open, and is not a missed red. The fix, if there is one, is a
+    /// rate bound decided against the frozen-device escalation's liveness — not
+    /// something to land beside the pin.
+    ///
+    /// `paced_refused_rearms_never_escalate_by_themselves` holds only while a
+    /// group's latch stays set, which is the case when the account-wide replay
+    /// never runs or never refuses anything for this group. A saturated
+    /// deferred-peel cap breaks exactly that: the cap is one minted traffic can
+    /// fill by itself (mdk#339), it answers `ResourceRefused` to the replay's
+    /// own fetch for the group as well as to live traffic, and
+    /// [`EpochStallDetector::rearm_refused_groups`] then clears the latch the
+    /// arm just set. The next refusal takes the counted branch rather than the
+    /// paced one, so the loop refusal -> arm -> fruitless replay -> unlatch
+    /// walks straight to [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`] with no epoch
+    /// advance and no hour elapsed. Bounded by what escalation does: it reports.
+    #[test]
+    fn a_saturated_cap_can_drive_counted_arms_through_the_refusal_loop() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+        let refused: HashSet<GroupId> = std::iter::once(g.clone()).collect();
+
+        // One turn per whole-account replay: a flood-driven refusal, then the
+        // fruitless drain re-arming the group whose history it could not
+        // retain. Turns sit one retry backoff apart, far inside both the pacing
+        // interval and the run-continuation window.
+        let mut decisions = Vec::new();
+        for turn in 0..3u64 {
+            decisions.push(detector.observe_resource_refusal(
+                g.clone(),
+                EpochId(10),
+                T0 + turn * 15_000,
+            ));
+            detector.rearm_refused_groups(&refused);
+        }
+
+        assert_eq!(
+            decisions,
+            vec![
+                BackfillDecision::Arm,
+                BackfillDecision::Arm,
+                BackfillDecision::ArmAndEscalate { arms: 3 },
+            ],
+            "every refusal behind a fruitless replay takes the counted arm branch, so a \
+             saturated cap reaches the escalation threshold without an authenticated commit \
+             and without waiting out a single pacing interval",
+        );
     }
 
     /// A run is unbounded in wall-clock without this: an unrelated stall weeks
