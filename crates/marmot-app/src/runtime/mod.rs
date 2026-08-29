@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
 use crate::app_telemetry::{
@@ -201,6 +201,11 @@ struct GeneratedSetupTasks {
 
 const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
 const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
@@ -1314,6 +1319,14 @@ impl MarmotAppRuntime {
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
         self.accounts.catch_up_accounts().await.map(|_| ())
+    }
+
+    /// Notify every running account worker that the host has observed usable
+    /// connectivity after an outage. This interrupts transport retry backoff
+    /// for already-durable work; callers may separately request catch-up when
+    /// they also need inbound relay synchronization.
+    pub async fn notify_connectivity_restored(&self) -> Result<(), AppError> {
+        self.accounts.notify_connectivity_restored().await
     }
 
     /// Catch up every running account worker and report how many account
@@ -4560,6 +4573,110 @@ pub struct CatchUpAccountsSummary {
     pub accounts_considered: usize,
 }
 
+fn is_transient_account_catch_up_error(error: &AppError) -> bool {
+    match error {
+        AppError::AccountCatchUp(failure) => {
+            let classification = failure.classification();
+            matches!(
+                classification.failure_stage,
+                SyncFailureStage::TransportActivation
+                    | SyncFailureStage::GroupSubscriptionSync
+                    | SyncFailureStage::RelayReceive
+            ) && !matches!(
+                classification.error_class,
+                SyncErrorClass::Protocol
+                    | SyncErrorClass::Crypto
+                    | SyncErrorClass::Storage
+                    | SyncErrorClass::Cancelled
+            )
+        }
+        _ => false,
+    }
+}
+
+async fn run_account_catch_up_pass(
+    commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    response_wait: Duration,
+) -> Vec<(mpsc::Sender<AccountWorkerCommand>, Result<(), AppError>)> {
+    let mut responses = Vec::with_capacity(commands.len());
+    let mut outcomes = Vec::with_capacity(commands.len());
+    for command in commands {
+        let (respond, response) = oneshot::channel();
+        if command
+            .send(AccountWorkerCommand::CatchUp { respond })
+            .await
+            .is_err()
+        {
+            outcomes.push((command, Err(AppError::TransportClosed)));
+        } else {
+            responses.push((command, response));
+        }
+    }
+    for (command, response) in responses {
+        let outcome = match timeout(response_wait, response).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(failure))) => Err(AppError::AccountCatchUp(failure)),
+            Ok(Err(_)) => Err(AppError::TransportClosed),
+            Err(_) => Err(AppError::AccountCatchUp(AccountCatchUpFailure::new(
+                "account worker catch-up timed out".into(),
+                SyncFailureClassification::new(
+                    SyncFailureStage::AccountWorker,
+                    SyncErrorClass::Timeout,
+                ),
+            ))),
+        };
+        outcomes.push((command, outcome));
+    }
+    outcomes
+}
+
+async fn catch_up_account_commands_with_retry(
+    commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    response_wait: Duration,
+    retry_delays: &[Duration],
+) -> Result<(), AppError> {
+    let mut pending_commands = commands;
+    let mut retry_delays = retry_delays.iter();
+    let mut first_terminal_error = None;
+
+    loop {
+        let outcomes = run_account_catch_up_pass(pending_commands, response_wait).await;
+        let mut retry_commands = Vec::new();
+        let mut first_retryable_error = None;
+        for (command, outcome) in outcomes {
+            let Err(error) = outcome else {
+                continue;
+            };
+            if is_transient_account_catch_up_error(&error) {
+                retry_commands.push(command);
+                if first_retryable_error.is_none() {
+                    first_retryable_error = Some(error);
+                }
+            } else if first_terminal_error.is_none() {
+                first_terminal_error = Some(error);
+            }
+        }
+
+        if retry_commands.is_empty() {
+            return first_terminal_error.map_or(Ok(()), Err);
+        }
+        let Some(retry_delay) = retry_delays.next() else {
+            return Err(first_terminal_error
+                .or(first_retryable_error)
+                .expect("retry commands always carry an error"));
+        };
+        tracing::debug!(
+            target: "marmot_app::runtime",
+            method = "catch_up_accounts",
+            retry_accounts = retry_commands.len(),
+            retry_delay_ms = retry_delay.as_millis() as u64,
+            "retrying transient account catch-up failures",
+        );
+        sleep(*retry_delay).await;
+        pending_commands = retry_commands;
+    }
+}
+
 impl AccountManager {
     fn new(
         app: MarmotApp,
@@ -5043,6 +5160,33 @@ impl AccountManager {
         result
     }
 
+    pub async fn notify_connectivity_restored(&self) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let commands = self.running_account_commands().await;
+        let mut responses = Vec::with_capacity(commands.len());
+        for command in commands {
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::ConnectivityRestored { respond })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            responses.push(response);
+        }
+        for response in responses {
+            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => return Err(error),
+                Ok(Err(_)) => return Err(AppError::TransportClosed),
+                Err(_) => {
+                    return Err(AppError::BlockingTask(
+                        "account worker connectivity-restored wake timed out".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn running_account_commands(&self) -> Vec<mpsc::Sender<AccountWorkerCommand>> {
         self.workers
             .lock()
@@ -5057,32 +5201,12 @@ impl AccountManager {
         commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
     ) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
-        let mut responses = Vec::with_capacity(commands.len());
-        for command in commands {
-            let (respond, response) = oneshot::channel();
-            command
-                .send(AccountWorkerCommand::CatchUp { respond })
-                .await
-                .map_err(|_| AppError::TransportClosed)?;
-            responses.push(response);
-        }
-        for response in responses {
-            match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(failure))) => return Err(AppError::AccountCatchUp(failure)),
-                Ok(Err(_)) => return Err(AppError::TransportClosed),
-                Err(_) => {
-                    return Err(AppError::AccountCatchUp(AccountCatchUpFailure::new(
-                        "account worker catch-up timed out".into(),
-                        SyncFailureClassification::new(
-                            SyncFailureStage::AccountWorker,
-                            SyncErrorClass::Timeout,
-                        ),
-                    )));
-                }
-            }
-        }
-        Ok(())
+        catch_up_account_commands_with_retry(
+            commands,
+            APP_RUNTIME_ACCOUNT_READY_WAIT,
+            &ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS,
+        )
+        .await
     }
 
     /// Delete one local JSONL audit log file.

@@ -656,27 +656,28 @@ impl NostrSdkRelayClient {
                 .or_default() += 1;
         }
         let transport_endpoint = TransportEndpoint(endpoint.to_string());
-        match timeout(
-            SDK_RELAY_CONNECT_WAIT,
-            self.client.connect_relay(endpoint.clone()),
-        )
-        .await
+        // `Client::connect_relay` only starts a background task and returns
+        // before the WebSocket handshake completes. Sending immediately after
+        // that call can therefore turn a proven offline connection failure
+        // into `PossiblyExposed`, putting a message behind the conservative
+        // ambiguity clock even though no relay could have received it. Await
+        // the SDK's bounded connection attempt so pre-send failures remain
+        // explicitly retryable and a host connectivity wake can replay them
+        // immediately.
+        match self
+            .client
+            .try_connect_relay(endpoint.clone(), SDK_RELAY_CONNECT_WAIT)
+            .await
         {
-            Ok(Ok(())) => Ok(endpoint),
+            Ok(()) => Ok(endpoint),
             // Failure reasons never embed the nostr-sdk error Display: it
             // commonly carries the relay URL, and these reasons flow into
             // `TransportAdapterError::Publish` Display (see
             // `finish_publish_outcome`), which upper layers may log. The
             // endpoint stays available on the structured failure record.
-            Ok(Err(_)) => Err(TransportEndpointFailure {
-                endpoint: transport_endpoint,
-                reason: "connect relay failed".to_owned(),
-                kind: TransportEndpointFailureKind::RetryableUnavailable,
-                rejection_category: None,
-            }),
             Err(_) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
-                reason: "connect relay timed out".to_owned(),
+                reason: "connect relay failed".to_owned(),
                 kind: TransportEndpointFailureKind::RetryableUnavailable,
                 rejection_category: None,
             }),
@@ -2307,6 +2308,32 @@ mod tests {
         assert!(
             outcome.failed.is_empty(),
             "aborted fan-out tasks must not add failures after quorum"
+        );
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
+    async fn publish_connection_failure_is_retryable_before_exposure() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", reservation.local_addr().unwrap()));
+        drop(reservation);
+        let sdk = NostrSdkRelayClient::new(Client::builder().signer(Keys::generate()).build());
+        let dto = signed_group_event_dto();
+
+        let error = timeout(
+            Duration::from_secs(3),
+            sdk.publish_event(std::slice::from_ref(&endpoint), &dto, 1),
+        )
+        .await
+        .expect("a refused connection must fail promptly")
+        .expect_err("an event cannot be published without a relay connection");
+
+        let failures = error.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::RetryableUnavailable,
+            "a failed connection proves the event was never exposed to the relay",
         );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }

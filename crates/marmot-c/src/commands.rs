@@ -712,6 +712,10 @@ c_cmd! {
     /// quarantined. Unknown-group status if the id is not quarantined.
     async fn marmot_retry_hydrate_quarantined_group(account_ref: str, group_id_hex: str) -> scalar(bool) = retry_hydrate_quarantined_group;
 
+    /// Interrupt retry backoff for durable outbound work after the host has
+    /// observed usable connectivity.
+    async fn marmot_notify_connectivity_restored() -> unit = notify_connectivity_restored;
+
     /// Flag a group archived (or restore it). Local-only projection
     /// state. Free with `marmot_app_group_record_free`.
     async fn marmot_set_group_archived(account_ref: str, group_id_hex: str, archived: flag) -> rec(MarmotAppGroupRecord) = set_group_archived;

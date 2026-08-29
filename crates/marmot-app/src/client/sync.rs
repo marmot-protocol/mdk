@@ -391,6 +391,26 @@ impl StagedSyncError {
 }
 
 impl AppClient {
+    /// Persist a host connectivity-restored edge into every exact fanout whose
+    /// prior attempt was proven unavailable, then schedule its group for an
+    /// immediate worker pass. Ambiguous fanouts keep their original clocks.
+    pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
+        let mut woken_targets = 0;
+        for mut fanout in self.runtime.session().outbound_fanouts()? {
+            let woken = fanout.wake_retryable_unavailable_targets();
+            if woken == 0 {
+                continue;
+            }
+            let group_id = fanout.group_id().cloned();
+            self.runtime.session().put_outbound_fanout(&fanout)?;
+            if let Some(group_id) = group_id {
+                self.pending_convergence_groups.insert(group_id);
+            }
+            woken_targets += woken;
+        }
+        Ok(woken_targets)
+    }
+
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
     }
@@ -1039,6 +1059,15 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
+        // `runtime.drain()` also resumes durable outbound fanouts. That work
+        // can publish an accepted-pending application message without emitting
+        // any engine event, so it must be projected before the eventless fast
+        // path below. Otherwise the exact event reaches the relay while the
+        // sender's durable timeline row remains stuck in `Sending` forever.
+        self.remember_published_reports(effects);
+        summary
+            .projection_updates
+            .extend(self.finalize_published_app_message_source_retention(effects)?);
         if effects.events.is_empty() {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);

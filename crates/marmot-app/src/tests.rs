@@ -11583,7 +11583,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
 /// The swept row's terminal outcome is asserted where it is stored, on the row
 /// itself. #1384 deliberately demotes a failed local send out of the chat
 /// preview ("keep failed local sends visible without letting them pin chat
-/// previews", `CHAT_LIST_PREVIEW_ORDER_DESC` in `storage-sqlite/src/chat_list.rs`),
+/// previews", `chat_list_preview_order_desc` in `storage-sqlite/src/chat_list.rs`),
 /// so once a send that did reach the relay exists the preview falls back to it
 /// rather than rendering the swept row's `Failed`. That fallback is asserted
 /// here too, because it is the same thing this test guards: after the sweep
@@ -15138,6 +15138,251 @@ async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
 }
 
 #[tokio::test]
+async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-recovery-wake.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("sender").await.unwrap();
+    let group_id = setup_client
+        .create_group("send recovery wake", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+
+    for plaintext in ["first wake retained send", "second wake retained send"] {
+        let summary = runtime
+            .send_message("sender", &group_id, plaintext.as_bytes().to_vec())
+            .await
+            .expect("a temporary transport failure must retain the send");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
+    }
+    let failed_ids = relay.attempted_event_ids()[attempts_before..].to_vec();
+    assert_eq!(failed_ids.len(), 2);
+
+    relay.allow_publishes();
+    runtime
+        .notify_connectivity_restored()
+        .await
+        .expect("the host connectivity signal must reach every account worker");
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    tokio::time::timeout(std::time::Duration::from_millis(750), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "sender",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 2
+                && timeline
+                    .messages
+                    .iter()
+                    .all(|message| message.source_message_id_hex.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("connectivity recovery must not wait for the normal 1.1 second convergence timer");
+
+    let published_in_order = relay
+        .published_event_ids()
+        .into_iter()
+        .filter(|event_id| failed_ids.contains(event_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        published_in_order, failed_ids,
+        "one recovery wake must finalize retained sends once and in order"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://reconnect-send-recovery.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("sender").await.unwrap();
+    let group_id = setup_client
+        .create_group("reconnect send recovery", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+    let summary = runtime
+        .send_message("sender", &group_id, b"retained across reconnect".to_vec())
+        .await
+        .expect("a temporary transport failure must retain the send");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let failed_event_id = relay.attempted_event_ids()[attempts_before].clone();
+
+    relay.allow_publishes();
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_recovery_for_test(1);
+    let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match runtime.unhydrated_group_count_for_test("sender").await {
+            Err(AppError::TransportClosed) => break,
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < backoff_deadline,
+            "account worker did not enter reconnect backoff"
+        );
+    }
+
+    runtime
+        .notify_connectivity_restored()
+        .await
+        .expect("the reconnecting worker must retain the connectivity wake");
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    tokio::time::timeout(Duration::from_millis(750), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "sender",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 1 && timeline.messages[0].source_message_id_hex.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retained connectivity wake must retry before the normal timer");
+
+    assert_eq!(
+        relay
+            .published_event_ids()
+            .iter()
+            .filter(|event_id| *event_id == &failed_event_id)
+            .count(),
+        1,
+        "reconnect recovery must accept the exact retained event once"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn eventless_drain_projects_every_retained_send_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://eventless-drain.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("sender").await.unwrap();
+    let group_id = client.create_group("eventless drain", &[]).await.unwrap();
+    relay.fail_publishes_as_unavailable();
+
+    for plaintext in ["first eventless retained", "second eventless retained"] {
+        let summary = client
+            .send_with_local_projection(&group_id, plaintext.as_bytes(), |_| {})
+            .await
+            .expect("a temporary transport failure must retain the send");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
+    }
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app
+        .timeline_messages_with_query(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.messages.len(), 2);
+    assert!(
+        pending
+            .messages
+            .iter()
+            .all(|message| message.source_message_id_hex.is_none())
+    );
+
+    relay.allow_publishes();
+    assert_eq!(
+        client
+            .note_connectivity_restored()
+            .expect("the connectivity edge must wake exact unavailable fanouts"),
+        2
+    );
+    let summary = client
+        .drain_pending_session_events()
+        .await
+        .expect("the eventless drain must resume the durable fanouts");
+    assert_eq!(
+        summary.projection_updates.len(),
+        2,
+        "both pending-to-sent transitions must reach runtime subscribers"
+    );
+
+    let recovered = app
+        .timeline_messages_with_query(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(recovered.messages.len(), 2);
+    assert!(
+        recovered
+            .messages
+            .iter()
+            .all(|message| message.source_message_id_hex.is_some()),
+        "eventless drain publication must persist every pending-to-sent transition"
+    );
+}
+
+#[tokio::test]
 async fn two_unavailable_sends_retry_once_in_order_after_transport_recovers() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -15245,7 +15490,11 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
         .expect("the invite commit must reach the transport boundary");
 
     relay.allow_publishes();
-    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+    runtime
+        .notify_connectivity_restored()
+        .await
+        .expect("the host connectivity signal must wake the retained invite");
+    tokio::time::timeout(std::time::Duration::from_millis(750), async {
         loop {
             if relay
                 .published_event_ids()
@@ -15258,7 +15507,7 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
         }
     })
     .await
-    .expect("the retained invite commit must finalize after connectivity returns");
+    .expect("the retained invite commit must finalize without waiting for its retry timer");
 
     assert_eq!(
         runtime

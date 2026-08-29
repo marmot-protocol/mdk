@@ -9,6 +9,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_notify_connectivity_restored`, allowing C hosts to wake durable
+  outbound retries immediately after usable connectivity returns.
 - Initial C ABI over `marmot-uniffi`: client lifecycle, accounts, groups,
   messaging, media, notifications, push, relays/telemetry, audit logs,
   timeline reads, Markdown parsing, and the 8 subscription surfaces with

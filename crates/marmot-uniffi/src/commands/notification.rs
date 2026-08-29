@@ -47,6 +47,14 @@ impl Marmot {
         Ok(())
     }
 
+    /// Interrupt retry backoff for durable outbound work after the host has
+    /// observed usable connectivity. This is a scheduling signal only; it does
+    /// not recreate application events or weaken exact-replay guarantees.
+    pub async fn notify_connectivity_restored(&self) -> Result<(), MarmotKitError> {
+        self.runtime.notify_connectivity_restored().await?;
+        Ok(())
+    }
+
     pub async fn collect_notifications_after_wake(
         &self,
         max_wait_ms: u32,

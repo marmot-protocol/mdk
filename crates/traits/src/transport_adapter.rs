@@ -466,6 +466,23 @@ impl OutboundFanout {
         self.target_last_attempt_at_ms.get(index).copied().flatten()
     }
 
+    /// Make targets whose last attempt was proven not to reach a relay
+    /// immediately eligible after the host observes restored connectivity.
+    /// Possibly-exposed targets deliberately retain their conservative retry
+    /// clock because replaying them early could duplicate an accepted event.
+    pub fn wake_retryable_unavailable_targets(&mut self) -> usize {
+        self.ensure_target_metadata_len();
+        let mut woken = 0;
+        for (index, status) in self.target_statuses.iter().enumerate() {
+            if *status == FanoutTargetStatus::RetryableUnavailable
+                && self.target_last_attempt_at_ms[index].take().is_some()
+            {
+                woken += 1;
+            }
+        }
+        woken
+    }
+
     pub fn possible_exposure(&self) -> bool {
         self.target_possible_exposure.iter().any(|exposed| *exposed)
             || self
@@ -1265,6 +1282,49 @@ mod tests {
         let restored: OutboundFanout =
             serde_json::from_slice(&serde_json::to_vec(&fanout).unwrap()).unwrap();
         assert_eq!(restored, fanout);
+    }
+
+    #[test]
+    fn connectivity_wake_only_clears_proven_unavailable_retry_clocks() {
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+        for (index, kind) in [
+            TransportEndpointFailureKind::PossiblyExposed,
+            TransportEndpointFailureKind::RetryableUnavailable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fanout.mark_attempt_started_at(index, 100).unwrap();
+            fanout
+                .record_target_failure(
+                    index,
+                    TransportEndpointFailure {
+                        endpoint: fanout.request().target.endpoints()[index].clone(),
+                        reason: "scripted failure".into(),
+                        kind,
+                        rejection_category: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(fanout.wake_retryable_unavailable_targets(), 1);
+        assert_eq!(fanout.target_last_attempt_at_ms(0), Some(100));
+        assert_eq!(fanout.target_last_attempt_at_ms(1), None);
+        assert_eq!(
+            fanout.target_status(0),
+            Some(FanoutTargetStatus::PossiblyExposed)
+        );
+        assert_eq!(
+            fanout.target_status(1),
+            Some(FanoutTargetStatus::RetryableUnavailable)
+        );
     }
 
     #[test]
