@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use cgka_traits::TransportEndpoint;
+use cgka_traits::{MaintenanceStorage, TransportEndpoint};
 use marmot_account::AccountSummary;
 use nostr_sdk::prelude::PublicKey;
 use storage_sqlite::{PublicDirectoryUserRecord, SqliteSharedStorage};
@@ -47,6 +47,37 @@ use crate::{
     blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
 
+/// Per-relay bound for setup-time kind-10002 history. A conforming relay has
+/// one replaceable winner; reaching this bound is therefore ambiguous and must
+/// not establish local route authority.
+const SETUP_NIP65_STRICT_HISTORY_LIMIT: usize = 12;
+
+#[derive(Clone, Copy)]
+enum RemovedSlotAdmission<'a> {
+    InspectSessionGate,
+    AlreadyAdmitted(Option<&'a AccountSummary>),
+}
+
+fn merge_newer_live_key_package(
+    current: &mut Option<DirectoryKeyPackage>,
+    candidate: Option<&DirectoryKeyPackage>,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let replace = current.as_ref().is_none_or(|current| {
+        crate::nostr_replaceable_coordinate_is_newer(
+            candidate.created_at,
+            &candidate.key_package_event_id,
+            current.created_at,
+            &current.key_package_event_id,
+        )
+    });
+    if replace {
+        *current = Some(candidate.clone());
+    }
+}
+
 impl MarmotApp {
     pub fn warm_directory_storage(&self) -> Result<(), AppError> {
         let _span = tracing::debug_span!(
@@ -55,8 +86,60 @@ impl MarmotApp {
             method = "warm_directory_storage"
         )
         .entered();
-        let _shared = self.shared_storage()?;
-        let _caches = self.directory_caches()?;
+        let shared = self.shared_storage()?;
+        let caches = self.directory_caches()?;
+        self.reconcile_removed_local_key_package_projections(&caches, &shared)?;
+        Ok(())
+    }
+
+    /// Retry the non-authoritative projection scrub after a crash between the
+    /// immutable tombstone commit and cache cleanup. Only active account
+    /// caches are opened here; a signed-out cache is reconciled when an
+    /// explicit sign-in makes it active and warms directory storage again.
+    fn reconcile_removed_local_key_package_projections(
+        &self,
+        caches: &[DirectoryCache],
+        shared: &SqliteSharedStorage,
+    ) -> Result<(), AppError> {
+        // Tombstones are immutable and both projection clears are CAS-style.
+        // Do not hold the projection-mutation mutex while the marker check
+        // consults account-session admission: live ingestion orders those
+        // locks admission -> mutation, so the inverse order would deadlock.
+        let mut changed = false;
+        for record in shared.public_directory_users()? {
+            let Some(key_package_json) = record.key_package_json.as_deref() else {
+                continue;
+            };
+            let key_package: DirectoryKeyPackage = serde_json::from_str(key_package_json)?;
+            if self.removed_local_key_package_slot_is_retired(
+                &record.account_id_hex,
+                &key_package.key_package_id,
+            )? {
+                changed |= shared.clear_public_directory_key_package_if_matches(
+                    &record.account_id_hex,
+                    key_package_json,
+                )?;
+            }
+        }
+        for cache in caches {
+            for entry in cache.entries()? {
+                let Some(key_package) = entry.key_package else {
+                    continue;
+                };
+                if self.removed_local_key_package_slot_is_retired(
+                    &entry.account_id_hex,
+                    &key_package.key_package_id,
+                )? {
+                    changed |= cache.clear_key_package_if_slot(
+                        &entry.account_id_hex,
+                        Some(&key_package.key_package_id),
+                    )?;
+                }
+            }
+        }
+        if changed {
+            self.request_directory_sync_rebuild();
+        }
         Ok(())
     }
 
@@ -136,8 +219,10 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.clone();
             let remembered = status.clone();
-            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
-                .await?;
+            blocking_app_task(move || {
+                app.remember_observed_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
         }
         Ok(status)
     }
@@ -216,10 +301,136 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.clone();
             let remembered = status.clone();
-            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
-                .await?;
+            blocking_app_task(move || {
+                app.remember_observed_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
         }
         Ok(Some(status))
+    }
+
+    /// Fetch the exact signed kind-10002 winner used to establish a local
+    /// signing account's durable route authority during import/login.
+    ///
+    /// Unlike ordinary directory projection reads, every requested relay must
+    /// explicitly complete its stored-event page. A future-dated event or a
+    /// page that fills the bounded history capacity is inconclusive rather
+    /// than permission to adopt an older visible revision.
+    pub(crate) async fn fetch_exact_self_nip65_event_strict(
+        &self,
+        account_id_hex: &str,
+        discovery_relays: &[TransportEndpoint],
+    ) -> Result<Option<RelayEventRecord>, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let source_relays = self.directory_source_relays(discovery_relays);
+        let records = self
+            .relay_plane
+            .fetch_directory_events_strict(
+                source_relays,
+                vec![DirectoryEventQuery::new(
+                    KIND_NIP65_RELAY_LIST,
+                    vec![account_id_hex.clone()],
+                    SETUP_NIP65_STRICT_HISTORY_LIMIT,
+                )],
+            )
+            .await
+            .map_err(|error| {
+                AppError::RelayDirectory(format!(
+                    "strict setup NIP-65 discovery did not complete: {error}"
+                ))
+            })?;
+
+        let freshness = self.directory_freshness();
+        let mut endpoint_event_ids = BTreeMap::<String, HashSet<String>>::new();
+        let mut candidates = Vec::new();
+        for record in records {
+            if record.event.pubkey != account_id_hex || record.event.kind != KIND_NIP65_RELAY_LIST {
+                return Err(AppError::RelayDirectory(
+                    "strict setup NIP-65 discovery returned an unrelated event".into(),
+                ));
+            }
+            record.event.to_verified_nostr_event().map_err(|_| {
+                AppError::RelayDirectory(
+                    "strict setup NIP-65 discovery returned an invalid signature".into(),
+                )
+            })?;
+            if !freshness.accepts(&record) {
+                return Err(AppError::RelayDirectory(
+                    "strict setup NIP-65 discovery observed a future-dated event".into(),
+                ));
+            }
+            if record.endpoints.is_empty() {
+                return Err(AppError::RelayDirectory(
+                    "strict setup NIP-65 discovery returned an unscoped event".into(),
+                ));
+            }
+            if relay_list_state_from_event(&record.event).is_none() {
+                return Err(AppError::RelayDirectory(
+                    "strict setup NIP-65 discovery returned a malformed relay list".into(),
+                ));
+            }
+            for endpoint in &record.endpoints {
+                endpoint_event_ids
+                    .entry(endpoint.0.clone())
+                    .or_default()
+                    .insert(record.event.id.clone());
+            }
+            candidates.push(record);
+        }
+        if endpoint_event_ids
+            .values()
+            .any(|event_ids| event_ids.len() >= SETUP_NIP65_STRICT_HISTORY_LIMIT)
+        {
+            return Err(AppError::RelayDirectory(
+                "strict setup NIP-65 discovery reached its bounded history capacity".into(),
+            ));
+        }
+
+        let Some(mut winner_index) = (!candidates.is_empty()).then_some(0usize) else {
+            return Ok(None);
+        };
+        for candidate_index in 1..candidates.len() {
+            let candidate = &candidates[candidate_index].event;
+            let winner = &candidates[winner_index].event;
+            if crate::nostr_replaceable_coordinate_is_newer(
+                candidate.created_at,
+                &candidate.id,
+                winner.created_at,
+                &winner.id,
+            ) {
+                winner_index = candidate_index;
+            }
+        }
+        let winner_event = candidates[winner_index].event.clone();
+        let winner_state = relay_list_state_from_event(&winner_event).ok_or_else(|| {
+            AppError::RelayDirectory("strict setup NIP-65 winner has no relay-list state".into())
+        })?;
+        let safe_write_relays = self.sanitize_key_package_deletion_endpoints(
+            winner_state
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+        )?;
+        if safe_write_relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
+        }
+        let mut endpoints = candidates
+            .iter()
+            .filter(|candidate| candidate.event.id == winner_event.id)
+            .flat_map(|candidate| candidate.endpoints.iter().cloned())
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        endpoints.dedup();
+        Ok(Some(RelayEventRecord {
+            endpoints,
+            event: winner_event,
+        }))
     }
 
     /// Fetch the account's own current published kind:0 profile metadata from
@@ -305,8 +516,10 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.to_owned();
             let remembered = relay_lists.clone();
-            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
-                .await?;
+            blocking_app_task(move || {
+                app.remember_observed_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
         }
         let mut source_relays = self.retain_safe_discovered_endpoints(
             relay_lists
@@ -336,20 +549,43 @@ impl MarmotApp {
         };
         let mut fetched = fresh_or_cached_key_package(
             account_id_hex,
-            latest_fresh_key_package_from_records(
-                account_id_hex,
-                records,
-                self.directory_freshness(),
-            )?,
+            self.latest_fresh_non_retired_key_package_from_records(account_id_hex, records)?,
             cached_entry,
         )?;
         fetched.relay_lists = relay_lists;
-        {
+        let remembered = {
             let app = self.clone();
             let remembered = fetched.clone();
-            blocking_app_task(move || app.remember_directory_key_package(&remembered)).await?;
+            blocking_app_task(move || app.remember_directory_key_package_if_live(&remembered))
+                .await?
+        };
+        if !remembered {
+            return Err(AppError::MissingKeyPackage(account_id_hex.to_owned()));
         }
         Ok(fetched)
+    }
+
+    /// Filter immutable removed-local slots before selecting the newest NIP-33
+    /// coordinate. This preserves a valid sibling-device slot even when a
+    /// newer relay echo exists for the removed device's retired `d` tag.
+    pub(crate) fn latest_fresh_non_retired_key_package_from_records(
+        &self,
+        account_id_hex: &str,
+        records: Vec<RelayEventRecord>,
+    ) -> Result<crate::DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+        let mut admitted = Vec::with_capacity(records.len());
+        for record in records {
+            let retired = record.event.kind == KIND_MARMOT_KEY_PACKAGE
+                && record.event.pubkey == account_id_hex
+                && self.removed_local_key_package_slot_is_retired(
+                    account_id_hex,
+                    record.event.tag_value("d").unwrap_or_default(),
+                )?;
+            if !retired {
+                admitted.push(record);
+            }
+        }
+        latest_fresh_key_package_from_records(account_id_hex, admitted, self.directory_freshness())
     }
 
     pub async fn refresh_directory_entry_for_account_id(
@@ -370,8 +606,10 @@ impl MarmotApp {
             let app = self.clone();
             let account_id = account_id_hex.to_owned();
             let remembered = status.clone();
-            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
-                .await?;
+            blocking_app_task(move || {
+                app.remember_observed_directory_relay_lists(&account_id, &remembered)
+            })
+            .await?;
         }
         let app = self.clone();
         let account_id = account_id_hex.to_owned();
@@ -390,6 +628,26 @@ impl MarmotApp {
         let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
         self.directory_entry_for_account_id_with_handles(&account_id_hex, &caches, &shared_storage)
+    }
+
+    /// Admission-aware cache read for a caller already holding
+    /// `account_session_admissions`. The ordinary hydration path may inspect
+    /// that same non-reentrant mutex when an account-wide legacy tombstone is
+    /// present, so admitted callers must carry their proof through instead.
+    pub(crate) fn directory_entry_for_account_id_with_admitted_account(
+        &self,
+        account_id_hex: &str,
+        local_signing_account: Option<&AccountSummary>,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        let caches = self.directory_caches()?;
+        let shared_storage = self.shared_storage()?;
+        self.directory_entry_for_account_id_with_handles_and_admission(
+            &account_id_hex,
+            &caches,
+            &shared_storage,
+            RemovedSlotAdmission::AlreadyAdmitted(local_signing_account),
+        )
     }
 
     /// Bounded local cached-identity page for many account IDs.
@@ -703,6 +961,28 @@ impl MarmotApp {
             .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))
     }
 
+    pub(crate) async fn fetch_key_package_events_for_account_id_with_limit_strict(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+        limit: usize,
+    ) -> Result<Vec<RelayEventRecord>, AppError> {
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let source_relays = self.directory_source_relays(source_relays);
+        self.relay_plane
+            .fetch_directory_events_strict(
+                source_relays,
+                vec![DirectoryEventQuery::new(
+                    KIND_MARMOT_KEY_PACKAGE,
+                    vec![public_key.to_hex()],
+                    limit,
+                )],
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("strict key package fetch: {e}")))
+    }
+
     pub(crate) async fn fetch_follow_list_for_account_id(
         &self,
         account_id_hex: &str,
@@ -967,12 +1247,32 @@ impl MarmotApp {
         caches: &[DirectoryCache],
         shared_storage: &SqliteSharedStorage,
     ) -> Result<Option<UserDirectoryRecord>, AppError> {
+        self.directory_entry_for_account_id_with_handles_and_admission(
+            account_id_hex,
+            caches,
+            shared_storage,
+            RemovedSlotAdmission::InspectSessionGate,
+        )
+    }
+
+    fn directory_entry_for_account_id_with_handles_and_admission(
+        &self,
+        account_id_hex: &str,
+        caches: &[DirectoryCache],
+        shared_storage: &SqliteSharedStorage,
+        admission: RemovedSlotAdmission<'_>,
+    ) -> Result<Option<UserDirectoryRecord>, AppError> {
         let cached_entry = Self::directory_entry_from_caches(caches, account_id_hex)?
-            .map(|entry| self.hydrate_directory_record(entry))
+            .map(|entry| self.hydrate_directory_record_with_admission(entry, admission))
             .transpose()?;
         let shared_entry = shared_storage
             .public_directory_user(account_id_hex)?
-            .map(|record| self.hydrate_public_directory_record(record))
+            .map(|record| {
+                self.hydrate_directory_record_with_admission(
+                    user_directory_record_from_public(record)?,
+                    admission,
+                )
+            })
             .transpose()?;
         Ok(select_newer_directory_entry(cached_entry, shared_entry))
     }
@@ -1015,15 +1315,147 @@ impl MarmotApp {
         self.save_directory_entry(&entry)
     }
 
+    /// Cache relay-list observations without allowing a generic directory read
+    /// to replace the locally managed NIP-65 route. The account-manager path is
+    /// the sole authority for a local identity's kind-10002 projection; inbox
+    /// and bootstrap observations remain safe to refresh here.
+    fn remember_observed_directory_relay_lists(
+        &self,
+        account_id_hex: &str,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Result<(), AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        if self.local_account_label_for_id(&account_id_hex).is_none() {
+            return self.remember_directory_relay_lists(&account_id_hex, relay_lists);
+        }
+        let mut entry = self
+            .directory_entry_for_account_id(&account_id_hex)?
+            .unwrap_or_else(|| self.empty_directory_record(&account_id_hex));
+        let local_nip65 = entry.relay_lists.nip65.clone();
+        entry.account_id_hex = account_id_hex;
+        entry.relay_lists = relay_lists.clone();
+        entry.relay_lists.nip65 = local_nip65;
+        entry.relay_lists.refresh();
+        self.save_directory_entry(&entry)
+    }
+
     pub(crate) fn remember_directory_key_package(
         &self,
         fetched: &FetchedKeyPackage,
     ) -> Result<(), AppError> {
+        let _ = self.remember_directory_key_package_if_live(fetched)?;
+        Ok(())
+    }
+
+    /// Admit one exact KeyPackage observation into the durable directory.
+    ///
+    /// For identities this app can sign as, the account-private lifecycle is
+    /// authoritative. Signed-out accounts are rejected before their SQLCipher
+    /// storage is opened, and active accounts accept only the exact current or
+    /// pending signed revision. Public/tracked account records intentionally
+    /// remain ordinary remote identities and do not acquire local lifecycle
+    /// semantics merely because they are present in `AccountHome`.
+    pub(crate) fn remember_directory_key_package_if_live(
+        &self,
+        fetched: &FetchedKeyPackage,
+    ) -> Result<bool, AppError> {
+        Ok(self
+            .with_local_key_package_admission(&fetched.account_id_hex, |local_signing_account| {
+                self.remember_directory_key_package_if_live_admitted(fetched, local_signing_account)
+            })?
+            .unwrap_or(false))
+    }
+
+    /// Run one bounded local KeyPackage cache operation under the same
+    /// admission mutex teardown closes synchronously before its first await.
+    /// An operation admitted first finishes before teardown can proceed to its
+    /// final eviction; an operation arriving second observes the closed gate
+    /// and returns before opening any account-private directory/session store.
+    pub(crate) fn with_local_key_package_admission<T>(
+        &self,
+        account_id_hex: &str,
+        operation: impl FnOnce(Option<&AccountSummary>) -> Result<T, AppError>,
+    ) -> Result<Option<T>, AppError> {
+        let local_signing_account = self.local_signing_account_for_id(account_id_hex)?;
+        let _session_admission = if let Some(account) = local_signing_account.as_ref() {
+            let admission = self
+                .account_session_admissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let admission_open = admission
+                .get(&account.label)
+                .is_none_or(|state| state.account_id_hex != account.account_id_hex || state.open);
+            if account.signed_out || !admission_open {
+                return Ok(None);
+            }
+            Some(admission)
+        } else {
+            None
+        };
+        operation(local_signing_account.as_ref()).map(Some)
+    }
+
+    /// Cache an exact revision after the caller has serialized local signing
+    /// state with teardown's session-admission gate.
+    fn remember_directory_key_package_if_live_admitted(
+        &self,
+        fetched: &FetchedKeyPackage,
+        local_signing_account: Option<&AccountSummary>,
+    ) -> Result<bool, AppError> {
+        if self.removed_local_key_package_slot_is_retired_for_admitted_account(
+            &fetched.account_id_hex,
+            &fetched.key_package_id,
+            local_signing_account,
+        )? {
+            return Ok(false);
+        }
+        if let Some(account) = local_signing_account
+            && !self.local_key_package_revision_is_live_for_account(
+                account,
+                &fetched.key_package_ref_hex,
+                &fetched.key_package_event_id,
+            )?
+        {
+            // The account lifecycle is the private-material authority for our
+            // own identity. A delayed relay echo must never make a consumed,
+            // deleted, signed-out, or otherwise non-live revision available
+            // to local invite resolution again.
+            return Ok(false);
+        }
         let mut entry = self
-            .directory_entry_for_account_id(&fetched.account_id_hex)?
+            .directory_entry_for_account_id_with_admitted_account(
+                &fetched.account_id_hex,
+                local_signing_account,
+            )?
             .unwrap_or_else(|| self.empty_directory_record(&fetched.account_id_hex));
+        if entry.key_package.as_ref().is_some_and(|cached| {
+            !crate::nostr_replaceable_coordinate_is_newer(
+                fetched.created_at,
+                &fetched.key_package_event_id,
+                cached.created_at,
+                &cached.key_package_event_id,
+            )
+        }) {
+            let already_remembered = entry.key_package.as_ref().is_some_and(|cached| {
+                cached.key_package_id == fetched.key_package_id
+                    && cached.key_package_ref_hex == fetched.key_package_ref_hex
+                    && cached.key_package_event_id == fetched.key_package_event_id
+                    && cached.key_package_hex == hex::encode(fetched.key_package.bytes())
+                    && cached.created_at == fetched.created_at
+            });
+            // Live subscriptions deliver one relay record at a time and may
+            // echo an older parameterized-replaceable revision after a newer
+            // one was already projected. Keep the NIP-33 coordinate winner so
+            // arrival order cannot resurrect a consumed/stale KeyPackage.
+            return Ok(already_remembered);
+        }
+        let local_nip65 = local_signing_account.map(|_| entry.relay_lists.nip65.clone());
         entry.account_id_hex = fetched.account_id_hex.clone();
         entry.relay_lists = fetched.relay_lists.clone();
+        if let Some(local_nip65) = local_nip65 {
+            entry.relay_lists.nip65 = local_nip65;
+            entry.relay_lists.refresh();
+        }
         entry.key_package = Some(DirectoryKeyPackage {
             key_package_id: fetched.key_package_id.clone(),
             key_package_ref_hex: fetched.key_package_ref_hex.clone(),
@@ -1032,7 +1464,158 @@ impl MarmotApp {
             created_at: fetched.created_at,
             source_relays: fetched.source_relays.clone(),
         });
-        self.save_directory_entry(&entry)
+        self.save_directory_entry_with_reason_under_admission(
+            &entry,
+            "directory",
+            local_signing_account,
+        )?;
+
+        // `save_directory_entry` reconciles the account-private and shared
+        // projections. Re-read the winner so a concurrent newer coordinate is
+        // a rejection at a composition commit boundary rather than permission
+        // to return the older prefetched bytes.
+        Ok(self
+            .directory_entry_for_account_id_with_admitted_account(
+                &fetched.account_id_hex,
+                local_signing_account,
+            )?
+            .and_then(|entry| entry.key_package)
+            .is_some_and(|cached| {
+                cached.key_package_id == fetched.key_package_id
+                    && cached.key_package_ref_hex == fetched.key_package_ref_hex
+                    && cached.key_package_event_id == fetched.key_package_event_id
+                    && cached.key_package_hex == hex::encode(fetched.key_package.bytes())
+                    && cached.created_at == fetched.created_at
+            }))
+    }
+
+    pub(crate) fn local_signing_account_for_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<AccountSummary>, AppError> {
+        Ok(self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex && account.can_sign()))
+    }
+
+    /// Whether an observed exact revision is still authorized by local
+    /// private-material state. Remote and tracked-only identities return true;
+    /// signed-out signing identities return false before account storage is
+    /// consulted.
+    pub(crate) fn local_key_package_revision_is_live(
+        &self,
+        account_id_hex: &str,
+        key_package_ref_hex: &str,
+        key_package_event_id: &str,
+    ) -> Result<bool, AppError> {
+        let Some(account) = self.local_signing_account_for_id(account_id_hex)? else {
+            return Ok(true);
+        };
+        let admission = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission_open = admission
+            .get(&account.label)
+            .is_none_or(|state| state.account_id_hex != account.account_id_hex || state.open);
+        if account.signed_out || !admission_open {
+            return Ok(false);
+        }
+        self.local_key_package_revision_is_live_for_account(
+            &account,
+            key_package_ref_hex,
+            key_package_event_id,
+        )
+    }
+
+    /// Inner lifecycle authority check for callers already holding the account
+    /// session-admission mutex.
+    pub(crate) fn local_key_package_revision_is_live_for_account(
+        &self,
+        account: &AccountSummary,
+        key_package_ref_hex: &str,
+        key_package_event_id: &str,
+    ) -> Result<bool, AppError> {
+        let key_package_ref = hex::decode(key_package_ref_hex)?;
+        let event_id_bytes = hex::decode(key_package_event_id)?;
+        if event_id_bytes.len() != 32 {
+            return Ok(false);
+        }
+        let event_id = cgka_traits::MessageId::new(event_id_bytes);
+        let Some(lifecycle) = self
+            .account_storage(&account.label)?
+            .key_package_lifecycle()?
+        else {
+            return Ok(false);
+        };
+        if lifecycle.key_package_ref_is_consumed(&key_package_ref)
+            || lifecycle
+                .deleted_live_revision_event_ids
+                .contains(&event_id)
+        {
+            return Ok(false);
+        }
+        let live_current = lifecycle.current_key_package_ref.as_ref() == Some(&key_package_ref)
+            && lifecycle.authored_event_id.as_ref() == Some(&event_id)
+            && lifecycle
+                .authored_signed_event
+                .as_ref()
+                .is_none_or(|artifact| artifact.id == event_id);
+        let live_pending = lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.key_package_ref == key_package_ref
+                    && pending
+                        .signed_event
+                        .as_ref()
+                        .is_some_and(|artifact| artifact.id == event_id)
+            });
+        Ok(live_current || live_pending)
+    }
+
+    /// Validate locally stored current private material against the exact live
+    /// lifecycle revision. The event id is lifecycle-owned, so callers only
+    /// supply the KeyPackageRef derived from the candidate bytes.
+    pub(crate) fn local_current_key_package_ref_is_live(
+        &self,
+        account_id_hex: &str,
+        key_package_ref_hex: &str,
+    ) -> Result<bool, AppError> {
+        let Some(account) = self.local_signing_account_for_id(account_id_hex)? else {
+            return Ok(true);
+        };
+        let admission = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission_open = admission
+            .get(&account.label)
+            .is_none_or(|state| state.account_id_hex != account.account_id_hex || state.open);
+        if account.signed_out || !admission_open {
+            return Ok(false);
+        }
+        let key_package_ref = hex::decode(key_package_ref_hex)?;
+        let Some(lifecycle) = self
+            .account_storage(&account.label)?
+            .key_package_lifecycle()?
+        else {
+            return Ok(false);
+        };
+        let Some(event_id) = lifecycle.authored_event_id.as_ref() else {
+            return Ok(false);
+        };
+        Ok(
+            lifecycle.current_key_package_ref.as_ref() == Some(&key_package_ref)
+                && !lifecycle.key_package_ref_is_consumed(&key_package_ref)
+                && !lifecycle.deleted_live_revision_event_ids.contains(event_id)
+                && lifecycle
+                    .authored_signed_event
+                    .as_ref()
+                    .is_none_or(|artifact| &artifact.id == event_id),
+        )
     }
 
     fn remember_directory_user(&self, account_id_hex: &str) -> Result<(), AppError> {
@@ -1156,6 +1739,11 @@ impl MarmotApp {
         account_id_hex: &str,
         record: &RelayEventRecord,
     ) -> Result<(), AppError> {
+        if record.event.kind == KIND_NIP65_RELAY_LIST
+            && self.local_account_label_for_id(account_id_hex).is_some()
+        {
+            return Ok(());
+        }
         let Some(state) = relay_list_state_from_event(&record.event) else {
             return Ok(());
         };
@@ -1183,6 +1771,11 @@ impl MarmotApp {
             return Ok(());
         }
         let account_id_hex = parse_account_id_hex(&record.event.pubkey)?;
+        if record.event.kind == KIND_NIP65_RELAY_LIST
+            && self.local_account_label_for_id(&account_id_hex).is_some()
+        {
+            return Ok(());
+        }
         match record.event.kind {
             KIND_NOSTR_METADATA => {
                 if let Some((profile_account_id, profile)) = profile_from_record(record) {
@@ -1198,10 +1791,26 @@ impl MarmotApp {
             }
             KIND_MARMOT_KEY_PACKAGE => {
                 let mut fetched = key_package_from_record(record)?;
-                fetched.relay_lists = self
-                    .account_relay_list_status_for_account_id(&account_id_hex)
-                    .unwrap_or_else(|_| AccountRelayListStatus::empty());
-                self.remember_directory_key_package(&fetched)?;
+                let _ = self.with_local_key_package_admission(
+                    &account_id_hex,
+                    |local_signing_account| {
+                        fetched.relay_lists = self
+                            .directory_entry_for_account_id_with_admitted_account(
+                                &account_id_hex,
+                                local_signing_account,
+                            )
+                            .map(|entry| {
+                                entry
+                                    .map(|entry| entry.relay_lists)
+                                    .unwrap_or_else(AccountRelayListStatus::empty)
+                            })
+                            .unwrap_or_else(|_| AccountRelayListStatus::empty());
+                        self.remember_directory_key_package_if_live_admitted(
+                            &fetched,
+                            local_signing_account,
+                        )
+                    },
+                )?;
             }
             _ => {}
         }
@@ -1217,24 +1826,92 @@ impl MarmotApp {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
-        let proposed_entry = self.hydrate_directory_record(entry.clone())?;
+        let local_signing_account = self.local_signing_account_for_id(&entry.account_id_hex)?;
+        let session_admission = local_signing_account.as_ref().map(|_| {
+            self.account_session_admissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let admitted_local_signing_account = local_signing_account.as_ref().filter(|account| {
+            account.is_active_signing()
+                && session_admission.as_ref().is_some_and(|admissions| {
+                    admissions.get(&account.label).is_none_or(|state| {
+                        state.account_id_hex != account.account_id_hex || state.open
+                    })
+                })
+        });
+        self.save_directory_entry_with_reason_under_admission(
+            entry,
+            reason,
+            admitted_local_signing_account,
+        )
+    }
+
+    /// Persist a projection while carrying the caller's already-held session
+    /// admission proof. Lock ordering is always session admission -> removed
+    /// slot mutation; hydration must use that proof rather than recursively
+    /// inspecting the non-reentrant admission mutex.
+    fn save_directory_entry_with_reason_under_admission(
+        &self,
+        entry: &UserDirectoryRecord,
+        reason: &str,
+        local_signing_account: Option<&AccountSummary>,
+    ) -> Result<(), AppError> {
+        // Acquire handles first: one-time legacy migration takes the mutation
+        // mutex internally and must finish before this write transaction takes
+        // the same mutex.
+        let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
+        let _removed_local_key_package_mutation = self
+            .removed_local_key_package_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission = RemovedSlotAdmission::AlreadyAdmitted(local_signing_account);
+        let proposed_entry =
+            self.hydrate_directory_record_with_admission(entry.clone(), admission)?;
         let shared_record = shared_storage.public_directory_user(&proposed_entry.account_id_hex)?;
         let shared_entry = shared_record
             .clone()
-            .map(|record| self.hydrate_public_directory_record(record))
+            .map(|record| {
+                self.hydrate_directory_record_with_admission(
+                    user_directory_record_from_public(record)?,
+                    admission,
+                )
+            })
             .transpose()?;
-        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
+        // Profile/follow changes and KeyPackage revisions have independent
+        // Nostr coordinates. In particular, filtering a retired local slot
+        // turns one stale whole-record candidate into `key_package = None`;
+        // that must not let a newer profile timestamp erase a live sibling
+        // device's KeyPackage from another projection.
+        let mut live_key_package = proposed_entry.key_package.clone();
+        merge_newer_live_key_package(
+            &mut live_key_package,
+            shared_entry
+                .as_ref()
+                .and_then(|entry| entry.key_package.as_ref()),
+        );
+        let mut cached_entries = Vec::with_capacity(caches.len());
+        for cache in &caches {
+            let cached_entry = cache
+                .entry(&proposed_entry.account_id_hex)?
+                .map(|record| self.hydrate_directory_record_with_admission(record, admission))
+                .transpose()?;
+            merge_newer_live_key_package(
+                &mut live_key_package,
+                cached_entry
+                    .as_ref()
+                    .and_then(|entry| entry.key_package.as_ref()),
+            );
+            cached_entries.push(cached_entry);
+        }
+        let mut entry = select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
             .expect("proposed directory entry should be present");
-        let caches = self.directory_caches()?;
+        entry.key_package = live_key_package;
         let public_entry = public_directory_user_record(&entry)?;
         let shared_entry_matches = shared_record.as_ref() == Some(&public_entry);
         let mut caches_match = true;
-        for cache in &caches {
-            let cached_entry = cache
-                .entry(&entry.account_id_hex)?
-                .map(|record| self.hydrate_directory_record(record))
-                .transpose()?;
+        for cached_entry in cached_entries {
             if cached_entry.as_ref() != Some(&entry) {
                 caches_match = false;
                 break;
@@ -1264,7 +1941,7 @@ impl MarmotApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = handle;
     }
 
-    fn request_directory_sync_rebuild(&self) {
+    pub(crate) fn request_directory_sync_rebuild(&self) {
         let handle = self
             .directory_sync
             .read()
@@ -1363,6 +2040,10 @@ impl MarmotApp {
         &self,
         caches: &[DirectoryCache],
     ) -> Result<(), AppError> {
+        let _removed_local_key_package_mutation = self
+            .removed_local_key_package_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut checked = self
             .legacy_directory_cache_checked
             .lock()
@@ -1382,7 +2063,17 @@ impl MarmotApp {
 
         let entries = entries
             .into_iter()
-            .map(|entry| self.hydrate_directory_record(entry))
+            // A plaintext legacy cache can contain only pre-migration state,
+            // so an account-wide removal marker rejects every slot it carries.
+            // Do not consult account-session admission while holding the
+            // marker mutation mutex; that would invert live ingestion's
+            // admission -> mutation lock order.
+            .map(|entry| {
+                self.hydrate_directory_record_with_admission(
+                    entry,
+                    RemovedSlotAdmission::AlreadyAdmitted(None),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let shared_storage = self.shared_storage()?;
         for entry in &entries {
@@ -1457,11 +2148,54 @@ impl MarmotApp {
 
     fn hydrate_directory_record(
         &self,
+        entry: UserDirectoryRecord,
+    ) -> Result<UserDirectoryRecord, AppError> {
+        self.hydrate_directory_record_with_admission(
+            entry,
+            RemovedSlotAdmission::InspectSessionGate,
+        )
+    }
+
+    fn hydrate_directory_record_with_admission(
+        &self,
         mut entry: UserDirectoryRecord,
+        admission: RemovedSlotAdmission<'_>,
     ) -> Result<UserDirectoryRecord, AppError> {
         entry.account_id_hex = parse_account_id_hex(&entry.account_id_hex)?;
         entry.npub = npub_for_account_id(&entry.account_id_hex)?;
+        let key_package_is_retired = entry
+            .key_package
+            .as_ref()
+            .map(|key_package| match admission {
+                RemovedSlotAdmission::InspectSessionGate => self
+                    .removed_local_key_package_slot_is_retired(
+                        &entry.account_id_hex,
+                        &key_package.key_package_id,
+                    ),
+                RemovedSlotAdmission::AlreadyAdmitted(local_signing_account) => self
+                    .removed_local_key_package_slot_is_retired_for_admitted_account(
+                        &entry.account_id_hex,
+                        &key_package.key_package_id,
+                        local_signing_account,
+                    ),
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if key_package_is_retired {
+            entry.key_package = None;
+        }
         entry.local_account = self.local_account_for_id(&entry.account_id_hex);
+        if let Some(local) = entry.local_account.as_ref()
+            && let Some(generation) =
+                self.read_nip65_route_generation_for_authoring(&local.label)?
+        {
+            // Profiles and KeyPackages may make a shared/cache record newer as
+            // a whole, but they do not carry route authority. Overlay the exact
+            // state bound to the verified local kind-10002 generation so cache
+            // selection can never roll the account back to stale relays.
+            entry.relay_lists.nip65 = generation.nip65;
+            entry.relay_lists.refresh();
+        }
         entry.follows = normalize_account_ids(entry.follows)?;
         entry.follow_source_relays.sort();
         entry.follow_source_relays.dedup();

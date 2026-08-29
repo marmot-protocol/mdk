@@ -34,8 +34,8 @@ use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
-    EventGroupProjection, GroupConfirmationProjection, add_group, fail_if_publish_failed,
-    publish_failure_error, send_summary_from_effects, validate_group_profile,
+    EventGroupProjection, GroupConfirmationProjection, add_group, publish_failure_error,
+    send_summary_from_effects, validate_group_profile,
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
@@ -47,11 +47,12 @@ use crate::media::{
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::notifications;
 use crate::{
-    AccountState, AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupAdminPolicyComponent,
-    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageComponent,
-    AppGroupImageInput, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupRecord, AppInitialGroupImage, AppPerformanceTelemetry, AppPreparedGroupImageUpload,
+    AccountRelayListBootstrap, AccountState, AgentOperationEventRequest,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
+    AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
+    AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
+    AppInitialGroupImage, AppPerformanceTelemetry, AppPreparedGroupImageUpload,
     AppPreparedGroupImageUploadState, AppQuarantinedGroup, AppRoutingState, AppRuntime,
     AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
     MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
@@ -284,9 +285,30 @@ pub(crate) struct GroupRouteRefresh {
     pub(crate) state_pruned: bool,
 }
 
+/// Durable account-runtime effects currently leased to this app client.
+///
+/// A newer runtime handoff supersedes the lease generation but contains every
+/// still-unacknowledged row, so staged ids are retained only when they remain
+/// present in the replacement batch set. `projection_operation_id` selects the
+/// source-attributed operation whose event rows the app is presently applying.
+pub(crate) struct PendingAccountVisibilityLease {
+    pub(crate) lease: marmot_account::AccountVisibilityLease,
+    pub(crate) batches: Vec<marmot_account::AccountVisibilityBatch>,
+    pub(crate) staged_batch_ids: Vec<Vec<u8>>,
+    pub(crate) projection_operation_id: Option<Vec<u8>>,
+}
+
 pub struct AppClient {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
+    /// Exact account identity admitted when this exclusive session opened.
+    /// A label may be removed and later recreated, so stale-client boundaries
+    /// must compare both fields against the live AccountHome record.
+    pub(crate) account_id_hex: String,
+    /// Monotonic process-local capability captured before this session's
+    /// unabortable open. Sign-out advances and closes the generation, so this
+    /// client stays stale after any later explicit sign-in.
+    pub(crate) session_admission: crate::AccountSessionAdmission,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
     // before this guard so ownership is released only after engine teardown.
     pub(crate) _session_guard: crate::AppAccountSessionGuard,
@@ -322,12 +344,21 @@ pub struct AppClient {
     /// sync summary so live chat-list/group-state subscriptions observe the
     /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
-    /// App-visible outputs ingested during a sync whose account-projection
-    /// checkpoint failed. A retained client keeps the matching projected state
-    /// and outbox acknowledgements, then returns this summary after its next
-    /// successful checkpoint. A reopened client recovers the same outputs from
-    /// the durable engine outbox instead.
-    pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// App-visible output projected since the last successful account-state
+    /// checkpoint. `Some` is an occupied aggregate, including a meaningful
+    /// empty wake batch. Projection state and engine-outbox acknowledgements
+    /// remain staged beside it, so a retained client can checkpoint it later
+    /// and a reopened client can recover it from the durable engine outbox.
+    pub(crate) pending_uncheckpointed_sync_summary: Option<crate::SyncSummary>,
+    /// App-visible output whose projection and engine-outbox acknowledgements
+    /// committed, but which no outer seam has taken for return or publication
+    /// yet. This bounded aggregate is process-local ownership (visibility V2):
+    /// cancellation and unrelated saves cannot strand it, but a process restart
+    /// does not replay it because its engine outbox row is already acknowledged.
+    /// The runtime handoff is an at-most-once broadcast attempt, not subscriber
+    /// receipt; lagged/new subscribers recover materialized state by snapshot.
+    /// Durable engine replay protects only the uncheckpointed V1 slot above.
+    pub(crate) pending_checkpointed_sync_summary: Option<crate::SyncSummary>,
     /// Epoch-stall escalations the detector has raised but no caller has been
     /// handed yet.
     ///
@@ -346,12 +377,21 @@ pub struct AppClient {
     /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
     /// committed with the account projection and any frontier clear.
     pub(crate) pending_application_event_acks: HashSet<MessageId>,
-    /// A live ingest changed the in-memory transport routing table after its
-    /// durable projection was committed. The account worker publishes the
-    /// resulting app summary before it asks the relay plane to rebuild its
-    /// ordinary group subscriptions; failures remain armed here for bounded
-    /// background retry instead of turning the already-applied ingest into an
-    /// apparent receive failure.
+    /// Complete lower account-effects rows awaiting the same projection
+    /// transaction. Stable row ids move here only after their source-specific
+    /// projection semantics complete; the save deletes them atomically with
+    /// projection state and engine application-event acknowledgements.
+    pub(crate) pending_account_visibility_lease: Option<PendingAccountVisibilityLease>,
+    /// A projected-but-uncheckpointed batch changed group routing. A successful
+    /// common state save transfers this intent to the runtime retry bit in the
+    /// same synchronous promotion that moves visibility V1 to V2.
+    pub(crate) pending_uncheckpointed_runtime_group_subscription_refresh: bool,
+    /// A live ingest or no-inbound engine drain changed the in-memory transport
+    /// routing table after its durable projection was committed. The account
+    /// worker publishes the resulting app summary before it asks the relay
+    /// plane to rebuild ordinary group subscriptions; failures remain armed
+    /// here for bounded background retry instead of turning already-applied
+    /// output into an apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
     /// Last transport cursor promoted by a completed drain checkpoint. Live
     /// one-at-a-time worker ingests may advance `state` for diagnostics, but
@@ -363,11 +403,35 @@ pub struct AppClient {
     /// and EOSE-gated recovery must complete before the cursor is trusted.
     pub(crate) delivery_overflow_recovery_pending: bool,
     pub(crate) delivery_overflow_recovery_marker_token: Option<u64>,
+    /// New-message notification fanout deferred until the worker has published
+    /// the send-applied visibility summary. Keeping only group ids deduplicates
+    /// a burst of sends without placing acknowledged app visibility behind a
+    /// best-effort network await.
+    pub(crate) pending_new_message_notification_groups: HashSet<GroupId>,
     /// Unit-test fault injection for the account-open replay path. This keeps
     /// the live protocol group intact while exercising a missing best-effort
     /// app projection.
     #[cfg(test)]
     pub(crate) force_event_group_projection_unavailable: bool,
+    /// Deterministically pause a catch-up pass after one delivery's projection
+    /// has entered visibility V1 and before the next receive/checkpoint.
+    #[cfg(test)]
+    pub(crate) block_after_sync_delivery_projection:
+        Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// Deterministically pause a sync after its relay prefix checkpoint,
+    /// exercising visibility V2 cancellation without adding a production
+    /// await after that checkpoint.
+    #[cfg(test)]
+    pub(crate) block_after_sync_prefix_checkpoint:
+        Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// Fail after a convergence retry has durably finalized timeline rows but
+    /// before the method returns to its worker.
+    #[cfg(test)]
+    pub(crate) fail_after_convergence_retry_finalize: bool,
+    /// Skip singleton-journal prune after a committed local delete so tests can
+    /// inject the crash window between wipe and backfill cleanup.
+    #[cfg(test)]
+    pub(crate) skip_epoch_backfill_prune_on_delete: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -383,12 +447,22 @@ pub struct AppClient {
     /// Earliest instant an automatic seam may retry a pending epoch-gap
     /// backfill whose last attempt could not confirm its replay.
     ///
-    /// Process-local on purpose: the intent it paces is durable, so a restart
-    /// costs at most one unpaced attempt, while persisting a monotonic deadline
-    /// would mean durable schema for a scheduling hint.
+    /// Restored from the singleton intent journal so a restart cannot spin a
+    /// fruitless replay at full speed. The remaining duration is stored as a
+    /// wall-clock deadline beside the durable intent set.
     pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Recovery intent currently owned by an in-flight replay. Unlike the
+    /// future-local execution timer/snapshot, this copy is persisted and stays
+    /// client-owned until terminal finish. Cancellation therefore turns it
+    /// back into pending work instead of forgetting the replay.
+    pub(crate) active_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// The in-memory intent set has not yet been durably mirrored. A failed
+    /// journal write must stay retryable even after the detector latched the
+    /// arm that produced it; otherwise a later worker abort could forget the
+    /// only executable repair intent.
+    pub(crate) epoch_backfill_intent_journal_dirty: bool,
     /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
     /// when a replay failure must not overwrite a newer arm minted in flight.
     pub(crate) queued_epoch_backfills:
@@ -596,6 +670,149 @@ fn record_app_performance(
 }
 
 impl AppClient {
+    fn active_session_admission_token(
+        &self,
+    ) -> Result<crate::AccountSessionAdmissionToken, AppError> {
+        match &self.session_admission {
+            crate::AccountSessionAdmission::Active(token) => Ok(token.clone()),
+            crate::AccountSessionAdmission::Teardown(_) => Err(AppError::Publish(
+                "teardown cleanup clients cannot perform active-account operations".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn ensure_session_account(&self) -> Result<(), AppError> {
+        match &self.session_admission {
+            crate::AccountSessionAdmission::Active(_) => self.ensure_active_signing_account(),
+            crate::AccountSessionAdmission::Teardown(_) => self.ensure_teardown_cleanup_account(),
+        }
+    }
+
+    pub(crate) fn ensure_active_signing_account(&self) -> Result<(), AppError> {
+        let crate::AccountSessionAdmission::Active(session_admission) = &self.session_admission
+        else {
+            return Err(AppError::Publish(
+                "teardown cleanup clients cannot perform active-account operations".into(),
+            ));
+        };
+        let live_account_matches = self
+            .app
+            .account_home()
+            .account(&self.state.label)
+            .is_ok_and(|account| {
+                account.is_active_signing() && account.account_id_hex == self.account_id_hex
+            });
+        if live_account_matches
+            && self
+                .app
+                .account_session_admission_is_current(&self.state.label, session_admission)
+        {
+            Ok(())
+        } else {
+            Err(AppError::Publish(
+                "account is signed out, removed, or no longer matches this client session".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn ensure_teardown_cleanup_account(&self) -> Result<(), AppError> {
+        let crate::AccountSessionAdmission::Teardown(session_admission) = &self.session_admission
+        else {
+            return Err(AppError::AccountWorkerBusy);
+        };
+        let live_account_matches = self
+            .app
+            .account_home()
+            .account(&self.state.label)
+            .is_ok_and(|account| {
+                account.signed_out && account.account_id_hex == self.account_id_hex
+            });
+        if live_account_matches
+            && self
+                .app
+                .account_teardown_session_admission_is_current(&self.state.label, session_admission)
+        {
+            Ok(())
+        } else {
+            Err(AppError::AccountWorkerBusy)
+        }
+    }
+
+    pub(crate) async fn publish_account_nip65_relay_set(
+        &mut self,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<crate::AccountRelayListStatus, AppError> {
+        self.ensure_active_signing_account()?;
+        let session_admission = self.active_session_admission_token()?;
+        let status = self
+            .app
+            .publish_account_nip65_relay_set_for_session(
+                &self.state.label,
+                read_relays,
+                write_relays,
+                bootstrap_relays,
+                &session_admission,
+            )
+            .await?;
+        self.refresh_routing()?;
+        let app = self.app.clone();
+        app.finish_client_open_network_maintenance(self).await;
+        Ok(status)
+    }
+
+    pub(crate) async fn set_account_nip65_relays(
+        &mut self,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<crate::AccountRelayListStatus, AppError> {
+        // Keep the role-preserving read behind worker admission. A signed-out
+        // caller must fail before reopening the per-account directory cache.
+        self.ensure_active_signing_account()?;
+        let current = self.app.account_relay_list_status(&self.state.label)?.nip65;
+        let relay_set = crate::nip65_relay_set_preserving_roles(&current, relays);
+        self.publish_account_nip65_relay_set(
+            relay_set.read_relays,
+            relay_set.write_relays,
+            bootstrap_relays,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_account_inbox_relays(
+        &mut self,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<crate::AccountRelayListStatus, AppError> {
+        self.ensure_active_signing_account()?;
+        let session_admission = self.active_session_admission_token()?;
+        self.app
+            .publish_account_inbox_relays_for_session(
+                &self.state.label,
+                relays,
+                bootstrap_relays,
+                &session_admission,
+            )
+            .await
+    }
+
+    pub(crate) async fn ingest_self_nip65_relay_event(
+        &mut self,
+        record: crate::relay_plane::DirectoryRelayEventRecord,
+    ) -> Result<crate::AccountRelayListStatus, AppError> {
+        let route_lock = self.app.key_package_route_lock(&self.state.label);
+        let status = {
+            let _route_guard = route_lock.lock().await;
+            self.app
+                .ingest_local_nip65_relay_event_unlocked(&self.state.label, record)?
+        };
+        self.refresh_routing()?;
+        let app = self.app.clone();
+        app.finish_client_open_network_maintenance(self).await;
+        Ok(status)
+    }
+
     /// Persist the exact first KeyPackage and signed publication artifact
     /// without activating transport or contacting a relay.
     pub(crate) async fn prepare_initial_key_package(
@@ -606,10 +823,45 @@ impl AppClient {
     }
 
     pub async fn publish_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        // Reject stale sessions before any route refresh, lifecycle read, or
+        // cache open. The final publisher repeats this proof under the route
+        // lock to close the race with a concurrent sign-out/removal commit.
+        self.ensure_active_signing_account()?;
+        let session_admission = self.active_session_admission_token()?;
+        // This public call is the explicit user action that supersedes a
+        // generated setup's durable initial-publication hold. While setup is
+        // still incomplete, recover its context-bound route before releasing
+        // that hold; a direct client must never reinterpret the app fallback
+        // as the generated account's requested authority.
+        if self
+            .app
+            .generated_initial_key_package_publication_held(&self.state.label)?
+        {
+            let generated_setup_incomplete = self
+                .app
+                .account_home()
+                .account_setup_state(&self.state.label)?
+                .is_some_and(|state| {
+                    state.kind == marmot_account::AccountSetupKind::GeneratedIdentity
+                });
+            if generated_setup_incomplete {
+                self.recover_generated_setup_nip65_authority_inner(false)
+                    .await?;
+            } else {
+                self.app
+                    .clear_generated_initial_key_package_publication_hold_for_session(
+                        &self.state.label,
+                        &session_admission,
+                    )
+                    .await?;
+            }
+        }
         self.app
-            .ensure_local_account_relay_lists(&self.state.label)
+            .ensure_local_account_relay_lists_for_session(&self.state.label, &session_admission)
             .await?;
         self.refresh_routing()?;
+        self.ensure_key_package_cutover_ready_for_publication()
+            .await?;
         self.runtime.activate_transport(None).await?;
         self.publish_key_package_from_lifecycle().await
     }
@@ -619,11 +871,77 @@ impl AppClient {
     /// managed worker runs this only for `KeyPackagePublicationStarted`; all
     /// general publication continues through [`Self::publish_key_package`].
     pub(crate) async fn publish_setup_key_package(&mut self) -> Result<KeyPackage, AppError> {
-        self.app
-            .ensure_local_account_relay_lists(&self.state.label)
-            .await?;
+        let generated_fresh_replacement = self
+            .runtime
+            .key_package_maintenance_status()?
+            .as_ref()
+            .map(|lifecycle| {
+                self.app
+                    .generated_account_fresh_replacement_can_open_cutover_gate(
+                        &self.state.label,
+                        lifecycle,
+                    )
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !generated_fresh_replacement {
+            let session_admission = self.active_session_admission_token()?;
+            self.app
+                .ensure_local_account_relay_lists_for_session(&self.state.label, &session_admission)
+                .await?;
+        }
         self.refresh_routing()?;
         self.publish_key_package_from_lifecycle().await
+    }
+
+    /// Recover the exact route intent persisted by generated-account local
+    /// preparation before the setup-priority KeyPackage publisher runs. The
+    /// generic app fallback is never route authority for this lane.
+    pub(crate) async fn recover_generated_setup_nip65_authority(&mut self) -> Result<(), AppError> {
+        self.recover_generated_setup_nip65_authority_inner(true)
+            .await
+    }
+
+    async fn recover_generated_setup_nip65_authority_inner(
+        &mut self,
+        require_setup_publication_intent: bool,
+    ) -> Result<(), AppError> {
+        let session_admission = self.active_session_admission_token()?;
+        let context = self
+            .app
+            .account_home()
+            .account_setup_context(&self.state.label)?
+            .ok_or(AppError::AccountSetupRetryRequired)
+            .and_then(|bytes| {
+                serde_json::from_slice::<crate::runtime::GeneratedAccountSetupContext>(&bytes)
+                    .map_err(AppError::from)
+            })?;
+        if require_setup_publication_intent && !context.publish_initial_key_package() {
+            return Err(AppError::Publish(
+                "generated setup did not authorize initial KeyPackage publication".into(),
+            ));
+        }
+        let request = context.request();
+        let bootstrap =
+            AccountRelayListBootstrap::new(request.default_relays, request.bootstrap_relays);
+        let proof = self
+            .app
+            .recover_generated_account_nip65_route_authority_for_session(
+                &self.state.label,
+                &bootstrap,
+                self.transport_signer.clone(),
+                &session_admission,
+            )
+            .await?;
+        self.refresh_routing()?;
+        self.app
+            .open_generated_account_key_package_publication_gate(
+                &self.state.label,
+                &bootstrap,
+                &proof,
+                &session_admission,
+            )
+            .await
     }
 
     async fn publish_key_package_from_lifecycle(&mut self) -> Result<KeyPackage, AppError> {
@@ -642,6 +960,63 @@ impl AppClient {
         }
     }
 
+    async fn ensure_key_package_cutover_ready_for_publication(&mut self) -> Result<(), AppError> {
+        let lifecycle = self.runtime.key_package_maintenance_status()?;
+        let durable_gate_open = lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| !lifecycle.cutover_publication_blocked);
+        let generated_fresh_admission = lifecycle
+            .as_ref()
+            .map(|lifecycle| {
+                self.app
+                    .generated_account_fresh_replacement_can_open_cutover_gate(
+                        &self.state.label,
+                        lifecycle,
+                    )
+            })
+            .transpose()?
+            .unwrap_or(false)
+            && self
+                .app
+                .generated_initial_key_package_publication_held(&self.state.label)
+                .is_ok_and(|held| !held);
+        if durable_gate_open
+            && self
+                .app
+                .key_package_cutover_publication_allowed(&self.state.label)
+            && (!self
+                .app
+                .key_package_cutover_replacement_pending(&self.state.label)
+                || generated_fresh_admission)
+        {
+            return Ok(());
+        }
+
+        // This runs under the AppClient/account-worker single-writer boundary.
+        // Arm before discovery so a failed or cancelled scan cannot leave a
+        // later maintenance tick publication-open.
+        self.runtime
+            .set_key_package_cutover_publication_blocked(true)?;
+        let app = self.app.clone();
+        app.finish_client_open_network_maintenance(self).await;
+        let durable_gate_open = self
+            .runtime
+            .key_package_maintenance_status()?
+            .is_some_and(|lifecycle| !lifecycle.cutover_publication_blocked);
+        if durable_gate_open
+            && self
+                .app
+                .key_package_cutover_publication_allowed(&self.state.label)
+        {
+            Ok(())
+        } else {
+            Err(AppError::Publish(
+                "key package publication remains blocked until strict relay cutover completes"
+                    .into(),
+            ))
+        }
+    }
+
     pub fn maintenance_status(
         &self,
         group_id: &GroupId,
@@ -654,6 +1029,74 @@ impl AppClient {
         &self,
     ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
         Ok(self.runtime.key_package_maintenance_status()?)
+    }
+
+    pub(crate) async fn delete_key_package_revision_durably(
+        &mut self,
+        event_id: &cgka_traits::MessageId,
+        relays: Vec<TransportEndpoint>,
+    ) -> Result<usize, AppError> {
+        // Reject a stale worker/client before any relay-list read can reopen
+        // account or directory storage after sign-out.
+        self.ensure_active_signing_account()?;
+        let endpoints = if relays.is_empty() {
+            let relay_lists = self
+                .app
+                .account_relay_list_status_for_account_id(&self.account_id_hex)?;
+            self.app.key_package_endpoints(&relay_lists)
+        } else {
+            relays
+        };
+        if endpoints.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                crate::MissingRelayListKind::Nip65,
+            ]));
+        }
+        let endpoints = self
+            .app
+            .relay_plane
+            .sanitize_relay_endpoints(endpoints, "key package deletion publish")
+            .map_err(|error| {
+                AppError::Transport(cgka_traits::TransportAdapterError::Publish(error))
+            })?;
+        if endpoints.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                crate::MissingRelayListKind::Nip65,
+            ]));
+        }
+        let mut requested = endpoints.clone();
+        requested.sort();
+        requested.dedup();
+        let deletion = self
+            .runtime
+            .delete_key_package_revision_durably(event_id, endpoints)
+            .await;
+        // The deletion publisher arms the relay-history frontier before any
+        // kind-5 I/O. Repair it even when the receipt was partial or failed so
+        // the live worker does not require a restart before its next safe
+        // KeyPackage publication.
+        let repair = self.repair_key_package_history_frontier().await;
+        let (receipt, deferred) = deletion?;
+        repair?;
+        let terminal = receipt
+            .accepted
+            .len()
+            .saturating_add(receipt.confirmed_absent.len());
+        let accounted = terminal
+            .saturating_add(receipt.rejected.len())
+            .saturating_add(receipt.failed.len())
+            .saturating_add(deferred.len());
+        if !receipt.rejected.is_empty()
+            || !receipt.failed.is_empty()
+            || !deferred.is_empty()
+            || terminal == 0
+            || accounted != requested.len()
+        {
+            return Err(AppError::Publish(
+                "one or more relay key package deletions remain retryable".to_owned(),
+            ));
+        }
+        Ok(terminal)
     }
 
     pub fn durably_owned_key_packages(&self) -> Result<Vec<KeyPackage>, AppError> {
@@ -691,6 +1134,19 @@ impl AppClient {
     }
 
     pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
+        self.run_due_maintenance_with_intermediate_handoff(|client, summary| {
+            // A direct caller has no runtime event publisher. Keep V2 on the
+            // retained client so its next sync/worker seam can hand it off.
+            client.retain_checkpointed_sync_summary(summary);
+        })
+        .await
+    }
+
+    pub(crate) async fn run_due_maintenance_with_intermediate_handoff(
+        &mut self,
+        mut handoff: impl FnMut(&mut Self, crate::SyncSummary),
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
+        self.replay_pending_account_visibility().await?;
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;
             let summary = self
@@ -698,8 +1154,135 @@ impl AppClient {
                 .maintenance_run_summary(&marmot_account::AccountDeviceEffects::default())?;
             return Ok(maintenance_run_summary_from_account(summary));
         }
-        let effects = self.runtime.run_due_maintenance().await?;
-        self.observe_recovery_evidence_then_summarize_maintenance(&effects)
+        // A previous interrupted maintenance tick may have left a strict
+        // post-delete replay pending. Repair before the tick so its first
+        // publication is not spuriously blocked, and again afterward because
+        // this tick can perform another exact retired-revision deletion.
+        let _ = self.repair_key_package_history_frontier().await;
+        let effects = self.runtime.run_due_maintenance_leased().await?;
+        self.install_account_visibility_lease(
+            effects.lease,
+            effects.batches,
+            effects.current_operation_id,
+        );
+        let effects = effects.effects;
+        // Transfer one-shot engine effects into AppClient-owned detector and
+        // projection state before the post-delete relay repair can await,
+        // error, or be cancelled by worker shutdown.
+        let summary = self.checkpoint_maintenance_effects(&effects)?;
+        if let Some(visibility) = self.take_pending_checkpointed_sync_summary() {
+            // No await may intervene between V2 ownership and this handoff.
+            handoff(self, visibility);
+        }
+        self.repair_key_package_history_frontier().await?;
+        Ok(summary)
+    }
+
+    fn checkpoint_maintenance_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
+        self.checkpoint_maintenance_effects_at(
+            effects,
+            self.current_account_visibility_observed_at(),
+        )
+    }
+
+    fn checkpoint_maintenance_effects_at(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_received_at: u64,
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
+        // Compute the aggregate before mutating app projection state. A summary
+        // decode/storage error must leave the durable lower visibility rows
+        // untouched for replay.
+        let summary = self.runtime.maintenance_run_summary(effects)?;
+        self.observe_recovery_evidence(effects)?;
+        let affected_groups = self.project_current_account_non_session_visibility(effects, None)?;
+
+        // Maintenance reports failures as counts rather than failing the tick.
+        // Reuse the no-inbound projector with only that gate suppressed; its
+        // event-local V1/ACK semantics remain identical to startup drains.
+        let mut projectable = effects.clone();
+        projectable.failures.clear();
+        if let Err(error) =
+            self.observe_drained_session_events_staged_at(&projectable, source_received_at)
+        {
+            self.checkpoint_pending_sync_visibility()?;
+            return Err(error);
+        }
+        for group_id in &affected_groups {
+            self.refresh_group(group_id);
+            if let Err(error) = self.prune_plaintext_retention_for_group(group_id) {
+                self.checkpoint_pending_sync_visibility()?;
+                return Err(error);
+            }
+        }
+        self.stage_current_account_visibility_header_batch();
+        self.checkpoint_pending_sync_visibility()?;
+        Ok(maintenance_run_summary_from_account(summary))
+    }
+
+    async fn repair_key_package_history_frontier(&mut self) -> Result<(), AppError> {
+        let lifecycle = self.runtime.key_package_maintenance_status()?;
+        let gate_is_blocked = lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.cutover_publication_blocked);
+        if self
+            .app
+            .key_package_cutover_relay_frontier(&self.state.label)?
+            .is_empty()
+            && !gate_is_blocked
+            && self
+                .app
+                .key_package_cutover_publication_allowed(&self.state.label)
+        {
+            return Ok(());
+        }
+        let route_lock = self.app.key_package_route_lock(&self.state.label);
+        let route_guard = route_lock.lock().await;
+        let lifecycle = self.runtime.key_package_maintenance_status()?;
+        let gate_is_blocked = lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.cutover_publication_blocked);
+        if self
+            .app
+            .key_package_cutover_relay_frontier(&self.state.label)?
+            .is_empty()
+            && !gate_is_blocked
+            && self
+                .app
+                .key_package_cutover_publication_allowed(&self.state.label)
+        {
+            return Ok(());
+        }
+        // The deletion publisher owns the active route lock at its lowest
+        // signer/network boundary. Release this focused repair snapshot before
+        // retirement invokes it, then reacquire for the completion proof.
+        drop(route_guard);
+        let app = self.app.clone();
+        if !app
+            .retire_relay_non_current_key_packages(&self.state.label, &mut self.runtime)
+            .await
+        {
+            return Err(AppError::Publish(
+                "key package relay-history repair remains retryable".into(),
+            ));
+        }
+        let _route_guard = route_lock.lock().await;
+        if !app.key_package_cutover_publication_allowed(&self.state.label) {
+            return Err(AppError::Publish(
+                "key package relay-history repair did not establish a durable completion proof"
+                    .into(),
+            ));
+        }
+        // Preserve the SQL gate byte-for-byte. The durable frontier/marker and
+        // route/history locks already fence every final kind-30443 boundary,
+        // while this focused helper cannot determine whether a pre-existing
+        // gate belongs to cached legacy ambiguity or another full-open repair.
+        // It therefore proves relay history only; the full maintenance path is
+        // the sole owner of SQL-gate reconciliation.
+        Ok(())
     }
 
     /// Observe one maintenance tick's recovery evidence, then summarize the
@@ -724,11 +1307,12 @@ impl AppClient {
     /// pending backfill after a tick, so the intent waits for the next
     /// delivery-driven seam to drain it. The arm and its audit row are durable
     /// meanwhile, so the wait costs latency, not the recovery.
+    #[cfg(test)]
     pub(crate) fn observe_recovery_evidence_then_summarize_maintenance(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        self.observe_recovery_evidence(effects);
+        self.observe_recovery_evidence(effects)?;
         self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
         Ok(maintenance_run_summary_from_account(summary))
@@ -920,10 +1504,17 @@ impl AppClient {
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        // Match explicit publish: a retained client must fail before route
+        // refresh or cache access once sign-out/removal (or same-label
+        // replacement) invalidates the session.
+        self.ensure_active_signing_account()?;
+        let session_admission = self.active_session_admission_token()?;
         self.app
-            .ensure_local_account_relay_lists(&self.state.label)
+            .ensure_local_account_relay_lists_for_session(&self.state.label, &session_admission)
             .await?;
         self.refresh_routing()?;
+        self.ensure_key_package_cutover_ready_for_publication()
+            .await?;
         self.runtime.activate_transport(None).await?;
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
@@ -1971,20 +2562,26 @@ impl AppClient {
             Ok(PreparedSessionSend::Commit(prepared)) => prepared,
             Ok(PreparedSessionSend::Queued(session_effects)) => {
                 let queued = self
-                    .runtime
-                    .publish_prepared_session_effects_with_audit_context(
+                    .publish_prepared_session_effects_with_visibility(
                         session_effects,
                         audit_context,
                     )
-                    .await
-                    .map_err(AppError::from);
+                    .await;
                 record_app_performance(
                     telemetry,
                     AppPerformanceOperation::GroupInviteEnginePublish,
                     engine_publish_started_at.elapsed(),
                     queued.is_ok(),
                 );
-                return queued.map(|effects| send_summary_from_effects(&effects));
+                let effects = queued?;
+                let visibility_complete = self
+                    .project_current_outbound_visibility(&effects, None)
+                    .await?;
+                if visibility_complete {
+                    self.stage_current_account_visibility_header_batch();
+                }
+                self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+                return Ok(send_summary_from_effects(&effects));
             }
             Err(error) => {
                 record_app_performance(
@@ -2014,17 +2611,43 @@ impl AppClient {
             Err(error) => {
                 let rollback = self
                     .runtime
-                    .rollback_prepared_session_commit(prepared)
+                    .rollback_prepared_session_commit_leased(prepared)
                     .await
                     .map_err(AppError::from);
+                let rollback = rollback.map(|leased| {
+                    self.install_account_visibility_lease(
+                        leased.lease,
+                        leased.batches,
+                        leased.current_operation_id,
+                    );
+                    leased.effects
+                });
                 record_app_performance(
                     telemetry,
                     AppPerformanceOperation::GroupInviteEnginePublish,
                     engine_publish_started_at.elapsed(),
                     false,
                 );
-                rollback?;
+                let rollback = rollback?;
+                let visibility_complete = match self
+                    .project_current_outbound_visibility(&rollback, None)
+                    .await
+                {
+                    Ok(complete) => complete,
+                    Err(projection_error) => {
+                        tracing::warn!(
+                            target: "marmot_app::client",
+                            method = "invite_members_intent_failure_rollback",
+                            error_kind = projection_error.privacy_safe_kind(),
+                            "rolled back staged invite but kept its incomplete visibility durable"
+                        );
+                        false
+                    }
+                };
                 self.refresh_group(group_id);
+                if visibility_complete {
+                    self.stage_current_account_visibility_header_batch();
+                }
                 if let Err(refresh_error) =
                     self.save_state_with_pending_local_group_deletion_frontier_clears()
                 {
@@ -2049,13 +2672,11 @@ impl AppClient {
         });
 
         let published = match self
-            .runtime
-            .publish_prepared_session_effects_with_audit_context(
+            .publish_prepared_session_effects_with_visibility(
                 session_effects,
                 audit_context.clone(),
             )
             .await
-            .map_err(AppError::from)
         {
             // Matched rather than chained so the gate can arm first: it
             // previously sat in a combinator closure that could not reach
@@ -2083,8 +2704,12 @@ impl AppClient {
             }
         };
 
+        let visibility_projection = self
+            .project_current_outbound_visibility(&effects, None)
+            .await;
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
+            let visibility_complete = visibility_projection?;
             if cfg!(feature = "test-policy-overrides")
                 && self.app.config.dev_fail_invite_local_refresh
             {
@@ -2092,13 +2717,13 @@ impl AppClient {
                     "injected invite local refresh failure".into(),
                 ));
             }
-            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
-            self.remember_published_reports(&effects);
             self.refresh_group(group_id);
             self.prune_plaintext_retention_for_group(group_id)?;
+            if visibility_complete {
+                self.stage_current_account_visibility_header_batch();
+            }
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            self.queue_own_group_system_projection_updates(&effects);
             Ok::<_, AppError>(())
         })();
         record_app_performance(
@@ -2151,22 +2776,25 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, &target_hexes);
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::RemoveMembers {
                     group_id: group_id.clone(),
                     members,
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         self.publish_targeted_group_state_wake_best_effort(
             group_id,
             wake_snapshot,
@@ -2177,14 +2805,41 @@ impl AppClient {
     }
 
     pub async fn leave_group(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        let mut handoff = |client: &mut Self| client.retain_direct_send_applied_visibility();
+        self.leave_group_with_handoff(group_id, &mut handoff).await
+    }
+
+    pub(crate) async fn leave_group_with_handoff(
+        &mut self,
+        group_id: &GroupId,
+        visibility_handoff: &mut impl FnMut(&mut Self),
+    ) -> Result<SendSummary, AppError> {
         let audit_context = Self::local_human_action_context(
             "leave_group",
             vec!["membership"],
             Vec::new(),
             Some(1),
         );
-        self.leave_group_with_audit_context(group_id, audit_context)
+        self.leave_group_with_audit_context(group_id, audit_context, visibility_handoff)
             .await
+    }
+
+    pub(crate) async fn leave_group_for_teardown(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_teardown_cleanup_account()?;
+        let audit_context = Self::local_human_action_context(
+            "leave_group",
+            vec!["membership"],
+            Vec::new(),
+            Some(1),
+        );
+        let result = self
+            .leave_group_with_audit_context(group_id, audit_context, &mut |_| {})
+            .await;
+        self.ensure_teardown_cleanup_account()?;
+        result
     }
 
     /// Atomically install lifecycle-v1 and make it required for this group.
@@ -2204,18 +2859,22 @@ impl AppClient {
         );
         self.sync_runtime_groups().await?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::EnableDisbanding {
                     group_id: group_id.clone(),
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         self.refresh_group(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         // Enabling lifecycle-v1 changes eligibility, not group history. It
         // intentionally emits no kind-1210 system row.
@@ -2240,15 +2899,16 @@ impl AppClient {
         );
         self.sync_runtime_groups().await?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::Disband {
                     group_id: group_id.clone(),
                 },
-                audit_context,
+                Some(audit_context),
             )
             .await?;
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         if let Err(error) = self
             .app
             .delete_message_draft(&self.state.label, &hex::encode(group_id.as_slice()))
@@ -2263,6 +2923,9 @@ impl AppClient {
                 error_kind = error.privacy_safe_kind(),
                 "durable disband request outpaced composer draft cleanup"
             );
+        }
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
         }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.runtime
@@ -2285,14 +2948,27 @@ impl AppClient {
     /// restored without restoring the projection. The durable deletion frontier
     /// filters historical replay until a strictly newer app message arrives.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        let mut handoff = |client: &mut Self| client.retain_direct_send_applied_visibility();
+        self.delete_group_local_with_handoff(group_id, &mut handoff)
+            .await
+    }
+
+    pub(crate) async fn delete_group_local_with_handoff(
+        &mut self,
+        group_id: &GroupId,
+        visibility_handoff: &mut impl FnMut(&mut Self),
+    ) -> Result<bool, AppError> {
         if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
         }
         // A local wipe removes this group's transport route. Any already-durable
         // removal must publish first; retaining it after the route disappears
         // would preserve bytes on disk without preserving liveness.
-        self.drain_existing_push_registration_removals_for_group(group_id)
-            .await?;
+        self.drain_existing_push_registration_removals_for_group_with_handoff(
+            group_id,
+            visibility_handoff,
+        )
+        .await?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let original_groups = self.state.groups.clone();
         let original_routing = self.routing.snapshot();
@@ -2367,6 +3043,11 @@ impl AppClient {
                 }
             }
         }
+        #[cfg(test)]
+        if self.skip_epoch_backfill_prune_on_delete {
+            return Ok(was_live || result);
+        }
+        self.prune_deleted_epoch_backfill_group(group_id);
         Ok(was_live || result)
     }
 
@@ -2392,6 +3073,7 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         audit_context: AuditEventContext,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
@@ -2399,17 +3081,19 @@ impl AppClient {
         // removal. Drain that durable intent first; if the leave later fails,
         // queue the current registration update as compensation.
         let removed_registration = self
-            .drain_push_registration_removal_before_departure(group_id)
+            .drain_push_registration_removal_before_departure_with_handoff(
+                group_id,
+                visibility_handoff,
+            )
             .await?;
         let effects = match async {
             self.sync_runtime_groups().await?;
             let effects = self
-                .runtime
-                .send_with_audit_context(
+                .send_account_intent_with_visibility(
                     SendIntent::Leave {
                         group_id: group_id.clone(),
                     },
-                    audit_context.clone(),
+                    Some(audit_context.clone()),
                 )
                 .await?;
             self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
@@ -2424,31 +3108,25 @@ impl AppClient {
                     removed_registration.as_ref(),
                 );
                 let _ = self
-                    .retry_pending_push_registration_shares_best_effort()
+                    .retry_pending_push_registration_shares_best_effort_with_handoff(
+                        visibility_handoff,
+                    )
                     .await;
                 return Err(err);
             }
         };
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
-        // A local leave / decline is a voluntary departure, recorded as `Left`
-        // so the chat list can distinguish it from an involuntary removal. The
-        // inbound `observe_account_device_effects` path records this for an
-        // observed self-removal, but our own relay echoes are skipped, so the
-        // locally initiated departure must record (and thereby suppress) here
-        // too. No-op if no `account_groups` row exists yet, so it never
-        // resurrects pruned projection state. This is the source-of-truth write
-        // for the account unread aggregate, so propagate its error (like the
-        // nearby projection writes) rather than swallow it: a silently failed
-        // update would leave `account_unread_total()` returning an inflated
-        // badge after a leave that otherwise reports success.
-        self.app.set_group_self_membership(
-            &self.state.label,
-            &hex::encode(group_id.as_slice()),
-            SelfMembership::Left,
-        )?;
+        // `Left` is applied from a published Leave action outcome inside
+        // outbound/drain visibility projection, before this Header save. Own
+        // relay echoes are skipped, so that typed outcome is the local
+        // authorization — including crash replay of an unacknowledged Header.
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -2601,6 +3279,16 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<GroupInviteDeclineResult, AppError> {
+        let mut handoff = |client: &mut Self| client.retain_direct_send_applied_visibility();
+        self.decline_group_invite_with_handoff(group_id, &mut handoff)
+            .await
+    }
+
+    pub(crate) async fn decline_group_invite_with_handoff(
+        &mut self,
+        group_id: &GroupId,
+        visibility_handoff: &mut impl FnMut(&mut Self),
+    ) -> Result<GroupInviteDeclineResult, AppError> {
         let audit_context = Self::local_human_action_context(
             "decline_group_invite",
             vec!["membership"],
@@ -2608,7 +3296,7 @@ impl AppClient {
             Some(1),
         );
         let summary = self
-            .leave_group_with_audit_context(group_id, audit_context)
+            .leave_group_with_audit_context(group_id, audit_context, visibility_handoff)
             .await?;
         let group = self.set_group_invite_confirmation(group_id, false, true)?;
         Ok(GroupInviteDeclineResult { group, summary })
@@ -2688,21 +3376,24 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, wake_targets);
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         self.refresh_group(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         self.publish_targeted_group_state_wake_best_effort(
             group_id,
             wake_snapshot,
@@ -2729,22 +3420,25 @@ impl AppClient {
 
         self.sync_runtime_groups().await?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -2800,21 +3494,24 @@ impl AppClient {
 
         self.sync_runtime_groups().await?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         self.refresh_group(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -2844,21 +3541,24 @@ impl AppClient {
 
         self.sync_runtime_groups().await?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![component],
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         self.refresh_group(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -2867,8 +3567,10 @@ impl AppClient {
         group_id: &GroupId,
         payload: &[u8],
     ) -> Result<SendSummary, AppError> {
-        self.send_with_local_projection(group_id, payload, |_| {})
-            .await
+        let result = self
+            .send_with_local_projection(group_id, payload, |_| {})
+            .await;
+        self.finish_direct_send_visibility(result).await
     }
 
     pub(crate) async fn send_with_local_projection<F>(
@@ -2906,6 +3608,145 @@ impl AppClient {
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         self.send_app_event_with_local_projection(group_id, intent, |_| {})
             .await
+    }
+
+    /// Complete a send owned directly by an [`AppClient`], rather than by the
+    /// managed account worker. The worker has an outer publication chokepoint;
+    /// a direct client does not, so move any send-applied visibility into V2
+    /// before notification I/O and perform the deferred notification here.
+    async fn finish_direct_send_visibility<T>(
+        &mut self,
+        result: Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        self.retain_direct_send_applied_visibility();
+        // A send can fold a peer commit after its initial subscription sync.
+        // The completed publish must not be reported as failed merely because
+        // this best-effort route rebuild fails; keep the retry intent armed for
+        // the next direct/managed seam instead.
+        if self.has_pending_runtime_group_subscription_refresh()
+            && let Err(error) = self
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+        {
+            tracing::warn!(
+                target: "marmot_app::messages",
+                method = "finish_direct_send_visibility",
+                error_kind = error.privacy_safe_kind(),
+                "direct send completed but its runtime group subscription refresh failed",
+            );
+        }
+        self.publish_pending_new_message_notifications_best_effort()
+            .await;
+        result
+    }
+
+    fn retain_direct_send_applied_visibility(&mut self) {
+        let applied = self.take_pending_applied_sync_summary();
+        if applied != crate::SyncSummary::default() {
+            self.retain_checkpointed_sync_summary(applied);
+        }
+    }
+
+    /// Project every source-independent effect carried by the current
+    /// outbound visibility operation, then observe its event stream through
+    /// the same pipeline as inbound work. `false` means an event suffix remains
+    /// durable; callers may still checkpoint the completed prefix, but must not
+    /// stage the operation Header.
+    async fn project_current_outbound_visibility(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        deferred_app_event_id: Option<&str>,
+    ) -> Result<bool, AppError> {
+        self.project_current_account_non_session_visibility(effects, deferred_app_event_id)?;
+        Ok(self.observe_send_applied_effects_best_effort(effects).await)
+    }
+
+    /// Exercise the exact generic-outbound visibility checkpoint from app
+    /// integration tests without exposing the internal staging protocol to
+    /// production callers.
+    #[cfg(test)]
+    pub(crate) async fn checkpoint_current_outbound_visibility_for_test(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<bool, AppError> {
+        let complete = self
+            .project_current_outbound_visibility(effects, None)
+            .await?;
+        if complete {
+            self.stage_current_account_visibility_header_batch();
+        }
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        Ok(complete)
+    }
+
+    async fn send_account_intent_with_visibility(
+        &mut self,
+        intent: SendIntent,
+        context: Option<AuditEventContext>,
+    ) -> Result<marmot_account::AccountDeviceEffects, AppError> {
+        self.replay_pending_account_visibility().await?;
+        let leased = match context {
+            Some(context) => {
+                self.runtime
+                    .send_with_audit_context_leased(intent, context)
+                    .await?
+            }
+            None => self.runtime.send_leased(intent).await?,
+        };
+        self.install_account_visibility_lease(
+            leased.lease,
+            leased.batches,
+            leased.current_operation_id,
+        );
+        Ok(leased.effects)
+    }
+
+    async fn queue_app_message_with_visibility(
+        &mut self,
+        group_id: GroupId,
+        payload: Vec<u8>,
+        context: AuditEventContext,
+    ) -> Result<marmot_account::AccountDeviceEffects, AppError> {
+        self.replay_pending_account_visibility().await?;
+        let leased = self
+            .runtime
+            .queue_app_message_with_audit_context_leased(group_id, payload, context)
+            .await?;
+        self.install_account_visibility_lease(
+            leased.lease,
+            leased.batches,
+            leased.current_operation_id,
+        );
+        Ok(leased.effects)
+    }
+
+    async fn publish_prepared_session_effects_with_visibility(
+        &mut self,
+        effects: SessionEffects,
+        context: AuditEventContext,
+    ) -> Result<marmot_account::AccountDeviceEffects, AppError> {
+        self.replay_pending_account_visibility().await?;
+        let leased = self
+            .runtime
+            .publish_prepared_session_effects_with_audit_context_leased(effects, context)
+            .await?;
+        self.install_account_visibility_lease(
+            leased.lease,
+            leased.batches,
+            leased.current_operation_id,
+        );
+        Ok(leased.effects)
+    }
+
+    async fn send_app_event_direct(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        let result = self
+            .send_app_event_with_local_projection(group_id, intent, |_| {})
+            .await;
+        self.finish_direct_send_visibility(result).await
     }
 
     pub(crate) async fn send_app_event_with_local_projection<F>(
@@ -2971,22 +3812,13 @@ impl AppClient {
                 // Thread the human-action context through the engine so the
                 // send's audit rows carry `human_action`, matching
                 // create_group/invite/etc.
-                match &audit_context {
-                    Some(context) => {
-                        self.runtime
-                            .send_with_audit_context(send_intent, context.clone())
-                            .await
-                    }
-                    None => self.runtime.send(send_intent).await,
-                }
-                .map_err(AppError::from)
+                self.send_account_intent_with_visibility(send_intent, audit_context.clone())
+                    .await
             }
             Err(error) if error.is_account_not_active() => {
                 let context = audit_context.clone().unwrap_or_default();
-                self.runtime
-                    .queue_app_message_with_audit_context(group_id.clone(), payload, context)
+                self.queue_app_message_with_visibility(group_id.clone(), payload, context)
                     .await
-                    .map_err(AppError::from)
             }
             Err(error) => Err(error),
         };
@@ -3022,7 +3854,7 @@ impl AppClient {
         if let Some(context) = &audit_context {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
-        self.remember_published_reports(&effects);
+        self.project_current_account_non_session_visibility(&effects, Some(app_event_id.as_str()))?;
         // Discarded deliberately, unlike on the convergence-retry path: the
         // re-record below reprojects the same row with its new source id and
         // hands that update to `on_local_projection`, so forwarding these too
@@ -3059,15 +3891,20 @@ impl AppClient {
         // for the account worker to broadcast; dropping the events here leaves
         // storage renamed while chat-list/group-state subscribers never wake.
         // Best-effort: a projection failure must not fail a completed publish.
-        self.observe_send_applied_effects_best_effort(&effects)
+        let visibility_complete = self
+            .observe_send_applied_effects_best_effort(&effects)
             .await;
+        // The common NonSession projector intentionally deferred this send's
+        // own app-event finalization so the caller callback could receive its
+        // exact update. That finalization and local re-record are now complete.
+        self.stage_current_account_visibility_non_session_batch();
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
-            self.publish_notification_trigger_best_effort(
-                group_id,
-                notifications::NotificationTrigger::NewMessage,
-            )
-            .await;
+            self.pending_new_message_notification_groups
+                .insert(group_id.clone());
         }
         Ok((
             event,
@@ -3199,8 +4036,10 @@ impl AppClient {
         target_message_id: &str,
         emoji: &str,
     ) -> Result<SendSummary, AppError> {
-        self.react_to_message_with_local_projection(group_id, target_message_id, emoji, |_| {})
-            .await
+        let result = self
+            .react_to_message_with_local_projection(group_id, target_message_id, emoji, |_| {})
+            .await;
+        self.finish_direct_send_visibility(result).await
     }
 
     pub(crate) async fn react_to_message_with_local_projection<F>(
@@ -3281,7 +4120,7 @@ impl AppClient {
             crate::messages::validate_reaction_content(emoji)?;
         }
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::Unreact {
                     target_message_id: target_message_id.to_owned(),
@@ -3298,7 +4137,7 @@ impl AppClient {
         target_message_id: &str,
     ) -> Result<SendSummary, AppError> {
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::Delete {
                     target_message_id: target_message_id.to_owned(),
@@ -3315,7 +4154,7 @@ impl AppClient {
         text: &str,
     ) -> Result<SendSummary, AppError> {
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::Reply {
                     target_message_id: target_message_id.to_owned(),
@@ -3345,7 +4184,7 @@ impl AppClient {
             )?;
         }
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::Media {
                     attachments,
@@ -3571,8 +4410,7 @@ impl AppClient {
         };
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::UpdateAppComponents {
                     group_id: group_id.clone(),
                     updates: vec![AppComponentData {
@@ -3580,16 +4418,20 @@ impl AppClient {
                         data,
                     }],
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(summary)
     }
 
@@ -3641,14 +4483,16 @@ impl AppClient {
         parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.start_agent_text_stream_with_local_projection(
-            group_id,
-            stream_id,
-            parent_message_id,
-            quic_candidates,
-            |_| {},
-        )
-        .await
+        let result = self
+            .start_agent_text_stream_with_local_projection(
+                group_id,
+                stream_id,
+                parent_message_id,
+                quic_candidates,
+                |_| {},
+            )
+            .await;
+        self.finish_direct_send_visibility(result).await
     }
 
     pub(crate) async fn start_agent_text_stream_with_local_projection<F>(
@@ -3679,8 +4523,10 @@ impl AppClient {
         group_id: &GroupId,
         request: AgentTextStreamFinishRequest,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.finish_agent_text_stream_with_local_projection(group_id, request, |_| {})
-            .await
+        let result = self
+            .finish_agent_text_stream_with_local_projection(group_id, request, |_| {})
+            .await;
+        self.finish_direct_send_visibility(result).await
     }
 
     pub(crate) async fn finish_agent_text_stream_with_local_projection<F>(
@@ -3709,7 +4555,7 @@ impl AppClient {
         extra: Option<serde_json::Value>,
     ) -> Result<SendSummary, AppError> {
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::AgentActivity {
                     status,
@@ -3743,7 +4589,7 @@ impl AppClient {
             reply_to_message_id,
         } = request;
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::AgentOperation {
                     event_type,
@@ -3773,7 +4619,7 @@ impl AppClient {
         data: Option<serde_json::Value>,
     ) -> Result<SendSummary, AppError> {
         let (_event, summary) = self
-            .send_app_event(
+            .send_app_event_direct(
                 group_id,
                 AppMessageIntent::GroupSystem {
                     system_type,
@@ -3813,39 +4659,112 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
+        let result = self
+            .retry_group_convergence_with_deferred_notification(group_id)
+            .await;
+        self.finish_direct_convergence_notification(result).await
+    }
+
+    pub(crate) async fn finish_direct_convergence_notification<T>(
+        &mut self,
+        result: Result<T, AppError>,
+    ) -> Result<T, AppError> {
+        // Explicit convergence now observes applied events through the same
+        // durable pipeline as scheduled convergence. Direct callers have no
+        // worker publication chokepoint, so preserve that summary in the
+        // client-owned V2 slot before crossing notification network I/O.
+        if let Err(error) = self.checkpoint_pending_sync_visibility() {
+            tracing::warn!(
+                target: "marmot_app::messages",
+                method = "finish_direct_convergence_notification",
+                error_kind = error.privacy_safe_kind(),
+                "direct convergence left visibility pending after its checkpoint failed",
+            );
+        }
+        self.retain_pending_explicit_convergence_visibility();
+        self.retain_direct_send_applied_visibility();
+        // Direct AppClient callers have no worker completion chokepoint. Own
+        // and finish notification fanout here even when a later projection
+        // tail failed after finalizing an earlier released message.
+        self.publish_pending_new_message_notifications_best_effort()
+            .await;
+        result
+    }
+
+    /// Worker-owned convergence keeps notification I/O deferred until its
+    /// one-shot projection updates have been published to runtime subscribers.
+    pub(crate) async fn retry_group_convergence_with_deferred_notification(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
         self.sync_runtime_groups().await?;
-        let effects = self.runtime.advance_convergence(group_id).await?;
-        self.observe_convergence_retry_effects(group_id, &effects)
+        let effects = self.runtime.advance_convergence_leased(group_id).await?;
+        self.install_account_visibility_lease(
+            effects.lease,
+            effects.batches,
+            effects.current_operation_id,
+        );
+        self.observe_convergence_retry_effects(group_id, &effects.effects)
+            .await
     }
 
     /// Project one convergence retry's effects, split from the advance itself so
     /// the projection is exercisable against a given batch of effects.
-    pub(crate) fn observe_convergence_retry_effects(
+    pub(crate) async fn observe_convergence_retry_effects(
         &mut self,
         group_id: &GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
-        // Observe before the publish gate, for the reason spelled out in
-        // `observe_drained_session_events`.
-        self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
-        self.remember_published_reports(effects);
-        // This is the path that releases sends the engine had retained, so its
-        // finalize updates carry the pending -> delivered flip for each of them.
-        // Unlike the send path — which drops the same updates because it
-        // immediately re-records the row and hands that update to the caller —
-        // there is nothing here to re-emit them, so buffer them for the account
-        // worker to broadcast. Dropping them leaves storage delivered while
-        // every timeline and chat-list subscriber still shows pending.
-        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
-        self.pending_projection_updates.extend(finalize_updates);
-        self.refresh_group(group_id);
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(effects);
-        Ok(send_summary_from_effects(effects))
+        let send_summary = send_summary_from_effects(effects);
+        let checkpoint = self
+            .checkpoint_scheduled_convergence_effects(group_id, effects)
+            .await;
+        match checkpoint {
+            Ok(visibility) => {
+                self.retain_explicit_convergence_visibility(visibility.summary);
+            }
+            Err(error) => {
+                // The scheduled pipeline retains each fully projected prefix
+                // in V1/V2. Land what is safe before restoring the explicit
+                // path's legacy handoff slots; Header and an unfinished event
+                // remain unstaged and therefore replayable.
+                if let Err(checkpoint_error) = self.checkpoint_pending_sync_visibility() {
+                    tracing::warn!(
+                        target: "marmot_app::messages",
+                        method = "observe_convergence_retry_effects",
+                        error_kind = checkpoint_error.privacy_safe_kind(),
+                        "explicit convergence failed with visibility still pending",
+                    );
+                }
+                self.retain_pending_explicit_convergence_visibility();
+                return Err(error);
+            }
+        }
+        #[cfg(test)]
+        if self.fail_after_convergence_retry_finalize {
+            return Err(AppError::BlockingTask(
+                "injected failure after convergence-retry finalization".to_owned(),
+            ));
+        }
+        Ok(send_summary)
+    }
+
+    /// Preserve the explicit convergence API's established handoff shape
+    /// after borrowing the scheduled path's atomic projection checkpoint.
+    /// Projection updates remain one-shot for the command worker, while the
+    /// rest of the fully applied summary uses the common send-applied channel.
+    fn retain_explicit_convergence_visibility(&mut self, mut summary: crate::SyncSummary) {
+        self.pending_projection_updates
+            .append(&mut summary.projection_updates);
+        self.pending_applied_sync_summary.merge(summary);
+    }
+
+    fn retain_pending_explicit_convergence_visibility(&mut self) {
+        if let Some(summary) = self.take_pending_checkpointed_sync_summary() {
+            self.retain_explicit_convergence_visibility(summary);
+        }
     }
 
     pub async fn update_group_profile(
@@ -3877,19 +4796,21 @@ impl AppClient {
 
         self.sync_runtime_groups().await?;
         let effects = self
-            .runtime
-            .send_with_audit_context(
+            .send_account_intent_with_visibility(
                 SendIntent::UpdateGroupData {
                     group_id: group_id.clone(),
                     name: name.map(ToOwned::to_owned),
                     description: description.map(ToOwned::to_owned),
                 },
-                audit_context.clone(),
+                Some(audit_context.clone()),
             )
             .await?;
         self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
+        let visibility_complete = self
+            .project_current_outbound_visibility(&effects, None)
+            .await?;
         let group_metadata = self.runtime.group_record(group_id).ok();
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
         let projection = EventGroupProjection {
@@ -3910,6 +4831,9 @@ impl AppClient {
             GroupConfirmationProjection::Preserve,
         );
         self.mark_group_projection_dirty(group_id);
+        if visibility_complete {
+            self.stage_current_account_visibility_header_batch();
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
@@ -4346,7 +5270,7 @@ impl AppClient {
         Ok(refresh)
     }
 
-    fn refresh_routing(&mut self) -> Result<(), AppError> {
+    pub(crate) fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
         self.preserve_local_deleted_group_routes(&routing)?;
         self.routing.replace(routing.snapshot());
@@ -4392,29 +5316,75 @@ impl AppClient {
         group_id_hex: &str,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        if effects.welcome_failures.is_empty() {
-            return Ok(());
-        }
-        let storage = self.app.account_storage(&self.state.label)?;
-        let recorded_at = unix_now_seconds();
         for failure in &effects.welcome_failures {
-            let message_id_hex = hex::encode(failure.message_id.as_slice());
-            let recipient_hex = hex::encode(failure.recipient.as_slice());
-            storage.record_pending_welcome_delivery(
-                &message_id_hex,
-                group_id_hex,
-                &recipient_hex,
+            self.record_welcome_delivery_failure(group_id_hex, failure)?;
+        }
+        Ok(())
+    }
+
+    fn record_welcome_delivery_failures_from_effects_at(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        recorded_at: u64,
+    ) -> Result<(), AppError> {
+        for failure in &effects.welcome_failures {
+            let group_id = failure.group_id.as_ref().ok_or_else(|| {
+                AppError::BlockingTask(
+                    "resumed Welcome failure is missing its owning group".to_owned(),
+                )
+            })?;
+            self.record_welcome_delivery_failure_at(
+                &hex::encode(group_id.as_slice()),
+                failure,
                 recorded_at,
             )?;
-            // Queue a runtime event so subscribers (UI/CLI/UniFFI) learn the
-            // member is unjoinable without polling the durable queue.
-            self.pending_welcome_delivery_events
-                .push(PendingWelcomeDelivery {
-                    group_id_hex: group_id_hex.to_owned(),
-                    message_id_hex,
-                    recipient_hex,
-                    recorded_at,
-                });
+        }
+        Ok(())
+    }
+
+    fn record_welcome_delivery_failure(
+        &mut self,
+        group_id_hex: &str,
+        failure: &marmot_account::WelcomeDeliveryFailure,
+    ) -> Result<(), AppError> {
+        self.record_welcome_delivery_failure_at(group_id_hex, failure, unix_now_seconds())
+    }
+
+    fn record_welcome_delivery_failure_at(
+        &mut self,
+        group_id_hex: &str,
+        failure: &marmot_account::WelcomeDeliveryFailure,
+        recorded_at: u64,
+    ) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let message_id_hex = hex::encode(failure.message_id.as_slice());
+        let recipient_hex = hex::encode(failure.recipient.as_slice());
+        storage.record_pending_welcome_delivery(
+            &message_id_hex,
+            group_id_hex,
+            &recipient_hex,
+            recorded_at,
+        )?;
+        // Queue a runtime event so subscribers (UI/CLI/UniFFI) learn the
+        // member is unjoinable without polling the durable queue.
+        let pending = PendingWelcomeDelivery {
+            group_id_hex: group_id_hex.to_owned(),
+            message_id_hex: message_id_hex.clone(),
+            recipient_hex: recipient_hex.clone(),
+            recorded_at,
+        };
+        if let Some(existing) = self
+            .pending_welcome_delivery_events
+            .iter_mut()
+            .find(|existing| {
+                existing.group_id_hex == pending.group_id_hex
+                    && existing.message_id_hex == message_id_hex
+                    && existing.recipient_hex == recipient_hex
+            })
+        {
+            *existing = pending;
+        } else {
+            self.pending_welcome_delivery_events.push(pending);
         }
         Ok(())
     }
@@ -4571,13 +5541,11 @@ impl AppClient {
             } => {
                 let welcome_publish_started_at = Instant::now();
                 let publish_result = self
-                    .runtime
-                    .publish_prepared_session_effects_with_audit_context(
+                    .publish_prepared_session_effects_with_visibility(
                         effects,
                         work.audit_context.clone(),
                     )
-                    .await
-                    .map_err(AppError::from);
+                    .await;
                 record_app_performance(
                     telemetry,
                     AppPerformanceOperation::GroupCreateWelcomePublish,
@@ -4599,16 +5567,24 @@ impl AppClient {
                     "classify_founding_welcome_publish",
                     self.observe_recovery_evidence_then_fail_if_publish_failed(&effects),
                 );
-                recover_post_canonical_result(
-                    "record_founding_welcome_delivery_failures",
-                    self.record_welcome_delivery_failures(
-                        &hex::encode(work.group_id.as_slice()),
-                        &effects,
-                    ),
-                );
                 self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
-                self.remember_published_reports(&effects);
-                self.queue_own_group_system_projection_updates(&effects);
+                let visibility_complete = recover_post_canonical_result(
+                    "project_founding_visibility",
+                    self.project_current_outbound_visibility(&effects, None)
+                        .await,
+                );
+                if visibility_complete {
+                    self.stage_current_account_visibility_header_batch();
+                }
+                match self.save_state_with_pending_local_group_deletion_frontier_clears() {
+                    Ok(()) => {}
+                    Err(error) => tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "drive_unpublished_welcome_delivery",
+                        error_kind = error.privacy_safe_kind(),
+                        "founding visibility remains durable after app checkpoint failure"
+                    ),
+                }
             }
             UnpublishedWelcomeKind::Invite {
                 welcomes,
@@ -5031,6 +6007,56 @@ mod post_canonical_create_tests {
         });
 
         assert_eq!(collect_bounded_ordered(work, 2).await, Err("first"));
+    }
+}
+
+#[cfg(test)]
+mod direct_visibility_completion_tests {
+    use super::*;
+    use crate::tests::ScriptedPushRelayClient;
+    use marmot_account::AccountHome;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn direct_send_route_refresh_failure_is_best_effort_and_stays_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "direct send retained route retry",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &AppPerformanceTelemetry::default(),
+            )
+            .await
+            .unwrap();
+        client.pending_runtime_group_subscription_refresh = true;
+        relay.fail_next_subscribe();
+
+        client
+            .finish_direct_send_visibility::<()>(Ok(()))
+            .await
+            .expect("a completed send must not become a false failure");
+        assert!(
+            client.has_pending_runtime_group_subscription_refresh(),
+            "a failed best-effort refresh must remain retryable"
+        );
+
+        client
+            .finish_direct_send_visibility::<()>(Ok(()))
+            .await
+            .unwrap();
+        assert!(
+            !client.has_pending_runtime_group_subscription_refresh(),
+            "a later direct completion seam must drain the retained retry"
+        );
     }
 }
 

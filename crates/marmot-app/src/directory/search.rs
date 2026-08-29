@@ -1850,7 +1850,7 @@ mod tests {
             .expect("create the stranger's identity")
             .account;
         wait_for_network_ready(&stranger_runtime, &stranger.account_id_hex).await;
-        stranger_app
+        stranger_runtime
             .publish_account_relay_lists(
                 &stranger.account_id_hex,
                 crate::AccountRelayListBootstrap::new(
@@ -2121,7 +2121,7 @@ mod tests {
             .expect("create the stranger's identity")
             .account;
         wait_for_network_ready(&stranger_runtime, &stranger.account_id_hex).await;
-        stranger_app
+        stranger_runtime
             .publish_account_relay_lists(
                 &stranger.account_id_hex,
                 crate::AccountRelayListBootstrap::new(

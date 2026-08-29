@@ -471,7 +471,7 @@ pub(crate) fn parse_key_package_event_id_hex(value: &str) -> Result<String, AppE
             bytes.len()
         )));
     }
-    Ok(trimmed.to_owned())
+    Ok(hex::encode(bytes))
 }
 
 /// Per spec/transports/nostr.md, each KeyPackage id-list tag is exactly one

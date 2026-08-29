@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -726,6 +727,40 @@ struct PanicOnceDirectoryFetcher {
     panicked: AtomicBool,
 }
 
+struct SplitDirectoryFetcher {
+    normal_fetch_count: AtomicUsize,
+    strict_fetch_count: AtomicUsize,
+    normal_started: Notify,
+    normal_release: Notify,
+    normal_events: Vec<DirectoryRelayEventRecord>,
+    strict_results: StdMutex<VecDeque<Result<Vec<DirectoryRelayEventRecord>, String>>>,
+}
+
+#[async_trait]
+impl DirectoryRelayFetcher for SplitDirectoryFetcher {
+    async fn fetch_directory_events(
+        &self,
+        _request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        self.normal_fetch_count.fetch_add(1, Ordering::SeqCst);
+        self.normal_started.notify_one();
+        self.normal_release.notified().await;
+        Ok(self.normal_events.clone())
+    }
+
+    async fn fetch_directory_events_strict(
+        &self,
+        _request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        self.strict_fetch_count.fetch_add(1, Ordering::SeqCst);
+        self.strict_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("strict test result is scripted")
+    }
+}
+
 #[async_trait]
 impl DirectoryRelayFetcher for PanicOnceDirectoryFetcher {
     async fn fetch_directory_events(
@@ -1088,6 +1123,114 @@ async fn directory_fetches_coalesce_identical_inflight_requests() {
     assert_eq!(health.directory_completed_fetches, 1);
     assert_eq!(health.directory_coalesced_waiters, 1);
     assert_eq!(health.directory_failed_fetches, 0);
+}
+
+#[tokio::test]
+async fn strict_directory_fetch_propagates_incomplete_eose_errors() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let errors = [
+        "strict directory subscription closed before EOSE",
+        "strict directory fetch timed out before EOSE",
+    ];
+    let directory_fetcher = Arc::new(SplitDirectoryFetcher {
+        normal_fetch_count: AtomicUsize::new(0),
+        strict_fetch_count: AtomicUsize::new(0),
+        normal_started: Notify::new(),
+        normal_release: Notify::new(),
+        normal_events: Vec::new(),
+        strict_results: StdMutex::new(
+            errors
+                .iter()
+                .map(|error| Err((*error).to_owned()))
+                .collect(),
+        ),
+    });
+    let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
+    let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+    let queries = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+    for expected in errors {
+        let error = relay_plane
+            .fetch_directory_events_strict(endpoints.clone(), queries.clone())
+            .await
+            .expect_err("strict incomplete response must remain an error");
+        assert_eq!(error, expected);
+    }
+
+    assert_eq!(
+        directory_fetcher.normal_fetch_count.load(Ordering::SeqCst),
+        0,
+        "strict requests must never fall back to the ordinary fetch method"
+    );
+    assert_eq!(
+        directory_fetcher.strict_fetch_count.load(Ordering::SeqCst),
+        2
+    );
+    let health = relay_plane.relay_health().await;
+    assert_eq!(health.directory_completed_fetches, 0);
+    assert_eq!(health.directory_failed_fetches, 2);
+    assert_eq!(health.directory_inflight_fetches, 0);
+    assert_eq!(health.directory_coalesced_waiters, 0);
+}
+
+#[tokio::test]
+async fn strict_directory_fetch_uses_its_own_completed_response_without_coalescing() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let normal_event = DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://normal.relay.example".into())],
+        event: group_event("normal-response", &[0x61; 32]),
+    };
+    let strict_event = DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://strict.relay.example".into())],
+        event: group_event("strict-response", &[0x62; 32]),
+    };
+    let directory_fetcher = Arc::new(SplitDirectoryFetcher {
+        normal_fetch_count: AtomicUsize::new(0),
+        strict_fetch_count: AtomicUsize::new(0),
+        normal_started: Notify::new(),
+        normal_release: Notify::new(),
+        normal_events: vec![normal_event.clone()],
+        strict_results: StdMutex::new(VecDeque::from([Ok(vec![strict_event.clone()])])),
+    });
+    let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
+    let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+    let queries = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+    let ordinary_plane = relay_plane.clone();
+    let ordinary_endpoints = endpoints.clone();
+    let ordinary_queries = queries.clone();
+    let ordinary = tokio::spawn(async move {
+        ordinary_plane
+            .fetch_directory_events(ordinary_endpoints, ordinary_queries)
+            .await
+    });
+    directory_fetcher.normal_started.notified().await;
+
+    let strict = relay_plane
+        .fetch_directory_events_strict(endpoints, queries)
+        .await
+        .unwrap();
+    assert_eq!(strict, vec![strict_event]);
+    assert!(
+        !ordinary.is_finished(),
+        "the strict response must not wait on or join the ordinary inflight owner"
+    );
+
+    directory_fetcher.normal_release.notify_one();
+    assert_eq!(ordinary.await.unwrap().unwrap(), vec![normal_event]);
+    assert_eq!(
+        directory_fetcher.normal_fetch_count.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        directory_fetcher.strict_fetch_count.load(Ordering::SeqCst),
+        1
+    );
+    let health = relay_plane.relay_health().await;
+    assert_eq!(health.directory_completed_fetches, 2);
+    assert_eq!(health.directory_failed_fetches, 0);
+    assert_eq!(health.directory_inflight_fetches, 0);
+    assert_eq!(health.directory_coalesced_waiters, 0);
 }
 
 #[tokio::test]

@@ -577,20 +577,56 @@ impl AppClient {
     ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
         let mut updates = Vec::new();
         for published in &effects.published_app_messages {
-            let group_id_hex = hex::encode(published.group_id.as_slice());
-            let source_message_id_hex = hex::encode(published.message_id.as_slice());
-            if let Some(update) = self.app.finalize_account_app_event_source_retention(
-                &self.state.label,
-                &group_id_hex,
-                &published.app_event_id,
-                Some(source_message_id_hex.as_str()),
-                published.source_epoch.0,
-                published.retention,
-            )? {
+            if let Some(update) =
+                self.finalize_published_app_message_source_retention_one(published)?
+            {
                 updates.push(update);
             }
         }
         Ok(updates)
+    }
+
+    pub(crate) fn finalize_published_app_message_source_retention_one(
+        &mut self,
+        published: &marmot_account::PublishedApplicationMessage,
+    ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
+        let group_id_hex = hex::encode(published.group_id.as_slice());
+        let source_message_id_hex = hex::encode(published.message_id.as_slice());
+        self.app.finalize_account_app_event_source_retention(
+            &self.state.label,
+            &group_id_hex,
+            &published.app_event_id,
+            Some(source_message_id_hex.as_str()),
+            published.source_epoch.0,
+            published.retention,
+        )
+    }
+
+    /// Finalize a released outbound app message and retain its notification
+    /// obligation in one place. Maintenance, scheduled convergence, and an
+    /// explicit convergence retry can all release the same pending send; each
+    /// path must apply the same chat/deleted/invalidated eligibility rule.
+    pub(crate) fn finalize_published_app_message_and_queue_notification(
+        &mut self,
+        published: &marmot_account::PublishedApplicationMessage,
+    ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
+        let update = self.finalize_published_app_message_source_retention_one(published)?;
+        let group_id_hex = hex::encode(published.group_id.as_slice());
+        if self
+            .app
+            .reaction_target(&self.state.label, &group_id_hex, &published.app_event_id)
+            .ok()
+            .flatten()
+            .is_some_and(|message| {
+                message.kind == MARMOT_APP_EVENT_KIND_CHAT
+                    && !message.deleted
+                    && !message.invalidated
+            })
+        {
+            self.pending_new_message_notification_groups
+                .insert(published.group_id.clone());
+        }
+        Ok(update)
     }
 
     pub(crate) fn prune_plaintext_retention_for_group(

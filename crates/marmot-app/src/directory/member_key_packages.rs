@@ -21,8 +21,7 @@ use transport_nostr_adapter::{
 };
 
 use crate::key_package_records::{
-    fresh_or_cached_key_package, fresh_relay_list_status_from_records,
-    latest_fresh_key_package_from_records, validated_cached_key_package,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, validated_cached_key_package,
 };
 use crate::relay_plane::DirectoryEventQuery;
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp, push_unique_strings};
@@ -77,6 +76,12 @@ mod tests {
             Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
+
+        let retained = format!("{:064x}", MEMBER_PREWARM_CACHE_LIMIT - 1);
+        assert!(cache.get(&retained).is_some());
+        cache.remove(&retained);
+        assert!(cache.get(&retained).is_none());
+        assert!(!cache.order.contains(&retained));
     }
 }
 
@@ -112,6 +117,14 @@ impl MemberKeyPackagePrewarmCache {
             };
             self.entries.remove(&oldest);
         }
+    }
+
+    /// Evict all process-local composition material for one identity.
+    /// Sign-out/removal calls this while the canonical account record is still
+    /// available, before the same pubkey can be re-added as a tracked account.
+    pub(crate) fn remove(&mut self, account_id_hex: &str) {
+        self.entries.remove(account_id_hex);
+        self.order.retain(|existing| existing != account_id_hex);
     }
 
     fn remove_expired(&mut self) {
@@ -166,6 +179,7 @@ impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
 struct MemberTarget {
     account_id_hex: String,
     local_label: Option<String>,
+    local_signing_unavailable: bool,
     relay_lists: AccountRelayListStatus,
 }
 
@@ -252,23 +266,64 @@ impl MarmotApp {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for member_ref in member_refs {
-            let local = self.account_home().account(member_ref).ok();
-            let account_id_hex = match &local {
+            let local_by_ref = self.account_home().account(member_ref).ok();
+            let account_id_hex = match &local_by_ref {
                 Some(account) => account.account_id_hex.clone(),
                 None => PublicKey::parse(member_ref)
                     .map_err(|_| AppError::InvalidPublicKey)?
                     .to_hex(),
             };
+            // `AccountHome::account(hex)` can resolve only an account whose
+            // canonical label is that hex value. Test/dev aliases and legacy
+            // named local accounts still need to be classified by their
+            // stored account id; otherwise a signed-out local identity passed
+            // by npub/hex is accidentally treated as remote.
+            let local = match local_by_ref {
+                Some(account) => Some(account),
+                None => self
+                    .account_home()
+                    .accounts()?
+                    .into_iter()
+                    .find(|account| account.account_id_hex == account_id_hex),
+            };
             if !seen.insert(account_id_hex.clone()) {
                 continue;
             }
-            let relay_lists = self
-                .directory_entry_for_account_id(&account_id_hex)?
-                .map(|entry| entry.relay_lists)
-                .unwrap_or_else(AccountRelayListStatus::empty);
+            let local_signing = local.as_ref().is_some_and(|account| account.can_sign());
+            let (local_signing_unavailable, relay_lists) = if local_signing {
+                match self.with_local_key_package_admission(
+                    &account_id_hex,
+                    |local_signing_account| {
+                        Ok(self
+                            .directory_entry_for_account_id_with_admitted_account(
+                                &account_id_hex,
+                                local_signing_account,
+                            )?
+                            .map(|entry| entry.relay_lists)
+                            .unwrap_or_else(AccountRelayListStatus::empty))
+                    },
+                )? {
+                    Some(relay_lists) => (false, relay_lists),
+                    // A signed-out or teardown-fenced local identity is a
+                    // terminal missing outcome for this pass. Do not consult
+                    // durable directory state outside the admission gate:
+                    // doing so can reopen its private cache after eviction.
+                    None => (true, AccountRelayListStatus::empty()),
+                }
+            } else {
+                (
+                    false,
+                    self.directory_entry_for_account_id(&account_id_hex)?
+                        .map(|entry| entry.relay_lists)
+                        .unwrap_or_else(AccountRelayListStatus::empty),
+                )
+            };
             targets.push(MemberTarget {
                 account_id_hex,
-                local_label: local.map(|account| account.label),
+                local_label: local
+                    .filter(|account| account.can_sign() && !account.signed_out)
+                    .map(|account| account.label),
+                local_signing_unavailable,
                 relay_lists,
             });
         }
@@ -279,19 +334,32 @@ impl MarmotApp {
         let mut unresolved = Vec::new();
         let mut reused_members = 0usize;
         for (index, target) in targets.iter().enumerate() {
+            if target.local_signing_unavailable {
+                outcomes[index] = Some(Err(AppError::MissingKeyPackage(
+                    target.account_id_hex.clone(),
+                )));
+                continue;
+            }
             if let Some(label) = &target.local_label
                 && let Some(key_package) = self.validated_current_local_key_package(label)
-                && let Ok(key_package) =
-                    self.validate_member_key_package_current(&target.account_id_hex, key_package)
+                && let Ok(key_package) = self
+                    .validate_current_local_member_key_package(&target.account_id_hex, key_package)
             {
                 outcomes[index] = Some(Ok(key_package));
                 reused_members += 1;
                 continue;
             }
-            let cached = self.directory_entry_for_account_id(&target.account_id_hex)?;
-            if let Some(key_package) = cached.and_then(|entry| entry.key_package)
+            let cached = self.directory_entry_for_member_target(target)?;
+            if let Some(cached_key_package) = cached.and_then(|entry| entry.key_package)
+                && self
+                    .local_key_package_revision_is_live(
+                        &target.account_id_hex,
+                        &cached_key_package.key_package_ref_hex,
+                        &cached_key_package.key_package_event_id,
+                    )
+                    .unwrap_or(false)
                 && let Ok(key_package) =
-                    validated_cached_key_package(&target.account_id_hex, &key_package)
+                    validated_cached_key_package(&target.account_id_hex, &cached_key_package)
                 && let Ok(key_package) =
                     self.validate_member_key_package_current(&target.account_id_hex, key_package)
             {
@@ -357,22 +425,94 @@ impl MarmotApp {
         })
     }
 
+    /// Read a locally signing target's directory projection only while its
+    /// teardown admission remains open. Remote/tracked targets need no local
+    /// serialization and retain the ordinary directory behavior.
+    fn directory_entry_for_member_target(
+        &self,
+        target: &MemberTarget,
+    ) -> Result<Option<crate::UserDirectoryRecord>, AppError> {
+        if target.local_label.is_none() {
+            return self.directory_entry_for_account_id(&target.account_id_hex);
+        }
+        Ok(self
+            .with_local_key_package_admission(&target.account_id_hex, |local_signing_account| {
+                self.directory_entry_for_account_id_with_admitted_account(
+                    &target.account_id_hex,
+                    local_signing_account,
+                )
+            })?
+            .flatten())
+    }
+
     fn accept_prefetched_key_package(
         &self,
         purpose: MemberResolutionPurpose,
         fetched: FetchedKeyPackage,
     ) -> Result<KeyPackage, AppError> {
+        if self.removed_local_key_package_slot_is_retired(
+            &fetched.account_id_hex,
+            &fetched.key_package_id,
+        )? {
+            return Err(AppError::MissingKeyPackage(fetched.account_id_hex));
+        }
+        if !self.local_key_package_revision_is_live(
+            &fetched.account_id_hex,
+            &fetched.key_package_ref_hex,
+            &fetched.key_package_event_id,
+        )? {
+            return Err(AppError::MissingKeyPackage(fetched.account_id_hex));
+        }
         let key_package = self.validate_member_key_package_current(
             &fetched.account_id_hex,
             fetched.key_package.clone(),
         )?;
         match purpose {
-            MemberResolutionPurpose::Commit => self.remember_directory_key_package(&fetched)?,
-            MemberResolutionPurpose::Prewarm => self
-                .member_key_package_prewarm_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(fetched),
+            MemberResolutionPurpose::Commit => {
+                if !self.remember_directory_key_package_if_live(&fetched)? {
+                    return Err(AppError::MissingKeyPackage(fetched.account_id_hex));
+                }
+            }
+            MemberResolutionPurpose::Prewarm => {
+                let account_id_hex = fetched.account_id_hex.clone();
+                let admitted = self
+                    .with_local_key_package_admission(&account_id_hex, |local_signing_account| {
+                        if let Some(account) = local_signing_account
+                            && !self.local_key_package_revision_is_live_for_account(
+                                account,
+                                &fetched.key_package_ref_hex,
+                                &fetched.key_package_event_id,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        self.member_key_package_prewarm_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(fetched);
+                        Ok(true)
+                    })?
+                    .unwrap_or(false);
+                if !admitted {
+                    return Err(AppError::MissingKeyPackage(account_id_hex));
+                }
+            }
+        }
+        Ok(key_package)
+    }
+
+    fn validate_current_local_member_key_package(
+        &self,
+        account_id_hex: &str,
+        key_package: KeyPackage,
+    ) -> Result<KeyPackage, AppError> {
+        let key_package = self.validate_member_key_package_current(account_id_hex, key_package)?;
+        let metadata = key_package_metadata(&key_package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+        if !self
+            .local_current_key_package_ref_is_live(account_id_hex, &metadata.key_package_ref_hex)?
+        {
+            return Err(AppError::MissingKeyPackage(account_id_hex.to_owned()));
         }
         Ok(key_package)
     }
@@ -662,15 +802,14 @@ impl MarmotApp {
                     .cloned()
                     .collect::<Vec<_>>();
                 let cached = self
-                    .directory_entry_for_account_id(account_id)
+                    .directory_entry_for_member_target(&targets[index])
                     .ok()
                     .flatten();
-                let selected = latest_fresh_key_package_from_records(
-                    account_id,
-                    account_records,
-                    self.directory_freshness(),
-                )
-                .and_then(|selection| fresh_or_cached_key_package(account_id, selection, cached));
+                let selected = self
+                    .latest_fresh_non_retired_key_package_from_records(account_id, account_records)
+                    .and_then(|selection| {
+                        fresh_or_cached_key_package(account_id, selection, cached)
+                    });
                 match selected {
                     Ok(mut fetched) => {
                         fetched.relay_lists = targets[index].relay_lists.clone();
@@ -724,13 +863,12 @@ impl MarmotApp {
                             .map_err(|error| {
                                 AppError::RelayDirectory(format!("fetch key packages: {error}"))
                             })?;
-                        let cached = app.directory_entry_for_account_id(&target.account_id_hex)?;
+                        let cached = app.directory_entry_for_member_target(&target)?;
                         let mut fetched = fresh_or_cached_key_package(
                             &target.account_id_hex,
-                            latest_fresh_key_package_from_records(
+                            app.latest_fresh_non_retired_key_package_from_records(
                                 &target.account_id_hex,
                                 records,
-                                app.directory_freshness(),
                             )?,
                             cached,
                         )?;

@@ -127,6 +127,14 @@ pub struct MarmotRelayPlaneAccountAdapter {
     publish_client: Arc<dyn NostrRelayClient>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<AccountDeliveryEvent>>>,
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
+    /// Revocable capability shared by every clone of one account session's
+    /// adapter. Teardown flips it under `activity` before returning so a stale
+    /// AppClient cannot reactivate subscriptions or publish afterward.
+    active: Arc<AtomicBool>,
+    /// Linearize teardown revocation with subscription and publish I/O. A
+    /// writer waits for already-started outbound work; later readers observe
+    /// `active = false` and fail without reaching the relay.
+    activity: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Clone)]
@@ -698,6 +706,8 @@ impl MarmotRelayPlane {
             publish_client,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
+            active: Arc::new(AtomicBool::new(true)),
+            activity: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -714,6 +724,22 @@ impl MarmotRelayPlane {
                 .is_ok(),
             None => false,
         }
+    }
+
+    /// Remove one account's local delivery route and transport subscriptions.
+    /// Account teardown calls this independently of whether a managed worker or
+    /// a temporary client was able to open, so no-group and degraded-open paths
+    /// cannot leave a signed-out identity active in the shared relay plane.
+    pub(crate) async fn deactivate_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), TransportAdapterError> {
+        account_deliveries_write(&self.inner.transport.account_deliveries).remove(account_id);
+        self.inner
+            .transport
+            .adapter
+            .deactivate_account(account_id)
+            .await
     }
 
     pub(crate) fn sanitize_relay_endpoints(
@@ -918,6 +944,23 @@ impl MarmotRelayPlane {
         self.inner
             .directory
             .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
+            .await
+    }
+
+    /// Fetch a finite directory page with explicit per-relay EOSE completion.
+    /// Silence, disconnect, notification loss, and the deadline are errors.
+    pub(crate) async fn fetch_directory_events_strict(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        queries: Vec<DirectoryEventQuery>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "strict directory fetch")?;
+        self.inner
+            .directory
+            .fetch_events_strict(DirectoryFetchRequest::new(endpoints, queries)?)
             .await
     }
 
@@ -1730,6 +1773,14 @@ fn recover_relay_notification_forwarder(
 }
 
 impl MarmotRelayPlaneAccountAdapter {
+    fn ensure_active(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
+        if account_id == &self.account_id && self.active.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(TransportAdapterError::AccountNotActive(account_id.clone()))
+        }
+    }
+
     /// The account this adapter is bound to — the `MemberId` every subscription
     /// issued through it carries (activation and group sync reject any other
     /// id), and the key its registrations bucket under on the shared relay
@@ -1859,6 +1910,8 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         group: TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
+        let _activity = self.activity.read().await;
+        self.ensure_active(&self.account_id)?;
         let sync = self
             .relay_plane
             .inner
@@ -1883,6 +1936,10 @@ impl MarmotRelayPlaneAccountAdapter {
     }
 
     pub(crate) async fn group_maintenance_any_eose(&self, subscription_id: &str) -> Option<bool> {
+        let _activity = self.activity.read().await;
+        if self.ensure_active(&self.account_id).is_err() {
+            return None;
+        }
         self.relay_plane
             .inner
             .transport
@@ -1897,6 +1954,10 @@ impl MarmotRelayPlaneAccountAdapter {
     /// The epoch-gap backfill drain reads this to tell a relay that has
     /// finished replaying stored history from one that has simply gone quiet.
     pub(crate) async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
+        let _activity = self.activity.read().await;
+        if self.ensure_active(&self.account_id).is_err() {
+            return AccountSubscriptionEose::default();
+        }
         let mut eose = self
             .relay_plane
             .inner
@@ -1959,6 +2020,8 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         group: &TransportGroupSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let _activity = self.activity.read().await;
+        self.ensure_active(&self.account_id)?;
         let sync = self
             .relay_plane
             .inner
@@ -1994,11 +2057,8 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         &self,
         activation: TransportAccountActivation,
     ) -> Result<(), TransportAdapterError> {
-        if activation.account_id != self.account_id {
-            return Err(TransportAdapterError::AccountNotActive(
-                activation.account_id,
-            ));
-        }
+        let _activity = self.activity.read().await;
+        self.ensure_active(&activation.account_id)?;
         let activation = self
             .relay_plane
             .inner
@@ -2017,9 +2077,8 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         &self,
         sync: TransportGroupSync,
     ) -> Result<(), TransportAdapterError> {
-        if sync.account_id != self.account_id {
-            return Err(TransportAdapterError::AccountNotActive(sync.account_id));
-        }
+        let _activity = self.activity.read().await;
+        self.ensure_active(&sync.account_id)?;
         let sync = self
             .relay_plane
             .inner
@@ -2038,23 +2097,19 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if account_id != &self.account_id {
             return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
         }
-        account_deliveries_write(&self.relay_plane.inner.transport.account_deliveries)
-            .remove(account_id);
-        self.relay_plane
-            .inner
-            .transport
-            .adapter
-            .deactivate_account(account_id)
-            .await
+        let _activity = self.activity.write().await;
+        // Revoke before network cleanup. Even when unsubscribe fails, this
+        // session can no longer recreate its subscriptions or publish.
+        self.active.store(false, Ordering::Release);
+        self.relay_plane.deactivate_account(account_id).await
     }
 
     async fn publish(
         &self,
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
-        if request.account_id != self.account_id {
-            return Err(TransportAdapterError::AccountNotActive(request.account_id));
-        }
+        let _activity = self.activity.read().await;
+        self.ensure_active(&request.account_id)?;
         let request = self
             .relay_plane
             .inner
@@ -2095,8 +2150,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
     }
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
+        self.ensure_active(&self.account_id)?;
         match self.receive_account_delivery().await? {
-            Some(AccountDeliveryReceive::Delivery(delivery)) => Ok(Some(*delivery)),
+            Some(AccountDeliveryReceive::Delivery(delivery)) => {
+                self.ensure_active(&self.account_id)?;
+                Ok(Some(*delivery))
+            }
             Some(AccountDeliveryReceive::Overflow(_)) => Err(TransportAdapterError::Other(
                 "account delivery overflow recovery required".to_owned(),
             )),

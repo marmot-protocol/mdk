@@ -20,9 +20,9 @@ use tokio::time::{Instant as TokioInstant, MissedTickBehavior, Sleep, interval, 
 use zeroize::Zeroizing;
 
 use super::{
-    MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
-    RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
-    wait_for_runtime_shutdown,
+    GeneratedAccountSetupContext, MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage,
+    RuntimeGroupEvent, RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate,
+    RuntimeSharedServices, wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::{
@@ -41,7 +41,7 @@ use crate::{
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, ReceivedMessage, RetentionSweepReport, SecureDeleteExpiredResult,
-    SendSummary, SyncSummary,
+    SendSummary, SyncFailure, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -101,6 +101,12 @@ pub(crate) struct AccountWorkerRuntime {
 pub(crate) enum AccountWorkerCommand {
     CatchUp {
         respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
+    },
+    /// Caller-visible sync that preserves the exact durably applied prefix on
+    /// failure. Unlike `CatchUp`, this is not coalesced because its caller must
+    /// receive the summary produced by its own FIFO position.
+    SyncWithPartialProgress {
+        respond: oneshot::Sender<Result<SyncSummary, SyncFailure>>,
     },
     /// Startup-coalesced catch-up response held in the same FIFO as deferred
     /// mutations so later live reads cannot bypass those mutations.
@@ -326,6 +332,31 @@ pub(crate) enum AccountWorkerCommand {
         message_id_hex: String,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    DeleteKeyPackageRevision {
+        event_id: cgka_traits::MessageId,
+        endpoints: Vec<cgka_traits::TransportEndpoint>,
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
+    PublishNip65RelaySet {
+        read_relays: Vec<cgka_traits::TransportEndpoint>,
+        write_relays: Vec<cgka_traits::TransportEndpoint>,
+        bootstrap_relays: Vec<cgka_traits::TransportEndpoint>,
+        respond: oneshot::Sender<Result<crate::AccountRelayListStatus, AppError>>,
+    },
+    SetNip65Relays {
+        relays: Vec<cgka_traits::TransportEndpoint>,
+        bootstrap_relays: Vec<cgka_traits::TransportEndpoint>,
+        respond: oneshot::Sender<Result<crate::AccountRelayListStatus, AppError>>,
+    },
+    PublishInboxRelayList {
+        relays: Vec<cgka_traits::TransportEndpoint>,
+        bootstrap_relays: Vec<cgka_traits::TransportEndpoint>,
+        respond: oneshot::Sender<Result<crate::AccountRelayListStatus, AppError>>,
+    },
+    IngestSelfNip65RelayEvent {
+        record: crate::relay_plane::DirectoryRelayEventRecord,
+        respond: oneshot::Sender<Result<crate::AccountRelayListStatus, AppError>>,
+    },
     PublishKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
@@ -409,19 +440,6 @@ pub(crate) enum AccountWorkerCommand {
     UnhydratedGroupCount {
         respond: oneshot::Sender<usize>,
     },
-}
-
-impl AccountWorkerCommand {
-    fn may_change_push_registration_work(&self) -> bool {
-        matches!(
-            self,
-            Self::SharePushRegistration { .. }
-                | Self::UpsertPushRegistration { .. }
-                | Self::ClearPushRegistration { .. }
-                | Self::SetNativePushEnabled { .. }
-                | Self::RemovePushRegistration { .. }
-        )
-    }
 }
 
 /// A command held back during the initial background catch-up, replayed in
@@ -563,8 +581,18 @@ async fn run_app_runtime_account_worker(
     // still background work, and that task may advance the journal as soon as
     // the ready signal is observed. Capturing here preserves the narrow
     // priority lane for the exact locally prepared KeyPackage.
-    let setup_key_package_priority =
-        setup_key_package_priority(app.account_home().account_setup_state(&account_label));
+    let setup_key_package_priority = setup_key_package_priority(
+        app.account_home().account_setup_state(&account_label),
+        || {
+            let bytes = app
+                .account_home()
+                .account_setup_context(&account_label)?
+                .ok_or(AppError::AccountSetupRetryRequired)?;
+            Ok(serde_json::from_slice::<GeneratedAccountSetupContext>(
+                &bytes,
+            )?)
+        },
+    );
     if let Err(error) = &setup_key_package_priority {
         publish_app_runtime_account_error(
             &events,
@@ -591,6 +619,7 @@ async fn run_app_runtime_account_worker(
         Ok(SetupKeyPackagePriority::PublishExactDurableInitial) => {
             let started_at = Instant::now();
             let result = async {
+                client.recover_generated_setup_nip65_authority().await?;
                 let key_package = client.publish_setup_key_package().await?;
                 Ok(key_package.bytes().len())
             }
@@ -687,22 +716,18 @@ async fn run_app_runtime_account_worker(
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let startup_sync_result = {
-        let mut initial_sync = std::pin::pin!(async {
-            let summary = client
-                .sync_with_stage_telemetry(&startup_stage_telemetry)
-                .await?;
-            app.finish_client_open_network_maintenance(&mut client)
-                .await;
-            Ok::<_, ClassifiedSyncFailure>(summary)
-        });
-        loop {
+        let mut initial_sync =
+            std::pin::pin!(client.sync_with_stage_telemetry(&startup_stage_telemetry));
+        'initial_sync: loop {
             tokio::select! {
-                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                _ = &mut shutdown => return,
-                result = &mut initial_sync => break result,
+                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                    break 'initial_sync None
+                },
+                _ = &mut shutdown => break 'initial_sync None,
+                result = &mut initial_sync => break 'initial_sync Some(result),
                 command = commands.recv() => {
                     match command {
-                        None => return,
+                        None => break 'initial_sync None,
                         Some(AccountWorkerCommand::Members { group_id, respond }) => {
                             match &read_snapshot {
                                 Some(snapshot) => {
@@ -792,6 +817,21 @@ async fn run_app_runtime_account_worker(
             }
         }
     };
+    let Some(startup_sync_result) = startup_sync_result else {
+        // The selected sync future has been dropped, releasing its `&mut`
+        // borrow. Synchronously checkpoint any V1 prefix, then hand off V2
+        // before honoring shutdown. If that save fails, V1 remains replayable
+        // on the next open.
+        let _ = publish_pending_checkpointed_sync_summary_handoff(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            &shared,
+            "startup_cancelled_fallback",
+        );
+        return;
+    };
     shared.app_performance_telemetry().record_sync_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
@@ -802,7 +842,14 @@ async fn run_app_runtime_account_worker(
     );
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
-            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            publish_sync_summary_with_audit(
+                &events,
+                &account_id_hex,
+                &account_label,
+                &summary,
+                &shared,
+                "startup_sync",
+            );
             start_post_join_history_after_visibility(
                 &mut client,
                 &summary,
@@ -811,8 +858,14 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             )
             .await;
+            // Startup network maintenance is intentionally after app
+            // visibility. It may await relay work, so keeping it inside the
+            // shutdown-selected sync future would put the only returned
+            // summary back on a cancellable stack after its ACK committed.
+            app.finish_client_open_network_maintenance(&mut client)
+                .await;
             schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
-            let backfill_result = run_pending_epoch_backfill_reporting_arm(
+            run_pending_epoch_backfill_reporting_arm(
                 &mut client,
                 &events,
                 &account_id_hex,
@@ -820,11 +873,7 @@ async fn run_app_runtime_account_worker(
                 &shared,
                 EpochBackfillExecutionSeam::Startup,
             )
-            .await;
-            if sync_summary_triggers_audit_tracker_update(&summary) {
-                shared.schedule_audit_log_tracker_update("startup_sync");
-            }
-            backfill_result
+            .await
         }
         Err(failure) => {
             publish_sync_summary_with_audit(
@@ -835,14 +884,13 @@ async fn run_app_runtime_account_worker(
                 &shared,
                 "startup_sync",
             );
-            start_post_join_history_after_visibility(
-                &mut client,
-                &failure.partial_summary,
-                &events,
-                &account_id_hex,
-                &account_label,
-            )
-            .await;
+            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+            scheduled_runtime_group_subscription_refresh.observe_pending(
+                client.has_pending_runtime_group_subscription_refresh(),
+                &command_tx,
+            );
+            scheduled_push_retry
+                .observe_pending(client.has_pending_push_registration_work(), &command_tx);
             // A failed initial catch-up surfaces as an account error but must not
             // fail worker readiness — readiness was already signalled above.
             let message = account_error_message("runtime startup receive failed", &failure.source);
@@ -852,6 +900,21 @@ async fn run_app_runtime_account_worker(
                 &account_label,
                 message.clone(),
             );
+            start_post_join_history_after_visibility(
+                &mut client,
+                &failure.partial_summary,
+                &events,
+                &account_id_hex,
+                &account_label,
+            )
+            .await;
+            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+            scheduled_runtime_group_subscription_refresh.observe_pending(
+                client.has_pending_runtime_group_subscription_refresh(),
+                &command_tx,
+            );
+            scheduled_push_retry
+                .observe_pending(client.has_pending_push_registration_work(), &command_tx);
             // Hydration may already have scheduled durable queued intents from
             // a prior process. Initial transport activation failed before the
             // normal sync path could drain those engine effects, so transfer
@@ -860,7 +923,21 @@ async fn run_app_runtime_account_worker(
             // failure remains retryable and is reported separately.
             match client.drain_pending_session_events().await {
                 Ok(summary) => {
-                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                    publish_sync_summary_with_audit(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &summary,
+                        &shared,
+                        "startup_queued_work",
+                    );
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                    scheduled_runtime_group_subscription_refresh.observe_pending(
+                        client.has_pending_runtime_group_subscription_refresh(),
+                        &command_tx,
+                    );
+                    scheduled_push_retry
+                        .observe_pending(client.has_pending_push_registration_work(), &command_tx);
                     start_post_join_history_after_visibility(
                         &mut client,
                         &summary,
@@ -869,8 +946,37 @@ async fn run_app_runtime_account_worker(
                         &account_label,
                     )
                     .await;
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                    scheduled_runtime_group_subscription_refresh.observe_pending(
+                        client.has_pending_runtime_group_subscription_refresh(),
+                        &command_tx,
+                    );
+                    scheduled_push_retry
+                        .observe_pending(client.has_pending_push_registration_work(), &command_tx);
                 }
                 Err(drain_error) => {
+                    let published_visibility = publish_pending_checkpointed_sync_summary_handoff(
+                        &mut client,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &shared,
+                        "startup_queued_work_fallback",
+                    );
+                    if published_visibility.is_some() {
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        scheduled_push_retry.observe_pending(
+                            client.has_pending_push_registration_work(),
+                            &command_tx,
+                        );
+                    }
                     publish_app_runtime_account_error(
                         &events,
                         &account_id_hex,
@@ -880,6 +986,29 @@ async fn run_app_runtime_account_worker(
                             &drain_error,
                         ),
                     );
+                    if let Some(summary) = published_visibility.as_ref() {
+                        finish_sync_summary_followups(
+                            &mut client,
+                            summary,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &shared,
+                        )
+                        .await;
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        scheduled_push_retry.observe_pending(
+                            client.has_pending_push_registration_work(),
+                            &command_tx,
+                        );
+                    }
                 }
             }
             Err(AccountCatchUpFailure::new(
@@ -930,6 +1059,13 @@ async fn run_app_runtime_account_worker(
                         account_id_hex: &account_id_hex,
                         account_label: &account_label,
                         shared: &shared,
+                        pending_work_schedulers: Some(AccountWorkerPendingWorkSchedulers {
+                            convergence: &mut scheduled_convergence,
+                            runtime_group_subscription_refresh:
+                                &mut scheduled_runtime_group_subscription_refresh,
+                            push_retry: &mut scheduled_push_retry,
+                            commands: &command_tx,
+                        }),
                     },
                 )
                 .await;
@@ -947,11 +1083,49 @@ async fn run_app_runtime_account_worker(
                         account_label: &account_label,
                         shared: &shared,
                         media_http: &media_http,
+                        pending_work_schedulers: Some(AccountWorkerPendingWorkSchedulers {
+                            convergence: &mut scheduled_convergence,
+                            runtime_group_subscription_refresh:
+                                &mut scheduled_runtime_group_subscription_refresh,
+                            push_retry: &mut scheduled_push_retry,
+                            commands: &command_tx,
+                        }),
                     },
                 )
                 .await;
             }
         }
+        if publish_pending_checkpointed_sync_summary(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            &shared,
+            "deferred_command_fallback",
+        )
+        .await
+        {
+            scheduled_runtime_group_subscription_refresh.observe_pending(
+                client.has_pending_runtime_group_subscription_refresh(),
+                &command_tx,
+            );
+            scheduled_push_retry
+                .observe_pending(client.has_pending_push_registration_work(), &command_tx);
+        }
+        schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+    }
+    if publish_pending_checkpointed_sync_summary(
+        &mut client,
+        &events,
+        &account_id_hex,
+        &account_label,
+        &shared,
+        "startup_tail_fallback",
+    )
+    .await
+    {
+        scheduled_push_retry
+            .observe_pending(client.has_pending_push_registration_work(), &command_tx);
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
     }
     scheduled_runtime_group_subscription_refresh.observe_pending(
@@ -961,11 +1135,26 @@ async fn run_app_runtime_account_worker(
     // Automatic gossip is best-effort network work. Run it only after startup
     // callers have received their deferred responses so a degraded relay cannot
     // extend account-open latency.
-    let push_work_pending = client
-        .retry_pending_push_registration_shares_best_effort()
-        .await;
+    let push_work_pending = retry_pending_push_registration_shares_with_visibility(
+        &mut client,
+        &events,
+        &account_id_hex,
+        &account_label,
+        &shared,
+    )
+    .await;
     scheduled_push_retry.schedule_after_attempt(push_work_pending, &command_tx);
-    publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
+    publish_client_pending_applied_summary(
+        &mut client,
+        &events,
+        &account_id_hex,
+        &account_label,
+        &shared,
+    );
+    scheduled_runtime_group_subscription_refresh.observe_pending(
+        client.has_pending_runtime_group_subscription_refresh(),
+        &command_tx,
+    );
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -994,14 +1183,31 @@ async fn run_app_runtime_account_worker(
                 drain_waiters: Vec::new(),
             }
         });
+    let mut epoch_backfill_journal_error_reported = false;
 
     'worker: loop {
+        match client.ensure_epoch_backfill_intent_journal_persisted() {
+            Ok(()) => epoch_backfill_journal_error_reported = false,
+            Err(error) => {
+                if !epoch_backfill_journal_error_reported {
+                    publish_app_runtime_account_error(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        account_error_message("epoch-backfill intent persistence failed", &error),
+                    );
+                    epoch_backfill_journal_error_reported = true;
+                }
+            }
+        }
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                let _ = client.ensure_epoch_backfill_intent_journal_persisted();
                 return;
             }
             _ = &mut shutdown => {
+                let _ = client.ensure_epoch_backfill_intent_journal_persisted();
                 return;
             }
             recovered = async {
@@ -1039,8 +1245,9 @@ async fn run_app_runtime_account_worker(
                 let groups = scheduled_convergence.take_ready();
                 match client.sync_runtime_groups().await {
                     Ok(()) => {
+                        let mut groups = groups.into_iter();
                         let mut remaining = groups.len();
-                        for group_id in groups {
+                        while let Some(group_id) = groups.next() {
                             // Each group's convergence pass is a long blocking
                             // stretch of synchronous engine + SQLite work with
                             // no await inside it, so `JoinHandle::abort` cannot
@@ -1063,8 +1270,25 @@ async fn run_app_runtime_account_worker(
                             }
                             remaining -= 1;
                             match client.advance_convergence_after_runtime_sync(&group_id).await {
-                                Ok(summary) => {
-                                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                Ok(visibility) => {
+                                    publish_sync_summary_with_followups(
+                                        &mut client,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &visibility.summary,
+                                        &shared,
+                                        "scheduled_convergence",
+                                    )
+                                    .await;
+                                    scheduled_runtime_group_subscription_refresh.observe_pending(
+                                        client.has_pending_runtime_group_subscription_refresh(),
+                                        &command_tx,
+                                    );
+                                    scheduled_push_retry.observe_pending(
+                                        client.has_pending_push_registration_work(),
+                                        &command_tx,
+                                    );
                                     match client.convergence_schedule_state(&group_id) {
                                         Ok(state) => scheduled_convergence
                                             .schedule_after_pass(&group_id, state),
@@ -1095,21 +1319,104 @@ async fn run_app_runtime_account_worker(
                                         EpochBackfillExecutionSeam::Maintenance,
                                     )
                                     .await;
-                                    if sync_summary_triggers_audit_tracker_update(&summary) {
-                                        shared.schedule_audit_log_tracker_update("scheduled_convergence");
-                                    }
+                                    schedule_pending_convergence_groups(
+                                        &mut scheduled_convergence,
+                                        &mut client,
+                                    );
+                                    scheduled_runtime_group_subscription_refresh.observe_pending(
+                                        client.has_pending_runtime_group_subscription_refresh(),
+                                        &command_tx,
+                                    );
+                                    scheduled_push_retry.observe_pending(
+                                        client.has_pending_push_registration_work(),
+                                        &command_tx,
+                                    );
                                 }
                                 Err(err) => {
                                     let mut retry_groups = client.take_pending_convergence_groups();
                                     retry_groups.push(group_id.clone());
+                                    // A failed operation can retain a durable
+                                    // visibility suffix under its original
+                                    // source. Do not start another group's
+                                    // lower operation until that suffix has
+                                    // replayed; reschedule every undispatched
+                                    // group and stop this batch after publishing
+                                    // the exact completed prefix.
+                                    retry_groups.extend(groups.by_ref());
                                     scheduled_convergence.schedule_retry_groups(retry_groups);
+                                    let published_visibility =
+                                        publish_pending_checkpointed_sync_summary_handoff(
+                                        &mut client,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &shared,
+                                        "scheduled_convergence_error_fallback",
+                                    );
+                                    schedule_pending_convergence_groups(
+                                        &mut scheduled_convergence,
+                                        &mut client,
+                                    );
+                                    scheduled_runtime_group_subscription_refresh.observe_pending(
+                                        client.has_pending_runtime_group_subscription_refresh(),
+                                        &command_tx,
+                                    );
+                                    scheduled_push_retry.observe_pending(
+                                        client.has_pending_push_registration_work(),
+                                        &command_tx,
+                                    );
                                     publish_app_runtime_account_error(
                                         &events,
                                         &account_id_hex,
                                         &account_label,
                                         account_error_message("scheduled convergence failed", &err),
                                     );
+                                    if let Some(summary) = published_visibility.as_ref() {
+                                        finish_sync_summary_followups(
+                                            &mut client,
+                                            summary,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            &shared,
+                                        )
+                                        .await;
+                                        scheduled_runtime_group_subscription_refresh
+                                            .observe_pending(
+                                                client
+                                                    .has_pending_runtime_group_subscription_refresh(),
+                                                &command_tx,
+                                            );
+                                        scheduled_push_retry.observe_pending(
+                                            client.has_pending_push_registration_work(),
+                                            &command_tx,
+                                        );
+                                    }
+                                    break;
                                 }
+                            }
+                            if publish_pending_checkpointed_sync_summary(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &shared,
+                                "scheduled_convergence_fallback",
+                            )
+                            .await
+                            {
+                                schedule_pending_convergence_groups(
+                                    &mut scheduled_convergence,
+                                    &mut client,
+                                );
+                                scheduled_runtime_group_subscription_refresh.observe_pending(
+                                    client.has_pending_runtime_group_subscription_refresh(),
+                                    &command_tx,
+                                );
+                                scheduled_push_retry.observe_pending(
+                                    client.has_pending_push_registration_work(),
+                                    &command_tx,
+                                );
                             }
                         }
                     }
@@ -1159,8 +1466,6 @@ async fn run_app_runtime_account_worker(
                                 }
                                 command => command,
                             };
-                            let may_change_push_registration_work =
-                                command.may_change_push_registration_work();
                             match command {
                                 AccountWorkerCommand::CatchUp { respond } => {
                                     handle_account_worker_catch_up(
@@ -1174,6 +1479,15 @@ async fn run_app_runtime_account_worker(
                                             account_id_hex: &account_id_hex,
                                             account_label: &account_label,
                                             shared: &shared,
+                                            pending_work_schedulers: Some(
+                                                AccountWorkerPendingWorkSchedulers {
+                                                    convergence: &mut scheduled_convergence,
+                                                    runtime_group_subscription_refresh:
+                                                        &mut scheduled_runtime_group_subscription_refresh,
+                                                    push_retry: &mut scheduled_push_retry,
+                                                    commands: &command_tx,
+                                                },
+                                            ),
                                         },
                                     )
                                     .await;
@@ -1191,11 +1505,29 @@ async fn run_app_runtime_account_worker(
                                             account_label: &account_label,
                                             shared: &shared,
                                             media_http: &media_http,
+                                            pending_work_schedulers: Some(
+                                                AccountWorkerPendingWorkSchedulers {
+                                                    convergence: &mut scheduled_convergence,
+                                                    runtime_group_subscription_refresh:
+                                                        &mut scheduled_runtime_group_subscription_refresh,
+                                                    push_retry: &mut scheduled_push_retry,
+                                                    commands: &command_tx,
+                                                },
+                                            ),
                                         },
                                     )
                                     .await;
                                 }
                             }
+                            let _ = publish_pending_checkpointed_sync_summary(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &shared,
+                                "command_fallback",
+                            )
+                            .await;
                             schedule_pending_convergence_groups(
                                 &mut scheduled_convergence,
                                 &mut client,
@@ -1204,12 +1536,10 @@ async fn run_app_runtime_account_worker(
                                 client.has_pending_runtime_group_subscription_refresh(),
                                 &command_tx,
                             );
-                            if may_change_push_registration_work {
-                                scheduled_push_retry.observe_pending(
-                                    client.has_pending_push_registration_work(),
-                                    &command_tx,
-                                );
-                            }
+                            scheduled_push_retry.observe_pending(
+                                client.has_pending_push_registration_work(),
+                                &command_tx,
+                            );
                         }
                     }
                     None => return,
@@ -1269,7 +1599,14 @@ async fn run_app_runtime_account_worker(
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
-                        publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        publish_sync_summary_with_audit(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &summary,
+                            &shared,
+                            "receive",
+                        );
                         start_post_join_history_after_visibility(
                             &mut client,
                             &summary,
@@ -1278,13 +1615,13 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                         )
                         .await;
-                        scheduled_runtime_group_subscription_refresh.observe_pending(
-                            client.has_pending_runtime_group_subscription_refresh(),
-                            &command_tx,
-                        );
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
                         );
                         if !overflow_recovery_incomplete {
                             let _ = run_pending_epoch_backfill_reporting_arm(
@@ -1300,26 +1637,82 @@ async fn run_app_runtime_account_worker(
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
                         if !summary.joined_groups.is_empty() {
-                            let pending = client
-                                .retry_pending_push_registration_shares_best_effort()
-                                .await;
+                            let pending = retry_pending_push_registration_shares_with_visibility(
+                                &mut client,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &shared,
+                            )
+                            .await;
                             scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
                             publish_client_pending_applied_summary(
                                 &mut client,
                                 &events,
                                 &account_id_hex,
                                 &account_label,
+                                &shared,
                             );
                         }
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        scheduled_push_retry.observe_pending(
+                            client.has_pending_push_registration_work(),
+                            &command_tx,
+                        );
                     }
                     Err(err) => {
+                        let published_visibility =
+                            publish_pending_checkpointed_sync_summary_handoff(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &shared,
+                            "receive_error_fallback",
+                        );
+                        if published_visibility.is_some() {
+                            schedule_pending_convergence_groups(
+                                &mut scheduled_convergence,
+                                &mut client,
+                            );
+                            scheduled_runtime_group_subscription_refresh.observe_pending(
+                                client.has_pending_runtime_group_subscription_refresh(),
+                                &command_tx,
+                            );
+                            scheduled_push_retry.observe_pending(
+                                client.has_pending_push_registration_work(),
+                                &command_tx,
+                            );
+                        }
                         publish_app_runtime_account_error(
                             &events,
                             &account_id_hex,
                             &account_label,
                             account_error_message("runtime receive failed", &err),
                         );
+                        if let Some(summary) = published_visibility.as_ref() {
+                            finish_sync_summary_followups(
+                                &mut client,
+                                summary,
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                &shared,
+                            )
+                            .await;
+                        }
                         // The account-session ownership guard is held by
                         // `AppClient`. Destroy the failed engine before the
                         // backoff as well as before hydrating its replacement;
@@ -1395,6 +1788,15 @@ async fn run_app_runtime_account_worker(
                                     // mid-session reconnect (mdk#1161).
                                     if let Err(err) = drain_deferred_hydration(&mut reopened).await
                                     {
+                                        let _ = publish_pending_checkpointed_sync_summary(
+                                            &mut reopened,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            &shared,
+                                            "reconnect_hydration_fallback",
+                                        )
+                                        .await;
                                         publish_app_runtime_account_error(
                                             &events,
                                             &account_id_hex,
@@ -1420,6 +1822,15 @@ async fn run_app_runtime_account_worker(
                                         result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
                                     };
                                     if let Err(transport_err) = prepare_transport {
+                                        let _ = publish_pending_checkpointed_sync_summary(
+                                            &mut reopened,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            &shared,
+                                            "reconnect_transport_fallback",
+                                        )
+                                        .await;
                                         publish_app_runtime_account_error(
                                             &events,
                                             &account_id_hex,
@@ -1436,11 +1847,13 @@ async fn run_app_runtime_account_worker(
                                         .await;
                                     match reopened.drain_pending_session_events().await {
                                         Ok(summary) => {
-                                            publish_app_runtime_summary(
+                                            publish_sync_summary_with_audit(
                                                 &events,
                                                 &account_id_hex,
                                                 &account_label,
                                                 &summary,
+                                                &shared,
+                                                "reconnect_queued_work",
                                             );
                                             start_post_join_history_after_visibility(
                                                 &mut reopened,
@@ -1452,6 +1865,15 @@ async fn run_app_runtime_account_worker(
                                             .await;
                                         }
                                         Err(error) => {
+                                            let _ = publish_pending_checkpointed_sync_summary(
+                                                &mut reopened,
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                &shared,
+                                                "reconnect_queued_work_fallback",
+                                            )
+                                            .await;
                                             publish_app_runtime_account_error(
                                                 &events,
                                                 &account_id_hex,
@@ -1463,8 +1885,14 @@ async fn run_app_runtime_account_worker(
                                             );
                                         }
                                     }
-                                    let pending = reopened
-                                        .retry_pending_push_registration_shares_best_effort()
+                                    let pending =
+                                        retry_pending_push_registration_shares_with_visibility(
+                                            &mut reopened,
+                                            &events,
+                                            &account_id_hex,
+                                            &account_label,
+                                            &shared,
+                                        )
                                         .await;
                                     scheduled_push_retry
                                         .schedule_after_attempt(pending, &command_tx);
@@ -1473,6 +1901,7 @@ async fn run_app_runtime_account_worker(
                                         &events,
                                         &account_id_hex,
                                         &account_label,
+                                        &shared,
                                     );
                                     break reopened;
                                 }
@@ -1486,6 +1915,10 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                         };
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -1512,16 +1945,18 @@ async fn run_app_runtime_account_worker(
                 if client.key_package_maintenance_requires_catch_up() {
                     match timeout(
                         Duration::from_secs(15),
-                        client.sync_with_partial_progress(),
+                        client.sync_with_classified_partial_progress(),
                     )
-                    .await
+                        .await
                     {
                         Ok(Ok(summary)) => {
-                            publish_app_runtime_summary(
+                            publish_sync_summary_with_audit(
                                 &events,
                                 &account_id_hex,
                                 &account_label,
                                 &summary,
+                                &shared,
+                                "key_package_maintenance_catch_up",
                             );
                             start_post_join_history_after_visibility(
                                 &mut client,
@@ -1531,6 +1966,26 @@ async fn run_app_runtime_account_worker(
                                 &account_label,
                             )
                             .await;
+                            if !summary.joined_groups.is_empty() {
+                                let pending =
+                                    retry_pending_push_registration_shares_with_visibility(
+                                        &mut client,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &shared,
+                                    )
+                                    .await;
+                                scheduled_push_retry
+                                    .schedule_after_attempt(pending, &command_tx);
+                                publish_client_pending_applied_summary(
+                                    &mut client,
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    &shared,
+                                );
+                            }
                             publish_client_pending_projection_updates(
                                 &mut client,
                                 &events,
@@ -1559,6 +2014,26 @@ async fn run_app_runtime_account_worker(
                                 &account_label,
                             )
                             .await;
+                            if !failure.partial_summary.joined_groups.is_empty() {
+                                let pending =
+                                    retry_pending_push_registration_shares_with_visibility(
+                                        &mut client,
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        &shared,
+                                    )
+                                    .await;
+                                scheduled_push_retry
+                                    .schedule_after_attempt(pending, &command_tx);
+                                publish_client_pending_applied_summary(
+                                    &mut client,
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    &shared,
+                                );
+                            }
                             publish_app_runtime_account_error(
                                 &events,
                                 &account_id_hex,
@@ -1578,6 +2053,25 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                 }
+                if publish_pending_checkpointed_sync_summary(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                    "maintenance_timeout_fallback",
+                )
+                .await
+                {
+                    schedule_pending_convergence_groups(
+                        &mut scheduled_convergence,
+                        &mut client,
+                    );
+                    scheduled_push_retry.observe_pending(
+                        client.has_pending_push_registration_work(),
+                        &command_tx,
+                    );
+                }
                 scheduled_runtime_group_subscription_refresh.observe_pending(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
@@ -1591,6 +2085,18 @@ async fn run_app_runtime_account_worker(
                     EpochBackfillExecutionSeam::Maintenance,
                 )
                 .await;
+                schedule_pending_convergence_groups(
+                    &mut scheduled_convergence,
+                    &mut client,
+                );
+                scheduled_runtime_group_subscription_refresh.observe_pending(
+                    client.has_pending_runtime_group_subscription_refresh(),
+                    &command_tx,
+                );
+                scheduled_push_retry.observe_pending(
+                    client.has_pending_push_registration_work(),
+                    &command_tx,
+                );
                 if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
                     publish_app_runtime_account_error(
                         &events,
@@ -1599,36 +2105,140 @@ async fn run_app_runtime_account_worker(
                         account_error_message("post-join maintenance subscription failed", &err),
                     );
                 }
-                match client.run_due_maintenance().await {
-                    Ok(summary) => {
-                        let _ = summary;
-                        publish_client_pending_projection_updates(
-                            &mut client,
+                let mut maintenance_visibility = None::<SyncSummary>;
+                let maintenance_result = client
+                    .run_due_maintenance_with_intermediate_handoff(|_client, summary| {
+                        // The tick may now cross a post-delete relay repair.
+                        // Broadcast/audit its already-checkpointed V2 before
+                        // that await so forced shutdown cannot erase it.
+                        publish_sync_summary_with_audit(
                             &events,
                             &account_id_hex,
                             &account_label,
+                            &summary,
+                            &shared,
+                            "scheduled_maintenance",
                         );
-                        publish_client_pending_applied_summary(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                        );
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                    }
-                    Err(err) => {
-                        publish_app_runtime_account_error(
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            account_error_message("scheduled maintenance failed", &err),
-                        );
-                    }
+                        match &mut maintenance_visibility {
+                            Some(retained) => retained.merge(summary),
+                            None => maintenance_visibility = Some(summary),
+                        }
+                    })
+                    .await;
+                // The account tick hands one-shot effects to AppClient before
+                // its post-delete relay repair. Publish those staged effects
+                // whether that later repair succeeded or failed, and always
+                // before the corresponding AccountError.
+                publish_client_pending_projection_updates(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                );
+                publish_client_pending_applied_summary(
+                    &mut client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                );
+                publish_pending_welcome_delivery_events(
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &mut client,
+                );
+                schedule_pending_convergence_groups(
+                    &mut scheduled_convergence,
+                    &mut client,
+                );
+                scheduled_runtime_group_subscription_refresh.observe_pending(
+                    client.has_pending_runtime_group_subscription_refresh(),
+                    &command_tx,
+                );
+                scheduled_push_retry.observe_pending(
+                    client.has_pending_push_registration_work(),
+                    &command_tx,
+                );
+                let error_visibility = if maintenance_result.is_err() {
+                    publish_pending_checkpointed_sync_summary_handoff(
+                        &mut client,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &shared,
+                        "scheduled_maintenance_error_fallback",
+                    )
+                } else {
+                    None
+                };
+                if let Err(err) = maintenance_result {
+                    publish_app_runtime_account_error(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        account_error_message("scheduled maintenance failed", &err),
+                    );
                 }
+                if let Some(summary) = maintenance_visibility.as_ref() {
+                    finish_sync_summary_followups(
+                        &mut client,
+                        summary,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &shared,
+                    )
+                    .await;
+                }
+                if let Some(summary) = error_visibility.as_ref() {
+                    finish_sync_summary_followups(
+                        &mut client,
+                        summary,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &shared,
+                    )
+                    .await;
+                }
+                // Either follow-up can perform a final push-gossip send that
+                // folds route-changing peer commits or leaves durable push
+                // work behind. Re-observe unconditionally after both network
+                // seams; the summary handoff was already consumed, so the
+                // generic fallback below may otherwise have nothing to key on.
+                schedule_pending_convergence_groups(
+                    &mut scheduled_convergence,
+                    &mut client,
+                );
+                observe_scheduled_maintenance_followup_retries(
+                    &mut scheduled_runtime_group_subscription_refresh,
+                    client.has_pending_runtime_group_subscription_refresh(),
+                    &mut scheduled_push_retry,
+                    client.has_pending_push_registration_work(),
+                    &command_tx,
+                );
+                #[cfg(test)]
+                shared.notify_maintenance_tick_completed_for_test(&account_label);
             }
+        }
+        if publish_pending_checkpointed_sync_summary(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            &shared,
+            "worker_fallback",
+        )
+        .await
+        {
+            schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+            scheduled_runtime_group_subscription_refresh.observe_pending(
+                client.has_pending_runtime_group_subscription_refresh(),
+                &command_tx,
+            );
+            scheduled_push_retry
+                .observe_pending(client.has_pending_push_registration_work(), &command_tx);
         }
     }
 }
@@ -1640,12 +2250,53 @@ async fn run_app_runtime_account_worker(
 /// later reads remain behind it to preserve worker FIFO semantics.
 /// Additional catch-up requests received before such a command coalesce onto
 /// the in-flight sync.
+struct AccountWorkerPendingWorkSchedulers<'a> {
+    convergence: &'a mut ScheduledConvergence,
+    runtime_group_subscription_refresh: &'a mut ScheduledRuntimeGroupSubscriptionRefresh,
+    push_retry: &'a mut ScheduledPushRegistrationRetry,
+    commands: &'a mpsc::Sender<AccountWorkerCommand>,
+}
+
+impl AccountWorkerPendingWorkSchedulers<'_> {
+    fn observe(&mut self, client: &mut AppClient) {
+        schedule_pending_convergence_groups(self.convergence, client);
+        self.runtime_group_subscription_refresh.observe_pending(
+            client.has_pending_runtime_group_subscription_refresh(),
+            self.commands,
+        );
+        self.push_retry
+            .observe_pending(client.has_pending_push_registration_work(), self.commands);
+    }
+}
+
+fn observe_scheduled_maintenance_followup_retries(
+    runtime_group_subscription_refresh: &mut ScheduledRuntimeGroupSubscriptionRefresh,
+    runtime_group_subscription_refresh_pending: bool,
+    push_retry: &mut ScheduledPushRegistrationRetry,
+    push_retry_pending: bool,
+    commands: &mpsc::Sender<AccountWorkerCommand>,
+) {
+    runtime_group_subscription_refresh
+        .observe_pending(runtime_group_subscription_refresh_pending, commands);
+    push_retry.observe_pending(push_retry_pending, commands);
+}
+
+fn observe_pending_worker_work(
+    schedulers: &mut Option<AccountWorkerPendingWorkSchedulers<'_>>,
+    client: &mut AppClient,
+) {
+    if let Some(schedulers) = schedulers.as_mut() {
+        schedulers.observe(client);
+    }
+}
+
 struct AccountWorkerCatchUpContext<'a> {
     app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
     account_label: &'a str,
     shared: &'a RuntimeSharedServices,
+    pending_work_schedulers: Option<AccountWorkerPendingWorkSchedulers<'a>>,
 }
 
 async fn handle_account_worker_catch_up(
@@ -1653,7 +2304,7 @@ async fn handle_account_worker_catch_up(
     respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
     commands: &mut mpsc::Receiver<AccountWorkerCommand>,
     pending: &mut VecDeque<AccountWorkerCommand>,
-    context: AccountWorkerCatchUpContext<'_>,
+    mut context: AccountWorkerCatchUpContext<'_>,
 ) {
     let read_snapshot = match client.group_read_snapshot() {
         Ok(snapshot) => Some(snapshot),
@@ -1761,14 +2412,18 @@ async fn handle_account_worker_catch_up(
             }
         }
     };
-    let result = match sync_result {
+    let (result, joined_group_visible) = match sync_result {
         Ok(summary) => {
-            publish_app_runtime_summary(
+            let joined_group_visible = !summary.joined_groups.is_empty();
+            publish_sync_summary_with_audit(
                 context.events,
                 context.account_id_hex,
                 context.account_label,
                 &summary,
+                context.shared,
+                "catch_up",
             );
+            observe_pending_worker_work(&mut context.pending_work_schedulers, client);
             start_post_join_history_after_visibility(
                 client,
                 &summary,
@@ -1777,6 +2432,7 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
             )
             .await;
+            observe_pending_worker_work(&mut context.pending_work_schedulers, client);
             let backfill_result = run_pending_epoch_backfill_reporting_arm(
                 client,
                 context.events,
@@ -1786,12 +2442,10 @@ async fn handle_account_worker_catch_up(
                 EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
             .await;
-            if sync_summary_triggers_audit_tracker_update(&summary) {
-                context.shared.schedule_audit_log_tracker_update("catch_up");
-            }
-            backfill_result
+            (backfill_result, joined_group_visible)
         }
         Err(failure) => {
+            let joined_group_visible = !failure.partial_summary.joined_groups.is_empty();
             publish_sync_summary_with_audit(
                 context.events,
                 context.account_id_hex,
@@ -1799,6 +2453,14 @@ async fn handle_account_worker_catch_up(
                 &failure.partial_summary,
                 context.shared,
                 "catch_up",
+            );
+            observe_pending_worker_work(&mut context.pending_work_schedulers, client);
+            let message = account_error_message("runtime catch-up failed", &failure.source);
+            publish_app_runtime_account_error(
+                context.events,
+                context.account_id_hex,
+                context.account_label,
+                message.clone(),
             );
             start_post_join_history_after_visibility(
                 client,
@@ -1808,19 +2470,16 @@ async fn handle_account_worker_catch_up(
                 context.account_label,
             )
             .await;
-            let message = account_error_message("runtime catch-up failed", &failure.source);
-            publish_app_runtime_account_error(
-                context.events,
-                context.account_id_hex,
-                context.account_label,
-                message.clone(),
-            );
-            Err(AccountCatchUpFailure::new(
-                message,
-                failure.classification(),
-            ))
+            (
+                Err(AccountCatchUpFailure::new(
+                    message,
+                    failure.classification(),
+                )),
+                joined_group_visible,
+            )
         }
     };
+    observe_pending_worker_work(&mut context.pending_work_schedulers, client);
     context
         .shared
         .app_performance_telemetry()
@@ -1832,15 +2491,21 @@ async fn handle_account_worker_catch_up(
                 .err()
                 .map(AccountCatchUpFailure::classification),
         );
-    let retry_after_response = result.is_ok();
+    let retry_after_response = result.is_ok() || joined_group_visible;
     for respond in catch_up_responders {
         let _ = respond.send(result.clone());
     }
     pending.append(&mut deferred);
     if retry_after_response {
-        client
-            .retry_pending_push_registration_shares_best_effort()
-            .await;
+        retry_pending_push_registration_shares_with_visibility(
+            client,
+            context.events,
+            context.account_id_hex,
+            context.account_label,
+            context.shared,
+        )
+        .await;
+        observe_pending_worker_work(&mut context.pending_work_schedulers, client);
     }
 }
 
@@ -2034,6 +2699,7 @@ async fn run_startup_hydration_pipeline(
                                 events,
                                 account_id_hex,
                                 account_label,
+                                shared,
                                 setup_key_package_result,
                             )
                             .await;
@@ -2055,6 +2721,7 @@ async fn run_startup_hydration_pipeline(
                         events,
                         account_id_hex,
                         account_label,
+                        shared,
                         setup_key_package_result,
                     )
                     .await;
@@ -2092,7 +2759,14 @@ async fn run_startup_hydration_pipeline(
         // hydration quarantines, restored leave requests) exactly as a live
         // drain would, so the projection updates incrementally.
         if let Ok(summary) = client.drain_pending_session_events().await {
-            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            publish_sync_summary_with_audit(
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+                shared,
+                "startup_hydration",
+            );
         }
         if progress.remaining == 0 {
             break;
@@ -2143,6 +2817,7 @@ async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError
 /// subscribers through their `GroupHydrationQuarantined` events. Invite
 /// acceptance also runs live; everything else joins the startup deferral in
 /// arrival order.
+#[allow(clippy::too_many_arguments)]
 async fn handle_startup_hydration_command(
     client: &mut AppClient,
     command: AccountWorkerCommand,
@@ -2150,6 +2825,7 @@ async fn handle_startup_hydration_command(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
+    shared: &RuntimeSharedServices,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
@@ -2193,9 +2869,14 @@ async fn handle_startup_hydration_command(
             let retry_after_response = result.is_ok();
             let _ = respond.send(result);
             if retry_after_response {
-                client
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                retry_pending_push_registration_shares_with_visibility(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
             }
         }
         #[cfg(test)]
@@ -2529,6 +3210,7 @@ struct AccountWorkerCommandContext<'a> {
     account_label: &'a str,
     shared: &'a RuntimeSharedServices,
     media_http: &'a MediaHttpContext,
+    pending_work_schedulers: Option<AccountWorkerPendingWorkSchedulers<'a>>,
 }
 
 /// Commands that arrived while a previous handler held `&mut client` stay in
@@ -2550,6 +3232,7 @@ async fn handle_account_worker_command(
         account_label,
         shared,
         media_http,
+        mut pending_work_schedulers,
     } = context;
     match command {
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
@@ -2586,9 +3269,30 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();
-            let result = match client.sync_with_classified_partial_progress().await {
+            let (result, joined_group_visible) = match client
+                .sync_with_classified_partial_progress()
+                .await
+            {
                 Ok(summary) => {
-                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    let joined_group_visible = !summary.joined_groups.is_empty();
+                    publish_sync_summary_with_audit(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                        shared,
+                        "catch_up",
+                    );
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
+                    start_post_join_history_after_visibility(
+                        client,
+                        &summary,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    )
+                    .await;
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
                     let backfill_result = run_pending_epoch_backfill_reporting_arm(
                         client,
                         events,
@@ -2598,12 +3302,10 @@ async fn handle_account_worker_command(
                         EpochBackfillExecutionSeam::ExplicitCatchUp,
                     )
                     .await;
-                    if sync_summary_triggers_audit_tracker_update(&summary) {
-                        shared.schedule_audit_log_tracker_update("catch_up");
-                    }
-                    backfill_result
+                    (backfill_result, joined_group_visible)
                 }
                 Err(failure) => {
+                    let joined_group_visible = !failure.partial_summary.joined_groups.is_empty();
                     publish_sync_summary_with_audit(
                         events,
                         account_id_hex,
@@ -2612,6 +3314,7 @@ async fn handle_account_worker_command(
                         shared,
                         "catch_up",
                     );
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
                     let message = account_error_message("runtime catch-up failed", &failure.source);
                     publish_app_runtime_account_error(
                         events,
@@ -2619,12 +3322,24 @@ async fn handle_account_worker_command(
                         account_label,
                         message.clone(),
                     );
-                    Err(AccountCatchUpFailure::new(
-                        message,
-                        failure.classification(),
-                    ))
+                    start_post_join_history_after_visibility(
+                        client,
+                        &failure.partial_summary,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    )
+                    .await;
+                    (
+                        Err(AccountCatchUpFailure::new(
+                            message,
+                            failure.classification(),
+                        )),
+                        joined_group_visible,
+                    )
                 }
             };
+            observe_pending_worker_work(&mut pending_work_schedulers, client);
             shared.app_performance_telemetry().record_sync_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
@@ -2633,23 +3348,168 @@ async fn handle_account_worker_command(
                     .err()
                     .map(AccountCatchUpFailure::classification),
             );
-            let retry_after_response = result.is_ok();
+            let retry_after_response = result.is_ok() || joined_group_visible;
             let _ = respond.send(result);
             if retry_after_response {
-                client
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                retry_pending_push_registration_shares_with_visibility(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            }
+        }
+        AccountWorkerCommand::SyncWithPartialProgress { respond } => {
+            let sync_started_at = Instant::now();
+            let mut failure_classification = None;
+            let (result, joined_group_visible) =
+                match client.sync_with_classified_partial_progress().await {
+                    Ok(summary) => {
+                        publish_sync_summary_with_audit(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            &summary,
+                            shared,
+                            "sync_with_partial_progress",
+                        );
+                        observe_pending_worker_work(&mut pending_work_schedulers, client);
+                        start_post_join_history_after_visibility(
+                            client,
+                            &summary,
+                            events,
+                            account_id_hex,
+                            account_label,
+                        )
+                        .await;
+                        let joined_group_visible = !summary.joined_groups.is_empty();
+                        (Ok(summary), joined_group_visible)
+                    }
+                    Err(failure) => {
+                        failure_classification = Some(failure.classification());
+                        publish_sync_summary_with_audit(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            &failure.partial_summary,
+                            shared,
+                            "sync_with_partial_progress",
+                        );
+                        observe_pending_worker_work(&mut pending_work_schedulers, client);
+                        publish_app_runtime_account_error(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            account_error_message("runtime sync failed", &failure.source),
+                        );
+                        start_post_join_history_after_visibility(
+                            client,
+                            &failure.partial_summary,
+                            events,
+                            account_id_hex,
+                            account_label,
+                        )
+                        .await;
+                        let joined_group_visible =
+                            !failure.partial_summary.joined_groups.is_empty();
+                        (Err(SyncFailure::from(failure)), joined_group_visible)
+                    }
+                };
+            observe_pending_worker_work(&mut pending_work_schedulers, client);
+            // The classified sync detector can arm a full-history replay while
+            // ingesting either a successful batch or a partial-progress
+            // failure. Execute/report that durable intent at this explicit sync
+            // seam instead of waiting for unrelated receive or maintenance;
+            // preserve the primary SyncFailure response contract if replay also
+            // fails (the helper emits its own typed AccountError).
+            let _ = run_pending_epoch_backfill_reporting_arm(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                shared,
+                EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .await;
+            shared.app_performance_telemetry().record_sync_result(
+                AppPerformanceOperation::AccountSync,
+                sync_started_at.elapsed(),
+                failure_classification,
+            );
+            let retry_after_response = result.is_ok() || joined_group_visible;
+            let _ = respond.send(result);
+            if retry_after_response {
+                retry_pending_push_registration_shares_with_visibility(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
             }
         }
         AccountWorkerCommand::RepairFullHistory { respond } => {
             let sync_started_at = Instant::now();
-            let result = match client.repair_full_history().await {
+            let mut intermediate_summary = SyncSummary::default();
+            let repair = client
+                .repair_full_history_with_intermediate_handoff(|client, summary| {
+                    // An unconfirmed detector replay can still have committed a
+                    // visible prefix. Publish it synchronously before explicit
+                    // repair starts its second, unfloored relay pass; retaining
+                    // it in this future would lose V2 on forced worker abort.
+                    publish_sync_summary_with_audit(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                        shared,
+                        "repair_full_history_intermediate",
+                    );
+                    intermediate_summary.merge(summary);
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
+                })
+                .await;
+            let intermediate_joined_visible = !intermediate_summary.joined_groups.is_empty();
+            let (result, joined_group_visible) = match repair {
                 Ok(summary) => {
-                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
-                    if sync_summary_triggers_audit_tracker_update(&summary) {
-                        shared.schedule_audit_log_tracker_update("repair_full_history");
+                    publish_sync_summary_with_audit(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                        shared,
+                        "repair_full_history",
+                    );
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
+                    if intermediate_summary != SyncSummary::default() {
+                        start_post_join_history_after_visibility(
+                            client,
+                            &intermediate_summary,
+                            events,
+                            account_id_hex,
+                            account_label,
+                        )
+                        .await;
+                        observe_pending_worker_work(&mut pending_work_schedulers, client);
                     }
-                    Ok(())
+                    start_post_join_history_after_visibility(
+                        client,
+                        &summary,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    )
+                    .await;
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
+                    (
+                        Ok(()),
+                        intermediate_joined_visible || !summary.joined_groups.is_empty(),
+                    )
                 }
                 Err(failure) => {
                     publish_sync_summary_with_audit(
@@ -2660,6 +3520,9 @@ async fn handle_account_worker_command(
                         shared,
                         "repair_full_history",
                     );
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
+                    let joined_group_visible = intermediate_joined_visible
+                        || !failure.partial_summary.joined_groups.is_empty();
                     let message =
                         account_error_message("full-history repair failed", &failure.source);
                     publish_app_runtime_account_error(
@@ -2668,10 +3531,33 @@ async fn handle_account_worker_command(
                         account_label,
                         message.clone(),
                     );
-                    Err(AccountCatchUpFailure::new(
-                        message,
-                        failure.classification(),
-                    ))
+                    if intermediate_summary != SyncSummary::default() {
+                        start_post_join_history_after_visibility(
+                            client,
+                            &intermediate_summary,
+                            events,
+                            account_id_hex,
+                            account_label,
+                        )
+                        .await;
+                        observe_pending_worker_work(&mut pending_work_schedulers, client);
+                    }
+                    start_post_join_history_after_visibility(
+                        client,
+                        &failure.partial_summary,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    )
+                    .await;
+                    observe_pending_worker_work(&mut pending_work_schedulers, client);
+                    (
+                        Err(AccountCatchUpFailure::new(
+                            message,
+                            failure.classification(),
+                        )),
+                        joined_group_visible,
+                    )
                 }
             };
             shared.app_performance_telemetry().record_sync_result(
@@ -2683,6 +3569,17 @@ async fn handle_account_worker_command(
                     .map(AccountCatchUpFailure::classification),
             );
             let _ = respond.send(result);
+            if joined_group_visible {
+                retry_pending_push_registration_shares_with_visibility(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            }
         }
         AccountWorkerCommand::CreateGroup {
             queued_at,
@@ -2787,9 +3684,14 @@ async fn handle_account_worker_command(
                                 "confirmed group creation could not refresh subscriptions immediately"
                             );
                         }
-                        client
-                            .retry_pending_push_registration_shares_best_effort()
-                            .await;
+                        retry_pending_push_registration_shares_with_visibility(
+                            client,
+                            events,
+                            account_id_hex,
+                            account_label,
+                            shared,
+                        )
+                        .await;
                     },
                     commands,
                     pending,
@@ -2959,9 +3861,14 @@ async fn handle_account_worker_command(
                 // consumers refresh and the group leaves the recovery
                 // surface and reappears as a normal chat.
                 match client.drain_pending_session_events().await {
-                    Ok(summary) => {
-                        publish_app_runtime_summary(events, account_id_hex, account_label, &summary)
-                    }
+                    Ok(summary) => publish_sync_summary_with_audit(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &summary,
+                        shared,
+                        "retry_hydration",
+                    ),
                     Err(err) => publish_app_runtime_account_error(
                         events,
                         account_id_hex,
@@ -3169,7 +4076,19 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::LeaveGroup { group_id, respond } => {
-            let result = client.leave_group(&group_id).await;
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                );
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
+            let result = client
+                .leave_group_with_handoff(&group_id, &mut handoff)
+                .await;
             // Drain the kind-1210 "member left" row this commit queued. Sibling
             // mutators (invite/remove/profile) already flush
             // `pending_projection_updates`; without this the live timeline stays
@@ -3196,7 +4115,19 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::DeleteGroupLocal { group_id, respond } => {
-            let result = client.delete_group_local(&group_id).await;
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                );
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
+            let result = client
+                .delete_group_local_with_handoff(&group_id, &mut handoff)
+                .await;
             if matches!(result, Ok(true)) {
                 publish_app_runtime_group_state_updated(
                     events,
@@ -3220,13 +4151,30 @@ async fn handle_account_worker_command(
             let retry_after_response = result.is_ok();
             let _ = respond.send(result);
             if retry_after_response {
-                client
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                retry_pending_push_registration_shares_with_visibility(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
             }
         }
         AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => {
-            let result = client.decline_group_invite(&group_id).await;
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                );
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
+            let result = client
+                .decline_group_invite_with_handoff(&group_id, &mut handoff)
+                .await;
             if result.is_ok() {
                 publish_client_pending_projection_updates(
                     client,
@@ -3598,14 +4546,18 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => {
-            let result = client.retry_group_convergence(&group_id).await;
+            let result = client
+                .retry_group_convergence_with_deferred_notification(&group_id)
+                .await;
+            // Finalization updates are one-shot: publish the completed prefix
+            // on errors too, before the response can trigger later work.
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
             if result.is_ok() {
-                publish_client_pending_projection_updates(
-                    client,
-                    events,
-                    account_id_hex,
-                    account_label,
-                );
                 publish_app_runtime_group_state_updated(
                     events,
                     account_id_hex,
@@ -3624,6 +4576,51 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.redeliver_welcome(&message_id_hex).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeleteKeyPackageRevision {
+            event_id,
+            endpoints,
+            respond,
+        } => {
+            let result = client
+                .delete_key_package_revision_durably(&event_id, endpoints)
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PublishNip65RelaySet {
+            read_relays,
+            write_relays,
+            bootstrap_relays,
+            respond,
+        } => {
+            let result = client
+                .publish_account_nip65_relay_set(read_relays, write_relays, bootstrap_relays)
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SetNip65Relays {
+            relays,
+            bootstrap_relays,
+            respond,
+        } => {
+            let result = client
+                .set_account_nip65_relays(relays, bootstrap_relays)
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PublishInboxRelayList {
+            relays,
+            bootstrap_relays,
+            respond,
+        } => {
+            let result = client
+                .publish_account_inbox_relays(relays, bootstrap_relays)
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::IngestSelfNip65RelayEvent { record, respond } => {
+            let result = client.ingest_self_nip65_relay_event(record).await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::PublishKeyPackage { respond } => {
@@ -3684,18 +4681,29 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::RunDueMaintenance { respond } => {
             let result = client.run_due_maintenance().await;
-            if result.is_ok() {
-                publish_client_pending_projection_updates(
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SharePushRegistration { respond } => {
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
                     client,
                     events,
                     account_id_hex,
                     account_label,
+                    shared,
                 );
-            }
-            let _ = respond.send(result);
-        }
-        AccountWorkerCommand::SharePushRegistration { respond } => {
-            let result = client.share_push_registration().await;
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
+            let result = client
+                .share_push_registration_with_handoff(&mut handoff)
+                .await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::UpsertPushRegistration {
@@ -3705,18 +4713,41 @@ async fn handle_account_worker_command(
             relay_hint,
             respond,
         } => {
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                );
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
             let result = client
-                .upsert_and_share_push_registration(
+                .upsert_and_share_push_registration_with_handoff(
                     platform,
                     &raw_token,
                     &server_pubkey_hex,
                     relay_hint,
+                    &mut handoff,
                 )
                 .await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::ClearPushRegistration { respond } => {
-            let result = client.clear_and_share_push_registration().await;
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                );
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
+            let result = client
+                .clear_and_share_push_registration_with_handoff(&mut handoff)
+                .await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::SetNativePushEnabled { enabled, respond } => {
@@ -3726,22 +4757,44 @@ async fn handle_account_worker_command(
             let should_retry = result.is_ok();
             let _ = respond.send(result);
             if should_retry {
-                client
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
+                retry_pending_push_registration_shares_with_visibility(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
             }
         }
         AccountWorkerCommand::RemovePushRegistration {
             registration,
             respond,
         } => {
-            let result = client.remove_push_registration(registration).await;
+            let mut handoff = |client: &mut AppClient| {
+                publish_client_pending_applied_summary(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                );
+                observe_pending_worker_work(&mut pending_work_schedulers, client);
+            };
+            let result = client
+                .remove_push_registration_with_handoff(registration, &mut handoff)
+                .await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::RetryPushRegistration { respond } => {
-            let pending = client
-                .retry_pending_push_registration_shares_best_effort()
-                .await;
+            let pending = retry_pending_push_registration_shares_with_visibility(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                shared,
+            )
+            .await;
             let _ = respond.send(pending);
         }
         AccountWorkerCommand::DeleteAuditLog { path, respond } => {
@@ -3756,7 +4809,15 @@ async fn handle_account_worker_command(
     // Publishing from this seam — rather than inside each send arm — keeps
     // every command path covered; the summary is empty for commands that
     // applied nothing.
-    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label, shared);
+    observe_pending_worker_work(&mut pending_work_schedulers, client);
+    // A send records its notification intent before returning from the client
+    // method. The applied summary above must reach subscribers first; only then
+    // cross the notification network await. Cancellation leaves the group in
+    // the client-owned set for the next worker seam.
+    client
+        .publish_pending_new_message_notifications_best_effort()
+        .await;
 }
 
 pub(super) fn group_roster_after_hydration(
@@ -4354,6 +5415,145 @@ fn publish_sync_summary_with_audit(
     }
 }
 
+/// Publish the visibility handoff before any network follow-up, then perform
+/// the durable join obligations that every summary-producing seam shares.
+/// Returning whether a join was visible lets callers arm their local retry
+/// schedulers without re-inspecting a summary after the awaits.
+async fn publish_sync_summary_with_followups(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    summary: &SyncSummary,
+    shared: &RuntimeSharedServices,
+    audit_trigger: &'static str,
+) -> bool {
+    publish_sync_summary_with_audit(
+        events,
+        account_id_hex,
+        account_label,
+        summary,
+        shared,
+        audit_trigger,
+    );
+    finish_sync_summary_followups(
+        client,
+        summary,
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+    )
+    .await
+}
+
+async fn finish_sync_summary_followups(
+    client: &mut AppClient,
+    summary: &SyncSummary,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+) -> bool {
+    start_post_join_history_after_visibility(
+        client,
+        summary,
+        events,
+        account_id_hex,
+        account_label,
+    )
+    .await;
+    let joined_group_visible = !summary.joined_groups.is_empty();
+    if joined_group_visible {
+        retry_pending_push_registration_shares_with_visibility(
+            client,
+            events,
+            account_id_hex,
+            account_label,
+            shared,
+        )
+        .await;
+    }
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label, shared);
+    client
+        .publish_pending_new_message_notifications_best_effort()
+        .await;
+    joined_group_visible
+}
+
+/// Synchronously checkpoint/take/publish a retained V1/V2 prefix. Error paths
+/// use this before emitting their AccountError or arming schedulers, then may
+/// run [`finish_sync_summary_followups`] afterward. This keeps best-effort
+/// network awaits from delaying the primary visibility/error ordering.
+fn publish_pending_checkpointed_sync_summary_handoff(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+    audit_trigger: &'static str,
+) -> Option<SyncSummary> {
+    if let Err(error) = client.checkpoint_pending_sync_visibility() {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("pending sync visibility checkpoint failed", &error),
+        );
+    }
+    let summary = client.take_pending_checkpointed_sync_summary()?;
+    publish_sync_summary_with_audit(
+        events,
+        account_id_hex,
+        account_label,
+        &summary,
+        shared,
+        audit_trigger,
+    );
+    Some(summary)
+}
+
+/// Checkpoint any cancellation-retained V1 batch, then hand off V2 from the
+/// owning [`AppClient`]. The take happens before the first follow-up await so a
+/// second fallback seam cannot attempt to publish the same batch. Broadcast is
+/// deliberately at-most-once; subscribers that lag must resnapshot durable
+/// projections. `Some(default)` remains meaningful occupancy: publishing it is
+/// a no-op, but the caller still needs to schedule convergence/backfill and
+/// subscription work retained on the client.
+fn publish_pending_checkpointed_sync_summary<'a>(
+    client: &'a mut AppClient,
+    events: &'a broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &'a str,
+    account_label: &'a str,
+    shared: &'a RuntimeSharedServices,
+    audit_trigger: &'static str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        if let Err(error) = client.checkpoint_pending_sync_visibility() {
+            publish_app_runtime_account_error(
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message("pending sync visibility checkpoint failed", &error),
+            );
+        }
+        let Some(summary) = client.take_pending_checkpointed_sync_summary() else {
+            return false;
+        };
+        publish_sync_summary_with_followups(
+            client,
+            events,
+            account_id_hex,
+            account_label,
+            &summary,
+            shared,
+            audit_trigger,
+        )
+        .await;
+        true
+    })
+}
+
 /// Run any pending epoch-gap backfill and push its arm evidence to the audit
 /// tracker. The arm state is captured *before* the replay drains it, and the
 /// tracker is scheduled unconditionally on the replay outcome: the
@@ -4377,6 +5577,9 @@ async fn run_pending_epoch_backfill_reporting_arm(
     seam: EpochBackfillExecutionSeam,
 ) -> Result<(), AccountCatchUpFailure> {
     let backfill_armed = client.has_pending_epoch_backfill();
+    if backfill_armed {
+        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
+    }
     let mut result = match client.run_pending_epoch_backfill(seam).await {
         // An incomplete replay published the same real summary: it ingested
         // whatever it reached before the relays failed to confirm they had
@@ -4386,18 +5589,46 @@ async fn run_pending_epoch_backfill_reporting_arm(
             EpochBackfillRunOutcome::Completed(summary)
             | EpochBackfillRunOutcome::Incomplete(summary),
         ) => {
-            publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+            publish_sync_summary_with_followups(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+                shared,
+                "epoch_backfill",
+            )
+            .await;
             Ok(())
         }
         Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => Ok(()),
         Err(error) => {
             let message = account_error_message("epoch-gap backfill failed", &error);
+            let published_visibility = publish_pending_checkpointed_sync_summary_handoff(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                shared,
+                "epoch_backfill_error_fallback",
+            );
             publish_app_runtime_account_error(
                 events,
                 account_id_hex,
                 account_label,
                 message.clone(),
             );
+            if let Some(summary) = published_visibility.as_ref() {
+                finish_sync_summary_followups(
+                    client,
+                    summary,
+                    events,
+                    account_id_hex,
+                    account_label,
+                    shared,
+                )
+                .await;
+            }
             // run_pending_epoch_backfill returns only AppError, after several
             // distinct sync boundaries. Preserve its typed broad cause but do
             // not derive a stage from that cause.
@@ -4407,9 +5638,6 @@ async fn run_pending_epoch_backfill_reporting_arm(
             ))
         }
     };
-    if backfill_armed {
-        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
-    }
     // An epoch replay is itself a large relay burst and can discover the
     // bounded account queue's overflow record. Resolve that distinct durable
     // gap immediately instead of waiting for unrelated later traffic to wake
@@ -4538,9 +5766,38 @@ fn publish_client_pending_applied_summary(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
     account_label: &str,
+    shared: &RuntimeSharedServices,
 ) {
     let summary = client.take_pending_applied_sync_summary();
-    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+    publish_sync_summary_with_audit(
+        events,
+        account_id_hex,
+        account_label,
+        &summary,
+        shared,
+        "send_applied",
+    );
+}
+
+async fn retry_pending_push_registration_shares_with_visibility(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+) -> bool {
+    let mut handoff = |client: &mut AppClient| {
+        publish_client_pending_applied_summary(
+            client,
+            events,
+            account_id_hex,
+            account_label,
+            shared,
+        );
+    };
+    client
+        .retry_pending_push_registration_shares_best_effort_with_handoff(&mut handoff)
+        .await
 }
 
 pub(crate) fn publish_app_runtime_group_state_updated(
@@ -4604,20 +5861,29 @@ enum SetupKeyPackagePriority {
     Skip,
 }
 
-fn setup_key_package_priority(
+fn setup_key_package_priority<F>(
     state: Result<Option<AccountSetupState>, AccountHomeError>,
-) -> Result<SetupKeyPackagePriority, AppError> {
-    let publish = state?.is_some_and(|state| {
-        state.kind == AccountSetupKind::GeneratedIdentity
-            && matches!(
-                state.phase,
-                AccountSetupPhase::LocalReady
-                    | AccountSetupPhase::BootstrapPublicationStarted
-                    | AccountSetupPhase::BootstrapPublicationConfirmed
-                    | AccountSetupPhase::KeyPackagePublicationStarted
-            )
-    });
-    Ok(if publish {
+    load_generated_context: F,
+) -> Result<SetupKeyPackagePriority, AppError>
+where
+    F: FnOnce() -> Result<GeneratedAccountSetupContext, AppError>,
+{
+    let Some(state) = state? else {
+        return Ok(SetupKeyPackagePriority::Skip);
+    };
+    let eligible_phase = state.kind == AccountSetupKind::GeneratedIdentity
+        && matches!(
+            state.phase,
+            AccountSetupPhase::LocalReady
+                | AccountSetupPhase::BootstrapPublicationStarted
+                | AccountSetupPhase::BootstrapPublicationConfirmed
+                | AccountSetupPhase::KeyPackagePublicationStarted
+        );
+    if !eligible_phase {
+        return Ok(SetupKeyPackagePriority::Skip);
+    }
+    let context = load_generated_context()?;
+    Ok(if context.publish_initial_key_package() {
         SetupKeyPackagePriority::PublishExactDurableInitial
     } else {
         SetupKeyPackagePriority::Skip
@@ -4680,6 +5946,48 @@ mod tests {
         }
     }
 
+    fn generated_setup_context(publish_initial_key_package: bool) -> GeneratedAccountSetupContext {
+        GeneratedAccountSetupContext::from_request(&crate::runtime::AccountSetupRequest {
+            publish_initial_key_package,
+            ..crate::runtime::AccountSetupRequest::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_can_drop_a_queued_key_package_delete_before_durable_admission() {
+        let lifecycle = RuntimeLifecycle::new();
+        let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
+        let (commands_tx, mut commands) = mpsc::channel(1);
+        let (respond, response) = oneshot::channel();
+        commands_tx
+            .send(AccountWorkerCommand::DeleteKeyPackageRevision {
+                event_id: MessageId::new(vec![0x11; 32]),
+                endpoints: vec![cgka_traits::TransportEndpoint(
+                    "wss://relay.example".to_owned(),
+                )],
+                respond,
+            })
+            .await
+            .expect("queue delete command while worker is live");
+        lifecycle.begin_shutdown();
+
+        // Mirrors the steady-state worker's biased control ordering. A
+        // successful mpsc send is volatile admission: when stop and command
+        // are both ready, stop wins before the durable deletion handler runs.
+        let command_was_dequeued = tokio::select! {
+            biased;
+            _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => false,
+            command = commands.recv() => command.is_some(),
+        };
+
+        assert!(!command_was_dequeued);
+        drop(commands);
+        assert!(
+            response.await.is_err(),
+            "no success response may imply durable admission for a command the stop branch dropped"
+        );
+    }
+
     #[test]
     fn generated_setup_priority_selects_the_exact_durable_initial_key_package() {
         for phase in [
@@ -4689,13 +5997,39 @@ mod tests {
             AccountSetupPhase::KeyPackagePublicationStarted,
         ] {
             assert_eq!(
-                setup_key_package_priority(Ok(Some(setup_state(
-                    AccountSetupKind::GeneratedIdentity,
-                    phase,
-                ))))
+                setup_key_package_priority(
+                    Ok(Some(setup_state(
+                        AccountSetupKind::GeneratedIdentity,
+                        phase,
+                    ))),
+                    || Ok(generated_setup_context(true))
+                )
                 .unwrap(),
                 SetupKeyPackagePriority::PublishExactDurableInitial,
                 "phase {phase:?} must select the lifecycle-owned initial KeyPackage"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_setup_priority_honors_the_durable_publication_opt_out() {
+        for phase in [
+            AccountSetupPhase::LocalReady,
+            AccountSetupPhase::BootstrapPublicationStarted,
+            AccountSetupPhase::BootstrapPublicationConfirmed,
+            AccountSetupPhase::KeyPackagePublicationStarted,
+        ] {
+            assert_eq!(
+                setup_key_package_priority(
+                    Ok(Some(setup_state(
+                        AccountSetupKind::GeneratedIdentity,
+                        phase
+                    ))),
+                    || Ok(generated_setup_context(false)),
+                )
+                .unwrap(),
+                SetupKeyPackagePriority::Skip,
+                "phase {phase:?} must retain the durable KeyPackage publication opt-out"
             );
         }
     }
@@ -4709,10 +6043,12 @@ mod tests {
             AccountSetupPhase::KeyPackagePublicationStarted,
         ] {
             assert_eq!(
-                setup_key_package_priority(Ok(Some(setup_state(
-                    AccountSetupKind::ImportedIdentity,
-                    phase,
-                ))))
+                setup_key_package_priority(
+                    Ok(Some(
+                        setup_state(AccountSetupKind::ImportedIdentity, phase,)
+                    )),
+                    || panic!("imported setup must not load generated context")
+                )
                 .unwrap(),
                 SetupKeyPackagePriority::Skip
             );
@@ -4722,23 +6058,32 @@ mod tests {
             AccountSetupPhase::KeyPackagePublicationConfirmed,
         ] {
             assert_eq!(
-                setup_key_package_priority(Ok(Some(setup_state(
-                    AccountSetupKind::GeneratedIdentity,
-                    phase,
-                ))))
+                setup_key_package_priority(
+                    Ok(Some(setup_state(
+                        AccountSetupKind::GeneratedIdentity,
+                        phase,
+                    ))),
+                    || panic!("ineligible phase must not load generated context")
+                )
                 .unwrap(),
                 SetupKeyPackagePriority::Skip
             );
         }
         assert_eq!(
-            setup_key_package_priority(Ok(None)).unwrap(),
+            setup_key_package_priority(Ok(None), || {
+                panic!("absent setup must not load generated context")
+            })
+            .unwrap(),
             SetupKeyPackagePriority::Skip
         );
     }
 
     #[test]
     fn setup_state_lookup_failure_never_enters_the_publication_lane() {
-        let error = setup_key_package_priority(Err(AccountHomeError::AccountSetupStateMissing))
+        let error =
+            setup_key_package_priority(Err(AccountHomeError::AccountSetupStateMissing), || {
+                panic!("failed setup lookup must not load generated context")
+            })
             .expect_err("lookup failure must be surfaced");
 
         assert!(matches!(error, AppError::AccountHome(_)));
@@ -5002,12 +6347,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
 
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
@@ -5091,12 +6438,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
 
         let (events, mut subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
@@ -5232,12 +6581,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
 
         let (events, _subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
@@ -5249,6 +6600,7 @@ mod tests {
             shared: &shared,
             account_id_hex: "account-id",
             account_label: "alice",
+            pending_work_schedulers: None,
         };
         let (respond, response) = oneshot::channel();
 
@@ -5282,12 +6634,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
         client
             .pending_epoch_backfill
             .as_mut()
@@ -5309,6 +6663,7 @@ mod tests {
             shared: &shared,
             account_id_hex: "account-id",
             account_label: "alice",
+            pending_work_schedulers: None,
         };
         let (respond, response) = oneshot::channel();
 
@@ -5339,6 +6694,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_sync_command_returns_its_exact_worker_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let subscriptions_before = relay.subscription_count();
+
+        let (events, _subscriber) = broadcast::channel(4);
+        let shared = RuntimeSharedServices::default();
+        let (respond, response) = oneshot::channel();
+        let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
+        let (media_http_worker_lifetime, _) = watch::channel(());
+        let media_http = MediaHttpContext {
+            tx: media_http_tx,
+            permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
+            prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+            worker_lifetime: media_http_worker_lifetime,
+        };
+        let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
+        handle_account_worker_command(
+            &mut client,
+            AccountWorkerCommand::SyncWithPartialProgress { respond },
+            AccountWorkerCommandContext {
+                commands: &mut unused_commands,
+                pending: &mut unused_pending,
+                app: &app,
+                events: &events,
+                account_id_hex: "account-id",
+                account_label: "alice",
+                shared: &shared,
+                media_http: &media_http,
+                pending_work_schedulers: None,
+            },
+        )
+        .await;
+
+        let summary = response
+            .await
+            .unwrap()
+            .expect("detailed worker sync must return its own summary");
+        assert_eq!(summary, SyncSummary::default());
+        assert!(
+            relay.subscription_count() > subscriptions_before,
+            "the detailed result must come from a real worker-owned transport sync"
+        );
+    }
+
+    #[tokio::test]
     async fn full_history_repair_consumes_prearmed_backfill_without_replaying_twice() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -5358,12 +6766,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
         let subscriptions_before_repair = relay.subscription_count();
 
         let (events, _subscriber) = broadcast::channel(4);
@@ -5390,6 +6800,7 @@ mod tests {
                 account_label: "alice",
                 shared: &shared,
                 media_http: &media_http,
+                pending_work_schedulers: None,
             },
         )
         .await;
@@ -5426,12 +6837,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
         let marker_token = 7;
         app.account_storage("alice")
             .unwrap()
@@ -5529,12 +6942,14 @@ mod tests {
             .await
             .unwrap();
         let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
         client
             .pending_epoch_backfill
             .as_mut()
@@ -5581,31 +6996,38 @@ mod tests {
         let group_b = client.create_group("queued repair b", &[]).await.unwrap();
 
         let stalled_epoch_a = client.group_mls_state(&group_a).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_a,
-            stalled_epoch_a,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_a,
+                stalled_epoch_a,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
         let execution = client
             .begin_epoch_backfill_execution(EpochBackfillExecutionSeam::Maintenance)
+            .expect("persist first intent execution")
             .expect("first intent must begin");
         let operation_a = execution.pending.attempt_id.clone();
 
         let stalled_epoch_b = client.group_mls_state(&group_b).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_b,
-            stalled_epoch_b,
-            BackfillDecision::Arm,
-            EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
+        client
+            .apply_backfill_decision(
+                &group_b,
+                stalled_epoch_b,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
         let operation_b = client
             .pending_epoch_backfill
             .as_ref()
             .expect("second intent must arm in flight")
             .attempt_id
             .clone();
-        client.test_finish_epoch_backfill_execution(execution, false);
+        client
+            .test_finish_epoch_backfill_execution(execution, false)
+            .unwrap();
         client
             .pending_epoch_backfill
             .as_mut()
@@ -5756,24 +7178,28 @@ mod tests {
         assert!(!scheduled.is_armed());
     }
 
-    #[test]
-    fn push_registration_retry_observation_is_scoped_to_relevant_commands() {
-        let (share_respond, _share_response) = oneshot::channel();
-        assert!(
-            AccountWorkerCommand::SharePushRegistration {
-                respond: share_respond
-            }
-            .may_change_push_registration_work()
+    #[tokio::test]
+    async fn scheduled_maintenance_followup_reobserves_new_route_and_push_work() {
+        let (commands, _received_commands) = mpsc::channel(2);
+        let mut runtime_group_subscription_refresh =
+            ScheduledRuntimeGroupSubscriptionRefresh::new();
+        let mut push_retry = ScheduledPushRegistrationRetry::new();
+
+        observe_scheduled_maintenance_followup_retries(
+            &mut runtime_group_subscription_refresh,
+            true,
+            &mut push_retry,
+            true,
+            &commands,
         );
 
-        let (convergence_respond, _convergence_response) = oneshot::channel();
         assert!(
-            !AccountWorkerCommand::RetryGroupConvergence {
-                group_id: test_group_id(1),
-                respond: convergence_respond,
-            }
-            .may_change_push_registration_work(),
-            "unrelated convergence commands must not arm push maintenance"
+            runtime_group_subscription_refresh.is_armed(),
+            "a route change produced by the final follow-up send must arm its worker retry"
+        );
+        assert!(
+            push_retry.is_armed(),
+            "durable push work left by the final follow-up send must arm its worker retry"
         );
     }
 
