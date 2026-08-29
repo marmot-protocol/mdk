@@ -4151,6 +4151,90 @@ mod runtime_group_subscription_refresh_tests {
         );
         assert!(!client.has_pending_runtime_group_subscription_refresh());
     }
+
+    /// The drained seam's subscription rebuild owes the same retry edge.
+    ///
+    /// Both edges that could re-fire the rebuild are spent by the pass that
+    /// failed: `drain()` empties the engine's in-memory event buffer one-shot,
+    /// so the `routes_dirty` event is gone, and `refresh_group_routes` reports
+    /// `routing_changed` only while the in-memory routing table is actually
+    /// mutating. Without an explicit arm the account's ordinary group
+    /// subscriptions stay stale until some unrelated delivery happens to dirty
+    /// the routes again — and a stale group subscription is exactly what stops
+    /// those deliveries from arriving.
+    #[tokio::test]
+    async fn drained_epilogue_arms_refresh_after_failed_subscription_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        // The managed-runtime create, which defers the relay-side subscription
+        // install to a later refresh (the worker performs it after replying).
+        // The second group is that outstanding install: the drained disband
+        // below dirties the routes, and the rebuild it triggers is the one the
+        // relay refuses.
+        let created = client
+            .create_group_with_options_and_telemetry(
+                "drained retry intent",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "drained retry bystander",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: created.group_id,
+                epoch: cgka_traits::EpochId(2),
+                actor: Some(cgka_traits::MemberId::new(
+                    hex::decode(&account.account_id_hex).unwrap(),
+                )),
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                origin_commit_id: None,
+            }],
+            ..Default::default()
+        };
+        relay.fail_next_subscribe();
+        client
+            .observe_drained_session_events(&effects)
+            .await
+            .expect_err("the injected group subscription rebuild must fail the drain");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        // Nothing is left to re-derive the intent from: the drained batch that
+        // dirtied the routes is consumed, and the routing table reports no
+        // further change, so the armed flag is the only surviving re-fire edge.
+        assert!(!client.refresh_group_routes().unwrap().routing_changed);
+
+        let subscriptions_before = relay.subscription_count();
+        assert!(
+            !client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap()
+        );
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            relay.subscription_count() > subscriptions_before,
+            "the armed retry must actually re-issue the rebuild the drain lost"
+        );
+    }
 }
 
 #[cfg(test)]

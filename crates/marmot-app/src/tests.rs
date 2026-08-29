@@ -12058,6 +12058,102 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     );
 }
 
+/// Issue #1177 follow-up: the drained seam owes the live seam's kind-1210
+/// system-row synthesis too.
+///
+/// `observe_account_device_effects` ends by synthesizing a durable system row
+/// for every authenticated `GroupStateChanged`; the drained seam ran its own
+/// projection loop and never called the synthesizer. Nothing else writes those
+/// rows, and a drained batch is one-shot, so a crash-replayed rename or
+/// membership change lost its timeline row permanently and silently.
+#[tokio::test]
+async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://drained-system-rows.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("drained system rows", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    // One authenticated rename, twice: the row id is derived from the change
+    // and its epoch, so the two seams take one epoch each rather than
+    // converging on the same deterministic row.
+    let rename = |epoch: u64, name: &str| marmot_account::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(epoch),
+            actor: Some(actor.clone()),
+            change: cgka_traits::engine::GroupStateChange::GroupRenamed {
+                name: name.to_owned(),
+                previous_name: Some("drained system rows".to_owned()),
+            },
+            origin_commit_id: None,
+        }],
+        ..Default::default()
+    };
+
+    // Control: the live seam, which has always synthesized the row.
+    client
+        .observe_send_applied_effects(&rename(2, "live rename"))
+        .await
+        .unwrap();
+
+    let drained = client
+        .observe_drained_session_events(&rename(3, "replayed rename"))
+        .await
+        .unwrap();
+    // Crash replay is not exclusive with the first pass: the synthesizer is a
+    // deterministic upsert, so a second drain of the same batch must converge.
+    client
+        .observe_drained_session_events(&rename(3, "replayed rename"))
+        .await
+        .expect("re-observing a replayed batch must not error");
+
+    let rows = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let system_rows = |epoch: u64| {
+        rows.iter()
+            .filter(|row| {
+                row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM && row.source_epoch == Some(epoch)
+            })
+            .count()
+    };
+    assert_eq!(
+        system_rows(2),
+        1,
+        "control: the live seam synthesizes one kind-1210 row for the rename; got {rows:?}"
+    );
+    assert_eq!(
+        system_rows(3),
+        1,
+        "a crash-replayed rename owes the same durable kind-1210 row, once; got {rows:?}"
+    );
+    assert!(
+        drained.projection_updates.iter().any(|update| {
+            update.timeline_messages.iter().any(|row| {
+                row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM && row.source_epoch == Some(3)
+            })
+        }),
+        "and must surface it to runtime subscribers on the same summary the seam returns"
+    );
+}
+
 #[test]
 fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {
