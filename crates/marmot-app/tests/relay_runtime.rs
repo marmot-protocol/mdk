@@ -51,6 +51,7 @@ async fn mock_relay() -> (MockRelay, String) {
 }
 
 async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+    install_mock_keyring();
     let (relay, url) = mock_relay().await;
     // The test harness exercises encrypted-media upload/download against a
     // loopback MockBlossom server, which is exactly the dev/test scenario the
@@ -199,6 +200,47 @@ struct BlockKeyPackagesWhileArmed {
     armed: Arc<AtomicBool>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockDeletionsAndCountKeyPackages {
+    blocking_deletions: Arc<AtomicBool>,
+    deletions_blocked: Arc<AtomicUsize>,
+    deletion_entered: Arc<Notify>,
+    deletion_release: Arc<Notify>,
+    key_packages_seen: Arc<AtomicUsize>,
+}
+
+impl BlockDeletionsAndCountKeyPackages {
+    fn new() -> Self {
+        Self {
+            blocking_deletions: Arc::new(AtomicBool::new(false)),
+            deletions_blocked: Arc::new(AtomicUsize::new(0)),
+            deletion_entered: Arc::new(Notify::new()),
+            deletion_release: Arc::new(Notify::new()),
+            key_packages_seen: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn block_deletions(&self) {
+        self.deletions_blocked.store(0, Ordering::SeqCst);
+        self.blocking_deletions.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_deletion_blocked(&self) {
+        while self.deletions_blocked.load(Ordering::SeqCst) == 0 {
+            self.deletion_entered.notified().await;
+        }
+    }
+
+    fn release_deletions(&self) {
+        self.blocking_deletions.store(false, Ordering::SeqCst);
+        self.deletion_release.notify_waiters();
+    }
+
+    fn key_packages_seen(&self) -> usize {
+        self.key_packages_seen.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -490,8 +532,46 @@ impl WritePolicy for BlockKeyPackagesWhileArmed {
     }
 }
 
+impl WritePolicy for BlockDeletionsAndCountKeyPackages {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind == Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16) {
+                self.key_packages_seen.fetch_add(1, Ordering::SeqCst);
+            }
+            if event.kind == Kind::EventDeletion && self.blocking_deletions.load(Ordering::SeqCst) {
+                let released = self.deletion_release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.deletions_blocked.fetch_add(1, Ordering::SeqCst);
+                self.deletion_entered.notify_one();
+                released.await;
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
 async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotApp, String) {
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(RejectDeletionEvents));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    (relay, app, url)
+}
+
+async fn deletion_blocking_key_package_counting_app(
+    dir: &tempfile::TempDir,
+    gate: BlockDeletionsAndCountKeyPackages,
+) -> (LocalRelay, MarmotApp, String) {
+    let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let app = MarmotApp::with_relay_and_config(
@@ -1779,7 +1859,7 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         dir.path()
             .join("key-packages")
             .join(format!(
-                "{}.capability-refresh-v1-relay-scan-complete",
+                "{}.capability-refresh-v2-relay-scan-complete",
                 created.account.label
             ))
             .exists(),
@@ -2379,18 +2459,19 @@ async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays() {
     let home = AccountHome::open(dir.path());
     home.create_account("bob").unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    app.publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
+    runtime
+        .publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
         .await
         .unwrap();
-    let complete = app
+    let complete = runtime
         .publish_account_relay_list_kind("bob", "inbox", vec![endpoint(&url)], vec![endpoint(&url)])
         .await
         .unwrap();
     assert!(complete.complete);
     assert!(complete.missing.is_empty());
 
-    let runtime = MarmotAppRuntime::new(app.clone());
     let bob = home.account("bob").unwrap().account_id_hex;
     let rotated_bytes = runtime.rotate_key_package("bob").await.unwrap();
     let fetched = app
@@ -7796,8 +7877,9 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let status = app
+    let status = runtime
         .publish_account_relay_lists(
             "alice",
             AccountRelayListBootstrap::new(
@@ -7829,6 +7911,7 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
         .await
         .unwrap();
     assert_eq!(fetched, status);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -7838,8 +7921,9 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
     let (_inbox_relay, inbox_url) = mock_relay().await;
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let status = app
+    let status = runtime
         .set_account_nip65_relays(
             "alice",
             vec![endpoint(&seed_url)],
@@ -7853,7 +7937,7 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
         vec![seed_url.clone()]
     );
 
-    let status = app
+    let status = runtime
         .set_account_inbox_relays(
             "alice",
             vec![endpoint(&inbox_url)],
@@ -7867,6 +7951,7 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
         app.account_inbox_relays("alice").unwrap(),
         vec![inbox_url.clone()]
     );
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -7876,8 +7961,9 @@ async fn relay_app_nip65_getter_setter_round_trip_preserves_roles() {
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
     let read_only_url = "wss://read-only.example".to_owned();
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let status = app
+    let status = runtime
         .publish_account_nip65_relay_set(
             "alice",
             vec![endpoint(&seed_url), endpoint(&read_only_url)],
@@ -7897,7 +7983,7 @@ async fn relay_app_nip65_getter_setter_round_trip_preserves_roles() {
         editable_relays,
         vec![seed_url.clone(), read_only_url.clone()]
     );
-    let status = app
+    let status = runtime
         .set_account_nip65_relays(
             "alice",
             editable_relays.into_iter().map(TransportEndpoint).collect(),
@@ -7911,6 +7997,7 @@ async fn relay_app_nip65_getter_setter_round_trip_preserves_roles() {
         vec![seed_url.clone(), read_only_url]
     );
     assert_eq!(status.nip65.write_relays, vec![seed_url]);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -7955,8 +8042,9 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
     let (seed_b, seed_b_url) = mock_relay().await;
     let _relays = (seed_a, seed_b);
     let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let cached = app
+    let cached = runtime
         .publish_account_relay_lists(
             "alice",
             AccountRelayListBootstrap::new(
@@ -7979,6 +8067,7 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
         .unwrap()
         .expect("cached directory entry");
     assert_eq!(directory_entry.relay_lists, cached);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -8168,8 +8257,9 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let inbox = app
+    let inbox = runtime
         .set_account_inbox_relays(
             "alice",
             vec![endpoint(&seed_url), endpoint("wss://relay.nostr.band")],
@@ -8180,7 +8270,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
         matches!(inbox, Err(AppError::RelayDirectory(message)) if message.contains("account relay-list declaration") && message.contains("retired"))
     );
 
-    let bootstrap = app
+    let bootstrap = runtime
         .publish_account_relay_lists(
             "alice",
             AccountRelayListBootstrap::new(
@@ -8193,7 +8283,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
         matches!(bootstrap, Err(AppError::RelayDirectory(message)) if message.contains("account relay-list publication") && message.contains("retired"))
     );
 
-    let nip65_read = app
+    let nip65_read = runtime
         .publish_account_nip65_relay_set(
             "alice",
             vec![endpoint("wss://relay.nostr.band")],
@@ -8205,7 +8295,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
         matches!(nip65_read, Err(AppError::RelayDirectory(message)) if message.contains("account NIP-65 read-relay declaration") && message.contains("retired"))
     );
 
-    let nip65_write = app
+    let nip65_write = runtime
         .publish_account_nip65_relay_set(
             "alice",
             vec![endpoint(&seed_url)],
@@ -8216,6 +8306,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
     assert!(
         matches!(nip65_write, Err(AppError::RelayDirectory(message)) if message.contains("account NIP-65 write-relay declaration") && message.contains("retired"))
     );
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -8224,8 +8315,9 @@ async fn relay_list_all_read_fetch_clears_cached_write_targets() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let cached = app
+    let cached = runtime
         .publish_account_relay_lists(
             "alice",
             AccountRelayListBootstrap::new(vec![endpoint(&seed_url)], vec![endpoint(&seed_url)]),
@@ -8260,6 +8352,7 @@ async fn relay_list_all_read_fetch_clears_cached_write_targets() {
     assert_eq!(fetched.nip65.read_relays, vec!["wss://read-only.example"]);
     assert_eq!(fetched.inbox, cached.inbox);
     assert_eq!(fetched.missing, vec![MissingRelayListKind::Nip65]);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -8271,8 +8364,9 @@ async fn relay_list_fetch_rejects_future_events_and_keeps_cached_lists() {
     let (seed_b, seed_b_url) = mock_relay().await;
     let _relays = (seed_a, seed_b);
     let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    let cached = app
+    let cached = runtime
         .publish_account_relay_lists(
             "alice",
             AccountRelayListBootstrap::new(
@@ -8303,6 +8397,7 @@ async fn relay_list_fetch_rejects_future_events_and_keeps_cached_lists() {
         .unwrap()
         .expect("cached directory entry");
     assert_eq!(directory_entry.relay_lists, cached);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -8348,13 +8443,15 @@ async fn directory_cache_is_durable_app_state_not_json_user_files() {
     home.create_account("alice").unwrap();
     let (_seed, app, seed_url) = mock_app(&dir).await;
     let account_id = home.account("alice").unwrap().account_id_hex;
+    let runtime = MarmotAppRuntime::new(app.clone());
 
-    app.publish_account_relay_lists(
-        "alice",
-        AccountRelayListBootstrap::new(vec![endpoint(&seed_url)], vec![endpoint(&seed_url)]),
-    )
-    .await
-    .unwrap();
+    runtime
+        .publish_account_relay_lists(
+            "alice",
+            AccountRelayListBootstrap::new(vec![endpoint(&seed_url)], vec![endpoint(&seed_url)]),
+        )
+        .await
+        .unwrap();
 
     let reopened = MarmotApp::with_relay(dir.path(), seed_url);
     let cached = reopened
@@ -8369,6 +8466,7 @@ async fn directory_cache_is_durable_app_state_not_json_user_files() {
     assert!(sqlite_file_requires_key_for_test(&cache_path));
     assert!(!dir.path().join("app-cache.sqlite3").exists());
     assert!(!dir.path().join("directory/users").exists());
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -8863,6 +8961,149 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     assert!(runtime.accounts().resolve(&account_id).is_err());
 
     runtime.shutdown().await;
+}
+
+async fn assert_account_teardown_quiesces_worker_before_key_package_deletion(destructive: bool) {
+    install_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockDeletionsAndCountKeyPackages::new();
+    let (_relay, app, url) = deletion_blocking_key_package_counting_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let created = timeout(
+        Duration::from_secs(10),
+        runtime.create_identity_local_ready(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("local account setup must not stall")
+    .expect("local account setup must succeed");
+    let account_id = created.account.account_id_hex;
+    wait_for_account_network_ready(&runtime, &account_id).await;
+    timeout(Duration::from_secs(20), async {
+        while gate.key_packages_seen() == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must publish a KeyPackage before teardown");
+    let key_packages_before_teardown = gate.key_packages_seen();
+    assert!(
+        key_packages_before_teardown > 0,
+        "setup must publish a KeyPackage before exercising teardown"
+    );
+
+    gate.block_deletions();
+    let teardown_runtime = runtime.clone();
+    let teardown_account_id = account_id.clone();
+    let teardown = tokio::spawn(async move {
+        if destructive {
+            let outcome = teardown_runtime
+                .sign_out_and_wipe(&teardown_account_id)
+                .await?;
+            Ok::<_, AppError>((
+                outcome.key_packages_deleted,
+                outcome.key_package_failures,
+                outcome.local_cleanup,
+            ))
+        } else {
+            let outcome = teardown_runtime
+                .sign_out(&teardown_account_id, SignOutOptions::default())
+                .await?;
+            Ok((
+                outcome.key_packages_deleted,
+                outcome.key_package_failures,
+                outcome.local_cleanup,
+            ))
+        }
+    });
+
+    timeout(Duration::from_secs(10), gate.wait_until_deletion_blocked())
+        .await
+        .expect("teardown must reach KeyPackage deletion");
+
+    // The relay is holding the deletion open. At this exact boundary the
+    // durable signed-out marker must already be set and the worker fully
+    // reaped. Before the fix, teardown deleted first and left the worker live,
+    // so this rotation published a new KeyPackage that was absent from the
+    // discovery snapshot and survived the deletion.
+    let managed = runtime
+        .accounts()
+        .managed_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.account_id_hex == account_id)
+        .expect("the account is removed only after relay cleanup completes");
+    assert!(managed.signed_out);
+    assert!(!managed.running);
+    let rotation = timeout(
+        Duration::from_secs(2),
+        runtime.rotate_key_package(&account_id),
+    )
+    .await
+    .expect("a post-quiescence rotation must fail without waiting on a worker");
+    assert!(
+        rotation.is_err(),
+        "teardown must close worker publication admission before deletion"
+    );
+    assert_eq!(
+        gate.key_packages_seen(),
+        key_packages_before_teardown,
+        "no KeyPackage may be published after relay deletion starts"
+    );
+    let concurrent_sign_in = timeout(Duration::from_secs(2), runtime.sign_in_account(&account_id))
+        .await
+        .expect("a concurrent sign-in must fail promptly instead of waiting on relay cleanup");
+    assert!(
+        matches!(concurrent_sign_in, Err(AppError::AccountWorkerBusy)),
+        "the account-scoped teardown barrier must reject concurrent sign-in: {concurrent_sign_in:?}"
+    );
+
+    gate.release_deletions();
+    let (deleted, failures, local_cleanup) = timeout(Duration::from_secs(10), teardown)
+        .await
+        .expect("teardown must finish after deletion is released")
+        .expect("teardown task must not panic")
+        .expect("teardown must succeed");
+    assert!(deleted >= 1);
+    assert!(
+        failures.is_empty(),
+        "unexpected deletion failures: {failures:?}"
+    );
+    assert!(local_cleanup.completed);
+    assert!(local_cleanup.reason.is_none());
+
+    if destructive {
+        assert!(
+            runtime.sign_in_account(&account_id).await.is_err(),
+            "a wiped account must remain absent after the teardown barrier clears"
+        );
+    } else {
+        let signed_in = timeout(
+            Duration::from_secs(10),
+            runtime.sign_in_account(&account_id),
+        )
+        .await
+        .expect("sign-in must resume once relay cleanup releases the barrier")
+        .expect("a non-destructively signed-out account must remain sign-in capable");
+        assert!(signed_in.running);
+        assert!(!signed_in.signed_out);
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn app_runtime_sign_out_quiesces_worker_before_key_package_deletion() {
+    assert_account_teardown_quiesces_worker_before_key_package_deletion(false).await;
+}
+
+#[tokio::test]
+async fn app_runtime_wipe_quiesces_worker_before_key_package_deletion() {
+    assert_account_teardown_quiesces_worker_before_key_package_deletion(true).await;
 }
 
 #[tokio::test]
