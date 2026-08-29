@@ -906,6 +906,16 @@ pub struct TransportEndpointFailure {
     pub rejection_category: Option<TransportEndpointRejectionCategory>,
 }
 
+impl TransportEndpointFailure {
+    /// Whether the adapter mapped an exact, stable relay response to terminal
+    /// target-absence evidence. The sentinel reason is adapter-authored and
+    /// privacy-safe; arbitrary relay suffix text is never retained here.
+    pub fn confirms_target_absence(&self) -> bool {
+        self.rejection_category == Some(TransportEndpointRejectionCategory::Invalid)
+            && self.reason == "relay rejected event (not-found)"
+    }
+}
+
 /// Publish failure surfaced by transport adapters.
 ///
 /// `summary` is safe for `Display`/logging. Per-endpoint diagnostics live in

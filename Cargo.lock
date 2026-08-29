@@ -1989,6 +1989,7 @@ version = "0.9.18"
 dependencies = [
  "libc",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

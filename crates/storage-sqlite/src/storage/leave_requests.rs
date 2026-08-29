@@ -105,6 +105,7 @@ mod tests {
             group_id: group.id.clone(),
             requested_at_ms: 42,
             last_proposed_epoch: Some(EpochId(3)),
+            last_proposed_message_id: None,
         };
         store.put_leave_request(&request).unwrap();
         assert_eq!(store.leave_request(&group.id).unwrap(), Some(request));

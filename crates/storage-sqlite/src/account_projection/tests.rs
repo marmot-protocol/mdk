@@ -2855,6 +2855,78 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
 }
 
 #[test]
+fn visibility_batch_ack_is_atomic_with_projection_delta() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let operation_id = b"visibility-operation";
+    let batch_id = b"visibility-batch".to_vec();
+    store
+        .upsert_account_visibility_journal(operation_id, 1, &batch_id, b"opaque-effects")
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_visibility_projection
+             BEFORE INSERT ON account_groups
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected visibility projection failure');
+             END;",
+        )
+        .unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: vec!["visible-event".to_owned()],
+        last_transport_timestamp: None,
+        groups: vec![group("aa", "visible group")],
+    };
+
+    let result = store
+        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+            &state,
+            16,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+            std::slice::from_ref(&batch_id),
+        );
+
+    assert!(result.is_err());
+    assert_eq!(store.load_account_visibility_journal().unwrap().len(), 1);
+    assert!(
+        store
+            .load_account_projection_state("alice", 16)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "a failed projection must not expose state while keeping the lower row",
+    );
+
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_visibility_projection")
+        .unwrap();
+    store
+        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+            &state,
+            16,
+            MAX_FUTURE_SKEW_SECS,
+            &[],
+            &[],
+            std::slice::from_ref(&batch_id),
+        )
+        .unwrap();
+    assert!(store.load_account_visibility_journal().unwrap().is_empty());
+    assert_eq!(
+        store
+            .load_account_projection_state("alice", 16)
+            .unwrap()
+            .groups,
+        state.groups,
+    );
+}
+
+#[test]
 fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);
