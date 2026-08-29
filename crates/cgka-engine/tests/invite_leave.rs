@@ -3029,11 +3029,18 @@ async fn leave_hydration_preserves_existing_last_proposed_message_id() {
     bob_storage.put_leave_request(&request).unwrap();
     drop(bob);
 
-    let _reopened = build_client_on_storage(b"bob", bob_storage.clone());
+    let mut reopened = build_client_on_storage(b"bob", bob_storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("eager hydrate restores the leave request");
     let restored = bob_storage
         .leave_request(&group_id)
         .unwrap()
         .expect("hydration restores the LeaveRequest");
+    assert!(
+        restored.last_proposed_epoch.is_some(),
+        "epoch-only hydration repair must fill last_proposed_epoch"
+    );
     assert_eq!(
         restored.last_proposed_message_id.as_ref(),
         Some(&second_id),
