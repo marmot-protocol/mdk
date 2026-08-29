@@ -2056,8 +2056,8 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         if let Some(mut request) = self.storage.leave_request(group_id)? {
-            if request.last_proposed_epoch.is_none()
-                && self.sent_self_remove_leaving_gate_should_restore(
+            if (request.last_proposed_epoch.is_none() || request.last_proposed_message_id.is_none())
+                && let Some(message_id) = self.sent_self_remove_message_to_restore(
                     group_id,
                     mls_group,
                     group,
@@ -2065,13 +2065,16 @@ impl<S: StorageProvider> Engine<S> {
                     stored_message_records,
                 )?
             {
-                request.last_proposed_epoch = Some(group.epoch);
+                if request.last_proposed_epoch.is_none() {
+                    request.last_proposed_epoch = Some(group.epoch);
+                }
+                request.last_proposed_message_id = Some(message_id);
                 self.storage.put_leave_request(&request)?;
             }
             return Ok(Some(request));
         }
 
-        if self.sent_self_remove_leaving_gate_should_restore(
+        if let Some(message_id) = self.sent_self_remove_message_to_restore(
             group_id,
             mls_group,
             group,
@@ -2082,6 +2085,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
                 requested_at_ms: self.convergence_now_ms(),
                 last_proposed_epoch: Some(group.epoch),
+                last_proposed_message_id: Some(message_id),
             };
             self.storage.put_leave_request(&request)?;
             return Ok(Some(request));
@@ -2215,20 +2219,20 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    fn sent_self_remove_leaving_gate_should_restore(
+    fn sent_self_remove_message_to_restore(
         &self,
         group_id: &GroupId,
         mls_group: &mut openmls::group::MlsGroup,
         group: &Group,
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
         stored_message_records: &[cgka_traits::message::MessageRecord],
-    ) -> Result<bool, cgka_traits::storage::StorageError> {
+    ) -> Result<Option<MessageId>, cgka_traits::storage::StorageError> {
         if !group
             .members
             .iter()
             .any(|member| &member.id == self.identity.self_id())
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         for record in stored_message_records {
@@ -2277,11 +2281,11 @@ impl<S: StorageProvider> Engine<S> {
                 && matches!(queued.proposal(), Proposal::SelfRemove)
                 && crate::app_components::authorize_standalone_proposal(mls_group, &queued).is_ok()
             {
-                return Ok(true);
+                return Ok(Some(record.id.clone()));
             }
         }
 
-        Ok(false)
+        Ok(None)
     }
 
     fn quarantine_stored_group_on_hydrate(

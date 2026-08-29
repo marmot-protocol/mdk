@@ -27,6 +27,7 @@ use crate::{
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
     PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
     PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    SyncFailure, SyncSummary,
 };
 
 impl AccountManager {
@@ -155,6 +156,28 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         long_account_worker_catch_up_response(response).await
+    }
+
+    /// Run one caller-visible sync through the selected account's owning
+    /// worker, preserving the exact applied prefix when a later stage fails.
+    pub async fn sync_with_partial_progress(
+        &self,
+        account_ref: &str,
+    ) -> Result<SyncSummary, SyncFailure> {
+        let command = self
+            .worker_commands(account_ref)
+            .await
+            .map_err(SyncFailure::from)?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SyncWithPartialProgress { respond })
+            .await
+            .map_err(|_| SyncFailure::from(AppError::TransportClosed))?;
+        match tokio::time::timeout(super::APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT, response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(SyncFailure::from(AppError::TransportClosed)),
+            Err(_) => Err(SyncFailure::from(AppError::AccountWorkerResponseTimedOut)),
+        }
     }
 
     /// Create the group and return its canonical id. Invitation delivery is

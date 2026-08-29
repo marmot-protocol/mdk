@@ -206,12 +206,12 @@ fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

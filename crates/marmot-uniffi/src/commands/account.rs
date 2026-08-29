@@ -89,8 +89,9 @@ impl Marmot {
     /// groups, message history, and drafts intact. The account ref stays valid
     /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
     /// KeyPackage cleanup failures. These are the final best-effort results for
-    /// this call; the runtime does not persist a remote-deletion retry queue
-    /// (mdk#477).
+    /// this call. The durable lifecycle retains superseded per-relay cleanup
+    /// obligations and forces a new signed revision on next activation when a
+    /// live revision may have been deleted (mdk#477).
     pub async fn sign_out(
         &self,
         account_ref: String,
@@ -350,7 +351,7 @@ impl Marmot {
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
         );
-        self.app
+        self.runtime
             .publish_account_relay_lists(&account_ref, bootstrap)
             .await?;
         Ok(())

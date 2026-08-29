@@ -973,12 +973,36 @@ impl SqliteAccountStorage {
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
     ) -> StorageResult<()> {
+        self.save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            frontiers_to_clear,
+            application_event_ids_to_ack,
+            &[],
+        )
+    }
+
+    /// Persist the complete account projection and atomically transfer both
+    /// engine application events and lower account-visibility rows into app
+    /// ownership. A crash therefore replays the rows or observes their fully
+    /// committed projection, never an engine state advance with neither.
+    pub fn save_account_projection_state_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+        visibility_batch_ids_to_ack: &[Vec<u8>],
+    ) -> StorageResult<()> {
         self.save_account_projection(
             state,
             max_seen_events,
             max_future_skew_secs,
             frontiers_to_clear,
             application_event_ids_to_ack,
+            visibility_batch_ids_to_ack,
             true,
         )
     }
@@ -1001,16 +1025,38 @@ impl SqliteAccountStorage {
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
     ) -> StorageResult<()> {
+        self.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            frontiers_to_clear,
+            application_event_ids_to_ack,
+            &[],
+        )
+    }
+
+    /// Delta counterpart to the full-snapshot visibility transfer above.
+    pub fn save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+        visibility_batch_ids_to_ack: &[Vec<u8>],
+    ) -> StorageResult<()> {
         self.save_account_projection(
             state,
             max_seen_events,
             max_future_skew_secs,
             frontiers_to_clear,
             application_event_ids_to_ack,
+            visibility_batch_ids_to_ack,
             false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_account_projection(
         &self,
         state: &StoredAccountState,
@@ -1018,6 +1064,7 @@ impl SqliteAccountStorage {
         max_future_skew_secs: u64,
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
+        visibility_batch_ids_to_ack: &[Vec<u8>],
         replace_group_snapshot: bool,
     ) -> StorageResult<()> {
         let now = unix_now_seconds();
@@ -1267,6 +1314,13 @@ impl SqliteAccountStorage {
                 conn.execute(
                     "DELETE FROM pending_application_events WHERE message_id = ?1",
                     params![message_id.as_slice()],
+                )
+                    .storage()?;
+            }
+            for batch_id in visibility_batch_ids_to_ack {
+                conn.execute(
+                    "DELETE FROM account_visibility_journal WHERE batch_id = ?1",
+                    params![batch_id],
                 )
                 .storage()?;
             }

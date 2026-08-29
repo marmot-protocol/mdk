@@ -21,15 +21,19 @@ pub use home::{
     DEFAULT_KEYCHAIN_SERVICE_NAME, EXTERNAL_SQLCIPHER_SECRET_FILE, NostrAccountImport,
 };
 pub use key_package::{
-    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    NoopKeyPackagePublisher,
+    DetailedKeyPackagePublishReceipt, KeyPackagePublication, KeyPackagePublishError,
+    KeyPackagePublishReceipt, KeyPackagePublisher, NoopKeyPackagePublisher,
 };
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
-    AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects, CompletedWelcomePublishTask,
+    AccountDeviceEffects, AccountDeviceRuntime, AccountIngestEffects,
+    AccountVisibilityActionOutcome, AccountVisibilityBatch, AccountVisibilityLease,
+    AccountVisibilityOutboundAction, AccountVisibilityRecordKind, AccountVisibilitySource,
+    CompletedWelcomePublishTask, LeasedAccountDeviceEffects, LeasedAccountIngestEffects,
     PendingResolution, PreparedSessionCommit, PreparedSessionSend, PreparedWelcomePublishTask,
-    PublishFailure, PublishedApplicationMessage, UnresolvedApplicationMessage, UnresolvedPublish,
-    UnresolvedPublishReason, WelcomeDeliveryFailure,
+    PublishFailure, PublishedApplicationMessage, RetiredKeyPackageDeletionPassReport,
+    UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    WelcomeDeliveryFailure,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
 pub use time::{

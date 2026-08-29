@@ -4,10 +4,10 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,13 +42,14 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_G
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
 use cgka_traits::storage::{DisbandTombstoneStorage, KeyPackageBundleStorage, MaintenanceStorage};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::{
     GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
     TransportPublishTarget,
 };
 use marmot_account::{
-    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
+    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase,
+    AccountSummary, DetailedKeyPackagePublishReceipt, KeyPackagePublication,
     KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, TransportRoutingError,
     TransportRoutingPolicy,
 };
@@ -95,6 +96,8 @@ mod projection;
 mod publisher_sequences;
 mod relay_plane;
 mod relay_telemetry_export;
+#[cfg(test)]
+mod removed_local_key_package_tests;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
@@ -277,10 +280,7 @@ use key_package_records::{
     publish_endpoints_from_bootstrap,
 };
 #[cfg(test)]
-use key_package_records::{
-    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
-    validated_cached_key_package,
-};
+use key_package_records::{fresh_or_cached_key_package, validated_cached_key_package};
 use projection::LegacyAccountProjectionDb;
 use relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 
@@ -302,8 +302,20 @@ pub(crate) const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
 const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
+// Each reported account-runtime pass can perform at most one relay deletion.
+// Keep one app cutover invocation bounded even if a relay exposes a long
+// parameterized-replaceable history one winner at a time. The durable frontier
+// makes the next open/retry resume without losing the post-delete scan proof.
+const KEY_PACKAGE_CUTOVER_MAX_DELETION_PASSES: usize = 16;
+// A durable history endpoint is retained across route generations so a crash
+// cannot forget it after SQL liability pruning. Bound that monotonic set; a
+// 257th unique relay is rejected before exact deletion I/O rather than turning
+// a privacy journal into unbounded state.
+const KEY_PACKAGE_CUTOVER_RELAY_HISTORY_CAPACITY: usize = 256;
+const KEY_PACKAGE_REAUTHOR_AT_AGE_SECS: u64 = 10 * 60;
 const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
+const REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_DIR: &str = "removed-local-slots-v1";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 /// Maximum wall-clock quantum one epoch-gap backfill drain owns the serial
@@ -551,6 +563,15 @@ type AppRuntime = AccountDeviceRuntime<
     AppTransportRouting,
     AppKeyPackagePublisher,
 >;
+type CanonicalNip65RouteState = (
+    Vec<TransportEndpoint>,
+    Vec<TransportEndpoint>,
+    Vec<TransportEndpoint>,
+);
+type KeyPackageDeletionEndpointAliases = (
+    Vec<TransportEndpoint>,
+    Vec<(TransportEndpoint, TransportEndpoint)>,
+);
 
 #[cfg(test)]
 type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
@@ -579,13 +600,34 @@ pub struct MarmotApp {
     /// [`Self::close_storage`] holds the write side across its whole teardown.
     /// See [`Self::begin_storage_open`].
     storage_lifecycle: Arc<RwLock<()>>,
+    /// Admission for synchronous mutations of AccountHome and other files in
+    /// the Marmot root. Terminal close holds the writer through root-lease
+    /// release, so detached old-runtime work either commits before ownership
+    /// transfers or wakes afterward and observes the closed latch.
+    root_mutation_lifecycle: Arc<RwLock<()>>,
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
     config: MarmotAppConfig,
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    /// Session-owned connections are opened independently from
+    /// `account_storages`. Retain one close handle per live account session so
+    /// terminal close and per-account eviction can make every engine/OpenMLS
+    /// clone inert without waiting for an unabortable blocking open to drop.
+    account_session_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
+    /// Process-local monotonic admission for account sessions. The durable
+    /// signed-out bit says whether a new session may be opened; this
+    /// generation additionally makes every capability captured before a
+    /// sign-out permanently stale, even after an explicit sign-in clears that
+    /// reversible bit again.
+    account_session_admissions: Arc<Mutex<HashMap<String, AccountSessionAdmissionState>>>,
+    next_account_session_admission_generation: Arc<AtomicU64>,
+    /// Revocable transport capability for the one live session per account.
+    /// Runtime teardown uses this registry to reach standalone public-client
+    /// relay planes, not only the managed runtime's shared plane.
+    account_session_adapters: Arc<Mutex<HashMap<String, MarmotRelayPlaneAccountAdapter>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
@@ -611,6 +653,26 @@ pub struct MarmotApp {
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
+    /// Serialize the authoritative NIP-65 mutation boundary with the final
+    /// kind-30443 check and relay send for each account. This closes the gap in
+    /// which a route-list event could commit after validation but before the
+    /// old-route KeyPackage attempt reached the transport.
+    key_package_route_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Serialize an exact KeyPackage deletion, its pre-I/O relay-history
+    /// frontier, and the strict replay that discharges that frontier with the
+    /// final kind-30443 publication boundary. This is deliberately distinct
+    /// from `key_package_route_locks`: cutover holds the route lock while it
+    /// invokes deletion and would deadlock on recursive acquisition.
+    key_package_history_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The root-mutation lifecycle is a close-admission read lock, not an
+    /// exclusive file-operation lock. Serialize frontier read/modify/write
+    /// sequences across app clones so a concurrent endpoint arm cannot be
+    /// lost by another clone's completion update.
+    key_package_frontier_mutation_lock: Arc<Mutex<()>>,
+    /// Serialize immutable removed-local-slot publication with directory
+    /// projection writes. A concurrent relay echo therefore either commits
+    /// before the tombstone scrub or observes the tombstone and is rejected.
+    removed_local_key_package_mutation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1161,9 +1223,190 @@ pub(crate) struct KeyPackageDeletionTarget {
 }
 
 #[derive(Debug)]
+pub(crate) struct KeyPackageDeletionAdmission {
+    pub admitted: Vec<KeyPackageDeletionTarget>,
+    pub deferred: Vec<KeyPackageDeletionTarget>,
+    /// Safety-rejected exact keys that were journaled but must not reach I/O.
+    pub unsafe_targets: Vec<KeyPackageDeletionTarget>,
+    /// Malformed target rows that cannot be journaled or sent. They remain
+    /// isolated from valid siblings in the same teardown batch.
+    pub invalid_targets: Vec<KeyPackageDeletionInvalidTarget>,
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyPackageDeletionInvalidTarget {
+    pub target: KeyPackageDeletionTarget,
+    pub reason: String,
+}
+
+#[derive(Debug)]
+struct CachedKeyPackageRetirementAdmission {
+    complete: bool,
+    event_id: Option<MessageId>,
+}
+
+#[derive(Debug)]
 pub(crate) struct KeyPackageDeletionResult {
     pub event_id_hex: String,
+    pub accepted_endpoints: Vec<TransportEndpoint>,
+    pub confirmed_absent_endpoints: Vec<TransportEndpoint>,
+    pub failed_endpoints: Vec<TransportEndpoint>,
     pub result: Result<usize, AppError>,
+}
+
+fn canonicalize_key_package_fanout_targets<F>(
+    targets: &mut Vec<cgka_traits::TransportFanoutTarget>,
+    mut canonicalize: F,
+) -> bool
+where
+    F: FnMut(&TransportEndpoint) -> Option<TransportEndpoint>,
+{
+    let before = targets.clone();
+    for target in targets.iter_mut() {
+        if let Some(canonical) = canonicalize(&target.endpoint) {
+            target.endpoint = canonical;
+        }
+    }
+    targets.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    let mut merged = Vec::<cgka_traits::TransportFanoutTarget>::with_capacity(targets.len());
+    for candidate in std::mem::take(targets) {
+        if let Some(existing) = merged
+            .last_mut()
+            .filter(|existing| existing.endpoint == candidate.endpoint)
+        {
+            merge_key_package_fanout_target_evidence(existing, candidate);
+        } else {
+            merged.push(candidate);
+        }
+    }
+    *targets = merged;
+    *targets != before
+}
+
+fn key_package_lifecycle_endpoint_liability_count(
+    lifecycle: &cgka_traits::KeyPackageLifecycleState,
+) -> usize {
+    let mut liabilities = HashSet::<(Vec<u8>, TransportEndpoint)>::new();
+    let mut include = |event_id: &MessageId, targets: &[cgka_traits::TransportFanoutTarget]| {
+        for target in targets {
+            if target.failure_code.as_deref() != Some("confirmed_absent") {
+                liabilities.insert((event_id.as_slice().to_vec(), target.endpoint.clone()));
+            }
+        }
+    };
+    if let Some(event_id) = lifecycle
+        .authored_signed_event
+        .as_ref()
+        .map(|artifact| &artifact.id)
+        .or(lifecycle.authored_event_id.as_ref())
+    {
+        include(event_id, &lifecycle.publication_targets);
+    }
+    if let Some(pending) = lifecycle.pending_replacement.as_ref()
+        && let Some(artifact) = pending.signed_event.as_ref()
+    {
+        include(&artifact.id, &pending.targets);
+    }
+    for retired in &lifecycle.retired_publications_pending_deletion {
+        include(&retired.event_id, &retired.deletion_targets);
+    }
+    liabilities.len()
+}
+
+fn retain_imported_legacy_key_package_publication(
+    lifecycle: &mut cgka_traits::KeyPackageLifecycleState,
+    imported: cgka_traits::RetiredKeyPackagePublication,
+) {
+    if let Some(existing) = lifecycle
+        .retired_publications_pending_deletion
+        .iter_mut()
+        .find(|existing| existing.event_id == imported.event_id)
+    {
+        existing.authored_created_at = existing
+            .authored_created_at
+            .max(imported.authored_created_at);
+        if existing.key_package_ref.is_none() {
+            existing.key_package_ref = imported.key_package_ref;
+        }
+        if existing.package_not_after.is_none() {
+            existing.package_not_after = imported.package_not_after;
+        }
+        existing.delete_without_successor |= imported.delete_without_successor;
+        for target in imported.deletion_targets {
+            if !existing
+                .deletion_targets
+                .iter()
+                .any(|candidate| candidate.endpoint == target.endpoint)
+            {
+                existing.deletion_targets.push(target);
+            }
+        }
+        existing
+            .deletion_targets
+            .sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+        return;
+    }
+
+    lifecycle
+        .retired_publications_pending_deletion
+        .push(imported);
+    lifecycle
+        .retired_publications_pending_deletion
+        .sort_by(|left, right| {
+            left.authored_created_at
+                .cmp(&right.authored_created_at)
+                .then_with(|| left.event_id.as_slice().cmp(right.event_id.as_slice()))
+        });
+}
+
+fn merge_key_package_fanout_target_evidence(
+    existing: &mut cgka_traits::TransportFanoutTarget,
+    candidate: cgka_traits::TransportFanoutTarget,
+) {
+    use cgka_traits::TransportFanoutAttemptState;
+
+    let confirmed_absent = existing.failure_code.as_deref() == Some("confirmed_absent")
+        || candidate.failure_code.as_deref() == Some("confirmed_absent");
+    let accepted = existing.state == TransportFanoutAttemptState::Accepted
+        || candidate.state == TransportFanoutAttemptState::Accepted;
+    let existing_policy_prohibited =
+        existing.state == TransportFanoutAttemptState::PolicyProhibited;
+    let candidate_policy_prohibited =
+        candidate.state == TransportFanoutAttemptState::PolicyProhibited;
+    let all_policy_prohibited = existing_policy_prohibited && candidate_policy_prohibited;
+    let attempted = existing.attempt_count > 0
+        || candidate.attempt_count > 0
+        || existing.last_attempt_at.is_some()
+        || candidate.last_attempt_at.is_some()
+        || existing.state == TransportFanoutAttemptState::AttemptedFailed
+        || candidate.state == TransportFanoutAttemptState::AttemptedFailed;
+    let policy_failure = existing
+        .failure_code
+        .clone()
+        .or(candidate.failure_code.clone());
+
+    existing.attempt_count = existing.attempt_count.max(candidate.attempt_count);
+    existing.last_attempt_at = match (existing.last_attempt_at, candidate.last_attempt_at) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    if confirmed_absent {
+        existing.state = TransportFanoutAttemptState::AttemptedFailed;
+        existing.failure_code = Some("confirmed_absent".into());
+    } else if accepted {
+        existing.state = TransportFanoutAttemptState::Accepted;
+        existing.failure_code = None;
+    } else if all_policy_prohibited {
+        existing.state = TransportFanoutAttemptState::PolicyProhibited;
+        existing.failure_code =
+            policy_failure.or_else(|| Some("endpoint_removed_from_policy".into()));
+    } else if attempted {
+        existing.state = TransportFanoutAttemptState::AttemptedFailed;
+        existing.failure_code = Some("possible_exposure".into());
+    } else {
+        existing.state = TransportFanoutAttemptState::Unattempted;
+        existing.failure_code = None;
+    }
 }
 
 /// Per-account unread aggregate, suitable for an account-switcher and
@@ -1262,9 +1505,127 @@ struct KeyPackageRecord {
     key_package_hex: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RemovedLocalKeyPackageTombstone {
+    account_id_hex: String,
+    /// `None` is the explicit legacy fail-closed fallback used only when the
+    /// removed account's durable NIP-33 slot can no longer be proven.
+    stable_slot_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemovedLocalKeyPackageScope {
+    StableSlot(String),
+    AccountWideLegacy,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct KeyPackageCutoverScanMarker {
+    /// `false` for markers authored by the pre-peeling implementation. Those
+    /// markers proved only one visible NIP-33 winner per relay and must never
+    /// authorize publication after this upgrade.
+    #[serde(default)]
+    strict_history_peeling: bool,
+    #[serde(default)]
+    fresh_account_proof: bool,
+    #[serde(default)]
+    authoritative_relays: Vec<String>,
+    /// Every durable current/pending/retired publication endpoint covered by
+    /// the strict scan, including relays no longer present in NIP-65.
+    #[serde(default)]
+    history_relays: Vec<String>,
+    /// NIP-33 ordering coordinate of the self-authored kind-10002 projection
+    /// whose write-relay set was scanned. URL equality alone is insufficient:
+    /// a B -> A -> B route cycle may expose a new same-slot KeyPackage on B.
+    #[serde(default)]
+    route_created_at: Option<u64>,
+    #[serde(default)]
+    route_event_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct KeyPackageCutoverRelayFrontier {
+    #[serde(default)]
+    relays: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct KeyPackageRelayAdmissionSummary {
+    non_current_event_count: usize,
+    discovered_current_revision_count: usize,
+    deferred_endpoint_count: usize,
+    admission_failure_count: usize,
+}
+
+impl KeyPackageRelayAdmissionSummary {
+    fn absorb(&mut self, other: Self) {
+        self.non_current_event_count = self
+            .non_current_event_count
+            .saturating_add(other.non_current_event_count);
+        self.discovered_current_revision_count = self
+            .discovered_current_revision_count
+            .saturating_add(other.discovered_current_revision_count);
+        self.deferred_endpoint_count = self
+            .deferred_endpoint_count
+            .saturating_add(other.deferred_endpoint_count);
+        self.admission_failure_count = self
+            .admission_failure_count
+            .saturating_add(other.admission_failure_count);
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Nip65RouteGeneration {
+    created_at: u64,
+    event_id: String,
+    /// Exact parsed write-relay authority from the same verified kind-10002
+    /// event. Directory cache rows remain projections and must never select a
+    /// different route merely because they carry a newer profile or
+    /// KeyPackage timestamp.
+    nip65: AccountRelayListState,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratedNip65RouteAuthorityProof {
+    generation: Nip65RouteGeneration,
+    endpoints: Vec<TransportEndpoint>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Nip65RouteMutationSource {
+    /// Includes every pre-field journal and every ordinary route edit. Keeping
+    /// this as the serde default makes old intents retain the strict gate.
+    #[default]
+    AccountMutation,
+    /// The first route declaration authored by a durably journaled generated
+    /// identity before any KeyPackage publication could have completed.
+    GeneratedAccountBootstrap,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingNip65RouteMutation {
+    account_id_hex: String,
+    nip65: AccountRelayListState,
+    #[serde(default)]
+    bootstrap_relays: Vec<String>,
+    #[serde(default)]
+    publish_endpoints: Vec<String>,
+    /// Exact signed local event. Relay-observed mutations are already accepted
+    /// and can recover from their proposed state plus ordering coordinate.
+    #[serde(default)]
+    signed_event: Option<NostrTransportEvent>,
+    generation: Nip65RouteGeneration,
+    #[serde(default)]
+    network_accepted: bool,
+    #[serde(default)]
+    source: Nip65RouteMutationSource,
+}
+
 struct OpenAppAccount {
     runtime: AppRuntime,
     session_guard: AppAccountSessionGuard,
+    session_admission: AccountSessionAdmission,
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
     state: AccountState,
@@ -1273,17 +1634,94 @@ struct OpenAppAccount {
     signer: Arc<dyn nostr::NostrSigner>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountSessionAdmissionToken {
+    account_id_hex: String,
+    generation: u64,
+}
+
+/// Exact capability required by the lowest account relay-list signing and
+/// publication boundary. Ordinary edits carry the live account-session
+/// generation; setup publication carries its separately revocable setup
+/// generation. There is deliberately no capability-free variant.
+#[derive(Clone, Copy)]
+enum AccountRelayListMutationAdmission<'a> {
+    Active(&'a AccountSessionAdmissionToken),
+    Setup(&'a runtime::AccountSetupPublicationAdmission),
+}
+
+/// Exact, process-local capability for the cleanup phase of one account
+/// teardown. It is valid only while ordinary admission remains closed at the
+/// generation against which it was minted, and the teardown barrier revokes
+/// it on every exit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountTeardownSessionAdmissionToken {
+    account_id_hex: String,
+    closed_generation: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AccountSessionAdmission {
+    Active(AccountSessionAdmissionToken),
+    Teardown(AccountTeardownSessionAdmissionToken),
+}
+
+#[derive(Clone, Debug)]
+struct AccountSessionAdmissionState {
+    account_id_hex: String,
+    generation: u64,
+    open: bool,
+    teardown_generation: Option<u64>,
+}
+
+/// Keeps runtime account-open admission live while a completed blocking open
+/// is waiting to be consumed by its async caller. A cancelled `spawn_blocking`
+/// waiter cannot cancel the blocking work, so dropping the permit inside the
+/// closure would let shutdown report the open drained while `OpenAppAccount`
+/// was still retained in the task's result slot.
+struct OpenAppAccountResult {
+    open: OpenAppAccount,
+    _permit: Option<runtime::RuntimeAccountOpenPermit>,
+}
+
 struct AppAccountSessionGuard {
     label: String,
     owners: Arc<Mutex<HashSet<String>>>,
+    storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    adapters: Arc<Mutex<HashMap<String, MarmotRelayPlaneAccountAdapter>>>,
 }
 
 impl Drop for AppAccountSessionGuard {
     fn drop(&mut self) {
-        self.owners
+        // Keep ownership admission closed until this session's registered
+        // connection is removed and closed. Releasing `owners` first would let
+        // a replacement session register under the same label, which this
+        // guard could then accidentally remove as if it were the old handle.
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut storages = self
+            .storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(storage) = storages.remove(&self.label)
+            && let Err(error) = storage.close()
+        {
+            tracing::warn!(
+                target: "marmot_app::storage",
+                method = "drop_account_session_guard",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "failed to close released account session storage",
+            );
+        }
+        drop(storages);
+        self.adapters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.label);
+        owners.remove(&self.label);
     }
 }
 
@@ -1417,12 +1855,17 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            root_mutation_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_session_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
+            account_session_admissions: Arc::new(Mutex::new(HashMap::new())),
+            next_account_session_admission_generation: Arc::new(AtomicU64::new(0)),
+            account_session_adapters: Arc::new(Mutex::new(HashMap::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
@@ -1445,6 +1888,10 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            key_package_route_locks: Arc::new(Mutex::new(HashMap::new())),
+            key_package_history_locks: Arc::new(Mutex::new(HashMap::new())),
+            key_package_frontier_mutation_lock: Arc::new(Mutex::new(())),
+            removed_local_key_package_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1490,13 +1937,18 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            root_mutation_lifecycle: Arc::new(RwLock::new(())),
             relay_urls,
             account_home,
             relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_session_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
+            account_session_admissions: Arc::new(Mutex::new(HashMap::new())),
+            next_account_session_admission_generation: Arc::new(AtomicU64::new(0)),
+            account_session_adapters: Arc::new(Mutex::new(HashMap::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
@@ -1519,6 +1971,10 @@ impl MarmotApp {
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
+            key_package_route_locks: Arc::new(Mutex::new(HashMap::new())),
+            key_package_history_locks: Arc::new(Mutex::new(HashMap::new())),
+            key_package_frontier_mutation_lock: Arc::new(Mutex::new(())),
+            removed_local_key_package_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1569,6 +2025,227 @@ impl MarmotApp {
         Ok(())
     }
 
+    fn next_account_session_admission_generation(&self) -> Result<u64, AppError> {
+        self.next_account_session_admission_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|generation| generation + 1)
+            .map_err(|_| {
+                AppError::BlockingTask("account session admission generation exhausted".into())
+            })
+    }
+
+    /// Capture the exact process-local account-session generation before any
+    /// unabortable database open begins. A teardown closes and advances this
+    /// state synchronously, so an open that completes late can never become
+    /// valid again merely because a later sign-in clears the durable marker.
+    fn capture_account_session_admission(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> Result<AccountSessionAdmissionToken, AppError> {
+        let mut admissions = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(admission) = admissions.get(label)
+            && admission.account_id_hex == account_id_hex
+        {
+            if !admission.open {
+                return Err(AppError::AccountWorkerBusy);
+            }
+            return Ok(AccountSessionAdmissionToken {
+                account_id_hex: account_id_hex.to_owned(),
+                generation: admission.generation,
+            });
+        }
+
+        // A missing entry is the first open in this process. A changed account
+        // id is a same-label replacement: allocate a fresh generation so a
+        // capability from the removed identity cannot follow the label.
+        let generation = self.next_account_session_admission_generation()?;
+        admissions.insert(
+            label.to_owned(),
+            AccountSessionAdmissionState {
+                account_id_hex: account_id_hex.to_owned(),
+                generation,
+                open: true,
+                teardown_generation: None,
+            },
+        );
+        Ok(AccountSessionAdmissionToken {
+            account_id_hex: account_id_hex.to_owned(),
+            generation,
+        })
+    }
+
+    /// Explicitly open a new generation after an authorized signed-out to
+    /// active transition. This always advances, even when the previous state
+    /// was already closed, so no pre-sign-out token can suffer an ABA.
+    pub(crate) fn open_account_session_admission(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> Result<AccountSessionAdmissionToken, AppError> {
+        let mut admissions = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = self.next_account_session_admission_generation()?;
+        admissions.insert(
+            label.to_owned(),
+            AccountSessionAdmissionState {
+                account_id_hex: account_id_hex.to_owned(),
+                generation,
+                open: true,
+                teardown_generation: None,
+            },
+        );
+        Ok(AccountSessionAdmissionToken {
+            account_id_hex: account_id_hex.to_owned(),
+            generation,
+        })
+    }
+
+    /// Revoke every capability captured for this label before returning. At
+    /// generation exhaustion the gate still becomes permanently closed: the
+    /// `open` bit is part of validation, while no later open can allocate a
+    /// generation that aliases the revoked token.
+    pub(crate) fn close_account_session_admission(&self, label: &str, account_id_hex: &str) {
+        let mut admissions = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = self
+            .next_account_session_admission_generation()
+            .unwrap_or(u64::MAX);
+        admissions.insert(
+            label.to_owned(),
+            AccountSessionAdmissionState {
+                account_id_hex: account_id_hex.to_owned(),
+                generation,
+                open: false,
+                teardown_generation: None,
+            },
+        );
+    }
+
+    /// Mint the only session capability accepted while ordinary account
+    /// admission is closed. The caller must already own the account teardown
+    /// barrier; validation ties the capability to the exact closed generation
+    /// so sign-in, another teardown, or same-label replacement revokes it.
+    pub(crate) fn open_account_teardown_session_admission(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> Result<AccountTeardownSessionAdmissionToken, AppError> {
+        let mut admissions = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission = admissions
+            .get_mut(label)
+            .filter(|admission| admission.account_id_hex == account_id_hex && !admission.open)
+            .ok_or(AppError::AccountWorkerBusy)?;
+        let generation = self.next_account_session_admission_generation()?;
+        admission.teardown_generation = Some(generation);
+        Ok(AccountTeardownSessionAdmissionToken {
+            account_id_hex: account_id_hex.to_owned(),
+            closed_generation: admission.generation,
+            generation,
+        })
+    }
+
+    pub(crate) fn close_account_teardown_session_admission(
+        &self,
+        label: &str,
+        token: &AccountTeardownSessionAdmissionToken,
+    ) {
+        let mut admissions = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(admission) = admissions.get_mut(label)
+            && !admission.open
+            && admission.account_id_hex == token.account_id_hex
+            && admission.generation == token.closed_generation
+            && admission.teardown_generation == Some(token.generation)
+        {
+            admission.teardown_generation = None;
+        }
+    }
+
+    pub(crate) fn account_teardown_session_admission_is_current(
+        &self,
+        label: &str,
+        token: &AccountTeardownSessionAdmissionToken,
+    ) -> bool {
+        self.account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|admission| {
+                !admission.open
+                    && admission.account_id_hex == token.account_id_hex
+                    && admission.generation == token.closed_generation
+                    && admission.teardown_generation == Some(token.generation)
+            })
+    }
+
+    pub(crate) fn account_session_admission_is_current(
+        &self,
+        label: &str,
+        token: &AccountSessionAdmissionToken,
+    ) -> bool {
+        self.account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|admission| {
+                admission.open
+                    && admission.account_id_hex == token.account_id_hex
+                    && admission.generation == token.generation
+            })
+    }
+
+    pub(crate) fn active_account_session_admission_is_current(
+        &self,
+        label: &str,
+        token: &AccountSessionAdmissionToken,
+    ) -> bool {
+        self.account_home().account(label).is_ok_and(|account| {
+            account.is_active_signing() && account.account_id_hex == token.account_id_hex
+        }) && self.account_session_admission_is_current(label, token)
+    }
+
+    pub(crate) fn account_session_admission_is_open(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> bool {
+        self.account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_none_or(|admission| admission.account_id_hex != account_id_hex || admission.open)
+    }
+
+    fn account_open_admission_is_current(
+        &self,
+        label: &str,
+        admission: &AccountSessionAdmission,
+    ) -> bool {
+        match admission {
+            AccountSessionAdmission::Active(token) => {
+                self.account_session_admission_is_current(label, token)
+            }
+            AccountSessionAdmission::Teardown(token) => {
+                self.account_teardown_session_admission_is_current(label, token)
+            }
+        }
+    }
+
     /// Open the account's exclusive in-memory engine session.
     ///
     /// Only one [`AppClient`] for an account may exist within a [`MarmotApp`]
@@ -1576,6 +2253,12 @@ impl MarmotApp {
     /// returns [`AppError::AccountSessionBusy`]. Drop the owning client before
     /// retrying.
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
+        let account = self.account_home().account(label)?;
+        if !account.is_active_signing() {
+            return Err(AppError::Publish(
+                "cannot open a direct client for a signed-out or non-signing account".into(),
+            ));
+        }
         #[cfg(test)]
         let relay_plane = self
             .test_relay_client
@@ -1590,8 +2273,20 @@ impl MarmotApp {
         let relay_plane = MarmotRelayPlane::full_history_with_loopback(
             self.config.allow_loopback_relay_endpoints,
         );
-        self.client_with_relay_plane(label, &relay_plane, None)
-            .await
+        let mut client = self
+            .local_client_with_relay_plane(label, &relay_plane, None)
+            .await?;
+        // An unabortable blocking open may finish after concurrent sign-out.
+        // Re-prove the exact record before transport activation; if teardown
+        // already found this session in the registry, its revoked adapter also
+        // makes activation fail closed.
+        client.ensure_active_signing_account()?;
+        client.prepare_transport().await?;
+        client.ensure_active_signing_account()?;
+        self.finish_client_open_network_maintenance(&mut client)
+            .await;
+        client.ensure_active_signing_account()?;
+        Ok(client)
     }
 
     async fn runtime_local_client(
@@ -1607,6 +2302,7 @@ impl MarmotApp {
             .await
     }
 
+    #[cfg(test)]
     async fn client_with_relay_plane(
         &self,
         label: &str,
@@ -1642,26 +2338,102 @@ impl MarmotApp {
         lifecycle: Option<runtime::RuntimeLifecycle>,
         defer_group_hydration: bool,
     ) -> Result<AppClient, AppError> {
-        let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
-        let label = self.account_home().account(label)?.label;
+        let account = self.account_home().account(label)?;
+        if !account.is_active_signing() {
+            return Err(AppError::Publish(
+                "cannot open a client for a signed-out or non-signing account".into(),
+            ));
+        }
+        let label = account.label;
+        let account_id_hex = account.account_id_hex.clone();
+        let session_admission = AccountSessionAdmission::Active(
+            self.capture_account_session_admission(&label, &account_id_hex)?,
+        );
+        self.local_client_with_admission(
+            label,
+            account_id_hex,
+            relay_plane,
+            lifecycle,
+            defer_group_hydration,
+            session_admission,
+        )
+        .await
+    }
+
+    /// Open one exact teardown-owned session without reopening ordinary
+    /// account admission. This path is crate-private, consumes a capability
+    /// owned by the live teardown barrier, and constructs a publisher that is
+    /// categorically unable to emit a KeyPackage.
+    pub(crate) async fn local_teardown_cleanup_client_with_relay_plane(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+        relay_plane: &MarmotRelayPlane,
+        admission: &AccountTeardownSessionAdmissionToken,
+    ) -> Result<AppClient, AppError> {
+        let account = self.account_home().account(label)?;
+        if !account.signed_out
+            || !account.can_sign()
+            || account.account_id_hex != account_id_hex
+            || admission.account_id_hex != account_id_hex
+            || !self.account_teardown_session_admission_is_current(&account.label, admission)
+        {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        self.local_client_with_admission(
+            account.label,
+            account.account_id_hex,
+            relay_plane,
+            None,
+            false,
+            AccountSessionAdmission::Teardown(admission.clone()),
+        )
+        .await
+    }
+
+    async fn local_client_with_admission(
+        &self,
+        label: String,
+        account_id_hex: String,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+        defer_group_hydration: bool,
+        session_admission: AccountSessionAdmission,
+    ) -> Result<AppClient, AppError> {
+        let app = self.clone();
+        let label_for_open = label.clone();
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
             .map(runtime::RuntimeLifecycle::begin_account_open)
             .transpose()?;
-        let open = blocking_app_task(move || {
-            let _permit = permit;
-            app.ensure_account_state(&label)?;
-            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+        let open_result = blocking_app_task(move || {
+            app.ensure_account_state(&label_for_open)?;
+            let open = app.open_account_with_admission(
+                &label_for_open,
+                &relay_plane_for_open,
+                defer_group_hydration,
+                session_admission,
+            );
             #[cfg(test)]
-            app.local_open_gates.wait(&label);
-            open
+            app.local_open_gates.wait(&label_for_open);
+            open.map(|open| OpenAppAccountResult {
+                open,
+                _permit: permit,
+            })
         })
         .await?;
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
+        }
+        let OpenAppAccountResult {
+            open,
+            _permit: open_permit,
+        } = open_result;
+        if !self.account_open_admission_is_current(&label, &open.session_admission) {
+            return Err(AppError::AccountWorkerBusy);
         }
         let seen_events_index = open
             .state
@@ -1684,6 +2456,8 @@ impl MarmotApp {
         let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
+            account_id_hex,
+            session_admission: open.session_admission,
             _session_guard: open.session_guard,
             adapter: open.adapter,
             routing: open.routing,
@@ -1695,28 +2469,42 @@ impl MarmotApp {
             pending_group_projection_updates: std::collections::HashSet::new(),
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
-            pending_failed_sync_summary: SyncSummary::default(),
+            pending_uncheckpointed_sync_summary: None,
+            pending_checkpointed_sync_summary: None,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
+            pending_account_visibility_lease: None,
+            pending_uncheckpointed_runtime_group_subscription_refresh: false,
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
+            pending_new_message_notification_groups: std::collections::HashSet::new(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
+            #[cfg(test)]
+            block_after_sync_delivery_projection: None,
+            #[cfg(test)]
+            block_after_sync_prefix_checkpoint: None,
+            #[cfg(test)]
+            fail_after_convergence_retry_finalize: false,
             pending_welcome_delivery_events: Vec::new(),
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
+            active_epoch_backfill: None,
+            epoch_backfill_intent_journal_dirty: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
+        client.ensure_session_account()?;
+        client.restore_epoch_backfill_intent_journal()?;
         let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
         client.restore_persisted_epoch_backfill_intents(persisted_backfills);
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
@@ -1725,39 +2513,276 @@ impl MarmotApp {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
             client.reconcile_hydrated_account_state()?;
+            client.replay_pending_account_visibility().await?;
         }
+        // The open is now fully represented by `client`; shutdown may stop
+        // counting the blocking handoff without waiting for the client's whole
+        // lifetime.
+        drop(open_permit);
         Ok(client)
     }
 
     async fn finish_client_open_network_maintenance(&self, client: &mut AppClient) {
-        client
-            .app
-            .retire_cached_non_current_key_package(&client.state.label)
-            .await;
-        client
-            .app
-            .retire_relay_non_current_key_packages(&client.state.label)
-            .await;
-        if client
-            .app
-            .key_package_cutover_replacement_pending(&client.state.label)
+        let cutover_app = client.app.clone();
+        let cutover_label = client.state.label.clone();
+        match cutover_app.generated_initial_key_package_publication_held(&cutover_label) {
+            Ok(true) => {
+                let _ = client
+                    .runtime
+                    .set_key_package_cutover_publication_blocked(true);
+                return;
+            }
+            Err(error) => {
+                let _ = client
+                    .runtime
+                    .set_key_package_cutover_publication_blocked(true);
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not validate the generated initial KeyPackage publication hold"
+                );
+                return;
+            }
+            Ok(false) => {}
+        }
+        let cutover_route_lock = cutover_app.key_package_route_lock(&cutover_label);
+        let cutover_route_guard = cutover_route_lock.lock().await;
+        if let Err(error) = cutover_app
+            .recover_pending_nip65_route_mutation(&cutover_label, client.transport_signer.clone())
+            .await
         {
-            let lifecycle_current = client
+            let _ = client
+                .runtime
+                .set_key_package_cutover_publication_blocked(true);
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                error_kind = error.privacy_safe_kind(),
+                "could not recover a pending authoritative NIP-65 route mutation"
+            );
+            return;
+        }
+        if let Err(error) = client.refresh_routing() {
+            let _ = client
+                .runtime
+                .set_key_package_cutover_publication_blocked(true);
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                error_kind = error.privacy_safe_kind(),
+                "could not refresh routing after NIP-65 cutover recovery"
+            );
+            return;
+        }
+        // A generated identity's exact first KeyPackage is prepared under a
+        // durable no-predecessor proof before its initial NIP-65 route exists.
+        // Once pending route recovery has completed, that narrow proof is
+        // sufficient for the setup-priority publisher's final lifecycle,
+        // route, and marker checks. Running the ordinary retirement path here
+        // would invalidate the one-time proof merely because the replacement
+        // intent is still pending, permanently wedging setup.
+        if client
+            .runtime
+            .key_package_maintenance_status()
+            .ok()
+            .flatten()
+            .is_some_and(|lifecycle| {
+                cutover_app
+                    .generated_account_fresh_replacement_can_open_cutover_gate(
+                        &cutover_label,
+                        &lifecycle,
+                    )
+                    .unwrap_or(false)
+            })
+        {
+            return;
+        }
+        if (!cutover_app.key_package_cutover_publication_allowed(&cutover_label)
+            || cutover_app.key_package_cutover_replacement_pending(&cutover_label))
+            && let Err(error) = client
+                .runtime
+                .set_key_package_cutover_publication_blocked(true)
+        {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not arm key package cutover publication interlock"
+            );
+            return;
+        }
+        let cached_admission =
+            cutover_app.retire_cached_non_current_key_package(&cutover_label, &mut client.runtime);
+        // Exact deletion now owns the active-session route lock at its lowest
+        // signer/network boundary. Release the wider cutover guard before the
+        // retirement runtime invokes that publisher, then reacquire it for the
+        // marker/gate decisions below. Every such decision is re-read after the
+        // unlocked scan, so a route mutation that wins here remains fail-closed.
+        drop(cutover_route_guard);
+        let relay_scan_complete = cutover_app
+            .retire_relay_non_current_key_packages(&cutover_label, &mut client.runtime)
+            .await;
+        let cutover_route_guard = cutover_route_lock.lock().await;
+        if cached_admission.complete
+            && let Some(event_id) = cached_admission.event_id.as_ref()
+            && let Ok(_root_mutation) =
+                cutover_app.begin_root_mutation("remove terminal cached KeyPackage revision")
+        {
+            cutover_app.remove_terminal_cached_key_package_record(&cutover_label, event_id);
+        }
+        if !cached_admission.complete || !relay_scan_complete {
+            if let Err(error) = client
+                .runtime
+                .set_key_package_cutover_publication_blocked(true)
+            {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not retain key package cutover publication interlock"
+                );
+            }
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                cached_admission_complete = cached_admission.complete,
+                relay_scan_complete,
+                "deferred key package replacement until every discovered historical publication is durably admitted"
+            );
+            return;
+        }
+        // Re-read the endpoint-bound marker after the scan. A live NIP-65
+        // mutation can complete while per-relay discovery is in flight; its
+        // new route set must not inherit the proof for the old set.
+        if !cutover_app.key_package_cutover_publication_allowed(&cutover_label) {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                "authoritative key package relays changed during cutover; retaining publication interlock"
+            );
+            return;
+        }
+        let replacement_pending =
+            cutover_app.key_package_cutover_replacement_pending(&cutover_label);
+        let lifecycle_current = client
+            .runtime
+            .key_package_maintenance_status()
+            .ok()
+            .flatten()
+            .is_some_and(|lifecycle| {
+                cutover_app
+                    .key_package_lifecycle_has_current_cutover_revision(&cutover_label, &lifecycle)
+            });
+        if replacement_pending && !lifecycle_current {
+            let replacement_endpoints = match cutover_app
+                .authoritative_key_package_relays(&cutover_label)
+            {
+                Ok(endpoints) if !endpoints.is_empty() => endpoints,
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "finish_client_open_network_maintenance",
+                        "could not prepare a cutover replacement without safe authoritative relays"
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = client
+                .runtime
+                .prepare_fresh_key_package(replacement_endpoints.clone())
+                .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not durably prepare the strict-newer cutover replacement"
+                );
+                return;
+            }
+            let prepared = client
                 .runtime
                 .key_package_maintenance_status()
                 .ok()
                 .flatten()
-                .and_then(|lifecycle| lifecycle.current_key_package)
-                .and_then(|key_package| key_package_metadata(&key_package).ok())
-                .is_some_and(|metadata| {
-                    client
-                        .app
-                        .key_package_metadata_matches_current_support(&metadata)
+                .is_some_and(|lifecycle| {
+                    cutover_app.key_package_lifecycle_has_prepared_cutover_replacement(
+                        &cutover_label,
+                        &lifecycle,
+                        &replacement_endpoints,
+                    )
                 });
+            if !prepared {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    "prepared cutover replacement failed durable strict-newer validation"
+                );
+                return;
+            }
+        }
+        // Signing a pending replacement may await an external signer. Re-read
+        // the generation-bound marker immediately before clearing the SQL
+        // gate; a self NIP-65 update admitted through any route during that
+        // wait must retain the interlock.
+        if !cutover_app.key_package_cutover_publication_allowed(&cutover_label) {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                "authoritative key package route changed while preparing the cutover replacement"
+            );
+            return;
+        }
+        // Preparing can run the conservative legacy private-material sweep and
+        // create additional cutover-only consumption tombstones after the
+        // relay scan's first finalization pass. Transfer/reclaim those refs in
+        // this same serialized cutover before opening publication admission.
+        if let Err(error) = client
+            .runtime
+            .finalize_key_package_cutover_consumption_evidence()
+        {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not finalize key package cutover consumption evidence"
+            );
+            return;
+        }
+        if let Err(error) = client
+            .runtime
+            .set_key_package_cutover_publication_blocked(false)
+        {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "finish_client_open_network_maintenance",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not clear completed key package cutover publication interlock"
+            );
+            return;
+        }
+        // The final publisher takes this same lock around its marker/gate/route
+        // validation and relay I/O. Release before calling it to avoid
+        // recursive acquisition; a route mutation that wins next re-arms the
+        // gate and invalidates the marker, so the final check will fail closed.
+        drop(cutover_route_guard);
+        if replacement_pending {
             if lifecycle_current {
-                client
+                if let Ok(_root_mutation) = client
                     .app
-                    .clear_key_package_cutover_replacement_pending(&client.state.label);
+                    .begin_root_mutation("clear completed KeyPackage cutover replacement")
+                    && let Err(error) = client
+                        .app
+                        .clear_key_package_cutover_replacement_pending(&client.state.label)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "finish_client_open_network_maintenance",
+                        error_kind = error.privacy_safe_kind(),
+                        "could not durably clear completed KeyPackage cutover replacement"
+                    );
+                }
             } else {
                 match client.runtime.publish_fresh_key_package().await {
                     Ok(_) => tracing::info!(
@@ -1777,20 +2802,127 @@ impl MarmotApp {
                     .key_package_maintenance_status()
                     .ok()
                     .flatten()
-                    .and_then(|lifecycle| lifecycle.current_key_package)
-                    .and_then(|key_package| key_package_metadata(&key_package).ok())
-                    .is_some_and(|metadata| {
+                    .is_some_and(|lifecycle| {
                         client
                             .app
-                            .key_package_metadata_matches_current_support(&metadata)
+                            .key_package_lifecycle_has_current_cutover_revision(
+                                &client.state.label,
+                                &lifecycle,
+                            )
                     })
-                {
-                    client
+                    && let Ok(_root_mutation) = client
                         .app
-                        .clear_key_package_cutover_replacement_pending(&client.state.label);
+                        .begin_root_mutation("clear published KeyPackage cutover replacement")
+                    && let Err(error) = client
+                        .app
+                        .clear_key_package_cutover_replacement_pending(&client.state.label)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "finish_client_open_network_maintenance",
+                        error_kind = error.privacy_safe_kind(),
+                        "could not durably clear published KeyPackage cutover replacement"
+                    );
                 }
             }
         }
+    }
+
+    fn key_package_lifecycle_has_current_cutover_revision(
+        &self,
+        label: &str,
+        lifecycle: &cgka_traits::KeyPackageLifecycleState,
+    ) -> bool {
+        let Some(artifact) = lifecycle.authored_signed_event.as_ref() else {
+            return false;
+        };
+        let Some(key_package_ref) = lifecycle.current_key_package_ref.as_ref() else {
+            return false;
+        };
+        let Some(metadata) = lifecycle
+            .current_key_package
+            .as_ref()
+            .and_then(|key_package| key_package_metadata(key_package).ok())
+        else {
+            return false;
+        };
+        let Ok(metadata_ref) = hex::decode(&metadata.key_package_ref_hex) else {
+            return false;
+        };
+        let Ok(account) = self.account_home().account(label) else {
+            return false;
+        };
+        self.key_package_metadata_matches_current_support(&metadata)
+            && metadata.credential_identity_hex == account.account_id_hex
+            && metadata_ref == *key_package_ref
+            && !lifecycle.key_package_ref_is_consumed(key_package_ref)
+            && lifecycle.authored_event_id.as_ref() == Some(&artifact.id)
+            && lifecycle.authored_event_created_at == Some(artifact.created_at)
+            && !lifecycle
+                .deleted_live_revision_event_ids
+                .contains(&artifact.id)
+            && lifecycle
+                .retired_publications_pending_deletion
+                .iter()
+                .all(|retired| retired.authored_created_at < artifact.created_at)
+    }
+
+    fn key_package_lifecycle_has_prepared_cutover_replacement(
+        &self,
+        label: &str,
+        lifecycle: &cgka_traits::KeyPackageLifecycleState,
+        authoritative_endpoints: &[TransportEndpoint],
+    ) -> bool {
+        let Some(pending) = lifecycle.pending_replacement.as_ref() else {
+            return false;
+        };
+        let Some(artifact) = pending.signed_event.as_ref() else {
+            return false;
+        };
+        let Some(metadata) = key_package_metadata(&pending.key_package).ok() else {
+            return false;
+        };
+        let Ok(account) = self.account_home().account(label) else {
+            return false;
+        };
+        let Ok(metadata_ref) = hex::decode(&metadata.key_package_ref_hex) else {
+            return false;
+        };
+        let Ok(expected) =
+            self.sanitize_key_package_deletion_endpoints(authoritative_endpoints.to_vec())
+        else {
+            return false;
+        };
+        let Ok(actual) = self.sanitize_key_package_deletion_endpoints(
+            pending
+                .targets
+                .iter()
+                .filter(|target| {
+                    target.state != cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+                })
+                .map(|target| target.endpoint.clone())
+                .collect::<Vec<_>>(),
+        ) else {
+            return false;
+        };
+
+        !expected.is_empty()
+            && actual == expected
+            && self.key_package_metadata_matches_current_support(&metadata)
+            && metadata.credential_identity_hex == account.account_id_hex
+            && metadata_ref == pending.key_package_ref
+            && !lifecycle.key_package_ref_is_consumed(&pending.key_package_ref)
+            && artifact.created_at == pending.authored_created_at
+            && !lifecycle
+                .deleted_live_revision_event_ids
+                .contains(&artifact.id)
+            && lifecycle
+                .authored_event_created_at
+                .is_none_or(|high_water| artifact.created_at > high_water)
+            && lifecycle
+                .retired_publications_pending_deletion
+                .iter()
+                .all(|retired| retired.authored_created_at < artifact.created_at)
     }
 
     pub fn status(&self, label: &str) -> Result<AppStatus, AppError> {
@@ -1811,38 +2943,432 @@ impl MarmotApp {
         })
     }
 
+    /// Legacy direct-app seam retained for API compatibility.
+    ///
+    /// Relay-list mutations require account-worker or setup admission, neither
+    /// of which a bare [`MarmotApp`] owns. Use the matching
+    /// [`MarmotAppRuntime`] operation; this method always fails before reading
+    /// account caches, signing, or relay I/O.
     pub async fn publish_account_relay_lists(
+        &self,
+        _label: &str,
+        _bootstrap: AccountRelayListBootstrap,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        Err(AppError::AccountWorkerBusy)
+    }
+
+    pub(crate) async fn publish_account_relay_lists_for_setup(
         &self,
         label: &str,
         bootstrap: AccountRelayListBootstrap,
+        setup_admission: &runtime::AccountSetupPublicationAdmission,
     ) -> Result<AccountRelayListStatus, AppError> {
-        self.publish_selected_account_relay_lists(
+        self.publish_selected_account_relay_lists_with_nip65(
             label,
             bootstrap,
             &[
                 NostrAccountRelayListKind::Nip65,
                 NostrAccountRelayListKind::Inbox,
             ],
+            None,
+            AccountRelayListMutationAdmission::Setup(setup_admission),
         )
         .await
+    }
+
+    /// Durably stage and sign the generated identity's exact initial NIP-65
+    /// authority without contacting a relay. The pending route file is both the
+    /// crash-recovery source for the exact signed event and the final-boundary
+    /// fence that prevents a KeyPackage from escaping before that authority is
+    /// committed.
+    pub(crate) async fn stage_generated_account_nip65_route_mutation(
+        &self,
+        label: &str,
+        bootstrap: &AccountRelayListBootstrap,
+    ) -> Result<(), AppError> {
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        self.validate_account_relay_list_declarations(bootstrap, None)?;
+        let route_lock = self.key_package_route_lock(label);
+        let _route_guard = route_lock.lock().await;
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        self.stage_generated_account_nip65_route_mutation_unlocked(
+            label,
+            bootstrap,
+            signer.as_nostr_signer(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Validate the generated setup's desired authority, stage it when absent,
+    /// then exact-replay/commit it under the same account route lock. Callers
+    /// pass the relay options recovered from the durable generated-setup
+    /// context; an older pending intent for any other authority fails before
+    /// network I/O instead of being reinterpreted as this setup attempt.
+    pub(crate) async fn recover_generated_account_nip65_route_authority_for_session(
+        &self,
+        label: &str,
+        bootstrap: &AccountRelayListBootstrap,
+        signer: Arc<dyn nostr::NostrSigner>,
+        session_admission: &AccountSessionAdmissionToken,
+    ) -> Result<GeneratedNip65RouteAuthorityProof, AppError> {
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        self.validate_account_relay_list_declarations(bootstrap, None)?;
+        let route_lock = self.key_package_route_lock(label);
+        let _route_guard = route_lock.lock().await;
+        if !self.active_account_session_admission_is_current(label, session_admission) {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        let desired = self
+            .stage_generated_account_nip65_route_mutation_unlocked(label, bootstrap, signer.clone())
+            .await?;
+        if !self.active_account_session_admission_is_current(label, session_admission) {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        self.recover_validated_generated_nip65_route_mutation(label, signer)
+            .await?;
+        let generation = self
+            .read_nip65_route_generation_for_authoring(label)?
+            .ok_or_else(|| {
+                AppError::Publish(
+                    "generated account NIP-65 authority was not durably committed".into(),
+                )
+            })?;
+        if self.canonical_nip65_route_state(&generation.nip65)?
+            != self.canonical_nip65_route_state(&desired)?
+        {
+            return Err(AppError::Publish(
+                "generated account NIP-65 authority does not match its durable setup context"
+                    .into(),
+            ));
+        }
+        let endpoints = self.validate_nip65_route_generation(&generation)?;
+        Ok(GeneratedNip65RouteAuthorityProof {
+            generation,
+            endpoints,
+        })
+    }
+
+    #[cfg(test)]
+    async fn recover_generated_account_nip65_route_authority(
+        &self,
+        label: &str,
+        bootstrap: &AccountRelayListBootstrap,
+        signer: Arc<dyn nostr::NostrSigner>,
+    ) -> Result<GeneratedNip65RouteAuthorityProof, AppError> {
+        let account = self.account_home().account(label)?;
+        let admission =
+            self.capture_account_session_admission(&account.label, &account.account_id_hex)?;
+        self.recover_generated_account_nip65_route_authority_for_session(
+            label, bootstrap, signer, &admission,
+        )
+        .await
+    }
+
+    /// Reopen the generated setup's SQL publication interlock only after the
+    /// caller has refreshed routing from the recovered authority. This second
+    /// route-locked proof prevents a refresh failure or an intervening route
+    /// mutation from inheriting the recovery capability.
+    pub(crate) async fn open_generated_account_key_package_publication_gate(
+        &self,
+        label: &str,
+        bootstrap: &AccountRelayListBootstrap,
+        proof: &GeneratedNip65RouteAuthorityProof,
+        session_admission: &AccountSessionAdmissionToken,
+    ) -> Result<(), AppError> {
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        self.validate_account_relay_list_declarations(bootstrap, None)?;
+        let route_lock = self.key_package_route_lock(label);
+        let _route_guard = route_lock.lock().await;
+        if !self.active_account_session_admission_is_current(label, session_admission) {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        let account = self.account_home().account(label)?;
+        let publish_endpoints = self.publish_route_including_requested(
+            &account.account_id_hex,
+            publish_endpoints_from_bootstrap(bootstrap),
+        );
+        let (_, desired) =
+            self.generated_account_nip65_event_and_state(&account, bootstrap, publish_endpoints)?;
+        let desired_authority = self.canonical_nip65_route_state(&desired)?;
+        let current = self
+            .read_nip65_route_generation_for_authoring(label)?
+            .ok_or_else(|| {
+                AppError::Publish(
+                    "generated account NIP-65 authority disappeared before gate admission".into(),
+                )
+            })?;
+        let current_endpoints = self.validate_nip65_route_generation(&current)?;
+        if current != proof.generation
+            || self.canonical_nip65_route_state(&current.nip65)? != desired_authority
+            || current_endpoints != proof.endpoints
+            || desired_authority.0 != proof.endpoints
+        {
+            return Err(AppError::Publish(
+                "generated account NIP-65 authority changed before KeyPackage gate admission"
+                    .into(),
+            ));
+        }
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            return Err(AppError::Publish(
+                "generated account route recovery has no durable KeyPackage lifecycle".into(),
+            ));
+        };
+        if !self.generated_account_fresh_replacement_can_open_cutover_gate(label, &lifecycle)? {
+            return Err(AppError::Publish(
+                "generated account route recovery cannot prove its exact fresh KeyPackage replacement"
+                    .into(),
+            ));
+        }
+        if !self.active_account_session_admission_is_current(label, session_admission) {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        self.clear_generated_initial_key_package_publication_hold(label)?;
+        if lifecycle.cutover_publication_blocked {
+            lifecycle.cutover_publication_blocked = false;
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
+    }
+
+    /// The caller owns `key_package_route_lock(label)`. This method performs no
+    /// relay I/O: it only validates existing durable authority or signs and
+    /// persists one exact pending generated-bootstrap event.
+    async fn stage_generated_account_nip65_route_mutation_unlocked(
+        &self,
+        label: &str,
+        bootstrap: &AccountRelayListBootstrap,
+        signer: Arc<dyn nostr::NostrSigner>,
+    ) -> Result<AccountRelayListState, AppError> {
+        let account = self.account_home().account(label)?;
+        let publish_endpoints = self.publish_route_including_requested(
+            &account.account_id_hex,
+            publish_endpoints_from_bootstrap(bootstrap),
+        );
+        let (generated_event, desired) = self.generated_account_nip65_event_and_state(
+            &account,
+            bootstrap,
+            publish_endpoints.clone(),
+        )?;
+        let desired_authority = self.canonical_nip65_route_state(&desired)?;
+        let desired_endpoints = desired_authority.0.clone();
+        let desired_publish_endpoints = self.canonical_nip65_publication_endpoints(
+            publish_endpoints.clone(),
+            "generated-account NIP-65 setup publication",
+        )?;
+
+        if self.pending_nip65_route_mutation(label) {
+            let pending = self.read_pending_nip65_route_mutation(label)?;
+            let pending_endpoints = self.validate_pending_nip65_route_mutation(label, &pending)?;
+            let pending_publish_endpoints = self.canonical_nip65_publication_endpoints(
+                pending
+                    .publish_endpoints
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "pending generated-account NIP-65 publication",
+            )?;
+            let pending_bootstrap_endpoints = self.canonical_nip65_publication_endpoints(
+                pending
+                    .bootstrap_relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "pending generated-account bootstrap projection",
+            )?;
+            if pending.source != Nip65RouteMutationSource::GeneratedAccountBootstrap
+                || pending.signed_event.is_none()
+                || self.canonical_nip65_route_state(&pending.nip65)? != desired_authority
+                || pending_endpoints != desired_endpoints
+                || pending_publish_endpoints != desired_publish_endpoints
+                || pending_bootstrap_endpoints != desired_publish_endpoints
+            {
+                return Err(AppError::Publish(
+                    "pending generated-account NIP-65 route does not match its durable setup context"
+                        .into(),
+                ));
+            }
+            return Ok(pending.nip65);
+        }
+
+        if let Some(generation) = self.read_nip65_route_generation_for_authoring(label)? {
+            let generation_endpoints = self.validate_nip65_route_generation(&generation)?;
+            if self.canonical_nip65_route_state(&generation.nip65)? != desired_authority
+                || generation_endpoints != desired_endpoints
+            {
+                return Err(AppError::Publish(
+                    "generated account NIP-65 authority does not match its durable setup context"
+                        .into(),
+                ));
+            }
+            // The declared authority is unchanged, but a reconstructed setup
+            // context may name a different bootstrap publication route. The
+            // generation journal does not prove that route saw the event, so
+            // deterministically re-sign the exact committed coordinate and
+            // stage an id-equal replay to the context-authorized endpoints.
+            // This never authors a newer route revision and never silently
+            // reuses stale bootstrap endpoints.
+            let mut signed_event = generated_event;
+            signed_event.created_at = generation.created_at;
+            signed_event = self
+                .sign_account_transport_event(signer, signed_event)
+                .await?;
+            if signed_event.id != generation.event_id
+                || relay_list_state_from_event(&signed_event).as_ref() != Some(&generation.nip65)
+            {
+                return Err(AppError::Publish(
+                    "generated account NIP-65 generation cannot be exactly replayed to its durable setup route"
+                        .into(),
+                ));
+            }
+            let pending = PendingNip65RouteMutation {
+                account_id_hex: account.account_id_hex,
+                nip65: generation.nip65.clone(),
+                bootstrap_relays: publish_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
+                publish_endpoints: publish_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
+                signed_event: Some(signed_event),
+                generation: generation.clone(),
+                network_accepted: false,
+                source: Nip65RouteMutationSource::GeneratedAccountBootstrap,
+            };
+            let _root_mutation =
+                self.begin_root_mutation("stage exact generated-account NIP-65 route replay")?;
+            self.write_pending_nip65_route_mutation(label, &pending)?;
+            return Ok(generation.nip65);
+        }
+
+        let mut signed_event = generated_event;
+        signed_event.created_at = self.next_locally_authored_nip65_created_at(label)?;
+        signed_event = self
+            .sign_account_transport_event(signer, signed_event)
+            .await?;
+        let nip65 = relay_list_state_from_event(&signed_event).ok_or_else(|| {
+            AppError::Publish("signed NIP-65 event has no relay-list state".into())
+        })?;
+        if nip65 != desired {
+            return Err(AppError::Publish(
+                "signed generated-account NIP-65 event changed its declared authority".into(),
+            ));
+        }
+        let pending = PendingNip65RouteMutation {
+            account_id_hex: account.account_id_hex,
+            nip65: nip65.clone(),
+            bootstrap_relays: publish_endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            publish_endpoints: publish_endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            signed_event: Some(signed_event.clone()),
+            generation: Nip65RouteGeneration {
+                created_at: signed_event.created_at,
+                event_id: signed_event.id.clone(),
+                nip65: nip65.clone(),
+            },
+            network_accepted: false,
+            source: Nip65RouteMutationSource::GeneratedAccountBootstrap,
+        };
+        {
+            let _root_mutation =
+                self.begin_root_mutation("stage generated-account NIP-65 route mutation")?;
+            self.write_pending_nip65_route_mutation(label, &pending)?;
+            let fresh_account_proof_preserved =
+                self.invalidate_key_package_cutover_scan_for_route_mutation(label)?;
+            if !fresh_account_proof_preserved {
+                self.arm_key_package_cutover_publication_gate_for_relays(
+                    label,
+                    &desired_endpoints,
+                )?;
+            }
+        }
+        Ok(nip65)
+    }
+
+    fn generated_account_nip65_event_and_state(
+        &self,
+        account: &AccountSummary,
+        bootstrap: &AccountRelayListBootstrap,
+        publish_endpoints: Vec<TransportEndpoint>,
+    ) -> Result<(NostrTransportEvent, AccountRelayListState), AppError> {
+        let generated_event = NostrAccountRelayListPublication {
+            account_id: MemberId::new(hex::decode(&account.account_id_hex)?),
+            list_kind: NostrAccountRelayListKind::Nip65,
+            relays: bootstrap.default_relays.clone(),
+            publish_endpoints,
+        }
+        .to_event()?;
+        let desired = relay_list_state_from_event(&generated_event).ok_or_else(|| {
+            AppError::Publish("generated NIP-65 event has no relay-list state".into())
+        })?;
+        Ok((generated_event, desired))
     }
 
     /// Publish every generated-identity bootstrap record through one scoped
     /// relay batch. The SDK connects the endpoint union once for the two relay
     /// lists, empty follow list, and default profile, then returns one ordered
     /// acknowledgement result per replaceable event.
-    pub(crate) async fn publish_generated_account_bootstrap(
+    pub(crate) async fn publish_generated_account_bootstrap_admitted(
         &self,
         label: &str,
         bootstrap: AccountRelayListBootstrap,
         profile: &UserProfileMetadata,
+        setup_admission: &runtime::AccountSetupPublicationAdmission,
     ) -> Result<GeneratedAccountBootstrapPublication, AppError> {
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
         }
         self.validate_account_relay_list_declarations(&bootstrap, None)?;
+        let key_package_route_lock = self.key_package_route_lock(label);
+        let _key_package_route_guard = key_package_route_lock.lock().await;
         let account = self.account_home().account(label)?;
+        let setup_is_current = || {
+            self.account_home().account(label).is_ok_and(|current| {
+                current.is_active_signing()
+                    && current.account_id_hex == setup_admission.account_id_hex()
+                    && current.signed_out == setup_admission.started_signed_out()
+            }) && setup_admission.is_current()
+                && self.account_session_admission_is_open(&account.label, &account.account_id_hex)
+        };
+        if !setup_is_current() {
+            return Err(AppError::AccountWorkerBusy);
+        }
         let signer = self.account_signer_for_summary(&account)?;
+        // Validate an older exact intent against this durable setup request
+        // before replaying it. A mismatched but otherwise valid pending route
+        // must not be committed merely because it carries the generated source.
+        let pending_preexisted = self.pending_nip65_route_mutation(label);
+        let desired_nip65 = self
+            .stage_generated_account_nip65_route_mutation_unlocked(
+                label,
+                &bootstrap,
+                signer.as_nostr_signer(),
+            )
+            .await?;
+        if pending_preexisted {
+            if !setup_is_current() {
+                return Err(AppError::AccountWorkerBusy);
+            }
+            self.recover_validated_generated_nip65_route_mutation(label, signer.as_nostr_signer())
+                .await?;
+        }
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         // Relay-list records are discoverability maps and therefore go to the
         // bootstrap route. Profiles and contact lists are outbox content: keep
@@ -1855,23 +3381,43 @@ impl MarmotApp {
             publish_endpoints_from_bootstrap(&bootstrap),
         );
 
+        let relays = bootstrap
+            .default_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
         let mut requests = Vec::with_capacity(4);
-        for list_kind in [
-            NostrAccountRelayListKind::Nip65,
-            NostrAccountRelayListKind::Inbox,
-        ] {
+        let mut record_kinds = Vec::with_capacity(4);
+        let mut pending_nip65 = if self.pending_nip65_route_mutation(label) {
+            Some(self.read_pending_nip65_route_mutation(label)?)
+        } else {
+            None
+        };
+        if let Some(pending) = pending_nip65.as_ref() {
+            let event = pending.signed_event.clone().ok_or_else(|| {
+                AppError::Publish(
+                    "unacknowledged generated NIP-65 route intent has no exact signed event".into(),
+                )
+            })?;
             requests.push(NostrEventPublishRequest {
                 endpoints: endpoints.clone(),
-                event: NostrAccountRelayListPublication {
-                    account_id: account_id.clone(),
-                    list_kind,
-                    relays: bootstrap.default_relays.clone(),
-                    publish_endpoints: endpoints.clone(),
-                }
-                .to_event()?,
+                event,
                 required_acks: 1,
             });
+            record_kinds.push("NIP-65 relay list");
         }
+        requests.push(NostrEventPublishRequest {
+            endpoints: endpoints.clone(),
+            event: NostrAccountRelayListPublication {
+                account_id: account_id.clone(),
+                list_kind: NostrAccountRelayListKind::Inbox,
+                relays: bootstrap.default_relays.clone(),
+                publish_endpoints: endpoints.clone(),
+            }
+            .to_event()?,
+            required_acks: 1,
+        });
+        record_kinds.push("inbox relay list");
         requests.push(NostrEventPublishRequest {
             endpoints: content_endpoints.clone(),
             event: NostrTransportEvent::new_unsigned(
@@ -1882,6 +3428,7 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
+        record_kinds.push("contact list");
         requests.push(NostrEventPublishRequest {
             endpoints: content_endpoints.clone(),
             event: NostrTransportEvent::new_unsigned(
@@ -1892,15 +3439,13 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
+        record_kinds.push("profile metadata");
 
         let relay_client =
             self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer());
-        let record_kinds = [
-            "NIP-65 relay list",
-            "inbox relay list",
-            "contact list",
-            "profile metadata",
-        ];
+        if !setup_is_current() {
+            return Err(AppError::AccountWorkerBusy);
+        }
         let batch = relay_client.publish_events_with_timings(&requests).await;
         let outcomes = batch.outcomes;
         if outcomes.len() != record_kinds.len() {
@@ -1917,39 +3462,44 @@ impl MarmotApp {
                 record_kinds.len()
             )));
         }
-        let relay_and_follow_duration = batch.request_durations[..3]
+        let non_profile_request_count = batch.request_durations.len().saturating_sub(1);
+        let relay_and_follow_duration = batch.request_durations[..non_profile_request_count]
             .iter()
             .copied()
             .max()
             .unwrap_or_default();
-        let default_profile_duration = batch.request_durations[3];
-        for (record_kind, outcome) in record_kinds.into_iter().zip(outcomes) {
+        let default_profile_duration = batch.request_durations.last().copied().unwrap_or_default();
+        for (index, (record_kind, outcome)) in record_kinds.into_iter().zip(outcomes).enumerate() {
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(format!(
                     "relay acknowledged zero events for bootstrap record {record_kind}"
                 )));
             }
+            if index == 0
+                && let Some(pending) = pending_nip65.as_mut()
+            {
+                debug_assert_eq!(record_kind, "NIP-65 relay list");
+                pending.network_accepted = true;
+                {
+                    let _root_mutation = self.begin_root_mutation(
+                        "record generated-account NIP-65 route acknowledgement",
+                    )?;
+                    self.write_pending_nip65_route_mutation(label, pending)?;
+                }
+                self.commit_pending_nip65_route_mutation(label, pending)?;
+            }
         }
 
-        let relays = bootstrap
-            .default_relays
-            .iter()
-            .map(|endpoint| endpoint.0.clone())
-            .collect::<Vec<_>>();
         let mut status = AccountRelayListStatus {
             complete: false,
             missing: Vec::new(),
             default_relays: Vec::new(),
-            bootstrap_relays: endpoints
+            bootstrap_relays: bootstrap
+                .bootstrap_relays
                 .iter()
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
-            nip65: AccountRelayListState {
-                kind: KIND_NIP65_RELAY_LIST,
-                relays: relays.clone(),
-                read_relays: relays.clone(),
-                write_relays: relays.clone(),
-            },
+            nip65: desired_nip65,
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
                 relays,
@@ -1977,21 +3527,65 @@ impl MarmotApp {
         })
     }
 
-    pub async fn publish_missing_account_relay_lists(
+    #[cfg(test)]
+    async fn publish_generated_account_bootstrap(
         &self,
         label: &str,
         bootstrap: AccountRelayListBootstrap,
-    ) -> Result<AccountRelayListStatus, AppError> {
-        let current = self.account_relay_list_status(label)?;
-        self.publish_missing_account_relay_lists_from_status(label, bootstrap, current)
+        profile: &UserProfileMetadata,
+    ) -> Result<GeneratedAccountBootstrapPublication, AppError> {
+        let account = self.account_home().account(label)?;
+        let admission =
+            runtime::AccountSetupPublicationAdmission::for_test(&account.account_id_hex);
+        self.publish_generated_account_bootstrap_admitted(label, bootstrap, profile, &admission)
             .await
     }
 
+    /// Legacy direct-app seam retained for API compatibility; use
+    /// [`MarmotAppRuntime`] so the active account worker supplies admission.
+    /// This method always fails before reading account caches or publishing.
+    pub async fn publish_missing_account_relay_lists(
+        &self,
+        _label: &str,
+        _bootstrap: AccountRelayListBootstrap,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        Err(AppError::AccountWorkerBusy)
+    }
+
+    /// Legacy direct-app seam retained for API compatibility; use
+    /// [`MarmotAppRuntime`] so the active account worker supplies admission.
+    /// This method always fails before reading account caches or publishing.
     pub async fn publish_missing_account_relay_lists_from_status(
+        &self,
+        _label: &str,
+        _bootstrap: AccountRelayListBootstrap,
+        _current: AccountRelayListStatus,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        Err(AppError::AccountWorkerBusy)
+    }
+
+    pub(crate) async fn publish_missing_account_relay_lists_from_status_for_setup(
         &self,
         label: &str,
         bootstrap: AccountRelayListBootstrap,
         current: AccountRelayListStatus,
+        setup_admission: &runtime::AccountSetupPublicationAdmission,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_missing_account_relay_lists_from_status_unlocked(
+            label,
+            bootstrap,
+            current,
+            AccountRelayListMutationAdmission::Setup(setup_admission),
+        )
+        .await
+    }
+
+    async fn publish_missing_account_relay_lists_from_status_unlocked(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        current: AccountRelayListStatus,
+        admission: AccountRelayListMutationAdmission<'_>,
     ) -> Result<AccountRelayListStatus, AppError> {
         let missing = current
             .missing
@@ -2004,13 +3598,16 @@ impl MarmotApp {
         if missing.is_empty() {
             return Ok(current);
         }
-        self.publish_selected_account_relay_lists(label, bootstrap, &missing)
-            .await
+        self.publish_selected_account_relay_lists_with_nip65(
+            label, bootstrap, &missing, None, admission,
+        )
+        .await
     }
 
-    async fn ensure_local_account_relay_lists(
+    pub(crate) async fn ensure_local_account_relay_lists_for_session(
         &self,
         label: &str,
+        session_admission: &AccountSessionAdmissionToken,
     ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.account_home().account(label)?;
         let status = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
@@ -2021,20 +3618,35 @@ impl MarmotApp {
         if default_relays.is_empty() {
             return Err(AppError::MissingRelayLists(status.missing));
         }
-        self.publish_missing_account_relay_lists_from_status(
+        let missing = status
+            .missing
+            .iter()
+            .map(|kind| match kind {
+                MissingRelayListKind::Nip65 => NostrAccountRelayListKind::Nip65,
+                MissingRelayListKind::Inbox => NostrAccountRelayListKind::Inbox,
+            })
+            .collect::<Vec<_>>();
+        self.publish_selected_account_relay_lists_with_nip65(
             label,
             AccountRelayListBootstrap::new(default_relays.clone(), default_relays),
-            status,
+            &missing,
+            None,
+            AccountRelayListMutationAdmission::Active(session_admission),
         )
         .await
     }
 
+    /// Legacy direct-app seam retained for API compatibility.
+    ///
+    /// Supported relay-list kinds fail closed without runtime admission;
+    /// unknown kinds retain their input-validation error. Use
+    /// [`MarmotAppRuntime::publish_account_relay_list_kind`] for mutations.
     pub async fn publish_account_relay_list_kind(
         &self,
-        label: &str,
+        _label: &str,
         list_kind: &str,
-        relays: Vec<TransportEndpoint>,
-        bootstrap_relays: Vec<TransportEndpoint>,
+        _relays: Vec<TransportEndpoint>,
+        _bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
         let list_kind = match list_kind {
             "nip65" => NostrAccountRelayListKind::Nip65,
@@ -2045,12 +3657,8 @@ impl MarmotApp {
                 )));
             }
         };
-        self.publish_selected_account_relay_lists(
-            label,
-            AccountRelayListBootstrap::new(relays, bootstrap_relays),
-            &[list_kind],
-        )
-        .await
+        let _ = list_kind;
+        Err(AppError::AccountWorkerBusy)
     }
 
     /// Return every declared NIP-65 relay for backward-compatible list editing.
@@ -2087,31 +3695,38 @@ impl MarmotApp {
         Ok(self.account_relay_list_status(label)?.inbox.relays)
     }
 
+    /// Legacy direct-app seam retained for API compatibility; use
+    /// [`MarmotAppRuntime::set_account_nip65_relays`]. This method always fails
+    /// before reading the role-preserving relay-list cache or publishing.
     pub async fn set_account_nip65_relays(
         &self,
-        label: &str,
-        relays: Vec<TransportEndpoint>,
-        bootstrap_relays: Vec<TransportEndpoint>,
+        _label: &str,
+        _relays: Vec<TransportEndpoint>,
+        _bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
-        let current = self.account_relay_list_status(label)?.nip65;
-        let relay_set = nip65_relay_set_preserving_roles(&current, relays);
-        self.publish_account_nip65_relay_set(
-            label,
-            relay_set.read_relays,
-            relay_set.write_relays,
-            bootstrap_relays,
-        )
-        .await
+        Err(AppError::AccountWorkerBusy)
     }
 
-    /// Replace the account's NIP-65 list while preserving explicit relay
-    /// directions in the published kind-10002 event.
+    /// Legacy direct-app seam retained for API compatibility; use
+    /// [`MarmotAppRuntime::publish_account_nip65_relay_set`]. This method
+    /// always fails before signing or relay I/O.
     pub async fn publish_account_nip65_relay_set(
+        &self,
+        _label: &str,
+        _read_relays: Vec<TransportEndpoint>,
+        _write_relays: Vec<TransportEndpoint>,
+        _bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        Err(AppError::AccountWorkerBusy)
+    }
+
+    pub(crate) async fn publish_account_nip65_relay_set_for_session(
         &self,
         label: &str,
         read_relays: Vec<TransportEndpoint>,
         write_relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
+        session_admission: &AccountSessionAdmissionToken,
     ) -> Result<AccountRelayListStatus, AppError> {
         let relay_set = NostrNip65RelaySet {
             read_relays: unique_transport_endpoints(read_relays),
@@ -2122,48 +3737,38 @@ impl MarmotApp {
             AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays),
             &[NostrAccountRelayListKind::Nip65],
             Some(&relay_set),
+            AccountRelayListMutationAdmission::Active(session_admission),
         )
         .await
     }
 
-    pub async fn set_account_inbox_relays(
+    pub(crate) async fn publish_account_inbox_relays_for_session(
         &self,
         label: &str,
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
+        session_admission: &AccountSessionAdmissionToken,
     ) -> Result<AccountRelayListStatus, AppError> {
-        self.set_account_relay_list_kind(
-            label,
-            NostrAccountRelayListKind::Inbox,
-            relays,
-            bootstrap_relays,
-        )
-        .await
-    }
-
-    async fn set_account_relay_list_kind(
-        &self,
-        label: &str,
-        list_kind: NostrAccountRelayListKind,
-        relays: Vec<TransportEndpoint>,
-        bootstrap_relays: Vec<TransportEndpoint>,
-    ) -> Result<AccountRelayListStatus, AppError> {
-        self.publish_selected_account_relay_lists(
+        self.publish_selected_account_relay_lists_with_nip65(
             label,
             AccountRelayListBootstrap::new(relays, bootstrap_relays),
-            &[list_kind],
+            &[NostrAccountRelayListKind::Inbox],
+            None,
+            AccountRelayListMutationAdmission::Active(session_admission),
         )
         .await
     }
 
-    async fn publish_selected_account_relay_lists(
+    /// Legacy direct-app seam retained for API compatibility; use
+    /// [`MarmotAppRuntime::set_account_inbox_relays`]. This method always fails
+    /// before signing, relay I/O, or cache mutation.
+    pub async fn set_account_inbox_relays(
         &self,
-        label: &str,
-        bootstrap: AccountRelayListBootstrap,
-        list_kinds: &[NostrAccountRelayListKind],
+        _label: &str,
+        _relays: Vec<TransportEndpoint>,
+        _bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
-        self.publish_selected_account_relay_lists_with_nip65(label, bootstrap, list_kinds, None)
-            .await
+        Err(AppError::AccountWorkerBusy)
     }
 
     async fn publish_selected_account_relay_lists_with_nip65(
@@ -2172,6 +3777,7 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
         list_kinds: &[NostrAccountRelayListKind],
         nip65_relay_set: Option<&NostrNip65RelaySet>,
+        admission: AccountRelayListMutationAdmission<'_>,
     ) -> Result<AccountRelayListStatus, AppError> {
         let has_directional_nip65_relays = nip65_relay_set.is_some_and(|relays| {
             !relays.read_relays.is_empty() || !relays.write_relays.is_empty()
@@ -2180,10 +3786,55 @@ impl MarmotApp {
             return Err(AppError::MissingDefaultRelays);
         }
         self.validate_account_relay_list_declarations(&bootstrap, nip65_relay_set)?;
+        let mut proposed_key_package_relays = None;
+        if list_kinds.contains(&NostrAccountRelayListKind::Nip65) {
+            let proposed = nip65_relay_set
+                .map(|relay_set| relay_set.write_relays.clone())
+                .unwrap_or_else(|| bootstrap.default_relays.clone());
+            proposed_key_package_relays =
+                Some(self.sanitize_key_package_deletion_endpoints(proposed)?);
+        }
+        // Inbox mutations use the same route lock as NIP-65. This gives
+        // teardown one final boundary for every signed relay-list event and
+        // prevents a retained caller from repopulating account caches after
+        // sign-out has completed.
+        let key_package_route_lock = self.key_package_route_lock(label);
+        let _key_package_route_guard = key_package_route_lock.lock().await;
         let account = self.account_home().account(label)?;
+        let admission_is_current = || match admission {
+            AccountRelayListMutationAdmission::Active(token) => {
+                account.is_active_signing()
+                    && account.account_id_hex == token.account_id_hex
+                    && self.active_account_session_admission_is_current(label, token)
+            }
+            AccountRelayListMutationAdmission::Setup(admission) => {
+                admission.is_current()
+                    && account.account_id_hex == admission.account_id_hex()
+                    && account.signed_out == admission.started_signed_out()
+                    && account.can_sign()
+            }
+        };
+        if !admission_is_current() {
+            return Err(AppError::AccountWorkerBusy);
+        }
         let signer = self.account_signer_for_summary(&account)?;
+        if proposed_key_package_relays.is_some() {
+            // A prior process may have exposed the new route-list event and
+            // died before committing its local projection. Replay the exact
+            // signed event (when still unacknowledged) and finish that durable
+            // intent before authoring another replaceable revision.
+            if !admission_is_current() {
+                return Err(AppError::AccountWorkerBusy);
+            }
+            self.recover_pending_nip65_route_mutation(label, signer.as_nostr_signer())
+                .await?;
+        }
+        let nip65_created_at = list_kinds
+            .contains(&NostrAccountRelayListKind::Nip65)
+            .then(|| self.next_locally_authored_nip65_created_at(label))
+            .transpose()?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
-        let account_id_hex = account.account_id_hex;
+        let account_id_hex = account.account_id_hex.clone();
         // Outbox routing: publish relay-list events to the account's own NIP-65
         // write relays; fall back to the bootstrap/seed relays on first publish
         // (no NIP-65 yet). The declared list (content) is `default_relays`, but
@@ -2204,8 +3855,9 @@ impl MarmotApp {
         let relay_client =
             self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
         let mut requests = Vec::with_capacity(list_kinds.len());
+        let mut pending_nip65 = None;
         for list_kind in list_kinds {
-            let event = if *list_kind == NostrAccountRelayListKind::Nip65
+            let mut event = if *list_kind == NostrAccountRelayListKind::Nip65
                 && let Some(relays) = nip65_relay_set
             {
                 NostrNip65RelayListPublication {
@@ -2223,17 +3875,87 @@ impl MarmotApp {
                 }
                 .to_event()?
             };
+            if *list_kind == NostrAccountRelayListKind::Nip65 {
+                event.created_at =
+                    nip65_created_at.expect("a NIP-65 relay-list batch has an authoring timestamp");
+                event = self
+                    .sign_account_transport_event(signer.as_nostr_signer(), event)
+                    .await?;
+                if !admission_is_current() {
+                    return Err(AppError::AccountWorkerBusy);
+                }
+                let nip65 = relay_list_state_from_event(&event).ok_or_else(|| {
+                    AppError::Publish("signed NIP-65 event has no relay-list state".into())
+                })?;
+                let generation = Nip65RouteGeneration {
+                    created_at: event.created_at,
+                    event_id: event.id.clone(),
+                    nip65: nip65.clone(),
+                };
+                pending_nip65 = Some(PendingNip65RouteMutation {
+                    account_id_hex: account_id_hex.clone(),
+                    nip65,
+                    bootstrap_relays: endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.0.clone())
+                        .collect(),
+                    publish_endpoints: endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.0.clone())
+                        .collect(),
+                    signed_event: Some(event.clone()),
+                    generation,
+                    network_accepted: false,
+                    source: Nip65RouteMutationSource::AccountMutation,
+                });
+            }
             requests.push(NostrEventPublishRequest {
                 endpoints: endpoints.clone(),
                 event,
                 required_acks: 1,
             });
         }
-        for outcome in relay_client.publish_events(&requests).await {
+        if let Some(pending) = pending_nip65.as_ref() {
+            if !admission_is_current() {
+                return Err(AppError::AccountWorkerBusy);
+            }
+            // The intent precedes both the durable SQL gate and any network
+            // I/O. A crash at either following boundary therefore leaves a
+            // restart-readable reason to refuse kind-30443 publication.
+            let _root_mutation = self.begin_root_mutation("stage pending NIP-65 route mutation")?;
+            self.write_pending_nip65_route_mutation(label, pending)?;
+            self.invalidate_key_package_cutover_scan_for_route_mutation(label)?;
+            self.arm_key_package_cutover_publication_gate_for_relays(
+                label,
+                proposed_key_package_relays
+                    .as_deref()
+                    .expect("NIP-65 mutation has a proposed write-relay set"),
+            )?;
+        }
+        if !admission_is_current() {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        let outcomes = relay_client.publish_events(&requests).await;
+        if outcomes.len() != list_kinds.len() {
+            return Err(AppError::Publish(format!(
+                "account relay-list batch returned {} outcomes for {} events",
+                outcomes.len(),
+                list_kinds.len()
+            )));
+        }
+        for (list_kind, outcome) in list_kinds.iter().zip(outcomes) {
             if outcome?.accepted.is_empty() {
                 return Err(AppError::Publish(
                     "relay acknowledged zero account relay-list events".to_owned(),
                 ));
+            }
+            if *list_kind == NostrAccountRelayListKind::Nip65
+                && let Some(pending) = pending_nip65.as_mut()
+            {
+                pending.network_accepted = true;
+                let _root_mutation =
+                    self.begin_root_mutation("record NIP-65 route acknowledgement")?;
+                self.write_pending_nip65_route_mutation(label, pending)?;
             }
         }
 
@@ -2246,35 +3968,11 @@ impl MarmotApp {
         for list_kind in list_kinds {
             match list_kind {
                 NostrAccountRelayListKind::Nip65 => {
-                    let (read_relays, write_relays) = nip65_relay_set
-                        .map(|relays| {
-                            (
-                                relays
-                                    .read_relays
-                                    .iter()
-                                    .map(|endpoint| endpoint.0.clone())
-                                    .collect::<Vec<_>>(),
-                                relays
-                                    .write_relays
-                                    .iter()
-                                    .map(|endpoint| endpoint.0.clone())
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            let relays = bootstrap
-                                .default_relays
-                                .iter()
-                                .map(|endpoint| endpoint.0.clone())
-                                .collect::<Vec<_>>();
-                            (relays.clone(), relays)
-                        });
-                    status.nip65 = AccountRelayListState {
-                        kind: KIND_NIP65_RELAY_LIST,
-                        relays: write_relays.clone(),
-                        read_relays,
-                        write_relays,
-                    };
+                    status.nip65 = pending_nip65
+                        .as_ref()
+                        .expect("published NIP-65 event has durable intent")
+                        .nip65
+                        .clone();
                 }
                 NostrAccountRelayListKind::Inbox => {
                     status.inbox = AccountRelayListState {
@@ -2295,7 +3993,21 @@ impl MarmotApp {
             endpoints.iter().map(|endpoint| endpoint.0.clone()),
         );
         status.refresh();
+        let _root_mutation = self.begin_root_mutation("commit account relay-list publication")?;
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pending) = pending_nip65.as_ref() {
+            // Route authority precedes its cache projection. The still-present
+            // pending intent and SQL gate make a crash between these writes
+            // restartable without exposing the previous route.
+            self.write_nip65_route_generation(label, &pending.generation)?;
+        }
         self.remember_directory_relay_lists(&account_id_hex, &status)?;
+        if pending_nip65.is_some() {
+            self.clear_pending_nip65_route_mutation(label)?;
+        }
         Ok(status)
     }
 
@@ -3476,6 +5188,7 @@ impl MarmotApp {
         Ok(group)
     }
 
+    #[cfg(test)]
     fn open_account(
         &self,
         label: &str,
@@ -3483,6 +5196,33 @@ impl MarmotApp {
         defer_group_hydration: bool,
     ) -> Result<OpenAppAccount, AppError> {
         let account = self.account_home().account(label)?;
+        let session_admission =
+            self.capture_account_session_admission(&account.label, &account.account_id_hex)?;
+        self.open_account_with_admission(
+            &account.label,
+            relay_plane,
+            defer_group_hydration,
+            AccountSessionAdmission::Active(session_admission),
+        )
+    }
+
+    fn open_account_with_admission(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        defer_group_hydration: bool,
+        session_admission: AccountSessionAdmission,
+    ) -> Result<OpenAppAccount, AppError> {
+        let account = self.account_home().account(label)?;
+        let admitted_account_id_hex = match &session_admission {
+            AccountSessionAdmission::Active(token) => &token.account_id_hex,
+            AccountSessionAdmission::Teardown(token) => &token.account_id_hex,
+        };
+        if account.account_id_hex != *admitted_account_id_hex
+            || !self.account_open_admission_is_current(&account.label, &session_admission)
+        {
+            return Err(AppError::AccountWorkerBusy);
+        }
         // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
         // by the canonical stored label so aliases cannot open a second engine.
         let label = account.label.as_str();
@@ -3559,8 +5299,28 @@ impl MarmotApp {
             session_config = session_config.recorder(recorder);
         }
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
+        self.canonicalize_key_package_lifecycle_targets_before_session_open(label)?;
+        // `AccountDeviceSession` opens its own SQLCipher connection rather than
+        // cloning `account_storages`. Hold storage-open admission until that
+        // connection is published into the terminal-close registry: the close
+        // writer must see either no connection or a closeable handle for every
+        // successfully opened session.
+        let storage_lifecycle = self.begin_storage_open("account session storage")?;
         let session =
             AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
+        self.account_session_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(label.to_owned(), session.storage_handle());
+        // Do not carry the read guard into `routing_for`: its database helpers
+        // take their own storage-open admission, and a pending close writer
+        // could otherwise turn that nested read into a self-deadlock. The
+        // session is now published, so terminal close can safely proceed.
+        drop(storage_lifecycle);
+
+        if !self.account_open_admission_is_current(label, &session_admission) {
+            return Err(AppError::AccountWorkerBusy);
+        }
 
         let publish_client =
             self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
@@ -3583,18 +5343,29 @@ impl MarmotApp {
             publish_client,
             Some(recovery_marker),
         );
+        self.account_session_adapters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(label.to_owned(), adapter.clone());
 
         let key_packages = AppKeyPackagePublisher {
             app: self.clone(),
             account_label: label.to_owned(),
             signer: signer.clone(),
+            session_admission: session_admission.clone(),
         };
         let routing = self.routing_for(&state)?;
-        let runtime =
+        let mut runtime =
             AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+        // Schema-51 retained only one overwritten Welcome-consumption marker.
+        // Resolve that one-time ambiguity synchronously under the newly opened
+        // account writer before transport activation can ingest another Welcome
+        // and destroy the detectable legacy shape.
+        runtime.sweep_expired_key_package_private_material()?;
         Ok(OpenAppAccount {
             runtime,
             session_guard,
+            session_admission,
             adapter,
             routing,
             state,
@@ -3615,7 +5386,17 @@ impl MarmotApp {
         Ok(AppAccountSessionGuard {
             label: label.to_owned(),
             owners: self.account_session_owners.clone(),
+            storages: self.account_session_storages.clone(),
+            adapters: self.account_session_adapters.clone(),
         })
+    }
+
+    fn account_session_adapter(&self, label: &str) -> Option<MarmotRelayPlaneAccountAdapter> {
+        self.account_session_adapters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
     }
 
     fn routing_for(&self, state: &AccountState) -> Result<AppTransportRouting, AppError> {
@@ -3706,20 +5487,24 @@ impl MarmotApp {
         Ok(key_package.with_protocol_profile(metadata.protocol_profile))
     }
 
-    /// Best-effort public-event cleanup after the session has already
-    /// transactionally removed the matching non-current private bundle.
-    ///
-    /// A failed relay deletion deliberately leaves the cache record in place:
-    /// the current replacement then reuses the same replaceable-event `d`
-    /// slot, superseding the legacy event wherever the deletion was missed.
-    /// If replacement publication also fails, the next account open retries
-    /// from the unchanged cache.
-    async fn retire_cached_non_current_key_package(&self, label: &str) -> bool {
+    /// Durably admit an exact non-current cache revision before any deletion or
+    /// replacement publication can escape. Historical endpoints come only from
+    /// the account-private observation of this exact event; current routing is
+    /// never substituted. Unknown provenance, malformed JSON, invalid ids, and
+    /// capacity-deferred endpoints keep both the cache and cutover pending.
+    fn retire_cached_non_current_key_package(
+        &self,
+        label: &str,
+        runtime: &mut AppRuntime,
+    ) -> CachedKeyPackageRetirementAdmission {
         let path = self.key_package_record_path(label);
         let record = match read_json::<KeyPackageRecord>(&path) {
             Ok(record) => record,
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return false;
+                return CachedKeyPackageRetirementAdmission {
+                    complete: true,
+                    event_id: None,
+                };
             }
             Err(error) => {
                 tracing::warn!(
@@ -3728,83 +5513,559 @@ impl MarmotApp {
                     error_kind = error.privacy_safe_kind(),
                     "could not classify cached key package after strict cutover"
                 );
-                if !self.mark_key_package_cutover_replacement_pending(label) {
-                    return false;
-                }
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(remove_error) => tracing::warn!(
-                        target: "marmot_app::key_packages",
-                        method = "retire_cached_non_current_key_package",
-                        error_kind = AppError::from(remove_error).privacy_safe_kind(),
-                        "could not remove invalid key package cache"
-                    ),
-                }
-                return true;
+                let _ = self.mark_key_package_cutover_replacement_pending(label);
+                return CachedKeyPackageRetirementAdmission {
+                    complete: false,
+                    event_id: None,
+                };
             }
         };
-        let is_current = key_package_from_hex_with_optional_source(
+        let current_metadata = key_package_from_hex_with_optional_source(
             &record.key_package_hex,
             &record.key_package_event_id,
         )
         .ok()
-        .and_then(|key_package| key_package_metadata(&key_package).ok())
-        .is_some_and(|metadata| {
-            self.key_package_metadata_matches_current_support(&metadata)
-                && metadata.credential_identity_hex == record.account_id_hex
-        });
-        if is_current {
-            return false;
-        }
-        if !self.mark_key_package_cutover_replacement_pending(label) {
-            return false;
-        }
-
-        if record.key_package_event_id.is_empty() {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::warn!(
+        .and_then(|key_package| key_package_metadata(&key_package).ok());
+        let account = match self.account_home().account(label) {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "retire_cached_non_current_key_package",
                     error_kind = AppError::from(error).privacy_safe_kind(),
-                    "could not remove unpublished non-current key package cache"
-                ),
+                    "could not resolve cached key package account"
+                );
+                return CachedKeyPackageRetirementAdmission {
+                    complete: false,
+                    event_id: None,
+                };
             }
-            return true;
+        };
+        let lifecycle = runtime.key_package_maintenance_status().ok().flatten();
+        let parsed_event_id = (!record.key_package_event_id.is_empty()).then(|| {
+            parse_key_package_event_id_hex(&record.key_package_event_id).and_then(|event_id_hex| {
+                hex::decode(event_id_hex)
+                    .map(MessageId::new)
+                    .map_err(AppError::from)
+            })
+        });
+        let (exact_cached_endpoints, exact_cached_created_at) = parsed_event_id
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|_| {
+                self.cached_key_package_provenance(
+                    &account,
+                    &record,
+                    (!record.key_package_ref_hex.is_empty())
+                        .then_some(record.key_package_ref_hex.as_str()),
+                )
+            })
+            .unwrap_or_default();
+        let cache_matches_local_coordinate = lifecycle.as_ref().is_some_and(|lifecycle| {
+            !lifecycle.stable_slot_id.is_empty()
+                && lifecycle.stable_slot_id == record.key_package_id
+                && record.account_id_hex == account.account_id_hex
+        });
+        if current_metadata.as_ref().is_some_and(|metadata| {
+            self.key_package_metadata_matches_current_support(metadata)
+                && metadata.credential_identity_hex == account.account_id_hex
+                && (record.key_package_ref_hex.is_empty()
+                    || record
+                        .key_package_ref_hex
+                        .eq_ignore_ascii_case(&metadata.key_package_ref_hex))
+        }) && cache_matches_local_coordinate
+            && let Some(lifecycle) = lifecycle.as_ref()
+        {
+            if parsed_event_id.is_none() {
+                let matches_current_ref = current_metadata.as_ref().is_some_and(|metadata| {
+                    lifecycle
+                        .current_key_package_ref
+                        .as_ref()
+                        .is_some_and(|current_ref| {
+                            hex::encode(current_ref)
+                                .eq_ignore_ascii_case(&metadata.key_package_ref_hex)
+                        })
+                });
+                if matches_current_ref {
+                    return CachedKeyPackageRetirementAdmission {
+                        complete: true,
+                        event_id: None,
+                    };
+                }
+            } else if let Some(Ok(event_id)) = parsed_event_id.as_ref() {
+                let cached_endpoints_are_covered =
+                    |targets: &[cgka_traits::TransportFanoutTarget]| {
+                        exact_cached_endpoints.iter().all(|endpoint| {
+                            targets.iter().any(|target| target.endpoint == *endpoint)
+                        })
+                    };
+                let signed_live_exact = lifecycle
+                    .authored_signed_event
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.id == *event_id)
+                    && !lifecycle.publication_targets.is_empty()
+                    && cached_endpoints_are_covered(&lifecycle.publication_targets);
+                let imported_live_exact = lifecycle.authored_event_id.as_ref() == Some(event_id)
+                    && !exact_cached_endpoints.is_empty()
+                    && exact_cached_endpoints.iter().all(|endpoint| {
+                        lifecycle
+                            .publication_targets
+                            .iter()
+                            .any(|target| target.endpoint == *endpoint)
+                    });
+                let pending_exact = lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .and_then(|pending| {
+                        pending
+                            .signed_event
+                            .as_ref()
+                            .map(|artifact| (pending, artifact))
+                    })
+                    .is_some_and(|(pending, artifact)| {
+                        artifact.id == *event_id
+                            && !pending.targets.is_empty()
+                            && cached_endpoints_are_covered(&pending.targets)
+                    });
+                if signed_live_exact || imported_live_exact || pending_exact {
+                    return CachedKeyPackageRetirementAdmission {
+                        complete: true,
+                        event_id: None,
+                    };
+                }
+                let exact_retired = lifecycle
+                    .retired_publications_pending_deletion
+                    .iter()
+                    .find(|retired| retired.event_id == *event_id);
+                if exact_retired.is_some_and(|retired| {
+                    !retired.deletion_targets.is_empty()
+                        && cached_endpoints_are_covered(&retired.deletion_targets)
+                }) {
+                    return CachedKeyPackageRetirementAdmission {
+                        complete: true,
+                        event_id: Some(event_id.clone()),
+                    };
+                }
+            }
+        }
+        if !self.mark_key_package_cutover_replacement_pending(label) {
+            return CachedKeyPackageRetirementAdmission {
+                complete: false,
+                event_id: None,
+            };
         }
 
-        match self
-            .delete_key_package_event(label, &record.key_package_event_id, Vec::new())
-            .await
-        {
-            Ok(accepted) => tracing::info!(
-                target: "marmot_app::key_packages",
-                method = "retire_cached_non_current_key_package",
-                relay_accept_count = accepted,
-                "retired cached non-current key package event"
-            ),
-            Err(error) => tracing::warn!(
-                target: "marmot_app::key_packages",
-                method = "retire_cached_non_current_key_package",
-                error_kind = error.privacy_safe_kind(),
-                "could not delete cached non-current key package event; current replacement will supersede its slot"
-            ),
+        if record.key_package_event_id.is_empty() {
+            let complete = match fs::remove_file(path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "retire_cached_non_current_key_package",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "could not remove unpublished non-current key package cache"
+                    );
+                    false
+                }
+            };
+            return CachedKeyPackageRetirementAdmission {
+                complete,
+                event_id: None,
+            };
         }
-        true
+        let event_id = match parsed_event_id.expect("non-empty cached event id was parsed") {
+            Ok(event_id) => event_id,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_cached_non_current_key_package",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not durably admit cached key package event with invalid identity"
+                );
+                return CachedKeyPackageRetirementAdmission {
+                    complete: false,
+                    event_id: None,
+                };
+            }
+        };
+        if record.account_id_hex != account.account_id_hex {
+            return CachedKeyPackageRetirementAdmission {
+                complete: false,
+                event_id: Some(event_id),
+            };
+        }
+        let historical_endpoints = exact_cached_endpoints;
+        if record.key_package_id.is_empty() || historical_endpoints.is_empty() {
+            return CachedKeyPackageRetirementAdmission {
+                complete: false,
+                event_id: Some(event_id),
+            };
+        }
+        let complete = match runtime.journal_discovered_unparsed_key_package_publication(
+            record.key_package_id.clone(),
+            event_id.clone(),
+            Timestamp(
+                exact_cached_created_at
+                    .map(|cached| cached.max(record.published_at))
+                    .unwrap_or(record.published_at),
+            ),
+            historical_endpoints,
+        ) {
+            Ok((_admitted, deferred)) => deferred.is_empty(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_cached_non_current_key_package",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not durably admit cached key package deletion liability"
+                );
+                false
+            }
+        };
+        CachedKeyPackageRetirementAdmission {
+            complete,
+            event_id: Some(event_id),
+        }
     }
 
-    /// Scan the account's authoritative KeyPackage relays and best-effort
-    /// delete every still-discoverable legacy event. This runs on each account
-    /// open, so a crash or partial relay outage simply leaves work for the next
-    /// restart. Local private bundles have already been retired synchronously.
-    async fn retire_relay_non_current_key_packages(&self, label: &str) -> bool {
-        if self.key_package_cutover_scan_complete(label)
-            && !self.key_package_cutover_replacement_pending(label)
+    fn remove_terminal_cached_key_package_record(&self, label: &str, event_id: &MessageId) {
+        let Ok(Some(lifecycle)) = self
+            .account_storage(label)
+            .and_then(|storage| storage.key_package_lifecycle().map_err(AppError::from))
+        else {
+            // Failure to prove terminal durable state must retain the only
+            // local exact-event cache rather than turn a read error into loss.
+            return;
+        };
+        if lifecycle
+            .retired_publications_pending_deletion
+            .iter()
+            .any(|retired| retired.event_id == *event_id)
         {
-            return false;
+            return;
         }
+        let path = self.key_package_record_path(label);
+        let Ok(record) = read_json::<KeyPackageRecord>(&path) else {
+            return;
+        };
+        let Ok(record_event_id_hex) = parse_key_package_event_id_hex(&record.key_package_event_id)
+        else {
+            return;
+        };
+        if record_event_id_hex != hex::encode(event_id.as_slice()) {
+            // A concurrent cache refresh may already have installed another
+            // exact revision. Never remove it while finalizing this one.
+            return;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "remove_terminal_cached_key_package_record",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not remove terminal cached key package record"
+            ),
+        }
+    }
+
+    fn journal_unparsed_relay_key_package_revision(
+        &self,
+        runtime: &mut AppRuntime,
+        stable_slot_id: &str,
+        event_id_hex: &str,
+        authored_created_at: u64,
+        source_endpoints: Vec<TransportEndpoint>,
+    ) -> Result<(usize, usize), AppError> {
+        let event_id_hex = parse_key_package_event_id_hex(event_id_hex)?;
+        let event_id = MessageId::new(hex::decode(event_id_hex)?);
+        let (admitted, deferred) = runtime
+            .journal_discovered_unparsed_key_package_publication(
+                stable_slot_id.to_owned(),
+                event_id,
+                Timestamp(authored_created_at),
+                source_endpoints,
+            )
+            .map_err(AppError::from)?;
+        Ok((admitted.len(), deferred.len()))
+    }
+
+    fn admit_relay_key_package_records(
+        &self,
+        label: &str,
+        runtime: &mut AppRuntime,
+        records: Vec<RelayEventRecord>,
+        delete_without_successor: bool,
+    ) -> Result<KeyPackageRelayAdmissionSummary, AppError> {
+        let lifecycle = runtime
+            .key_package_maintenance_status()
+            .map_err(AppError::from)?
+            .filter(|lifecycle| !lifecycle.stable_slot_id.is_empty())
+            .ok_or_else(|| {
+                AppError::Publish(
+                    "relay key package retirement requires lifecycle slot authority".into(),
+                )
+            })?;
+        let stable_slot_id = lifecycle.stable_slot_id.clone();
+        let mut live_event_ids = HashSet::new();
+        if let Some(event_id) = lifecycle
+            .authored_event_id
+            .as_ref()
+            .filter(|event_id| !lifecycle.deleted_live_revision_event_ids.contains(event_id))
+        {
+            live_event_ids.insert(hex::encode(event_id.as_slice()));
+        }
+        if let Some(artifact) = lifecycle.authored_signed_event.as_ref().filter(|artifact| {
+            !lifecycle
+                .deleted_live_revision_event_ids
+                .contains(&artifact.id)
+        }) {
+            live_event_ids.insert(hex::encode(artifact.id.as_slice()));
+        }
+        if let Some(artifact) = lifecycle
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| pending.signed_event.as_ref())
+            .filter(|artifact| {
+                !lifecycle
+                    .deleted_live_revision_event_ids
+                    .contains(&artifact.id)
+            })
+        {
+            live_event_ids.insert(hex::encode(artifact.id.as_slice()));
+        }
+        let local_live_artifact_created_at = lifecycle
+            .authored_signed_event
+            .as_ref()
+            .map(|artifact| artifact.created_at.0)
+            .into_iter()
+            .chain(
+                lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .and_then(|pending| pending.signed_event.as_ref())
+                    .map(|artifact| artifact.created_at.0),
+            )
+            .max();
+
+        let mut summary = KeyPackageRelayAdmissionSummary::default();
+        for record in records {
+            let event_id = record.event.id.clone();
+            let authored_created_at = record.event.created_at;
+            let raw_endpoints = record.endpoints.clone();
+            if record.event.tag_value("d") != Some(stable_slot_id.as_str()) {
+                // One Nostr account can have several device-local `d` slots.
+                // An account-wide relay query must not turn a sibling device's
+                // revision into deletion work for this lifecycle.
+                continue;
+            }
+            if live_event_ids.contains(&event_id) {
+                let observed = hex::decode(&event_id)
+                    .map(MessageId::new)
+                    .map_err(AppError::from)
+                    .and_then(|event_id| {
+                        runtime
+                            .observe_live_key_package_publication(
+                                stable_slot_id.clone(),
+                                &event_id,
+                                Timestamp(authored_created_at),
+                                raw_endpoints.clone(),
+                            )
+                            .map_err(AppError::from)
+                    });
+                match observed {
+                    Ok((_admitted, deferred)) if deferred.is_empty() => {}
+                    Ok((_admitted, deferred)) => {
+                        summary.deferred_endpoint_count = summary
+                            .deferred_endpoint_count
+                            .saturating_add(deferred.len());
+                        summary.admission_failure_count += 1;
+                    }
+                    Err(_) => summary.admission_failure_count += 1,
+                }
+                continue;
+            }
+
+            match key_package_from_record(record) {
+                Ok(fetched) => {
+                    if fetched.key_package_id != stable_slot_id {
+                        continue;
+                    }
+                    let metadata = match key_package_metadata(&fetched.key_package) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            if !self.mark_key_package_cutover_replacement_pending(label) {
+                                summary.admission_failure_count += 1;
+                            }
+                            summary.non_current_event_count += 1;
+                            match self.journal_unparsed_relay_key_package_revision(
+                                runtime,
+                                &stable_slot_id,
+                                &fetched.key_package_event_id,
+                                fetched.created_at,
+                                fetched
+                                    .source_relays
+                                    .into_iter()
+                                    .map(TransportEndpoint)
+                                    .collect(),
+                            ) {
+                                Ok((_admitted, deferred)) => {
+                                    summary.deferred_endpoint_count =
+                                        summary.deferred_endpoint_count.saturating_add(deferred);
+                                    if deferred > 0 {
+                                        summary.admission_failure_count += 1;
+                                    }
+                                }
+                                Err(_) => summary.admission_failure_count += 1,
+                            }
+                            continue;
+                        }
+                    };
+                    // NIP-33 resolves equal timestamps by event-id tie-break.
+                    // This is already a different exact id, so equality is not
+                    // enough to prove the local artifact will supersede it.
+                    let discovered_can_compete_with_local_artifact = local_live_artifact_created_at
+                        .is_none_or(|created_at| fetched.created_at >= created_at);
+                    if (!self.key_package_metadata_matches_current_support(&metadata)
+                        || discovered_can_compete_with_local_artifact)
+                        && !self.mark_key_package_cutover_replacement_pending(label)
+                    {
+                        summary.admission_failure_count += 1;
+                    }
+                    let event_id_hex =
+                        match parse_key_package_event_id_hex(&fetched.key_package_event_id) {
+                            Ok(event_id_hex) => event_id_hex,
+                            Err(_) => {
+                                summary.admission_failure_count += 1;
+                                continue;
+                            }
+                        };
+                    let key_package_ref = match hex::decode(&fetched.key_package_ref_hex) {
+                        Ok(key_package_ref) => key_package_ref,
+                        Err(_) => {
+                            summary.admission_failure_count += 1;
+                            continue;
+                        }
+                    };
+                    let endpoints = match self.sanitize_key_package_deletion_endpoints(
+                        fetched
+                            .source_relays
+                            .into_iter()
+                            .map(TransportEndpoint)
+                            .collect(),
+                    ) {
+                        Ok(endpoints) if !endpoints.is_empty() => endpoints,
+                        Ok(_) | Err(_) => {
+                            summary.admission_failure_count += 1;
+                            continue;
+                        }
+                    };
+                    let event_id = MessageId::new(
+                        hex::decode(event_id_hex)
+                            .expect("validated key package event id remains hex"),
+                    );
+                    match runtime.journal_discovered_retired_key_package_publication_with_policy(
+                        stable_slot_id.clone(),
+                        event_id,
+                        Timestamp(fetched.created_at),
+                        key_package_ref,
+                        Timestamp(metadata.not_after),
+                        endpoints,
+                        delete_without_successor,
+                    ) {
+                        Ok((_admitted, deferred)) => {
+                            summary.discovered_current_revision_count += 1;
+                            summary.deferred_endpoint_count = summary
+                                .deferred_endpoint_count
+                                .saturating_add(deferred.len());
+                            if !deferred.is_empty() {
+                                summary.admission_failure_count += 1;
+                            }
+                        }
+                        Err(_) => summary.admission_failure_count += 1,
+                    }
+                }
+                Err(_) => {
+                    if !self.mark_key_package_cutover_replacement_pending(label) {
+                        summary.admission_failure_count += 1;
+                    }
+                    summary.non_current_event_count += 1;
+                    match self.journal_unparsed_relay_key_package_revision(
+                        runtime,
+                        &stable_slot_id,
+                        &event_id,
+                        authored_created_at,
+                        raw_endpoints,
+                    ) {
+                        Ok((_admitted, deferred)) => {
+                            summary.deferred_endpoint_count =
+                                summary.deferred_endpoint_count.saturating_add(deferred);
+                            if deferred > 0 {
+                                summary.admission_failure_count += 1;
+                            }
+                        }
+                        Err(_) => summary.admission_failure_count += 1,
+                    }
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    fn retired_key_package_deletion_target_endpoints(
+        runtime: &AppRuntime,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let mut endpoints = runtime
+            .key_package_maintenance_status()
+            .map_err(AppError::from)?
+            .into_iter()
+            .flat_map(|lifecycle| lifecycle.retired_publications_pending_deletion)
+            .flat_map(|retired| retired.deletion_targets)
+            .map(|target| target.endpoint)
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        endpoints.dedup();
+        Ok(endpoints)
+    }
+
+    /// Scan the account's authoritative KeyPackage relays for revisions in this
+    /// device's stable slot. Valid current-profile predecessors are durably
+    /// journaled before any deletion I/O, then retried through the account
+    /// runtime so successor eligibility and per-endpoint receipts remain
+    /// authoritative. Sibling-device slots and the exact live current/pending
+    /// ids are never classified as local retirement work.
+    async fn retire_relay_non_current_key_packages(
+        &self,
+        label: &str,
+        runtime: &mut AppRuntime,
+    ) -> bool {
+        self.retire_relay_non_current_key_packages_with_policy(label, runtime, false)
+            .await
+    }
+
+    async fn retire_relay_non_current_key_packages_for_teardown(
+        &self,
+        label: &str,
+        runtime: &mut AppRuntime,
+    ) -> bool {
+        self.retire_relay_non_current_key_packages_with_policy(label, runtime, true)
+            .await
+    }
+
+    async fn retire_relay_non_current_key_packages_with_policy(
+        &self,
+        label: &str,
+        runtime: &mut AppRuntime,
+        authorize_without_successor: bool,
+    ) -> bool {
+        let destructive_cleanup_was_durable = match self.key_package_teardown_cleanup_pending(label)
+        {
+            Ok(pending) => pending,
+            Err(_) => return false,
+        };
+        let authorize_without_successor =
+            authorize_without_successor || destructive_cleanup_was_durable;
         let account = match self.account_home().account(label) {
             Ok(account) => account,
             Err(error) => {
@@ -3837,73 +6098,637 @@ impl MarmotApp {
             .cloned()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        if source_relays.is_empty() {
+        let source_relays = match self.sanitize_key_package_deletion_endpoints(source_relays) {
+            Ok(source_relays) if !source_relays.is_empty() => source_relays,
+            Ok(_) | Err(_) => return false,
+        };
+        let history_lock = self.key_package_history_lock(label);
+        let history_guard = history_lock.lock().await;
+        let lifecycle = match runtime.key_package_maintenance_status() {
+            Ok(Some(lifecycle)) if !lifecycle.stable_slot_id.is_empty() => lifecycle,
+            Ok(_) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = "missing_stable_slot",
+                    "deferred relay key package retirement scan without lifecycle slot authority"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not read lifecycle authority for relay key package retirement"
+                );
+                return false;
+            }
+        };
+        if authorize_without_successor
+            && runtime
+                .authorize_teardown_key_package_deletions_without_successor()
+                .is_err()
+        {
             return false;
         }
-        let records = match self
-            .fetch_key_package_events_for_account_id_with_limit(
-                &account.account_id_hex,
-                &source_relays,
-                KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
-            )
-            .await
+        let known_history_relays = match self.key_package_lifecycle_history_endpoints(&lifecycle) {
+            Ok(endpoints) => endpoints,
+            Err(_) => return false,
+        };
+        let durable_history_relays = match self.key_package_cutover_relay_history(label) {
+            Ok(endpoints) => endpoints,
+            Err(_) => return false,
+        };
+        if self.key_package_cutover_scan_complete_for_relays(label, &source_relays) {
+            // A fresh-account proof is endpoint-independent only until the
+            // account's first completed open. Bind it to the then-current
+            // authoritative set so later NIP-65 additions/re-additions re-arm
+            // the scan instead of inheriting the one-time creation proof.
+            if runtime
+                .finalize_key_package_cutover_consumption_evidence()
+                .is_err()
+            {
+                return false;
+            }
+            let Ok(_root_mutation) =
+                self.begin_root_mutation("bind fresh KeyPackage cutover scan marker")
+            else {
+                return false;
+            };
+            let proof_relays = source_relays
+                .iter()
+                .cloned()
+                .chain(known_history_relays.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            return self
+                .mark_key_package_cutover_scan_complete_for_relays(
+                    label,
+                    &source_relays,
+                    &proof_relays,
+                )
+                .is_ok();
+        }
         {
-            Ok(records) => records,
+            let Ok(_root_mutation) =
+                self.begin_root_mutation("invalidate incomplete KeyPackage history proof")
+            else {
+                return false;
+            };
+            let _frontier_mutation = self
+                .key_package_frontier_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self
+                .invalidate_key_package_cutover_scan_marker(label)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        let mut relay_frontier = match self.key_package_cutover_relay_frontier(label) {
+            Ok(frontier) => frontier,
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "retire_relay_non_current_key_packages",
                     error_kind = error.privacy_safe_kind(),
-                    "deferred relay key package retirement scan"
+                    "could not read the durable KeyPackage relay-history frontier"
                 );
                 return false;
             }
         };
-
+        // An aggregate directory fetch is intentionally partial-success: if
+        // one relay connects, callers can still use what it returned. That is
+        // not strong enough for a durable scan-complete proof. Query each
+        // authoritative relay and every crash-recovery frontier relay
+        // independently and in parallel, requiring this invocation's own EOSE
+        // from each endpoint. A historical frontier relay can be absent from
+        // the current NIP-65 route and must not be forgotten for that reason.
+        let stable_slot_id = lifecycle.stable_slot_id.clone();
+        let mut live_event_ids = HashSet::new();
+        if let Some(event_id) = lifecycle
+            .authored_event_id
+            .as_ref()
+            .filter(|event_id| !lifecycle.deleted_live_revision_event_ids.contains(event_id))
+        {
+            live_event_ids.insert(hex::encode(event_id.as_slice()));
+        }
+        if let Some(artifact) = lifecycle.authored_signed_event.as_ref().filter(|artifact| {
+            !lifecycle
+                .deleted_live_revision_event_ids
+                .contains(&artifact.id)
+        }) {
+            live_event_ids.insert(hex::encode(artifact.id.as_slice()));
+        }
+        if let Some(artifact) = lifecycle
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| pending.signed_event.as_ref())
+            .filter(|artifact| {
+                !lifecycle
+                    .deleted_live_revision_event_ids
+                    .contains(&artifact.id)
+            })
+        {
+            live_event_ids.insert(hex::encode(artifact.id.as_slice()));
+        }
+        let local_live_artifact_created_at = lifecycle
+            .authored_signed_event
+            .as_ref()
+            .map(|artifact| artifact.created_at.0)
+            .into_iter()
+            .chain(
+                lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .and_then(|pending| pending.signed_event.as_ref())
+                    .map(|artifact| artifact.created_at.0),
+            )
+            .max();
+        let scan_relays = source_relays
+            .iter()
+            .cloned()
+            .chain(relay_frontier.iter().cloned())
+            // A settled historical relay carries its last strict short-page
+            // proof in the monotonic ledger. Do not make every later route
+            // edit depend on an offline retired relay forever. Current source
+            // relays and any newly armed deletion frontier are always scanned
+            // again; lifecycle-only history needs a fresh scan only until its
+            // first proof is durably transferred into that ledger.
+            .chain(
+                known_history_relays
+                    .difference(&durable_history_relays)
+                    .cloned(),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let per_relay_records = futures::future::join_all(scan_relays.iter().map(|endpoint| {
+            self.fetch_key_package_events_for_account_id_with_limit_strict(
+                &account.account_id_hex,
+                std::slice::from_ref(endpoint),
+                KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
+            )
+        }))
+        .await;
+        let mut records = Vec::new();
+        let mut all_required_relays_scanned = true;
+        let mut scan_was_truncated = false;
+        let mut frontier_clear_candidates = BTreeSet::new();
+        let mut scanned_history_relays = durable_history_relays;
+        for (endpoint, fetched) in scan_relays.iter().zip(per_relay_records) {
+            let relay_records = match fetched {
+                Ok(records) => records,
+                Err(error) => {
+                    all_required_relays_scanned = false;
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "retire_relay_non_current_key_packages",
+                        error_kind = error.privacy_safe_kind(),
+                        "required relay did not complete a strict EOSE scan; processing reachable relay revisions while retaining the cutover gate"
+                    );
+                    continue;
+                }
+            };
+            let page_was_truncated = relay_records.len() >= KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT;
+            scan_was_truncated |= page_was_truncated;
+            if !page_was_truncated {
+                scanned_history_relays.insert(endpoint.clone());
+            }
+            if relay_frontier.contains(endpoint) && !page_was_truncated {
+                frontier_clear_candidates.insert(endpoint.clone());
+            }
+            records.extend(relay_records);
+        }
         let mut non_current_event_count = 0usize;
-        let mut accepted_delete_count = 0usize;
-        let mut delete_failure_count = 0usize;
+        let mut discovered_current_revision_count = 0usize;
+        let mut deferred_endpoint_count = 0usize;
+        let mut admission_failure_count = 0usize;
         for record in records {
             let event_id = record.event.id.clone();
-            let endpoints = record.endpoints.clone();
-            let is_current = key_package_from_record(record)
-                .ok()
-                .and_then(|fetched| key_package_metadata(&fetched.key_package).ok())
-                .is_some_and(|metadata| {
-                    self.key_package_metadata_matches_current_support(&metadata)
-                });
-            if is_current {
+            let authored_created_at = record.event.created_at;
+            let raw_endpoints = record.endpoints.clone();
+            if record.event.tag_value("d") != Some(stable_slot_id.as_str()) {
+                // One Nostr account can have several device-local `d` slots.
+                // An account-wide relay query must not turn a sibling device's
+                // revision into deletion work for this lifecycle.
                 continue;
             }
-            if !self.mark_key_package_cutover_replacement_pending(label) {
-                delete_failure_count += 1;
+            if live_event_ids.contains(&event_id) {
+                let observed = hex::decode(&event_id)
+                    .map(MessageId::new)
+                    .map_err(AppError::from)
+                    .and_then(|event_id| {
+                        runtime
+                            .observe_live_key_package_publication(
+                                stable_slot_id.clone(),
+                                &event_id,
+                                Timestamp(authored_created_at),
+                                raw_endpoints.clone(),
+                            )
+                            .map_err(AppError::from)
+                    });
+                match observed {
+                    Ok((_admitted, deferred)) if deferred.is_empty() => {}
+                    Ok((_admitted, deferred)) => {
+                        deferred_endpoint_count =
+                            deferred_endpoint_count.saturating_add(deferred.len());
+                        admission_failure_count += 1;
+                    }
+                    Err(_) => admission_failure_count += 1,
+                }
                 continue;
             }
-            non_current_event_count += 1;
-            match self
-                .delete_key_package_event(label, &event_id, endpoints)
-                .await
+
+            match key_package_from_record(record) {
+                Ok(fetched) => {
+                    if fetched.key_package_id != stable_slot_id {
+                        continue;
+                    }
+                    let metadata = match key_package_metadata(&fetched.key_package) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            if !self.mark_key_package_cutover_replacement_pending(label) {
+                                admission_failure_count += 1;
+                            }
+                            non_current_event_count += 1;
+                            match self.journal_unparsed_relay_key_package_revision(
+                                runtime,
+                                &stable_slot_id,
+                                &fetched.key_package_event_id,
+                                fetched.created_at,
+                                fetched
+                                    .source_relays
+                                    .into_iter()
+                                    .map(TransportEndpoint)
+                                    .collect(),
+                            ) {
+                                Ok((_admitted, deferred)) => {
+                                    deferred_endpoint_count =
+                                        deferred_endpoint_count.saturating_add(deferred);
+                                    if deferred > 0 {
+                                        admission_failure_count += 1;
+                                    }
+                                }
+                                Err(_) => admission_failure_count += 1,
+                            }
+                            continue;
+                        }
+                    };
+                    // NIP-33 resolves equal timestamps by event-id tie-break.
+                    // This is already a different exact id, so equality is not
+                    // enough to prove the local artifact will supersede it.
+                    let discovered_can_compete_with_local_artifact = local_live_artifact_created_at
+                        .is_none_or(|created_at| fetched.created_at >= created_at);
+                    if (!self.key_package_metadata_matches_current_support(&metadata)
+                        || discovered_can_compete_with_local_artifact)
+                        && !self.mark_key_package_cutover_replacement_pending(label)
+                    {
+                        admission_failure_count += 1;
+                    }
+                    let event_id_hex =
+                        match parse_key_package_event_id_hex(&fetched.key_package_event_id) {
+                            Ok(event_id_hex) => event_id_hex,
+                            Err(_) => {
+                                admission_failure_count += 1;
+                                continue;
+                            }
+                        };
+                    let key_package_ref = match hex::decode(&fetched.key_package_ref_hex) {
+                        Ok(key_package_ref) => key_package_ref,
+                        Err(_) => {
+                            admission_failure_count += 1;
+                            continue;
+                        }
+                    };
+                    let endpoints = match self.sanitize_key_package_deletion_endpoints(
+                        fetched
+                            .source_relays
+                            .into_iter()
+                            .map(TransportEndpoint)
+                            .collect(),
+                    ) {
+                        Ok(endpoints) if !endpoints.is_empty() => endpoints,
+                        Ok(_) | Err(_) => {
+                            admission_failure_count += 1;
+                            continue;
+                        }
+                    };
+                    let event_id = MessageId::new(
+                        hex::decode(event_id_hex)
+                            .expect("validated key package event id remains hex"),
+                    );
+                    match runtime.journal_discovered_retired_key_package_publication_with_policy(
+                        stable_slot_id.clone(),
+                        event_id,
+                        Timestamp(fetched.created_at),
+                        key_package_ref,
+                        Timestamp(metadata.not_after),
+                        endpoints,
+                        authorize_without_successor,
+                    ) {
+                        Ok((_admitted, deferred)) => {
+                            discovered_current_revision_count += 1;
+                            deferred_endpoint_count =
+                                deferred_endpoint_count.saturating_add(deferred.len());
+                            if !deferred.is_empty() {
+                                admission_failure_count += 1;
+                            }
+                        }
+                        Err(_) => admission_failure_count += 1,
+                    }
+                }
+                Err(_) => {
+                    if !self.mark_key_package_cutover_replacement_pending(label) {
+                        admission_failure_count += 1;
+                    }
+                    non_current_event_count += 1;
+                    match self.journal_unparsed_relay_key_package_revision(
+                        runtime,
+                        &stable_slot_id,
+                        &event_id,
+                        authored_created_at,
+                        raw_endpoints,
+                    ) {
+                        Ok((_admitted, deferred)) => {
+                            deferred_endpoint_count =
+                                deferred_endpoint_count.saturating_add(deferred);
+                            if deferred > 0 {
+                                admission_failure_count += 1;
+                            }
+                        }
+                        Err(_) => admission_failure_count += 1,
+                    }
+                }
+            }
+        }
+
+        let mut summary = KeyPackageRelayAdmissionSummary {
+            non_current_event_count,
+            discovered_current_revision_count,
+            deferred_endpoint_count,
+            admission_failure_count,
+        };
+        if authorize_without_successor
+            && runtime
+                .authorize_teardown_key_package_deletions_without_successor()
+                .is_err()
+        {
+            summary.admission_failure_count += 1;
+        }
+
+        // Move every successfully admitted strict short-page proof into a
+        // monotonic ledger before clearing any crash frontier. If another
+        // relay fails later, a restart still knows to include these historical
+        // endpoints even after their terminal SQL liabilities are pruned.
+        if summary.admission_failure_count == 0
+            && self
+                .extend_key_package_cutover_relay_history(label, &scanned_history_relays)
+                .is_err()
+        {
+            summary.admission_failure_count += 1;
+        }
+
+        // A strict short-page replay discharges a frontier written by an
+        // earlier process before exact deletion. If this write fails, retain
+        // the in-memory frontier too so this invocation cannot manufacture a
+        // completion proof that the durable state does not carry.
+        if all_required_relays_scanned
+            && summary.admission_failure_count == 0
+            && !scan_was_truncated
+            && !frontier_clear_candidates.is_empty()
+        {
+            match self.remove_key_package_cutover_relay_frontier_endpoints(
+                label,
+                &frontier_clear_candidates,
+            ) {
+                Ok(frontier) => relay_frontier = frontier,
+                Err(_) => summary.admission_failure_count += 1,
+            }
+        }
+        // Deletion takes this same lock around frontier arm and network I/O.
+        // Release before the runtime invokes the publisher, then reacquire for
+        // the strict post-delete replay and conditional discharge.
+        drop(history_guard);
+
+        // A relay may expose parameterized-replaceable history one winner at
+        // a time. The AppKeyPackagePublisher deletion boundary durably arms
+        // the exact canonical endpoint before kind-5 I/O, including for
+        // ordinary maintenance outside this cutover. After every attempt,
+        // strictly rescan the complete durable frontier: an error or explicit
+        // failed receipt can still be ambiguous about relay-side acceptance.
+        // The bounded loop keeps one open responsive; exhaustion leaves the
+        // publication gate restart-readable.
+        let mut retry_failure_count = 0usize;
+        let mut peeling_failed = false;
+        let mut peeling_exhausted = false;
+        let mut uncovered_eligible_deletion = false;
+        for pass_index in 0..KEY_PACKAGE_CUTOVER_MAX_DELETION_PASSES {
+            let pending_endpoints =
+                match Self::retired_key_package_deletion_target_endpoints(runtime) {
+                    Ok(endpoints) => endpoints,
+                    Err(_) => {
+                        peeling_failed = true;
+                        break;
+                    }
+                };
+            if pending_endpoints.is_empty() && relay_frontier.is_empty() {
+                uncovered_eligible_deletion = false;
+                break;
+            }
+
+            let (report_failed, terminal_endpoints) = if pending_endpoints.is_empty() {
+                (false, BTreeSet::new())
+            } else {
+                match runtime
+                    .retry_retired_key_package_deletions_once_reported()
+                    .await
+                {
+                    Ok(report) => {
+                        uncovered_eligible_deletion = report.has_uncovered_eligible_deletion;
+                        match self
+                            .sanitize_key_package_deletion_endpoints(report.terminal_endpoints)
+                        {
+                            Ok(endpoints) => {
+                                (false, endpoints.into_iter().collect::<BTreeSet<_>>())
+                            }
+                            Err(_) => {
+                                peeling_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        retry_failure_count += 1;
+                        peeling_failed = true;
+                        (true, BTreeSet::new())
+                    }
+                }
+            };
+            let history_guard = history_lock.lock().await;
+            relay_frontier = match self.key_package_cutover_relay_frontier(label) {
+                Ok(frontier) => frontier,
+                Err(_) => {
+                    peeling_failed = true;
+                    drop(history_guard);
+                    break;
+                }
+            };
+            if !terminal_endpoints.is_subset(&relay_frontier) {
+                // A terminal SQLite receipt without its pre-I/O relay intent
+                // would reopen the exact crash window this frontier closes.
+                peeling_failed = true;
+                drop(history_guard);
+                break;
+            }
+            if relay_frontier.is_empty() {
+                drop(history_guard);
+                break;
+            }
+
+            let frontier_endpoints = relay_frontier.iter().cloned().collect::<Vec<_>>();
+            let refetched = futures::future::join_all(frontier_endpoints.iter().map(|endpoint| {
+                self.fetch_key_package_events_for_account_id_with_limit_strict(
+                    &account.account_id_hex,
+                    std::slice::from_ref(endpoint),
+                    KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
+                )
+            }))
+            .await;
+            let mut revealed_revision = false;
+            let mut refetch_complete = true;
+            let mut frontier_clear_candidates = BTreeSet::new();
+            for (endpoint, fetched) in frontier_endpoints.iter().zip(refetched) {
+                let records = match fetched {
+                    Ok(records) => records,
+                    Err(_) => {
+                        refetch_complete = false;
+                        continue;
+                    }
+                };
+                let page_was_truncated = records.len() >= KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT;
+                scan_was_truncated |= page_was_truncated;
+                let admitted = match self.admit_relay_key_package_records(
+                    label,
+                    runtime,
+                    records,
+                    authorize_without_successor,
+                ) {
+                    Ok(admitted) => admitted,
+                    Err(_) => {
+                        refetch_complete = false;
+                        continue;
+                    }
+                };
+                if authorize_without_successor
+                    && runtime
+                        .authorize_teardown_key_package_deletions_without_successor()
+                        .is_err()
+                {
+                    refetch_complete = false;
+                }
+                let endpoint_revealed = admitted.non_current_event_count > 0
+                    || admitted.discovered_current_revision_count > 0;
+                revealed_revision |= endpoint_revealed;
+                let endpoint_complete =
+                    !page_was_truncated && admitted.admission_failure_count == 0;
+                summary.absorb(admitted);
+                if endpoint_complete {
+                    frontier_clear_candidates.insert(endpoint.clone());
+                } else {
+                    refetch_complete = false;
+                }
+            }
+            if self
+                .extend_key_package_cutover_relay_history(label, &frontier_clear_candidates)
+                .is_err()
             {
-                Ok(accepted) => accepted_delete_count += accepted,
-                Err(_) => delete_failure_count += 1,
+                refetch_complete = false;
+            }
+            if refetch_complete {
+                match self.remove_key_package_cutover_relay_frontier_endpoints(
+                    label,
+                    &frontier_clear_candidates,
+                ) {
+                    Ok(frontier) => relay_frontier = frontier,
+                    Err(_) => refetch_complete = false,
+                }
+            }
+            drop(history_guard);
+            if !refetch_complete {
+                peeling_failed = true;
+                break;
+            }
+            if report_failed {
+                // The strict replay discharged the ambiguous relay-side
+                // frontier, but the deletion obligation itself remains
+                // retryable and this invocation cannot claim success.
+                break;
+            }
+            if !uncovered_eligible_deletion && !revealed_revision {
+                break;
+            }
+            if pass_index + 1 == KEY_PACKAGE_CUTOVER_MAX_DELETION_PASSES {
+                peeling_exhausted = true;
             }
         }
-        if delete_failure_count == 0 {
-            // The marker helper emits its own privacy-safe warning. It is not
-            // a relay deletion failure, so do not fold it into this counter.
-            let _ = self.mark_key_package_cutover_scan_complete(label);
+
+        let final_history_guard = history_lock.lock().await;
+        let frontier_is_empty = self
+            .key_package_cutover_relay_frontier(label)
+            .is_ok_and(|frontier| frontier.is_empty());
+        let mut scan_complete = all_required_relays_scanned
+            && summary.admission_failure_count == 0
+            && !scan_was_truncated
+            && !peeling_failed
+            && !peeling_exhausted
+            && !uncovered_eligible_deletion
+            && frontier_is_empty;
+        if scan_complete {
+            scan_complete = runtime
+                .finalize_key_package_cutover_consumption_evidence()
+                .is_ok();
         }
-        if non_current_event_count > 0 {
+        if scan_complete {
+            // Persistence is part of the proof: a failed marker write must
+            // leave the runtime publication interlock armed for the next open.
+            scan_complete = self
+                .begin_root_mutation("persist completed KeyPackage cutover scan marker")
+                .and_then(|_root_mutation| {
+                    self.mark_key_package_cutover_scan_complete_for_relays(
+                        label,
+                        &source_relays,
+                        &scanned_history_relays,
+                    )
+                })
+                .is_ok();
+        }
+        drop(final_history_guard);
+        if scan_complete
+            && destructive_cleanup_was_durable
+            && self
+                .clear_key_package_teardown_cleanup_pending(label)
+                .is_err()
+        {
+            scan_complete = false;
+        }
+        if summary.non_current_event_count > 0 || summary.discovered_current_revision_count > 0 {
             tracing::info!(
                 target: "marmot_app::key_packages",
                 method = "retire_relay_non_current_key_packages",
-                non_current_event_count,
-                accepted_delete_count,
-                delete_failure_count,
+                non_current_event_count = summary.non_current_event_count,
+                discovered_current_revision_count = summary.discovered_current_revision_count,
+                deferred_endpoint_count = summary.deferred_endpoint_count,
+                admission_failure_count = summary.admission_failure_count,
+                retry_failure_count,
+                all_required_relays_scanned,
+                scan_was_truncated,
+                peeling_exhausted,
                 "completed relay key package retirement scan"
             );
         }
-        non_current_event_count > 0
+        scan_complete
     }
 
     fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
@@ -3912,10 +6737,1191 @@ impl MarmotApp {
             .join(format!("{label}.capability-refresh-v1-replacement-pending"))
     }
 
-    fn key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
+    fn generated_initial_key_package_publication_hold_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!(
+                "{label}.generated-initial-key-package-publication-hold-v1"
+            ))
+    }
+
+    fn generated_initial_key_package_publication_held(
+        &self,
+        label: &str,
+    ) -> Result<bool, AppError> {
+        self.generated_initial_key_package_publication_hold_path(label)
+            .try_exists()
+            .map_err(AppError::from)
+    }
+
+    /// Create a private child directory and durably publish its directory
+    /// entry before any load-bearing file is written inside it. Syncing only
+    /// the child after `mkdir` is insufficient: a power loss can otherwise
+    /// discard the entire child namespace even though its files were synced.
+    fn ensure_private_directory_entry_durable(&self, directory: &Path) -> Result<(), AppError> {
+        fs_private::create_dir_all_private(directory)?;
+        #[cfg(unix)]
+        if let Some(parent) = directory.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Persist the setup-owned publication hold before any initial KeyPackage
+    /// can be prepared. This method only creates the crash-safe file; SQL
+    /// mirroring is a separate route-serialized step so it can never recreate
+    /// a hold that an explicit publisher already cleared.
+    fn arm_generated_initial_key_package_publication_hold(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let _root_mutation =
+            self.begin_root_mutation("arm generated initial KeyPackage publication hold")?;
+        let path = self.generated_initial_key_package_publication_hold_path(label);
+        let parent = path.parent().ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "generated initial KeyPackage publication hold has no parent directory",
+            ))
+        })?;
+        self.ensure_private_directory_entry_durable(parent)?;
+        fs_private::write_private_atomic(&path, b"held\n")?;
+        Ok(())
+    }
+
+    /// Arm only before the first lifecycle exists. Once an initial lifecycle
+    /// is durable, an absent file is itself the durable record that an explicit
+    /// publisher released setup ownership; resume must never resurrect it.
+    fn ensure_generated_initial_key_package_publication_hold_before_preparation(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let lifecycle_exists = if self.account_storage_path(label).exists() {
+            self.account_storage(label)?
+                .key_package_lifecycle()?
+                .is_some()
+        } else {
+            false
+        };
+        if lifecycle_exists {
+            return Ok(());
+        }
+        self.arm_generated_initial_key_package_publication_hold(label)
+    }
+
+    /// Mirror an existing file-backed hold into SQL without creating it. The
+    /// route lock orders this check/write against explicit generated-route
+    /// recovery, hold clearing, and the final kind-30443 boundary.
+    async fn mirror_generated_initial_key_package_publication_hold_into_lifecycle(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let route_lock = self.key_package_route_lock(label);
+        let _route_guard = route_lock.lock().await;
+        if !self.generated_initial_key_package_publication_held(label)? {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            return Err(AppError::AccountSetupRetryRequired);
+        };
+        if !lifecycle.cutover_publication_blocked {
+            lifecycle.cutover_publication_blocked = true;
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
+    }
+
+    fn clear_generated_initial_key_package_publication_hold(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let _root_mutation =
+            self.begin_root_mutation("clear generated initial KeyPackage publication hold")?;
+        let path = self.generated_initial_key_package_publication_hold_path(label);
+        let parent_exists = match path.parent() {
+            Some(parent) => parent.try_exists()?,
+            None => false,
+        };
+        if !path.try_exists()? && !parent_exists {
+            return Ok(());
+        }
+        remove_file_if_present(path)
+    }
+
+    pub(crate) async fn clear_generated_initial_key_package_publication_hold_for_session(
+        &self,
+        label: &str,
+        session_admission: &AccountSessionAdmissionToken,
+    ) -> Result<(), AppError> {
+        let route_lock = self.key_package_route_lock(label);
+        let _route_guard = route_lock.lock().await;
+        if !self.active_account_session_admission_is_current(label, session_admission) {
+            return Err(AppError::AccountWorkerBusy);
+        }
+        self.clear_generated_initial_key_package_publication_hold(label)
+    }
+
+    fn key_package_cutover_relay_frontier_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.capability-refresh-v2-relay-frontier.json"))
+    }
+
+    fn key_package_cutover_relay_history_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.capability-refresh-v2-relay-history.json"))
+    }
+
+    fn key_package_teardown_cleanup_pending_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!(
+                "{label}.capability-refresh-v2-destructive-cleanup-pending"
+            ))
+    }
+
+    fn key_package_teardown_cleanup_pending(&self, label: &str) -> Result<bool, AppError> {
+        self.key_package_teardown_cleanup_pending_path(label)
+            .try_exists()
+            .map_err(AppError::from)
+    }
+
+    fn mark_key_package_teardown_cleanup_pending(&self, label: &str) -> Result<(), AppError> {
+        let _root_mutation =
+            self.begin_root_mutation("arm destructive KeyPackage teardown cleanup")?;
+        let path = self.key_package_teardown_cleanup_pending_path(label);
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destructive KeyPackage cleanup marker has no parent directory",
+            )
+        })?;
+        self.ensure_private_directory_entry_durable(parent)?;
+        // Persist the destructive mode before invalidating the ordinary proof.
+        // A crash between these writes still makes marker admission reject the
+        // old proof because retirement consults this mode directly.
+        fs_private::write_private_atomic(&path, b"pending\n")?;
+        self.invalidate_key_package_cutover_scan_marker(label)
+    }
+
+    fn clear_key_package_teardown_cleanup_pending(&self, label: &str) -> Result<(), AppError> {
+        let _root_mutation =
+            self.begin_root_mutation("clear destructive KeyPackage teardown cleanup")?;
+        let path = self.key_package_teardown_cleanup_pending_path(label);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Some(parent) = path.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Relays that must receive one strict stored-history scan before the
+    /// upgrade cutover may complete.
+    ///
+    /// The frontier is written before exact deletion I/O. It therefore covers
+    /// the crash window in which deleting a parameterized-replaceable winner
+    /// reveals an older same-slot revision, including on a historical relay
+    /// that is no longer in the account's current NIP-65 set.
+    fn key_package_cutover_relay_frontier(
+        &self,
+        label: &str,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        let path = self.key_package_cutover_relay_frontier_path(label);
+        let frontier = match read_json::<KeyPackageCutoverRelayFrontier>(&path) {
+            Ok(frontier) => frontier,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeSet::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let endpoints = frontier
+            .relays
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        Ok(self
+            .sanitize_key_package_deletion_endpoints(endpoints)?
+            .into_iter()
+            .collect())
+    }
+
+    /// Monotonic set of relays whose KeyPackage history has mattered to this
+    /// account. It survives route removal, terminal SQL-liability pruning, and
+    /// completion-marker invalidation so a later cutover cannot silently
+    /// forget a historical endpoint that only an older generation knew.
+    fn key_package_cutover_relay_history(
+        &self,
+        label: &str,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        let path = self.key_package_cutover_relay_history_path(label);
+        let history = match read_json::<KeyPackageCutoverRelayFrontier>(&path) {
+            Ok(history) => history,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeSet::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let endpoints = history
+            .relays
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        Ok(self
+            .sanitize_key_package_deletion_endpoints(endpoints)?
+            .into_iter()
+            .collect())
+    }
+
+    fn extend_key_package_cutover_relay_history(
+        &self,
+        label: &str,
+        endpoints: &BTreeSet<TransportEndpoint>,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        if endpoints.is_empty() {
+            return self.key_package_cutover_relay_history(label);
+        }
+        let _root_mutation = self.begin_root_mutation("extend KeyPackage cutover relay history")?;
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.extend_key_package_cutover_relay_history_under_root(label, endpoints)
+    }
+
+    fn extend_key_package_cutover_relay_history_under_root(
+        &self,
+        label: &str,
+        endpoints: &BTreeSet<TransportEndpoint>,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        let mut history = self.key_package_cutover_relay_history(label)?;
+        history.extend(endpoints.iter().cloned());
+        let frontier = self.key_package_cutover_relay_frontier(label)?;
+        let mut projected_history = self.key_package_history_endpoints(label)?;
+        projected_history.extend(history.iter().cloned());
+        projected_history.extend(frontier);
+        projected_history.extend(self.key_package_current_route_history_endpoints(label)?);
+        if self.pending_nip65_route_mutation(label) {
+            let pending = self.read_pending_nip65_route_mutation(label)?;
+            projected_history.extend(
+                self.sanitize_key_package_deletion_endpoints(
+                    pending
+                        .nip65
+                        .relays
+                        .into_iter()
+                        .map(TransportEndpoint)
+                        .collect(),
+                )?,
+            );
+        }
+        if projected_history.len() > KEY_PACKAGE_CUTOVER_RELAY_HISTORY_CAPACITY {
+            return Err(AppError::Publish(
+                "KeyPackage relay-history journal is full".into(),
+            ));
+        }
+        let path = self.key_package_cutover_relay_history_path(label);
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cutover relay history has no parent directory",
+            )
+        })?;
+        self.ensure_private_directory_entry_durable(parent)?;
+        let marker = KeyPackageCutoverRelayFrontier {
+            relays: history.iter().map(|endpoint| endpoint.0.clone()).collect(),
+        };
+        let bytes = serde_json::to_vec(&marker).map_err(std::io::Error::other)?;
+        fs_private::write_private_atomic(&path, &bytes)?;
+        Ok(history)
+    }
+
+    /// Durably union exact-deletion endpoints into the frontier while holding
+    /// the root mutation lease across the read/modify/write sequence.
+    fn extend_key_package_cutover_relay_frontier(
+        &self,
+        label: &str,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Result<(), AppError> {
+        let endpoints = self
+            .sanitize_key_package_deletion_endpoints(endpoints)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if endpoints.is_empty() {
+            return Err(AppError::Publish(
+                "cannot arm KeyPackage cutover frontier without a safe relay endpoint".into(),
+            ));
+        }
+        let _root_mutation = self.begin_root_mutation("arm KeyPackage cutover relay frontier")?;
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let history = self.key_package_history_endpoints(label)?;
+        let mut frontier = self.key_package_cutover_relay_frontier(label)?;
+        let mut projected_history = history;
+        projected_history.extend(frontier.iter().cloned());
+        projected_history.extend(endpoints.iter().cloned());
+        projected_history.extend(self.key_package_current_route_history_endpoints(label)?);
+        if self.pending_nip65_route_mutation(label) {
+            let pending = self.read_pending_nip65_route_mutation(label)?;
+            projected_history.extend(
+                self.sanitize_key_package_deletion_endpoints(
+                    pending
+                        .nip65
+                        .relays
+                        .into_iter()
+                        .map(TransportEndpoint)
+                        .collect(),
+                )?,
+            );
+        }
+        if projected_history.len() > KEY_PACKAGE_CUTOVER_RELAY_HISTORY_CAPACITY {
+            return Err(AppError::Publish(
+                "KeyPackage relay-history journal is full; refusing exact deletion I/O".into(),
+            ));
+        }
+        frontier.extend(endpoints);
+        self.write_key_package_cutover_relay_frontier_under_root(label, &frontier)?;
+        // Persisting the frontier first is load-bearing: a crash before this
+        // invalidation still leaves the old marker unusable because marker
+        // admission also requires an empty frontier. Removing the marker
+        // before network I/O prevents a later strict scan from temporarily
+        // emptying the frontier and reviving a pre-peeling completion proof.
+        self.invalidate_key_package_cutover_scan_marker(label)?;
+        Ok(())
+    }
+
+    /// Remove only endpoints covered by the caller's completed strict scan.
+    /// The locked re-read preserves any distinct endpoint armed by another
+    /// app clone before this mutation acquired the file lock.
+    fn remove_key_package_cutover_relay_frontier_endpoints(
+        &self,
+        label: &str,
+        endpoints: &BTreeSet<TransportEndpoint>,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        if endpoints.is_empty() {
+            return self.key_package_cutover_relay_frontier(label);
+        }
+        let _root_mutation =
+            self.begin_root_mutation("discharge KeyPackage cutover relay frontier")?;
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut frontier = self.key_package_cutover_relay_frontier(label)?;
+        frontier.retain(|endpoint| !endpoints.contains(endpoint));
+        self.write_key_package_cutover_relay_frontier_under_root(label, &frontier)?;
+        Ok(frontier)
+    }
+
+    fn write_key_package_cutover_relay_frontier_under_root(
+        &self,
+        label: &str,
+        frontier: &BTreeSet<TransportEndpoint>,
+    ) -> Result<(), AppError> {
+        let path = self.key_package_cutover_relay_frontier_path(label);
+        if frontier.is_empty() {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    if let Some(parent) = path.parent() {
+                        std::fs::File::open(parent)?.sync_all()?;
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cutover relay frontier has no parent directory",
+            )
+        })?;
+        self.ensure_private_directory_entry_durable(parent)?;
+        let marker = KeyPackageCutoverRelayFrontier {
+            relays: frontier.iter().map(|endpoint| endpoint.0.clone()).collect(),
+        };
+        let bytes = serde_json::to_vec(&marker).map_err(std::io::Error::other)?;
+        fs_private::write_private_atomic(&path, &bytes)?;
+        Ok(())
+    }
+
+    fn pending_nip65_route_mutation_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.nip65-route-mutation-v1.json"))
+    }
+
+    fn nip65_route_generation_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.nip65-route-generation-v1.json"))
+    }
+
+    fn pending_nip65_route_mutation(&self, label: &str) -> bool {
+        self.pending_nip65_route_mutation_path(label).exists()
+    }
+
+    fn read_pending_nip65_route_mutation(
+        &self,
+        label: &str,
+    ) -> Result<PendingNip65RouteMutation, AppError> {
+        read_json(self.pending_nip65_route_mutation_path(label))
+    }
+
+    fn write_pending_nip65_route_mutation(
+        &self,
+        label: &str,
+        pending: &PendingNip65RouteMutation,
+    ) -> Result<(), AppError> {
+        self.write_private_json(
+            &self.pending_nip65_route_mutation_path(label),
+            pending,
+            "pending NIP-65 route mutation",
+        )
+    }
+
+    fn clear_pending_nip65_route_mutation(&self, label: &str) -> Result<(), AppError> {
+        remove_file_if_present(self.pending_nip65_route_mutation_path(label))
+    }
+
+    /// Read and validate the durable local kind-10002 authority without
+    /// treating a malformed or unreadable journal as an absent generation.
+    /// The exact parsed relay state is bound to the same event coordinate, so
+    /// every security-sensitive routing decision can fail closed instead of
+    /// consulting a whole-record directory-cache winner.
+    fn read_nip65_route_generation_for_authoring(
+        &self,
+        label: &str,
+    ) -> Result<Option<Nip65RouteGeneration>, AppError> {
+        match read_json(self.nip65_route_generation_path(label)) {
+            Ok(generation) => {
+                self.validate_nip65_route_generation(&generation)?;
+                Ok(Some(generation))
+            }
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Canonicalize each NIP-65 compatibility/directional endpoint vector for
+    /// semantic authority comparisons. Persisted event order and URL aliases
+    /// must not make the same relay declaration look different, while a
+    /// malformed or unsafe alias still fails closed.
+    fn canonical_nip65_route_state(
+        &self,
+        state: &AccountRelayListState,
+    ) -> Result<CanonicalNip65RouteState, AppError> {
+        if state.kind != KIND_NIP65_RELAY_LIST {
+            return Err(AppError::Publish(
+                "NIP-65 authority comparison received the wrong event kind".into(),
+            ));
+        }
+        let canonicalize = |relays: &[String]| {
+            self.sanitize_key_package_deletion_endpoints(
+                relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        Ok((
+            canonicalize(&state.relays)?,
+            canonicalize(&state.read_relays)?,
+            canonicalize(&state.write_relays)?,
+        ))
+    }
+
+    fn validate_nip65_route_generation(
+        &self,
+        generation: &Nip65RouteGeneration,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        if generation.nip65.kind != KIND_NIP65_RELAY_LIST {
+            return Err(AppError::Publish(
+                "durable NIP-65 route generation has the wrong event kind".into(),
+            ));
+        }
+        let event_id = hex::decode(&generation.event_id)?;
+        if event_id.len() != 32 {
+            return Err(AppError::Publish(
+                "durable NIP-65 route generation has an invalid event id".into(),
+            ));
+        }
+        let endpoints = generation
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let endpoints = self.sanitize_key_package_deletion_endpoints(endpoints)?;
+        if endpoints.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
+        }
+        Ok(endpoints)
+    }
+
+    fn next_locally_authored_nip65_created_at(&self, label: &str) -> Result<u64, AppError> {
+        let now = unix_now_seconds();
+        let created_at = match self.read_nip65_route_generation_for_authoring(label)? {
+            Some(generation) => generation
+                .created_at
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AppError::Publish("cannot advance the durable NIP-65 route generation".into())
+                })?
+                .max(now),
+            None => now,
+        };
+        if !DirectoryFreshness::from_unix_time(now, self.config.directory_max_future_skew)
+            .accepts_created_at(created_at)
+        {
+            return Err(AppError::Publish(
+                "cannot author a NIP-65 route revision beyond the directory future-skew bound"
+                    .into(),
+            ));
+        }
+        Ok(created_at)
+    }
+
+    fn write_nip65_route_generation(
+        &self,
+        label: &str,
+        generation: &Nip65RouteGeneration,
+    ) -> Result<(), AppError> {
+        self.write_private_json(
+            &self.nip65_route_generation_path(label),
+            generation,
+            "NIP-65 route generation",
+        )
+    }
+
+    fn write_private_json<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+        context: &str,
+    ) -> Result<(), AppError> {
+        let parent = path.parent().ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{context} has no parent directory"),
+            ))
+        })?;
+        self.ensure_private_directory_entry_durable(parent)?;
+        let bytes = serde_json::to_vec(value)?;
+        fs_private::write_private_atomic(path, &bytes)?;
+        Ok(())
+    }
+
+    fn local_account_label_for_id(&self, account_id_hex: &str) -> Option<String> {
+        self.account_home()
+            .accounts()
+            .ok()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex)
+            .map(|account| account.label)
+    }
+
+    fn authoritative_key_package_relays(
+        &self,
+        label: &str,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let Some(generation) = self.read_nip65_route_generation_for_authoring(label)? else {
+            return Err(AppError::Publish(
+                "local NIP-65 route authority is unavailable".into(),
+            ));
+        };
+        self.validate_nip65_route_generation(&generation)
+    }
+
+    async fn sign_account_transport_event(
+        &self,
+        signer: Arc<dyn nostr::NostrSigner>,
+        event: NostrTransportEvent,
+    ) -> Result<NostrTransportEvent, AppError> {
+        if event.sig.is_some() {
+            event
+                .to_verified_nostr_event()
+                .map_err(|error| AppError::Publish(format!("invalid signed event: {error}")))?;
+            return Ok(event);
+        }
+        let public_key = signer
+            .get_public_key()
+            .await
+            .map_err(|error| AppError::Publish(format!("signer public key: {error}")))?;
+        if event.pubkey != public_key.to_hex() {
+            return Err(AppError::Publish(
+                "relay-list event author does not match the selected account signer".into(),
+            ));
+        }
+        let kind = u16::try_from(event.kind)
+            .map(Kind::from)
+            .map_err(|_| AppError::Publish(format!("unsupported event kind {}", event.kind)))?;
+        let tags = event
+            .tags
+            .into_iter()
+            .map(Tag::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Publish(format!("relay-list event tags: {error}")))?;
+        let unsigned = EventBuilder::new(kind, event.content)
+            .tags(tags)
+            .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+            .build(public_key);
+        let signed = signer
+            .sign_event(unsigned)
+            .await
+            .map_err(|error| AppError::Publish(format!("sign relay-list event: {error}")))?;
+        NostrTransportEvent::from_nostr_event(&signed)
+            .map_err(|error| AppError::Publish(format!("signed relay-list event: {error}")))
+    }
+
+    fn validate_pending_nip65_route_mutation(
+        &self,
+        label: &str,
+        pending: &PendingNip65RouteMutation,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let account = self.account_home().account(label)?;
+        if pending.account_id_hex != account.account_id_hex
+            || pending.nip65.kind != KIND_NIP65_RELAY_LIST
+            || pending.generation.nip65 != pending.nip65
+        {
+            return Err(AppError::Publish(
+                "pending NIP-65 route mutation does not match the local account".into(),
+            ));
+        }
+        let event_id = hex::decode(&pending.generation.event_id)?;
+        if event_id.len() != 32 {
+            return Err(AppError::Publish(
+                "pending NIP-65 route generation has an invalid event id".into(),
+            ));
+        }
+        let proposed = pending
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let proposed = self.sanitize_key_package_deletion_endpoints(proposed)?;
+        if proposed.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
+        }
+        if let Some(event) = pending.signed_event.as_ref() {
+            event
+                .to_verified_nostr_event()
+                .map_err(|error| AppError::Publish(format!("pending route event: {error}")))?;
+            if event.id != pending.generation.event_id
+                || event.created_at != pending.generation.created_at
+                || event.pubkey != pending.account_id_hex
+                || event.kind != KIND_NIP65_RELAY_LIST
+                || relay_list_state_from_event(event).as_ref() != Some(&pending.nip65)
+            {
+                return Err(AppError::Publish(
+                    "pending NIP-65 route event does not match its durable intent".into(),
+                ));
+            }
+        }
+        Ok(proposed)
+    }
+
+    fn canonical_nip65_publication_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        let mut endpoints = self
+            .relay_plane
+            .sanitize_relay_endpoints(endpoints, context)
+            .map_err(|error| {
+                AppError::Transport(cgka_traits::TransportAdapterError::Publish(error))
+            })?;
+        endpoints.sort();
+        endpoints.dedup();
+        Ok(endpoints)
+    }
+
+    fn pending_nip65_route_mutation_preserves_generated_fresh_proof(
+        &self,
+        label: &str,
+        pending: &PendingNip65RouteMutation,
+    ) -> Result<bool, AppError> {
+        if pending.source != Nip65RouteMutationSource::GeneratedAccountBootstrap
+            || !self.key_package_cutover_has_fresh_account_proof(label)
+        {
+            return Ok(false);
+        }
+        let Some(setup) = self.account_home().account_setup_state(label)? else {
+            return Ok(false);
+        };
+        if setup.kind != AccountSetupKind::GeneratedIdentity
+            || setup.account_id_hex != pending.account_id_hex
+            || matches!(
+                setup.phase,
+                AccountSetupPhase::KeyPackagePublicationConfirmed
+            )
+            || pending.signed_event.is_none()
+        {
+            return Ok(false);
+        }
+        let proposed_endpoints = self.validate_pending_nip65_route_mutation(label, pending)?;
+        let Some(lifecycle) = self.account_storage(label)?.key_package_lifecycle()? else {
+            return Ok(false);
+        };
+        Ok(self.key_package_lifecycle_has_prepared_cutover_replacement(
+            label,
+            &lifecycle,
+            &proposed_endpoints,
+        ))
+    }
+
+    fn generated_account_fresh_replacement_can_open_cutover_gate(
+        &self,
+        label: &str,
+        lifecycle: &cgka_traits::KeyPackageLifecycleState,
+    ) -> Result<bool, AppError> {
+        if !self.key_package_cutover_replacement_pending(label)
+            || !self.key_package_cutover_has_fresh_account_proof(label)
+        {
+            return Ok(false);
+        }
+        let Some(setup) = self.account_home().account_setup_state(label)? else {
+            return Ok(false);
+        };
+        if setup.kind != AccountSetupKind::GeneratedIdentity
+            || !matches!(
+                setup.phase,
+                AccountSetupPhase::LocalReady
+                    | AccountSetupPhase::BootstrapPublicationStarted
+                    | AccountSetupPhase::BootstrapPublicationConfirmed
+                    | AccountSetupPhase::KeyPackagePublicationStarted
+            )
+        {
+            return Ok(false);
+        }
+        let authoritative_endpoints = if self.pending_nip65_route_mutation(label) {
+            let pending = self.read_pending_nip65_route_mutation(label)?;
+            if !self
+                .pending_nip65_route_mutation_preserves_generated_fresh_proof(label, &pending)?
+            {
+                return Ok(false);
+            }
+            self.validate_pending_nip65_route_mutation(label, &pending)?
+        } else {
+            let Some(generation) = self.read_nip65_route_generation_for_authoring(label)? else {
+                return Ok(false);
+            };
+            self.validate_nip65_route_generation(&generation)?
+        };
+        Ok(self.key_package_lifecycle_has_prepared_cutover_replacement(
+            label,
+            lifecycle,
+            &authoritative_endpoints,
+        ))
+    }
+
+    fn commit_pending_nip65_route_mutation(
+        &self,
+        label: &str,
+        pending: &PendingNip65RouteMutation,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let _root_mutation = self.begin_root_mutation("commit pending NIP-65 route mutation")?;
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The generation-bound state is the authority and the directory row is
+        // only its projection. Persist authority first: a crash before the
+        // cache write leaves the pending intent/gate in place, and restart can
+        // safely repeat the projection without ever reading the old route.
+        self.write_nip65_route_generation(label, &pending.generation)?;
+        let mut status = self.account_relay_list_status(label)?;
+        status.nip65 = pending.nip65.clone();
+        push_unique_strings(
+            &mut status.bootstrap_relays,
+            pending.bootstrap_relays.iter().cloned(),
+        );
+        status.refresh();
+        self.remember_directory_relay_lists(&pending.account_id_hex, &status)?;
+        self.clear_pending_nip65_route_mutation(label)?;
+        Ok(status)
+    }
+
+    async fn recover_pending_nip65_route_mutation(
+        &self,
+        label: &str,
+        signer: Arc<dyn nostr::NostrSigner>,
+    ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        self.recover_pending_nip65_route_mutation_inner(label, signer, false)
+            .await
+    }
+
+    /// Recover a generated-bootstrap intent only after its caller validated
+    /// the exact durable setup authority while holding the account route lock.
+    /// Keeping this capability separate prevents generic startup maintenance
+    /// from replaying a stale generated intent after context validation failed.
+    async fn recover_validated_generated_nip65_route_mutation(
+        &self,
+        label: &str,
+        signer: Arc<dyn nostr::NostrSigner>,
+    ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        self.recover_pending_nip65_route_mutation_inner(label, signer, true)
+            .await
+    }
+
+    async fn recover_pending_nip65_route_mutation_inner(
+        &self,
+        label: &str,
+        signer: Arc<dyn nostr::NostrSigner>,
+        generated_setup_authority_validated: bool,
+    ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        if !self.pending_nip65_route_mutation(label) {
+            return Ok(None);
+        }
+        let mut pending = self.read_pending_nip65_route_mutation(label)?;
+        if pending.source == Nip65RouteMutationSource::GeneratedAccountBootstrap
+            && !generated_setup_authority_validated
+        {
+            return Err(AppError::Publish(
+                "generated-account NIP-65 recovery requires durable setup-context validation"
+                    .into(),
+            ));
+        }
+        let proposed = self.validate_pending_nip65_route_mutation(label, &pending)?;
+        // Always re-evaluate the marker before recovery I/O. Only the exact
+        // generated-account bootstrap intent may retain a fresh-identity
+        // proof; every legacy or ordinary intent re-arms the SQL gate. This
+        // also handles a crash after the intent file was synced but before the
+        // original mutator reached its gate write.
+        {
+            let _root_mutation =
+                self.begin_root_mutation("re-arm pending NIP-65 route mutation")?;
+            let fresh_account_proof_preserved =
+                self.invalidate_key_package_cutover_scan_for_route_mutation(label)?;
+            if !fresh_account_proof_preserved {
+                self.arm_key_package_cutover_publication_gate_for_relays(label, &proposed)?;
+            }
+        }
+        if !pending.network_accepted {
+            let event = pending.signed_event.clone().ok_or_else(|| {
+                AppError::Publish(
+                    "unacknowledged pending NIP-65 route mutation has no exact signed event".into(),
+                )
+            })?;
+            let publish_endpoints = self
+                .relay_plane
+                .sanitize_relay_endpoints(
+                    pending
+                        .publish_endpoints
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "pending NIP-65 route mutation publish",
+                )
+                .map_err(|error| {
+                    AppError::Transport(cgka_traits::TransportAdapterError::Publish(error))
+                })?;
+            if publish_endpoints.is_empty() {
+                return Err(AppError::MissingDefaultRelays);
+            }
+            let relay_client =
+                self.relay_client_for_account_id(&pending.account_id_hex, signer.clone());
+            let outcome = relay_client
+                .publish_event(&publish_endpoints, &event, 1)
+                .await
+                .map_err(|error| AppError::Publish(error.to_string()))?;
+            if outcome.accepted.is_empty() {
+                return Err(AppError::Publish(
+                    "relay acknowledged zero pending NIP-65 route events".into(),
+                ));
+            }
+            pending.network_accepted = true;
+            let _root_mutation =
+                self.begin_root_mutation("record pending NIP-65 route acknowledgement")?;
+            self.write_pending_nip65_route_mutation(label, &pending)?;
+        }
+        self.commit_pending_nip65_route_mutation(label, &pending)
+            .map(Some)
+    }
+
+    pub(crate) async fn ingest_local_nip65_relay_event_serialized(
+        &self,
+        label: &str,
+        record: RelayEventRecord,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let route_lock = self.key_package_route_lock(label);
+        let _route_guard = route_lock.lock().await;
+        self.ingest_local_nip65_relay_event_unlocked(label, record)
+    }
+
+    fn ingest_local_nip65_relay_event_unlocked(
+        &self,
+        label: &str,
+        record: RelayEventRecord,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.account_home().account(label)?;
+        if record.event.pubkey != account.account_id_hex
+            || record.event.kind != KIND_NIP65_RELAY_LIST
+            || !self.directory_freshness().accepts(&record)
+        {
+            return self.account_relay_list_status(label);
+        }
+        let nip65 = relay_list_state_from_event(&record.event).ok_or_else(|| {
+            AppError::RelayDirectory("self NIP-65 event has no relay-list state".into())
+        })?;
+        let generation = Nip65RouteGeneration {
+            created_at: record.event.created_at,
+            event_id: record.event.id.clone(),
+            nip65: nip65.clone(),
+        };
+        if self
+            .read_nip65_route_generation_for_authoring(label)?
+            .is_some_and(|current| {
+                !nostr_replaceable_coordinate_is_newer(
+                    generation.created_at,
+                    &generation.event_id,
+                    current.created_at,
+                    &current.event_id,
+                )
+            })
+        {
+            return self.account_relay_list_status(label);
+        }
+        let proposed = self.sanitize_key_package_deletion_endpoints(
+            nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+        )?;
+        if proposed.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
+        }
+        let pending = PendingNip65RouteMutation {
+            account_id_hex: account.account_id_hex,
+            nip65,
+            bootstrap_relays: record
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            publish_endpoints: Vec::new(),
+            signed_event: record.event.sig.is_some().then_some(record.event),
+            generation,
+            network_accepted: true,
+            source: Nip65RouteMutationSource::AccountMutation,
+        };
+        {
+            let _root_mutation =
+                self.begin_root_mutation("stage observed self NIP-65 route mutation")?;
+            self.write_pending_nip65_route_mutation(label, &pending)?;
+            self.invalidate_key_package_cutover_scan_for_route_mutation(label)?;
+            self.arm_key_package_cutover_publication_gate_for_relays(label, &proposed)?;
+        }
+        self.commit_pending_nip65_route_mutation(label, &pending)
+    }
+
+    fn key_package_route_lock(&self, label: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.key_package_route_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(label.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn key_package_history_lock(&self, label: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.key_package_history_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(label.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn key_package_lifecycle_history_endpoints(
+        &self,
+        lifecycle: &cgka_traits::KeyPackageLifecycleState,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        let target_may_have_been_exposed = |target: &&cgka_traits::TransportFanoutTarget| {
+            target.state == cgka_traits::TransportFanoutAttemptState::Accepted
+                || target.attempt_count > 0
+                || target.last_attempt_at.is_some()
+        };
+        let endpoints = lifecycle
+            .publication_targets
+            .iter()
+            .filter(target_may_have_been_exposed)
+            .map(|target| target.endpoint.clone())
+            .chain(
+                lifecycle
+                    .pending_replacement
+                    .iter()
+                    .flat_map(|pending| pending.targets.iter())
+                    .filter(target_may_have_been_exposed)
+                    .map(|target| target.endpoint.clone()),
+            )
+            .chain(
+                lifecycle
+                    .retired_publications_pending_deletion
+                    .iter()
+                    .flat_map(|retired| retired.deletion_targets.iter())
+                    .map(|target| target.endpoint.clone()),
+            )
+            .collect::<Vec<_>>();
+        // An unsafe exact liability must remain byte-for-byte durable, but it
+        // is not a relay we can dial or strictly scan. Canonicalize each
+        // endpoint independently so one unsafe legacy sibling cannot prevent
+        // a distinct safe sibling from reaching deletion I/O and having its
+        // terminal ACK pruned. The unsafe target remains in the lifecycle and
+        // therefore keeps cleanup incomplete and retryable.
+        Ok(endpoints
+            .into_iter()
+            .filter_map(|endpoint| {
+                self.canonicalize_key_package_endpoint(&endpoint, "key package lifecycle history")
+                    .ok()
+            })
+            .collect())
+    }
+
+    fn key_package_history_endpoints(
+        &self,
+        label: &str,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        let mut endpoints = self.key_package_cutover_relay_history(label)?;
+        let Some(lifecycle) = self.account_storage(label)?.key_package_lifecycle()? else {
+            return Ok(endpoints);
+        };
+        endpoints.extend(self.key_package_lifecycle_history_endpoints(&lifecycle)?);
+        Ok(endpoints)
+    }
+
+    fn key_package_current_route_history_endpoints(
+        &self,
+        label: &str,
+    ) -> Result<BTreeSet<TransportEndpoint>, AppError> {
+        let Some(generation) = self.read_nip65_route_generation_for_authoring(label)? else {
+            return Ok(BTreeSet::new());
+        };
+        Ok(self
+            .validate_nip65_route_generation(&generation)?
+            .into_iter()
+            .collect())
+    }
+
+    fn invalidate_key_package_cutover_scan_for_route_mutation(
+        &self,
+        label: &str,
+    ) -> Result<bool, AppError> {
+        // Preserve a new identity's no-predecessor proof only for its exact,
+        // locally-authored initial bootstrap intent. Pre-field journals and
+        // every ordinary route mutation default to invalidating the proof.
+        if self.pending_nip65_route_mutation(label) {
+            let pending = self.read_pending_nip65_route_mutation(label)?;
+            if self.pending_nip65_route_mutation_preserves_generated_fresh_proof(label, &pending)? {
+                return Ok(true);
+            }
+        }
+        self.invalidate_key_package_cutover_scan_marker(label)
+            .map(|()| false)
+    }
+
+    fn invalidate_key_package_cutover_scan_marker(&self, label: &str) -> Result<(), AppError> {
+        let path = self.key_package_cutover_scan_complete_path(label);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Some(parent) = path.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn arm_key_package_cutover_publication_gate_for_relays(
+        &self,
+        label: &str,
+        proposed_relays: &[TransportEndpoint],
+    ) -> Result<(), AppError> {
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let history = self.key_package_history_endpoints(label)?;
+        let frontier = self.key_package_cutover_relay_frontier(label)?;
+        let proposed = self
+            .sanitize_key_package_deletion_endpoints(proposed_relays.to_vec())?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut projected_history = history;
+        projected_history.extend(frontier);
+        projected_history.extend(proposed);
+        projected_history.extend(self.key_package_current_route_history_endpoints(label)?);
+        if projected_history.len() > KEY_PACKAGE_CUTOVER_RELAY_HISTORY_CAPACITY {
+            return Err(AppError::Publish(
+                "KeyPackage relay-history journal is full; refusing route mutation".into(),
+            ));
+        }
+        if self.key_package_cutover_scan_complete_for_relays(label, proposed_relays)
+            && !self.key_package_cutover_replacement_pending(label)
+        {
+            return Ok(());
+        }
+        if !self.account_storage_path(label).exists() {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            return Ok(());
+        };
+        if lifecycle.stable_slot_id.is_empty() {
+            return Err(AppError::Publish(
+                "cannot arm key package cutover publication interlock without a stable slot".into(),
+            ));
+        }
+        if !lifecycle.cutover_publication_blocked {
+            lifecycle.cutover_publication_blocked = true;
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
+    }
+
+    fn legacy_key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
         self.key_package_cache_dir()
             .join(KEY_PACKAGE_DIR)
             .join(format!("{label}.capability-refresh-v1-relay-scan-complete"))
+    }
+
+    fn key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.capability-refresh-v2-relay-scan-complete"))
+    }
+
+    #[cfg(test)]
+    fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
+        self.key_package_cutover_scan_complete_path(label).exists()
     }
 
     fn key_package_cutover_replacement_pending(&self, label: &str) -> bool {
@@ -3925,23 +7931,24 @@ impl MarmotApp {
 
     fn mark_key_package_cutover_replacement_pending(&self, label: &str) -> bool {
         let path = self.key_package_cutover_replacement_pending_path(label);
-        let result = path
-            .parent()
-            .ok_or_else(|| {
-                std::io::Error::new(
+        let result = (|| -> Result<(), AppError> {
+            let parent = path.parent().ok_or_else(|| {
+                AppError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "cutover marker has no parent directory",
-                )
-            })
-            .and_then(fs_private::create_dir_all_private)
-            .and_then(|()| fs_private::write_private(&path, b"pending\n"));
+                ))
+            })?;
+            self.ensure_private_directory_entry_durable(parent)?;
+            fs_private::write_private_atomic(&path, b"pending\n")?;
+            Ok(())
+        })();
         match result {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "mark_key_package_cutover_replacement_pending",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    error_kind = error.privacy_safe_kind(),
                     "could not persist key package cutover replacement intent"
                 );
                 false
@@ -3949,18 +7956,308 @@ impl MarmotApp {
         }
     }
 
-    fn clear_key_package_cutover_replacement_pending(&self, label: &str) {
+    fn clear_key_package_cutover_replacement_pending(&self, label: &str) -> Result<(), AppError> {
         let path = self.key_package_cutover_replacement_pending_path(label);
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(
-                target: "marmot_app::key_packages",
-                method = "clear_key_package_cutover_replacement_pending",
-                error_kind = AppError::from(error).privacy_safe_kind(),
-                "could not clear completed key package replacement intent"
+        remove_file_if_present(path)
+    }
+
+    fn removed_local_key_package_tombstone_root(&self) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(REMOVED_LOCAL_KEY_PACKAGE_TOMBSTONE_DIR)
+    }
+
+    fn removed_local_key_package_account_tombstone_dir(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<PathBuf, AppError> {
+        Ok(self
+            .removed_local_key_package_tombstone_root()
+            .join(parse_account_id_hex(account_id_hex)?))
+    }
+
+    fn removed_local_key_package_tombstone_path(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: Option<&str>,
+    ) -> Result<PathBuf, AppError> {
+        let file_name = match stable_slot_id {
+            Some(stable_slot_id) => format!(
+                "slot-{}.json",
+                hex::encode(Sha256::digest(stable_slot_id.as_bytes()))
             ),
+            None => "all.json".to_owned(),
+        };
+        Ok(self
+            .removed_local_key_package_account_tombstone_dir(account_id_hex)?
+            .join(file_name))
+    }
+
+    fn validate_removed_local_key_package_tombstone(
+        &self,
+        path: &Path,
+        account_id_hex: &str,
+        stable_slot_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let marker: RemovedLocalKeyPackageTombstone = read_json(path)?;
+        if marker.account_id_hex != account_id_hex
+            || marker.stable_slot_id.as_deref() != stable_slot_id
+        {
+            return Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "removed-local KeyPackage tombstone does not match its path",
+            )));
         }
+        Ok(())
+    }
+
+    fn active_local_key_package_slot_is_authorized_for_admitted_account(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: &str,
+        account: Option<&AccountSummary>,
+    ) -> Result<bool, AppError> {
+        let Some(account) = account else {
+            return Ok(false);
+        };
+        if !account.is_active_signing() || account.account_id_hex != account_id_hex {
+            return Ok(false);
+        }
+        Ok(self
+            .account_storage(&account.label)?
+            .key_package_lifecycle()?
+            .is_some_and(|lifecycle| lifecycle.stable_slot_id == stable_slot_id))
+    }
+
+    fn active_local_key_package_slot_is_authorized(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: &str,
+    ) -> Result<bool, AppError> {
+        let Some(account) = self.local_signing_account_for_id(account_id_hex)? else {
+            return Ok(false);
+        };
+        let admission = self
+            .account_session_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admission_open = admission
+            .get(&account.label)
+            .is_none_or(|state| state.account_id_hex != account.account_id_hex || state.open);
+        let active_account = (admission_open && account.is_active_signing()).then_some(&account);
+        self.active_local_key_package_slot_is_authorized_for_admitted_account(
+            account_id_hex,
+            stable_slot_id,
+            active_account,
+        )
+    }
+
+    /// Admission-aware variant for callers already holding the account-session
+    /// mutex. It must not try to reacquire that non-reentrant mutex while
+    /// proving the active lifecycle exception to an account-wide legacy
+    /// marker.
+    pub(crate) fn removed_local_key_package_slot_is_retired_for_admitted_account(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: &str,
+        local_signing_account: Option<&AccountSummary>,
+    ) -> Result<bool, AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        let account_tombstone_dir =
+            self.removed_local_key_package_account_tombstone_dir(&account_id_hex)?;
+        if !account_tombstone_dir.try_exists()? {
+            return Ok(false);
+        }
+        let exact =
+            self.removed_local_key_package_tombstone_path(&account_id_hex, Some(stable_slot_id))?;
+        if exact.try_exists()? {
+            self.validate_removed_local_key_package_tombstone(
+                &exact,
+                &account_id_hex,
+                Some(stable_slot_id),
+            )?;
+            return Ok(true);
+        }
+        let account_wide = self.removed_local_key_package_tombstone_path(&account_id_hex, None)?;
+        if !account_wide.try_exists()? {
+            return Ok(false);
+        }
+        self.validate_removed_local_key_package_tombstone(&account_wide, &account_id_hex, None)?;
+        Ok(
+            !self.active_local_key_package_slot_is_authorized_for_admitted_account(
+                &account_id_hex,
+                stable_slot_id,
+                local_signing_account,
+            )?,
+        )
+    }
+
+    /// Whether a directory/publication candidate belongs to private local MLS
+    /// material that this installation has irreversibly removed.
+    ///
+    /// Exact stable-slot tombstones always win. The account-wide marker is a
+    /// legacy fail-closed fallback; a later explicit re-import may use only a
+    /// newly minted slot proven by its active local lifecycle.
+    pub(crate) fn removed_local_key_package_slot_is_retired(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: &str,
+    ) -> Result<bool, AppError> {
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
+        let account_tombstone_dir =
+            self.removed_local_key_package_account_tombstone_dir(&account_id_hex)?;
+        if !account_tombstone_dir.try_exists()? {
+            return Ok(false);
+        }
+        let exact =
+            self.removed_local_key_package_tombstone_path(&account_id_hex, Some(stable_slot_id))?;
+        if exact.try_exists()? {
+            self.validate_removed_local_key_package_tombstone(
+                &exact,
+                &account_id_hex,
+                Some(stable_slot_id),
+            )?;
+            return Ok(true);
+        }
+        let account_wide = self.removed_local_key_package_tombstone_path(&account_id_hex, None)?;
+        if !account_wide.try_exists()? {
+            return Ok(false);
+        }
+        self.validate_removed_local_key_package_tombstone(&account_wide, &account_id_hex, None)?;
+        Ok(!self.active_local_key_package_slot_is_authorized(&account_id_hex, stable_slot_id)?)
+    }
+
+    fn removed_local_key_package_scope(
+        &self,
+        account: &AccountSummary,
+    ) -> Option<RemovedLocalKeyPackageScope> {
+        if !account.can_sign() {
+            return None;
+        }
+        if self.account_storage_path(&account.label).exists()
+            && let Ok(storage) = self.account_storage(&account.label)
+            && let Ok(Some(lifecycle)) = storage.key_package_lifecycle()
+            && !lifecycle.stable_slot_id.is_empty()
+        {
+            return Some(RemovedLocalKeyPackageScope::StableSlot(
+                lifecycle.stable_slot_id,
+            ));
+        }
+        if let Ok(Some(stable_slot_id)) =
+            self.reusable_key_package_slot_id(&account.label, &account.account_id_hex)
+        {
+            return Some(RemovedLocalKeyPackageScope::StableSlot(stable_slot_id));
+        }
+        Some(RemovedLocalKeyPackageScope::AccountWideLegacy)
+    }
+
+    fn purge_removed_local_key_package_projections(
+        &self,
+        account_id_hex: &str,
+        scope: &RemovedLocalKeyPackageScope,
+    ) -> Result<(), AppError> {
+        self.member_key_package_prewarm_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id_hex);
+        let stable_slot_id = match scope {
+            RemovedLocalKeyPackageScope::StableSlot(stable_slot_id) => {
+                Some(stable_slot_id.as_str())
+            }
+            RemovedLocalKeyPackageScope::AccountWideLegacy => None,
+        };
+        let shared = self.shared_storage()?;
+        if let Some(record) = shared.public_directory_user(account_id_hex)?
+            && let Some(key_package_json) = record.key_package_json.as_deref()
+        {
+            let should_clear = stable_slot_id.is_none_or(|stable_slot_id| {
+                serde_json::from_str::<DirectoryKeyPackage>(key_package_json)
+                    .is_ok_and(|key_package| key_package.key_package_id == stable_slot_id)
+            });
+            if should_clear {
+                let _ = shared.clear_public_directory_key_package_if_matches(
+                    account_id_hex,
+                    key_package_json,
+                )?;
+            }
+        }
+        for cache in self.directory_caches()? {
+            let _ = cache.clear_key_package_if_slot(account_id_hex, stable_slot_id)?;
+        }
+        self.request_directory_sync_rebuild();
+        Ok(())
+    }
+
+    /// Persist the immutable local-removal authority before any account
+    /// artifact or AccountHome bytes are deleted, then scrub its cached
+    /// projections. Marker persistence is the destructive commit prerequisite;
+    /// projection cleanup is retryable because every read/write path consults
+    /// the marker.
+    pub(crate) fn persist_removed_local_key_package_tombstone(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<(), AppError> {
+        let Some(scope) = self.removed_local_key_package_scope(account) else {
+            return Ok(());
+        };
+        let stable_slot_id = match &scope {
+            RemovedLocalKeyPackageScope::StableSlot(stable_slot_id) => {
+                Some(stable_slot_id.as_str())
+            }
+            RemovedLocalKeyPackageScope::AccountWideLegacy => None,
+        };
+        {
+            let _mutation = self
+                .removed_local_key_package_mutation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Create and sync each namespace level separately. `create_dir_all`
+            // followed only by a sync of the deepest parent would not durably
+            // publish a newly created top-level `key-packages` entry.
+            self.ensure_private_directory_entry_durable(
+                &self.key_package_cache_dir().join(KEY_PACKAGE_DIR),
+            )?;
+            let root = self.removed_local_key_package_tombstone_root();
+            self.ensure_private_directory_entry_durable(&root)?;
+            let account_dir =
+                self.removed_local_key_package_account_tombstone_dir(&account.account_id_hex)?;
+            self.ensure_private_directory_entry_durable(&account_dir)?;
+            let tombstone_path = self.removed_local_key_package_tombstone_path(
+                &account.account_id_hex,
+                stable_slot_id,
+            )?;
+            if tombstone_path.try_exists()? {
+                self.validate_removed_local_key_package_tombstone(
+                    &tombstone_path,
+                    &account.account_id_hex,
+                    stable_slot_id,
+                )?;
+            } else {
+                self.write_private_json(
+                    &tombstone_path,
+                    &RemovedLocalKeyPackageTombstone {
+                        account_id_hex: account.account_id_hex.clone(),
+                        stable_slot_id: stable_slot_id.map(str::to_owned),
+                    },
+                    "removed-local KeyPackage tombstone",
+                )?;
+            }
+        }
+        // The immutable marker now gates every writer. Release the mutation
+        // mutex before opening caches: one-time legacy migration takes that
+        // same mutex and will either have completed before the marker or will
+        // observe it before importing any old projection.
+        if let Err(error) =
+            self.purge_removed_local_key_package_projections(&account.account_id_hex, &scope)
+        {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "persist_removed_local_key_package_tombstone",
+                error_kind = error.privacy_safe_kind(),
+                "removed-local KeyPackage tombstone committed but projection scrub is pending"
+            );
+        }
+        Ok(())
     }
 
     /// Remove compatibility artifacts that live outside the account directory.
@@ -3969,34 +8266,186 @@ impl MarmotApp {
         for path in [
             self.key_package_record_path(label),
             self.key_package_cutover_replacement_pending_path(label),
+            self.generated_initial_key_package_publication_hold_path(label),
+            self.key_package_cutover_relay_frontier_path(label),
+            self.key_package_cutover_relay_history_path(label),
+            self.key_package_teardown_cleanup_pending_path(label),
+            self.pending_nip65_route_mutation_path(label),
+            self.nip65_route_generation_path(label),
+            self.legacy_key_package_cutover_scan_complete_path(label),
             self.key_package_cutover_scan_complete_path(label),
         ] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            remove_file_if_present(path)?;
         }
         Ok(())
     }
 
-    fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
-        self.key_package_cutover_scan_complete_path(label).exists()
+    fn key_package_cutover_has_fresh_account_proof(&self, label: &str) -> bool {
+        read_json::<KeyPackageCutoverScanMarker>(self.key_package_cutover_scan_complete_path(label))
+            .is_ok_and(|marker| marker.strict_history_peeling && marker.fresh_account_proof)
     }
 
     fn mark_key_package_cutover_scan_complete(&self, label: &str) -> Result<(), AppError> {
-        let path = self.key_package_cutover_scan_complete_path(label);
-        let result = path
-            .parent()
+        self.write_key_package_cutover_scan_marker(
+            label,
+            &KeyPackageCutoverScanMarker {
+                strict_history_peeling: true,
+                fresh_account_proof: true,
+                authoritative_relays: Vec::new(),
+                history_relays: Vec::new(),
+                route_created_at: None,
+                route_event_id: None,
+            },
+        )
+    }
+
+    fn key_package_cutover_scan_complete_for_relays(
+        &self,
+        label: &str,
+        source_relays: &[TransportEndpoint],
+    ) -> bool {
+        if !self
+            .key_package_teardown_cleanup_pending(label)
+            .is_ok_and(|pending| !pending)
+        {
+            return false;
+        }
+        if !self
+            .key_package_cutover_relay_frontier(label)
+            .is_ok_and(|frontier| frontier.is_empty())
+        {
+            return false;
+        }
+        let Ok(marker) = read_json::<KeyPackageCutoverScanMarker>(
+            self.key_package_cutover_scan_complete_path(label),
+        ) else {
+            return false;
+        };
+        if !marker.strict_history_peeling {
+            return false;
+        }
+        if marker.fresh_account_proof && !self.pending_nip65_route_mutation(label) {
+            return true;
+        }
+        let Ok(required_history) = self.key_package_history_endpoints(label) else {
+            return false;
+        };
+        let history_was_covered = required_history
+            .iter()
+            .all(|endpoint| marker.history_relays.binary_search(&endpoint.0).is_ok());
+        if !history_was_covered {
+            return false;
+        }
+        let mut expected = source_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.dedup();
+        let Ok(Some(current_generation)) = self.read_nip65_route_generation_for_authoring(label)
+        else {
+            return false;
+        };
+        let Ok(authoritative_endpoints) = self.validate_nip65_route_generation(&current_generation)
+        else {
+            return false;
+        };
+        let mut generation_relays = authoritative_endpoints
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>();
+        generation_relays.sort();
+        generation_relays.dedup();
+        marker.authoritative_relays == expected
+            && expected == generation_relays
+            && marker.route_created_at == Some(current_generation.created_at)
+            && marker.route_event_id == Some(current_generation.event_id)
+    }
+
+    fn mark_key_package_cutover_scan_complete_for_relays(
+        &self,
+        label: &str,
+        source_relays: &[TransportEndpoint],
+        scanned_history_relays: &BTreeSet<TransportEndpoint>,
+    ) -> Result<(), AppError> {
+        let _frontier_mutation = self
+            .key_package_frontier_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.key_package_cutover_relay_frontier(label)?.is_empty() {
+            return Err(AppError::Publish(
+                "cannot complete KeyPackage cutover with relay-history scans pending".into(),
+            ));
+        }
+        let mut authoritative_relays = source_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        authoritative_relays.sort();
+        authoritative_relays.dedup();
+        let generation = self
+            .read_nip65_route_generation_for_authoring(label)?
             .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "cutover marker has no parent directory",
+                AppError::Publish(
+                    "cannot complete KeyPackage cutover without local NIP-65 route authority"
+                        .into(),
                 )
-            })
-            .and_then(fs_private::create_dir_all_private)
-            .and_then(|()| fs_private::write_private(&path, b"complete\n"))
-            .map_err(AppError::from);
+            })?;
+        let mut generation_relays = self
+            .validate_nip65_route_generation(&generation)?
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>();
+        generation_relays.sort();
+        generation_relays.dedup();
+        if authoritative_relays != generation_relays {
+            return Err(AppError::Publish(
+                "cannot bind a KeyPackage cutover marker to stale NIP-65 relays".into(),
+            ));
+        }
+        let required_history_relays = self
+            .account_storage(label)?
+            .key_package_lifecycle()?
+            .as_ref()
+            .map(|lifecycle| self.key_package_lifecycle_history_endpoints(lifecycle))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .chain(source_relays.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if !required_history_relays.is_subset(scanned_history_relays) {
+            return Err(AppError::Publish(
+                "cannot complete KeyPackage cutover with an unscanned historical relay".into(),
+            ));
+        }
+        let durable_history_relays = self
+            .extend_key_package_cutover_relay_history_under_root(label, scanned_history_relays)?;
+        let mut history_relays = durable_history_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        history_relays.sort();
+        history_relays.dedup();
+        self.write_key_package_cutover_scan_marker(
+            label,
+            &KeyPackageCutoverScanMarker {
+                strict_history_peeling: true,
+                fresh_account_proof: false,
+                authoritative_relays,
+                history_relays,
+                route_created_at: Some(generation.created_at),
+                route_event_id: Some(generation.event_id),
+            },
+        )
+    }
+
+    fn write_key_package_cutover_scan_marker(
+        &self,
+        label: &str,
+        marker: &KeyPackageCutoverScanMarker,
+    ) -> Result<(), AppError> {
+        let path = self.key_package_cutover_scan_complete_path(label);
+        let result = self.write_private_json(&path, marker, "completed KeyPackage relay scan");
         if let Err(error) = &result {
             tracing::warn!(
                 target: "marmot_app::key_packages",
@@ -4006,6 +8455,20 @@ impl MarmotApp {
             );
         }
         result
+    }
+
+    fn key_package_cutover_publication_allowed(&self, label: &str) -> bool {
+        // A prepared route mutation is publication-relevant even before its
+        // kind-10002 has an acknowledgement. This file is written before the
+        // durable lifecycle gate is armed, so it is also the crash-safe fence
+        // for that narrow pre-arm window.
+        if self.pending_nip65_route_mutation(label) {
+            return false;
+        }
+        let Ok(source_relays) = self.authoritative_key_package_relays(label) else {
+            return false;
+        };
+        self.key_package_cutover_scan_complete_for_relays(label, &source_relays)
     }
 
     pub fn local_key_package_records(
@@ -4026,6 +8489,7 @@ impl MarmotApp {
             let mut key_package_id = metadata.key_package_ref_hex.clone();
             let mut key_package_event_id = String::new();
             let mut published_at = 0;
+            let mut record_source_relays = source_relays.clone();
 
             if let Some(lifecycle) = lifecycle.as_ref() {
                 if lifecycle.current_key_package_ref.as_deref() == Some(&key_package_ref) {
@@ -4039,6 +8503,13 @@ impl MarmotApp {
                         .authored_event_created_at
                         .map(|created_at| created_at.0)
                         .unwrap_or_default();
+                    push_unique_strings(
+                        &mut record_source_relays,
+                        lifecycle
+                            .publication_targets
+                            .iter()
+                            .map(|target| target.endpoint.0.clone()),
+                    );
                 } else if let Some(pending) = lifecycle
                     .pending_replacement
                     .as_ref()
@@ -4055,6 +8526,13 @@ impl MarmotApp {
                         .as_ref()
                         .map(|event| event.created_at.0)
                         .unwrap_or(pending.authored_created_at.0);
+                    push_unique_strings(
+                        &mut record_source_relays,
+                        pending
+                            .targets
+                            .iter()
+                            .map(|target| target.endpoint.0.clone()),
+                    );
                 } else if let Some(retained) = lifecycle
                     .retained_private_material
                     .iter()
@@ -4088,12 +8566,75 @@ impl MarmotApp {
                 key_package_event_id,
                 published_at,
                 key_package_bytes: key_package.bytes().len(),
-                source_relays: source_relays.clone(),
+                source_relays: record_source_relays,
                 local: true,
                 relay: false,
             });
         }
         Ok(records)
+    }
+
+    /// Exact locally-authored event ids and historical target snapshots that
+    /// teardown must delete even when relay discovery is unavailable.
+    ///
+    /// This is deliberately a deletion-target projection, not a synthetic
+    /// [`AccountKeyPackageRecord`]: retired signed revisions no longer own MLS
+    /// private material and must never be reported as `local` KeyPackages.
+    pub(crate) fn durable_key_package_deletion_targets(
+        &self,
+        label: &str,
+    ) -> Result<Vec<KeyPackageDeletionTarget>, AppError> {
+        let Some(lifecycle) = self.account_storage(label)?.key_package_lifecycle()? else {
+            return Ok(Vec::new());
+        };
+        let mut targets = Vec::new();
+        let mut push = |event_id: &cgka_traits::MessageId, endpoints: Vec<TransportEndpoint>| {
+            if !endpoints.is_empty() {
+                targets.push(KeyPackageDeletionTarget {
+                    event_id_hex: hex::encode(event_id.as_slice()),
+                    source_relays: endpoints,
+                });
+            }
+        };
+
+        if let Some(event_id) = lifecycle
+            .authored_signed_event
+            .as_ref()
+            .map(|artifact| &artifact.id)
+            .or(lifecycle.authored_event_id.as_ref())
+        {
+            push(
+                event_id,
+                lifecycle
+                    .publication_targets
+                    .iter()
+                    .map(|target| target.endpoint.clone())
+                    .collect(),
+            );
+        }
+        if let Some(pending) = lifecycle.pending_replacement.as_ref()
+            && let Some(artifact) = pending.signed_event.as_ref()
+        {
+            push(
+                &artifact.id,
+                pending
+                    .targets
+                    .iter()
+                    .map(|target| target.endpoint.clone())
+                    .collect(),
+            );
+        }
+        for retired in &lifecycle.retired_publications_pending_deletion {
+            push(
+                &retired.event_id,
+                retired
+                    .deletion_targets
+                    .iter()
+                    .map(|target| target.endpoint.clone())
+                    .collect(),
+            );
+        }
+        Ok(targets)
     }
 
     pub async fn account_key_package_records(
@@ -4103,7 +8644,7 @@ impl MarmotApp {
         owned_key_packages: Vec<KeyPackage>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.account_home().account(label)?;
-        let account_id_hex = account.account_id_hex;
+        let account_id_hex = account.account_id_hex.clone();
         let mut packages = self.local_key_package_records(label, owned_key_packages)?;
 
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
@@ -4172,44 +8713,199 @@ impl MarmotApp {
         Ok(merge_key_package_records(packages))
     }
 
+    /// Legacy direct-app seam retained for API compatibility.
+    ///
+    /// Every KeyPackage deletion requires a durable runtime admission and
+    /// pre-I/O recovery journal, including relay-discovered unknown revisions.
+    /// Use [`MarmotAppRuntime::delete_key_package`]; this method validates the
+    /// event-id shape, then always fails before storage, signing, or relay I/O.
     pub async fn delete_key_package_event(
         &self,
-        label: &str,
+        _label: &str,
         event_id_hex: &str,
-        source_relays: Vec<TransportEndpoint>,
+        _source_relays: Vec<TransportEndpoint>,
     ) -> Result<usize, AppError> {
-        let mut outcomes = self
-            .delete_key_package_events(
-                label,
-                vec![KeyPackageDeletionTarget {
-                    event_id_hex: event_id_hex.to_owned(),
-                    source_relays,
-                }],
+        parse_key_package_event_id_hex(event_id_hex)?;
+        Err(AppError::Publish(
+            "direct KeyPackage deletion requires durable runtime admission".to_owned(),
+        ))
+    }
+
+    /// Canonicalize deletion endpoint keys through the relay dial policy
+    /// without applying the live-route cardinality cap to a historical cleanup
+    /// obligation. Each returned key has independently passed the same safety
+    /// validation used at I/O, and canonical aliases collapse before durable
+    /// admission or publication.
+    fn sanitize_key_package_deletion_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        self.key_package_deletion_endpoint_aliases(&endpoints)
+            .map(|(canonical, _aliases)| canonical)
+    }
+
+    fn canonicalize_key_package_endpoint(
+        &self,
+        endpoint: &TransportEndpoint,
+        context: &str,
+    ) -> Result<TransportEndpoint, AppError> {
+        let mut canonical = self
+            .relay_plane
+            .sanitize_relay_endpoints(vec![endpoint.clone()], context)
+            .map_err(|error| {
+                AppError::Transport(cgka_traits::TransportAdapterError::Publish(error))
+            })?;
+        canonical.pop().ok_or_else(|| {
+            AppError::Publish(
+                "key package endpoint canonicalization produced no endpoint".to_owned(),
             )
-            .await?;
-        outcomes
-            .pop()
-            .expect("single-event deletion batch returns one outcome")
-            .result
+        })
+    }
+
+    /// Return both the deduplicated canonical I/O keys and the exact durable
+    /// keys from which they came. The alias map lets active maintenance read a
+    /// legacy noncanonical journal row, perform I/O only with a safety-approved
+    /// canonical URL, and translate the receipt back to the exact key that its
+    /// transport-generic lifecycle owner must prune.
+    fn key_package_deletion_endpoint_aliases(
+        &self,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<KeyPackageDeletionEndpointAliases, AppError> {
+        let mut sanitized = Vec::with_capacity(endpoints.len());
+        let mut aliases = Vec::with_capacity(endpoints.len());
+        for requested_endpoint in endpoints {
+            let canonical_endpoint = self.canonicalize_key_package_endpoint(
+                requested_endpoint,
+                "key package deletion publish",
+            )?;
+            aliases.push((requested_endpoint.clone(), canonical_endpoint.clone()));
+            sanitized.push(canonical_endpoint);
+        }
+        sanitized.sort();
+        sanitized.dedup();
+        Ok((sanitized, aliases))
+    }
+
+    /// Repair valid legacy endpoint aliases while the account worker is
+    /// quiesced. Unsafe/invalid keys remain byte-for-byte intact and therefore
+    /// fail closed when selected; they are never silently erased as part of an
+    /// upgrade. Canonical collisions merge into one target while retaining the
+    /// strongest absence, acceptance, or possible-exposure evidence.
+    fn canonicalize_quiesced_key_package_lifecycle_targets(
+        &self,
+        lifecycle: &mut cgka_traits::KeyPackageLifecycleState,
+    ) -> bool {
+        let mut changed = canonicalize_key_package_fanout_targets(
+            &mut lifecycle.publication_targets,
+            |endpoint| {
+                self.canonicalize_key_package_endpoint(
+                    endpoint,
+                    "key package lifecycle endpoint repair",
+                )
+                .ok()
+            },
+        );
+        if let Some(pending) = lifecycle.pending_replacement.as_mut() {
+            changed |= canonicalize_key_package_fanout_targets(&mut pending.targets, |endpoint| {
+                self.canonicalize_key_package_endpoint(
+                    endpoint,
+                    "key package lifecycle endpoint repair",
+                )
+                .ok()
+            });
+        }
+        for retired in &mut lifecycle.retired_publications_pending_deletion {
+            changed |= canonicalize_key_package_fanout_targets(
+                &mut retired.deletion_targets,
+                |endpoint| {
+                    self.canonicalize_key_package_endpoint(
+                        endpoint,
+                        "key package lifecycle endpoint repair",
+                    )
+                    .ok()
+                },
+            );
+        }
+        changed
+    }
+
+    /// Normalize valid persisted relay aliases while the account-session guard
+    /// is held but before the transport-generic runtime reads the lifecycle.
+    /// This gives successor eligibility and deletion pruning one durable
+    /// endpoint identity across upgrades. Unsafe legacy keys remain unchanged
+    /// and therefore retry fail-closed through the publisher boundary.
+    fn canonicalize_key_package_lifecycle_targets_before_session_open(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            return Ok(());
+        };
+        if self.canonicalize_quiesced_key_package_lifecycle_targets(&mut lifecycle) {
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn delete_key_package_events(
         &self,
         label: &str,
         targets: Vec<KeyPackageDeletionTarget>,
+        session_admission: AccountSessionAdmission,
     ) -> Result<Vec<KeyPackageDeletionResult>, AppError> {
+        // Active deletion serializes its final capability proof with teardown.
+        // Teardown cleanup already owns the route lock while peeling history,
+        // so its exact cleanup capability must not recursively acquire it.
+        let active_route_lock = matches!(&session_admission, AccountSessionAdmission::Active(_))
+            .then(|| self.key_package_route_lock(label));
+        let _active_route_guard = match active_route_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let history_lock = self.key_package_history_lock(label);
+        let _history_guard = history_lock.lock().await;
         let account = self.account_home().account(label)?;
+        let admission_is_current = || match &session_admission {
+            AccountSessionAdmission::Active(token) => {
+                account.is_active_signing()
+                    && account.account_id_hex == token.account_id_hex
+                    && self.active_account_session_admission_is_current(label, token)
+            }
+            AccountSessionAdmission::Teardown(token) => {
+                account.signed_out
+                    && account.account_id_hex == token.account_id_hex
+                    && self.account_teardown_session_admission_is_current(label, token)
+            }
+        };
+        if !admission_is_current() {
+            return Err(AppError::AccountWorkerBusy);
+        }
         let signer = self.account_signer_for_summary(&account)?;
-        let account_id_hex = account.account_id_hex;
+        let account_id_hex = account.account_id_hex.clone();
+        // This is the lowest kind-5 I/O boundary. A process-local session
+        // capability proves who may act, but it does not prove that the exact
+        // relay side effect is crash-recoverable. Re-read the SQL lifecycle
+        // journal only after the route/history admission locks are held, then
+        // require every exact event/endpoint pair below to remain selected.
+        // Active callers persist this row through
+        // `prepare_key_package_deletion_recovery`; quiesced teardown persists
+        // it through `prepare_quiesced_key_package_deletion_recovery`.
+        let deletion_journal = self.account_storage(label)?.key_package_lifecycle()?;
         let mut results = targets
             .iter()
             .map(|target| KeyPackageDeletionResult {
                 event_id_hex: target.event_id_hex.clone(),
+                accepted_endpoints: Vec::new(),
+                confirmed_absent_endpoints: Vec::new(),
+                failed_endpoints: Vec::new(),
                 result: Err(AppError::Publish("deletion was not attempted".to_owned())),
             })
             .collect::<Vec<_>>();
         let mut requests = Vec::new();
-        let mut request_indices = Vec::new();
+        let mut request_targets = Vec::new();
+        let mut attempted = vec![false; results.len()];
+        let mut errors = (0..results.len()).map(|_| None).collect::<Vec<_>>();
 
         for (index, target) in targets.into_iter().enumerate() {
             let event_id_hex = match parse_key_package_event_id_hex(&target.event_id_hex) {
@@ -4236,47 +8932,175 @@ impl MarmotApp {
                 ]));
                 continue;
             }
-            let endpoints = match self
-                .relay_plane
-                .sanitize_relay_endpoints(endpoints, "key package deletion publish")
-            {
+            let endpoints = match self.sanitize_key_package_deletion_endpoints(endpoints) {
                 Ok(endpoints) => endpoints,
                 Err(error) => {
-                    results[index].result = Err(AppError::Transport(
-                        cgka_traits::TransportAdapterError::Publish(error),
-                    ));
+                    results[index].result = Err(error);
                     continue;
                 }
             };
-            requests.push(NostrEventPublishRequest {
-                endpoints,
-                event: NostrTransportEvent::new_unsigned(
-                    account_id_hex.clone(),
-                    5,
-                    vec![
-                        vec!["e".into(), event_id_hex],
-                        vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
-                    ],
-                    String::new(),
-                ),
-                required_acks: 1,
+            let event_id = MessageId::new(
+                hex::decode(&event_id_hex)
+                    .expect("validated KeyPackage event id remains canonical hex"),
+            );
+            let durably_selected = deletion_journal.as_ref().is_some_and(|lifecycle| {
+                lifecycle
+                    .retired_publications_pending_deletion
+                    .iter()
+                    .find(|retired| retired.event_id == event_id)
+                    .is_some_and(|retired| {
+                        endpoints.iter().all(|canonical_endpoint| {
+                            retired.deletion_targets.iter().any(|durable_target| {
+                                durable_target.failure_code.as_deref() != Some("confirmed_absent")
+                                    && self
+                                        .key_package_deletion_endpoint_aliases(
+                                            std::slice::from_ref(&durable_target.endpoint),
+                                        )
+                                        .is_ok_and(|(_canonical, aliases)| {
+                                            aliases.iter().any(|(durable_key, canonical_key)| {
+                                                durable_key == &durable_target.endpoint
+                                                    && canonical_key == canonical_endpoint
+                                            })
+                                        })
+                            })
+                        })
+                    })
             });
-            request_indices.push(index);
+            if !durably_selected {
+                results[index].result = Err(AppError::Publish(
+                    "key package deletion target was not durably selected by the account lifecycle journal"
+                        .to_owned(),
+                ));
+                continue;
+            }
+            let event = NostrTransportEvent::new_unsigned(
+                account_id_hex.clone(),
+                5,
+                vec![
+                    vec!["e".into(), event_id_hex],
+                    vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                ],
+                String::new(),
+            );
+            // One request per endpoint is load-bearing. The SDK completes a
+            // request once its required acknowledgement count is met; a single
+            // multi-endpoint request with `required_acks = 1` can therefore
+            // cancel the remaining sends and falsely report whole-event
+            // deletion after only one relay accepted it.
+            for endpoint in endpoints {
+                attempted[index] = true;
+                requests.push(NostrEventPublishRequest {
+                    endpoints: vec![endpoint.clone()],
+                    event: event.clone(),
+                    required_acks: 1,
+                });
+                request_targets.push((index, endpoint));
+            }
         }
 
         if !requests.is_empty() {
+            if !admission_is_current() {
+                return Err(AppError::AccountWorkerBusy);
+            }
+            // Universal pre-I/O crash boundary for every kind-5 KeyPackage
+            // deletion, including quiesced logout cleanup and low-level
+            // relay-discovered retirement. A later accepted or ambiguous send
+            // can reveal older parameterized-replaceable history, so future
+            // publication remains blocked until these endpoints receive a
+            // strict short-page replay.
+            self.extend_key_package_cutover_relay_frontier(
+                label,
+                request_targets
+                    .iter()
+                    .map(|(_index, endpoint)| endpoint.clone())
+                    .collect(),
+            )?;
             let relay_client =
                 self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
-            let outcomes = relay_client.publish_events(&requests).await;
-            for (index, outcome) in request_indices.into_iter().zip(outcomes) {
-                results[index].result = match outcome {
-                    Ok(outcome) if !outcome.accepted.is_empty() => Ok(outcome.accepted.len()),
-                    Ok(_) => Err(AppError::Publish(
-                        "relay acknowledged zero key package deletions".to_owned(),
-                    )),
-                    Err(error) => Err(error.into()),
+            let mut outcomes = relay_client.publish_events(&requests).await.into_iter();
+            for (index, endpoint) in request_targets {
+                let Some(outcome) = outcomes.next() else {
+                    if !results[index].failed_endpoints.contains(&endpoint) {
+                        results[index].failed_endpoints.push(endpoint);
+                    }
+                    errors[index].get_or_insert_with(|| {
+                        AppError::Publish(
+                            "relay returned no result for a key package deletion".to_owned(),
+                        )
+                    });
+                    continue;
                 };
+                match outcome {
+                    Ok(outcome)
+                        if outcome
+                            .accepted
+                            .iter()
+                            .any(|receipt| receipt.endpoint == endpoint) =>
+                    {
+                        if !results[index].accepted_endpoints.contains(&endpoint) {
+                            results[index].accepted_endpoints.push(endpoint);
+                        }
+                    }
+                    Ok(_) => {
+                        if !results[index].failed_endpoints.contains(&endpoint) {
+                            results[index].failed_endpoints.push(endpoint);
+                        }
+                        errors[index].get_or_insert_with(|| {
+                            AppError::Publish(
+                                "relay acknowledged zero key package deletions".to_owned(),
+                            )
+                        });
+                    }
+                    Err(error) => {
+                        let target_is_confirmed_absent =
+                            error.publish_endpoint_failures().iter().any(|failure| {
+                                failure.endpoint == endpoint && failure.confirms_target_absence()
+                            });
+                        if target_is_confirmed_absent {
+                            if !results[index]
+                                .confirmed_absent_endpoints
+                                .contains(&endpoint)
+                            {
+                                results[index].confirmed_absent_endpoints.push(endpoint);
+                            }
+                        } else if !results[index].failed_endpoints.contains(&endpoint) {
+                            results[index].failed_endpoints.push(endpoint);
+                        }
+                        if !target_is_confirmed_absent && errors[index].is_none() {
+                            errors[index] = Some(error.into());
+                        }
+                    }
+                }
             }
+        }
+
+        for (index, was_attempted) in attempted.into_iter().enumerate() {
+            if !was_attempted {
+                continue;
+            }
+            results[index].accepted_endpoints.sort();
+            results[index].accepted_endpoints.dedup();
+            results[index].confirmed_absent_endpoints.sort();
+            results[index].confirmed_absent_endpoints.dedup();
+            results[index].failed_endpoints.sort();
+            results[index].failed_endpoints.dedup();
+            let terminal_endpoint_count = results[index]
+                .accepted_endpoints
+                .len()
+                .saturating_add(results[index].confirmed_absent_endpoints.len());
+            results[index].result = if terminal_endpoint_count == 0 {
+                Err(errors[index].take().unwrap_or_else(|| {
+                    AppError::Publish("key package deletion produced no relay result".to_owned())
+                }))
+            } else if !results[index].failed_endpoints.is_empty() {
+                Err(errors[index].take().unwrap_or_else(|| {
+                    AppError::Publish(
+                        "one or more relay key package deletions remain retryable".to_owned(),
+                    )
+                }))
+            } else {
+                Ok(terminal_endpoint_count)
+            };
         }
 
         let path = self.key_package_record_path(label);
@@ -4296,6 +9120,437 @@ impl MarmotApp {
         }
 
         Ok(results)
+    }
+
+    /// Persist recovery intent before quiesced teardown can send a kind-5 for
+    /// the current or pending revision.
+    ///
+    /// The caller must own the account teardown barrier: this whole-row
+    /// lifecycle mutation is not safe beside the serialized account worker.
+    pub(crate) fn prepare_quiesced_key_package_deletion_recovery(
+        &self,
+        label: &str,
+        targets: &[KeyPackageDeletionTarget],
+    ) -> Result<KeyPackageDeletionAdmission, AppError> {
+        let _root_mutation =
+            self.begin_root_mutation("prepare quiesced KeyPackage deletion recovery")?;
+        if !targets.is_empty() {
+            // Invalidate before changing the SQL journal. A crash after the
+            // lifecycle commit but before removing an older completion marker
+            // could otherwise let teardown's focused peel take the stale fast
+            // path and erase the only retry evidence without another scan.
+            self.invalidate_key_package_cutover_scan_marker(label)?;
+        }
+        let storage = self.account_storage(label)?;
+        let mut lifecycle = match storage.key_package_lifecycle()? {
+            Some(lifecycle) => lifecycle,
+            None => {
+                let account = self.account_home().account(label)?;
+                let stable_slot_id = self
+                    .reusable_key_package_slot_id(label, &account.account_id_hex)?
+                    .ok_or_else(|| {
+                        AppError::Publish(
+                            "cannot durably journal KeyPackage deletion without a stable slot"
+                                .to_owned(),
+                        )
+                    })?;
+                cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
+            }
+        };
+        let mut changed = self.canonicalize_quiesced_key_package_lifecycle_targets(&mut lifecycle);
+
+        // Resolve every target into the exact liability that can escape in the
+        // following kind-5 send. Unknown relay-discovered event ids (including
+        // other stable `d` slots) are not covered by a later local NIP-33
+        // replacement and therefore need the same durable per-endpoint retry
+        // journal as locally authored revisions.
+        let mut deletion_liabilities: Vec<(
+            String,
+            MessageId,
+            Vec<TransportEndpoint>,
+            Vec<TransportEndpoint>,
+        )> = Vec::new();
+        let mut invalid_targets = Vec::new();
+        for target in targets {
+            let event_id_hex = match parse_key_package_event_id_hex(&target.event_id_hex) {
+                Ok(event_id_hex) => event_id_hex,
+                Err(error) => {
+                    invalid_targets.push(KeyPackageDeletionInvalidTarget {
+                        target: target.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if target.source_relays.is_empty() {
+                invalid_targets.push(KeyPackageDeletionInvalidTarget {
+                    target: KeyPackageDeletionTarget {
+                        event_id_hex,
+                        source_relays: Vec::new(),
+                    },
+                    reason: "key package deletion target has no relay endpoints".to_owned(),
+                });
+                continue;
+            }
+            let mut safe_endpoints = Vec::new();
+            let mut unsafe_endpoints = Vec::new();
+            for endpoint in &target.source_relays {
+                match self
+                    .canonicalize_key_package_endpoint(endpoint, "key package deletion publish")
+                {
+                    Ok(canonical) => safe_endpoints.push(canonical),
+                    Err(_) => unsafe_endpoints.push(endpoint.clone()),
+                }
+            }
+            safe_endpoints.sort();
+            safe_endpoints.dedup();
+            unsafe_endpoints.sort();
+            unsafe_endpoints.dedup();
+            let event_id = MessageId::new(
+                hex::decode(&event_id_hex)
+                    .map_err(|_| AppError::Publish("invalid key package event id".to_owned()))?,
+            );
+            if let Some((_, _, existing_safe, existing_unsafe)) = deletion_liabilities
+                .iter_mut()
+                .find(|(existing_id, _, _, _)| existing_id == &event_id_hex)
+            {
+                existing_safe.extend(safe_endpoints);
+                existing_safe.sort();
+                existing_safe.dedup();
+                existing_unsafe.extend(unsafe_endpoints);
+                existing_unsafe.sort();
+                existing_unsafe.dedup();
+            } else {
+                deletion_liabilities.push((
+                    event_id_hex,
+                    event_id,
+                    safe_endpoints,
+                    unsafe_endpoints,
+                ));
+            }
+        }
+
+        let mut exact_liabilities = HashSet::new();
+        let mut include_targets =
+            |event_id: &MessageId, targets: &[cgka_traits::TransportFanoutTarget]| {
+                for target in targets {
+                    if target.failure_code.as_deref() != Some("confirmed_absent") {
+                        exact_liabilities
+                            .insert((event_id.as_slice().to_vec(), target.endpoint.clone()));
+                    }
+                }
+            };
+        if let Some(artifact) = lifecycle.authored_signed_event.as_ref() {
+            include_targets(&artifact.id, &lifecycle.publication_targets);
+        }
+        if let Some(event_id) = lifecycle.authored_event_id.as_ref() {
+            // Pre-artifact upgrade rows can retain the exact current event id
+            // and endpoint exposure set without the signed bytes. Count those
+            // pairs before admitting any new deletion liability. If a corrupt
+            // row carries two differing identity representations, including
+            // both is the conservative capacity decision.
+            include_targets(event_id, &lifecycle.publication_targets);
+        }
+        if let Some(pending) = lifecycle.pending_replacement.as_ref()
+            && let Some(artifact) = pending.signed_event.as_ref()
+        {
+            include_targets(&artifact.id, &pending.targets);
+        }
+        for retired in &lifecycle.retired_publications_pending_deletion {
+            include_targets(&retired.event_id, &retired.deletion_targets);
+        }
+        let mut admitted_targets = Vec::new();
+        let mut deferred_targets = Vec::new();
+        let mut unsafe_targets = Vec::new();
+        let mut journaled_liabilities = Vec::new();
+        let mut live_event_ids = HashSet::new();
+        if let Some(artifact) = lifecycle.authored_signed_event.as_ref() {
+            live_event_ids.insert(artifact.id.as_slice().to_vec());
+        }
+        if let Some(event_id) = lifecycle.authored_event_id.as_ref() {
+            live_event_ids.insert(event_id.as_slice().to_vec());
+        }
+        if let Some(artifact) = lifecycle
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| pending.signed_event.as_ref())
+        {
+            live_event_ids.insert(artifact.id.as_slice().to_vec());
+        }
+        for (event_id_hex, event_id, safe_endpoints, unsafe_endpoints) in deletion_liabilities {
+            let is_live_revision = live_event_ids.contains(event_id.as_slice());
+            let mut requested_endpoints = safe_endpoints
+                .iter()
+                .chain(&unsafe_endpoints)
+                .cloned()
+                .collect::<Vec<_>>();
+            requested_endpoints.sort();
+            requested_endpoints.dedup();
+            let required_new_liabilities = requested_endpoints
+                .iter()
+                .filter(|endpoint| {
+                    !exact_liabilities
+                        .contains(&(event_id.as_slice().to_vec(), (*endpoint).clone()))
+                })
+                .count();
+            let liability_capacity = if is_live_revision {
+                cgka_traits::maintenance::MAX_KEY_PACKAGE_SIGNED_PUBLICATION_LIABILITIES_WITH_LIVE_DELETION_OVERFLOW
+            } else {
+                cgka_traits::maintenance::MAX_KEY_PACKAGE_SIGNED_PUBLICATION_LIABILITIES
+            };
+            if required_new_liabilities > liability_capacity.saturating_sub(exact_liabilities.len())
+            {
+                // No exact event can be deleted at only a subset of its
+                // requested endpoints. Unknown ids do not prove a sibling
+                // slot; a later replacement could hide the old exact id while
+                // an unjournaled endpoint remains. Defer the whole event: no
+                // kind-5 target, unsafe admission, or live marker is produced
+                // until every new pair fits in the bounded reserve.
+                deferred_targets.push(KeyPackageDeletionTarget {
+                    event_id_hex,
+                    source_relays: requested_endpoints,
+                });
+                continue;
+            }
+            let mut admitted_endpoints = Vec::new();
+            let mut journaled_unsafe_endpoints = Vec::new();
+            let mut deferred_endpoints = Vec::new();
+            for (endpoint, safe_for_io) in safe_endpoints
+                .into_iter()
+                .map(|endpoint| (endpoint, true))
+                .chain(
+                    unsafe_endpoints
+                        .into_iter()
+                        .map(|endpoint| (endpoint, false)),
+                )
+            {
+                let liability = (event_id.as_slice().to_vec(), endpoint.clone());
+                if exact_liabilities.contains(&liability)
+                    || exact_liabilities.len() < liability_capacity
+                {
+                    exact_liabilities.insert(liability);
+                    if safe_for_io {
+                        admitted_endpoints.push(endpoint);
+                    } else {
+                        journaled_unsafe_endpoints.push(endpoint);
+                    }
+                } else {
+                    deferred_endpoints.push(endpoint);
+                }
+            }
+            if !admitted_endpoints.is_empty() {
+                admitted_targets.push(KeyPackageDeletionTarget {
+                    event_id_hex: event_id_hex.clone(),
+                    source_relays: admitted_endpoints.clone(),
+                });
+            }
+            if !journaled_unsafe_endpoints.is_empty() {
+                unsafe_targets.push(KeyPackageDeletionTarget {
+                    event_id_hex: event_id_hex.clone(),
+                    source_relays: journaled_unsafe_endpoints.clone(),
+                });
+            }
+            let mut journaled_endpoints = admitted_endpoints;
+            journaled_endpoints.extend(journaled_unsafe_endpoints);
+            if !journaled_endpoints.is_empty() {
+                journaled_liabilities.push((event_id, journaled_endpoints, is_live_revision));
+            }
+            if !deferred_endpoints.is_empty() {
+                deferred_targets.push(KeyPackageDeletionTarget {
+                    event_id_hex,
+                    source_relays: deferred_endpoints,
+                });
+            }
+        }
+
+        let pending_event_id = lifecycle
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| pending.signed_event.as_ref())
+            .map(|artifact| artifact.id.clone());
+        for (event_id, endpoints, live_admission) in journaled_liabilities {
+            let deletes_current = lifecycle
+                .authored_signed_event
+                .as_ref()
+                .is_some_and(|artifact| artifact.id == event_id)
+                || lifecycle.authored_event_id.as_ref() == Some(&event_id);
+            if live_admission
+                && (deletes_current || pending_event_id.as_ref() == Some(&event_id))
+                && !lifecycle
+                    .deleted_live_revision_event_ids
+                    .contains(&event_id)
+            {
+                lifecycle
+                    .deleted_live_revision_event_ids
+                    .push(event_id.clone());
+                changed = true;
+            }
+            if let Some(retired) = lifecycle
+                .retired_publications_pending_deletion
+                .iter_mut()
+                .find(|retired| retired.event_id == event_id)
+            {
+                changed |= !retired.delete_without_successor;
+                retired.delete_without_successor = true;
+                for endpoint in endpoints {
+                    if !retired
+                        .deletion_targets
+                        .iter()
+                        .any(|target| target.endpoint == endpoint)
+                    {
+                        retired
+                            .deletion_targets
+                            .push(cgka_traits::TransportFanoutTarget {
+                                endpoint,
+                                state: cgka_traits::TransportFanoutAttemptState::Unattempted,
+                                attempt_count: 0,
+                                last_attempt_at: None,
+                                failure_code: None,
+                            });
+                        changed = true;
+                    }
+                }
+            } else {
+                lifecycle.retired_publications_pending_deletion.push(
+                    cgka_traits::RetiredKeyPackagePublication {
+                        event_id,
+                        authored_created_at: cgka_traits::Timestamp(0),
+                        key_package_ref: None,
+                        package_not_after: None,
+                        delete_without_successor: true,
+                        deletion_targets: endpoints
+                            .into_iter()
+                            .map(|endpoint| cgka_traits::TransportFanoutTarget {
+                                endpoint,
+                                state: cgka_traits::TransportFanoutAttemptState::Unattempted,
+                                attempt_count: 0,
+                                last_attempt_at: None,
+                                failure_code: None,
+                            })
+                            .collect(),
+                    },
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(KeyPackageDeletionAdmission {
+            admitted: admitted_targets,
+            deferred: deferred_targets,
+            unsafe_targets,
+            invalid_targets,
+        })
+    }
+
+    /// Commit endpoint-level acknowledgements for retired signed revisions.
+    ///
+    /// Call only while the account worker is quiesced. Active maintenance owns
+    /// the same lifecycle row and performs this pruning inside the serialized
+    /// account runtime instead.
+    pub(crate) fn acknowledge_retired_key_package_deletions(
+        &self,
+        label: &str,
+        results: &[KeyPackageDeletionResult],
+    ) -> Result<(), AppError> {
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            return Ok(());
+        };
+        let mut changed = false;
+        let mut completed_retired_event_ids = Vec::new();
+        for result in results {
+            let mut terminal_endpoints = result.accepted_endpoints.clone();
+            terminal_endpoints.extend(result.confirmed_absent_endpoints.clone());
+            if terminal_endpoints.is_empty() {
+                continue;
+            }
+            let deleted_current_revision = lifecycle
+                .authored_signed_event
+                .as_ref()
+                .is_some_and(|artifact| hex::encode(artifact.id.as_slice()) == result.event_id_hex)
+                || lifecycle
+                    .authored_event_id
+                    .as_ref()
+                    .is_some_and(|event_id| {
+                        hex::encode(event_id.as_slice()) == result.event_id_hex
+                    });
+            let deleted_pending_revision = lifecycle
+                .pending_replacement
+                .as_ref()
+                .and_then(|pending| pending.signed_event.as_ref())
+                .is_some_and(|artifact| hex::encode(artifact.id.as_slice()) == result.event_id_hex);
+            if deleted_current_revision
+                && let Some(event_id) = lifecycle
+                    .authored_signed_event
+                    .as_ref()
+                    .map(|artifact| artifact.id.clone())
+                && !lifecycle
+                    .deleted_live_revision_event_ids
+                    .contains(&event_id)
+            {
+                lifecycle.deleted_live_revision_event_ids.push(event_id);
+                changed = true;
+            }
+            if deleted_pending_revision
+                && let Some(event_id) = lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .and_then(|pending| pending.signed_event.as_ref())
+                    .map(|artifact| artifact.id.clone())
+                && !lifecycle
+                    .deleted_live_revision_event_ids
+                    .contains(&event_id)
+            {
+                lifecycle.deleted_live_revision_event_ids.push(event_id);
+                changed = true;
+            }
+            if deleted_current_revision {
+                for target in &mut lifecycle.publication_targets {
+                    if terminal_endpoints.contains(&target.endpoint) {
+                        target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
+                        target.failure_code = Some("confirmed_absent".into());
+                        changed = true;
+                    }
+                }
+            }
+            if deleted_pending_revision
+                && let Some(pending) = lifecycle.pending_replacement.as_mut()
+            {
+                for target in &mut pending.targets {
+                    if terminal_endpoints.contains(&target.endpoint) {
+                        target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
+                        target.failure_code = Some("confirmed_absent".into());
+                        changed = true;
+                    }
+                }
+            }
+            let Some(retired) = lifecycle
+                .retired_publications_pending_deletion
+                .iter_mut()
+                .find(|retired| hex::encode(retired.event_id.as_slice()) == result.event_id_hex)
+            else {
+                continue;
+            };
+            let before = retired.deletion_targets.len();
+            retired
+                .deletion_targets
+                .retain(|target| !terminal_endpoints.contains(&target.endpoint));
+            if retired.deletion_targets.len() != before {
+                changed = true;
+                if retired.deletion_targets.is_empty() {
+                    completed_retired_event_ids.push(retired.event_id.clone());
+                }
+            }
+        }
+        lifecycle
+            .retired_publications_pending_deletion
+            .retain(|retired| !completed_retired_event_ids.contains(&retired.event_id));
+        if changed {
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
     }
 
     fn key_package_record_path(&self, label: &str) -> PathBuf {
@@ -4360,6 +9615,277 @@ impl MarmotApp {
             .then_some(key_package)
     }
 
+    /// Historical relay provenance for a legacy cache can come only from a
+    /// locally cached observation of that exact signed revision. Current
+    /// NIP-65 or configured routing says where a replacement would publish
+    /// today; projecting it onto an older event would invent exposure and can
+    /// send deletion traffic to the wrong relay after an account route change.
+    /// Read the account-private cache directly: the shared public projection
+    /// intentionally strips source relays, and signed-out accounts are omitted
+    /// from the aggregate active-account cache view.
+    ///
+    /// Directory-cache failures and mismatches deliberately degrade to
+    /// unknown provenance. Account open must remain a local operation, and an
+    /// unknown endpoint set must stay empty rather than falling back to live
+    /// routing.
+    fn cached_key_package_provenance(
+        &self,
+        account: &AccountSummary,
+        record: &KeyPackageRecord,
+        expected_key_package_ref_hex: Option<&str>,
+    ) -> (Vec<TransportEndpoint>, Option<u64>) {
+        let Some(cached) = self
+            .directory_cache_for_account(account)
+            .ok()
+            .and_then(|cache| cache.entry(&account.account_id_hex).ok().flatten())
+            .and_then(|entry| entry.key_package)
+        else {
+            return (Vec::new(), None);
+        };
+        if !cached
+            .key_package_event_id
+            .eq_ignore_ascii_case(&record.key_package_event_id)
+            || cached.key_package_id != record.key_package_id
+            || (!record.key_package_ref_hex.is_empty()
+                && !cached
+                    .key_package_ref_hex
+                    .eq_ignore_ascii_case(&record.key_package_ref_hex))
+            || expected_key_package_ref_hex
+                .is_some_and(|expected| !cached.key_package_ref_hex.eq_ignore_ascii_case(expected))
+        {
+            return (Vec::new(), None);
+        }
+
+        let authored_created_at = cached.created_at;
+        // Preserve the exact observed endpoint keys, including historical
+        // values that today's dial policy rejects. The durable lifecycle must
+        // retain possible exposure at those endpoints; the publisher boundary
+        // partitions unsafe keys into failed receipts without dialing them.
+        let mut endpoints = cached
+            .source_relays
+            .into_iter()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        endpoints.dedup();
+        (endpoints, Some(authored_created_at))
+    }
+
+    /// Upgrade a pre-lifecycle current-profile cache into the durable account
+    /// lifecycle. A matching OpenMLS bundle becomes the projected current
+    /// package (even when the legacy cache has no event id). Conversely, a
+    /// valid event id whose bundle is already gone becomes a retired
+    /// liability. Exact cached source relays make that liability actionable;
+    /// unknown provenance retains only the event identity, without inventing
+    /// an endpoint. Both shapes preserve lifetime and stable-slot high-water.
+    fn import_cached_current_key_package_lifecycle(&self, label: &str) -> Result<bool, AppError> {
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            return Ok(false);
+        };
+        if lifecycle.stable_slot_id.is_empty()
+            || lifecycle.current_key_package.is_some()
+            || lifecycle.pending_replacement.is_some()
+        {
+            return Ok(false);
+        }
+        let record = match read_json::<KeyPackageRecord>(self.key_package_record_path(label)) {
+            Ok(record) => record,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(_) => return Ok(false),
+        };
+        let account = self.account_home().account(label)?;
+        if record.account_id_hex != account.account_id_hex
+            || record.key_package_id != lifecycle.stable_slot_id
+        {
+            return Ok(false);
+        }
+        let event_id = if record.key_package_event_id.is_empty() {
+            None
+        } else {
+            let event_id_hex = match parse_key_package_event_id_hex(&record.key_package_event_id) {
+                Ok(event_id_hex) => event_id_hex,
+                Err(_) => return Ok(false),
+            };
+            Some(MessageId::new(hex::decode(event_id_hex)?))
+        };
+        let key_package = match self.validated_current_local_key_package(label) {
+            Some(key_package) => key_package,
+            None => return Ok(false),
+        };
+        let metadata = key_package_metadata(&key_package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+        if !record.key_package_ref_hex.is_empty()
+            && !record
+                .key_package_ref_hex
+                .eq_ignore_ascii_case(&metadata.key_package_ref_hex)
+        {
+            return Ok(false);
+        }
+        let key_package_ref = hex::decode(&metadata.key_package_ref_hex)?;
+        let owns_private_bundle = cgka_engine::key_package::durably_owned_key_packages(
+            &storage,
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .map_err(cgka_session::SessionError::from)?
+        .iter()
+        .any(|owned| {
+            key_package_metadata(owned).is_ok_and(|owned_metadata| {
+                owned_metadata
+                    .key_package_ref_hex
+                    .eq_ignore_ascii_case(&metadata.key_package_ref_hex)
+            })
+        });
+        let (endpoints, cached_authored_created_at) = event_id
+            .as_ref()
+            .map(|_| {
+                self.cached_key_package_provenance(
+                    &account,
+                    &record,
+                    Some(&metadata.key_package_ref_hex),
+                )
+            })
+            .unwrap_or_default();
+
+        let authored_created_at = Timestamp(
+            cached_authored_created_at
+                .map(|cached| cached.max(record.published_at))
+                .unwrap_or(record.published_at),
+        );
+        lifecycle.authored_event_created_at = Some(
+            lifecycle
+                .authored_event_created_at
+                .map(|current| current.max(authored_created_at))
+                .unwrap_or(authored_created_at),
+        );
+        if owns_private_bundle {
+            lifecycle.current_key_package = Some(key_package);
+            lifecycle.current_key_package_ref = Some(key_package_ref.clone());
+            lifecycle.current_not_before = Some(Timestamp(metadata.not_before));
+            lifecycle.current_not_after = Some(Timestamp(metadata.not_after));
+            lifecycle.authored_event_id = event_id;
+            lifecycle.authored_signed_event = None;
+            lifecycle.publication_targets = if lifecycle.authored_event_id.is_some() {
+                endpoints
+                    .into_iter()
+                    .map(|endpoint| cgka_traits::TransportFanoutTarget {
+                        endpoint,
+                        state: cgka_traits::TransportFanoutAttemptState::AttemptedFailed,
+                        attempt_count: 1,
+                        last_attempt_at: Some(authored_created_at),
+                        failure_code: Some("possible_exposure".into()),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if lifecycle.authored_event_id.is_some() && lifecycle.publication_targets.is_empty() {
+                let event_id = lifecycle
+                    .authored_event_id
+                    .clone()
+                    .expect("cached event id remains selected during legacy import");
+                retain_imported_legacy_key_package_publication(
+                    &mut lifecycle,
+                    cgka_traits::RetiredKeyPackagePublication {
+                        event_id,
+                        authored_created_at,
+                        key_package_ref: Some(key_package_ref.clone()),
+                        package_not_after: Some(Timestamp(metadata.not_after)),
+                        delete_without_successor: false,
+                        deletion_targets: Vec::new(),
+                    },
+                );
+            }
+        } else if let Some(event_id) = event_id {
+            let imported_targets = endpoints
+                .into_iter()
+                .map(|endpoint| cgka_traits::TransportFanoutTarget {
+                    endpoint,
+                    state: cgka_traits::TransportFanoutAttemptState::Unattempted,
+                    attempt_count: 0,
+                    last_attempt_at: None,
+                    failure_code: None,
+                })
+                .collect::<Vec<_>>();
+            retain_imported_legacy_key_package_publication(
+                &mut lifecycle,
+                cgka_traits::RetiredKeyPackagePublication {
+                    event_id,
+                    authored_created_at,
+                    key_package_ref: Some(key_package_ref),
+                    package_not_after: Some(Timestamp(metadata.not_after)),
+                    delete_without_successor: true,
+                    deletion_targets: imported_targets,
+                },
+            );
+        } else {
+            return Ok(false);
+        }
+        lifecycle.refresh_at = Some(Timestamp(0));
+        lifecycle.upgrade_rotation_recorded = false;
+        lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
+        self.canonicalize_quiesced_key_package_lifecycle_targets(&mut lifecycle);
+        if key_package_lifecycle_endpoint_liability_count(&lifecycle)
+            > cgka_traits::maintenance::MAX_KEY_PACKAGE_SIGNED_PUBLICATION_LIABILITIES
+        {
+            return Err(AppError::Publish(
+                "key package signed-publication endpoint-liability journal is full".into(),
+            ));
+        }
+        storage.put_key_package_lifecycle(&lifecycle)?;
+        Ok(true)
+    }
+
+    /// Arm the transport-generic publication interlock while account storage
+    /// is still quiesced. Managed runtime startup performs fallible sync before
+    /// its network-maintenance finish hook; persisting here prevents an
+    /// immediate worker tick from publishing through that failure window.
+    fn arm_key_package_cutover_publication_gate_before_session_open(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        if self.key_package_cutover_publication_allowed(label)
+            && !self.key_package_cutover_replacement_pending(label)
+        {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        let Some(mut lifecycle) = storage.key_package_lifecycle()? else {
+            // An upgraded account whose database predates lifecycle state is
+            // already fail-closed: the replacement-intent file keeps ordinary
+            // admission blocked, and the final publisher rejects a missing
+            // lifecycle row. Preserve that detectable shape so setup can
+            // surface the typed consent-gated recovery state instead of
+            // turning it into an unrelated publication error.
+            return Ok(());
+        };
+        // A generated identity's first session deliberately staged and signed
+        // its exact replacement while the gate was armed. Once that durable
+        // replacement exists, its no-predecessor marker is sufficient to open
+        // the SQL gate for setup-priority publication. A pending initial
+        // NIP-65 intent remains a second, file-backed fence at the final relay
+        // boundary; ordinary and legacy intents cannot enter this branch.
+        if self.generated_account_fresh_replacement_can_open_cutover_gate(label, &lifecycle)? {
+            if lifecycle.cutover_publication_blocked {
+                lifecycle.cutover_publication_blocked = false;
+                storage.put_key_package_lifecycle(&lifecycle)?;
+            }
+            return Ok(());
+        }
+        if lifecycle.stable_slot_id.is_empty() {
+            return Err(AppError::Publish(
+                "cannot arm key package cutover publication interlock without a stable slot".into(),
+            ));
+        }
+        if !lifecycle.cutover_publication_blocked {
+            lifecycle.cutover_publication_blocked = true;
+            storage.put_key_package_lifecycle(&lifecycle)?;
+        }
+        Ok(())
+    }
+
     /// Persist strict-cutover replacement intent before the session layer can
     /// delete unpublished non-current private bundles during open.
     fn ensure_strict_cutover_replacement_intent_before_session_open(
@@ -4367,14 +9893,41 @@ impl MarmotApp {
         label: &str,
     ) -> Result<(), AppError> {
         let account_storage_preexisted = self.account_storage_path(label).exists();
-        let setup_in_progress = self.account_home().account_setup_state(label)?.is_some();
+        let setup_state = self.account_home().account_setup_state(label)?;
+        let setup_in_progress = setup_state.is_some();
         let storage = self.account_storage(label)?;
         let existing_lifecycle = storage.key_package_lifecycle()?;
-        if existing_lifecycle
+        if let Some(lifecycle) = existing_lifecycle
             .as_ref()
-            .is_some_and(|lifecycle| !lifecycle.stable_slot_id.is_empty())
+            .filter(|lifecycle| !lifecycle.stable_slot_id.is_empty())
         {
-            return Ok(());
+            // Older builds wrote this load-bearing marker without syncing its
+            // directory entry. An interrupted generated setup may therefore
+            // retain the exact lifecycle but lose only the marker. Rebuild it
+            // from the durable generated-setup provenance unless a current
+            // acknowledged cutover revision proves the marker was cleared on
+            // purpose after successful publication.
+            if setup_state.as_ref().is_some_and(|state| {
+                state.kind == AccountSetupKind::GeneratedIdentity
+                    && state.phase != AccountSetupPhase::KeyPackagePublicationConfirmed
+            }) && !self.key_package_cutover_replacement_pending(label)
+                && !self.key_package_lifecycle_has_current_cutover_revision(label, lifecycle)
+                && !self.mark_key_package_cutover_replacement_pending(label)
+            {
+                return Err(AppError::Io(std::io::Error::other(
+                    "could not restore generated setup cutover replacement intent",
+                )));
+            }
+            self.import_cached_current_key_package_lifecycle(label)?;
+            if self.key_package_record_path(label).exists()
+                && self.validated_current_local_key_package(label).is_none()
+                && !self.mark_key_package_cutover_replacement_pending(label)
+            {
+                return Err(AppError::Io(std::io::Error::other(
+                    "could not persist strict cutover replacement intent before session open",
+                )));
+            }
+            return self.arm_key_package_cutover_publication_gate_before_session_open(label);
         }
         let current_cache = self.validated_current_local_key_package(label).is_some();
         match self.reusable_key_package_slot_id(
@@ -4387,8 +9940,10 @@ impl MarmotApp {
                     .unwrap_or_else(|| empty_key_package_lifecycle(String::new()));
                 lifecycle.stable_slot_id = stable_slot_id;
                 storage.put_key_package_lifecycle(&lifecycle)?;
+                self.import_cached_current_key_package_lifecycle(label)?;
                 if current_cache || self.mark_key_package_cutover_replacement_pending(label) {
-                    return Ok(());
+                    return self
+                        .arm_key_package_cutover_publication_gate_before_session_open(label);
                 }
             }
             Ok(None)
@@ -4404,7 +9959,8 @@ impl MarmotApp {
                 storage
                     .put_key_package_lifecycle(&empty_key_package_lifecycle(hex::encode(slot)))?;
                 if self.mark_key_package_cutover_replacement_pending(label) {
-                    return Ok(());
+                    return self
+                        .arm_key_package_cutover_publication_gate_before_session_open(label);
                 }
             }
             Ok(None) | Err(_) if account_storage_preexisted && !setup_in_progress => {
@@ -4414,7 +9970,8 @@ impl MarmotApp {
                 // mint a second slot. Keep normal account reads available; the
                 // setup publication boundary surfaces the typed recovery state.
                 if self.mark_key_package_cutover_replacement_pending(label) {
-                    return Ok(());
+                    return self
+                        .arm_key_package_cutover_publication_gate_before_session_open(label);
                 }
             }
             Ok(None) | Err(_) => {
@@ -4422,12 +9979,13 @@ impl MarmotApp {
                 // refuse to mint a second slot until migration can recover the
                 // original `d` value.
                 if self.mark_key_package_cutover_replacement_pending(label) {
-                    return Ok(());
+                    return self
+                        .arm_key_package_cutover_publication_gate_before_session_open(label);
                 }
             }
         }
         if self.key_package_cutover_replacement_pending(label) {
-            return Ok(());
+            return self.arm_key_package_cutover_publication_gate_before_session_open(label);
         }
         Err(AppError::Io(std::io::Error::other(
             "could not persist strict cutover replacement intent before session open",
@@ -4489,15 +10047,13 @@ impl MarmotApp {
                     .await?;
                 let mut fetched = fresh_or_cached_key_package(
                     &account_id,
-                    latest_fresh_key_package_from_records(
-                        &account_id,
-                        records,
-                        self.directory_freshness(),
-                    )?,
+                    self.latest_fresh_non_retired_key_package_from_records(&account_id, records)?,
                     Some(entry.clone()),
                 )?;
                 fetched.relay_lists = entry.relay_lists;
-                self.remember_directory_key_package(&fetched)?;
+                if !self.remember_directory_key_package_if_live(&fetched)? {
+                    return Err(AppError::MissingKeyPackage(account_id));
+                }
                 return Ok(fetched.key_package);
             }
         }
@@ -4713,13 +10269,29 @@ impl MarmotApp {
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
     ) -> Result<(), AppError> {
+        self.save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+            delta,
+            frontiers_to_clear,
+            application_event_ids_to_ack,
+            &[],
+        )
+    }
+
+    fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
+        &self,
+        delta: &AccountState,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+        visibility_batch_ids_to_ack: &[Vec<u8>],
+    ) -> Result<(), AppError> {
         self.account_storage(&delta.label)?
-            .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
                 &stored_state_from_account_state(delta),
                 MAX_SEEN_EVENT_IDS,
                 TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
                 frontiers_to_clear,
                 application_event_ids_to_ack,
+                visibility_batch_ids_to_ack,
             )?;
         self.chat_list_projection_stale
             .lock()
@@ -4733,6 +10305,7 @@ impl MarmotApp {
         delta: &AccountState,
         frontiers_to_clear: &[(String, u64)],
         application_event_ids_to_ack: &[MessageId],
+        visibility_batch_ids_to_ack: &[Vec<u8>],
         group_id_hex: &str,
     ) -> Result<ChatListRow, AppError> {
         let account = self.account_home().account(&delta.label)?;
@@ -4743,12 +10316,13 @@ impl MarmotApp {
             .any(|group| group.group_id_hex != group_id_hex);
         let mut row = self
             .account_storage(&delta.label)?
-            .save_account_projection_delta_and_refresh_chat_list_row(
+            .save_account_projection_delta_and_refresh_chat_list_row_acking_application_events_and_visibility_batches(
                 &stored_state_from_account_state(delta),
                 MAX_SEEN_EVENT_IDS,
                 TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
                 frontiers_to_clear,
                 application_event_ids_to_ack,
+                visibility_batch_ids_to_ack,
                 &account.account_id_hex,
                 group_id_hex,
                 &classifier,
@@ -4985,11 +10559,14 @@ impl MarmotApp {
     /// runtime lease, so nothing this process owns holds a file lock inside the
     /// Marmot root.
     ///
-    /// Callers must quiesce first — this closes databases out from under any
-    /// work still running (see [`SqliteAccountStorage::close`] for what that
-    /// does to in-flight transactions). [`MarmotAppRuntime::shutdown_and_close`]
-    /// is the sequenced entry point host apps should use; it drains the account
-    /// workers before calling this.
+    /// Direct callers that need graceful completion should quiesce first — this
+    /// closes databases out from under any work still running (see
+    /// [`SqliteAccountStorage::close`] for what that does to in-flight
+    /// transactions). [`MarmotAppRuntime::shutdown_and_close`] is the terminal
+    /// entry point host apps should use: it closes runtime admission, gives
+    /// admitted account teardown a bounded chance to finish, then prioritizes
+    /// closing storage and releasing the root lease before graceful worker
+    /// cleanup continues.
     ///
     /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
     /// accessor then fails with
@@ -5013,6 +10590,14 @@ impl MarmotApp {
     /// error is returned once all of them have been closed.
     pub fn close_storage(&self) -> Result<(), AppError> {
         let started_at = Instant::now();
+        // Root mutations are admitted before database opens in the few paths
+        // that need both. Taking this writer first preserves that lock order
+        // and keeps the lease until every already-admitted bounded file commit
+        // has finished.
+        let _root_mutation = self
+            .root_mutation_lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Exclusive for the whole teardown. The `storage_closed` flag alone
         // would not make this atomic: two concurrent closes could interleave so
         // that one released the root lease and returned while the other was
@@ -5037,6 +10622,13 @@ impl MarmotApp {
             .drain()
             .map(|(_, storage)| storage)
             .collect::<Vec<_>>();
+        let account_session_storages = self
+            .account_session_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, storage)| storage)
+            .collect::<Vec<_>>();
         let directory_caches = self
             .directory_caches
             .lock()
@@ -5051,6 +10643,12 @@ impl MarmotApp {
             .take();
 
         for storage in account_storages {
+            closed += 1;
+            if let Err(error) = storage.close() {
+                first_error.get_or_insert(AppError::from(error));
+            }
+        }
+        for storage in account_session_storages {
             closed += 1;
             if let Err(error) = storage.close() {
                 first_error.get_or_insert(AppError::from(error));
@@ -5131,6 +10729,23 @@ impl MarmotApp {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_storage_open(database)?;
+        Ok(guard)
+    }
+
+    /// Admit one bounded synchronous mutation inside the Marmot root.
+    ///
+    /// Callers must drop the returned guard before any network or worker await.
+    /// Terminal close takes the writer and latches `storage_closed` before it
+    /// releases the cross-process root lease.
+    pub(crate) fn begin_root_mutation(
+        &self,
+        operation: &'static str,
+    ) -> Result<RwLockReadGuard<'_, ()>, AppError> {
+        let guard = self
+            .root_mutation_lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_storage_open(operation)?;
         Ok(guard)
     }
 
@@ -5535,31 +11150,81 @@ impl MarmotApp {
         self.root.clone()
     }
 
-    /// Evict every in-memory handle and warm flag bound to `label`.
+    /// Close and evict every in-memory handle and warm flag bound to `label`.
     ///
     /// Must be called before the account directory is deleted on removal or
-    /// setup-failure rollback. Without this, the cached `SqliteAccountStorage`
-    /// connection in `account_storages` (and the `directory_caches` handle)
-    /// keeps pointing at the now-unlinked inode: after the user re-imports the
-    /// same account, the session DB is rebuilt fresh while projection paths
-    /// keep writing through the stale handle, silently losing data. Clearing
-    /// the warm/stale/ready flags forces the rebuilt account to re-warm its
-    /// projections from the fresh database.
+    /// setup-failure rollback. Without this, the cached projection connection,
+    /// the independently opened account-session connection, or the directory
+    /// cache can keep pointing at the now-unlinked inode: after the user
+    /// re-imports the same account, the session DB is rebuilt fresh while a
+    /// stale handle silently loses writes. Clearing the warm/stale/ready flags
+    /// forces the rebuilt account to re-warm its projections from the fresh
+    /// database.
     fn drop_account_caches(&self, label: &str) {
         if let Ok(account) = self.account_home().account(label) {
             self.account_publish_clients
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&account.account_id_hex);
+            self.member_key_package_prewarm_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&account.account_id_hex);
         }
-        self.account_storages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(label);
-        self.directory_caches
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(label);
+        // Eviction alone is not enough: an unabortable `spawn_blocking`
+        // account open can still own clones after its async worker was reaped.
+        // Closing the shared handles makes every such clone inert before the
+        // cache entry becomes unreachable to terminal `close_storage`. Each
+        // close stays under its registry mutex so terminal draining cannot
+        // miss a removed handle whose close is still in progress.
+        {
+            let mut storages = self
+                .account_storages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(storage) = storages.remove(label)
+                && let Err(error) = storage.close()
+            {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "drop_account_caches",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "failed to close evicted account storage",
+                );
+            }
+        }
+        {
+            let mut storages = self
+                .account_session_storages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(storage) = storages.remove(label)
+                && let Err(error) = storage.close()
+            {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "drop_account_caches",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "failed to close evicted account session storage",
+                );
+            }
+        }
+        {
+            let mut caches = self
+                .directory_caches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cache) = caches.remove(label)
+                && let Err(error) = cache.close()
+            {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "drop_account_caches",
+                    error_kind = error.privacy_safe_kind(),
+                    "failed to close evicted directory cache",
+                );
+            }
+        }
         self.account_state_ready
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5967,6 +11632,7 @@ struct AppKeyPackagePublisher {
     app: MarmotApp,
     account_label: String,
     signer: AccountSigner,
+    session_admission: AccountSessionAdmission,
 }
 
 impl AppKeyPackagePublisher {
@@ -6027,6 +11693,14 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))
     }
 
+    fn signed_artifact_reauthor_at_age_secs(&self) -> Option<u64> {
+        // Buzz rejects timestamps differing from relay time by more than 900
+        // seconds. Reauthor at signed-revision age >= 600 seconds, reserving
+        // 300 seconds for combined clock skew, scheduling/signing delay, and
+        // delivery across the relay set.
+        Some(KEY_PACKAGE_REAUTHOR_AT_AGE_SECS)
+    }
+
     async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
@@ -6073,7 +11747,17 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         publication: &KeyPackagePublication,
         artifact: &cgka_traits::SignedPublicationArtifact,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
-        let nostr_publication = self.nostr_publication(publication)?;
+        self.publish_prepared_key_package_detailed(publication, artifact)
+            .await
+            .map(Into::into)
+    }
+
+    async fn publish_prepared_key_package_detailed(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<DetailedKeyPackagePublishReceipt, KeyPackagePublishError> {
+        let mut nostr_publication = self.nostr_publication(publication)?;
         let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
         if event.id != hex::encode(artifact.id.as_slice())
@@ -6083,6 +11767,178 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 "persisted KeyPackage event identity does not match lifecycle record",
             ));
         }
+        let mut canonical_publish_endpoints = Vec::new();
+        let mut endpoint_aliases = Vec::new();
+        let mut failed = Vec::new();
+        for requested_endpoint in &publication.endpoints {
+            match self
+                .app
+                .canonicalize_key_package_endpoint(requested_endpoint, "key package publish")
+            {
+                Ok(canonical_endpoint) => {
+                    canonical_publish_endpoints.push(canonical_endpoint.clone());
+                    endpoint_aliases.push((requested_endpoint.clone(), canonical_endpoint));
+                }
+                Err(_) => failed.push(requested_endpoint.clone()),
+            }
+        }
+        canonical_publish_endpoints.sort();
+        canonical_publish_endpoints.dedup();
+        if canonical_publish_endpoints.is_empty() {
+            return Err(KeyPackagePublishError::unexposed(
+                "no safe KeyPackage publication endpoint remains after validation",
+            ));
+        }
+        let key_package_route_lock = self.app.key_package_route_lock(&self.account_label);
+        let _key_package_route_guard = key_package_route_lock.lock().await;
+        let publication_account_id_hex = hex::encode(publication.account_id.as_slice());
+        let live_account_matches = self
+            .app
+            .account_home()
+            .account(&self.account_label)
+            .is_ok_and(|account| {
+                account.is_active_signing() && account.account_id_hex == publication_account_id_hex
+            });
+        let active_admission_is_current = match &self.session_admission {
+            AccountSessionAdmission::Active(token) => self
+                .app
+                .account_session_admission_is_current(&self.account_label, token),
+            // Teardown cleanup may delete or retire KeyPackages, but can never
+            // author a replacement. This is a categorical mode check in
+            // addition to the teardown runtime's durable publication block.
+            AccountSessionAdmission::Teardown(_) => false,
+        };
+        if !live_account_matches || !active_admission_is_current {
+            return Err(KeyPackagePublishError::unexposed(
+                "key package publisher account is signed out, removed, or no longer matches the live account record",
+            ));
+        }
+        if self
+            .app
+            .removed_local_key_package_slot_is_retired(
+                &publication_account_id_hex,
+                &publication.slot_id,
+            )
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "prepared KeyPackage uses a stable slot retired by local account removal",
+            ));
+        }
+        let key_package_history_lock = self.app.key_package_history_lock(&self.account_label);
+        let _key_package_history_guard = key_package_history_lock.lock().await;
+        let incomplete_generated_setup_has_valid_context = self
+            .app
+            .account_home()
+            .account_setup_state(&self.account_label)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?
+            .filter(|state| state.kind == AccountSetupKind::GeneratedIdentity)
+            .map(|_| {
+                self.app
+                    .account_home()
+                    .account_setup_context(&self.account_label)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|bytes| {
+                        serde_json::from_slice::<runtime::GeneratedAccountSetupContext>(&bytes)
+                            .is_ok()
+                    })
+            })
+            .unwrap_or(true);
+        if !incomplete_generated_setup_has_valid_context
+            || !self
+                .app
+                .generated_initial_key_package_publication_held(&self.account_label)
+                .is_ok_and(|held| !held)
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "generated initial KeyPackage publication remains durably held",
+            ));
+        }
+        let lifecycle = self
+            .app
+            .account_storage(&self.account_label)
+            .and_then(|storage| storage.key_package_lifecycle().map_err(AppError::from))
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?
+            .ok_or_else(|| {
+                KeyPackagePublishError::unexposed(
+                    "key package lifecycle is unavailable at the final publication boundary",
+                )
+            })?;
+        if lifecycle.cutover_publication_blocked
+            || !self
+                .app
+                .key_package_cutover_publication_allowed(&self.account_label)
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "key package publication is blocked until strict relay cutover completes",
+            ));
+        }
+        let key_package_ref = hex::decode(&nostr_publication.key_package_ref)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        if lifecycle.stable_slot_id != publication.slot_id
+            || lifecycle.key_package_ref_is_consumed(&key_package_ref)
+            || lifecycle
+                .deleted_live_revision_event_ids
+                .contains(&artifact.id)
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "prepared KeyPackage revision is no longer live in the durable lifecycle",
+            ));
+        }
+        let target_was_durably_admitted =
+            |targets: &[cgka_traits::TransportFanoutTarget], endpoint: &TransportEndpoint| {
+                targets.iter().any(|target| {
+                    target.endpoint == *endpoint
+                        && target.state
+                            != cgka_traits::TransportFanoutAttemptState::PolicyProhibited
+                        && (target.state == cgka_traits::TransportFanoutAttemptState::Accepted
+                            || (target.attempt_count > 0 && target.last_attempt_at.is_some()))
+                })
+            };
+        let matches_current = lifecycle.current_key_package.as_ref()
+            == Some(&publication.key_package)
+            && lifecycle.current_key_package_ref.as_ref() == Some(&key_package_ref)
+            && lifecycle.authored_signed_event.as_ref() == Some(artifact)
+            && lifecycle.authored_event_id.as_ref() == Some(&artifact.id)
+            && canonical_publish_endpoints.iter().all(|endpoint| {
+                target_was_durably_admitted(&lifecycle.publication_targets, endpoint)
+            });
+        let matches_pending = lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.key_package == publication.key_package
+                    && pending.key_package_ref == key_package_ref
+                    && pending.signed_event.as_ref() == Some(artifact)
+                    && pending.authored_created_at == artifact.created_at
+                    && canonical_publish_endpoints
+                        .iter()
+                        .all(|endpoint| target_was_durably_admitted(&pending.targets, endpoint))
+            });
+        if !matches_current && !matches_pending {
+            return Err(KeyPackagePublishError::unexposed(
+                "prepared KeyPackage artifact or endpoint attempt is not the durable live revision",
+            ));
+        }
+        let authoritative_endpoints = self
+            .app
+            .authoritative_key_package_relays(&self.account_label)
+            .map_err(|_| {
+                KeyPackagePublishError::unexposed(
+                    "could not validate authoritative KeyPackage publication endpoints",
+                )
+            })?;
+        if authoritative_endpoints.is_empty()
+            || canonical_publish_endpoints
+                .iter()
+                .any(|endpoint| !authoritative_endpoints.contains(endpoint))
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "prepared KeyPackage publication targets are outside the authoritative relay set",
+            ));
+        }
+        nostr_publication.publish_endpoints = canonical_publish_endpoints;
         let relay_client = self.app.relay_client_for_account_id(
             &hex::encode(publication.account_id.as_slice()),
             self.signer.as_nostr_signer(),
@@ -6091,22 +11947,23 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             .publish_prepared_key_package(&nostr_publication, &event)
             .await
             .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
-        let accepted = outcome
+        let canonical_accepted = outcome
             .accepted
             .into_iter()
             .map(|receipt| receipt.endpoint)
             .collect::<Vec<_>>();
-        let failed = outcome
-            .failed
-            .into_iter()
-            .map(|failure| failure.endpoint)
-            .collect::<Vec<_>>();
+        let mut canonical_rejected = Vec::new();
+        for failure in outcome.failed {
+            if failure.rejection_category.is_some() {
+                canonical_rejected.push(failure.endpoint);
+            }
+        }
 
         // SQLCipher lifecycle state remains authoritative. This directory row
         // is only a best-effort projection for local invite lookups, which
         // otherwise could reuse a consumed package until the next relay fetch.
-        if !accepted.is_empty() {
-            let account_id_hex = hex::encode(publication.account_id.as_slice());
+        if !canonical_accepted.is_empty() {
+            let account_id_hex = publication_account_id_hex;
             let relay_lists = self
                 .app
                 .account_relay_list_status_for_account_id(&account_id_hex)
@@ -6118,10 +11975,18 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 key_package_ref_hex: nostr_publication.key_package_ref,
                 key_package_event_id: hex::encode(artifact.id.as_slice()),
                 created_at: artifact.created_at.0,
-                source_relays: accepted.iter().map(|endpoint| endpoint.0.clone()).collect(),
+                source_relays: canonical_accepted
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
                 relay_lists,
             };
-            if self.app.remember_directory_key_package(&fetched).is_err() {
+            if self
+                .app
+                .begin_root_mutation("project acknowledged local KeyPackage")
+                .and_then(|_root_mutation| self.app.remember_directory_key_package(&fetched))
+                .is_err()
+            {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "publish_prepared_key_package",
@@ -6130,7 +11995,128 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             }
         }
 
-        Ok(KeyPackagePublishReceipt { accepted, failed })
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        for (requested, canonical) in endpoint_aliases {
+            if canonical_accepted.contains(&canonical) {
+                accepted.push(requested);
+            } else if canonical_rejected.contains(&canonical) {
+                rejected.push(requested);
+            } else {
+                // Includes explicit transport failures and a malformed/missing
+                // per-endpoint receipt. Neither may erase the durable exact
+                // requested key's possible-exposure evidence.
+                failed.push(requested);
+            }
+        }
+        accepted.sort();
+        accepted.dedup();
+        rejected.sort();
+        rejected.dedup();
+        rejected.retain(|endpoint| !accepted.contains(endpoint));
+        failed.sort();
+        failed.dedup();
+        failed.retain(|endpoint| !accepted.contains(endpoint) && !rejected.contains(endpoint));
+
+        Ok(DetailedKeyPackagePublishReceipt {
+            accepted,
+            rejected,
+            confirmed_absent: Vec::new(),
+            failed,
+        })
+    }
+
+    async fn delete_key_package_revision(
+        &self,
+        event_id: &cgka_traits::MessageId,
+        endpoints: &[TransportEndpoint],
+    ) -> Result<DetailedKeyPackagePublishReceipt, KeyPackagePublishError> {
+        // Legacy lifecycle rows can contain both noncanonical valid aliases
+        // and unsafe keys from before relay validation happened at durable
+        // admission. Partition them per target: unsafe exact keys remain
+        // retryable without reaching I/O, while safe siblings share one
+        // canonical deletion whose receipt expands back to every requested
+        // durable alias.
+        if endpoints.is_empty() {
+            return Err(KeyPackagePublishError::unexposed(
+                "key package deletion requires at least one relay endpoint",
+            ));
+        }
+        let mut canonical_endpoints = Vec::new();
+        let mut endpoint_aliases = Vec::new();
+        let mut failed = Vec::new();
+        for requested_endpoint in endpoints {
+            match self.app.canonicalize_key_package_endpoint(
+                requested_endpoint,
+                "key package deletion publish",
+            ) {
+                Ok(canonical_endpoint) => {
+                    canonical_endpoints.push(canonical_endpoint.clone());
+                    endpoint_aliases.push((requested_endpoint.clone(), canonical_endpoint));
+                }
+                Err(_) => failed.push(requested_endpoint.clone()),
+            }
+        }
+        canonical_endpoints.sort();
+        canonical_endpoints.dedup();
+        if canonical_endpoints.is_empty() {
+            failed.sort();
+            failed.dedup();
+            return Ok(DetailedKeyPackagePublishReceipt {
+                accepted: Vec::new(),
+                rejected: Vec::new(),
+                confirmed_absent: Vec::new(),
+                failed,
+            });
+        }
+        let mut results = self
+            .app
+            .delete_key_package_events(
+                &self.account_label,
+                vec![KeyPackageDeletionTarget {
+                    event_id_hex: hex::encode(event_id.as_slice()),
+                    source_relays: canonical_endpoints,
+                }],
+                self.session_admission.clone(),
+            )
+            .await
+            .map_err(|error| KeyPackagePublishError::exposed(error.to_string()))?;
+        let result = results
+            .pop()
+            .expect("single retired-revision deletion returns one outcome");
+        let expand_receipts = |canonical_receipts: &[TransportEndpoint]| {
+            let mut requested = endpoint_aliases
+                .iter()
+                .filter(|(_requested, canonical)| canonical_receipts.contains(canonical))
+                .map(|(requested, _canonical)| requested.clone())
+                .collect::<Vec<_>>();
+            requested.sort();
+            requested.dedup();
+            requested
+        };
+        let accepted = expand_receipts(&result.accepted_endpoints);
+        let confirmed_absent = expand_receipts(&result.confirmed_absent_endpoints);
+        for (requested, canonical) in endpoint_aliases {
+            if !result.accepted_endpoints.contains(&canonical)
+                && !result.confirmed_absent_endpoints.contains(&canonical)
+            {
+                // Includes explicit failure, a malformed/missing endpoint
+                // receipt, and an aggregate deletion error. None proves the
+                // exact durable alias absent.
+                failed.push(requested);
+            }
+        }
+        failed.sort();
+        failed.dedup();
+        failed.retain(|endpoint| {
+            !accepted.contains(endpoint) && !confirmed_absent.contains(endpoint)
+        });
+        Ok(DetailedKeyPackagePublishReceipt {
+            accepted,
+            rejected: Vec::new(),
+            confirmed_absent,
+            failed,
+        })
     }
 }
 
@@ -6164,13 +12150,21 @@ pub(crate) struct DirectoryFreshness {
 
 impl DirectoryFreshness {
     fn from_now(max_future_skew: Duration) -> Self {
+        Self::from_unix_time(unix_now_seconds(), max_future_skew)
+    }
+
+    fn from_unix_time(now: u64, max_future_skew: Duration) -> Self {
         Self {
-            max_created_at: unix_now_seconds().saturating_add(max_future_skew.as_secs()),
+            max_created_at: now.saturating_add(max_future_skew.as_secs()),
         }
     }
 
+    fn accepts_created_at(self, created_at: u64) -> bool {
+        created_at <= self.max_created_at
+    }
+
     pub(crate) fn accepts(self, record: &RelayEventRecord) -> bool {
-        record.event.created_at <= self.max_created_at
+        self.accepts_created_at(record.event.created_at)
     }
 }
 
@@ -6185,8 +12179,23 @@ fn sort_directory_records(records: &mut [RelayEventRecord]) {
         a.event
             .created_at
             .cmp(&b.event.created_at)
-            .then_with(|| a.event.id.cmp(&b.event.id))
+            // Callers fold in order and retain the last replaceable event.
+            // NIP-01 selects the lowest id when timestamps tie, so sort equal
+            // timestamps in descending id order.
+            .then_with(|| b.event.id.cmp(&a.event.id))
     });
+}
+
+/// NIP-01 replaceable-event ordering: greater `created_at` wins; at equal
+/// timestamps the lexicographically lowest event id wins.
+fn nostr_replaceable_coordinate_is_newer(
+    candidate_created_at: u64,
+    candidate_event_id: &str,
+    current_created_at: u64,
+    current_event_id: &str,
+) -> bool {
+    candidate_created_at > current_created_at
+        || (candidate_created_at == current_created_at && candidate_event_id < current_event_id)
 }
 
 fn sqlite_file_requires_key(path: &Path) -> bool {
@@ -6326,6 +12335,32 @@ fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<I
 fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, AppError> {
     let bytes = fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn remove_file_if_present(path: impl AsRef<Path>) -> Result<(), AppError> {
+    let path = path.as_ref();
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    };
+    // Persist both a new unlink and a previously unsynced absence before a
+    // caller reports the transition complete. This is load-bearing when an
+    // atomically written successor record must survive without its
+    // predecessor.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        // A missing parent already proves the child absent. This keeps
+        // idempotent rollback valid when no compatibility namespace was ever
+        // created, while still persisting an unlink (or an earlier unsynced
+        // absence) whenever the parent directory exists.
+        match std::fs::File::open(parent) {
+            Ok(directory) => directory.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

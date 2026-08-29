@@ -42,15 +42,110 @@ pub struct ReservedPublisherRecords {
     pub transcript_hash: [u8; 32],
     pub chunk_count: u64,
     context_id: [u8; 32],
-    token: [u8; 16],
+    initial_transcript_hash: [u8; 32],
+    reservation: PublisherSequenceReservation,
     store: Arc<dyn PublisherSequenceStore>,
 }
 
 impl ReservedPublisherRecords {
     pub fn confirm(self) -> Result<(), QuicTextStreamError> {
         self.store
-            .confirm(&self.context_id, &self.token)
+            .confirm(&self.context_id, &self.reservation.token)
             .map_err(QuicTextStreamError::PublisherSequence)
+    }
+
+    pub(crate) fn confirm_and_detach_store(
+        self,
+    ) -> Result<Arc<dyn PublisherSequenceStore>, QuicTextStreamError> {
+        self.store
+            .confirm(&self.context_id, &self.reservation.token)
+            .map_err(QuicTextStreamError::PublisherSequence)?;
+        Ok(Arc::new(DetachedPublisherSequenceStore {
+            context_id: self.context_id,
+            initial_transcript_hash: self.initial_transcript_hash,
+            expected: self.reservation.expected,
+            resulting: self.reservation.resulting,
+            state: Mutex::new(DetachedPublisherSequenceState::Ready),
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetachedPublisherSequenceState {
+    Ready,
+    Reserved([u8; 16]),
+    Exhausted,
+}
+
+/// One-shot capability for replaying one already-durable reservation after
+/// its SQLCipher store has been closed for a root-ownership handoff.
+struct DetachedPublisherSequenceStore {
+    context_id: [u8; 32],
+    initial_transcript_hash: [u8; 32],
+    expected: PublisherSequenceSnapshot,
+    resulting: PublisherSequenceSnapshot,
+    state: Mutex<DetachedPublisherSequenceState>,
+}
+
+impl PublisherSequenceStore for DetachedPublisherSequenceStore {
+    fn load(&self, context_id: &[u8; 32]) -> Result<Option<PublisherSequenceSnapshot>, String> {
+        if context_id != &self.context_id {
+            return Err("detached publisher context does not match".to_owned());
+        }
+        match *self
+            .state
+            .lock()
+            .map_err(|_| "detached publisher state lock poisoned")?
+        {
+            DetachedPublisherSequenceState::Ready => Ok(Some(self.expected)),
+            DetachedPublisherSequenceState::Reserved(_) => {
+                Err("publisher continuity is ambiguous".to_owned())
+            }
+            DetachedPublisherSequenceState::Exhausted => {
+                Err("detached publisher sequence capability is exhausted".to_owned())
+            }
+        }
+    }
+
+    fn reserve(
+        &self,
+        context_id: &[u8; 32],
+        initial_transcript_hash: &[u8; 32],
+        reservation: &PublisherSequenceReservation,
+    ) -> Result<(), String> {
+        if context_id != &self.context_id
+            || initial_transcript_hash != &self.initial_transcript_hash
+            || reservation.expected != self.expected
+            || reservation.resulting != self.resulting
+        {
+            return Err("detached publisher reservation does not match".to_owned());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "detached publisher state lock poisoned")?;
+        if *state != DetachedPublisherSequenceState::Ready {
+            return Err("detached publisher sequence capability is not available".to_owned());
+        }
+        *state = DetachedPublisherSequenceState::Reserved(reservation.token);
+        Ok(())
+    }
+
+    fn confirm(&self, context_id: &[u8; 32], token: &[u8; 16]) -> Result<(), String> {
+        if context_id != &self.context_id {
+            return Err("detached publisher context does not match".to_owned());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "detached publisher state lock poisoned")?;
+        match *state {
+            DetachedPublisherSequenceState::Reserved(current) if &current == token => {
+                *state = DetachedPublisherSequenceState::Exhausted;
+                Ok(())
+            }
+            _ => Err("detached publisher reservation is not current".to_owned()),
+        }
     }
 }
 
@@ -110,23 +205,21 @@ pub fn reserve_publisher_records(
         transcript_hash: transcript.hash(),
         chunk_count: transcript.chunk_count(),
     };
+    let reservation = PublisherSequenceReservation {
+        expected,
+        resulting,
+        token,
+    };
     store
-        .reserve(
-            &context_id,
-            &initial,
-            &PublisherSequenceReservation {
-                expected,
-                resulting,
-                token,
-            },
-        )
+        .reserve(&context_id, &initial, &reservation)
         .map_err(QuicTextStreamError::PublisherSequence)?;
     Ok(ReservedPublisherRecords {
         records,
         transcript_hash: resulting.transcript_hash,
         chunk_count: resulting.chunk_count,
         context_id,
-        token,
+        initial_transcript_hash: initial,
+        reservation,
         store,
     })
 }
@@ -260,6 +353,69 @@ mod tests {
                 &stream_id,
                 &start,
                 &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"retry".to_vec())],
+            ),
+            Err(QuicTextStreamError::PublisherSequence(_))
+        ));
+    }
+
+    #[test]
+    fn confirmed_detached_capability_replays_exact_durable_range_once() {
+        let store = Arc::new(EphemeralPublisherSequenceStore::default());
+        let durable_crypto = crypto(store);
+        let stream_id = durable_crypto.context.stream_id.clone();
+        let start = durable_crypto.context.start_event_id.clone();
+        let detached_crypto = crate::prepare_text_stream_crypto_for_network_handoff(
+            durable_crypto.clone(),
+            &stream_id,
+            &start,
+            "detached",
+            1024,
+            None,
+        )
+        .unwrap();
+
+        let frames = vec![(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"detached".to_vec())];
+        let detached = reserve_publisher_records(&detached_crypto, &stream_id, &start, &frames)
+            .expect("the exact preconfirmed range remains usable after storage closes");
+        assert_eq!(detached.records[0].seq, 1);
+        detached.confirm().unwrap();
+        assert!(matches!(
+            reserve_publisher_records(&detached_crypto, &stream_id, &start, &frames),
+            Err(QuicTextStreamError::PublisherSequence(_))
+        ));
+
+        let next = reserve_publisher_records(
+            &durable_crypto,
+            &stream_id,
+            &start,
+            &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"next".to_vec())],
+        )
+        .expect("durable state advanced before the detached send");
+        assert_eq!(next.records[0].seq, 2);
+        next.confirm().unwrap();
+    }
+
+    #[test]
+    fn detached_capability_rejects_a_different_frame_set() {
+        let durable_crypto = crypto(Arc::new(EphemeralPublisherSequenceStore::default()));
+        let stream_id = durable_crypto.context.stream_id.clone();
+        let start = durable_crypto.context.start_event_id.clone();
+        let detached_crypto = crate::prepare_text_stream_crypto_for_network_handoff(
+            durable_crypto,
+            &stream_id,
+            &start,
+            "authorized",
+            1024,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reserve_publisher_records(
+                &detached_crypto,
+                &stream_id,
+                &start,
+                &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"different".to_vec())],
             ),
             Err(QuicTextStreamError::PublisherSequence(_))
         ));

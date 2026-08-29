@@ -540,7 +540,7 @@ async fn stream_compose_final_report_contains_full_transcript_text() {
 }
 
 #[test]
-fn destructive_execute_commands_are_refused_over_daemon() {
+fn reset_is_refused_but_logout_is_owned_by_the_daemon_runtime() {
     let reset =
         blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Reset { confirm: true }))
             .expect("reset should be blocked");
@@ -550,15 +550,162 @@ fn destructive_execute_commands_are_refused_over_daemon() {
     assert_eq!(reset_json["error"]["code"], "daemon_forbidden");
     assert_eq!(reset_json["error"]["command"], "reset");
 
-    let logout = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Logout {
+    let logout = daemon_test_cli(crate::Command::Logout {
         pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-    }))
-    .expect("logout should be blocked");
-    let logout_json: serde_json::Value =
-        serde_json::from_str(logout.stdout.trim()).expect("logout error JSON");
-    assert_eq!(logout.code, 1);
-    assert_eq!(logout_json["error"]["code"], "daemon_forbidden");
-    assert_eq!(logout_json["error"]["command"], "logout");
+    });
+    assert!(
+        blocked_daemon_execute_output(&logout).is_none(),
+        "logout must reach the already-owned daemon runtime"
+    );
+    assert!(is_hosted_runtime_command(&logout));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hosted_logout_uses_daemon_runtime_and_retains_incomplete_local_cleanup() {
+    let home = tempfile::tempdir().expect("temp home");
+    let account_home = marmot_account::AccountHome::open(home.path());
+    let account = account_home
+        .create_nostr_account()
+        .expect("create local account");
+    let public_account = account_home
+        .add_public_account(&nostr::Keys::generate().public_key().to_hex())
+        .expect("create tracked-only account");
+    let app = marmot_app::MarmotApp::try_with_relays_and_account_home_and_config(
+        home.path(),
+        Vec::new(),
+        marmot_account::AccountHome::open(home.path()),
+        marmot_app::MarmotAppConfig::default(),
+    )
+    .expect("daemon runtime owns root");
+    let runtime = app.runtime();
+    let defaults = DaemonDefaults {
+        home: home.path().to_path_buf(),
+        socket: home.path().join("dev/wnd.sock"),
+        pid_path: home.path().join("dev/wnd.pid"),
+        log_path: home.path().join("dev/wnd.log"),
+        relay: Some("wss://relay.example".to_owned()),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("daemon-test-keychain".to_owned()),
+    };
+    let mut cli = daemon_test_cli(crate::Command::Logout {
+        pubkey: account.account_id_hex.clone(),
+    });
+    apply_defaults(&mut cli, &defaults);
+
+    let output = dispatch_hosted_runtime_command(&cli, &defaults, &app, &runtime)
+        .await
+        .expect("logout is hosted");
+    assert_eq!(
+        output.code, 1,
+        "a fixture without durable relay-history proof must fail closed: {output:?}"
+    );
+    let output_json: serde_json::Value =
+        serde_json::from_str(output.stdout.trim()).expect("hosted logout JSON");
+    assert_eq!(output_json["error"]["code"], "logout_incomplete");
+    assert_eq!(
+        output_json["error"]["cleanup"]["local_cleanup"]["completed"],
+        false
+    );
+    assert_eq!(output_json["error"]["safe_to_retry"], true);
+    assert!(
+        account_home.account(&account.account_id_hex).is_ok(),
+        "failed relay-history proof must retain local recovery state"
+    );
+
+    let mut public_cli = daemon_test_cli(crate::Command::Logout {
+        pubkey: public_account.account_id_hex.clone(),
+    });
+    apply_defaults(&mut public_cli, &defaults);
+    let public_output = dispatch_hosted_runtime_command(&public_cli, &defaults, &app, &runtime)
+        .await
+        .expect("tracked-only logout is hosted");
+    assert_eq!(
+        public_output.code, 0,
+        "tracked-only hosted logout failed: {public_output:?}"
+    );
+    let public_json: serde_json::Value =
+        serde_json::from_str(public_output.stdout.trim()).expect("tracked-only logout JSON");
+    assert_eq!(public_json["result"]["logged_out"], true);
+    assert_eq!(public_json["result"]["cleanup"]["key_packages_deleted"], 0);
+    assert!(
+        account_home
+            .account(&public_account.account_id_hex)
+            .is_err(),
+        "tracked-only account must remain locally removable through the owner"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hosted_sync_runs_through_the_daemons_owning_account_worker() {
+    let home = tempfile::tempdir().expect("temp home");
+    let account_home = marmot_account::AccountHome::open(home.path());
+    let account = account_home
+        .create_nostr_account()
+        .expect("create local account");
+    let app = marmot_app::MarmotApp::try_with_relays_and_account_home_and_config(
+        home.path(),
+        Vec::new(),
+        marmot_account::AccountHome::open(home.path()),
+        marmot_app::MarmotAppConfig::default(),
+    )
+    .expect("daemon runtime owns root");
+    let runtime = app.runtime();
+    runtime.start().await.expect("daemon runtime starts");
+
+    assert!(
+        app.client(&account.label).await.is_err(),
+        "the managed account worker must exclusively own the live session"
+    );
+
+    let defaults = DaemonDefaults {
+        home: home.path().to_path_buf(),
+        socket: home.path().join("dev/wnd.sock"),
+        pid_path: home.path().join("dev/wnd.pid"),
+        log_path: home.path().join("dev/wnd.log"),
+        relay: Some("wss://relay.example".to_owned()),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("daemon-test-keychain".to_owned()),
+    };
+    let mut cli = daemon_test_cli(crate::Command::Sync);
+    cli.account = Some(account.account_id_hex.clone());
+    apply_defaults(&mut cli, &defaults);
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatch_hosted_runtime_command(&cli, &defaults, &app, &runtime),
+    )
+    .await
+    .expect("hosted sync must not wait on an independently opened session")
+    .expect("sync is hosted");
+    assert_eq!(
+        output.code, 1,
+        "the relay-less fixture should surface its worker sync failure: {output:?}"
+    );
+    let output_json: serde_json::Value =
+        serde_json::from_str(output.stdout.trim()).expect("hosted sync JSON");
+    assert_eq!(output_json["error"]["code"], "command_failed");
+    assert_eq!(
+        output_json["error"]["partial"]["account_id"],
+        account.account_id_hex
+    );
+    assert_eq!(
+        output_json["error"]["partial"]["joined_groups"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        output_json["error"]["partial"]["messages"],
+        serde_json::json!([])
+    );
+
+    runtime.shutdown().await;
 }
 
 #[test]

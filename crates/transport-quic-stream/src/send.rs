@@ -47,20 +47,11 @@ pub struct SentTextStream {
 pub async fn send_text_stream(
     config: SendTextStream,
 ) -> Result<SentTextStream, QuicTextStreamError> {
-    if config.max_chunk_bytes == 0 {
-        return Err(QuicTextStreamError::EmptyChunkSize);
-    }
-    if config.max_chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
-        return Err(QuicTextStreamError::ChunkSizeTooLarge(
-            config.max_chunk_bytes,
-        ));
-    }
-    // Clamp the chunk size to the group policy cap when the caller supplied
-    // one. A plaintext within the cap always encrypts to a ciphertext within
-    // the record's `ciphertext<0..2^16-1>` field bound (cap + 16 <= 65535).
-    let max_chunk_bytes = config
-        .max_chunk_bytes
-        .min(effective_plaintext_cap(config.max_plaintext_frame_len));
+    let frames = text_delta_frames(
+        &config.text,
+        config.max_chunk_bytes,
+        config.max_plaintext_frame_len,
+    )?;
 
     let endpoint = client_endpoint(config.trust, config.server_addr)?;
     let connection = connect_with_timeout(
@@ -71,15 +62,6 @@ pub async fn send_text_stream(
     )
     .await?;
     let mut send = connection.open_uni().await?;
-    let frames = split_text_deltas(&config.text, max_chunk_bytes)
-        .into_iter()
-        .map(|chunk| {
-            (
-                cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-                chunk,
-            )
-        })
-        .collect::<Vec<_>>();
     let mut transcript =
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id.clone());
     let reservation = config
@@ -138,6 +120,57 @@ pub async fn send_text_stream(
         transcript_hash,
         chunk_count,
     })
+}
+
+/// Persist and confirm exactly one bounded text-record range, then replace the
+/// crypto's SQL-backed sequence store with a one-shot in-memory capability for
+/// that same range. This is for hosts that must terminally close storage before
+/// network I/O to transfer exclusive root ownership.
+///
+/// A later network failure burns the confirmed range rather than risking nonce
+/// reuse. The returned capability rejects any different frame set and cannot be
+/// reused for another send.
+pub fn prepare_text_stream_crypto_for_network_handoff(
+    crypto: AgentTextStreamCrypto,
+    stream_id: &[u8],
+    start_event_id: &MessageId,
+    text: &str,
+    max_chunk_bytes: usize,
+    max_plaintext_frame_len: Option<u32>,
+) -> Result<AgentTextStreamCrypto, QuicTextStreamError> {
+    let frames = text_delta_frames(text, max_chunk_bytes, max_plaintext_frame_len)?;
+    if frames.is_empty() {
+        return Ok(crypto);
+    }
+    let detached_store = reserve_publisher_records(&crypto, stream_id, start_event_id, &frames)?
+        .confirm_and_detach_store()?;
+    Ok(crypto.with_publisher_sequence_store(detached_store))
+}
+
+fn text_delta_frames(
+    text: &str,
+    max_chunk_bytes: usize,
+    max_plaintext_frame_len: Option<u32>,
+) -> Result<Vec<(u8, Vec<u8>)>, QuicTextStreamError> {
+    if max_chunk_bytes == 0 {
+        return Err(QuicTextStreamError::EmptyChunkSize);
+    }
+    if max_chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize {
+        return Err(QuicTextStreamError::ChunkSizeTooLarge(max_chunk_bytes));
+    }
+    // Clamp the chunk size to the group policy cap when the caller supplied
+    // one. A plaintext within the cap always encrypts to a ciphertext within
+    // the record's `ciphertext<0..2^16-1>` field bound (cap + 16 <= 65535).
+    let max_chunk_bytes = max_chunk_bytes.min(effective_plaintext_cap(max_plaintext_frame_len));
+    Ok(split_text_deltas(text, max_chunk_bytes)
+        .into_iter()
+        .map(|chunk| {
+            (
+                cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
+                chunk,
+            )
+        })
+        .collect())
 }
 
 pub fn random_stream_id() -> Vec<u8> {

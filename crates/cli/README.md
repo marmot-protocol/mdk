@@ -134,6 +134,17 @@ wn account relay-lists [npub-or-hex] --bootstrap-relays <relay-url>
 The older `wn account create` spelling is kept as a compatibility/repair surface, but new setup flows should use
 `wn create-identity` or `wn login`.
 
+`wn logout` is a destructive runtime wipe. When `wnd` is running, the command
+is executed by that daemon's already-owned runtime; otherwise the foreground
+CLI must acquire exclusive ownership of the data root. The runtime quiesces the
+account, attempts group leave and per-relay KeyPackage deletion, and then
+removes the local account. Relay operations are best-effort, so JSON callers
+must inspect `cleanup.group_leave_failures` and
+`cleanup.key_package_failures`; `logged_out: true` means the local wipe
+completed, not that every relay acknowledged cleanup. A tracked-only npub has
+no signer and therefore no device-authored group or KeyPackage obligations; it
+uses the same owner-serialized local teardown without relay stages.
+
 When a daemon is running, `create-identity` and `wn login --nsec-stdin` use the daemon's account-relay defaults to
 publish the required relay lists and an initial KeyPackage. `printf '%s\n' "$NSEC" | wn login --nsec-stdin --relay
 <url>` is the command-local fallback for a custom relay-list publish during import. Public `npub` logins only check
@@ -154,16 +165,22 @@ wn --account <npub-or-hex> keys delete <event-id>
 wn --account <npub-or-hex> keys delete-all --confirm
 ```
 
-`keys publish` initializes or retries the durable KeyPackage lifecycle and publishes a fresh replacement under the
-account-device's stable kind-30443 `d` slot. Once an exact event has been signed, every retry reuses it.
+`keys publish` initializes or resumes the durable KeyPackage lifecycle under the account-device's stable kind-30443
+`d` slot. Retries reuse the current signed revision while it is within transport freshness policy; a stale revision
+may be durably reauthored at the same coordinate before the next attempt. The MLS KeyPackage and private material stay
+unchanged, while `created_at`, event id, and signature change.
 `keys rotate` (alias `force-publish`) explicitly starts the same replacement operation when no replacement is
-already pending. Routine replacement does not publish a kind-5 deletion; `keys delete` and `keys delete-all` remain
-explicit teardown/legacy-cleanup tools. `keys maintenance-status` shows the persisted slot, lifetime, refresh,
-replacement, retry, and retained-private-material state.
+already pending. Routine replacement journals superseded exact event ids and maintenance publishes per-relay kind-5
+deletions after a newer revision is acknowledged there (or the old package expires/is consumed); partial cleanup
+survives restart. `keys delete` and `keys delete-all` remain explicit teardown/legacy-cleanup tools.
+`keys maintenance-status` shows the persisted slot, lifetime, refresh, replacement, retry, and
+retained-private-material state.
 
 KeyPackage publish/fetch/check/list use the current relay-directory path. `keys list` returns the relay event id for
-each known KeyPackage record. `keys delete` publishes a Nostr deletion for one event id, and `keys delete-all
---confirm` publishes deletions for every relay-published KeyPackage record found for the selected account.
+each known KeyPackage record. Its `relay` flag means the exact event was re-fetched during that inventory call; a
+durably authored or acknowledged local revision can correctly report `relay: false`. `keys delete` publishes a Nostr
+deletion for one event id, and `keys delete-all --confirm` publishes deletions for every locally or remotely known
+event id found for the selected account.
 
 Chat projection commands:
 
@@ -803,7 +820,8 @@ and always shows the account npub so it is unambiguous which account is destroye
 irreversible, so its confirmation requires typing the literal word `logout` and pressing `Enter`; an empty or
 mismatched entry keeps the popup open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A
 public-only account is re-addable, so it keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). On confirmation
-the account list reloads; if the removed account was the last one, the TUI returns to the login menu rather than
+the daemon-owned runtime first attempts group leave and relay KeyPackage deletion, then the account list reloads; if
+the removed account was the last one, the TUI returns to the login menu rather than
 pointing at a removed account.
 
 `/login <nsec>` redacts the secret in the composer and pipes it to the child `wn` process over stdin instead of argv.

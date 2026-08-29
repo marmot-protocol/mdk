@@ -1644,10 +1644,10 @@ impl TuiApp {
     }
 
     /// Arm the logout popup for the currently selected account, scaling the guard
-    /// to the consequence. `wn logout` is a destructive wipe
-    /// (`AccountHome::remove_account`): it erases the account's local data from
-    /// this device, and for a local-signing account it also deletes the signing
-    /// key. That irreversible case is gated behind a typed-token confirmation —
+    /// to the consequence. `wn logout` is a runtime-owned destructive wipe: it
+    /// quiesces account work, attempts relay cleanup, erases the account's local
+    /// data from this device, and for a local-signing account also deletes the
+    /// signing key. That irreversible case is gated behind a typed-token confirmation —
     /// the user must type `logout` — so the TUI's only identity-destroying action
     /// is never reachable by a stray Enter-then-Enter. A public-only account is
     /// re-addable, so it keeps the lighter `y`/`Enter` confirm. Both bodies state

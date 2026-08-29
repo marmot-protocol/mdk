@@ -342,6 +342,9 @@ struct FlakyUnsubscribeRelayClient {
     unsubscribed: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
     unsubscribed_accounts: Mutex<Vec<MemberId>>,
     fail_next_unsubscribes: AtomicUsize,
+    fail_next_account_unsubscribes: AtomicUsize,
+    block_account_unsubscribes: AtomicBool,
+    account_unsubscribe_entered: AtomicUsize,
 }
 
 #[async_trait]
@@ -377,6 +380,22 @@ impl NostrRelayClient for FlakyUnsubscribeRelayClient {
         &self,
         account_id: &MemberId,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.block_account_unsubscribes.load(Ordering::SeqCst) {
+            self.account_unsubscribe_entered
+                .fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        if self
+            .fail_next_account_unsubscribes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+                armed.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected account unsubscribe failure".into(),
+            ));
+        }
         self.unsubscribed_accounts
             .lock()
             .unwrap()
@@ -2381,6 +2400,111 @@ async fn deactivate_account_clears_pending_unsubscribes() {
         std::slice::from_ref(&account_id)
     );
     assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 0);
+}
+
+#[tokio::test]
+async fn failed_account_unsubscribe_still_clears_local_account_routes() {
+    let relay = Arc::new(FlakyUnsubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    assert_eq!(adapter.metrics().await.active_accounts, 1);
+
+    relay
+        .fail_next_account_unsubscribes
+        .store(1, Ordering::SeqCst);
+    adapter
+        .deactivate_account(&account_id)
+        .await
+        .expect_err("relay-side account unsubscribe is injected to fail");
+
+    assert_eq!(
+        adapter.metrics().await.active_accounts,
+        0,
+        "local routing must be inactive even when relay unsubscribe fails"
+    );
+    assert!(
+        relay.unsubscribed_accounts.lock().unwrap().is_empty(),
+        "the injected failure must not be recorded as a relay acknowledgement"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_pending_account_unsubscribe_keeps_local_account_deactivated() {
+    let relay = Arc::new(FlakyUnsubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xB2; 32]),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![group],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    relay.fail_next_unsubscribes.store(1, Ordering::SeqCst);
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .expect("group removal commits despite failed relay cleanup");
+    assert_eq!(adapter.metrics().await.unsubscribe_retries_pending, 1);
+
+    relay
+        .block_account_unsubscribes
+        .store(true, Ordering::SeqCst);
+    let adapter_for_deactivation = adapter.clone();
+    let account_for_deactivation = account_id.clone();
+    let deactivation = tokio::spawn(async move {
+        adapter_for_deactivation
+            .deactivate_account(&account_for_deactivation)
+            .await
+    });
+    tokio::time::timeout(concurrent_subscribe_timeout(), async {
+        while relay.account_unsubscribe_entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deactivation must reach the pending relay unsubscribe");
+
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_accounts, 0);
+    assert_eq!(metrics.active_group_subscriptions, 0);
+    assert_eq!(
+        metrics.unsubscribe_retries_pending, 0,
+        "blanket account teardown must clear queued relay cleanup before awaiting"
+    );
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 0);
+
+    deactivation.abort();
+    let join_error = deactivation
+        .await
+        .expect_err("pending deactivation must be cancellable");
+    assert!(join_error.is_cancelled());
+
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_accounts, 0);
+    assert_eq!(metrics.unsubscribe_retries_pending, 0);
 }
 
 #[tokio::test]

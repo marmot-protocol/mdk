@@ -368,7 +368,11 @@ async fn handle_daemon_connection(
                     &mut workers_guard.runtime,
                 )
                 .await;
-                workers_guard.runtime.runtime.clone()
+                workers_guard
+                    .runtime
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.runtime.clone())
             };
             let _ =
                 handle_messages_subscription(&mut stream, &defaults, state, events, runtime, *cli)
@@ -385,7 +389,11 @@ async fn handle_daemon_connection(
                     &mut workers_guard.runtime,
                 )
                 .await;
-                workers_guard.runtime.runtime.clone()
+                workers_guard
+                    .runtime
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.runtime.clone())
             };
             let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
         }
@@ -400,7 +408,11 @@ async fn handle_daemon_connection(
                     &mut workers_guard.runtime,
                 )
                 .await;
-                workers_guard.runtime.runtime.clone()
+                workers_guard
+                    .runtime
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.runtime.clone())
             };
             let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
         }
@@ -415,7 +427,11 @@ async fn handle_daemon_connection(
                     &mut workers_guard.runtime,
                 )
                 .await;
-                workers_guard.runtime.runtime.clone()
+                workers_guard
+                    .runtime
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.runtime.clone())
             };
             let _ = handle_notifications_subscription(&mut stream, runtime, *cli).await;
         }
@@ -497,7 +513,11 @@ async fn daemon_status_output(
 ) -> CliOutput {
     let (runtime, stream_watch) = match workers.try_lock() {
         Ok(workers_guard) => (
-            workers_guard.runtime.runtime.clone(),
+            workers_guard
+                .runtime
+                .owner
+                .as_ref()
+                .map(|owner| owner.runtime.clone()),
             workers_guard.runtime.stream_watch.clone(),
         ),
         Err(_) => (None, StreamWatchWorkers::default()),
@@ -522,15 +542,15 @@ async fn handle_stream_watch_connection(
     // Hold the lock only for the host-mutating reconcile; clone the runtime handle and the
     // (interior-mutable) stream-watch registry, then spawn the watch + open the broker
     // connection off the lock (#633).
-    let (runtime, stream_watch) = {
+    let (owner, stream_watch) = {
         let mut guard = workers.lock().await;
         reconcile_app_runtime(defaults, state.clone(), events.clone(), &mut guard.runtime).await;
         (
-            guard.runtime.runtime.clone(),
+            guard.runtime.owner.clone(),
             guard.runtime.stream_watch.clone(),
         )
     };
-    let output = start_stream_watch(*cli, defaults, runtime.as_ref(), &stream_watch).await;
+    let output = start_stream_watch(*cli, defaults, owner.as_ref(), &stream_watch).await;
 
     write_daemon_output(stream, &output).await;
     Ok(())
@@ -603,9 +623,21 @@ async fn handle_execute_connection(
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
-    // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
-    // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli, import_nsec).await;
+    // Keep local-only command execution off the workers lock (#633). When the
+    // daemon runtime is available, execute against a clone of its owning app
+    // graph. If
+    // the lock is contended, use the foreground/exclusive path: it fails fast
+    // with `runtime_busy` when a daemon runtime owns the root instead of either
+    // waiting behind unrelated relay I/O or opening an unleased writer.
+    let owning_app = workers
+        .try_lock()
+        .ok()
+        .and_then(|guard| guard.runtime.owner.as_ref().map(|owner| owner.app.clone()));
+    let output = if let Some(owning_app) = owning_app {
+        crate::run_cli_root_coordinated(*cli, import_nsec, owning_app).await
+    } else {
+        crate::run_cli_local(*cli, import_nsec).await
+    };
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }

@@ -12,21 +12,30 @@ pub(crate) struct DaemonState {
 
 #[derive(Default)]
 pub(crate) struct AppRuntimeHost {
-    pub(crate) runtime: Option<marmot_app::MarmotAppRuntime>,
+    pub(crate) owner: Option<OwnedAppRuntime>,
     pub(crate) bridge: Option<JoinHandle<()>>,
     pub(crate) stream_watch: StreamWatchWorkers,
 }
 
+/// The daemon's single owning application graph and the runtime derived from
+/// it. Retaining both handles prevents hosted commands from constructing an
+/// independently hydrated `MarmotApp` against the daemon-owned root.
+#[derive(Clone)]
+pub(crate) struct OwnedAppRuntime {
+    pub(crate) app: marmot_app::MarmotApp,
+    pub(crate) runtime: marmot_app::MarmotAppRuntime,
+}
+
 impl AppRuntimeHost {
     pub(crate) async fn abort_all(&mut self) {
-        if let Some(runtime) = &self.runtime {
-            runtime.shutdown().await;
+        if let Some(owner) = &self.owner {
+            owner.runtime.shutdown().await;
         }
         if let Some(handle) = self.bridge.take() {
             handle.abort();
         }
         self.stream_watch.abort_all();
-        self.runtime = None;
+        self.owner = None;
     }
 }
 
@@ -55,20 +64,21 @@ pub(crate) fn app_runtime_enabled(defaults: &DaemonDefaults) -> bool {
     defaults.relay.is_some()
 }
 
-/// Reconcile the app runtime under the workers lock and return a cloned runtime handle so the
-/// caller can perform relay I/O WITHOUT holding the lock. The lock is held only for the
-/// host-mutating reconcile (runtime create / bridge spawn / account reconcile), matching the
-/// subscription handlers and fixing the head-of-line blocking in #633. Returns `None` when no
-/// runtime could be brought up (missing relay / open error).
+/// Reconcile the app runtime under the workers lock and return the cloned
+/// owning app/runtime graph so the caller can perform relay I/O WITHOUT holding
+/// the lock. The lock is held only for the host-mutating reconcile (runtime
+/// create / bridge spawn / account reconcile), matching the subscription
+/// handlers and fixing the head-of-line blocking in #633. Returns `None` when
+/// no runtime could be brought up (missing relay / open error).
 pub(crate) async fn reconcile_and_clone_runtime(
     defaults: &DaemonDefaults,
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     workers: &SharedDaemonWorkers,
-) -> Option<marmot_app::MarmotAppRuntime> {
+) -> Option<OwnedAppRuntime> {
     let mut guard = workers.lock().await;
     reconcile_app_runtime(defaults, state, events, &mut guard.runtime).await;
-    guard.runtime.runtime.clone()
+    guard.runtime.owner.clone()
 }
 
 pub(crate) async fn handle_app_runtime_account_setup_request(
@@ -87,7 +97,7 @@ pub(crate) async fn handle_app_runtime_account_setup_request(
         Ok(None) => return None,
         Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
     };
-    let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
+    let Some(owner) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::WnError::MissingRelay),
@@ -96,7 +106,8 @@ pub(crate) async fn handle_app_runtime_account_setup_request(
     request.import_nsec = import_nsec.take().map(ImportNsec::into_inner);
     // create_or_import_account drives relay I/O through the cloned runtime handle (internally
     // synchronized), so it runs off the workers lock.
-    let output = runtime
+    let output = owner
+        .runtime
         .create_or_import_account(request)
         .await
         .map_err(crate::commands::account::map_account_setup_error)
@@ -116,13 +127,13 @@ pub(crate) async fn handle_app_runtime_command_request(
     if !app_runtime_enabled(defaults) || !is_hosted_runtime_command(cli) {
         return None;
     }
-    let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
+    let Some(owner) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::WnError::MissingRelay),
         ));
     };
-    dispatch_hosted_runtime_command(cli, defaults, &runtime).await
+    dispatch_hosted_runtime_command(cli, defaults, &owner.app, &owner.runtime).await
 }
 
 /// Host-based entry used by the stream-compose path (`run_hosted_stream_marker_cli_json`), which
@@ -139,21 +150,22 @@ pub(crate) async fn handle_hosted_runtime_command_with_host(
         return None;
     }
     reconcile_app_runtime(defaults, state, events, host).await;
-    let Some(runtime) = &host.runtime else {
+    let Some(owner) = &host.owner else {
         return Some(crate::command_output_result(
             cli.json,
             Err(crate::WnError::MissingRelay),
         ));
     };
-    dispatch_hosted_runtime_command(cli, defaults, runtime).await
+    dispatch_hosted_runtime_command(cli, defaults, &owner.app, &owner.runtime).await
 }
 
 /// Dispatch a hosted runtime command against an already-resolved runtime handle. Performs the
 /// relay-backed command work and touches no shared daemon state, so callers run it off the
 /// workers lock.
-async fn dispatch_hosted_runtime_command(
+pub(crate) async fn dispatch_hosted_runtime_command(
     cli: &Cli,
     defaults: &DaemonDefaults,
+    app: &marmot_app::MarmotApp,
     runtime: &marmot_app::MarmotAppRuntime,
 ) -> Option<CliOutput> {
     let secret_store = match crate::resolve_secret_store(defaults.secret_store) {
@@ -166,21 +178,11 @@ async fn dispatch_hosted_runtime_command(
             Ok(account_home) => account_home,
             Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
-    };
-
     let output = match cli.command.clone() {
         crate::Command::Group { command } => {
             crate::commands::groups::group_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -190,7 +192,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Chats { command } => {
             crate::commands::chats::chats_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -200,7 +202,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Groups { command } => {
             crate::commands::groups::groups_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -210,7 +212,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Message { command } | crate::Command::Messages { command } => {
             crate::commands::messages::message_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -220,7 +222,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Stream { command } => {
             crate::commands::stream::stream_command_app_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -230,7 +232,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Keys { command } => {
             crate::commands::key_package::key_package_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -240,7 +242,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Follows { command } => {
             crate::commands::follows::follows_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -251,7 +253,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Profile { command } => {
             crate::commands::profile::profile_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -262,7 +264,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Relays { command } => {
             crate::commands::relays::relays_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -273,7 +275,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Users { command } => {
             crate::commands::users::users_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
@@ -283,12 +285,25 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Media { command } => {
             crate::commands::media::media_command_with_runtime(
                 &account_home,
-                &app,
+                app,
                 runtime,
                 command,
                 cli.account.clone(),
             )
             .await
+        }
+        crate::Command::Logout { pubkey } => {
+            crate::commands::account::logout_command_with_runtime(runtime, pubkey).await
+        }
+        crate::Command::Sync => {
+            let account = match crate::resolve_account(&account_home, cli.account.clone()) {
+                Ok(account) => account,
+                Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
+            };
+            if let Err(err) = crate::ensure_local_signing(&account) {
+                return Some(crate::command_output_result(cli.json, Err(err)));
+            }
+            crate::commands::sync::sync_command_with_runtime(app, runtime, account).await
         }
         crate::Command::RelayStats => {
             crate::commands::relay_stats::relay_stats_command_with_runtime(runtime).await
@@ -319,10 +334,12 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
                 }
         ),
         crate::Command::Keys { .. }
+        | crate::Command::Logout { .. }
         | crate::Command::Follows { .. }
         | crate::Command::Profile { .. }
         | crate::Command::Relays { .. }
         | crate::Command::RelayStats
+        | crate::Command::Sync
         | crate::Command::Users { .. }
         | crate::Command::Media { .. } => true,
         _ => false,
@@ -401,7 +418,7 @@ pub(crate) fn app_runtime_account_setup_request(
                 bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 discovery_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 publish_missing_relay_lists: *publish_missing_relay_lists,
-                publish_initial_key_package: false,
+                publish_initial_key_package: true,
             }))
         }
         _ => Ok(None),
@@ -448,7 +465,7 @@ pub(crate) async fn refresh_app_runtime(
             // restart off the lock.
             let runtime = {
                 let mut guard = workers.lock().await;
-                if guard.runtime.runtime.is_none() {
+                if guard.runtime.owner.is_none() {
                     reconcile_app_runtime(
                         defaults,
                         state.clone(),
@@ -458,7 +475,11 @@ pub(crate) async fn refresh_app_runtime(
                     .await;
                     None
                 } else {
-                    guard.runtime.runtime.clone()
+                    guard
+                        .runtime
+                        .owner
+                        .as_ref()
+                        .map(|owner| owner.runtime.clone())
                 }
             };
             let Some(runtime) = runtime else {
@@ -478,8 +499,8 @@ pub(crate) async fn refresh_app_runtime(
         AppRuntimeRefresh::CatchUpAll => {
             let runtime =
                 reconcile_and_clone_runtime(defaults, state.clone(), events, workers).await;
-            if let Some(runtime) = runtime
-                && let Err(err) = runtime.catch_up_accounts().await
+            if let Some(owner) = runtime
+                && let Err(err) = owner.runtime.catch_up_accounts().await
             {
                 record_runtime_activity_error(&state, err.to_string());
             }
@@ -510,16 +531,16 @@ pub(crate) async fn reconcile_app_runtime(
         return;
     }
 
-    if host.runtime.is_none() {
-        let runtime = match open_app_runtime(defaults) {
-            Ok(runtime) => runtime,
+    if host.owner.is_none() {
+        let owner = match open_app_runtime(defaults) {
+            Ok(owner) => owner,
             Err(err) => {
                 record_runtime_activity_error(&state, err.to_string());
                 return;
             }
         };
-        let receiver = runtime.subscribe();
-        if let Err(err) = runtime.start().await {
+        let receiver = owner.runtime.subscribe();
+        if let Err(err) = owner.runtime.start().await {
             record_runtime_activity_error(&state, err.to_string());
             return;
         }
@@ -528,16 +549,17 @@ pub(crate) async fn reconcile_app_runtime(
             state.clone(),
             events.clone(),
             host.stream_watch.clone(),
-            runtime.clone(),
-            runtime.shared_services().agent_streams(),
+            owner.app.clone(),
+            owner.runtime.clone(),
+            owner.runtime.shared_services().agent_streams(),
             receiver,
         ));
-        host.runtime = Some(runtime);
+        host.owner = Some(owner);
         return;
     }
 
-    if let Some(runtime) = &host.runtime {
-        if let Err(err) = runtime.reconcile_accounts().await {
+    if let Some(owner) = &host.owner {
+        if let Err(err) = owner.runtime.reconcile_accounts().await {
             record_runtime_activity_error(&state, err.to_string());
         }
         if host
@@ -550,9 +572,10 @@ pub(crate) async fn reconcile_app_runtime(
                 state,
                 events,
                 host.stream_watch.clone(),
-                runtime.clone(),
-                runtime.shared_services().agent_streams(),
-                runtime.subscribe(),
+                owner.app.clone(),
+                owner.runtime.clone(),
+                owner.runtime.shared_services().agent_streams(),
+                owner.runtime.subscribe(),
             ));
         }
     }
@@ -560,17 +583,18 @@ pub(crate) async fn reconcile_app_runtime(
 
 pub(crate) fn open_app_runtime(
     defaults: &DaemonDefaults,
-) -> Result<marmot_app::MarmotAppRuntime, crate::WnError> {
+) -> Result<OwnedAppRuntime, crate::WnError> {
     let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
     let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
     let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-    let app = crate::app_for(
+    let app = crate::exclusive_app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
         defaults.discovery_relays.clone(),
         account_home,
     )?;
-    Ok(app.runtime())
+    let runtime = app.runtime();
+    Ok(OwnedAppRuntime { app, runtime })
 }
 
 pub(crate) fn spawn_app_runtime_bridge(
@@ -578,6 +602,7 @@ pub(crate) fn spawn_app_runtime_bridge(
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     stream_workers: StreamWatchWorkers,
+    app: marmot_app::MarmotApp,
     runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
     mut receiver: broadcast::Receiver<marmot_app::MarmotAppEvent>,
@@ -591,6 +616,7 @@ pub(crate) fn spawn_app_runtime_bridge(
                         state.clone(),
                         events.clone(),
                         stream_workers.clone(),
+                        app.clone(),
                         runtime.clone(),
                         stream_manager.clone(),
                         event,
@@ -614,6 +640,7 @@ pub(crate) async fn handle_app_runtime_event(
     state: Arc<Mutex<DaemonState>>,
     events: DaemonEventHub,
     stream_workers: StreamWatchWorkers,
+    app: marmot_app::MarmotApp,
     runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
     event: marmot_app::MarmotAppEvent,
@@ -671,6 +698,7 @@ pub(crate) async fn handle_app_runtime_event(
                 &message.account_id_hex,
                 &summary,
                 stream_workers,
+                app,
                 runtime,
                 stream_manager,
             )
@@ -711,6 +739,7 @@ pub(crate) async fn auto_watch_agent_stream_starts(
     account_id: &str,
     summary: &marmot_app::SyncSummary,
     stream_workers: StreamWatchWorkers,
+    app: marmot_app::MarmotApp,
     runtime: marmot_app::MarmotAppRuntime,
     stream_manager: marmot_app::AgentStreamWatchManager,
 ) {
@@ -724,15 +753,6 @@ pub(crate) async fn auto_watch_agent_stream_starts(
             Ok(account_home) => account_home,
             Err(_) => return,
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(_) => return,
-    };
     for message in &summary.messages {
         let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {
@@ -925,6 +945,21 @@ mod tests {
             "wn", "settings", "show"
         ])));
         assert!(!is_hosted_runtime_command(&cli(&["wn", "whoami"])));
+    }
+
+    #[test]
+    fn sync_is_answered_by_the_daemons_account_worker() {
+        assert!(is_hosted_runtime_command(&cli(&["wn", "sync"])));
+    }
+
+    #[test]
+    fn account_create_requests_initial_key_package_publication() {
+        let cli = cli(&["wn", "account", "create"]);
+        let request = app_runtime_account_setup_request(&cli, None)
+            .expect("account create request is valid")
+            .expect("account create builds a setup request");
+
+        assert!(request.publish_initial_key_package);
     }
 
     /// Streaming subscriptions have their own socket entry points; routing them

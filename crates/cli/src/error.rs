@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use cgka_traits::error::EngineError;
 use marmot_account::{AccountError, AccountHomeError};
-use marmot_app::{AccountRelayListStatus, AppError, MissingRelayListKind};
+use marmot_app::{AccountRelayListStatus, AppError, MissingRelayListKind, WipeOutcome};
 use serde_json::{Value, json};
 
 use crate::relay_lists_json;
@@ -68,8 +68,17 @@ pub(crate) enum WnError {
     MissingAccount,
     #[error("multiple accounts exist; pass --account or set WN_ACCOUNT")]
     MultipleAccounts,
+    #[error(
+        "White Noise data is in use by another runtime; stop the daemon or other White Noise process and retry"
+    )]
+    RuntimeBusy,
     #[error("account not found: {0}")]
     UnknownLocalAccount(String),
+    #[error("logout did not remove the local account: {reason}")]
+    LogoutIncomplete {
+        reason: String,
+        outcome: Box<WipeOutcome>,
+    },
     #[error("invalid public key")]
     InvalidPublicKey,
     #[error("public Nostr accounts do not have local signing keys")]
@@ -484,10 +493,26 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
                 "env": "WN_ACCOUNT",
             },
         }),
+        WnError::RuntimeBusy => json!({
+            "code": "runtime_busy",
+            "message": err.to_string(),
+            "safe_to_retry": true,
+            "repair": {
+                "stop_daemon": "wn daemon stop",
+                "retry": "retry the original command after the owning process exits",
+            },
+        }),
         WnError::UnknownLocalAccount(account) => json!({
             "code": "unknown_account",
             "message": err.to_string(),
             "account_ref": account,
+        }),
+        WnError::LogoutIncomplete { reason, outcome } => json!({
+            "code": "logout_incomplete",
+            "message": err.to_string(),
+            "reason": reason,
+            "safe_to_retry": true,
+            "cleanup": outcome,
         }),
         WnError::InvalidPublicKey => json!({
             "code": "invalid_public_key",
@@ -802,5 +827,32 @@ mod tests {
         let timed_out = wn_error_json(&WnError::App(AppError::AccountWorkerResponseTimedOut));
         assert_eq!(timed_out["code"], "account_worker_response_timed_out");
         assert_eq!(timed_out["completion_unknown"], true);
+    }
+
+    #[test]
+    fn incomplete_logout_error_preserves_privacy_safe_partial_cleanup() {
+        let mut outcome = WipeOutcome {
+            groups_left: 2,
+            key_packages_deleted: 1,
+            ..WipeOutcome::default()
+        };
+        outcome.key_package_failures.push(marmot_app::RelayFailure {
+            event_id_hex: "11".repeat(32),
+            reason: "relay deletion deadline exceeded".to_owned(),
+        });
+        outcome.local_cleanup.reason = Some("local removal did not start".to_owned());
+        let error = wn_error_json(&WnError::LogoutIncomplete {
+            reason: "local removal did not start".to_owned(),
+            outcome: Box::new(outcome),
+        });
+
+        assert_eq!(error["code"], "logout_incomplete");
+        assert_eq!(error["cleanup"]["groups_left"], 2);
+        assert_eq!(error["cleanup"]["key_packages_deleted"], 1);
+        assert_eq!(
+            error["cleanup"]["key_package_failures"][0]["reason"],
+            "relay deletion deadline exceeded"
+        );
+        assert_eq!(error["cleanup"]["local_cleanup"]["completed"], false);
     }
 }

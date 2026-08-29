@@ -12,7 +12,9 @@ use storage_sqlite::{
     CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher,
 };
 
-use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMetadata};
+use crate::{
+    AccountRelayListStatus, AppError, DirectoryKeyPackage, UserDirectoryRecord, UserProfileMetadata,
+};
 
 /// How long a `kind:0` profile resolved by web-of-trust search stays usable
 /// before search re-fetches it.
@@ -160,6 +162,52 @@ impl DirectoryCache {
         Self::put_with_reason_locked(&tx, entry, reason)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Remove only the cached KeyPackage in `stable_slot_id`, preserving every
+    /// other directory field and any sibling-device slot that won a race.
+    pub(crate) fn clear_key_package_if_slot(
+        &self,
+        account_id_hex: &str,
+        stable_slot_id: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let Some(key_package_json) = tx
+            .query_row(
+                "SELECT key_package_json
+                 FROM directory_users
+                 WHERE account_id_hex = ?1",
+                [account_id_hex],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let should_clear = match stable_slot_id {
+            Some(stable_slot_id) => {
+                serde_json::from_str::<DirectoryKeyPackage>(&key_package_json)?.key_package_id
+                    == stable_slot_id
+            }
+            None => true,
+        };
+        if !should_clear {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE directory_users
+             SET key_package_json = NULL,
+                 updated_at = ?3
+             WHERE account_id_hex = ?1
+               AND key_package_json = ?2",
+            params![account_id_hex, key_package_json, unix_now_seconds() as i64],
+        )?;
+        tx.commit()?;
+        Ok(changed != 0)
     }
 
     fn put_with_reason_locked(
@@ -896,6 +944,41 @@ mod tests {
 
         assert_eq!(user_count, 1);
         assert_eq!(follows, vec![bob]);
+    }
+
+    #[test]
+    fn conditional_key_package_clear_preserves_identity_and_sibling_slot() {
+        let (_dir, cache) = test_cache();
+        let alice = account_id(1);
+        let bob = account_id(2);
+        let mut record = directory_record(alice.clone(), vec![bob.clone()]);
+        record.key_package = Some(DirectoryKeyPackage {
+            key_package_id: "removed-slot".to_owned(),
+            key_package_ref_hex: "11".repeat(32),
+            key_package_event_id: "22".repeat(32),
+            key_package_hex: "33".repeat(32),
+            created_at: 1_700_000_002,
+            source_relays: vec!["wss://relay.example".to_owned()],
+        });
+        cache.put(&record).unwrap();
+
+        assert!(
+            !cache
+                .clear_key_package_if_slot(&alice, Some("sibling-slot"))
+                .unwrap()
+        );
+        assert_eq!(cache.entry(&alice).unwrap().unwrap(), record);
+
+        assert!(
+            cache
+                .clear_key_package_if_slot(&alice, Some("removed-slot"))
+                .unwrap()
+        );
+        let scrubbed = cache.entry(&alice).unwrap().unwrap();
+        assert_eq!(scrubbed.profile, record.profile);
+        assert_eq!(scrubbed.relay_lists, record.relay_lists);
+        assert_eq!(scrubbed.follows, vec![bob]);
+        assert!(scrubbed.key_package.is_none());
     }
 
     #[test]

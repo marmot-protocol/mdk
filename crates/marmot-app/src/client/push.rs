@@ -8,12 +8,34 @@ use crate::notifications;
 use super::AppClient;
 
 impl AppClient {
-    pub(crate) async fn upsert_and_share_push_registration(
+    /// Finish notification fanout only after the account worker has handed the
+    /// corresponding send-applied summary to runtime subscribers. Each group
+    /// stays owned until its best-effort attempt returns, so ordinary
+    /// cancellation with a retained client can retry it.
+    pub(crate) async fn publish_pending_new_message_notifications_best_effort(&mut self) {
+        while let Some(group_id) = self
+            .pending_new_message_notification_groups
+            .iter()
+            .next()
+            .cloned()
+        {
+            self.publish_notification_trigger_best_effort(
+                &group_id,
+                notifications::NotificationTrigger::NewMessage,
+            )
+            .await;
+            self.pending_new_message_notification_groups
+                .remove(&group_id);
+        }
+    }
+
+    pub(crate) async fn upsert_and_share_push_registration_with_handoff(
         &mut self,
         platform: notifications::PushPlatform,
         raw_token: &str,
         server_pubkey_hex: &str,
         relay_hint: Option<String>,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
         let registration = self.app.upsert_push_registration(
             &self.state.label,
@@ -22,15 +44,25 @@ impl AppClient {
             server_pubkey_hex,
             relay_hint,
         )?;
-        let share = self.share_push_registration().await?;
+        let share = self
+            .share_push_registration_with_handoff(visibility_handoff)
+            .await?;
         Ok(notifications::PushRegistrationSyncResult {
             registration,
             share,
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn share_push_registration(
         &mut self,
+    ) -> Result<notifications::PushRegistrationShareOutcome, AppError> {
+        self.share_push_registration_with_handoff(&mut |_| {}).await
+    }
+
+    pub(crate) async fn share_push_registration_with_handoff(
+        &mut self,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<notifications::PushRegistrationShareOutcome, AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
         let settings = self.app.notification_settings(&account.label)?;
@@ -106,10 +138,14 @@ impl AppClient {
                     continue;
                 }
             };
-            match self
+            let send_result = self
                 .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
-                .await
-            {
+                .await;
+            // `send_app_event` can checkpoint peer state-change visibility as a
+            // side effect. Give the owning worker a synchronous publication
+            // chokepoint before this loop crosses its next signing/send await.
+            visibility_handoff(self);
+            match send_result {
                 Ok((_event, summary))
                     if summary.accept_disposition
                         == cgka_traits::SendAcceptDisposition::Published =>
@@ -220,10 +256,11 @@ impl AppClient {
                         continue;
                     }
                 };
-                match self
+                let send_result = self
                     .send_app_event(&group_id, AppMessageIntent::PushTokenUpdate { content })
-                    .await
-                {
+                    .await;
+                visibility_handoff(self);
+                match send_result {
                     Ok((_event, summary))
                         if summary.accept_disposition
                             == cgka_traits::SendAcceptDisposition::Published =>
@@ -303,8 +340,14 @@ impl AppClient {
         ))
     }
 
-    pub(crate) async fn retry_pending_push_registration_shares_best_effort(&mut self) -> bool {
-        match self.share_push_registration().await {
+    pub(crate) async fn retry_pending_push_registration_shares_best_effort_with_handoff(
+        &mut self,
+        visibility_handoff: &mut impl FnMut(&mut Self),
+    ) -> bool {
+        match self
+            .share_push_registration_with_handoff(visibility_handoff)
+            .await
+        {
             Ok(outcome) if outcome.failed_groups > 0 => {
                 tracing::warn!(
                     target: "marmot_app::notifications",
@@ -364,19 +407,24 @@ impl AppClient {
         Ok(registration)
     }
 
-    pub(crate) async fn drain_push_registration_removal_before_departure(
+    pub(crate) async fn drain_push_registration_removal_before_departure_with_handoff(
         &mut self,
         group_id: &GroupId,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<Option<crate::PushRegistration>, AppError> {
         let registration = self.queue_current_push_registration_removal_for_group(group_id)?;
-        self.drain_existing_push_registration_removals_for_group(group_id)
-            .await?;
+        self.drain_existing_push_registration_removals_for_group_with_handoff(
+            group_id,
+            visibility_handoff,
+        )
+        .await?;
         Ok(registration)
     }
 
-    pub(crate) async fn drain_existing_push_registration_removals_for_group(
+    pub(crate) async fn drain_existing_push_registration_removals_for_group_with_handoff(
         &mut self,
         group_id: &GroupId,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<(), AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
         let had_pending_removal = self
@@ -387,7 +435,9 @@ impl AppClient {
         if !had_pending_removal {
             return Ok(());
         }
-        let _ = self.share_push_registration().await?;
+        let _ = self
+            .share_push_registration_with_handoff(visibility_handoff)
+            .await?;
         let remains_pending = self
             .app
             .pending_push_registration_removals(&self.state.label)?
@@ -426,20 +476,26 @@ impl AppClient {
         }
     }
 
-    pub(crate) async fn remove_push_registration(
+    pub(crate) async fn remove_push_registration_with_handoff(
         &mut self,
         registration: crate::PushRegistration,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<usize, AppError> {
         self.app
             .queue_push_registration_removals(&self.state.label, registration)?;
-        Ok(self.share_push_registration().await?.succeeded_groups as usize)
+        Ok(self
+            .share_push_registration_with_handoff(visibility_handoff)
+            .await?
+            .succeeded_groups as usize)
     }
 
-    pub(crate) async fn clear_and_share_push_registration(
+    pub(crate) async fn clear_and_share_push_registration_with_handoff(
         &mut self,
+        visibility_handoff: &mut impl FnMut(&mut Self),
     ) -> Result<notifications::PushRegistrationShareOutcome, AppError> {
         self.app.clear_push_registration(&self.state.label)?;
-        self.share_push_registration().await
+        self.share_push_registration_with_handoff(visibility_handoff)
+            .await
     }
 
     pub(crate) fn snapshot_group_push_tokens_for_members(

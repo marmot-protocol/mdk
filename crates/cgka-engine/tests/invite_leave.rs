@@ -1336,6 +1336,7 @@ async fn realization_with_pending_leave_request_attributes_member_left() {
             group_id: group_id.clone(),
             requested_at_ms: 1,
             last_proposed_epoch: None,
+            last_proposed_message_id: None,
         })
         .unwrap();
 

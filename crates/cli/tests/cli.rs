@@ -15,7 +15,10 @@ use marmot_app::{
     AccountRelayListBootstrap, AccountRelayListStatus, MarmotApp, UserProfileMetadata,
 };
 use nostr::nips::nip19::ToBech32;
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::LocalRelay;
+use nostr_relay_builder::prelude::{
+    MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder,
+};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, QuicBrokerServer};
@@ -25,7 +28,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
-    _relay: MockRelay,
+    _relay: LocalRelay,
+    database: MemoryDatabase,
     url: String,
 }
 
@@ -33,14 +37,21 @@ impl TestRelay {
     fn new() -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("test relay runtime");
         let mut last_error = None;
-        let relay = (0..8)
-            .find_map(|attempt| match runtime.block_on(MockRelay::run()) {
-                Ok(relay) => Some(relay),
-                Err(err) => {
-                    eprintln!("mock relay startup attempt {} failed: {err}", attempt + 1);
-                    last_error = Some(err);
-                    std::thread::sleep(Duration::from_millis(25));
-                    None
+        let (relay, database) = (0..8)
+            .find_map(|attempt| {
+                let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                    events: true,
+                    max_events: Some(75_000),
+                });
+                let relay = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+                match runtime.block_on(relay.run()) {
+                    Ok(()) => Some((relay, database)),
+                    Err(err) => {
+                        eprintln!("mock relay startup attempt {} failed: {err}", attempt + 1);
+                        last_error = Some(err);
+                        std::thread::sleep(Duration::from_millis(25));
+                        None
+                    }
                 }
             })
             .unwrap_or_else(|| panic!("mock relay should start: {last_error:?}"));
@@ -48,6 +59,7 @@ impl TestRelay {
         Self {
             _runtime: runtime,
             _relay: relay,
+            database,
             url,
         }
     }
@@ -70,6 +82,12 @@ impl TestRelay {
                 .expect("query mock relay")
                 .len()
         })
+    }
+
+    fn wipe(&self) {
+        self._runtime
+            .block_on(self.database.wipe())
+            .expect("wipe mock relay database");
     }
 }
 
@@ -1982,6 +2000,18 @@ fn whitenoise_parity_commands_have_real_or_explicit_contracts() {
 
     let logout = run_json(home.path(), &["logout", &bob]);
     assert_eq!(logout["logged_out"], true);
+    assert_eq!(logout["cleanup"]["local_cleanup"]["completed"], true);
+    assert!(
+        logout["cleanup"]["key_packages_deleted"]
+            .as_u64()
+            .expect("deleted KeyPackage count")
+            >= 1,
+        "logout must route through runtime relay cleanup: {logout}"
+    );
+    assert_eq!(
+        logout["cleanup"]["key_package_failures"],
+        serde_json::json!([])
+    );
     let accounts = run_json(home.path(), &["accounts", "list"]);
     assert_eq!(accounts["accounts"].as_array().expect("accounts").len(), 1);
 }
@@ -2928,6 +2958,52 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
     );
     assert_eq!(delete_all["failed"], serde_json::json!([]));
     assert_eq!(delete_all["failed_count"], 0);
+}
+
+#[test]
+fn keys_delete_all_keeps_locally_acknowledged_revision_when_relay_discovery_is_empty() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let relay = TestRelay::new();
+    let relay_url = relay.url();
+
+    let account_id = create_account_with_real_relay(home.path(), relay_url);
+    let before = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
+    let event_id = before["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .find(|key| key["relay"] == true)
+        .expect("startup KeyPackage should have reached the relay")["key_package_event_id"]
+        .as_str()
+        .expect("key package event id")
+        .to_owned();
+
+    // Model relay retention loss or an empty discovery response. The durable
+    // authored revision and its endpoint journal remain authoritative even
+    // though `keys list` can no longer re-fetch the exact event.
+    relay.wipe();
+    let after = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
+    let local = after["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .find(|key| key["key_package_event_id"] == event_id)
+        .expect("durable local revision must remain visible");
+    assert_eq!(local["local"], true);
+    assert_eq!(local["relay"], false);
+
+    let deleted = run_json(
+        home.path(),
+        &["--account", &account_id, "keys", "delete-all", "--confirm"],
+    );
+    assert_eq!(deleted["deleted_count"], 1);
+    assert!(
+        deleted["deleted"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["event_id"] == event_id)),
+        "delete-all must include the durable local revision: {deleted:?}"
+    );
+    assert_eq!(deleted["failed"], serde_json::json!([]));
 }
 
 #[test]
@@ -5720,10 +5796,9 @@ fn daemon_refuses_reset_over_socket() {
 }
 
 #[test]
-fn daemon_running_does_not_auto_forward_logout() {
+fn daemon_running_executes_implicit_logout_through_its_owned_runtime() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let account = create_local_account_id(home.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
@@ -5743,6 +5818,25 @@ fn daemon_running_does_not_auto_forward_logout() {
 
     wait_for_daemon(&socket);
 
+    let created = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .args(["create-identity"])
+        .output()
+        .expect("daemon-owned identity setup should start");
+    assert!(
+        created.status.success(),
+        "daemon-owned identity setup failed\n{}",
+        command_output_summary(&created)
+    );
+    let created_json: Value =
+        serde_json::from_slice(&created.stdout).expect("created identity JSON");
+    let account = created_json["result"]["account_id"]
+        .as_str()
+        .expect("created account id")
+        .to_owned();
+
     let mut logout_command = wn_without_relay(home.path());
     logout_command.env_remove("WN_SOCKET");
     let logout = logout_command
@@ -5750,19 +5844,33 @@ fn daemon_running_does_not_auto_forward_logout() {
         .output()
         .expect("wn logout should start");
 
-    stop_daemon(&socket, &mut child);
-
     assert!(
         logout.status.success(),
-        "implicit logout should run locally while daemon is running\n{}",
+        "daemon-owned logout failed\n{}",
         command_output_summary(&logout)
     );
     let logout_json: Value = serde_json::from_slice(&logout.stdout).expect("logout stdout JSON");
     assert_eq!(logout_json["result"]["logged_out"], true);
     assert_eq!(logout_json["result"]["account_id"], account);
+    assert_eq!(
+        logout_json["result"]["cleanup"]["local_cleanup"]["completed"],
+        true
+    );
+    assert!(
+        logout_json["result"]["cleanup"]["key_packages_deleted"]
+            .as_u64()
+            .expect("deleted KeyPackage count")
+            >= 1
+    );
+    assert_eq!(
+        logout_json["result"]["cleanup"]["key_package_failures"],
+        serde_json::json!([])
+    );
 
     let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
     assert_eq!(accounts.len(), 0);
+
+    stop_daemon(&socket, &mut child);
 }
 
 #[test]

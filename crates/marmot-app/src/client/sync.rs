@@ -5,6 +5,7 @@ use cgka_traits::GroupId;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
+use serde::{Deserialize, Serialize};
 use storage_sqlite::{
     TransportReconciliationItem, TransportReconciliationRoute, clamp_to_max_future_skew,
 };
@@ -119,6 +120,51 @@ pub(crate) struct EpochBackfillExecution {
     pub(crate) started: Instant,
 }
 
+const EPOCH_BACKFILL_INTENT_JOURNAL_VERSION: u32 = 1;
+
+/// App-owned representation stored as one encrypted account-DB blob. Groups
+/// are a vector rather than a JSON map because `GroupId` is opaque bytes and
+/// JSON object keys must be strings.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEpochBackfillIntentJournal {
+    version: u32,
+    pending: Option<PersistedEpochBackfillIntent>,
+    active: Option<PersistedEpochBackfillIntent>,
+    queued: Vec<PersistedEpochBackfillIntent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEpochBackfillIntent {
+    attempt_id: String,
+    groups: Vec<PersistedEpochBackfillGroup>,
+    execution_attempts: u32,
+    last_deferred_audit: Option<PersistedEpochBackfillDeferredSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEpochBackfillGroup {
+    group_id: Vec<u8>,
+    stalled_epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEpochBackfillDeferredSnapshot {
+    reason: EpochBackfillDeferredReason,
+    retry_ordinal: u64,
+    group_epochs: Vec<PersistedEpochBackfillDeferredGroupEpoch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEpochBackfillDeferredGroupEpoch {
+    group_id: Vec<u8>,
+    observed_epoch: Option<u64>,
+}
+
 struct EpochBackfillReplayOutcome {
     duration_ms: u64,
     activation_outcome: EpochBackfillActivationOutcome,
@@ -126,6 +172,41 @@ struct EpochBackfillReplayOutcome {
     completion_kind: Option<EpochBackfillCompletionKind>,
     counts: DrainCounts,
     succeeded: bool,
+}
+
+struct ReplayedAccountVisibilityOperation {
+    operation_id: Vec<u8>,
+    source: marmot_account::AccountVisibilitySource,
+    effects: marmot_account::AccountDeviceEffects,
+}
+
+fn merge_account_visibility_effects(
+    target: &mut marmot_account::AccountDeviceEffects,
+    source: &marmot_account::AccountDeviceEffects,
+) {
+    target.events.extend(source.events.iter().cloned());
+    target.queued.extend(source.queued.iter().cloned());
+    target
+        .pending_convergence
+        .extend(source.pending_convergence.iter().cloned());
+    target.reports.extend(source.reports.iter().cloned());
+    target.fanout.extend(source.fanout.iter().cloned());
+    target.failures.extend(source.failures.iter().cloned());
+    target
+        .action_outcomes
+        .extend(source.action_outcomes.iter().cloned());
+    target
+        .published_app_messages
+        .extend(source.published_app_messages.iter().cloned());
+    target
+        .welcome_failures
+        .extend(source.welcome_failures.iter().cloned());
+    target.pending.extend(source.pending.iter().cloned());
+    if source.maintenance_disposition
+        == cgka_traits::SendMaintenanceDisposition::PostJoinRotationPendingRetryable
+    {
+        target.maintenance_disposition = source.maintenance_disposition;
+    }
 }
 
 /// Result of checking the pending epoch-gap replay queue at one execution seam.
@@ -374,9 +455,12 @@ pub(crate) enum ConvergenceScheduleState {
     PendingOutbound,
 }
 
-enum SyncCheckpointError {
-    BeforePersistence(AppError),
-    AfterPersistence(AppError),
+/// A scheduled convergence pass whose durable projection/ACK checkpoint has
+/// completed and whose visibility summary has already been removed from the
+/// client-owned V2 slot. The worker must publish `summary` before performing
+/// either of the remaining best-effort network actions.
+pub(crate) struct ScheduledConvergenceVisibility {
+    pub(crate) summary: SyncSummary,
 }
 
 struct StagedSyncError {
@@ -390,7 +474,196 @@ impl StagedSyncError {
     }
 }
 
+impl From<&PendingEpochBackfill> for PersistedEpochBackfillIntent {
+    fn from(pending: &PendingEpochBackfill) -> Self {
+        let mut groups = pending
+            .groups
+            .iter()
+            .map(|(group_id, group)| PersistedEpochBackfillGroup {
+                group_id: group_id.as_slice().to_vec(),
+                stalled_epoch: group.stalled_epoch,
+            })
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+        Self {
+            attempt_id: pending.attempt_id.clone(),
+            groups,
+            execution_attempts: pending.execution_attempts,
+            last_deferred_audit: pending.last_deferred_audit.as_ref().map(|snapshot| {
+                PersistedEpochBackfillDeferredSnapshot {
+                    reason: snapshot.reason,
+                    retry_ordinal: snapshot.retry_ordinal,
+                    group_epochs: snapshot
+                        .group_epochs
+                        .iter()
+                        .map(|(group_id, observed_epoch)| {
+                            PersistedEpochBackfillDeferredGroupEpoch {
+                                group_id: group_id.as_slice().to_vec(),
+                                observed_epoch: *observed_epoch,
+                            }
+                        })
+                        .collect(),
+                }
+            }),
+        }
+    }
+}
+
+impl TryFrom<PersistedEpochBackfillIntent> for PendingEpochBackfill {
+    type Error = AppError;
+
+    fn try_from(persisted: PersistedEpochBackfillIntent) -> Result<Self, Self::Error> {
+        if persisted.attempt_id.is_empty() || persisted.groups.is_empty() {
+            return Err(AppError::BlockingTask(
+                "invalid durable epoch-backfill intent journal".to_owned(),
+            ));
+        }
+        let mut groups = HashMap::with_capacity(persisted.groups.len());
+        for group in persisted.groups {
+            if group.group_id.is_empty() {
+                return Err(AppError::BlockingTask(
+                    "invalid durable epoch-backfill intent group".to_owned(),
+                ));
+            }
+            if groups
+                .insert(
+                    GroupId::new(group.group_id),
+                    PendingEpochBackfillGroup {
+                        stalled_epoch: group.stalled_epoch,
+                    },
+                )
+                .is_some()
+            {
+                return Err(AppError::BlockingTask(
+                    "duplicate durable epoch-backfill intent group".to_owned(),
+                ));
+            }
+        }
+        let last_deferred_audit = persisted
+            .last_deferred_audit
+            .map(|snapshot| {
+                let mut group_epochs = Vec::with_capacity(snapshot.group_epochs.len());
+                for group in snapshot.group_epochs {
+                    if group.group_id.is_empty() {
+                        return Err(AppError::BlockingTask(
+                            "invalid durable epoch-backfill deferral group".to_owned(),
+                        ));
+                    }
+                    group_epochs.push((GroupId::new(group.group_id), group.observed_epoch));
+                }
+                Ok(EpochBackfillDeferredSnapshot {
+                    reason: snapshot.reason,
+                    retry_ordinal: snapshot.retry_ordinal,
+                    group_epochs,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            attempt_id: persisted.attempt_id,
+            groups,
+            execution_attempts: persisted.execution_attempts,
+            eose_unconfirmed_attempts: 0,
+            no_progress_attempts: 0,
+            last_deferred_audit,
+        })
+    }
+}
+
 impl AppClient {
+    fn persist_epoch_backfill_intent_journal(&mut self) -> Result<(), AppError> {
+        let result = (|| {
+            let storage = self.app.account_storage(&self.state.label)?;
+            if self.pending_epoch_backfill.is_none()
+                && self.active_epoch_backfill.is_none()
+                && self.queued_epoch_backfills.is_empty()
+            {
+                storage.clear_epoch_backfill_intent_journal()?;
+                return Ok(());
+            }
+            let journal = PersistedEpochBackfillIntentJournal {
+                version: EPOCH_BACKFILL_INTENT_JOURNAL_VERSION,
+                pending: self
+                    .pending_epoch_backfill
+                    .as_ref()
+                    .map(PersistedEpochBackfillIntent::from),
+                active: self
+                    .active_epoch_backfill
+                    .as_ref()
+                    .map(PersistedEpochBackfillIntent::from),
+                queued: self
+                    .queued_epoch_backfills
+                    .iter()
+                    .map(PersistedEpochBackfillIntent::from)
+                    .collect(),
+            };
+            storage.store_epoch_backfill_intent_journal(&serde_json::to_vec(&journal)?)?;
+            Ok(())
+        })();
+        self.epoch_backfill_intent_journal_dirty = result.is_err();
+        result
+    }
+
+    /// Retry a failed intent-journal write before any external replay or
+    /// before the worker becomes idle. The detector may not emit the same arm
+    /// twice, so this explicit obligation is the durable retry source.
+    pub(crate) fn ensure_epoch_backfill_intent_journal_persisted(
+        &mut self,
+    ) -> Result<(), AppError> {
+        if self.epoch_backfill_intent_journal_dirty {
+            self.persist_epoch_backfill_intent_journal()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_epoch_backfill_intent_journal(&mut self) -> Result<(), AppError> {
+        let Some(raw) = self
+            .app
+            .account_storage(&self.state.label)?
+            .load_epoch_backfill_intent_journal()?
+        else {
+            return Ok(());
+        };
+        let persisted: PersistedEpochBackfillIntentJournal = serde_json::from_slice(&raw)?;
+        if persisted.version != EPOCH_BACKFILL_INTENT_JOURNAL_VERSION {
+            return Err(AppError::BlockingTask(
+                "unsupported durable epoch-backfill intent journal".to_owned(),
+            ));
+        }
+        self.pending_epoch_backfill = persisted.pending.map(TryInto::try_into).transpose()?;
+        self.active_epoch_backfill = persisted.active.map(TryInto::try_into).transpose()?;
+        self.queued_epoch_backfills = persisted
+            .queued
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
+
+        // A process cannot still own the replay represented by an active row.
+        // Restore it with the same ordering used by an ordinary failed attempt:
+        // a newer primary stays first, and the interrupted intent retries after
+        // the already-queued work ahead of it.
+        if let Some(interrupted) = self.active_epoch_backfill.take() {
+            if self.pending_epoch_backfill.is_none() {
+                self.pending_epoch_backfill = Some(interrupted);
+            } else {
+                self.queued_epoch_backfills.push_back(interrupted);
+            }
+            self.persist_epoch_backfill_intent_journal()?;
+        }
+        Ok(())
+    }
+
+    fn recover_active_epoch_backfill_after_cancellation(&mut self) -> Result<(), AppError> {
+        let Some(interrupted) = self.active_epoch_backfill.take() else {
+            return Ok(());
+        };
+        if self.pending_epoch_backfill.is_none() {
+            self.pending_epoch_backfill = Some(interrupted);
+        } else {
+            self.queued_epoch_backfills.push_back(interrupted);
+        }
+        self.persist_epoch_backfill_intent_journal()
+    }
+
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
     }
@@ -476,9 +749,9 @@ impl AppClient {
     pub(crate) fn observe_recovery_evidence(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
-    ) {
+    ) -> Result<(), AppError> {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
+            return Ok(());
         }
         for event in &effects.events {
             match event {
@@ -509,11 +782,12 @@ impl AppClient {
                         record.epoch.0,
                         decision,
                         EpochStallBackfillTrigger::ResourceRefusal,
-                    );
+                    )?;
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// Apply the publish gate to `effects`, observing the same batch's
@@ -542,11 +816,12 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        self.observe_recovery_evidence(effects);
+        self.observe_recovery_evidence(effects)?;
         fail_if_publish_failed(effects)
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
+        self.replay_pending_account_visibility().await?;
         let rebuild_since = self.subscription_rebuild_since();
         self.sync_runtime_groups_since(rebuild_since).await
     }
@@ -742,6 +1017,561 @@ impl AppClient {
         self.pending_runtime_group_subscription_refresh
     }
 
+    fn merge_occupied_sync_summary(slot: &mut Option<SyncSummary>, summary: SyncSummary) {
+        match slot {
+            Some(pending) => pending.merge(summary),
+            None => *slot = Some(summary),
+        }
+    }
+
+    pub(crate) fn install_account_visibility_lease(
+        &mut self,
+        lease: marmot_account::AccountVisibilityLease,
+        batches: Vec<marmot_account::AccountVisibilityBatch>,
+        current_operation_id: Option<Vec<u8>>,
+    ) {
+        let mut staged_batch_ids = self
+            .pending_account_visibility_lease
+            .take()
+            .map(|pending| pending.staged_batch_ids)
+            .unwrap_or_default();
+        staged_batch_ids.retain(|batch_id| batches.iter().any(|batch| batch.batch_id == *batch_id));
+        self.pending_account_visibility_lease = Some(super::PendingAccountVisibilityLease {
+            lease,
+            batches,
+            staged_batch_ids,
+            projection_operation_id: current_operation_id,
+        });
+    }
+
+    /// Project every lower account-effects operation left by an interrupted
+    /// caller before accepting new relay or send work. Operations remain
+    /// ordered by their first durable row and are dispatched under their
+    /// original source; a later command can never lend an older batch its own
+    /// delivery metadata, group, or timestamp.
+    pub(crate) async fn replay_pending_account_visibility(&mut self) -> Result<bool, AppError> {
+        if self.has_staged_account_visibility_batches() {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        let Some(leased) = self.runtime.replay_visibility_leased()? else {
+            return Ok(false);
+        };
+        let batches = leased.batches.clone();
+        self.install_account_visibility_lease(leased.lease, leased.batches, None);
+
+        let mut operations = Vec::<ReplayedAccountVisibilityOperation>::new();
+        for batch in batches {
+            let operation_index = operations
+                .iter()
+                .position(|operation| operation.operation_id == batch.operation_id);
+            let operation = match operation_index {
+                Some(index) => &mut operations[index],
+                None => {
+                    operations.push(ReplayedAccountVisibilityOperation {
+                        operation_id: batch.operation_id.clone(),
+                        source: batch.source.clone(),
+                        effects: marmot_account::AccountDeviceEffects::default(),
+                    });
+                    operations
+                        .last_mut()
+                        .expect("just appended visibility operation")
+                }
+            };
+            if operation.source != batch.source {
+                return Err(AppError::BlockingTask(
+                    "account visibility operation changed source".to_owned(),
+                ));
+            }
+            merge_account_visibility_effects(&mut operation.effects, &batch.effects);
+        }
+
+        for operation in operations {
+            self.set_account_visibility_projection_operation(Some(operation.operation_id));
+            let replayed = match operation.source {
+                marmot_account::AccountVisibilitySource::Inbound {
+                    delivery,
+                    outcome,
+                    observed_at,
+                } => {
+                    self.replay_source_attributed_inbound_visibility(
+                        delivery,
+                        outcome,
+                        &operation.effects,
+                        observed_at.0,
+                    )
+                    .await
+                }
+                marmot_account::AccountVisibilitySource::Drain { observed_at } => self
+                    .replay_source_attributed_drain_visibility(&operation.effects, observed_at.0),
+                marmot_account::AccountVisibilitySource::Convergence {
+                    group_id,
+                    observed_at,
+                } => {
+                    self.replay_source_attributed_convergence_visibility(
+                        &group_id,
+                        &operation.effects,
+                        observed_at.0,
+                    )
+                    .await
+                }
+                marmot_account::AccountVisibilitySource::Maintenance { observed_at } => self
+                    .checkpoint_maintenance_effects_at(&operation.effects, observed_at.0)
+                    .map(|_| ()),
+                marmot_account::AccountVisibilitySource::Outbound {
+                    group_id,
+                    observed_at,
+                    ..
+                } => {
+                    self.replay_source_attributed_outbound_visibility(
+                        group_id.as_ref(),
+                        &operation.effects,
+                        observed_at.0,
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = replayed {
+                // Do not let a later unrelated local save inherit this
+                // operation as its projection authority. Exact completed rows
+                // are already staged individually and remain safe to checkpoint;
+                // the Header and unfinished record stay durable for replay.
+                self.set_account_visibility_projection_operation(None);
+                return Err(error);
+            }
+            // Header is the operation-complete marker. It is intentionally the
+            // last row staged, including for an empty drain/no-op maintenance
+            // pass, so no generic save can acknowledge an operation whose
+            // source-specific tail has not completed.
+            self.stage_current_account_visibility_header_batch();
+            self.checkpoint_pending_sync_visibility()?;
+        }
+        self.set_account_visibility_projection_operation(None);
+        Ok(true)
+    }
+
+    async fn replay_source_attributed_inbound_visibility(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+        outcome: IngestOutcome,
+        effects: &marmot_account::AccountDeviceEffects,
+        observed_at: u64,
+    ) -> Result<(), AppError> {
+        self.project_account_non_session_visibility_at(effects, observed_at, None)?;
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
+        let ingested = self
+            .project_source_attributed_inbound_visibility(
+                &outcome,
+                effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                delivery.received_at.0,
+                delivery.message.timestamp.0,
+                delivery.group_id_hint.clone(),
+                matches!(outcome, IngestOutcome::ResourceRefused { .. }),
+            )
+            .await?;
+        self.retain_uncheckpointed_sync_summary(summary);
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(ingested.routes_dirty);
+        if !ingested.must_stay_fetchable {
+            self.remember_seen_event(source_message_id_hex);
+        }
+        if ingested.routes_dirty {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        let refresh = self.refresh_group_routes()?;
+        if !ingested.routes_dirty || refresh.state_pruned {
+            self.remember_uncheckpointed_runtime_group_subscription_refresh(
+                refresh.routing_changed,
+            );
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        } else {
+            self.pending_runtime_group_subscription_refresh |= refresh.routing_changed;
+        }
+        Ok(())
+    }
+
+    fn replay_source_attributed_drain_visibility(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        observed_at: u64,
+    ) -> Result<(), AppError> {
+        let affected_groups =
+            self.project_account_non_session_visibility_at(effects, observed_at, None)?;
+        let mut projectable = effects.clone();
+        if !projectable.failures.is_empty() {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "replay_account_visibility",
+                failure_count = projectable.failures.len(),
+                "replaying a completed account operation that reported publish failures"
+            );
+            projectable.failures.clear();
+        }
+        self.observe_drained_session_events_staged_at(&projectable, observed_at)?;
+        for group_id in affected_groups {
+            self.refresh_group(&group_id);
+            self.prune_plaintext_retention_for_group(&group_id)?;
+        }
+        self.checkpoint_pending_sync_visibility()?;
+        Ok(())
+    }
+
+    async fn replay_source_attributed_convergence_visibility(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+        observed_at: u64,
+    ) -> Result<(), AppError> {
+        let mut projectable = effects.clone();
+        if !projectable.failures.is_empty() {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "replay_account_visibility",
+                failure_count = projectable.failures.len(),
+                "replaying convergence effects that reported publish failures"
+            );
+            projectable.failures.clear();
+        }
+        let visibility = self
+            .checkpoint_scheduled_convergence_effects_at(group_id, &projectable, observed_at)
+            .await?;
+        self.retain_checkpointed_sync_summary(visibility.summary);
+        Ok(())
+    }
+
+    async fn replay_source_attributed_outbound_visibility(
+        &mut self,
+        source_group_id: Option<&cgka_traits::GroupId>,
+        effects: &marmot_account::AccountDeviceEffects,
+        observed_at: u64,
+    ) -> Result<(), AppError> {
+        let primary_group = source_group_id.cloned().or_else(|| {
+            effects
+                .events
+                .iter()
+                .find_map(event_group_id)
+                .cloned()
+                .or_else(|| {
+                    effects
+                        .published_app_messages
+                        .first()
+                        .map(|published| published.group_id.clone())
+                })
+        });
+        let mut projectable = effects.clone();
+        if !projectable.failures.is_empty() {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "replay_account_visibility",
+                failure_count = projectable.failures.len(),
+                "replaying outbound effects that reported publish failures"
+            );
+            projectable.failures.clear();
+        }
+        if let Some(group_id) = primary_group {
+            let visibility = self
+                .checkpoint_scheduled_convergence_effects_at(&group_id, &projectable, observed_at)
+                .await?;
+            self.retain_checkpointed_sync_summary(visibility.summary);
+        } else {
+            let affected_groups =
+                self.project_account_non_session_visibility_at(effects, observed_at, None)?;
+            self.observe_drained_session_events_staged_at(&projectable, observed_at)?;
+            for group_id in affected_groups {
+                self.refresh_group(&group_id);
+                self.prune_plaintext_retention_for_group(&group_id)?;
+            }
+            self.checkpoint_pending_sync_visibility()?;
+        }
+        Ok(())
+    }
+
+    /// Apply terminal outbound-action tails before any Header acknowledgement.
+    ///
+    /// Local Leave has no inbound echo of our own SelfRemove, so `Left` is
+    /// authorized only by a durable `published: true` action outcome. A failed
+    /// or still-attempting fanout must not move membership; restart replay uses
+    /// this same projector so crash recovery cannot ACK the Header first.
+    fn apply_published_outbound_action_outcomes(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        for outcome in &effects.action_outcomes {
+            match outcome.action {
+                marmot_account::AccountVisibilityOutboundAction::Leave => {
+                    if !outcome.published {
+                        continue;
+                    }
+                    self.app.set_group_self_membership(
+                        &self.state.label,
+                        &hex::encode(outcome.group_id.as_slice()),
+                        SelfMembership::Left,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn project_account_non_session_visibility_at(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        recorded_at: u64,
+        deferred_app_event_id: Option<&str>,
+    ) -> Result<HashSet<cgka_traits::GroupId>, AppError> {
+        self.apply_published_outbound_action_outcomes(effects)?;
+        self.remember_published_reports(effects);
+        self.record_welcome_delivery_failures_from_effects_at(effects, recorded_at)?;
+        let mut affected_groups = effects
+            .events
+            .iter()
+            .filter_map(event_group_id)
+            .cloned()
+            .collect::<HashSet<_>>();
+        for published in &effects.published_app_messages {
+            affected_groups.insert(published.group_id.clone());
+            if deferred_app_event_id == Some(published.app_event_id.as_str()) {
+                continue;
+            }
+            if let Some(update) =
+                self.finalize_published_app_message_and_queue_notification(published)?
+            {
+                let mut finalized = SyncSummary::default();
+                finalized.projection_updates.push(update);
+                self.retain_uncheckpointed_sync_summary(finalized);
+            }
+        }
+        // NonSession is one cumulative row: acknowledge none of it until the
+        // complete vector has projected. SessionControl is safe at the same
+        // point because `remember_published_reports` retained every convergence
+        // wake before this boundary. Header remains the source-handler tail.
+        if deferred_app_event_id.is_none() {
+            self.stage_current_account_visibility_non_session_batch();
+        }
+        self.stage_current_account_visibility_record_kind(
+            marmot_account::AccountVisibilityRecordKind::SessionControl,
+        );
+        Ok(affected_groups)
+    }
+
+    pub(super) fn project_current_account_non_session_visibility(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        deferred_app_event_id: Option<&str>,
+    ) -> Result<HashSet<cgka_traits::GroupId>, AppError> {
+        let recorded_at = self.current_account_visibility_observed_at();
+        self.project_account_non_session_visibility_at(effects, recorded_at, deferred_app_event_id)
+    }
+
+    pub(super) fn current_account_visibility_observed_at(&self) -> u64 {
+        let Some(pending) = self.pending_account_visibility_lease.as_ref() else {
+            return unix_now_seconds();
+        };
+        let Some(operation_id) = pending.projection_operation_id.as_ref() else {
+            return unix_now_seconds();
+        };
+        pending
+            .batches
+            .iter()
+            .find(|batch| &batch.operation_id == operation_id)
+            .map(|batch| match &batch.source {
+                marmot_account::AccountVisibilitySource::Inbound { observed_at, .. }
+                | marmot_account::AccountVisibilitySource::Drain { observed_at }
+                | marmot_account::AccountVisibilitySource::Convergence { observed_at, .. }
+                | marmot_account::AccountVisibilitySource::Maintenance { observed_at }
+                | marmot_account::AccountVisibilitySource::Outbound { observed_at, .. } => {
+                    observed_at.0
+                }
+            })
+            .unwrap_or_else(unix_now_seconds)
+    }
+
+    fn set_account_visibility_projection_operation(&mut self, operation_id: Option<Vec<u8>>) {
+        if let Some(pending) = self.pending_account_visibility_lease.as_mut() {
+            pending.projection_operation_id = operation_id;
+        }
+    }
+
+    fn stage_current_account_visibility_record_kind(
+        &mut self,
+        kind: marmot_account::AccountVisibilityRecordKind,
+    ) {
+        let Some(pending) = self.pending_account_visibility_lease.as_ref() else {
+            return;
+        };
+        let Some(operation_id) = pending.projection_operation_id.as_ref() else {
+            return;
+        };
+        let batch_ids = pending
+            .batches
+            .iter()
+            .filter(|batch| &batch.operation_id == operation_id)
+            .filter(|batch| batch.kind == kind)
+            .map(|batch| batch.batch_id.clone())
+            .collect::<Vec<_>>();
+        let pending = self
+            .pending_account_visibility_lease
+            .as_mut()
+            .expect("visibility lease remains installed");
+        for batch_id in batch_ids {
+            if !pending.staged_batch_ids.contains(&batch_id) {
+                pending.staged_batch_ids.push(batch_id);
+            }
+        }
+    }
+
+    pub(super) fn stage_current_account_visibility_header_batch(&mut self) {
+        self.stage_current_account_visibility_record_kind(
+            marmot_account::AccountVisibilityRecordKind::Header,
+        );
+    }
+
+    pub(super) fn stage_current_account_visibility_non_session_batch(&mut self) {
+        self.stage_current_account_visibility_record_kind(
+            marmot_account::AccountVisibilityRecordKind::NonSession,
+        );
+    }
+
+    pub(super) fn stage_current_account_visibility_event(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+    ) {
+        let Some(pending) = self.pending_account_visibility_lease.as_ref() else {
+            return;
+        };
+        let Some(operation_id) = pending.projection_operation_id.as_ref() else {
+            return;
+        };
+        let Some(batch_id) = pending
+            .batches
+            .iter()
+            .filter(|batch| &batch.operation_id == operation_id)
+            .filter(|batch| {
+                matches!(
+                    batch.kind,
+                    marmot_account::AccountVisibilityRecordKind::Event { .. }
+                )
+            })
+            .filter(|batch| !pending.staged_batch_ids.contains(&batch.batch_id))
+            .find(|batch| batch.effects.events.as_slice() == std::slice::from_ref(event))
+            .map(|batch| batch.batch_id.clone())
+        else {
+            return;
+        };
+        self.pending_account_visibility_lease
+            .as_mut()
+            .expect("visibility lease remains installed")
+            .staged_batch_ids
+            .push(batch_id);
+    }
+
+    fn has_staged_account_visibility_batches(&self) -> bool {
+        self.pending_account_visibility_lease
+            .as_ref()
+            .is_some_and(|pending| !pending.staged_batch_ids.is_empty())
+    }
+
+    /// Retain successfully projected output before its next await or fallible
+    /// boundary. Occupancy is explicit so an empty batch that wakes convergence
+    /// or epoch backfill is not confused with no pending visibility work.
+    pub(super) fn retain_uncheckpointed_sync_summary(&mut self, summary: SyncSummary) {
+        Self::merge_occupied_sync_summary(&mut self.pending_uncheckpointed_sync_summary, summary);
+    }
+
+    pub(super) fn retain_checkpointed_sync_summary(&mut self, summary: SyncSummary) {
+        Self::merge_occupied_sync_summary(&mut self.pending_checkpointed_sync_summary, summary);
+    }
+
+    fn remember_uncheckpointed_runtime_group_subscription_refresh(&mut self, dirty: bool) {
+        self.pending_uncheckpointed_runtime_group_subscription_refresh |= dirty;
+    }
+
+    /// Complete the visibility checkpoint synchronously after the common state
+    /// transaction commits. There must be no await between that commit and this
+    /// promotion: V1 is protected by engine replay, while V2 is bounded
+    /// process-local ownership until an outer caller/worker consumes it.
+    fn promote_uncheckpointed_sync_visibility(&mut self) {
+        if let Some(summary) = self.pending_uncheckpointed_sync_summary.take() {
+            self.retain_checkpointed_sync_summary(summary);
+        }
+        self.pending_runtime_group_subscription_refresh |=
+            std::mem::take(&mut self.pending_uncheckpointed_runtime_group_subscription_refresh);
+    }
+
+    /// Take the one bounded, durably checkpointed aggregate. `Some(default)` is
+    /// meaningful occupancy for direct `next_event`; callers deciding whether
+    /// an empty result is publishable must inspect the summary, not collapse the
+    /// option. Epoch-stall escalations join only at this final ownership handoff.
+    pub(crate) fn take_pending_checkpointed_sync_summary(&mut self) -> Option<SyncSummary> {
+        if self.pending_checkpointed_sync_summary.is_none()
+            && self.pending_epoch_stall_escalations.is_empty()
+        {
+            return None;
+        }
+        let mut summary = self
+            .pending_checkpointed_sync_summary
+            .take()
+            .unwrap_or_default();
+        self.drain_epoch_stall_escalations(&mut summary);
+        Some(summary)
+    }
+
+    /// Finish a cancellation-retained V1 batch without awaiting relay I/O.
+    ///
+    /// The engine application-event outbox remains unacknowledged while V1 is
+    /// occupied. A managed timeout therefore calls this before its fallback
+    /// publication: the common save commits projection + ACK state and promotes
+    /// the aggregate to V2 synchronously, while the ordinary subscription
+    /// rebuild stays armed for the worker's bounded retry task.
+    pub(crate) fn checkpoint_pending_sync_visibility(&mut self) -> Result<bool, AppError> {
+        if self.pending_uncheckpointed_sync_summary.is_none()
+            && !self.has_staged_account_visibility_batches()
+        {
+            return Ok(false);
+        }
+        let refresh = self.refresh_group_routes()?;
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(refresh.routing_changed);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        Ok(true)
+    }
+
+    fn take_checkpointed_sync_summary_or_default(&mut self) -> SyncSummary {
+        let mut summary = self
+            .pending_checkpointed_sync_summary
+            .take()
+            .unwrap_or_default();
+        self.drain_epoch_stall_escalations(&mut summary);
+        summary
+    }
+
+    /// Consume only output an error's plain `partial_summary` can represent.
+    /// An occupied empty V2 is a wake edge, not reportable partial progress, so
+    /// it stays owned for the next successful/direct/worker seam.
+    fn take_reportable_checkpointed_sync_summary_for_failure(&mut self) -> SyncSummary {
+        let mut summary = if self
+            .pending_checkpointed_sync_summary
+            .as_ref()
+            .is_some_and(|summary| summary != &SyncSummary::default())
+        {
+            self.pending_checkpointed_sync_summary
+                .take()
+                .expect("checked nonempty checkpointed summary")
+        } else {
+            SyncSummary::default()
+        };
+        self.drain_epoch_stall_escalations(&mut summary);
+        summary
+    }
+
+    fn merge_checkpointed_visibility_into_failure(&mut self, failure: &mut ClassifiedSyncFailure) {
+        let mut retained = self.take_reportable_checkpointed_sync_summary_for_failure();
+        retained.merge(std::mem::take(&mut failure.partial_summary));
+        failure.partial_summary = retained;
+    }
+
     /// Retry an ordinary group-subscription rebuild that was deliberately
     /// moved behind live-ingest visibility. A successful rebuild disarms the
     /// intent; an error leaves it armed so the worker's bounded backoff can
@@ -751,6 +1581,14 @@ impl AppClient {
     ) -> Result<bool, AppError> {
         if !self.pending_runtime_group_subscription_refresh {
             return Ok(false);
+        }
+        // A routes-dirty delivery can checkpoint before its first route-table
+        // reconciliation. Rebuild the in-memory snapshot here on every retry;
+        // otherwise a cancelled/failed refresh could later subscribe the stale
+        // snapshot and incorrectly clear the durable retry intent.
+        let refresh = self.refresh_group_routes()?;
+        if refresh.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         if let Err(error) = self.sync_runtime_groups().await {
             if error.is_account_not_active() {
@@ -768,6 +1606,18 @@ impl AppClient {
         Ok(false)
     }
 
+    /// Preserve a direct caller's durable sync output while restoring the
+    /// historical ready-on-return subscription guarantee. The summary moves to
+    /// client-owned storage before the first retry await, so cancellation cannot
+    /// discard output whose engine-outbox acknowledgement already committed.
+    async fn finalize_direct_sync_summary(&mut self) -> Result<SyncSummary, AppError> {
+        if self.has_pending_runtime_group_subscription_refresh() {
+            self.retry_pending_runtime_group_subscription_refresh()
+                .await?;
+        }
+        Ok(self.take_checkpointed_sync_summary_or_default())
+    }
+
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
         self.prepare_transport_with_telemetry(None).await
     }
@@ -776,12 +1626,30 @@ impl AppClient {
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<(), AppError> {
+        self.replay_pending_account_visibility().await?;
         self.prepare_transport_for_sync(telemetry)
             .await
             .map_err(|(_, error)| error)
     }
 
     async fn prepare_transport_for_sync(
+        &mut self,
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<(), (SyncFailureStage, AppError)> {
+        self.ensure_active_signing_account()
+            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
+        self.prepare_transport_for_admitted_session(telemetry).await
+    }
+
+    pub(crate) async fn prepare_teardown_transport(&mut self) -> Result<(), AppError> {
+        self.ensure_teardown_cleanup_account()?;
+        self.prepare_transport_for_admitted_session(None)
+            .await
+            .map_err(|(_, error)| error)?;
+        self.ensure_teardown_cleanup_account()
+    }
+
+    async fn prepare_transport_for_admitted_session(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<(), (SyncFailureStage, AppError)> {
@@ -823,13 +1691,16 @@ impl AppClient {
     /// report the durably applied prefix of a failed catch-up pass.
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
         match self.sync_inner(None).await {
-            Ok(summary) => Ok(summary),
-            Err(failure) => {
+            Ok(()) => self.finalize_direct_sync_summary().await,
+            Err(mut failure) => {
                 // Compatibility callers cannot observe a failure summary.
                 // Retain any already-checkpointed prefix for their next
                 // successful sync instead of consuming it with the error.
-                self.pending_failed_sync_summary
-                    .merge(failure.partial_summary);
+                if failure.partial_summary != SyncSummary::default() {
+                    self.retain_checkpointed_sync_summary(std::mem::take(
+                        &mut failure.partial_summary,
+                    ));
+                }
                 Err(failure.source)
             }
         }
@@ -837,18 +1708,29 @@ impl AppClient {
 
     /// Synchronize while retaining the durably applied prefix on failure.
     pub async fn sync_with_partial_progress(&mut self) -> Result<SyncSummary, SyncFailure> {
-        self.sync_with_classified_partial_progress()
-            .await
-            .map_err(SyncFailure::from)
+        match self.sync_inner(None).await {
+            Ok(()) => match self.finalize_direct_sync_summary().await {
+                Ok(summary) => Ok(summary),
+                Err(source) => {
+                    let partial_summary =
+                        self.take_reportable_checkpointed_sync_summary_for_failure();
+                    Err(SyncFailure::new(partial_summary, source))
+                }
+            },
+            Err(mut failure) => {
+                self.merge_checkpointed_visibility_into_failure(&mut failure);
+                Err(SyncFailure::from(failure))
+            }
+        }
     }
 
     pub(crate) async fn sync_with_classified_partial_progress(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(None).await {
-            Ok(summary) => Ok(summary),
+            Ok(()) => Ok(self.take_checkpointed_sync_summary_or_default()),
             Err(mut failure) => {
-                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
+                self.merge_checkpointed_visibility_into_failure(&mut failure);
                 Err(failure)
             }
         }
@@ -859,9 +1741,9 @@ impl AppClient {
         telemetry: &AppPerformanceTelemetry,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(Some(telemetry)).await {
-            Ok(summary) => Ok(summary),
+            Ok(()) => Ok(self.take_checkpointed_sync_summary_or_default()),
             Err(mut failure) => {
-                self.drain_epoch_stall_escalations(&mut failure.partial_summary);
+                self.merge_checkpointed_visibility_into_failure(&mut failure);
                 Err(failure)
             }
         }
@@ -870,7 +1752,16 @@ impl AppClient {
     async fn sync_inner(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+    ) -> Result<(), ClassifiedSyncFailure> {
+        self.replay_pending_account_visibility()
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
@@ -930,38 +1821,40 @@ impl AppClient {
         // A complete startup/catch-up rebuild satisfies any older deferred
         // refresh intent before this pass starts ingesting new deliveries.
         self.pending_runtime_group_subscription_refresh = false;
+        self.pending_uncheckpointed_runtime_group_subscription_refresh = false;
         // Both the inbox/group activation and the group-subscription refresh
         // have now registered on relays; emit the rebuild audit row from the
         // drained registration log before draining inbound deliveries.
         self.record_subscription_rebuild(rebuild_since_secs).await;
-        let mut counts = DrainCounts::default();
-        let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
-        if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
-            self.recover_delivery_overflow_and_merge(&mut summary)
-                .await?;
+        // Drain effects that existed before this relay pass into V1 first. The
+        // relay checkpoint below then commits them in the same transaction as
+        // any newly received prefix. This deliberately leaves no network await
+        // after V1 has been promoted to process-local V2.
+        //
+        // Session `open()` hydration queues `GroupHydrationQuarantined` without
+        // an inbound delivery (mdk#426). Folding those events here keeps them
+        // visible even when the later relay drain is quiet.
+        if let Err(error) = self.drain_pending_session_events_staged().await {
+            return Err(ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                error,
+                SyncFailureStage::Unknown,
+            ));
         }
-        // Surface engine events queued without an inbound delivery — most
-        // importantly `GroupHydrationQuarantined`, queued during session
-        // `open()` hydration (mdk#426). If no relay delivery arrived
-        // above, `sync_sdk_relay` never drained the engine, so these would stay
-        // buffered and invisible to runtime subscribers until some later
-        // unrelated send/ingest. Fold any pending events into this summary.
-        let drained = match self.drain_pending_session_events().await {
-            Ok(drained) => drained,
-            Err(error) => {
-                // This composite drain spans engine drain, app-state reads,
-                // publish checks, and projection. Its AppError does not retain
-                // the inner boundary, so do not infer a stage from the cause.
-                return Err(ClassifiedSyncFailure::at_stage(
-                    summary,
-                    error,
-                    SyncFailureStage::Unknown,
-                ));
-            }
-        };
-        summary.merge(drained);
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
+        let mut counts = DrainCounts::default();
+        let drain_verdict = self.sync_sdk_relay(&mut counts).await?;
+        if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
+            let mut recovered = SyncSummary::default();
+            self.recover_delivery_overflow_and_merge(&mut recovered)
+                .await?;
+            self.retain_checkpointed_sync_summary(recovered);
+        }
+        #[cfg(test)]
+        if let Some((entered, release)) = self.block_after_sync_prefix_checkpoint.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
+        Ok(())
     }
 
     /// Drain engine events that were queued without an inbound transport
@@ -977,16 +1870,81 @@ impl AppClient {
     /// reference a not-yet-live (quarantined) group must not abort the drain —
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
-        let effects = self.runtime.drain().await?;
-        self.observe_drained_session_events(&effects).await
+        self.drain_pending_session_events_staged().await?;
+        self.checkpoint_pending_sync_visibility()?;
+        Ok(self.take_checkpointed_sync_summary_or_default())
+    }
+
+    /// Nested drain used by sync/backfill/repair. It stages visibility V1 but
+    /// does not save or take V2: the following relay-prefix checkpoint owns the
+    /// one durable commit, so no acknowledged output crosses another await.
+    async fn drain_pending_session_events_staged(&mut self) -> Result<(), AppError> {
+        // A lower drain creates a new durable source operation before it
+        // returns. Finish any older source-attributed suffix first so a replay
+        // projection error cannot be hidden behind (or rebound to) that new
+        // Drain operation. Replay handlers only project/checkpoint supplied
+        // effects; none calls this lower drain entry again.
+        self.replay_pending_account_visibility().await?;
+        let leased = self.runtime.drain_leased().await?;
+        self.install_account_visibility_lease(
+            leased.lease,
+            leased.batches,
+            leased.current_operation_id,
+        );
+        let effects = leased.effects;
+        self.project_current_account_non_session_visibility(&effects, None)?;
+        match self.observe_drained_session_events_staged(&effects) {
+            Ok(()) => {
+                self.stage_current_account_visibility_header_batch();
+                Ok(())
+            }
+            Err(error) => {
+                // The observer retains every fully projected event in V1 as it
+                // goes. Promote that exact prefix before returning an error so
+                // classified sync failure publication cannot overtake it.
+                self.checkpoint_pending_sync_visibility()?;
+                Err(error)
+            }
+        }
     }
 
     /// Project one drained batch of engine events, split from the drain itself
     /// so the projection is exercisable against a given batch of effects.
+    #[cfg(test)]
     pub(crate) async fn observe_drained_session_events(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        // Mirror `drain_pending_session_events_staged`: NonSession owns
+        // report/fanout/app-message projection, then events project in order,
+        // and Header is staged only after the complete source handler.
+        self.project_current_account_non_session_visibility(effects, None)?;
+        match self.observe_drained_session_events_staged(effects) {
+            Ok(()) => self.stage_current_account_visibility_header_batch(),
+            Err(error) => {
+                self.checkpoint_pending_sync_visibility()?;
+                return Err(error);
+            }
+        }
+        self.checkpoint_pending_sync_visibility()?;
+        Ok(self.take_checkpointed_sync_summary_or_default())
+    }
+
+    pub(super) fn observe_drained_session_events_staged(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        self.observe_drained_session_events_staged_at(
+            effects,
+            self.current_account_visibility_observed_at(),
+        )
+    }
+
+    pub(super) fn observe_drained_session_events_staged_at(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_received_at: u64,
+    ) -> Result<(), AppError> {
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
@@ -999,15 +1957,15 @@ impl AppClient {
         // because it is a field mutation plus a durable audit row, not summary
         // state. The two conditions are correlated rather than independent: this
         // drain publishes, so the failure and the refusal ride the same effects.
-        self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
-        let mut summary = SyncSummary::default();
+        self.observe_recovery_evidence(effects)?;
+        let publish_error = fail_if_publish_failed(effects).err();
         if effects.events.is_empty() {
-            self.drain_epoch_stall_escalations(&mut summary);
-            return Ok(summary);
+            return match publish_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         }
         let display_names = self.app.display_names_by_id()?;
-        let source_received_at = unix_now_seconds();
         // Hydration re-emits a stored group's `GroupDisbanded` on every open
         // (`restore_disband_tombstone`), and that replay is the only reconciler
         // left for a disband whose live-session projection never completed — a
@@ -1023,8 +1981,8 @@ impl AppClient {
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
-        let mut gossip_message_ids = HashSet::new();
         for event in &effects.events {
+            let mut event_summary = SyncSummary::default();
             // A replayed application event has no outer relay envelope, but its
             // durable engine outbox key is stable and unique. Use that key as
             // the synthetic source so a crash can replay several pending
@@ -1058,6 +2016,9 @@ impl AppClient {
             {
                 routes_dirty |= changed;
                 self.prepare_pending_application_event_ack(event);
+                self.remember_uncheckpointed_runtime_group_subscription_refresh(changed);
+                self.retain_uncheckpointed_sync_summary(event_summary);
+                self.stage_current_account_visibility_event(event);
                 continue;
             }
             let before = self.state.groups.len();
@@ -1074,7 +2035,7 @@ impl AppClient {
             if let Some(message) = observe_event(
                 &mut self.state,
                 &display_names,
-                &mut summary,
+                &mut event_summary,
                 event,
                 group_projection.as_ref(),
                 &source_message_id_hex,
@@ -1082,9 +2043,11 @@ impl AppClient {
                 None,
                 self.app.allow_loopback_blob_endpoints(),
             ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), &mut summary)?
+                self.project_received_message(message, group_metadata.as_ref(), &mut event_summary)?
             {
-                gossip_message_ids.insert(gossip_message_id);
+                event_summary
+                    .messages
+                    .retain(|message| message.message_id_hex != gossip_message_id);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1099,8 +2062,12 @@ impl AppClient {
                 updated_group.as_ref(),
                 &source_message_id_hex,
             );
-            routes_dirty |=
-                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary)?;
+            let event_routes_dirty = self.observe_event_projection_effects(
+                event,
+                &local_account_id_hex,
+                &mut event_summary,
+            )?;
+            routes_dirty |= event_routes_dirty;
             let can_ack_application_event = if crosses_frontier {
                 self.prepare_local_group_deletion_frontier_clear(
                     event,
@@ -1111,37 +2078,27 @@ impl AppClient {
             };
             if can_ack_application_event {
                 self.prepare_pending_application_event_ack(event);
+                self.stage_current_account_visibility_event(event);
             }
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
-        }
-        if !gossip_message_ids.is_empty() {
-            summary
-                .messages
-                .retain(|message| !gossip_message_ids.contains(&message.message_id_hex));
+            self.remember_uncheckpointed_runtime_group_subscription_refresh(
+                event_routes_dirty || self.state.groups.len() != before,
+            );
+            // The event is now fully projected. Move its only summary copy to
+            // V1 before the next loop iteration can hit another fallible seam.
+            self.retain_uncheckpointed_sync_summary(event_summary);
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
-        // Reconcile transport routes once after the batch drains instead of per
-        // membership-changing event. This installs a join's current route and
-        // retains any still-live address displaced by a routing rotation.
-        let routes_changed = self.refresh_group_routes()?.routing_changed;
-        if (routes_dirty || routes_changed)
-            && let Err(error) = self.sync_runtime_groups().await
-        {
-            self.pending_failed_sync_summary.merge(summary);
-            return Err(error);
+        // Record the routing obligation once after the batch drains instead of
+        // reconciling per membership-changing event. The outer checkpoint does
+        // the one route refresh and state save for this staged batch.
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(routes_dirty);
+        match publish_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
-            // The engine outbox remains unacknowledged. A reopened client will
-            // replay it; a retained client instead checkpoints the projected
-            // state on its next sync and returns this deferred summary once.
-            self.pending_failed_sync_summary.merge(summary);
-            return Err(error);
-        }
-        summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
     }
 
     /// Observe group events the engine applied as a side effect of an outbound
@@ -1169,8 +2126,8 @@ impl AppClient {
         // Synthetic source identity: these events have no single inbound
         // transport message (see `drain_pending_session_events`).
         let source_message_id_hex = String::new();
-        let source_received_at = unix_now_seconds();
-        let routes_dirty = self
+        let source_received_at = self.current_account_visibility_observed_at();
+        let routes_dirty = match self
             .observe_account_device_effects(
                 effects,
                 &display_names,
@@ -1179,12 +2136,21 @@ impl AppClient {
                 source_received_at,
                 None,
             )
-            .await?;
-        let routes_changed = self.refresh_group_routes()?.routing_changed;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
-        }
+            .await
+        {
+            Ok(routes_dirty) => routes_dirty,
+            Err(error) => {
+                self.pending_applied_sync_summary.merge(summary);
+                return Err(error);
+            }
+        };
+        // Own every fully projected event before route reconciliation or relay
+        // I/O can fail/cancel. The worker drains this aggregate after the send,
+        // while its ordinary state save commits any staged app-event ACKs.
         self.pending_applied_sync_summary.merge(summary);
+        self.pending_runtime_group_subscription_refresh |= routes_dirty;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
+        self.pending_runtime_group_subscription_refresh |= routes_changed;
         Ok(())
     }
 
@@ -1195,14 +2161,18 @@ impl AppClient {
     pub(crate) async fn observe_send_applied_effects_best_effort(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
-    ) {
-        if let Err(_err) = self.observe_send_applied_effects(effects).await {
-            tracing::warn!(
-                target: "marmot_app::messages",
-                method = "observe_send_applied_effects",
-                error_code = "send_applied_observe_failed",
-                "failed to observe group events applied during a send"
-            );
+    ) -> bool {
+        match self.observe_send_applied_effects(effects).await {
+            Ok(()) => true,
+            Err(_err) => {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "observe_send_applied_effects",
+                    error_code = "send_applied_observe_failed",
+                    "failed to observe group events applied during a send"
+                );
+                false
+            }
         }
     }
 
@@ -1244,8 +2214,95 @@ impl AppClient {
         })
     }
 
+    /// Finish one direct receive batch after its projection has committed.
+    ///
+    /// Only batches the historical `next_event` return predicate would expose
+    /// occupy the retention slot. That includes an empty summary when pending
+    /// convergence or epoch backfill needs to wake the caller. Occupancy is set
+    /// before the relay await, so cancellation cannot collapse that meaningful
+    /// empty batch back into "nothing pending".
+    async fn finalize_direct_next_event_summary(
+        &mut self,
+        summary: SyncSummary,
+    ) -> Result<Option<SyncSummary>, AppError> {
+        let should_return = summary != SyncSummary::default()
+            || !self.pending_convergence_groups.is_empty()
+            || self.has_pending_epoch_backfill();
+        if should_return {
+            self.retain_checkpointed_sync_summary(summary);
+        }
+
+        // A directly-owned AppClient has no account-worker scheduler to perform
+        // the post-visibility retry. Preserve its historical readiness contract
+        // when possible, but never hide an already-durable returnable batch
+        // behind a later relay failure.
+        if let Err(error) = self
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+        {
+            return self.direct_next_event_summary_after_refresh_error(error);
+        }
+        Ok(self.take_pending_checkpointed_sync_summary())
+    }
+
+    /// A nonempty committed batch remains more useful than a later route error,
+    /// so hand it to the caller and leave the retry armed. An empty batch is only
+    /// an internal wake edge; retain its occupied slot and surface the route
+    /// error until readiness succeeds, then return that wake exactly once.
+    fn direct_next_event_summary_after_refresh_error(
+        &mut self,
+        error: AppError,
+    ) -> Result<Option<SyncSummary>, AppError> {
+        if self
+            .pending_checkpointed_sync_summary
+            .as_ref()
+            .is_some_and(|summary| summary != &SyncSummary::default())
+        {
+            let summary = self
+                .take_pending_checkpointed_sync_summary()
+                .expect("checked occupied direct next-event summary");
+            tracing::warn!(
+                target: "marmot_app",
+                method = "next_event",
+                error_kind = error.privacy_safe_kind(),
+                "returning durable receive output while group-subscription refresh remains pending"
+            );
+            return Ok(Some(summary));
+        }
+        Err(error)
+    }
+
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
+            self.replay_pending_account_visibility().await?;
+            // A prior direct ingest can be cancelled (or fail route
+            // reconciliation) after projection but before its first save. Do
+            // not wait for another delivery: finish that staged checkpoint and
+            // promote V1 before any receive await.
+            if self.pending_uncheckpointed_sync_summary.is_some() {
+                let refresh = self.refresh_group_routes()?;
+                self.remember_uncheckpointed_runtime_group_subscription_refresh(
+                    refresh.routing_changed,
+                );
+                self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            }
+            // Finish an older durable refresh before accepting another
+            // delivery. A retained batch is returned immediately afterward, so
+            // relay readiness and app-visible output stay in commit order.
+            if self.has_pending_runtime_group_subscription_refresh()
+                && let Err(error) = self
+                    .retry_pending_runtime_group_subscription_refresh()
+                    .await
+            {
+                match self.direct_next_event_summary_after_refresh_error(error) {
+                    Ok(Some(summary)) => return Ok(summary),
+                    Ok(None) => unreachable!("refresh failure cannot synthesize no summary"),
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(summary) = self.take_pending_checkpointed_sync_summary() {
+                return Ok(summary);
+            }
             let summary = match self.receive_next_delivery().await? {
                 crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => {
                     self.ingest_received_delivery(*delivery).await?
@@ -1254,31 +2311,21 @@ impl AppClient {
                     let mut summary = SyncSummary::default();
                     match self.recover_delivery_overflow_and_merge(&mut summary).await {
                         Ok(()) => summary,
-                        Err(failure) => {
-                            self.pending_failed_sync_summary
-                                .merge(failure.partial_summary);
+                        Err(mut failure) => {
+                            self.merge_checkpointed_visibility_into_failure(&mut failure);
+                            self.retain_checkpointed_sync_summary(failure.partial_summary);
                             return Err(failure.source);
                         }
                     }
                 }
             };
-            // A directly-owned AppClient has no account-worker scheduler to
-            // perform the post-visibility retry. Preserve its historical
-            // contract by completing the pending rebuild before handing the
-            // summary to its caller; the managed worker uses the lower-level
-            // ingest method and owns the background retry instead.
-            self.retry_pending_runtime_group_subscription_refresh()
-                .await?;
-            if summary.joined_groups.is_empty()
-                && summary.messages.is_empty()
-                && summary.events.is_empty()
-                && summary.epoch_stall_escalations.is_empty()
-                && self.pending_convergence_groups.is_empty()
-                && !self.has_pending_epoch_backfill()
-            {
-                continue;
+            // The ingest checkpoint and engine-outbox acknowledgements are
+            // already durable. Finalization retains a returnable batch before
+            // its first relay await so cancellation cannot strand it on this
+            // stack.
+            if let Some(summary) = self.finalize_direct_next_event_summary(summary).await? {
+                return Ok(summary);
             }
-            return Ok(summary);
         }
     }
 
@@ -1347,6 +2394,11 @@ impl AppClient {
             // of the marker that represents the omitted older delivery.
             self.state.last_transport_timestamp = cursor_before_secs;
         }
+        // `ingest_delivery` has fully projected this delivery. Transfer its
+        // only app-visible copy to V1 before the first save/route-refresh
+        // boundary, including an occupied empty wake batch.
+        self.retain_uncheckpointed_sync_summary(summary);
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(ingested.routes_dirty);
         // Mark the delivery seen only after durable ingest succeeds, matching
         // the catch-up drain below. Marking at receive time would let a failed
         // ingest poison the index, so a reused client would silently skip the
@@ -1369,27 +2421,17 @@ impl AppClient {
         // routing-table delta lives in memory and obligates a subscription
         // refresh, not a second identical state write.
         if !routes_dirty || refresh.state_pruned {
+            self.remember_uncheckpointed_runtime_group_subscription_refresh(
+                refresh.routing_changed,
+            );
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        } else {
+            // The first save already checkpointed this batch. A routing-only
+            // refresh needs no second state write, so arm its runtime intent
+            // directly on the checkpointed side.
+            self.pending_runtime_group_subscription_refresh |= refresh.routing_changed;
         }
-        self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
-    }
-
-    fn checkpoint_error_stage_and_cursor(
-        &self,
-        error: &SyncCheckpointError,
-        cursor_before_secs: Option<u64>,
-    ) -> (SyncFailureStage, Option<u64>) {
-        match error {
-            SyncCheckpointError::BeforePersistence(_) => {
-                (SyncFailureStage::StatePersist, cursor_before_secs)
-            }
-            SyncCheckpointError::AfterPersistence(_) => (
-                SyncFailureStage::GroupSubscriptionSync,
-                self.state.last_transport_timestamp,
-            ),
-        }
+        Ok(self.take_checkpointed_sync_summary_or_default())
     }
 
     /// Drain the transport for an ordinary floored sync: ingest what is waiting
@@ -1397,7 +2439,7 @@ impl AppClient {
     async fn sync_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
-    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
+    ) -> Result<DrainVerdict, ClassifiedSyncFailure> {
         self.drain_sdk_relay(counts, DrainCompletion::Quiescence)
             .await
     }
@@ -1409,7 +2451,7 @@ impl AppClient {
     async fn backfill_sdk_relay(
         &mut self,
         counts: &mut DrainCounts,
-    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
+    ) -> Result<DrainVerdict, ClassifiedSyncFailure> {
         let execution_quantum = self.epoch_backfill_execution_quantum();
         let completion = DrainCompletion::EndOfStoredEvents {
             silence_budget: self.epoch_backfill_eose_wait(),
@@ -1463,9 +2505,10 @@ impl AppClient {
             ));
         }
         self.pending_runtime_group_subscription_refresh = false;
+        self.pending_uncheckpointed_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
         let mut counts = DrainCounts::default();
-        let (summary, verdict) = match self
+        let verdict = match self
             .drain_sdk_relay(
                 &mut counts,
                 DrainCompletion::EndOfStoredEvents {
@@ -1481,6 +2524,7 @@ impl AppClient {
                 return Err(error);
             }
         };
+        let summary = self.take_checkpointed_sync_summary_or_default();
         if verdict == DrainVerdict::Complete
             && let Some(recovery_elapsed_ms) =
                 self.adapter.finish_delivery_overflow_recovery(attempt)
@@ -1518,8 +2562,6 @@ impl AppClient {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "account delivery overflow recovery completed",
             );
-            let mut summary = summary;
-            self.drain_epoch_stall_escalations(&mut summary);
             return Ok(DeliveryOverflowRecoveryOutcome::Completed(summary));
         }
 
@@ -1662,7 +2704,7 @@ impl AppClient {
         &mut self,
         counts: &mut DrainCounts,
         completion: DrainCompletion,
-    ) -> Result<(SyncSummary, DrainVerdict), ClassifiedSyncFailure> {
+    ) -> Result<DrainVerdict, ClassifiedSyncFailure> {
         // These are local app-state reads before the relay receive loop. They
         // are not failures of the account-worker command boundary.
         let display_names = self.app.display_names_by_id().map_err(|error| {
@@ -1684,7 +2726,6 @@ impl AppClient {
                 )
             })?
             .account_id_hex;
-        let mut summary = SyncSummary::default();
         let mut first_wait = true;
         // Forensic drain accounting: wall-clock span, deliveries actually
         // ingested and receives skipped as echo or duplicate (counted apart, so
@@ -1739,7 +2780,6 @@ impl AppClient {
                         self.state.last_transport_timestamp = cursor_before_secs;
                         return Err(self
                             .finish_failed_sync_drain(
-                                summary,
                                 routes_dirty,
                                 counts.clone(),
                                 StagedSyncError::new(error, SyncFailureStage::StatePersist),
@@ -1761,7 +2801,6 @@ impl AppClient {
                 Ok(Err(error)) => {
                     return Err(self
                         .finish_failed_sync_drain(
-                            summary,
                             routes_dirty,
                             counts.clone(),
                             StagedSyncError::new(error.into(), SyncFailureStage::RelayReceive),
@@ -1818,7 +2857,6 @@ impl AppClient {
             {
                 return Err(self
                     .finish_failed_sync_drain(
-                        summary,
                         routes_dirty,
                         counts.clone(),
                         StagedSyncError::new(
@@ -1839,7 +2877,6 @@ impl AppClient {
                 Err(error) => {
                     return Err(self
                         .finish_failed_sync_drain(
-                            summary,
                             routes_dirty,
                             counts.clone(),
                             StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
@@ -1866,9 +2903,17 @@ impl AppClient {
             if !ingested.must_stay_fetchable {
                 self.remember_seen_event(event_id);
             }
+            // `ingest_delivery` has fully projected this delivery. Make V1 its
+            // sole summary owner before any later receive/checkpoint await.
+            self.retain_uncheckpointed_sync_summary(delivery_summary);
+            self.remember_uncheckpointed_runtime_group_subscription_refresh(ingested.routes_dirty);
             counts.deliveries = counts.deliveries.saturating_add(1);
-            summary.merge(delivery_summary);
             routes_dirty |= ingested.routes_dirty;
+            #[cfg(test)]
+            if let Some((entered, release)) = self.block_after_sync_delivery_projection.take() {
+                entered.notify_one();
+                release.notified().await;
+            }
         };
 
         if verdict != DrainVerdict::Overflow
@@ -1881,7 +2926,6 @@ impl AppClient {
             if let Err(error) = self.observe_delivery_overflow(overflow) {
                 return Err(self
                     .finish_failed_sync_drain(
-                        summary,
                         routes_dirty,
                         counts.clone(),
                         StagedSyncError::new(error, SyncFailureStage::StatePersist),
@@ -1893,20 +2937,18 @@ impl AppClient {
             verdict = DrainVerdict::Overflow;
         }
 
-        if let Err(error) = self
-            .checkpoint_sync_prefix(&mut summary, routes_dirty, counts.deliveries)
-            .await
-        {
-            let (stage, cursor_after_secs) =
-                self.checkpoint_error_stage_and_cursor(&error, cursor_before_secs);
-            let (summary, source) = self.checkpoint_failure_summary(summary, error);
+        if let Err(source) = self.checkpoint_sync_prefix(routes_dirty, counts.deliveries) {
             self.record_sync_drain(
                 drain_started.elapsed().as_millis() as u64,
                 counts.clone(),
                 cursor_before_secs,
-                cursor_after_secs,
+                cursor_before_secs,
             );
-            return Err(ClassifiedSyncFailure::at_stage(summary, source, stage));
+            return Err(ClassifiedSyncFailure::at_stage(
+                SyncSummary::default(),
+                source,
+                SyncFailureStage::StatePersist,
+            ));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -1914,51 +2956,41 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        Ok((summary, verdict))
+        Ok(verdict)
     }
 
     async fn finish_failed_sync_drain(
         &mut self,
-        mut summary: SyncSummary,
         routes_dirty: bool,
         counts: DrainCounts,
         original: StagedSyncError,
         drain_started: std::time::Instant,
         cursor_before_secs: Option<u64>,
     ) -> ClassifiedSyncFailure {
-        let (source, stage, cursor_after_secs) = match self
-            .checkpoint_sync_prefix(&mut summary, routes_dirty, counts.deliveries)
-            .await
-        {
-            Ok(()) => (
-                original.source,
-                original.stage,
-                self.state.last_transport_timestamp,
-            ),
-            Err(error) => {
-                let (stage, cursor_after_secs) =
-                    self.checkpoint_error_stage_and_cursor(&error, cursor_before_secs);
-                let (retained_summary, checkpoint_error) =
-                    self.checkpoint_failure_summary(summary, error);
-                summary = retained_summary;
-                (checkpoint_error, stage, cursor_after_secs)
-            }
-        };
+        let (source, stage, cursor_after_secs) =
+            match self.checkpoint_sync_prefix(routes_dirty, counts.deliveries) {
+                Ok(()) => (
+                    original.source,
+                    original.stage,
+                    self.state.last_transport_timestamp,
+                ),
+                Err(error) => (error, SyncFailureStage::StatePersist, cursor_before_secs),
+            };
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
             counts,
             cursor_before_secs,
             cursor_after_secs,
         );
-        ClassifiedSyncFailure::at_stage(summary, source, stage)
+        ClassifiedSyncFailure::at_stage(SyncSummary::default(), source, stage)
     }
 
-    async fn checkpoint_sync_prefix(
+    fn checkpoint_sync_prefix(
         &mut self,
-        summary: &mut SyncSummary,
         routes_dirty: bool,
         deliveries: u64,
-    ) -> Result<(), SyncCheckpointError> {
+    ) -> Result<(), AppError> {
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(routes_dirty);
         // The checkpoint re-runs `refresh_group_routes` only when the drained
         // prefix could have changed routing: deliveries advance epochs (which
         // gate prior-route pruning) and can mark groups disbanded. With zero
@@ -1966,15 +2998,17 @@ impl AppClient {
         // byte-identical to what the sync-start refresh already read, so the
         // recomputation here would rescan every group only to install the same
         // routing snapshot (mdk#1380).
-        let routes_changed = if deliveries > 0 || routes_dirty {
+        let routes_changed = if deliveries > 0
+            || routes_dirty
+            || self.pending_uncheckpointed_runtime_group_subscription_refresh
+        {
             self.checkpoint_route_refresh_recomputes =
                 self.checkpoint_route_refresh_recomputes.saturating_add(1);
-            self.refresh_group_routes()
-                .map_err(SyncCheckpointError::BeforePersistence)?
-                .routing_changed
+            self.refresh_group_routes()?.routing_changed
         } else {
             false
         };
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(routes_changed);
         let checkpointed_before = self.checkpointed_transport_timestamp;
         if self.adapter.pending_delivery_overflow().is_none() {
             self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
@@ -1994,44 +3028,13 @@ impl AppClient {
         };
         if let Err(error) = checkpoint {
             self.checkpointed_transport_timestamp = checkpointed_before;
-            return Err(SyncCheckpointError::BeforePersistence(error));
+            return Err(error);
         }
 
-        summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
-
-        if routes_dirty || routes_changed {
-            match self.sync_runtime_groups().await {
-                Ok(()) => self.pending_runtime_group_subscription_refresh = false,
-                Err(error) => {
-                    // The projection and route checkpoint above are durable.
-                    // Retain an explicit retry edge so the worker repairs the
-                    // ordinary subscriptions without replaying this prefix or
-                    // waiting for another catch-up trigger.
-                    self.pending_runtime_group_subscription_refresh = true;
-                    return Err(SyncCheckpointError::AfterPersistence(error));
-                }
-            }
-        }
+        // Projection, cursor, and application-event acknowledgements are now
+        // durable, and the common save moved their bounded aggregate to V2.
+        // Relay I/O belongs to the direct wrapper or managed scheduler.
         Ok(())
-    }
-
-    fn checkpoint_failure_summary(
-        &mut self,
-        summary: SyncSummary,
-        error: SyncCheckpointError,
-    ) -> (SyncSummary, AppError) {
-        match error {
-            SyncCheckpointError::BeforePersistence(source) => {
-                // Message/join projections from this drain are not reportable
-                // until their checkpoint commits. Keep one-shot epoch-stall
-                // escalations pending here: partial-progress entry points drain
-                // them into the failure, while compatibility `sync()` leaves
-                // them available for the retained client's next success.
-                self.pending_failed_sync_summary.merge(summary);
-                (SyncSummary::default(), source)
-            }
-            SyncCheckpointError::AfterPersistence(source) => (summary, source),
-        }
     }
 
     fn record_transport_reconciliation_item(
@@ -2086,19 +3089,51 @@ impl AppClient {
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
             transport_reconciliation_record(self.adapter.account_id(), &delivery);
-        let effects = self.runtime.ingest_delivery(delivery).await?;
-        let publish_error = fail_if_publish_failed(&effects.effects).err();
+        let effects = self.runtime.ingest_delivery_leased(delivery).await?;
+        self.install_account_visibility_lease(
+            effects.lease,
+            effects.batches,
+            effects.current_operation_id,
+        );
         let must_stay_fetchable = effects.left_object_unpersisted;
         if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
             self.record_transport_reconciliation_item(route, item);
         }
-        let refused_group = match &effects.outcome {
+        self.project_source_attributed_inbound_visibility(
+            &effects.outcome,
+            &effects.effects,
+            display_names,
+            summary,
+            &source_message_id_hex,
+            source_received_at,
+            outer_transport_at,
+            group_id_hint,
+            must_stay_fetchable,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn project_source_attributed_inbound_visibility(
+        &mut self,
+        outcome: &IngestOutcome,
+        effects: &marmot_account::AccountDeviceEffects,
+        display_names: &HashMap<String, String>,
+        summary: &mut SyncSummary,
+        source_message_id_hex: &str,
+        source_received_at: u64,
+        outer_transport_at: u64,
+        group_id_hint: Option<cgka_traits::GroupId>,
+        must_stay_fetchable: bool,
+    ) -> Result<DeliveryIngest, AppError> {
+        let publish_error = fail_if_publish_failed(effects).err();
+        let refused_group = match outcome {
             IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
-        self.remember_buffered_convergence_outcome(&effects.outcome);
-        self.remember_pending_convergence_groups(&effects.effects);
-        self.observe_recovery_evidence(&effects.effects);
+        self.remember_buffered_convergence_outcome(outcome);
+        self.remember_pending_convergence_groups(effects);
+        self.observe_recovery_evidence(effects)?;
         // The cursor is held back only by a resource refusal, which is
         // narrower than `must_stay_fetchable` on purpose.
         //
@@ -2120,34 +3155,14 @@ impl AppClient {
         if refused_group.is_none() {
             self.remember_transport_cursor(outer_transport_at);
         }
-        self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
-        // A delivery can contain several application events. If projection
-        // fails after an earlier event staged its acknowledgement, keep that
-        // event in the durable engine outbox so a retained or reopened client
-        // can replay its live summary. Recording only candidates absent before
-        // this delivery avoids cloning the whole accumulated acknowledgement
-        // set on every catch-up step.
-        let new_application_event_ack_candidates = effects
-            .effects
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
-                    Some(message_id.clone())
-                }
-                cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
-                    Some(via_welcome.clone())
-                }
-                _ => None,
-            })
-            .filter(|event_id| !self.pending_application_event_acks.contains(event_id))
-            .collect::<Vec<_>>();
+        self.detect_epoch_stall(group_id_hint, source_message_id_hex, outcome)?;
+        self.project_current_account_non_session_visibility(effects, None)?;
         let routes_dirty = match self
             .observe_account_device_effects(
-                &effects.effects,
+                effects,
                 display_names,
                 summary,
-                &source_message_id_hex,
+                source_message_id_hex,
                 source_received_at,
                 Some(outer_transport_at),
             )
@@ -2155,9 +3170,13 @@ impl AppClient {
         {
             Ok(routes_dirty) => routes_dirty,
             Err(error) => {
-                for event_id in new_application_event_ack_candidates {
-                    self.pending_application_event_acks.remove(&event_id);
-                }
+                // `observe_account_device_effects` merges only events whose
+                // projection and ACK staging fully completed. Move that exact
+                // prefix into V1 before the failed delivery unwinds; the sync
+                // failure checkpoint will commit it and return it before the
+                // AccountError. The incomplete current event keeps no ACK and
+                // remains replayable from the engine outbox.
+                self.retain_uncheckpointed_sync_summary(std::mem::take(summary));
                 return Err(error);
             }
         };
@@ -2176,6 +3195,7 @@ impl AppClient {
                 "incidental auto-publish failed after inbound effects were projected"
             );
         }
+        self.stage_current_account_visibility_header_batch();
         Ok(DeliveryIngest {
             routes_dirty,
             must_stay_fetchable,
@@ -2197,17 +3217,17 @@ impl AppClient {
         group_id_hint: Option<cgka_traits::GroupId>,
         message_id_hex: &str,
         outcome: &IngestOutcome,
-    ) {
+    ) -> Result<(), AppError> {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
+            return Ok(());
         }
         let Some(group_id) = group_id_hint else {
-            return;
+            return Ok(());
         };
         // A group we cannot resolve (unknown or quarantined) has its own recovery
         // surface; do not track it here.
         let Ok(record) = self.runtime.group_record(&group_id) else {
-            return;
+            return Ok(());
         };
         let now_ms = epoch_stall_now_ms();
         let decision = match outcome {
@@ -2248,7 +3268,7 @@ impl AppClient {
                 IngestOutcome::ResourceRefused { .. } => EpochStallBackfillTrigger::ResourceRefusal,
                 _ => EpochStallBackfillTrigger::UndecryptableThreshold,
             },
-        );
+        )
     }
 
     /// Apply an epoch-stall backfill decision: arm the replay, and record an
@@ -2269,7 +3289,7 @@ impl AppClient {
         stalled_epoch: u64,
         decision: BackfillDecision,
         trigger: EpochStallBackfillTrigger,
-    ) {
+    ) -> Result<(), AppError> {
         if decision.arms_backfill() {
             let durable_intent = storage_sqlite::StoredEpochBackfillIntent {
                 group_id_hex: hex::encode(group_id.as_slice()),
@@ -2310,11 +3330,10 @@ impl AppClient {
                 operation_id: Some(attempt_id),
                 ..AuditEventContext::default()
             };
-            // Record the arm decision before the replay side effect runs (the
-            // worker seam calls run_pending_epoch_backfill after this returns).
-            // Best-effort, fire-and-forget: recording can never block or fail
-            // the backfill.
+            // The executable intent, not only its audit evidence, must be
+            // durable before the worker can start its external replay.
             if record_arm {
+                self.persist_epoch_backfill_intent_journal()?;
                 self.record_epoch_stall_backfill_armed(group_id, stalled_epoch, trigger, &context);
             }
             // The arm mark is what paces the next one, so it has to outlive the
@@ -2335,6 +3354,7 @@ impl AppClient {
                 "apply_backfill_decision",
             );
         }
+        Ok(())
     }
 
     /// Report that repeated full-history replay is not recovering a group.
@@ -2378,14 +3398,14 @@ impl AppClient {
         &mut self,
         intents: Vec<storage_sqlite::StoredEpochBackfillIntent>,
     ) {
-        let mut pending = PendingEpochBackfill::new();
+        let mut table_groups = std::collections::HashMap::new();
         let mut malformed = 0_u64;
         for intent in intents {
             let Ok(group_id) = hex::decode(&intent.group_id_hex) else {
                 malformed = malformed.saturating_add(1);
                 continue;
             };
-            pending.groups.insert(
+            table_groups.insert(
                 cgka_traits::GroupId::new(group_id),
                 PendingEpochBackfillGroup {
                     stalled_epoch: intent.stalled_epoch,
@@ -2400,9 +3420,35 @@ impl AppClient {
                 "ignored malformed durable epoch-gap recovery markers"
             );
         }
-        if !pending.groups.is_empty() {
-            self.pending_epoch_backfill = Some(pending);
+        if table_groups.is_empty() {
+            return;
         }
+        // The singleton journal owns execution order and attempt ids. The
+        // per-group table is only the liveness floor when that journal is empty.
+        let journal_restored = self.pending_epoch_backfill.is_some()
+            || self.active_epoch_backfill.is_some()
+            || !self.queued_epoch_backfills.is_empty();
+        if journal_restored {
+            let known = self
+                .pending_epoch_backfill
+                .iter()
+                .chain(self.active_epoch_backfill.iter())
+                .chain(self.queued_epoch_backfills.iter())
+                .flat_map(|intent| intent.groups.keys().cloned())
+                .collect::<std::collections::HashSet<_>>();
+            let pending = self
+                .pending_epoch_backfill
+                .get_or_insert_with(PendingEpochBackfill::new);
+            for (group_id, group) in table_groups {
+                if !known.contains(&group_id) {
+                    pending.groups.entry(group_id).or_insert(group);
+                }
+            }
+            return;
+        }
+        let mut pending = PendingEpochBackfill::new();
+        pending.groups = table_groups;
+        self.pending_epoch_backfill = Some(pending);
     }
 
     /// Write the detector's frozen-epoch evidence for `groups` to durable
@@ -2542,7 +3588,9 @@ impl AppClient {
     /// the account worker to schedule a forensic audit-tracker upload for the
     /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
     pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
-        self.pending_epoch_backfill.is_some() || !self.queued_epoch_backfills.is_empty()
+        self.pending_epoch_backfill.is_some()
+            || self.active_epoch_backfill.is_some()
+            || !self.queued_epoch_backfills.is_empty()
     }
 
     fn take_next_pending_epoch_backfill(&mut self) -> Option<PendingEpochBackfill> {
@@ -2594,7 +3642,7 @@ impl AppClient {
         &mut self,
         execution: EpochBackfillExecution,
         succeeded: bool,
-    ) {
+    ) -> Result<(), AppError> {
         self.finish_epoch_backfill_execution(
             execution,
             EpochBackfillActivationOutcome::Succeeded,
@@ -2606,7 +3654,8 @@ impl AppClient {
             succeeded.then_some(EpochBackfillCompletionKind::EndOfStoredEvents),
             DrainCounts::default(),
             succeeded,
-        );
+        )
+        .map(|_| ())
     }
 
     /// Complete an execution the way a served end-of-stored-events drain does,
@@ -2630,7 +3679,8 @@ impl AppClient {
                 ..DrainCounts::default()
             },
             true,
-        );
+        )
+        .expect("test epoch-backfill completion must persist its intent journal");
     }
 
     fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
@@ -2664,8 +3714,11 @@ impl AppClient {
     pub(crate) fn begin_epoch_backfill_execution(
         &mut self,
         seam: EpochBackfillExecutionSeam,
-    ) -> Option<EpochBackfillExecution> {
-        let mut pending = self.take_next_pending_epoch_backfill()?;
+    ) -> Result<Option<EpochBackfillExecution>, AppError> {
+        self.recover_active_epoch_backfill_after_cancellation()?;
+        let Some(mut pending) = self.take_next_pending_epoch_backfill() else {
+            return Ok(None);
+        };
         let retry_ordinal = u64::from(pending.execution_attempts);
         let eose_unconfirmed_ordinal = u64::from(pending.eose_unconfirmed_attempts);
         let no_progress_ordinal = u64::from(pending.no_progress_attempts);
@@ -2687,19 +3740,30 @@ impl AppClient {
                 pending.last_deferred_audit = Some(defer_state);
             }
             self.restore_deferred_epoch_backfill(pending);
-            return None;
+            self.persist_epoch_backfill_intent_journal()?;
+            return Ok(None);
         }
         pending.last_deferred_audit = None;
         pending.execution_attempts = pending.execution_attempts.saturating_add(1);
+        self.active_epoch_backfill = Some(pending.clone());
+        if let Err(error) = self.persist_epoch_backfill_intent_journal() {
+            self.active_epoch_backfill = None;
+            if self.pending_epoch_backfill.is_none() {
+                self.pending_epoch_backfill = Some(pending);
+            } else {
+                self.queued_epoch_backfills.push_front(pending);
+            }
+            return Err(error);
+        }
         self.record_epoch_stall_backfill_started(seam, retry_ordinal, &context);
-        Some(EpochBackfillExecution {
+        Ok(Some(EpochBackfillExecution {
             pending,
             epochs_before,
             retry_ordinal,
             eose_unconfirmed_ordinal,
             no_progress_ordinal,
             started: Instant::now(),
-        })
+        }))
     }
 
     fn finish_epoch_backfill_execution(
@@ -2710,7 +3774,16 @@ impl AppClient {
         completion_kind: Option<EpochBackfillCompletionKind>,
         counts: DrainCounts,
         succeeded: bool,
-    ) -> bool {
+    ) -> Result<bool, AppError> {
+        if self
+            .active_epoch_backfill
+            .as_ref()
+            .is_none_or(|active| active.attempt_id != execution.pending.attempt_id)
+        {
+            return Err(AppError::BlockingTask(
+                "epoch-backfill terminal state does not match active intent".to_owned(),
+            ));
+        }
         let duration_ms = execution.started.elapsed().as_millis() as u64;
         let epochs_after = self.capture_pending_group_epochs(&execution.pending);
         let observed_all_groups = epochs_after.len() == execution.pending.groups.len();
@@ -2734,7 +3807,11 @@ impl AppClient {
                 succeeded,
             },
         );
-        if !succeeded {
+        let previous_pending = self.pending_epoch_backfill.clone();
+        let previous_active = self.active_epoch_backfill.clone();
+        let previous_queued = self.queued_epoch_backfills.clone();
+        self.active_epoch_backfill = None;
+        let recovered = if !succeeded {
             // Every error exit of `run_pending_epoch_backfill` lands here
             // without ever producing a drain verdict, so none of the
             // verdict-derived pacing rules in that function runs for it. Pace
@@ -2764,44 +3841,52 @@ impl AppClient {
             let backoff = self.epoch_backfill_retry_backoff(execution.retry_ordinal);
             self.epoch_backfill_retry_not_before = Some(Instant::now() + backoff);
             self.requeue_failed_epoch_backfill_intent(execution.pending);
-            return false;
-        }
-        if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, &counts) {
+            false
+        } else if Self::replay_recovered_something(&execution.epochs_before, &epochs_after, &counts)
+        {
             self.epoch_stall.mark_replayed();
-            return true;
-        }
-        // Fruitless. An end-of-stored-events completion is the relays saying
-        // they served this account's stored history in full and it held nothing
-        // that moves these groups — the one piece of evidence a device wedged
-        // at an epoch nobody can advance is able to accumulate, and the only
-        // completion shape strong enough to count. A drain that gave up
-        // unconfirmed proves only that the drain gave up.
-        if matches!(
-            completion_kind,
-            Some(EpochBackfillCompletionKind::EndOfStoredEvents)
-        ) {
-            let fruitless_threshold = self.epoch_stall.fruitless_completion_threshold();
-            let escalations = self
-                .epoch_stall
-                .observe_fruitless_completion(execution.pending.groups.keys());
-            for escalation in escalations {
-                self.report_epoch_stall_escalation(
-                    &escalation.group_id,
-                    escalation.stalled_epoch,
-                    escalation.completions,
-                    fruitless_threshold,
-                    "finish_epoch_backfill_execution",
-                );
+            true
+        } else {
+            // Fruitless. An end-of-stored-events completion is the relays saying
+            // they served this account's stored history in full and it held nothing
+            // that moves these groups — the one piece of evidence a device wedged
+            // at an epoch nobody can advance is able to accumulate, and the only
+            // completion shape strong enough to count. A drain that gave up
+            // unconfirmed proves only that the drain gave up.
+            if matches!(
+                completion_kind,
+                Some(EpochBackfillCompletionKind::EndOfStoredEvents)
+            ) {
+                let fruitless_threshold = self.epoch_stall.fruitless_completion_threshold();
+                let escalations = self
+                    .epoch_stall
+                    .observe_fruitless_completion(execution.pending.groups.keys());
+                for escalation in escalations {
+                    self.report_epoch_stall_escalation(
+                        &escalation.group_id,
+                        escalation.stalled_epoch,
+                        escalation.completions,
+                        fruitless_threshold,
+                        "finish_epoch_backfill_execution",
+                    );
+                }
+                self.persist_epoch_stall_evidence(execution.pending.groups.keys());
             }
-            self.persist_epoch_stall_evidence(execution.pending.groups.keys());
+            // Withholding `mark_replayed` re-arms bystanders only; the groups this
+            // drain actually refused history for latched themselves when they armed,
+            // so they need an explicit clear or they can never arm again at this
+            // epoch.
+            self.epoch_stall
+                .rearm_refused_groups(&counts.refused_groups);
+            false
+        };
+        if let Err(error) = self.persist_epoch_backfill_intent_journal() {
+            self.pending_epoch_backfill = previous_pending;
+            self.active_epoch_backfill = previous_active;
+            self.queued_epoch_backfills = previous_queued;
+            return Err(error);
         }
-        // Withholding `mark_replayed` re-arms bystanders only; the groups this
-        // drain actually refused history for latched themselves when they armed,
-        // so they need an explicit clear or they can never arm again at this
-        // epoch.
-        self.epoch_stall
-            .rearm_refused_groups(&counts.refused_groups);
-        false
+        Ok(recovered)
     }
 
     /// Whether a completed replay recovered anything, and has therefore earned
@@ -2894,6 +3979,8 @@ impl AppClient {
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
+        self.ensure_epoch_backfill_intent_journal_persisted()?;
+        self.recover_active_epoch_backfill_after_cancellation()?;
         if !self.has_pending_epoch_backfill() {
             return Ok(EpochBackfillRunOutcome::NotPending);
         }
@@ -2908,7 +3995,7 @@ impl AppClient {
         if self.epoch_backfill_retry_is_paced(seam) {
             return Ok(EpochBackfillRunOutcome::Deferred);
         }
-        let Some(mut execution) = self.begin_epoch_backfill_execution(seam) else {
+        let Some(mut execution) = self.begin_epoch_backfill_execution(seam)? else {
             return Ok(EpochBackfillRunOutcome::Deferred);
         };
         if let Err(error) = self.persist_epoch_backfill_intent(&execution.pending) {
@@ -2920,7 +4007,7 @@ impl AppClient {
                 None,
                 DrainCounts::default(),
                 false,
-            );
+            )?;
             return Err(error);
         }
 
@@ -2937,19 +4024,41 @@ impl AppClient {
                         None,
                         DrainCounts::default(),
                         false,
-                    );
+                    )?;
                     return Err(err);
                 }
                 self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
+                // This is a complete activation + group-subscription rebuild,
+                // so it satisfies both older deferred refresh ownership slots
+                // before the replay starts ingesting new history.
+                self.pending_runtime_group_subscription_refresh = false;
+                self.pending_uncheckpointed_runtime_group_subscription_refresh = false;
                 self.record_subscription_rebuild(None).await;
+                if let Err(err) = self.drain_pending_session_events_staged().await {
+                    let terminal_error = err.privacy_safe_kind().to_string();
+                    self.finish_epoch_backfill_execution(
+                        execution,
+                        EpochBackfillActivationOutcome::Succeeded,
+                        Some(terminal_error),
+                        None,
+                        DrainCounts::default(),
+                        false,
+                    )?;
+                    return Err(err);
+                }
                 let mut counts = DrainCounts::default();
                 let retry_ordinal = execution.retry_ordinal;
                 let eose_unconfirmed_ordinal = execution.eose_unconfirmed_ordinal;
                 let no_progress_ordinal = execution.no_progress_ordinal;
-                let (mut summary, verdict) = match self.backfill_sdk_relay(&mut counts).await {
+                let verdict = match self.backfill_sdk_relay(&mut counts).await {
                     Ok(drained) => drained,
-                    Err(err) => {
+                    Err(mut err) => {
                         let terminal_error = err.source.privacy_safe_kind().to_string();
+                        if err.partial_summary != SyncSummary::default() {
+                            self.retain_checkpointed_sync_summary(std::mem::take(
+                                &mut err.partial_summary,
+                            ));
+                        }
                         self.finish_epoch_backfill_execution(
                             execution,
                             EpochBackfillActivationOutcome::Succeeded,
@@ -2957,27 +4066,10 @@ impl AppClient {
                             None,
                             counts,
                             false,
-                        );
-                        self.pending_failed_sync_summary.merge(err.partial_summary);
+                        )?;
                         return Err(err.source);
                     }
                 };
-                let drained = match self.drain_pending_session_events().await {
-                    Ok(drained) => drained,
-                    Err(err) => {
-                        let terminal_error = err.privacy_safe_kind().to_string();
-                        self.finish_epoch_backfill_execution(
-                            execution,
-                            EpochBackfillActivationOutcome::Succeeded,
-                            Some(terminal_error),
-                            None,
-                            counts,
-                            false,
-                        );
-                        return Err(err);
-                    }
-                };
-                summary.merge(drained);
                 // Activation itself succeeded either way; what the verdict
                 // decides is whether the replay it opened actually served this
                 // account's stored history. An unconfirmed drain must not
@@ -3007,8 +4099,7 @@ impl AppClient {
                         None,
                         counts,
                         false,
-                    );
-                    self.pending_failed_sync_summary.merge(summary);
+                    )?;
                     return Err(error);
                 }
                 let recovered = self.finish_epoch_backfill_execution(
@@ -3018,7 +4109,7 @@ impl AppClient {
                     verdict.completion_kind(),
                     counts.clone(),
                     error_kind.is_none(),
-                );
+                )?;
                 if let Some(error_kind) = error_kind {
                     tracing::warn!(
                         target: "marmot_app::epoch_stall",
@@ -3040,7 +4131,9 @@ impl AppClient {
                         };
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(pacing_ordinal))
                     };
-                    return Ok(EpochBackfillRunOutcome::Incomplete(summary));
+                    return Ok(EpochBackfillRunOutcome::Incomplete(
+                        self.take_checkpointed_sync_summary_or_default(),
+                    ));
                 }
                 if recovered {
                     self.epoch_backfill_retry_not_before = None;
@@ -3059,7 +4152,9 @@ impl AppClient {
                     self.epoch_backfill_retry_not_before =
                         Some(Instant::now() + self.epoch_backfill_retry_backoff(retry_ordinal));
                 }
-                Ok(EpochBackfillRunOutcome::Completed(summary))
+                Ok(EpochBackfillRunOutcome::Completed(
+                    self.take_checkpointed_sync_summary_or_default(),
+                ))
             }
             Err(err) => {
                 let app_err: AppError = err.into();
@@ -3071,7 +4166,7 @@ impl AppClient {
                     None,
                     DrainCounts::default(),
                     false,
-                );
+                )?;
                 Err(app_err)
             }
         }
@@ -3082,9 +4177,41 @@ impl AppClient {
     /// participant that has no new traffic capable of arming epoch-stall
     /// detection). Unlike the automatic detector path, this is a caller-owned
     /// operation and therefore does not mutate the detector's debounce state.
+    #[cfg(test)]
     pub(crate) async fn repair_full_history(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.repair_full_history_with_intermediate_handoff(|client, summary| {
+            // A directly-owned client can keep V2 on itself while the explicit
+            // unfloored fallback runs. Cancellation returns the client to its
+            // caller with that visibility still owned; the account worker uses
+            // the sibling API below to publish the prefix synchronously instead.
+            client.retain_checkpointed_sync_summary(summary);
+        })
+        .await
+    }
+
+    /// Run explicit repair while handing any unconfirmed detector-backfill
+    /// prefix to the caller before the unfloored fallback crosses another
+    /// relay await. The managed worker uses this chokepoint to broadcast V2;
+    /// direct callers retain it on the client through [`Self::repair_full_history`].
+    pub(crate) async fn repair_full_history_with_intermediate_handoff(
+        &mut self,
+        mut handoff: impl FnMut(&mut Self, SyncSummary),
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        match self.repair_full_history_inner(&mut handoff).await {
+            Ok(()) => Ok(self.take_checkpointed_sync_summary_or_default()),
+            Err(mut failure) => {
+                self.merge_checkpointed_visibility_into_failure(&mut failure);
+                Err(failure)
+            }
+        }
+    }
+
+    async fn repair_full_history_inner(
+        &mut self,
+        handoff: &mut impl FnMut(&mut Self, SyncSummary),
+    ) -> Result<(), ClassifiedSyncFailure> {
         let refresh = self.refresh_group_routes().map_err(|error| {
             ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
@@ -3132,25 +4259,30 @@ impl AppClient {
                             SyncFailureStage::Unknown,
                         )
                     })? {
-                    EpochBackfillRunOutcome::Completed(mut summary) => {
+                    EpochBackfillRunOutcome::Completed(summary) => {
+                        self.retain_checkpointed_sync_summary(summary);
                         if self.delivery_overflow_recovery_pending {
-                            self.recover_delivery_overflow_and_merge(&mut summary)
+                            let mut recovered = self.take_checkpointed_sync_summary_or_default();
+                            self.recover_delivery_overflow_and_merge(&mut recovered)
                                 .await?;
+                            self.retain_checkpointed_sync_summary(recovered);
                             if self.delivery_overflow_recovery_pending {
+                                let summary = self.take_checkpointed_sync_summary_or_default();
                                 return Err(incomplete_full_history_repair(
                                     summary,
                                     DrainVerdict::Overflow,
                                 ));
                             }
                         }
-                        return Ok(summary);
+                        return Ok(());
                     }
-                    // The intent's own replay could not confirm it served this
-                    // account's history. Retain what it did ingest and fall
-                    // through to the caller-directed unfloored repair below
-                    // rather than re-running the same intent in a tight loop.
+                    // The detector replay did not confirm it served this
+                    // account's history, so its intent remains queued and the
+                    // caller-directed unfloored repair still has work to do.
+                    // Hand off its already-ACKed prefix *before* that second
+                    // relay pass: no V2 may remain future-local across it.
                     EpochBackfillRunOutcome::Incomplete(summary) => {
-                        self.pending_failed_sync_summary.merge(summary);
+                        handoff(self, summary);
                         break;
                     }
                     EpochBackfillRunOutcome::Deferred => continue,
@@ -3186,84 +4318,117 @@ impl AppClient {
             })?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         self.pending_runtime_group_subscription_refresh = false;
+        self.pending_uncheckpointed_runtime_group_subscription_refresh = false;
         self.record_subscription_rebuild(None).await;
+        self.drain_pending_session_events_staged()
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::Unknown,
+                )
+            })?;
         let mut counts = DrainCounts::default();
-        let (mut summary, mut verdict) = self.backfill_sdk_relay(&mut counts).await?;
+        let mut verdict = self.backfill_sdk_relay(&mut counts).await?;
         if verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
-            self.recover_delivery_overflow_and_merge(&mut summary)
+            let mut recovered = self.take_checkpointed_sync_summary_or_default();
+            self.recover_delivery_overflow_and_merge(&mut recovered)
                 .await?;
+            self.retain_checkpointed_sync_summary(recovered);
             verdict = if self.delivery_overflow_recovery_pending {
                 DrainVerdict::Overflow
             } else {
                 DrainVerdict::Complete
             };
         }
-        let drained = match self.drain_pending_session_events().await {
-            Ok(drained) => drained,
-            Err(error) => {
-                // As above, this composite drain has lost its inner boundary.
-                return Err(ClassifiedSyncFailure::at_stage(
-                    summary,
-                    error,
-                    SyncFailureStage::Unknown,
-                ));
-            }
-        };
-        summary.merge(drained);
         if verdict == DrainVerdict::Complete {
-            Ok(summary)
+            Ok(())
         } else {
-            Err(incomplete_full_history_repair(summary, verdict))
+            Err(incomplete_full_history_repair(
+                self.take_checkpointed_sync_summary_or_default(),
+                verdict,
+            ))
         }
     }
 
     pub(crate) async fn advance_convergence_after_runtime_sync(
         &mut self,
         group_id: &cgka_traits::GroupId,
-    ) -> Result<SyncSummary, AppError> {
+    ) -> Result<ScheduledConvergenceVisibility, AppError> {
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
-        let effects = self.runtime.advance_convergence(group_id).await?;
-        self.observe_scheduled_convergence_effects(group_id, &effects)
+        let effects = self.runtime.advance_convergence_leased(group_id).await?;
+        self.install_account_visibility_lease(
+            effects.lease,
+            effects.batches,
+            effects.current_operation_id,
+        );
+        self.checkpoint_scheduled_convergence_effects(group_id, &effects.effects)
             .await
     }
 
     /// Project one scheduled convergence batch's effects, split from the
     /// advance itself so the projection is exercisable against a given batch of
     /// effects.
+    #[cfg(test)]
     pub(crate) async fn observe_scheduled_convergence_effects(
         &mut self,
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        let visibility = self
+            .checkpoint_scheduled_convergence_effects(group_id, effects)
+            .await?;
+        if self.has_pending_runtime_group_subscription_refresh() {
+            self.retry_pending_runtime_group_subscription_refresh()
+                .await?;
+        }
+        self.publish_pending_new_message_notifications_best_effort()
+            .await;
+        Ok(visibility.summary)
+    }
+
+    /// Project and durably checkpoint one scheduled convergence batch without
+    /// awaiting after V1 is promoted. This is the worker-facing half of the
+    /// operation: it returns the only V2 copy immediately so the worker can
+    /// publish it before subscription or notification network work.
+    pub(super) async fn checkpoint_scheduled_convergence_effects(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<ScheduledConvergenceVisibility, AppError> {
+        self.checkpoint_scheduled_convergence_effects_at(
+            group_id,
+            effects,
+            self.current_account_visibility_observed_at(),
+        )
+        .await
+    }
+
+    async fn checkpoint_scheduled_convergence_effects_at(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_received_at: u64,
+    ) -> Result<ScheduledConvergenceVisibility, AppError> {
         self.remember_pending_convergence_groups(effects);
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
-        self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
-        self.remember_published_reports(effects);
-        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
-        let publish_new_message_notification =
-            effects.published_app_messages.iter().any(|published| {
-                let group_id_hex = hex::encode(published.group_id.as_slice());
-                self.app
-                    .reaction_target(&self.state.label, &group_id_hex, &published.app_event_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|message| {
-                        message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                            && !message.deleted
-                            && !message.invalidated
-                    })
-            });
-        self.refresh_group(group_id);
+        self.observe_recovery_evidence(effects)?;
+        let publish_error = fail_if_publish_failed(effects).err();
+        let mut affected_groups =
+            self.project_account_non_session_visibility_at(effects, source_received_at, None)?;
+        affected_groups.insert(group_id.clone());
+        affected_groups.extend(effects.events.iter().filter_map(event_group_id).cloned());
+        for affected_group in &affected_groups {
+            self.refresh_group(affected_group);
+        }
 
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
-        summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
-        let source_received_at = unix_now_seconds();
-        let routes_dirty = self
+        let observe_result = self
             .observe_account_device_effects(
                 effects,
                 &display_names,
@@ -3272,22 +4437,29 @@ impl AppClient {
                 source_received_at,
                 None,
             )
-            .await?;
-        let routes_changed = self.refresh_group_routes()?.routing_changed;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
-        }
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        if publish_new_message_notification {
-            self.publish_notification_trigger_best_effort(
-                group_id,
-                notifications::NotificationTrigger::NewMessage,
-            )
             .await;
+        self.retain_uncheckpointed_sync_summary(summary);
+        let routes_dirty = match observe_result {
+            Ok(routes_dirty) => routes_dirty,
+            Err(error) => {
+                self.checkpoint_pending_sync_visibility()?;
+                return Err(error);
+            }
+        };
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(routes_dirty);
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
+        self.remember_uncheckpointed_runtime_group_subscription_refresh(routes_changed);
+        for affected_group in &affected_groups {
+            self.prune_plaintext_retention_for_group(affected_group)?;
         }
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
+        self.stage_current_account_visibility_header_batch();
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        if let Some(error) = publish_error {
+            return Err(error);
+        }
+        Ok(ScheduledConvergenceVisibility {
+            summary: self.take_checkpointed_sync_summary_or_default(),
+        })
     }
 
     /// Snapshot each affected group's durable local-delete frontier before any
@@ -3488,6 +4660,15 @@ impl AppClient {
         self.pending_application_event_acks.insert(event_id.clone());
     }
 
+    fn discard_pending_application_event_ack(&mut self, event: &cgka_traits::engine::GroupEvent) {
+        let event_id = match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => message_id,
+            cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => via_welcome,
+            _ => return,
+        };
+        self.pending_application_event_acks.remove(event_id);
+    }
+
     pub(crate) fn save_state_with_pending_local_group_deletion_frontier_clears(
         &mut self,
     ) -> Result<(), AppError> {
@@ -3518,6 +4699,11 @@ impl AppClient {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let visibility_batch_ids_to_ack = self
+            .pending_account_visibility_lease
+            .as_ref()
+            .map(|pending| pending.staged_batch_ids.clone())
+            .unwrap_or_default();
         let seen_start = self
             .state
             .seen_events
@@ -3545,23 +4731,62 @@ impl AppClient {
                         &delta,
                         &frontiers_to_clear,
                         &application_event_ids_to_ack,
+                        &visibility_batch_ids_to_ack,
                         group_id_hex,
                     )?,
             )
         } else {
             self.app
-                .save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                .save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
                     &delta,
                     &frontiers_to_clear,
                     &application_event_ids_to_ack,
+                    &visibility_batch_ids_to_ack,
                 )?;
             None
         };
+        self.finish_durably_acknowledged_account_visibility_batches(&visibility_batch_ids_to_ack)?;
         self.pending_seen_event_count = 0;
         self.pending_group_projection_updates.clear();
         self.pending_local_group_deletion_frontier_clears.clear();
         self.pending_application_event_acks.clear();
+        // This save is the single visibility checkpoint for every caller that
+        // staged projection/ACK state. Promote synchronously after commit and
+        // before returning; an intervening unrelated save therefore completes,
+        // rather than loses, an older cancelled operation's V1 batch.
+        self.promote_uncheckpointed_sync_visibility();
         Ok(created_chat_list_row)
+    }
+
+    fn finish_durably_acknowledged_account_visibility_batches(
+        &mut self,
+        acknowledged_batch_ids: &[Vec<u8>],
+    ) -> Result<(), AppError> {
+        if acknowledged_batch_ids.is_empty() {
+            return Ok(());
+        }
+        let Some(lease) = self
+            .pending_account_visibility_lease
+            .as_ref()
+            .map(|pending| pending.lease)
+        else {
+            return Ok(());
+        };
+        self.runtime
+            .forget_durably_acknowledged_visibility_batches(lease, acknowledged_batch_ids)?;
+        let Some(pending) = self.pending_account_visibility_lease.as_mut() else {
+            return Ok(());
+        };
+        pending
+            .batches
+            .retain(|batch| !acknowledged_batch_ids.contains(&batch.batch_id));
+        pending
+            .staged_batch_ids
+            .retain(|batch_id| !acknowledged_batch_ids.contains(batch_id));
+        if pending.batches.is_empty() {
+            self.pending_account_visibility_lease = None;
+        }
+        Ok(())
     }
 
     /// Terminal disposition for accepted-but-unpublished sends (#1177).
@@ -3720,13 +4945,16 @@ impl AppClient {
             .account(&self.state.label)?
             .account_id_hex;
         let mut routes_dirty = false;
-        // #760: collect push-gossip ids and strip them from `summary.messages` in
-        // ONE pass after the loop. The previous per-message `retain` was O(n) per
-        // gossip event → O(n²) over a batch a relay could flood with kind-448s.
-        let mut gossip_message_ids: HashSet<String> = HashSet::new();
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         for event in &effects.events {
+            // An event may mutate in-memory projection state before a later
+            // projection/frontier operation fails. Keep its live summary local
+            // until every fallible boundary and its durable engine-outbox ACK
+            // have succeeded. On error, callers can checkpoint `summary` as the
+            // exact fully-completed prefix without broadcasting the current
+            // half-projected event (or replaying it twice after reopen).
+            let mut event_summary = SyncSummary::default();
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
                     local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
@@ -3747,6 +4975,11 @@ impl AppClient {
             {
                 routes_dirty |= changed;
                 self.prepare_pending_application_event_ack(event);
+                self.remember_uncheckpointed_runtime_group_subscription_refresh(changed);
+                // An intentionally suppressed event still owns an ACK
+                // checkpoint, represented by an empty completed-prefix batch.
+                summary.merge(event_summary);
+                self.stage_current_account_visibility_event(event);
                 continue;
             }
             let before = self.state.groups.len();
@@ -3776,7 +5009,7 @@ impl AppClient {
             if let Some(message) = observe_event(
                 &mut self.state,
                 display_names,
-                summary,
+                &mut event_summary,
                 event,
                 group_projection.as_ref(),
                 source_message_id_hex,
@@ -3784,9 +5017,11 @@ impl AppClient {
                 outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
             ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), summary)?
+                self.project_received_message(message, group_metadata.as_ref(), &mut event_summary)?
             {
-                gossip_message_ids.insert(gossip_message_id);
+                event_summary
+                    .messages
+                    .retain(|candidate| candidate.message_id_hex != gossip_message_id);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -3801,8 +5036,12 @@ impl AppClient {
                 updated_group.as_ref(),
                 source_message_id_hex,
             );
-            routes_dirty |=
-                self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
+            let event_routes_dirty = self.observe_event_projection_effects(
+                event,
+                &local_account_id_hex,
+                &mut event_summary,
+            )?;
+            routes_dirty |= event_routes_dirty;
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
@@ -3819,23 +5058,25 @@ impl AppClient {
                 if cfg!(feature = "test-policy-overrides")
                     && self.app.config.dev_fail_ingest_after_application_event_ack
                 {
+                    // This injected seam represents an incomplete current event:
+                    // leave both its summary and engine ACK out of the completed
+                    // prefix so durable replay owns it exactly once.
+                    self.discard_pending_application_event_ack(event);
                     return Err(AppError::BlockingTask(
                         "injected failure after application-event acknowledgement".to_owned(),
                     ));
                 }
+                self.stage_current_account_visibility_event(event);
             }
+            self.remember_uncheckpointed_runtime_group_subscription_refresh(
+                event_routes_dirty || self.state.groups.len() != before,
+            );
+            event_summary.projection_updates.extend(
+                self.project_group_system_rows(std::slice::from_ref(event), source_received_at),
+            );
+            summary.merge(event_summary);
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
-        // #760: strip all collected push-gossip messages in one pass.
-        if !gossip_message_ids.is_empty() {
-            summary
-                .messages
-                .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
-        }
-        // Synthesize durable kind-1210 system rows from authenticated state
-        // changes (peer commits, auto-commits, and scheduled convergence).
-        let system_updates = self.project_group_system_rows(&effects.events, source_received_at);
-        summary.projection_updates.extend(system_updates);
         Ok(routes_dirty)
     }
 
@@ -4106,14 +5347,70 @@ mod membership_change_tests {
 #[cfg(test)]
 mod runtime_group_subscription_refresh_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::{SyncCheckpointError, SyncSummary};
+    use super::SyncSummary;
+    use crate::client::epoch_stall::BackfillDecision;
     use crate::tests::ScriptedPushRelayClient;
-    use crate::{AppPerformanceTelemetry, MarmotApp};
+    use crate::{AppPerformanceTelemetry, MarmotApp, MarmotRelayPlane};
     use marmot_account::AccountHome;
+    use marmot_forensics::EpochStallBackfillTrigger;
+    use tokio::sync::Notify;
+
+    async fn pending_welcome_fixture(
+        group_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ScriptedPushRelayClient>,
+        crate::AppClient,
+        crate::AppClient,
+        cgka_traits::GroupId,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let bob = home.create_account("bob").unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let endpoint = crate::TransportEndpoint("wss://relay.example".to_owned());
+        let mut relay_lists = crate::AccountRelayListStatus::empty();
+        relay_lists.nip65.relays = vec![endpoint.0.clone()];
+        relay_lists.nip65.read_relays = vec![endpoint.0.clone()];
+        relay_lists.nip65.write_relays = vec![endpoint.0.clone()];
+        relay_lists.refresh();
+        app.write_nip65_route_generation(
+            "bob",
+            &crate::Nip65RouteGeneration {
+                created_at: crate::unix_now_seconds(),
+                event_id: "44".repeat(32),
+                nip65: relay_lists.nip65.clone(),
+            },
+        )
+        .unwrap();
+        app.remember_directory_relay_lists(&bob.account_id_hex, &relay_lists)
+            .unwrap();
+        app.mark_key_package_cutover_scan_complete("bob").unwrap();
+        let plane = MarmotRelayPlane::new(None, relay.clone());
+        let mut alice = app
+            .client_with_relay_plane("alice", &plane, None)
+            .await
+            .unwrap();
+        let mut bob_client = app
+            .client_with_relay_plane("bob", &plane, None)
+            .await
+            .unwrap();
+        bob_client.publish_key_package().await.unwrap();
+        bob_client.sync().await.unwrap();
+        let group_id = alice
+            .create_group(group_name, &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        (dir, relay, alice, bob_client, group_id)
+    }
 
     #[tokio::test]
-    async fn catch_up_checkpoint_arms_refresh_after_durable_subscription_failure() {
+    async fn catch_up_checkpoint_defers_subscription_refresh_after_durable_save() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -4135,12 +5432,15 @@ mod runtime_group_subscription_refresh_tests {
             .unwrap();
 
         relay.fail_next_subscribe();
-        let mut summary = SyncSummary::default();
-        let error = client
-            .checkpoint_sync_prefix(&mut summary, true, 0)
+        client
+            .checkpoint_sync_prefix(true, 0)
+            .expect("a durable checkpoint must not await relay I/O");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        client
+            .retry_pending_runtime_group_subscription_refresh()
             .await
-            .expect_err("the injected post-checkpoint subscription rebuild must fail");
-        assert!(matches!(error, SyncCheckpointError::AfterPersistence(_)));
+            .expect_err("the deferred injected subscription failure must reach the retry");
         assert!(client.has_pending_runtime_group_subscription_refresh());
 
         assert!(
@@ -4149,6 +5449,403 @@ mod runtime_group_subscription_refresh_tests {
                 .await
                 .unwrap()
         );
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
+    }
+
+    #[tokio::test]
+    async fn cancelled_next_event_is_returned_by_following_sync() {
+        let (_dir, relay, _alice, mut bob_client, group_id) =
+            pending_welcome_fixture("cancelled next-event output").await;
+
+        relay.block_next_subscribe();
+        let mut next = Box::pin(bob_client.next_event());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut next => {
+                    panic!("next_event returned before its injected refresh block: {result:?}")
+                }
+                () = relay.wait_for_blocked_subscribe() => {}
+            }
+        })
+        .await
+        .expect("next_event must reach the post-ingest subscription refresh");
+        drop(next);
+        relay.release_subscribe();
+
+        assert!(bob_client.has_pending_runtime_group_subscription_refresh());
+        assert_eq!(
+            bob_client
+                .pending_checkpointed_sync_summary
+                .as_ref()
+                .map(|summary| summary.joined_groups.as_slice()),
+            Some(std::slice::from_ref(&group_id)),
+            "cancellation must retain the already-durable join summary",
+        );
+
+        let recovered = tokio::time::timeout(Duration::from_secs(5), bob_client.sync())
+            .await
+            .expect("the following sync must recover the cancelled next-event output")
+            .unwrap();
+        assert_eq!(recovered.joined_groups, vec![group_id.clone()]);
+        assert!(bob_client.pending_checkpointed_sync_summary.is_none());
+        assert!(!bob_client.has_pending_runtime_group_subscription_refresh());
+        let next = bob_client.sync().await.unwrap();
+        assert!(
+            !next.joined_groups.contains(&group_id),
+            "the retained summary must be returned exactly once",
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_sync_v1_is_checkpointed_by_the_managed_fallback() {
+        let (_dir, _relay, _alice, mut bob_client, group_id) =
+            pending_welcome_fixture("pre-checkpoint cancellation").await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        bob_client.block_after_sync_delivery_projection = Some((entered.clone(), release.clone()));
+
+        let mut sync = Box::pin(bob_client.sync_with_classified_partial_progress());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut sync => {
+                    panic!("sync returned before its pre-checkpoint block: {result:?}")
+                }
+                () = entered.notified() => {}
+            }
+        })
+        .await
+        .expect("sync must retain the projected delivery before checkpointing");
+        drop(sync);
+        release.notify_one();
+
+        assert_eq!(
+            bob_client
+                .pending_uncheckpointed_sync_summary
+                .as_ref()
+                .map(|summary| summary.joined_groups.as_slice()),
+            Some(std::slice::from_ref(&group_id)),
+        );
+        assert!(bob_client.pending_checkpointed_sync_summary.is_none());
+        assert!(
+            !bob_client.pending_application_event_acks.is_empty(),
+            "V1 must retain the matching engine-outbox acknowledgement set",
+        );
+
+        // The managed worker's timeout/error fallback synchronously lands the
+        // still-staged projection and ACKs before it tries to publish V2.
+        assert!(bob_client.checkpoint_pending_sync_visibility().unwrap());
+        assert!(bob_client.pending_uncheckpointed_sync_summary.is_none());
+        assert_eq!(
+            bob_client
+                .pending_checkpointed_sync_summary
+                .as_ref()
+                .map(|summary| summary.joined_groups.as_slice()),
+            Some(std::slice::from_ref(&group_id)),
+        );
+        assert!(bob_client.pending_application_event_acks.is_empty());
+
+        let recovered = bob_client
+            .take_pending_checkpointed_sync_summary()
+            .expect("the fallback must receive the promoted V2 batch");
+        assert_eq!(recovered.joined_groups, vec![group_id]);
+        assert!(bob_client.pending_checkpointed_sync_summary.is_none());
+        assert!(!bob_client.checkpoint_pending_sync_visibility().unwrap());
+        assert!(
+            bob_client.sync().await.unwrap().joined_groups.is_empty(),
+            "the checkpointed batch must be handed off exactly once",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalation_without_a_summary_still_occupies_the_v2_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let escalation = crate::EpochStallEscalation {
+            group_id: cgka_traits::GroupId::new(vec![0x5a; 32]),
+            stalled_epoch: 9,
+            arms: 3,
+        };
+        client
+            .pending_epoch_stall_escalations
+            .push(escalation.clone());
+
+        let summary = client
+            .take_pending_checkpointed_sync_summary()
+            .expect("an escalation-only handoff must not collapse to None");
+        assert_eq!(summary.epoch_stall_escalations, vec![escalation]);
+        assert!(client.take_pending_checkpointed_sync_summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_sync_after_prefix_checkpoint_leaves_summary_owned_by_client() {
+        let (_dir, _relay, _alice, mut bob_client, group_id) =
+            pending_welcome_fixture("post-checkpoint cancellation").await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        bob_client.block_after_sync_prefix_checkpoint = Some((entered.clone(), release.clone()));
+
+        let mut sync = Box::pin(bob_client.sync_with_classified_partial_progress());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut sync => {
+                    panic!("sync returned before its post-checkpoint test block: {result:?}")
+                }
+                () = entered.notified() => {}
+            }
+        })
+        .await
+        .expect("sync must checkpoint the relay prefix before returning it");
+        drop(sync);
+        release.notify_one();
+
+        assert!(bob_client.pending_uncheckpointed_sync_summary.is_none());
+        assert_eq!(
+            bob_client
+                .pending_checkpointed_sync_summary
+                .as_ref()
+                .map(|summary| summary.joined_groups.as_slice()),
+            Some(std::slice::from_ref(&group_id)),
+            "V2 must remain client-owned while the post-checkpoint future is cancellable",
+        );
+        assert!(bob_client.pending_application_event_acks.is_empty());
+
+        let recovered = bob_client.sync().await.unwrap();
+        assert_eq!(recovered.joined_groups, vec![group_id]);
+        assert!(bob_client.pending_checkpointed_sync_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduled_convergence_returns_v2_before_subscription_network_work() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let group_id = client
+            .create_group("convergence visibility handoff", &[])
+            .await
+            .unwrap();
+        client
+            .checkpoint_sync_prefix(true, 0)
+            .expect("the route change must be checkpointed without relay I/O");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        let visibility = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.checkpoint_scheduled_convergence_effects(
+                &group_id,
+                &marmot_account::AccountDeviceEffects::default(),
+            ),
+        )
+        .await
+        .expect("the V2 handoff must not await a subscription refresh")
+        .unwrap();
+        assert_eq!(visibility.summary, SyncSummary::default());
+        assert!(client.pending_checkpointed_sync_summary.is_none());
+        assert!(
+            client.has_pending_runtime_group_subscription_refresh(),
+            "the V2 handoff must leave subscription network work for the worker scheduler",
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_next_event_retains_an_empty_epoch_backfill_wake_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        let group_id = client
+            .create_group_with_options_and_telemetry(
+                "empty next-event backfill wake",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
+        client
+            .apply_backfill_decision(
+                &group_id,
+                stalled_epoch,
+                BackfillDecision::Arm,
+                EpochStallBackfillTrigger::UndecryptableThreshold,
+            )
+            .unwrap();
+        assert!(client.has_pending_epoch_backfill());
+
+        client.pending_runtime_group_subscription_refresh = true;
+        relay.block_next_subscribe();
+        let mut finalize =
+            Box::pin(client.finalize_direct_next_event_summary(SyncSummary::default()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut finalize => {
+                    panic!("empty wake batch finalized before its injected refresh block: {result:?}")
+                }
+                () = relay.wait_for_blocked_subscribe() => {}
+            }
+        })
+        .await
+        .expect("empty wake batch must reach the post-ingest subscription refresh");
+        drop(finalize);
+        relay.release_subscribe();
+
+        assert_eq!(
+            client.pending_checkpointed_sync_summary,
+            Some(SyncSummary::default()),
+            "occupied retention must distinguish an empty wake batch from no batch",
+        );
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        relay.fail_next_subscribe();
+        tokio::time::timeout(Duration::from_secs(5), client.next_event())
+            .await
+            .expect("the injected retry failure must return promptly")
+            .expect_err("an empty wake batch must not hide a refresh error");
+        assert_eq!(
+            client.pending_checkpointed_sync_summary,
+            Some(SyncSummary::default()),
+            "an empty wake batch must remain occupied across retry failure",
+        );
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        let recovered = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+            .await
+            .expect("a successful retry must return the retained empty wake batch")
+            .unwrap();
+        assert_eq!(recovered, SyncSummary::default());
+        assert!(client.pending_checkpointed_sync_summary.is_none());
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
+        assert!(client.has_pending_epoch_backfill());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.next_event())
+                .await
+                .is_err(),
+            "the empty wake batch must be returned exactly once",
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_event_returns_summary_and_defers_subscription_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        let created = client
+            .create_group_with_options_and_telemetry(
+                "drained-event retry intent",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        // Model a durable engine event replay whose app projection did not
+        // survive the prior process. Re-observation restores the group and
+        // therefore owes an ordinary subscription rebuild.
+        client.state.groups.clear();
+        let group_id = created.group_id;
+        let joined = cgka_traits::engine::GroupEvent::GroupJoined {
+            group_id: group_id.clone(),
+            via_welcome: cgka_traits::MessageId::new(vec![0x42; 32]),
+            welcomer: None,
+        };
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![joined.clone()],
+            ..Default::default()
+        };
+
+        // A drained projection is visibility-first: the injected relay failure
+        // must remain untouched until the explicit background retry.
+        relay.fail_next_subscribe();
+        let summary = client
+            .observe_drained_session_events(&effects)
+            .await
+            .expect("the durable drained projection must not await relay I/O");
+        assert_eq!(summary.joined_groups, vec![group_id]);
+        assert_eq!(summary.events, vec![joined]);
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .expect_err("the deferred injected subscription failure must reach the retry");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        assert!(
+            !client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap()
+        );
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
+    }
+
+    #[tokio::test]
+    async fn direct_sync_finalizer_retains_summary_across_refresh_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        let created = client
+            .create_group_with_options_and_telemetry(
+                "direct sync retained output",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        client.pending_runtime_group_subscription_refresh = true;
+        let durable_summary = SyncSummary {
+            joined_groups: vec![created.group_id],
+            ..Default::default()
+        };
+        client.retain_checkpointed_sync_summary(durable_summary.clone());
+
+        relay.fail_next_subscribe();
+        client
+            .finalize_direct_sync_summary()
+            .await
+            .expect_err("the injected direct subscription finalizer must fail");
+        assert_eq!(
+            client.pending_checkpointed_sync_summary,
+            Some(durable_summary.clone())
+        );
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+
+        let recovered = client.finalize_direct_sync_summary().await.unwrap();
+        assert_eq!(recovered, durable_summary);
+        assert!(client.pending_checkpointed_sync_summary.is_none());
         assert!(!client.has_pending_runtime_group_subscription_refresh());
     }
 }
@@ -4503,7 +6200,7 @@ mod tests {
             joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
             ..SyncSummary::default()
         };
-        client.pending_failed_sync_summary.merge(ingested.clone());
+        client.retain_checkpointed_sync_summary(ingested.clone());
 
         let failure = client
             .repair_full_history()

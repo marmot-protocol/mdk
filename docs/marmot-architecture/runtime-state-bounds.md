@@ -1,8 +1,8 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-08-15
-tags: [marmot, architecture, runtime, daemon, broker, memory]
+updated: 2026-08-28
+tags: [marmot, architecture, runtime, daemon, broker, memory, key-package]
 ---
 
 # Long-lived runtime state — bounds and reclamation
@@ -64,6 +64,20 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | `AppClient.encrypted_media_not_required_epochs` | One `u64` per live projected group (mdk#1380) | Pruned to the live group set at the start of every warm pass; stale entries are evicted when the group epoch advances and an authoritative re-check finds the component required; the whole map is dropped with the client. Entries are only ever inserted after a successful authoritative negative, so map loss or eviction costs at most one `MlsGroup::load` re-check, never a wrong skip. |
 | `app_prepared_group_image_upload` SQLCipher rows | 16 active staged/uploaded/failed artifacts and 128 consumed idempotency markers per account | Active artifacts expire after 7 days and consumed markers after 30 days; staging prunes expired rows, consumption evicts the oldest marker at the cap, and consumed rows erase their retained ciphertext/upload-secret copies. The founding MLS component remains authoritative after consumption. |
+
+### `marmot-app` account runtime (`src/runtime/mod.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Runtime-owned sign-out/wipe tasks | 64 concurrently admitted operations (`ACCOUNT_TEARDOWN_TASK_LIMIT`) | Each task holds only an active-count guard; completion drops the guard without retaining a handle or account id. Graceful shutdown closes admission and drains the active count before stopping the relay plane. Terminal `shutdown_and_close` gives the same work one shared bounded grace interval, then closes storage even if a relay operation is still stalled. Over-cap calls fail retryably with `AccountWorkerBusy`. |
+| Removed-local KeyPackage tombstones (`key-packages/removed-local-slots-v1/<account>/slot-<hash>.json`, plus legacy `all.json`) | One immutable marker per distinct locally removed account-device stable slot, plus at most one account-wide fallback marker per identity when legacy state cannot prove a stable slot. Growth is driven only by explicit removal of locally signing account devices, never by relay traffic, retries, or cache ingestion. | Intentionally never reclaimed: an old removed slot must not become inviteable again after cache replay or restart. Re-import of the same identity creates a new stable slot; exact old-slot markers continue to win, while an account-wide legacy fallback admits only a different slot proven by the currently active local signing lifecycle. |
+
+### `marmot-account` KeyPackage lifecycle (`src/runtime.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Signed KeyPackage publication liabilities (`current`, signed `pending_replacement`, and `retired_publications_pending_deletion`) | 256 ordinary exact `(event_id, endpoint)` liabilities per account-device (`MAX_KEY_PACKAGE_SIGNED_PUBLICATION_LIABILITIES`), plus a lifecycle-wide reserve of 16 used only to admit one explicitly selected exact deletion atomically (`MAX_KEY_PACKAGE_LIVE_DELETION_OVERFLOW_LIABILITIES`) | Every possible exposure is marked durably before network I/O. Rotation, reauthoring, expiry, consumption, and relay-discovered teardown targets transfer old exact ids into the retired journal; a per-endpoint kind-5 acknowledgement or the adapter's exact recognized target-not-found response removes only that endpoint. Other free-text rejection variants remain retryable. Live-policy endpoints wait for a strictly newer accepted revision before old-id deletion; removed, expired, consumed, or teardown-discovered packages delete immediately. Obligations are never evicted. An explicit event id unknown to current lifecycle projections is conservatively treated as a possible older same-slot revision because that API carries no stable-slot proof. The reserved 16 pairs match the account boundary's maximum relay route and prevent a full ordinary journal from admitting only part of such an exact deletion; while total liabilities remain above 256, every new publication stays blocked until deletion receipts reduce the state to the ordinary bound. Other work never consumes the reserve. When the ordinary cap is full, cleanup is attempted and further discovery liability is blocked fail-closed. In particular, strict upgrade cutover keeps all KeyPackage publication durably interlocked—and can remain unavailable indefinitely—until expiry, consumption, policy prohibition, or a terminal deletion receipt frees enough capacity to admit every newly discovered exact endpoint. One cleanup call attempts at most one endpoint (`KEY_PACKAGE_RETIRED_DELETION_ATTEMPTS_PER_CALL`), bounding a serialized account pass to one relay publish deadline. |
+| Consumed KeyPackage reference journal (`consumed_key_package_refs`) | 256 distinct refs awaiting cleanup per account-device (`MAX_CONSUMED_KEY_PACKAGE_REFS_PENDING_CLEANUP`) | Welcome processing appends every locally matched reference atomically with the joined group, including legacy bundles that have no projected lifecycle row. Duplicates replace no state; a 257th distinct ref fails the Welcome transaction closed rather than evicting unswept privacy evidence. The account sweep keeps a consumed current ref until a semantic replacement succeeds, immediately retires a consumed pending ref without exact republication, removes consumed retained material, and clears each journal ref only after handling the matching private/lifecycle artifact. |
 
 ### `wn-cli` daemon / `wnd` (`src/daemon/`)
 

@@ -213,7 +213,11 @@ impl DirectorySyncPlan {
 }
 
 impl DirectorySyncHandle {
-    pub(crate) fn spawn(app: MarmotApp, relay_plane: MarmotRelayPlane) -> Self {
+    pub(crate) fn spawn(
+        app: MarmotApp,
+        relay_plane: MarmotRelayPlane,
+        account_manager: Option<crate::AccountManager>,
+    ) -> Self {
         let (commands, command_rx) = mpsc::channel(32);
         let directory_events = relay_plane.subscribe_directory_events();
         let rebuild_queued = Arc::new(AtomicBool::new(false));
@@ -223,6 +227,7 @@ impl DirectorySyncHandle {
             command_rx,
             directory_events,
             rebuild_queued.clone(),
+            account_manager,
         ));
         let abort = task.abort_handle();
         Self {
@@ -277,6 +282,7 @@ async fn run_directory_sync_worker(
         crate::relay_plane::DirectoryRelayPlaneEvent,
     >,
     rebuild_queued: Arc<AtomicBool>,
+    account_manager: Option<crate::AccountManager>,
 ) {
     let mut recovery_rebuilds = DirectoryRecoveryRebuildQueue::default();
     let mut recovery_task: Option<DirectoryRecoveryRebuildTask> = None;
@@ -322,8 +328,12 @@ async fn run_directory_sync_worker(
             event = directory_events.recv() => {
                 match event {
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::Record(record)) => {
-                        let app = app.clone();
-                        let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                        if let Some(account_manager) = account_manager.as_ref() {
+                            let _ = account_manager.ingest_directory_relay_event(record).await;
+                        } else {
+                            let app = app.clone();
+                            let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                        }
                     }
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::RecoveryRequired)
                     | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -543,7 +553,7 @@ mod tests {
         let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(
             std::time::Duration::from_secs(30),
         );
-        let handle = DirectorySyncHandle::spawn(app, relay_plane);
+        let handle = DirectorySyncHandle::spawn(app, relay_plane, None);
 
         handle.request_rebuild();
         wait_for_background_rebuild_flag_to_clear(&handle).await;

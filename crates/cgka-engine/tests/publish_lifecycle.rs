@@ -1606,6 +1606,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     let mut state = KeyPackageLifecycleState {
         stable_slot_id: "stable-slot".into(),
         phase: MaintenancePhase::Complete,
+        cutover_publication_blocked: false,
         current_key_package: None,
         current_key_package_ref: None,
         current_not_before: None,
@@ -1613,11 +1614,15 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         authored_event_id: None,
         authored_event_created_at: None,
         authored_signed_event: None,
+        deleted_live_revision_event_ids: Vec::new(),
+        deletion_overflow_owner_event_id: None,
+        retired_publications_pending_deletion: Vec::new(),
         publication_targets: Vec::new(),
         refresh_at: None,
         upgrade_rotation_recorded: false,
         last_consumed_key_package_ref: None,
         last_consumed_at: None,
+        consumed_key_package_refs: Vec::new(),
         retained_private_material: Vec::new(),
         pending_replacement: None,
     };

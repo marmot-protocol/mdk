@@ -1520,6 +1520,17 @@ fn relay_rejection_endpoint_failure(
     endpoint: TransportEndpoint,
     relay_message: &str,
 ) -> TransportEndpointFailure {
+    // Buzz relays currently expose deletion target absence through this exact
+    // stable rejection. Do not generalize the free-text suffix across other
+    // NIP-01 prefixes: only the observed full response is terminal evidence.
+    if relay_message == "invalid: target event not found" {
+        return TransportEndpointFailure {
+            endpoint,
+            reason: "relay rejected event (not-found)".to_owned(),
+            kind: TransportEndpointFailureKind::TerminalRejected,
+            rejection_category: Some(TransportEndpointRejectionCategory::Invalid),
+        };
+    }
     if let Some(prefix) = nostr::message::MachineReadablePrefix::parse(relay_message) {
         let category = map_relay_rejection_category(prefix);
         // nostr-sdk also uses the generic `error:` prefix for local SDK/send
@@ -1638,6 +1649,12 @@ mod tests {
                 "relay rejected event (invalid)",
             ),
             (
+                "invalid: target event not found",
+                TransportEndpointRejectionCategory::Invalid,
+                TransportEndpointFailureKind::TerminalRejected,
+                "relay rejected event (not-found)",
+            ),
+            (
                 "unsupported: kind 5",
                 TransportEndpointRejectionCategory::Unsupported,
                 TransportEndpointFailureKind::TerminalRejected,
@@ -1653,6 +1670,32 @@ mod tests {
             assert_eq!(failure.reason, summary);
             assert!(!failure.reason.contains("evil.example"));
             assert!(!failure.reason.contains("leaked event payload"));
+        }
+        assert!(
+            relay_rejection_endpoint_failure(
+                TransportEndpoint("wss://relay.example".into()),
+                "invalid: target event not found",
+            )
+            .confirms_target_absence()
+        );
+    }
+
+    #[test]
+    fn target_absence_requires_the_exact_known_relay_response() {
+        for message in [
+            "error: target event not found",
+            "blocked: target event not found",
+            "invalid: target event not found elsewhere",
+            "invalid: Target event not found",
+        ] {
+            let failure = relay_rejection_endpoint_failure(
+                TransportEndpoint("wss://relay.example".into()),
+                message,
+            );
+            assert!(
+                !failure.confirms_target_absence(),
+                "unrecognized free text must remain retryable: {message}"
+            );
         }
     }
 
