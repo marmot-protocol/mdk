@@ -8557,11 +8557,8 @@ async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
     let (bob, bob_path, bob_identity, group_id) =
         joined_selfremove_member(dir.path(), &key, "zero-ack-leave").await;
     let adapter = RecordingAdapter::default();
+    let gate = adapter.gate_all_publishes();
     let group_endpoint = TransportEndpoint("wss://zero-ack-leave-group.example".into());
-    adapter.fail_endpoints_as(
-        vec![group_endpoint.clone()],
-        TransportEndpointFailureKind::TerminalRejected,
-    );
     let route = || {
         StaticTransportRouting::new(vec![TransportEndpoint(
             "wss://zero-ack-leave-inbox.example".into(),
@@ -8573,23 +8570,56 @@ async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
             vec![group_endpoint.clone()],
         )
     };
-    let mut runtime =
-        AccountDeviceRuntime::new(bob, adapter, route(), RecordingKeyPackages::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        bob,
+        adapter.clone(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
     runtime.pause_maintenance();
-    let leased = runtime
-        .send_leased(SendIntent::Leave {
-            group_id: group_id.clone(),
-        })
-        .await
+    let mut cancelled = Box::pin(runtime.send_leased(SendIntent::Leave {
+        group_id: group_id.clone(),
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut cancelled => panic!("Leave returned before the terminal-fanout crash window: {result:?}"),
+            () = async {
+                while adapter.publishes().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+    })
+    .await
+    .expect("Leave reaches the blocked relay publish");
+    drop(cancelled);
+
+    let mut fanouts = runtime.session().outbound_fanouts().unwrap();
+    assert_eq!(
+        fanouts.len(),
+        1,
+        "cancelled Leave retains its frozen fanout"
+    );
+    let mut fanout = fanouts.pop().unwrap();
+    assert_eq!(fanout.request().required_acks, 0);
+    fanout
+        .record_target_failure(
+            0,
+            TransportEndpointFailure {
+                endpoint: group_endpoint.clone(),
+                reason: "injected terminal rejection before outcome checkpoint".into(),
+                kind: TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: None,
+            },
+        )
         .unwrap();
     assert!(
-        leased
-            .effects
-            .action_outcomes
-            .iter()
-            .all(|outcome| !outcome.published),
-        "required_acks=0 still needs at least one accept"
+        fanout.outcome().fanout_complete && fanout.outcome().accepted_targets == 0,
+        "the persisted crash window must contain one terminal zero-accept fanout"
     );
+    let leave_message_id = fanout.message_id().clone();
+    runtime.session_mut().put_outbound_fanout(&fanout).unwrap();
+    drop(gate);
     drop(runtime);
 
     let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
@@ -8600,26 +8630,12 @@ async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
         RecordingKeyPackages::default(),
     );
     restarted.pause_maintenance();
-    if let Some(replayed) = restarted.replay_visibility_leased().unwrap() {
-        assert!(
-            flatten_visibility_batches(&replayed.batches)
-                .action_outcomes
-                .iter()
-                .all(|outcome| !outcome.published),
-            "restart must not upgrade a zero-accept Leave to published:true"
-        );
-        assert!(restarted.acknowledge_visibility_lease(replayed.lease));
-    }
+    let fanouts = restarted.session().outbound_fanouts().unwrap();
+    assert_eq!(fanouts.len(), 1, "restart must recover the terminal fanout");
+    assert_eq!(fanouts[0].message_id(), &leave_message_id);
     assert!(
-        restarted
-            .session()
-            .outbound_fanouts()
-            .unwrap()
-            .iter()
-            .all(|fanout| {
-                fanout.outcome().accepted_targets < fanout.request().required_acks.max(1)
-            }),
-        "a surviving terminal zero-accept fanout must still miss required_acks.max(1)"
+        fanouts[0].outcome().accepted_targets < fanouts[0].request().required_acks.max(1),
+        "the recovered zero-accept fanout must miss required_acks.max(1)"
     );
     let drained = restarted.drain_leased().await.unwrap();
     assert!(
@@ -8627,13 +8643,35 @@ async fn zero_accept_best_effort_leave_does_not_publish_on_restart() {
             .effects
             .action_outcomes
             .iter()
-            .all(|outcome| !outcome.published),
-        "resuming a terminal zero-accept Leave must not authorize Left"
+            .any(|outcome| outcome.message_id == leave_message_id && !outcome.published),
+        "terminal-fanout recovery must durably record unpublished, not authorize Left"
     );
     assert!(
         restarted.session().outbound_fanouts().unwrap().is_empty(),
         "terminal zero-accept resume must finish the Leave fanout without publishing"
     );
+    drop(restarted);
+
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    let mut recovered = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        route(),
+        RecordingKeyPackages::default(),
+    );
+    recovered.pause_maintenance();
+    let replayed = recovered
+        .replay_visibility_leased()
+        .unwrap()
+        .expect("unpublished Leave outcome must survive fanout deletion and restart");
+    assert!(
+        flatten_visibility_batches(&replayed.batches)
+            .action_outcomes
+            .iter()
+            .any(|outcome| outcome.message_id == leave_message_id && !outcome.published),
+        "restart must replay the exact terminal zero-accept outcome"
+    );
+    assert!(recovered.acknowledge_visibility_lease(replayed.lease));
 }
 
 #[tokio::test]
@@ -8720,23 +8758,24 @@ async fn leave_m1_to_m2_repair_persists_every_row_so_cleared_request_does_not_sp
         }
     }
     assert!(
-        unique_source_by_operation
-            .values()
-            .any(|bound| bound.as_ref() == Some(&later_id)),
-        "repaired Leave source must name the live M2 id: {leave_sources:?}"
+        !unique_source_by_operation.is_empty()
+            && unique_source_by_operation
+                .values()
+                .all(|bound| bound.as_ref() == Some(&later_id)),
+        "repaired Leave source must name the live M2 id on every row: {leave_sources:?}"
     );
     drop(replayed);
     drop(repaired);
 
-    let storage_session =
-        session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
-    storage_session
+    // Open the engine first, then clear the request on that same session. A
+    // second engine reopen would legitimately rehydrate M1 from its retained
+    // SelfRemove and mask whether the repaired journal itself persisted M2.
+    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
+    reopened
         .storage_handle()
         .clear_leave_request(&group_id)
         .unwrap();
-    drop(storage_session);
 
-    let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
     let mut restarted = AccountDeviceRuntime::new(
         reopened,
         RecordingAdapter::default(),
@@ -8779,8 +8818,8 @@ async fn leave_m1_to_m2_repair_persists_every_row_so_cleared_request_does_not_sp
         !unique_source_by_operation.is_empty()
             && unique_source_by_operation
                 .values()
-                .all(|bound| bound.is_some()),
-        "cleared LeaveRequest must not resurrect a split or unbound Leave source: {leave_sources:?}"
+                .all(|bound| bound.as_ref() == Some(&later_id)),
+        "cleared LeaveRequest must retain the exact M2 source on every row: {leave_sources:?}"
     );
 }
 
@@ -9343,8 +9382,14 @@ async fn leave_quorum_records_published_true_while_optional_target_stays_retryab
             vec![required.clone(), optional.clone()],
         )
     };
+    let wall = Arc::new(TestWallClock::new(10_000));
     let mut runtime =
-        AccountDeviceRuntime::new(bob, adapter, route(), RecordingKeyPackages::default());
+        AccountDeviceRuntime::new(bob, adapter, route(), RecordingKeyPackages::default())
+            .with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
     runtime.pause_maintenance();
     let leased = runtime
         .send_leased(SendIntent::Leave {
@@ -9353,6 +9398,7 @@ async fn leave_quorum_records_published_true_while_optional_target_stays_retryab
         .await
         .unwrap();
     assert_eq!(leased.effects.action_outcomes.len(), 1);
+    let published_message_id = leased.effects.action_outcomes[0].message_id.clone();
     assert!(
         leased.effects.action_outcomes[0].published,
         "meeting required ACKs must authorize Left even if an optional target is still retryable"
@@ -9366,6 +9412,7 @@ async fn leave_quorum_records_published_true_while_optional_target_stays_retryab
         "the optional target must remain outstanding so this is not the complete-fanout path"
     );
     drop(runtime);
+    wall.set(20_000);
 
     let reopened = session_with_registry(&bob_path, &key, &bob_identity, selfremove_registry());
     let mut restarted = AccountDeviceRuntime::new(
@@ -9373,6 +9420,11 @@ async fn leave_quorum_records_published_true_while_optional_target_stays_retryab
         RecordingAdapter::default(),
         route(),
         RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
     );
     restarted.pause_maintenance();
     let replayed = restarted
@@ -9392,12 +9444,15 @@ async fn leave_quorum_records_published_true_while_optional_target_stays_retryab
         .await
         .expect("optional Leave completion must accept an already-durable published outcome");
     assert!(
-        drained
-            .effects
+        flatten_visibility_batches(&drained.batches)
             .action_outcomes
             .iter()
-            .all(|outcome| outcome.published),
-        "completing the optional target must not rewrite the durable published:true outcome"
+            .any(|outcome| { outcome.message_id == published_message_id && outcome.published }),
+        "the superseding lease must contain the exact durable published:true outcome"
+    );
+    assert!(
+        restarted.session().outbound_fanouts().unwrap().is_empty(),
+        "optional completion must delete the fanout after preserving its durable outcome"
     );
     if !restarted.acknowledge_visibility_lease(replayed.lease) {
         assert!(restarted.acknowledge_visibility_lease(drained.lease));
