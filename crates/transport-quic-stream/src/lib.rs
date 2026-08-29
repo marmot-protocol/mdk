@@ -50,5 +50,6 @@ pub use receive::{
     QuicTextStreamReceiver, ReceivedTextChunk, ReceivedTextStream, ServerTrust, stream_record_text,
 };
 pub use send::{
-    SendTextStream, SentTextStream, random_stream_id, send_text_stream, split_text_deltas,
+    SendTextStream, SentTextStream, prepare_text_stream_crypto_for_network_handoff,
+    random_stream_id, send_text_stream, split_text_deltas,
 };

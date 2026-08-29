@@ -3,6 +3,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cgka_traits::agent_text_stream::{
@@ -18,7 +19,8 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits,
-    EphemeralPublisherSequenceStore, stream_record_text,
+    EphemeralPublisherSequenceStore, PublisherSequenceReservation, PublisherSequenceSnapshot,
+    PublisherSequenceStore, prepare_text_stream_crypto_for_network_handoff, stream_record_text,
 };
 
 use crate::client::{
@@ -55,6 +57,55 @@ fn test_state(max_backlog: usize) -> BrokerState {
         DEFAULT_BROKER_MAX_BACKLOG_BYTES,
         MAX_BROKER_REPLAY_TTL,
     )
+}
+
+struct ClosablePublisherSequenceStore {
+    inner: EphemeralPublisherSequenceStore,
+    closed: AtomicBool,
+}
+
+impl ClosablePublisherSequenceStore {
+    fn new() -> Self {
+        Self {
+            inner: EphemeralPublisherSequenceStore::default(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn ensure_open(&self) -> Result<(), String> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err("publisher sequence backend is closed".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl PublisherSequenceStore for ClosablePublisherSequenceStore {
+    fn load(&self, context_id: &[u8; 32]) -> Result<Option<PublisherSequenceSnapshot>, String> {
+        self.ensure_open()?;
+        self.inner.load(context_id)
+    }
+
+    fn reserve(
+        &self,
+        context_id: &[u8; 32],
+        initial_transcript_hash: &[u8; 32],
+        reservation: &PublisherSequenceReservation,
+    ) -> Result<(), String> {
+        self.ensure_open()?;
+        self.inner
+            .reserve(context_id, initial_transcript_hash, reservation)
+    }
+
+    fn confirm(&self, context_id: &[u8; 32], token: &[u8; 16]) -> Result<(), String> {
+        self.ensure_open()?;
+        self.inner.confirm(context_id, token)
+    }
 }
 
 #[tokio::test]
@@ -110,6 +161,84 @@ async fn broker_forwards_live_records_to_subscriber_with_same_transcript() {
     assert_eq!(received.chunk_count, 4);
     assert_eq!(sent.chunk_count, received.chunk_count);
     assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn broker_publishes_preconfirmed_range_after_sequence_backend_closes() {
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let stream_id = vec![0xa8; 32];
+    let start_event_id = MessageId::new(vec![0x18; 32]);
+    let stream_secret = SecretBytes::new(vec![0x28; 32]);
+    let context = AgentTextStreamKeyContextV1::new(
+        GroupId::new(vec![0x38; 32]),
+        stream_id.clone(),
+        EpochId(4),
+        MemberId::new(vec![0x48; 32]),
+        start_event_id.clone(),
+    );
+    let sequence_backend = Arc::new(ClosablePublisherSequenceStore::new());
+    let durable_crypto = AgentTextStreamCrypto::new(stream_secret.clone(), context.clone())
+        .with_publisher_sequence_store(sequence_backend.clone());
+    let text = "publish after root shutdown";
+    let detached_crypto = prepare_text_stream_crypto_for_network_handoff(
+        durable_crypto,
+        &stream_id,
+        &start_event_id,
+        text,
+        7,
+        None,
+    )
+    .expect("reserve and confirm the exact range before shutdown");
+    sequence_backend.close();
+
+    let receiver_crypto = AgentTextStreamCrypto::new(stream_secret, context);
+    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+        stream_id: stream_id.clone(),
+        start_event_id: start_event_id.clone(),
+        crypto: Some(receiver_crypto),
+    }));
+    sleep(Duration::from_millis(100)).await;
+
+    let sent = publish_text_to_broker(PublishTextToBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert),
+        stream_id: stream_id.clone(),
+        start_event_id,
+        text: text.to_owned(),
+        max_chunk_bytes: 7,
+        chunk_delay: Duration::ZERO,
+        crypto: Some(detached_crypto),
+        max_plaintext_frame_len: None,
+    })
+    .await
+    .expect("publish must use only the detached one-shot capability");
+    let received = timeout(Duration::from_secs(5), subscriber)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(received.text, text);
+    assert_eq!(received.transcript_hash, sent.transcript_hash);
+    assert_eq!(received.chunk_count, sent.chunk_count);
 
     let _ = shutdown_tx.send(());
     broker_task.await.unwrap().unwrap();

@@ -1336,6 +1336,7 @@ async fn realization_with_pending_leave_request_attributes_member_left() {
             group_id: group_id.clone(),
             requested_at_ms: 1,
             last_proposed_epoch: None,
+            last_proposed_message_id: None,
         })
         .unwrap();
 
@@ -2945,6 +2946,103 @@ async fn repeat_leave_in_the_same_epoch_is_classified_by_the_engine() {
         bob_storage.leave_request(&group_id).unwrap(),
         Some(recorded),
         "refused duplicates must leave the durable request byte-identical"
+    );
+}
+
+#[tokio::test]
+async fn leave_hydration_preserves_existing_last_proposed_message_id() {
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "hydrate-leave-id".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let first = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let first_id = match first {
+        SendResult::Proposal { msg } => msg.id,
+        other => panic!("expected SelfRemove proposal, got {other:?}"),
+    };
+
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("still includes bob".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match rename {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = bob.ingest(routed).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    let _ = bob.advance_convergence(&group_id).await.unwrap();
+    let reproposals = bob.drain_auto_proposals();
+    assert_eq!(reproposals.len(), 1);
+    let second_id = reproposals[0].id.clone();
+    assert_ne!(
+        first_id, second_id,
+        "the epoch-changed SelfRemove must be a new message"
+    );
+
+    let mut request = bob_storage
+        .leave_request(&group_id)
+        .unwrap()
+        .expect("reproposal keeps the durable request");
+    assert_eq!(request.last_proposed_message_id.as_ref(), Some(&second_id));
+    request.last_proposed_epoch = None;
+    bob_storage.put_leave_request(&request).unwrap();
+    drop(bob);
+
+    let _reopened = build_client_on_storage(b"bob", bob_storage.clone());
+    let restored = bob_storage
+        .leave_request(&group_id)
+        .unwrap()
+        .expect("hydration restores the LeaveRequest");
+    assert_eq!(
+        restored.last_proposed_message_id.as_ref(),
+        Some(&second_id),
+        "epoch-only hydration repair must not overwrite the exact Leave id"
+    );
+    assert_ne!(
+        restored.last_proposed_message_id.as_ref(),
+        Some(&first_id),
+        "hydration must not replace the current Leave id with an earlier SelfRemove"
     );
 }
 

@@ -432,6 +432,18 @@ impl AccountDeviceSession {
         &self.open_timings
     }
 
+    /// A clone of the session's closeable storage handle.
+    ///
+    /// Hosts that must release local file locks at a known instant retain this
+    /// alongside the live session and call [`SqliteAccountStorage::close`]
+    /// during terminal shutdown. Every engine/OpenMLS clone shares the same
+    /// underlying close state, so closing this handle makes the whole session
+    /// storage graph inert without requiring the session to be dropped first.
+    #[must_use]
+    pub fn storage_handle(&self) -> SqliteAccountStorage {
+        self.storage.clone()
+    }
+
     /// Promote one bounded batch of legacy message rows after session
     /// readiness.
     ///

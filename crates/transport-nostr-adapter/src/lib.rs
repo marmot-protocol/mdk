@@ -1037,14 +1037,19 @@ impl TransportAdapter for NostrTransportAdapter {
             subscriptions_removed = removed_count,
             "deactivating transport account"
         );
-        self.relay_client.unsubscribe_account(account_id).await?;
-        let mut state = self.state.write().await;
-        state.forget_account_subscription_starts(account_id);
-        // The blanket `unsubscribe_account` above supersedes any queued
-        // per-subscription unsubscribes for this account.
-        state.clear_pending_unsubscribes_for_account(account_id);
-        state.deactivate(account_id, removed_count);
-        Ok(())
+        // Commit the local teardown before the fallible/cancellable relay I/O.
+        // A signed-out or wiped account cannot remain an active delivery target
+        // merely because a relay is unavailable or this future is cancelled.
+        {
+            let mut state = self.state.write().await;
+            state.forget_account_subscription_starts(account_id);
+            // The blanket `unsubscribe_account` below supersedes queued
+            // per-subscription relay cleanup for this account.
+            state.clear_pending_unsubscribes_for_account(account_id);
+            state.deactivate(account_id, removed_count);
+        }
+
+        self.relay_client.unsubscribe_account(account_id).await
     }
 
     async fn publish(
