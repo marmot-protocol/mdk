@@ -87,10 +87,11 @@ pub use ingest::{
     ProposalRejectionCategory, StaleReason,
 };
 pub use maintenance::{
-    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
-    GroupMaintenanceState, GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation,
-    MaintenancePhase, MaintenanceRandom, MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock,
-    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
+    ConsumedKeyPackageRefJournalFull, DurableGroupEvolution, DurableTransportFanout,
+    GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState, GroupMaintenanceStatus,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceRandom,
+    MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock, PendingKeyPackageReplacement,
+    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, RetiredKeyPackagePublication,
     SendMaintenanceDisposition, SignedPublicationArtifact, TransportFanoutAttemptState,
     TransportFanoutTarget, WallClock,
 };
