@@ -13438,6 +13438,85 @@ async fn retry_mixed_publish_batch_finalizes_success_before_failure() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Retry).await;
 }
 
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn published_message_delivery_update_survives_acknowledgement_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let config = MarmotAppConfig::default().with_dev_fail_published_app_message_acknowledgement();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://ack-failure.example".to_owned(),
+        config,
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("acknowledgement failure", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let app_event_id = "delivered-before-acknowledgement";
+
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: app_event_id.to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex,
+            plaintext: "delivery survives cleanup failure".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(10),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+
+    let published_message_id = cgka_traits::MessageId::new(vec![0xac; 32]);
+    let effects = marmot_account::AccountDeviceEffects {
+        published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+            group_id,
+            app_event_id: app_event_id.to_owned(),
+            message_id: published_message_id.clone(),
+            source_epoch: cgka_traits::EpochId(1),
+            retention: AppMessageRetentionDecision::new(10, 0),
+        }],
+        ..Default::default()
+    };
+
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .expect("fanout cleanup failure must not hide a committed delivery update");
+    assert_eq!(summary.projection_updates.len(), 1);
+
+    let row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == app_event_id)
+        .expect("the finalized local message remains in the timeline");
+    assert_eq!(
+        row.source_message_id_hex,
+        Some(hex::encode(published_message_id.as_slice()))
+    );
+}
+
 /// A resource refusal carried by a host-requested convergence retry must arm
 /// epoch-gap recovery even when that same pass's publish check fails it.
 ///

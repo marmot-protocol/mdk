@@ -590,8 +590,32 @@ impl AppClient {
                 updates.push(update);
             }
         }
-        self.runtime
-            .acknowledge_published_app_messages(&effects.published_app_messages)?;
+        let acknowledgement = if cfg!(feature = "test-policy-overrides")
+            && self
+                .app
+                .config
+                .dev_fail_published_app_message_acknowledgement
+        {
+            Err(AppError::BlockingTask(
+                "injected published application-message acknowledgement failure".to_owned(),
+            ))
+        } else {
+            self.runtime
+                .acknowledge_published_app_messages(&effects.published_app_messages)
+                .map_err(AppError::from)
+        };
+        if let Err(error) = acknowledgement {
+            // Projection is already durable, and the accepted fanout remains
+            // durable when acknowledgement fails. Return the delivery update
+            // so subscribers leave Sending; the next recovery drain replays
+            // the publication metadata and retries this idempotent cleanup.
+            tracing::warn!(
+                target: "marmot_app::client::projection",
+                method = "finalize_published_app_message_source_retention",
+                error_kind = error.privacy_safe_kind(),
+                "published application-message cleanup deferred",
+            );
+        }
         Ok(updates)
     }
 
