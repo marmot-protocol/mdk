@@ -2040,9 +2040,52 @@ where
             .outbound_fanouts_for_group(group_id)?
             .iter()
             .any(|fanout| {
-                fanout.outcome().outstanding_targets > 0
+                let outcome = fanout.outcome();
+                outcome.outstanding_targets > 0
                     || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || (outcome.accepted_targets > 0 && fanout.application_message().is_some())
             }))
+    }
+
+    /// Return the earliest durable retry cutoff for an incomplete frozen
+    /// fanout in `group_id`.
+    ///
+    /// `None` means the group has no network retry cutoff to honor. It may
+    /// still have local-only work, such as acknowledgement cleanup for an
+    /// accepted application-message fanout; callers should schedule that on
+    /// their ordinary retry delay. A zero delay means at least one exact event
+    /// is eligible now (including after a connectivity-restored wake).
+    pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
+        let now_ms = self.wall_clock.now_ms();
+        for fanout in self.session.outbound_fanouts_for_group(group_id)? {
+            let outcome = fanout.outcome();
+            if outcome.accepted_targets > 0
+                && outcome.fanout_complete
+                && fanout.application_message().is_some()
+            {
+                // Local projection acknowledgement cleanup should not wait
+                // behind an unrelated transport backoff in the same group.
+                return Ok(None);
+            }
+            if outcome.outstanding_targets == 0 {
+                if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let mut earliest = None;
+            for index in fanout.outstanding_target_indexes() {
+                if let Some(delay_ms) = frozen_fanout_target_retry_delay_ms(&fanout, index, now_ms)
+                {
+                    earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
+                }
+            }
+            // The first incomplete fanout is the group-scoped ordering
+            // barrier, so later NotAttempted records cannot pull this cutoff
+            // forward and cause a scheduler polling loop.
+            return Ok(earliest);
+        }
+        Ok(None)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -2265,12 +2308,31 @@ where
         };
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
+        let mut blocked_groups = HashSet::new();
         for fanout in fanouts {
+            if fanout
+                .group_id()
+                .is_some_and(|fanout_group| blocked_groups.contains(fanout_group))
+            {
+                continue;
+            }
             let outcome = fanout.outcome();
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             {
-                Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None)).await?;
+                let fanout_group = fanout.group_id().cloned();
+                let status =
+                    Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None))
+                        .await?;
+                if status.retry_deferred
+                    && let Some(fanout_group) = fanout_group
+                {
+                    // Preserve per-group staging order. An older exact event
+                    // that is still in durable backoff is a barrier for newer
+                    // fanouts in this group, but must not block unrelated
+                    // groups during an account-wide drain.
+                    blocked_groups.insert(fanout_group);
+                }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
                 record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
@@ -3830,10 +3892,18 @@ fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointF
 }
 
 fn frozen_fanout_target_retry_due(fanout: &OutboundFanout, index: usize, now_ms: u64) -> bool {
+    frozen_fanout_target_retry_delay_ms(fanout, index, now_ms) == Some(0)
+}
+
+fn frozen_fanout_target_retry_delay_ms(
+    fanout: &OutboundFanout,
+    index: usize,
+    now_ms: u64,
+) -> Option<u64> {
     use cgka_traits::FanoutTargetStatus;
 
     match fanout.target_status(index) {
-        Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::Attempting) => true,
+        Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::Attempting) => Some(0),
         Some(FanoutTargetStatus::PossiblyExposed) => {
             let attempt_count = fanout.target_attempt_count(index);
             let shift = attempt_count.saturating_sub(1).min(7);
@@ -3842,14 +3912,19 @@ fn frozen_fanout_target_retry_due(fanout: &OutboundFanout, index: usize, now_ms:
                 .min(FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS);
             fanout
                 .target_last_attempt_at_ms(index)
-                .is_none_or(|last| now_ms >= last.saturating_add(backoff_ms))
+                .map_or(Some(0), |last| {
+                    Some(last.saturating_add(backoff_ms).saturating_sub(now_ms))
+                })
         }
-        Some(FanoutTargetStatus::RetryableUnavailable) => {
-            fanout.target_last_attempt_at_ms(index).is_none_or(|last| {
-                now_ms >= last.saturating_add(FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS)
-            })
-        }
-        Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => false,
+        Some(FanoutTargetStatus::RetryableUnavailable) => fanout
+            .target_last_attempt_at_ms(index)
+            .map_or(Some(0), |last| {
+                Some(
+                    last.saturating_add(FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS)
+                        .saturating_sub(now_ms),
+                )
+            }),
+        Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => None,
     }
 }
 

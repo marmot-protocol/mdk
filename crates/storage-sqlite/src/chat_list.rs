@@ -1002,6 +1002,55 @@ pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
     )
 }
 
+fn accepted_activity_insert_order_high_water_sql(group_id_expression: &str) -> String {
+    let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    format!(
+        "MAX(
+            COALESCE((
+                SELECT boundary.accepted_activity_insert_order
+                FROM chat_list_rows AS boundary
+                WHERE boundary.group_id_hex = {group_id_expression}
+            ), 0),
+            COALESCE((
+                SELECT MAX(accepted_source.insert_order)
+                FROM message_timeline AS accepted
+                JOIN app_events AS accepted_source
+                  ON accepted_source.group_id_hex = accepted.group_id_hex
+                 AND accepted_source.message_id_hex = accepted.message_id_hex
+                WHERE accepted.group_id_hex = {group_id_expression}
+                  AND {accepted_activity_filter}
+                  AND accepted.invalidation_status IS NULL
+                  AND NOT (
+                      accepted.direction = 'sent'
+                      AND accepted.source_message_id_hex IS NULL
+                  )
+            ), 0)
+         )"
+    )
+}
+
+/// SQL predicate excluding a pending local preview after later accepted
+/// activity has durably displaced it. The live accepted-row maximum covers a
+/// first rebuild; the persisted high-water mark preserves the decision after
+/// secure pruning removes that evidence.
+pub(crate) fn chat_list_preview_eligibility_sql(column_prefix: &str) -> String {
+    let accepted_high_water =
+        accepted_activity_insert_order_high_water_sql(&format!("{column_prefix}group_id_hex"));
+    format!(
+        "NOT (
+            {column_prefix}direction = 'sent'
+            AND {column_prefix}source_message_id_hex IS NULL
+            AND {column_prefix}invalidation_status IS NULL
+            AND COALESCE((
+                SELECT current_source.insert_order
+                FROM app_events AS current_source
+                WHERE current_source.group_id_hex = {column_prefix}group_id_hex
+                  AND current_source.message_id_hex = {column_prefix}message_id_hex
+            ), -1) < {accepted_high_water}
+         )"
+    )
+}
+
 /// One authoritative latest-preview order for rebuild, completeness, and
 /// secure-prune repair. A pending local send stays at the preview head only
 /// until accepted activity is first persisted later on this device. The stable
@@ -1093,6 +1142,8 @@ fn chat_list_projection_complete_tx(
 ) -> StorageResult<bool> {
     let activity_filter = chat_list_activity_filter_sql("mt.");
     let preview_order = chat_list_preview_order_desc("mt.");
+    let preview_eligibility = chat_list_preview_eligibility_sql("mt.");
+    let accepted_high_water = accepted_activity_insert_order_high_water_sql("ag.group_id_hex");
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(
@@ -1200,6 +1251,7 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND {activity_filter}
+                          AND {preview_eligibility}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1237,6 +1289,7 @@ fn chat_list_projection_complete_tx(
                         ), 0),
                         ag.conversation_created_at
                      )
+                   OR row.accepted_activity_insert_order < {accepted_high_water}
              )"
         ),
         [],
@@ -1320,6 +1373,8 @@ fn rebuild_chat_list_row_for_group_tx(
 ) -> StorageResult<()> {
     let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
     let latest_message = latest.as_ref().map(|latest| &latest.preview);
+    let accepted_activity_insert_order =
+        latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
     let unread = unread_summary_tx(
         tx,
@@ -1351,12 +1406,12 @@ fn rebuild_chat_list_row_for_group_tx(
             first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
             conversation_created_at, activity_sort_at, retained_activity_sort_at,
-            updated_at, self_membership
+            accepted_activity_insert_order, updated_at, self_membership
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1389,6 +1444,10 @@ fn rebuild_chat_list_row_for_group_tx(
                 chat_list_rows.retained_activity_sort_at
             ),
             retained_activity_sort_at = chat_list_rows.retained_activity_sort_at,
+            accepted_activity_insert_order = MAX(
+                chat_list_rows.accepted_activity_insert_order,
+                excluded.accepted_activity_insert_order
+            ),
             updated_at = excluded.updated_at,
             self_membership = excluded.self_membership",
         params![
@@ -1452,6 +1511,7 @@ fn rebuild_chat_list_row_for_group_tx(
             )?,
             u64_to_i64(group.conversation_created_at)?,
             u64_to_i64(activity_sort_at)?,
+            accepted_activity_insert_order,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
         ],
@@ -1680,6 +1740,7 @@ fn latest_chat_list_activity_tx(
 ) -> StorageResult<Option<LatestChatListMessage>> {
     let activity_filter = chat_list_activity_filter_sql("preview.");
     let preview_order = chat_list_preview_order_desc("preview.");
+    let preview_eligibility = chat_list_preview_eligibility_sql("preview.");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
                 preview.kind, preview.timeline_at, preview.deleted,
@@ -1689,6 +1750,7 @@ fn latest_chat_list_activity_tx(
                 preview.timeline_order_phase, preview.timeline_order_at
          FROM message_timeline AS preview
          WHERE preview.group_id_hex = ?1 AND {activity_filter}
+           AND {preview_eligibility}
            AND (
                preview.invalidation_status IS NULL
                OR (
@@ -1711,6 +1773,32 @@ fn latest_chat_list_activity_tx(
         })
     })
     .optional()
+    .storage()
+}
+
+fn latest_accepted_activity_insert_order_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<Option<i64>> {
+    let activity_filter = chat_list_activity_filter_sql("accepted.");
+    tx.query_row(
+        &format!(
+            "SELECT MAX(accepted_source.insert_order)
+             FROM message_timeline AS accepted
+             JOIN app_events AS accepted_source
+               ON accepted_source.group_id_hex = accepted.group_id_hex
+              AND accepted_source.message_id_hex = accepted.message_id_hex
+             WHERE accepted.group_id_hex = ?1
+               AND {activity_filter}
+               AND accepted.invalidation_status IS NULL
+               AND NOT (
+                   accepted.direction = 'sent'
+                   AND accepted.source_message_id_hex IS NULL
+               )"
+        ),
+        params![group_id_hex],
+        |row| row.get(0),
+    )
     .storage()
 }
 

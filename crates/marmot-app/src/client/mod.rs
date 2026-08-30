@@ -346,6 +346,10 @@ pub struct AppClient {
     /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
     /// committed with the account projection and any frontier clear.
     pub(crate) pending_application_event_acks: HashSet<MessageId>,
+    /// One-shot test-policy fault at the projection/fanout cleanup boundary.
+    /// Kept on the client rather than re-reading config so the first failure
+    /// leaves the autonomous retry free to succeed.
+    pub(crate) fail_next_published_app_message_acknowledgement: bool,
     /// A live ingest changed the in-memory transport routing table after its
     /// durable projection was committed. The account worker publishes the
     /// resulting app summary before it asks the relay plane to rebuild its
@@ -3008,7 +3012,7 @@ impl AppClient {
             }
         };
         if let Err(publish_err) = self
-            .observe_recovery_evidence_then_gate_send_publish(&effects)
+            .observe_recovery_evidence_then_gate_send_publish(&effects, group_id, &app_event_id)
             .await
         {
             self.retract_failed_local_projection(
@@ -3092,20 +3096,35 @@ impl AppClient {
         ))
     }
 
-    /// Apply the publish gate to a completed send's effects — observing the same
-    /// batch's epoch-gap recovery evidence first — and, when the gate fails,
-    /// broadcast the peer commits the send folded before the caller surfaces the
-    /// error.
+    /// Apply the publish gate to one completed application send's effects —
+    /// observing the same batch's epoch-gap recovery evidence first — and,
+    /// when that send failed, broadcast peer commits the batch folded before
+    /// the caller surfaces the error.
     ///
     /// Split out of `send_app_event_with_local_projection` so the ordering is
-    /// exercisable against a given batch of effects. The caller keeps the
-    /// local-projection retraction, which needs that send's own locals.
+    /// exercisable against a given batch of effects. An aggregate effects batch
+    /// can contain an accepted or retained current send plus an unrelated
+    /// sibling failure; that sibling must not retract an already-delivered row.
+    /// The caller keeps the local-projection retraction, which needs the send's
+    /// own locals.
     pub(crate) async fn observe_recovery_evidence_then_gate_send_publish(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
+        group_id: &GroupId,
+        app_event_id: &str,
     ) -> Result<(), AppError> {
-        let publish_err = match self.observe_recovery_evidence_then_fail_if_publish_failed(effects)
-        {
+        self.observe_recovery_evidence(effects);
+        self.remember_pending_convergence_groups(effects);
+        let current_send_is_retained =
+            effects.published_app_messages.iter().any(|published| {
+                published.group_id == *group_id && published.app_event_id == app_event_id
+            }) || effects.unresolved_app_messages.iter().any(|unresolved| {
+                unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
+            });
+        if current_send_is_retained {
+            return Ok(());
+        }
+        let publish_err = match fail_if_publish_failed(effects) {
             Ok(()) => return Ok(()),
             Err(publish_err) => publish_err,
         };

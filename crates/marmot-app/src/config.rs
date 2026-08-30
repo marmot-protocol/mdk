@@ -168,8 +168,9 @@ pub struct MarmotAppConfig {
     /// have no external driver, so this stands in for them when a caller's
     /// handling of that error is what is under test.
     pub dev_fail_pending_session_event_drain: bool,
-    /// Dev/test-only fault injected after published application-message source
-    /// retention is finalized but before its durable fanout is acknowledged.
+    /// Dev/test-only one-shot fault injected after published
+    /// application-message source retention is finalized but before its
+    /// durable fanout is acknowledged.
     /// Honored only with `test-policy-overrides`; this exercises the recovery
     /// boundary where projection is committed but fanout cleanup must retry.
     pub dev_fail_published_app_message_acknowledgement: bool,
@@ -416,8 +417,8 @@ impl MarmotAppConfig {
         self
     }
 
-    /// Fail published application-message acknowledgement in test-policy
-    /// builds. Normal builds ignore this field.
+    /// Fail the next published application-message acknowledgement in
+    /// test-policy builds. Normal builds ignore this field.
     pub fn with_dev_fail_published_app_message_acknowledgement(mut self) -> Self {
         self.dev_fail_published_app_message_acknowledgement = true;
         self

@@ -13323,6 +13323,7 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
 
 #[derive(Clone, Copy)]
 enum MixedPublishObservation {
+    DirectSend,
     Drained,
     Scheduled,
     Retry,
@@ -13380,6 +13381,14 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     };
 
     let result = match observation {
+        MixedPublishObservation::DirectSend => client
+            .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, app_event_id)
+            .await
+            .and_then(|()| {
+                let updates = client.finalize_published_app_message_source_retention(&effects)?;
+                client.pending_projection_updates.extend(updates);
+                Ok(SyncSummary::default())
+            }),
         MixedPublishObservation::Drained => client.observe_drained_session_events(&effects).await,
         MixedPublishObservation::Scheduled => {
             client
@@ -13390,10 +13399,17 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             .observe_convergence_retry_effects(&group_id, &effects)
             .map(|_| SyncSummary::default()),
     };
-    assert!(
-        result.is_err(),
-        "the unrelated hard failure must still surface"
-    );
+    if matches!(observation, MixedPublishObservation::DirectSend) {
+        assert!(
+            result.is_ok(),
+            "an unrelated sibling failure must not fail the current delivered send"
+        );
+    } else {
+        assert!(
+            result.is_err(),
+            "the unrelated hard failure must still surface to aggregate observers"
+        );
+    }
     assert_eq!(
         client.take_pending_projection_updates().len(),
         1,
@@ -13423,6 +13439,12 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
 }
 
 #[tokio::test]
+async fn direct_send_mixed_batch_preserves_the_current_delivered_message() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::DirectSend)
+        .await;
+}
+
+#[tokio::test]
 async fn drained_mixed_publish_batch_finalizes_success_before_failure() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Drained).await;
 }
@@ -13440,63 +13462,70 @@ async fn retry_mixed_publish_batch_finalizes_success_before_failure() {
 
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
-async fn published_message_delivery_update_survives_acknowledgement_failure() {
+async fn published_message_acknowledgement_failure_retries_cleanup_without_republishing() {
     let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
+    AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let config = MarmotAppConfig::default().with_dev_fail_published_app_message_acknowledgement();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://ack-failure.example".to_owned(),
         config,
     )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     let group_id = client
         .create_group("acknowledgement failure", &[])
         .await
         .unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
-    let app_event_id = "delivered-before-acknowledgement";
-
-    app.record_account_app_event(
-        "alice",
-        &AppMessageProjection {
-            message_id_hex: app_event_id.to_owned(),
-            source_message_id_hex: None,
-            direction: "sent".to_owned(),
-            group_id_hex: group_id_hex.clone(),
-            sender: account.account_id_hex,
-            plaintext: "delivery survives cleanup failure".to_owned(),
-            kind: MARMOT_APP_EVENT_KIND_CHAT,
-            tags: Vec::new(),
-            source_epoch: Some(1),
-            retention: None,
-            recorded_at: Some(10),
-            origin_commit_id: None,
-            moderation_grant: false,
-        },
-    )
-    .unwrap();
-
-    let published_message_id = cgka_traits::MessageId::new(vec![0xac; 32]);
-    let effects = marmot_account::AccountDeviceEffects {
-        published_app_messages: vec![marmot_account::PublishedApplicationMessage {
-            group_id,
-            app_event_id: app_event_id.to_owned(),
-            message_id: published_message_id.clone(),
-            source_epoch: cgka_traits::EpochId(1),
-            retention: AppMessageRetentionDecision::new(10, 0),
-        }],
-        ..Default::default()
-    };
+    let publish_attempts_before = relay.attempted_event_ids().len();
 
     let summary = client
-        .observe_drained_session_events(&effects)
+        .send(&group_id, b"delivery survives cleanup failure")
         .await
-        .expect("fanout cleanup failure must not hide a committed delivery update");
-    assert_eq!(summary.projection_updates.len(), 1);
+        .expect("cleanup failure must not hide an accepted message");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    let app_event_id = summary.message_ids[0].clone();
+    assert_eq!(
+        client.runtime.session().outbound_fanouts().unwrap().len(),
+        1,
+        "the accepted fanout must remain durable after the injected acknowledgement failure"
+    );
+    assert!(
+        client.take_pending_convergence_groups().contains(&group_id),
+        "acknowledgement failure must create its own cleanup scheduling edge"
+    );
+    assert!(matches!(
+        client.convergence_schedule_state(&group_id).unwrap(),
+        ConvergenceScheduleState::PendingOutbound {
+            retry_after_ms: None
+        }
+    ));
+
+    client
+        .retry_group_convergence(&group_id)
+        .await
+        .expect("the autonomous cleanup replay must succeed after the one-shot fault");
+    assert!(
+        client
+            .runtime
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .is_empty(),
+        "the replayed publication metadata must be acknowledged and retired"
+    );
+    assert_eq!(
+        relay.attempted_event_ids().len(),
+        publish_attempts_before + 1,
+        "cleanup retry must not republish the already-accepted network event"
+    );
 
     let row = app
         .timeline_messages_with_query(
@@ -13511,10 +13540,7 @@ async fn published_message_delivery_update_survives_acknowledgement_failure() {
         .into_iter()
         .find(|message| message.message_id_hex == app_event_id)
         .expect("the finalized local message remains in the timeline");
-    assert_eq!(
-        row.source_message_id_hex,
-        Some(hex::encode(published_message_id.as_slice()))
-    );
+    assert!(row.source_message_id_hex.is_some());
 }
 
 /// A resource refusal carried by a host-requested convergence retry must arm
@@ -13612,7 +13638,7 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
     let result = client
-        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, "current-send")
         .await;
 
     assert!(
@@ -13652,7 +13678,7 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
 
     let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
     let result = client
-        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, "current-send")
         .await;
 
     assert!(

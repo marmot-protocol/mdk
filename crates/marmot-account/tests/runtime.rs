@@ -3832,6 +3832,15 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         1,
         "an accepted app fanout must remain durable until app projection acknowledges it"
     );
+    assert!(
+        runtime.has_pending_outbound_fanouts(&group_id).unwrap(),
+        "terminal accepted app fanout must remain scheduler-visible until cleanup acknowledgement"
+    );
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
+        None,
+        "local-only acknowledgement cleanup uses the scheduler's ordinary delay"
+    );
 
     // Simulate termination after relay acceptance was persisted but before the
     // app finalized its optimistic timeline row. Reopening must replay the

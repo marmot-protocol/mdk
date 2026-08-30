@@ -2202,6 +2202,64 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
 }
 
 #[test]
+fn secure_prune_does_not_resurrect_a_pending_preview_displaced_by_accepted_activity() {
+    let store = setup_store();
+    let mut pending = chat("pending", LOCAL, 300, "older unresolved send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = None;
+    store.record_app_event(&pending).unwrap();
+
+    let mut accepted = chat("accepted", REMOTE, 10, "newer accepted activity");
+    accepted.source_epoch = Some(7);
+    store.record_app_event(&accepted).unwrap();
+
+    let before = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        before
+            .last_message
+            .as_ref()
+            .map(|message| message.message_id_hex.as_str()),
+        Some("accepted")
+    );
+
+    store
+        .secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
+        .unwrap();
+
+    let after_prune = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert!(
+        after_prune.last_message.is_none(),
+        "the older pending send must stay displaced after its accepted witness is pruned"
+    );
+    let accepted_high_water = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT accepted_activity_insert_order
+             FROM chat_list_rows
+             WHERE group_id_hex = ?1",
+            params![GROUP],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert!(accepted_high_water > 0);
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("rebuilt chat row")
+            .last_message
+            .is_none(),
+        "projection repair must preserve the durable pending demotion"
+    );
+}
+
+#[test]
 fn secure_prune_keeps_chat_preview_on_canonical_latest_epoch() {
     let store = setup_store();
     let mut pruned = chat("pruned", REMOTE, 10, "old");

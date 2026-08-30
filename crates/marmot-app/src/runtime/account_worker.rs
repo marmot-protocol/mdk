@@ -4126,17 +4126,24 @@ impl ScheduledConvergence {
             ConvergenceScheduleState::PendingUnopenable => {
                 self.schedule_unsettled_groups([group_id.clone()]);
             }
-            ConvergenceScheduleState::PendingOutbound => {
+            ConvergenceScheduleState::PendingOutbound { retry_after_ms } => {
                 // A waiting outbound queue keeps the wakeup armed on the
-                // normal delay but is not unsettled convergence: it never
-                // feeds the re-arm cap, so a healthy queue cannot be demoted
-                // to error backoff (transport failures reach backoff through
-                // the sync/drain error paths instead). It also clears the
-                // counter: this state means pending inputs are gone, so any
-                // prior unopenable streak genuinely ended.
+                // durable fanout's exact cutoff (or the normal delay for
+                // queued/local-only work) but is not unsettled convergence:
+                // it never feeds the re-arm cap. It also clears the counter:
+                // this state means pending inputs are gone, so any prior
+                // unopenable streak genuinely ended.
                 self.retry_attempts.remove(group_id);
                 self.unsettled_rearm_attempts.remove(group_id);
-                self.arm_no_later(group_id.clone(), TokioInstant::now() + self.normal_delay());
+                let delay = retry_after_ms.map_or_else(
+                    || self.normal_delay(),
+                    |remaining_ms| {
+                        Duration::from_millis(remaining_ms)
+                            .max(MIN_CONVERGENCE_SETTLEMENT_DELAY)
+                            .saturating_add(self.test_delay)
+                    },
+                );
+                self.arm_no_later(group_id.clone(), TokioInstant::now() + delay);
                 self.reset_timer_to_earliest();
             }
         }
@@ -5878,7 +5885,12 @@ mod tests {
         let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
 
         for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
-            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingOutbound);
+            scheduled.schedule_after_pass(
+                &group_id,
+                ConvergenceScheduleState::PendingOutbound {
+                    retry_after_ms: None,
+                },
+            );
             scheduled.take_ready();
         }
 
@@ -5893,11 +5905,41 @@ mod tests {
         for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
             scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingUnopenable);
             scheduled.take_ready();
-            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingOutbound);
+            scheduled.schedule_after_pass(
+                &group_id,
+                ConvergenceScheduleState::PendingOutbound {
+                    retry_after_ms: None,
+                },
+            );
             scheduled.take_ready();
         }
         assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_outbound_arms_at_the_durable_retry_cutoff() {
+        let group_id = test_group_id(16);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let before = TokioInstant::now();
+
+        scheduled.schedule_after_pass(
+            &group_id,
+            ConvergenceScheduleState::PendingOutbound {
+                retry_after_ms: Some(30_000),
+            },
+        );
+
+        assert_eq!(
+            scheduled.deadlines[&group_id],
+            before + Duration::from_secs(30),
+            "a frozen fanout must sleep until its durable cutoff instead of polling every settlement interval"
+        );
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        assert!(
+            scheduled.deadlines[&group_id] > TokioInstant::now(),
+            "the ordinary convergence delay must not wake a backpressured fanout"
+        );
     }
 
     #[tokio::test]

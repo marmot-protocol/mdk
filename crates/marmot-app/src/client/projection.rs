@@ -590,12 +590,9 @@ impl AppClient {
                 updates.push(update);
             }
         }
-        let acknowledgement = if cfg!(feature = "test-policy-overrides")
-            && self
-                .app
-                .config
-                .dev_fail_published_app_message_acknowledgement
-        {
+        let fail_acknowledgement = cfg!(feature = "test-policy-overrides")
+            && std::mem::take(&mut self.fail_next_published_app_message_acknowledgement);
+        let acknowledgement = if fail_acknowledgement {
             Err(AppError::BlockingTask(
                 "injected published application-message acknowledgement failure".to_owned(),
             ))
@@ -606,9 +603,14 @@ impl AppClient {
         };
         if let Err(error) = acknowledgement {
             // Projection is already durable, and the accepted fanout remains
-            // durable when acknowledgement fails. Return the delivery update
-            // so subscribers leave Sending; the next recovery drain replays
-            // the publication metadata and retries this idempotent cleanup.
+            // durable when acknowledgement fails. Schedule its group so a
+            // cleanup-only replay runs without waiting for unrelated traffic;
+            // resume recognizes this terminal fanout and never republishes its
+            // network bytes.
+            for published in &effects.published_app_messages {
+                self.pending_convergence_groups
+                    .insert(published.group_id.clone());
+            }
             tracing::warn!(
                 target: "marmot_app::client::projection",
                 method = "finalize_published_app_message_source_retention",

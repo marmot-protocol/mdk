@@ -366,12 +366,12 @@ pub(crate) enum ConvergenceScheduleState {
     /// trigger). Re-check on the fallback delay; only this state counts
     /// toward the unsettled re-arm cap.
     PendingUnopenable,
-    /// No convergence work, but durable queued outbound intents remain. The
-    /// scheduled drain regenerates and publishes them (and a failed sync on
-    /// that tick triggers transport reactivation), so the wakeup stays armed
-    /// on the fallback delay — but a healthy waiting queue is not unsettled
-    /// convergence and never counts toward the re-arm cap.
-    PendingOutbound,
+    /// No convergence work, but durable outbound work remains. A frozen
+    /// transport event carries its earliest retry cutoff; queued intents and
+    /// local-only acknowledgement cleanup use the scheduler's ordinary delay.
+    /// This state is not unsettled convergence and never counts toward the
+    /// re-arm cap.
+    PendingOutbound { retry_after_ms: Option<u64> },
 }
 
 enum SyncCheckpointError {
@@ -443,10 +443,14 @@ impl AppClient {
             None => {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
-                } else if self.runtime.has_queued_outbound_intents(group_id)?
-                    || self.runtime.has_pending_outbound_fanouts(group_id)?
-                {
-                    Ok(ConvergenceScheduleState::PendingOutbound)
+                } else if self.runtime.has_queued_outbound_intents(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: None,
+                    })
+                } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
+                    })
                 } else {
                     match self.runtime.deferred_peel_cutoff_delay_ms(group_id)? {
                         Some(0) => Ok(ConvergenceScheduleState::Ready),
@@ -466,7 +470,9 @@ impl AppClient {
         }
     }
 
-    fn remember_pending_convergence_groups(
+    /// Retain engine-provided scheduling edges from an effects batch until the
+    /// account worker can arm their group timers.
+    pub(crate) fn remember_pending_convergence_groups(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) {

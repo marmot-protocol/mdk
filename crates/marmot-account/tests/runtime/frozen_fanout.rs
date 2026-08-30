@@ -218,6 +218,106 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 }
 
 #[tokio::test]
+async fn deferred_fanout_blocks_newer_same_group_fanouts_and_sets_the_retry_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
+    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "ordered fanout".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let endpoint = TransportEndpoint("wss://ordered-fanout.example".into());
+    let make_request = |id: u8| TransportPublishRequest {
+        account_id: alice.self_id(),
+        message: TransportMessage {
+            id: MessageId::new(vec![id; 32]),
+            payload: vec![id],
+            timestamp: Timestamp(100),
+            causal_deps: Vec::new(),
+            source: TransportSource("ordered-fanout-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        },
+        target: TransportPublishTarget::Group {
+            group_id: group_id.clone(),
+            transport_group_id: group_id.as_slice().to_vec(),
+            endpoints: vec![endpoint.clone()],
+        },
+        required_acks: 1,
+    };
+    let mut older = OutboundFanout::stage(make_request(1), None, None, 100_000).unwrap();
+    older.mark_attempt_started_at(0, 100_000).unwrap();
+    older
+        .record_target_failure(
+            0,
+            TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: "acknowledgement unknown".into(),
+                kind: TransportEndpointFailureKind::PossiblyExposed,
+                rejection_category: None,
+            },
+        )
+        .unwrap();
+    let newer = OutboundFanout::stage(make_request(2), None, None, 100_001).unwrap();
+    alice.put_outbound_fanout(&older).unwrap();
+    alice.put_outbound_fanout(&newer).unwrap();
+
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(100));
+    let policy = StaticTransportRouting::new(Vec::new()).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let effects = runtime.resume_outbound_fanouts().await.unwrap();
+
+    assert!(effects.reports.is_empty());
+    assert!(adapter.publishes().is_empty());
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
+        Some(30_000),
+        "the later NotAttempted fanout must not pull the older retry cutoff forward"
+    );
+    let stored = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(
+        stored[1].target_status(0),
+        Some(FanoutTargetStatus::NotAttempted),
+        "the newer event must remain untouched until the older obligation is retryable"
+    );
+}
+
+#[tokio::test]
 async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance() {
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice-unknown-retry.sqlite");

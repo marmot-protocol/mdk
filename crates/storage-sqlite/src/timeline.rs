@@ -1240,36 +1240,63 @@ fn retain_pruned_chat_activity_tx(
     group_id_hex: &str,
     pruned_message_ids: &BTreeSet<String>,
 ) -> StorageResult<()> {
-    let activity_filter = crate::chat_list::chat_list_activity_filter_sql("");
+    let activity_filter = crate::chat_list::chat_list_activity_filter_sql("timeline.");
     let sql = format!(
-        "SELECT timeline_at
-         FROM message_timeline
-         WHERE group_id_hex = ?1
-           AND message_id_hex = ?2
+        "SELECT timeline.timeline_at,
+                CASE
+                    WHEN timeline.invalidation_status IS NULL
+                     AND NOT (
+                         timeline.direction = 'sent'
+                         AND timeline.source_message_id_hex IS NULL
+                     ) THEN source.insert_order
+                    ELSE NULL
+                END
+         FROM message_timeline AS timeline
+         JOIN app_events AS source
+           ON source.group_id_hex = timeline.group_id_hex
+          AND source.message_id_hex = timeline.message_id_hex
+         WHERE timeline.group_id_hex = ?1
+           AND timeline.message_id_hex = ?2
            AND {activity_filter}
            AND (
-               invalidation_status IS NULL
-               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+               timeline.invalidation_status IS NULL
+               OR (
+                   timeline.direction = 'sent'
+                   AND timeline.invalidation_status = 'local_publish_failed'
+               )
            )"
     );
     let mut statement = tx.prepare(&sql).storage()?;
     let mut latest_pruned_activity = None;
+    let mut accepted_activity_insert_order = None;
     for message_id_hex in pruned_message_ids {
-        let timeline_at = statement
+        let retained = statement
             .query_row(params![group_id_hex, message_id_hex], |row| {
-                row.get::<_, i64>(0)
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
             })
             .optional()
             .storage()?;
-        latest_pruned_activity = latest_pruned_activity.max(timeline_at);
+        if let Some((timeline_at, accepted_insert_order)) = retained {
+            latest_pruned_activity = latest_pruned_activity.max(Some(timeline_at));
+            accepted_activity_insert_order =
+                accepted_activity_insert_order.max(accepted_insert_order);
+        }
     }
-    if let Some(timeline_at) = latest_pruned_activity {
+    if latest_pruned_activity.is_some() || accepted_activity_insert_order.is_some() {
         tx.execute(
             "UPDATE chat_list_rows
              SET retained_activity_sort_at = MAX(retained_activity_sort_at, ?2),
-                 activity_sort_at = MAX(activity_sort_at, ?2)
+                 activity_sort_at = MAX(activity_sort_at, ?2),
+                 accepted_activity_insert_order = MAX(
+                     accepted_activity_insert_order,
+                     ?3
+                 )
              WHERE group_id_hex = ?1",
-            params![group_id_hex, timeline_at],
+            params![
+                group_id_hex,
+                latest_pruned_activity.unwrap_or(0),
+                accepted_activity_insert_order.unwrap_or(0)
+            ],
         )
         .storage()?;
     }
@@ -1282,6 +1309,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
 ) -> StorageResult<()> {
     let activity_filter = crate::chat_list::chat_list_activity_filter_sql("preview.");
     let preview_order = crate::chat_list::chat_list_preview_order_desc("preview.");
+    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
                 preview.kind, preview.timeline_at, preview.deleted,
@@ -1295,6 +1323,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
          FROM message_timeline AS preview
          WHERE preview.group_id_hex = ?1
            AND {activity_filter}
+           AND {preview_eligibility}
            AND (
                preview.invalidation_status IS NULL
                OR (

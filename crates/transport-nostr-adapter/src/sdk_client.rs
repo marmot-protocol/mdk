@@ -883,7 +883,7 @@ impl NostrSdkRelayClient {
         // The first concurrent request window starts before shared relay
         // connection. A bounded `try_connect_relay` must not silently extend
         // the existing end-to-end event budget from 20s to 25s.
-        let mut request_window_deadline = publish_started_at + SDK_RELAY_PUBLISH_OVERALL_WAIT;
+        let initial_request_deadline = publish_started_at + SDK_RELAY_PUBLISH_OVERALL_WAIT;
         let batch_deadline = publish_started_at + SDK_RELAY_BATCH_OVERALL_WAIT;
         let mut unique_endpoints = Vec::new();
         let mut seen_endpoints = HashSet::new();
@@ -950,6 +950,7 @@ impl NostrSdkRelayClient {
             .collect::<Vec<Option<Result<NostrPublishOutcome, TransportAdapterError>>>>();
         let mut request_durations = vec![Duration::ZERO; request_count];
         let mut exhausted = false;
+        let mut admitted_network_requests = 0_usize;
         loop {
             while publishes.len() < SDK_RELAY_BATCH_MAX_IN_FLIGHT && !exhausted {
                 match pending.next() {
@@ -966,15 +967,13 @@ impl NostrSdkRelayClient {
                             request_durations[index] = batch_started_at.elapsed();
                             continue;
                         }
-                        // Requests admitted during one concurrency window share
-                        // its deadline. Once that window expires, later
-                        // backpressured requests receive the next bounded
-                        // window, capped by the whole-batch deadline.
-                        if now >= request_window_deadline {
-                            request_window_deadline =
-                                (now + SDK_RELAY_PUBLISH_OVERALL_WAIT).min(batch_deadline);
-                        }
-                        let request_deadline = request_window_deadline;
+                        let request_deadline = Self::batch_request_deadline(
+                            now,
+                            initial_request_deadline,
+                            batch_deadline,
+                            admitted_network_requests,
+                        );
+                        admitted_network_requests = admitted_network_requests.saturating_add(1);
                         let client = self.clone();
                         let unavailable = unavailable.clone();
                         publishes.spawn(async move {
@@ -1029,6 +1028,22 @@ impl NostrSdkRelayClient {
         NostrPublishBatch {
             outcomes,
             request_durations,
+        }
+    }
+
+    /// Preserve the first cohort's end-to-end budget while giving every
+    /// request admitted after backpressure a fresh per-event window, capped by
+    /// the whole-batch ceiling.
+    fn batch_request_deadline(
+        admitted_at: tokio::time::Instant,
+        initial_deadline: tokio::time::Instant,
+        batch_deadline: tokio::time::Instant,
+        admission_index: usize,
+    ) -> tokio::time::Instant {
+        if admission_index < SDK_RELAY_BATCH_MAX_IN_FLIGHT {
+            initial_deadline.min(batch_deadline)
+        } else {
+            (admitted_at + SDK_RELAY_PUBLISH_OVERALL_WAIT).min(batch_deadline)
         }
     }
 
@@ -2913,6 +2928,42 @@ mod tests {
             started_at.elapsed(),
         );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fifth_batch_request_gets_a_fresh_deadline_after_backpressure() {
+        let started_at = tokio::time::Instant::now();
+        let initial_deadline = started_at + SDK_RELAY_PUBLISH_OVERALL_WAIT;
+        let batch_deadline = started_at + SDK_RELAY_BATCH_OVERALL_WAIT;
+
+        for admission_index in 0..SDK_RELAY_BATCH_MAX_IN_FLIGHT {
+            assert_eq!(
+                NostrSdkRelayClient::batch_request_deadline(
+                    started_at,
+                    initial_deadline,
+                    batch_deadline,
+                    admission_index,
+                ),
+                initial_deadline,
+                "the first four concurrent requests share the original end-to-end budget"
+            );
+        }
+
+        tokio::time::advance(SDK_RELAY_PUBLISH_OVERALL_WAIT - Duration::from_millis(1)).await;
+        let admitted_at = tokio::time::Instant::now();
+        let fifth_deadline = NostrSdkRelayClient::batch_request_deadline(
+            admitted_at,
+            initial_deadline,
+            batch_deadline,
+            SDK_RELAY_BATCH_MAX_IN_FLIGHT,
+        );
+
+        assert_eq!(
+            fifth_deadline,
+            admitted_at + SDK_RELAY_PUBLISH_OVERALL_WAIT,
+            "a refill must not inherit the first cohort's final millisecond"
+        );
+        assert!(fifth_deadline > initial_deadline);
     }
 
     #[tokio::test]
