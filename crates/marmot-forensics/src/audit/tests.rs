@@ -963,6 +963,56 @@ fn audit_log_event_schema_tracks_kind_catalog() {
     assert_eq!(schema_tags, code_tags);
 }
 
+/// The trigger enum is a schema-visible catalog, so the two halves must move
+/// together. Without this the v3 `$defs` can be reverted to a narrower set — or
+/// left behind when a variant is added — and every other test still passes,
+/// because nothing else compares the two.
+#[test]
+fn v3_schema_tracks_the_epoch_stall_backfill_trigger_catalog() {
+    let triggers = [
+        EpochStallBackfillTrigger::UndecryptableThreshold,
+        EpochStallBackfillTrigger::ContestedForkDeferral,
+        EpochStallBackfillTrigger::ResourceRefusal,
+    ];
+    // Exhaustiveness guard: a new variant fails to compile here rather than
+    // silently shrinking the set this test compares.
+    for trigger in triggers {
+        match trigger {
+            EpochStallBackfillTrigger::UndecryptableThreshold
+            | EpochStallBackfillTrigger::ContestedForkDeferral
+            | EpochStallBackfillTrigger::ResourceRefusal => {}
+        }
+    }
+
+    let emitted = triggers
+        .iter()
+        .map(|trigger| {
+            serde_json::to_value(trigger)
+                .expect("trigger serializes")
+                .as_str()
+                .expect("trigger serializes to a string")
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v3.schema.json")).unwrap();
+    let defined = schema
+        .pointer("/$defs/epochStallBackfillTrigger/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("epochStallBackfillTrigger enum")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("trigger enum entry is a string")
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(emitted, defined);
+}
+
 #[test]
 fn v3_schema_cannot_express_former_sensitive_audit_fields() {
     let schema = include_str!("../../schema/audit-log-event.v3.schema.json");

@@ -605,6 +605,7 @@ mod tests {
             &metadata,
             Ok(&IngestOutcome::TransportDeferred {
                 group_id: GroupId::new(vec![1]),
+                lineage: cgka_traits::ingest::DeferralLineage::Uncontested,
             }),
         );
 
@@ -624,6 +625,7 @@ mod tests {
             &metadata,
             Ok(&IngestOutcome::TransportDeferred {
                 group_id: cgka_traits::types::GroupId::new(vec![1]),
+                lineage: cgka_traits::ingest::DeferralLineage::Uncontested,
             }),
         );
 

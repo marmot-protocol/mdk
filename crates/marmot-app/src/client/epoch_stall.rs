@@ -82,8 +82,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use cgka_traits::ingest::{DeferralLineage, IngestOutcome};
 use cgka_traits::{EpochId, GroupId};
-use marmot_forensics::EpochBackfillDeferredReason;
+use marmot_forensics::{EpochBackfillDeferredReason, EpochStallBackfillTrigger};
 use rand::RngCore;
 
 /// Distinct undecryptable messages a group may accumulate at one stalled epoch
@@ -276,6 +277,43 @@ impl BackfillDecision {
     }
 }
 
+/// Which trigger a stall-arming ingest outcome records on its durable armed row.
+///
+/// **The chosen semantics for a fork-side deferral: it counts, it arms, and it
+/// says so.** A deferral whose group's stored commit graph is contested is
+/// evidence of being stuck exactly as any other undecryptable is, and it is fed
+/// to the detector unchanged — suppressing it would cost more than the wasted
+/// replay it saves. The detector's frozen-device escalation is gated on having
+/// armed at the epoch the evidence was gathered at
+/// ([`GroupStall::observe_fruitless_completion`]), so a group whose deferrals
+/// did not arm can never report at all — and a forked group that never resolves
+/// is precisely the wedge that most needs reporting. What changes is the label,
+/// not the decision: the armed row names the fork, so an incident that keeps
+/// arming under [`EpochStallBackfillTrigger::ContestedForkDeferral`] reads as a
+/// fork to adjudicate rather than a device to re-sync. That costs the
+/// escalation none of its #1590 properties — the evidence behind a report is
+/// still the relays' own end-of-stored-events verdict, and the label is derived
+/// from retained authenticated commits, so it cannot be minted by publishing
+/// undecryptable envelopes.
+///
+/// Routing the group to convergence, which is what actually recovers it, needs
+/// nothing here: the engine schedules a group for convergence on the same seam
+/// that defers the object, and the app absorbs that through
+/// `effects.pending_convergence` on the very same delivery.
+pub(crate) fn backfill_trigger_for(outcome: &IngestOutcome) -> EpochStallBackfillTrigger {
+    match outcome {
+        IngestOutcome::TransportDeferred {
+            lineage: DeferralLineage::ContestedFork,
+            ..
+        } => EpochStallBackfillTrigger::ContestedForkDeferral,
+        IngestOutcome::ResourceRefused { .. } => EpochStallBackfillTrigger::ResourceRefusal,
+        // Every other outcome reaching an arm decision is threshold evidence,
+        // including a deferral with no fork evidence behind it — which is the
+        // case a full-history replay is the right answer for.
+        _ => EpochStallBackfillTrigger::UndecryptableThreshold,
+    }
+}
+
 /// Per-group stall accounting.
 struct GroupStall {
     /// The epoch the undecryptable messages accumulated at; a new epoch resets
@@ -434,6 +472,89 @@ impl GroupStall {
         self.fruitless_reported = false;
         self.fruitless_completions = 0;
         self.last_arm_at_ms = None;
+    }
+
+    /// End the arm run, leaving every epoch-scoped field standing.
+    ///
+    /// The one caller is [`Self::observe_convergence_reorg`], and the narrow
+    /// blast radius is what makes it safe. [`Self::end_run`] is the *run and
+    /// epoch* reset: it also drops the frozen-epoch evidence and the arm clock,
+    /// which is right for its callers because each either re-notes an arm in
+    /// the same breath ([`Self::arm`], [`Self::rearm_wedged`]) or is itself an
+    /// epoch change ([`Self::observe_epoch`]). A same-epoch reorg is neither.
+    /// It does not move the epoch, so nothing keyed on the epoch has expired:
+    /// `fruitless_completions` and `fruitless_reported` still describe the
+    /// relays' verdict about the epoch this device is still sitting on,
+    /// `last_arm_at_ms` still paces re-arms at it, and `fired_at_epoch` /
+    /// `armed_at_epoch` still debounce it.
+    ///
+    /// Both omissions are load-bearing, in opposite directions. Dropping
+    /// `last_arm_at_ms` would leave `fired_at_epoch` naming an epoch with no
+    /// mark to pace against, wedging [`Self::may_rearm_wedged`] shut for good on
+    /// a group whose epoch never moves again — the exact failure the paced
+    /// re-arm exists to prevent. Dropping the frozen-epoch evidence would hand a
+    /// recurring reorg the power to silence the wedge report, and reorgs do
+    /// recur: a losing commit is parked rather than consumed, so stored
+    /// convergence re-derives and re-announces the same withdrawal on every pass
+    /// it runs, and one unresolved fork plus ordinary member traffic produces a
+    /// reorg per pass indefinitely.
+    fn end_arm_run_keeping_epoch_evidence(&mut self) {
+        self.arms = 0;
+        self.escalated = false;
+    }
+
+    /// Convergence adjudicated a fork for this group: a commit on the branch
+    /// this device was following lost a same-epoch branch selection and its
+    /// state notifications were withdrawn.
+    ///
+    /// Ends the unrecovered *arm run*, for the same reason a passage spanning
+    /// two or more epochs does. It is not proof the device reached the tip —
+    /// nothing at this layer ever is — but it is proof that authenticated
+    /// commits are arriving and being adjudicated against each other, which is
+    /// the signature of a group that is alive rather than one this device has
+    /// fallen out of. Escalating such a device recommends the wrong recovery:
+    /// an account-wide relay replay cannot supply the branch adoption that
+    /// fork-side traffic is waiting on.
+    ///
+    /// It has to be its own signal because nothing else carries it. A
+    /// same-epoch reorg leaves `previous_tip == selected_tip`, so the engine
+    /// emits no `EpochChanged`, and the epoch every other `observe_*` call
+    /// reports is unchanged — [`Self::observe_epoch`] returns early and decides
+    /// nothing.
+    ///
+    /// ### What this hands an adversary, and what bounds it
+    ///
+    /// State it plainly: this is a new capability, and unlike an ordinary
+    /// commit it really can suppress the arm-run rule. An ordinary commit does
+    /// not — [`Self::observe_epoch`] continues a run across an epoch the device
+    /// *armed* at, which is the core rule of the escalation design — so a
+    /// member who can fork the group gains something here that a member who
+    /// merely commits does not have.
+    ///
+    /// Two things bound it. First, authentication holds: the withdrawal is
+    /// raised only by stored convergence adjudicating commits that already
+    /// passed authenticated admission, so a forgery is rejected against the
+    /// candidate state long before it can supersede anything, and a non-member
+    /// cannot provoke one at all. The capability is member-only, and a member
+    /// already outranks the threat model the arm-run threshold was written
+    /// against — that threshold exists to keep *minted undecryptable traffic*,
+    /// which anyone can publish, from inflating a run.
+    ///
+    /// Second, and this is the half that has to hold by construction rather
+    /// than by argument: the report a wedged group actually depends on is the
+    /// frozen-epoch one, escalated from the relays' own end-of-stored-events
+    /// verdict ([`Self::observe_fruitless_completion`]), and this method does
+    /// not touch its evidence. So no reorg cadence, however dense, can silence
+    /// a wedge report — it can only stop the arm *count* from being the thing
+    /// that raises it.
+    ///
+    /// Deliberately does not touch `epoch`, `undecryptable`, `fired_at_epoch`,
+    /// or `armed_at_epoch` either. Those are keyed on the stalled epoch, and a
+    /// same-epoch reorg is exactly the movement that does not change it: the
+    /// device is still where it was, still unable to read what it could not
+    /// read, and still debounced against re-arming here.
+    fn observe_convergence_reorg(&mut self) {
+        self.end_arm_run_keeping_epoch_evidence();
     }
 
     /// Record an arm at the current epoch and decide whether this run has now
@@ -767,6 +888,28 @@ impl EpochStallDetector {
             stall.observe_epoch(from.next());
         }
         stall.observe_epoch(to);
+    }
+
+    /// Note that stored convergence adjudicated a fork for an already-tracked
+    /// `group`: see [`GroupStall::observe_convergence_reorg`] for what that
+    /// ends and what it deliberately leaves alone.
+    ///
+    /// The caller passes the group off the engine's own
+    /// [`GroupEvent::GroupStateInvalidated`] withdrawal, once per superseded
+    /// commit. Ending an already-ended arm run is a no-op, so a pass that
+    /// withdraws several commits decides as one that withdrew one — and so does
+    /// the *next* pass re-announcing the same withdrawal, which is the ordinary
+    /// case for a fork that has not resolved.
+    ///
+    /// `get_mut` like [`Self::observe_epoch_passage`]: a reorg is evidence
+    /// about a stall run, never the start of one, so a group with no stall
+    /// history stays untracked.
+    ///
+    /// [`GroupEvent::GroupStateInvalidated`]: cgka_traits::engine::GroupEvent::GroupStateInvalidated
+    pub(crate) fn observe_convergence_reorg(&mut self, group: &GroupId) {
+        if let Some(stall) = self.groups.get_mut(group) {
+            stall.observe_convergence_reorg();
+        }
     }
 
     /// Record one undecryptable message for `group` observed while the group is
@@ -1585,6 +1728,166 @@ mod tests {
                 .observe_undecryptable(g.clone(), "m5".into(), EpochId(20), T0)
                 .arms_backfill(),
             "the count should restart at the new epoch, not carry over"
+        );
+    }
+
+    /// A reorg ends the run without opening a window on the replay.
+    ///
+    /// This is one of the omissions `end_arm_run_keeping_epoch_evidence`
+    /// exists for, from both sides. Clear the mark and the paced re-arm gate
+    /// reads `None` and stays shut forever on a wedged group — the very group
+    /// the pacing was added for. Clear `fired_at_epoch` instead and every reorg
+    /// buys an immediate unpaced account-wide replay, which is leverage a
+    /// member who forks the group at will would happily pay for.
+    #[test]
+    fn a_reorg_ends_the_run_without_unlocking_an_unpaced_rearm() {
+        let mut detector = EpochStallDetector::new(1, 3).with_wedge_rearm_interval_ms(HOUR_MS);
+        let g = group(0x01);
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
+            BackfillDecision::Arm
+        );
+        detector.observe_convergence_reorg(&g);
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(10), T0 + HOUR_MS - 1),
+            BackfillDecision::Skip,
+            "the reorg left the arm clock standing, so pacing still gates the replay",
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(10), T0 + HOUR_MS),
+            BackfillDecision::Arm,
+            "and the wedged group still earns its paced re-arm once the interval elapses",
+        );
+    }
+
+    /// The shape that decides the whole rescope: a group whose fork never
+    /// resolves still escalates, off the relays' own verdict.
+    ///
+    /// Reorgs are not rare punctuation on a forked group — they recur. A losing
+    /// commit is parked rather than consumed, so every convergence pass
+    /// re-derives and re-announces the same withdrawal, and ordinary member
+    /// traffic is enough to run a pass per round indefinitely. If a reorg reset
+    /// the frozen-epoch evidence along with the arm run, the count below would
+    /// return to zero every round and this group — wedged at one epoch, relays
+    /// confirming round after round that they hold nothing that moves it —
+    /// could never report at all. Keeping the epoch-scoped evidence out of the
+    /// reset makes the report survive by construction rather than by cadence.
+    #[test]
+    fn a_chronically_forked_group_still_escalates_off_relay_confirmed_evidence() {
+        let mut detector = EpochStallDetector::new(1, 3)
+            .with_wedge_rearm_interval_ms(HOUR_MS)
+            .with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+
+        let mut reports = Vec::new();
+        for round in 0..12u64 {
+            // Fresh undecryptable traffic arrives and the paced replay runs.
+            assert_eq!(
+                detector.observe_undecryptable(
+                    g.clone(),
+                    format!("fork-side-{round}"),
+                    EpochId(10),
+                    T0 + round * HOUR_MS,
+                ),
+                BackfillDecision::Arm,
+                "round {round}: a wedged group's paced re-arm is its only replay",
+            );
+            // The relays serve the account's stored history in full and it
+            // recovers nothing.
+            reports.extend(detector.observe_fruitless_completion([&g]));
+            // And the unresolved fork is re-adjudicated, announcing the same
+            // withdrawal again.
+            detector.observe_convergence_reorg(&g);
+        }
+
+        assert_eq!(
+            reports.len(),
+            1,
+            "exactly one report: earned on the third relay-confirmed completion, then latched for this epoch",
+        );
+        assert_eq!(reports[0].completions, 3);
+        assert_eq!(reports[0].stalled_epoch, 10);
+    }
+
+    /// Re-announcement is the ordinary case, not an edge one, so it must cost
+    /// the evidence nothing. The engine has no idempotence guard on the
+    /// withdrawal it derives from a parked losing commit; every pass emits the
+    /// same pair again.
+    #[test]
+    fn re_announcing_the_same_withdrawal_does_not_reset_the_frozen_epoch_evidence() {
+        let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
+        let g = group(0x01);
+
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(10), T0),
+            BackfillDecision::Arm
+        );
+        assert!(detector.observe_fruitless_completion([&g]).is_empty());
+        assert!(detector.observe_fruitless_completion([&g]).is_empty());
+
+        for _ in 0..10 {
+            detector.observe_convergence_reorg(&g);
+        }
+
+        let reports = detector.observe_fruitless_completion([&g]);
+        assert_eq!(
+            reports.len(),
+            1,
+            "ten re-announcements of one withdrawal must not spend the two completions already banked",
+        );
+        assert_eq!(reports[0].completions, 3);
+    }
+
+    /// A reorg is evidence about a run, never the start of one.
+    #[test]
+    fn a_reorg_for_a_group_with_no_stall_history_leaves_it_untracked() {
+        let mut detector = stall_detector(1);
+        let g = group(0x01);
+
+        detector.observe_convergence_reorg(&g);
+
+        assert_eq!(
+            detector.observe_undecryptable(g, "m1".into(), EpochId(10), T0),
+            BackfillDecision::Arm,
+            "the first arm of a fresh run, not a second one off invented history",
+        );
+    }
+
+    /// Fork-side traffic still arms, and the row it arms says which kind of
+    /// recovery it is: the deferral counts as stall evidence exactly as any
+    /// other undecryptable does, because a fork that never resolves is a wedge
+    /// and the wedge report is gated on having armed.
+    #[test]
+    fn a_contested_fork_deferral_arms_under_its_own_trigger() {
+        let deferred = |lineage| IngestOutcome::TransportDeferred {
+            group_id: group(0x01),
+            lineage,
+        };
+
+        assert_eq!(
+            backfill_trigger_for(&deferred(DeferralLineage::ContestedFork)),
+            EpochStallBackfillTrigger::ContestedForkDeferral,
+        );
+        assert_eq!(
+            backfill_trigger_for(&deferred(DeferralLineage::Uncontested)),
+            EpochStallBackfillTrigger::UndecryptableThreshold,
+        );
+        assert_eq!(
+            backfill_trigger_for(&IngestOutcome::ResourceRefused {
+                group_id: group(0x01),
+                resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            }),
+            EpochStallBackfillTrigger::ResourceRefusal,
+        );
+
+        // And the label changes nothing about the decision: a fork-side
+        // deferral crosses the same threshold and arms the same replay.
+        let mut detector = stall_detector(1);
+        assert_eq!(
+            detector.observe_undecryptable(group(0x01), "fork-side".into(), EpochId(10), T0),
+            BackfillDecision::Arm,
         );
     }
 

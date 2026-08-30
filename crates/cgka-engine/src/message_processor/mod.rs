@@ -25,7 +25,7 @@ use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{
-    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
+    DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{
@@ -1935,6 +1935,66 @@ impl<S: StorageProvider> Engine<S> {
             "deferred-peel retry sweep"
         );
         Ok(DeferredPeelWorkResult { status, progressed })
+    }
+
+    /// What the engine can soundly claim about why a transport-deferred object
+    /// is unreadable.
+    ///
+    /// This is a claim about the GROUP, never about the message. At the
+    /// deferral point the object failed to decrypt under the live context,
+    /// every retained snapshot, and every candidate branch a sweep had
+    /// materialized, so nothing observable separates one unreadable object
+    /// from another — the per-message discriminator the success path derives
+    /// from `recovered_from_candidate_branch` simply does not exist here.
+    /// What remains sayable is the shape of the stored commit graph, and that
+    /// is the fact deciding which recovery can help: a fork whose rival commit
+    /// is already retained cannot be fixed by fetching more relay history,
+    /// while a gap whose commit never arrived can — and the second case is
+    /// indistinguishable from no fork at all, which is precisely why the
+    /// uncontested answer is the one that admits a backfill.
+    ///
+    /// Uses the sweep's own replay-free contested predicate over the same
+    /// retained-anchor window branch enumeration uses, so this label and the
+    /// branch work it describes cannot disagree.
+    ///
+    /// Deliberately unmemoized. A cached verdict would have to be validated
+    /// against `deferred_peel_context_fingerprint` to be trustworthy — the
+    /// candidate cache beside it is safe precisely because it is self-validating
+    /// that way — and that fingerprint folds `stored_convergence_commit_digests`,
+    /// which is the same full stored-message scan this probe is. So a correct
+    /// cache costs what it saves, while an uncorroborated one buys speed with
+    /// exactly the wrong error: a stale verdict here reads `Uncontested` on a
+    /// group that has since forked, which is the inversion this whole
+    /// discriminator exists to prevent.
+    ///
+    /// The scan is therefore paid per deferral, and bounded by where it sits.
+    /// It runs only after the per-group retained-row cap has admitted the row
+    /// (`has_peel_deferred_capacity`), so a flood of attacker-minted
+    /// undecryptable input is answered `ResourceRefused` without ever reaching
+    /// here; and it runs on the seam that already pays a durable message write
+    /// plus a forensic audit write for the same object.
+    pub(crate) fn deferral_lineage(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<DeferralLineage, EngineError> {
+        let group = self.storage.get_group(group_id)?;
+        let policy = self
+            .convergence_policy_for_group_ungated(group_id)
+            .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
+        let contested = crate::openmls_projection::stored_graph_is_contested(
+            &self.storage,
+            group_id,
+            group
+                .epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        )
+        .map_err(|error| EngineError::Backend(format!("stored graph contested probe: {error}")))?;
+        Ok(if contested {
+            DeferralLineage::ContestedFork
+        } else {
+            DeferralLineage::Uncontested
+        })
     }
 
     /// Classify this group's convergence graph as contested or not, and
