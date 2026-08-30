@@ -4454,6 +4454,18 @@ MarmotStatus marmot_retry_hydrate_quarantined_group(const struct MarmotClient *c
                                                     bool *out);
 
 /**
+ * Interrupt retry backoff for durable outbound work after the host has
+ * observed usable connectivity.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_notify_connectivity_restored(const struct MarmotClient *client);
+
+/**
  * Flag a group archived (or restore it). Local-only projection
  * state. Free with `marmot_app_group_record_free`.
  *
