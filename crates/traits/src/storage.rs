@@ -481,6 +481,13 @@ pub trait DisbandCandidateStorage {
 /// record this row deliberately has no foreign key, so deleting local history
 /// cannot make a disbanded MLS group id joinable again.
 pub trait DisbandTombstoneStorage {
+    /// Write or rewrite the guard for `group_id`.
+    ///
+    /// `DisbandTombstone::announced` is owned by
+    /// [`Self::mark_disband_tombstone_announced`], not by callers of this
+    /// method: implementations must preserve an already-set marker rather than
+    /// take it from `tombstone`. A rewrite that cleared it would resurrect the
+    /// per-open `GroupDisbanded` replay.
     fn put_disband_tombstone(
         &self,
         group_id: &GroupId,
@@ -497,6 +504,23 @@ pub trait DisbandTombstoneStorage {
     fn list_disband_tombstones(
         &self,
     ) -> StorageResult<Vec<(GroupId, crate::group::DisbandTombstone)>>;
+
+    /// Flip this guard's `announced` marker so later opens stop replaying its
+    /// terminal `GroupDisbanded`.
+    ///
+    /// Not a destructive read: the guard row itself must survive, or a
+    /// disbanded MLS group id becomes joinable again. Idempotent, and a no-op
+    /// when no guard is stored for `group_id`.
+    ///
+    /// This is the first read-modify-write over a stored `DisbandTombstone`,
+    /// which makes the record's encoding lossy across versions in a way a
+    /// pure-append field never was: an older build re-marking a guard written
+    /// by a newer one deserializes into its own narrower struct and writes back
+    /// a record missing the newer fields. Every field added to
+    /// `DisbandTombstone` from here on must therefore be loss-safe — recoverable
+    /// or re-derivable if a downgrade strips it — or this method needs to
+    /// become a field-level update instead of a whole-record rewrite.
+    fn mark_disband_tombstone_announced(&self, group_id: &GroupId) -> StorageResult<()>;
 }
 
 // ── WelcomeStorage ──────────────────────────────────────────────────────────

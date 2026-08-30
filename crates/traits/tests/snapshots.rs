@@ -18,7 +18,7 @@ use cgka_traits::engine::{
     KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::group::{Group, Member, ProtocolProfile};
+use cgka_traits::group::{DisbandTombstone, Group, Member, ProtocolProfile};
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
 };
@@ -923,4 +923,23 @@ fn unrecoverable_defaults_false_for_old_records() {
     }))
     .unwrap();
     assert!(!legacy.unrecoverable);
+}
+
+/// A disband tombstone written before the announce-once marker existed carries
+/// no `announced` field. It must read back as unannounced so hydration replays
+/// it exactly once more and then marks it — the only safe default, because the
+/// opposite would silently swallow an announcement the application may never
+/// have received.
+#[test]
+fn disband_tombstone_announced_defaults_false_for_old_records() {
+    let legacy: DisbandTombstone = serde_json::from_value(serde_json::json!({
+        "epoch": 9,
+        "actor": [0xaa, 0xbb],
+        "origin_commit_id": null,
+        "commit_digest": vec![0u8; 32],
+        "local_was_committer_leaf": true,
+        "former_members": []
+    }))
+    .unwrap();
+    assert!(!legacy.announced);
 }

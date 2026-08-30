@@ -3243,6 +3243,7 @@ fn put_disband_tombstone_for(store: &SqliteAccountStorage, group_id_hex: &str) {
                 commit_digest: [0; 32],
                 local_was_committer_leaf: false,
                 former_members: Vec::new(),
+                announced: false,
             },
         )
         .unwrap();

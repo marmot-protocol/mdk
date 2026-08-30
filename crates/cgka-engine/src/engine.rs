@@ -1316,14 +1316,18 @@ impl<S: StorageProvider> Engine<S> {
             {
                 continue;
             }
-            let tombstone = group
-                .disbanded
-                .clone()
-                .or_else(|| tombstones.remove(&group.id));
+            // The guard row is the authority on the `announced` marker: the
+            // group record's mirror is written once at settle and never
+            // updated, and the row outlives the record when the user deletes
+            // local history. The mirror is the payload fallback only.
+            let tombstone = tombstones
+                .remove(&group.id)
+                .or_else(|| group.disbanded.clone());
             if let Some(tombstone) = tombstone {
-                // Reconcile the single deterministic system row after a
-                // crash. The application projection canonicalizes this event,
-                // so replaying it on open is idempotent.
+                // Reconcile the single deterministic system row after a crash.
+                // The replay is idempotent (the application projection
+                // canonicalizes it) *and* announced-once, so an already
+                // announced guard restores its epoch entry in silence.
                 self.restore_disband_tombstone(group.id, tombstone)?;
                 continue;
             }
@@ -1464,6 +1468,67 @@ impl<S: StorageProvider> Engine<S> {
             .collect())
     }
 
+    /// Restore one terminal guard's epoch entry, and replay its
+    /// `GroupDisbanded` to the application at most once ever.
+    ///
+    /// The epoch entry is in-memory and is restored unconditionally on every
+    /// open; only the replay is marked.
+    ///
+    /// # Why the mark happens here and not at settle
+    ///
+    /// A settle commits the guard durably, but the live `GroupDisbanded` it
+    /// emits only reaches the application through a later drain that can drop
+    /// the whole batch without a crash — `observe_drained_session_events` runs
+    /// `fail_if_publish_failed(effects)?` before it projects any event. A
+    /// settle-time marker could therefore suppress an announcement the
+    /// application never received. Marking at replay time instead guarantees
+    /// live delivery plus exactly one belt-and-braces replay, then silence.
+    ///
+    /// # The loss window
+    ///
+    /// This runs inside `AccountDeviceSession::open`, so the mark is durable at
+    /// *account open* — before any drain exists to consume the event it
+    /// announces. The window in which the replay can be lost is therefore
+    /// `[account open, first successful drained projection]`: it spans app
+    /// startup, and **one** process death (or one drained batch that fails its
+    /// publish gate) is enough to close it with the event unprojected. That is
+    /// wider than a same-drain window, which is exactly why the consequences
+    /// below have to be reconciled from durable state rather than from this
+    /// event.
+    ///
+    /// # What a lost replay costs
+    ///
+    /// Re-derived from the guard row on every read, so unaffected:
+    ///
+    /// - `Group::disbanded` (`MarmotApp::visible_groups`, via
+    ///   `list_disband_tombstones`)
+    /// - transport-route exclusion (`MarmotApp::routing_for`, same source)
+    /// - chat-list terminal flag and the account unread-aggregate exclusion
+    ///   (correlated `EXISTS`/`NOT EXISTS` over `cgka_disband_tombstones`)
+    ///
+    /// Reconciled from the guard row once per account open by
+    /// `AppClient::sweep_terminal_groups_from_guards`, so also unaffected:
+    ///
+    /// - held-send resolution (`invalidate_pending_sent_app_events_for_group`)
+    ///   — the mdk#1177 reconciler, which would otherwise strand a send at
+    ///   "Sending…" permanently
+    /// - stale peer push tokens (`remove_stale_group_push_tokens`)
+    ///
+    /// Still event-only, and therefore the actual residual:
+    ///
+    /// - the durable kind-1210 "group disbanded" system row
+    ///   (`project_group_system_rows`) — a missing transcript entry
+    /// - `clear_terminal_local_group_deletion_frontiers` — an idempotent
+    ///   `DELETE` whose loss leaves a local-deletion marker lingering
+    /// - `queue_current_push_registration_removal_for_group` — deliberately
+    ///   left out of the open-time sweep because it is an upsert that arms an
+    ///   outbox publish, so sweeping it would re-queue work on every open and
+    ///   reintroduce exactly the per-open cost this marker removes
+    ///
+    /// None of those can make a terminal group look live, routable, unread, or
+    /// stuck sending. An application-acknowledged marker would close even them,
+    /// but no ack seam covers `GroupStateChanged` today (only `MessageReceived`
+    /// / `GroupJoined`), so the plumbing is not proportionate to what is left.
     fn restore_disband_tombstone(
         &mut self,
         group_id: GroupId,
@@ -1471,13 +1536,32 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<(), EngineError> {
         self.epoch_manager
             .restore_disbanded(group_id.clone(), tombstone.epoch)?;
+        if tombstone.announced {
+            return Ok(());
+        }
         self.events_buf.push_back(GroupEvent::GroupStateChanged {
-            group_id,
+            group_id: group_id.clone(),
             epoch: tombstone.epoch,
             actor: Some(tombstone.actor),
             change: GroupStateChange::GroupDisbanded,
             origin_commit_id: tombstone.origin_commit_id,
         });
+        // Best-effort by design. A failed mark leaves the guard unannounced, so
+        // the next open replays again — the pre-fix behavior, and the safe
+        // direction. Propagating instead would quarantine a terminal group over
+        // a deduplication write.
+        if self
+            .storage
+            .mark_disband_tombstone_announced(&group_id)
+            .is_err()
+        {
+            tracing::debug!(
+                target: "cgka_engine::hydrate",
+                method = "restore_disband_tombstone",
+                error_kind = "mark_disband_tombstone_announced_failed",
+                "terminal guard replayed but not marked announced; the next open replays it again"
+            );
+        }
         Ok(())
     }
 
@@ -1541,17 +1625,17 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        let tombstone = match group.disbanded.clone() {
-            Some(tombstone) => Some(tombstone),
-            None => self
-                .storage
-                .disband_tombstone(group_id)
-                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?,
-        };
+        // Same guard-row-first precedence as the cheap hydration pass, for the
+        // same reason. Live groups already paid this lookup, so the query count
+        // is unchanged for them; a terminal group gains one indexed read.
+        let tombstone = self
+            .storage
+            .disband_tombstone(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .or_else(|| group.disbanded.clone());
         if let Some(tombstone) = tombstone {
-            // Reconcile the single deterministic system row after a crash. The
-            // application projection canonicalizes this event, so replaying it
-            // on open is idempotent.
+            // Same once-only reconciliation as the cheap pass: idempotent if it
+            // does replay, and silent once the guard is marked announced.
             let epoch = tombstone.epoch;
             self.restore_disband_tombstone(group_id.clone(), tombstone)
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;

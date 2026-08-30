@@ -105,6 +105,22 @@ pub struct DisbandTombstone {
     pub local_was_committer_leaf: bool,
     /// Deduplicated account roster captured immediately before disbanding.
     pub former_members: Vec<Member>,
+    /// Whether hydration has already replayed this guard's terminal
+    /// `GroupDisbanded` to the application.
+    ///
+    /// The guard itself is immortal — nothing may consume or clear it — so
+    /// suppressing the *replay* is the only thing this marker does. Rows
+    /// written before the marker existed carry no field and default to
+    /// unannounced, which replays them exactly once more and then marks them.
+    ///
+    /// The failure direction is deliberate: losing the marker costs one
+    /// redundant replay (the application's terminal projection is replay-safe
+    /// by construction), while a marker set too early would suppress an
+    /// announcement the application never received. Only
+    /// `Engine::restore_disband_tombstone` sets it, and only after it has
+    /// produced the replay.
+    #[serde(default)]
+    pub announced: bool,
 }
 
 /// One member of a group, as storage sees it.

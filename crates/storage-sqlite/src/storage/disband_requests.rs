@@ -179,13 +179,38 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
         group_id: &GroupId,
         tombstone: &DisbandTombstone,
     ) -> StorageResult<()> {
-        self.lock()?
-            .execute(
-                "INSERT OR REPLACE INTO cgka_disband_tombstones (group_id, record)
-                 VALUES (?1, ?2)",
-                params![group_id.as_slice(), serialize(tombstone)?],
+        // Preserve-on-rewrite. This is an `INSERT OR REPLACE`, so a caller that
+        // rewrites an existing guard with a freshly constructed
+        // `announced: false` would silently clear the latch and resurrect the
+        // per-open replay. The marker is owned by
+        // `mark_disband_tombstone_announced`, never by the writer of the guard,
+        // so OR it forward from any row already present.
+        let conn = self.lock()?;
+        let previously_announced = conn
+            .query_row(
+                "SELECT record FROM cgka_disband_tombstones WHERE group_id = ?1",
+                params![group_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
             )
-            .storage()?;
+            .optional()
+            .storage()?
+            .map(|record| deserialize::<DisbandTombstone>(&record))
+            .transpose()?
+            .is_some_and(|existing| existing.announced);
+        let record = if previously_announced && !tombstone.announced {
+            serialize(&DisbandTombstone {
+                announced: true,
+                ..tombstone.clone()
+            })?
+        } else {
+            serialize(tombstone)?
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO cgka_disband_tombstones (group_id, record)
+             VALUES (?1, ?2)",
+            params![group_id.as_slice(), record],
+        )
+        .storage()?;
         Ok(())
     }
 
@@ -217,6 +242,34 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
         rows.into_iter()
             .map(|(group_id, record)| Ok((GroupId::new(group_id), deserialize(&record)?)))
             .collect()
+    }
+
+    fn mark_disband_tombstone_announced(&self, group_id: &GroupId) -> StorageResult<()> {
+        // One connection guard spans the read and the write, so the
+        // read-modify-write cannot interleave with a concurrent caller.
+        let conn = self.lock()?;
+        let Some(record) = conn
+            .query_row(
+                "SELECT record FROM cgka_disband_tombstones WHERE group_id = ?1",
+                params![group_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .storage()?
+        else {
+            return Ok(());
+        };
+        let mut tombstone: DisbandTombstone = deserialize(&record)?;
+        if tombstone.announced {
+            return Ok(());
+        }
+        tombstone.announced = true;
+        conn.execute(
+            "UPDATE cgka_disband_tombstones SET record = ?2 WHERE group_id = ?1",
+            params![group_id.as_slice(), serialize(&tombstone)?],
+        )
+        .storage()?;
+        Ok(())
     }
 }
 
@@ -305,6 +358,7 @@ mod tests {
             commit_digest: candidate.commit_digest,
             local_was_committer_leaf: true,
             former_members: candidate.former_members,
+            announced: false,
         };
         store.put_disband_tombstone(&group.id, &tombstone).unwrap();
         assert!(
@@ -328,5 +382,144 @@ mod tests {
             store.list_disband_tombstones().unwrap(),
             vec![(group.id, tombstone)]
         );
+    }
+
+    /// A guard written before the announce-once marker existed is stored as a
+    /// JSON record with no `announced` key. It must read back as unannounced,
+    /// take the mark, and — this is the part that matters — still be there
+    /// afterwards: the marker suppresses a replay, it never consumes the
+    /// anti-resurrection guard.
+    #[test]
+    fn an_old_guard_row_reads_unannounced_marks_once_and_survives_the_mark() {
+        use rusqlite::params;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = gid(9);
+        let legacy = serde_json::json!({
+            "epoch": 8,
+            "actor": member_id(2),
+            "origin_commit_id": null,
+            "commit_digest": vec![0x5au8; 32],
+            "local_was_committer_leaf": true,
+            "former_members": []
+        });
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_disband_tombstones (group_id, record) VALUES (?1, ?2)",
+                params![group_id.as_slice(), serde_json::to_vec(&legacy).unwrap()],
+            )
+            .unwrap();
+
+        let before = store.disband_tombstone(&group_id).unwrap().unwrap();
+        assert!(!before.announced, "an old row must read as unannounced");
+
+        store.mark_disband_tombstone_announced(&group_id).unwrap();
+        let after = store.disband_tombstone(&group_id).unwrap().unwrap();
+        assert!(after.announced);
+        assert_eq!(
+            DisbandTombstone {
+                announced: false,
+                ..after.clone()
+            },
+            before,
+            "marking must change nothing but the marker"
+        );
+
+        // Idempotent, and still listed: the guard outlives its announcement.
+        store.mark_disband_tombstone_announced(&group_id).unwrap();
+        assert!(
+            store
+                .disband_tombstone(&group_id)
+                .unwrap()
+                .unwrap()
+                .announced
+        );
+        assert_eq!(
+            store.list_disband_tombstones().unwrap(),
+            vec![(group_id, after)]
+        );
+    }
+
+    /// `put_disband_tombstone` is an `INSERT OR REPLACE`, so a caller rewriting
+    /// an existing guard with a freshly built `announced: false` must not clear
+    /// the latch — that would resurrect the per-open replay silently. The
+    /// marker is owned by `mark_disband_tombstone_announced`, so it survives
+    /// any rewrite of the guard around it.
+    #[test]
+    fn rewriting_a_guard_cannot_clear_its_announced_marker() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = gid(11);
+        let guard = DisbandTombstone {
+            epoch: EpochId(3),
+            actor: member_id(5),
+            origin_commit_id: None,
+            commit_digest: [0x1d; 32],
+            local_was_committer_leaf: false,
+            former_members: Vec::new(),
+            announced: false,
+        };
+        store.put_disband_tombstone(&group_id, &guard).unwrap();
+        store.mark_disband_tombstone_announced(&group_id).unwrap();
+
+        // The dangerous rewrite: same guard value the settle path constructs.
+        store.put_disband_tombstone(&group_id, &guard).unwrap();
+        let after = store.disband_tombstone(&group_id).unwrap().unwrap();
+        assert!(
+            after.announced,
+            "a guard rewrite must not resurrect the per-open replay"
+        );
+        assert_eq!(
+            DisbandTombstone {
+                announced: false,
+                ..after
+            },
+            guard,
+            "everything except the marker must come from the rewritten value"
+        );
+    }
+
+    /// The first write of a guard is unannounced, and a rewrite that carries a
+    /// changed payload still lands: preserve-on-rewrite is an OR on one field,
+    /// not a refusal to update.
+    #[test]
+    fn a_first_guard_write_is_unannounced_and_rewrites_still_update_the_payload() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = gid(12);
+        let mut guard = DisbandTombstone {
+            epoch: EpochId(4),
+            actor: member_id(6),
+            origin_commit_id: None,
+            commit_digest: [0x2e; 32],
+            local_was_committer_leaf: false,
+            former_members: Vec::new(),
+            announced: false,
+        };
+        store.put_disband_tombstone(&group_id, &guard).unwrap();
+        assert!(
+            !store
+                .disband_tombstone(&group_id)
+                .unwrap()
+                .unwrap()
+                .announced
+        );
+
+        store.mark_disband_tombstone_announced(&group_id).unwrap();
+        guard.epoch = EpochId(5);
+        store.put_disband_tombstone(&group_id, &guard).unwrap();
+        let after = store.disband_tombstone(&group_id).unwrap().unwrap();
+        assert_eq!(after.epoch, EpochId(5));
+        assert!(after.announced);
+    }
+
+    /// Marking a group that has no guard is a no-op, not an error: hydration
+    /// calls this on a best-effort path and must not turn a missing row into a
+    /// failed open.
+    #[test]
+    fn marking_a_group_without_a_guard_is_a_no_op() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.mark_disband_tombstone_announced(&gid(4)).unwrap();
+        assert!(store.list_disband_tombstones().unwrap().is_empty());
     }
 }

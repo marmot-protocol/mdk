@@ -1721,6 +1721,10 @@ impl MarmotApp {
         client.restore_persisted_epoch_backfill_intents(persisted_backfills);
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
         client.restore_persisted_epoch_stall_evidence(persisted_evidence);
+        // Reads only the durable terminal guards, never live group state, so it
+        // runs on deferred opens too — and it must, because it is now the sole
+        // reconciler for a disband whose live projection never completed.
+        client.sweep_terminal_groups_from_guards();
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.

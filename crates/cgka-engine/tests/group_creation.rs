@@ -1646,6 +1646,189 @@ async fn solo_disband_is_durable_convergent_terminal_and_restart_safe() {
     );
 }
 
+/// Helper for the announce-once tests: drive one solo group all the way to a
+/// settled, durable disband and hand back the storage that outlives the engine.
+async fn settle_solo_disband(identity: &[u8]) -> (SqliteAccountStorage, cgka_traits::GroupId) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .convergence_clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build current-profile engine");
+    let (group_id, _) = alice
+        .create_group(CreateGroupRequest {
+            name: "announce once".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    alice.drain_events();
+
+    alice
+        .send(cgka_traits::engine::SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let prepared = alice.advance_convergence(&group_id).await.unwrap();
+    let pending = match prepared.as_slice() {
+        [SendResult::GroupEvolution { pending, .. }] => *pending,
+        other => panic!("expected one prepared disband commit, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    clock.advance_ms(1_000);
+    assert!(
+        alice
+            .advance_convergence(&group_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        matches!(
+            alice.epoch_state(&group_id),
+            Some(cgka_traits::EpochState::Disbanded(_))
+        ),
+        "disband did not settle within the bounded convergence pass"
+    );
+    // The live delivery the application receives in-session. Everything after
+    // this point is hydration's belt-and-braces reconciliation.
+    assert_eq!(
+        disband_replays(&mut alice),
+        1,
+        "the settling session owes exactly one live GroupDisbanded"
+    );
+    drop(alice);
+    (storage, group_id)
+}
+
+/// Count the terminal `GroupDisbanded` events one engine session hands the
+/// application.
+fn disband_replays(engine: &mut Engine<SqliteAccountStorage>) -> usize {
+    engine
+        .drain_events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                cgka_traits::engine::GroupEvent::GroupStateChanged {
+                    change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// A disband tombstone is immortal, but its announcement is not: hydration
+/// owes the application exactly one belt-and-braces replay of `GroupDisbanded`
+/// — the reconciler for a live delivery the application never projected — and
+/// silence on every open after that.
+///
+/// Without the marker every open re-emits, and the application's terminal arm
+/// forces a no-op route-refreshing sync for every disbanded group, forever.
+#[tokio::test]
+async fn a_disbanded_group_announces_itself_once_across_repeated_opens() {
+    let identity = b"alice-announce-once-record";
+    let (storage, group_id) = settle_solo_disband(identity).await;
+
+    let mut first =
+        build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+    first.hydrate_all_stored_groups().unwrap();
+    assert!(matches!(
+        first.epoch_state(&group_id),
+        Some(cgka_traits::EpochState::Disbanded(_))
+    ));
+    assert_eq!(
+        disband_replays(&mut first),
+        1,
+        "the first open owes the one reconciling replay"
+    );
+    drop(first);
+
+    for open in 2..=3 {
+        let mut later =
+            build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+        later.hydrate_all_stored_groups().unwrap();
+        assert!(
+            matches!(
+                later.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Disbanded(_))
+            ),
+            "open {open} must still restore the terminal epoch entry"
+        );
+        assert_eq!(
+            disband_replays(&mut later),
+            0,
+            "open {open} must not re-announce an already announced disband"
+        );
+        assert!(later.quarantined_groups().is_empty());
+        drop(later);
+    }
+}
+
+/// Same contract on the orphan-tombstone path: after the user deletes local
+/// history the group record is gone and only the anti-resurrection guard
+/// remains, so hydration reaches the tombstone through the orphan sweep rather
+/// than through a stored group record. Both hydration call sites must agree.
+#[tokio::test]
+async fn a_tombstone_only_group_announces_itself_once_across_repeated_opens() {
+    let identity = b"alice-announce-once-orphan";
+    let (storage, group_id) = settle_solo_disband(identity).await;
+    assert!(
+        storage
+            .delete_local_group_data(&hex::encode(group_id.as_slice()))
+            .unwrap()
+            .did_delete(),
+        "terminal local deletion should remove history and the full group row"
+    );
+
+    let mut first =
+        build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+    first.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        disband_replays(&mut first),
+        1,
+        "the orphan sweep owes the same single reconciling replay"
+    );
+    assert!(first.live_group_ids().unwrap().is_empty());
+    drop(first);
+
+    for open in 2..=3 {
+        let mut later =
+            build_profile_client_on_storage(identity, storage.clone(), ProtocolProfile::Current);
+        later.hydrate_all_stored_groups().unwrap();
+        assert!(
+            matches!(
+                later.epoch_state(&group_id),
+                Some(cgka_traits::EpochState::Disbanded(_))
+            ),
+            "open {open} must still restore the terminal epoch entry from the guard alone"
+        );
+        assert_eq!(
+            disband_replays(&mut later),
+            0,
+            "open {open} must not re-announce an already announced orphan tombstone"
+        );
+        drop(later);
+    }
+}
+
 #[tokio::test]
 async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
