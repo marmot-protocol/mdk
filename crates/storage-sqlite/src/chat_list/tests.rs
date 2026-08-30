@@ -1899,6 +1899,33 @@ fn newer_pending_message_replaces_older_authenticated_preview() {
 }
 
 #[test]
+fn pending_send_with_source_epoch_uses_pending_preview_ordering() {
+    let store = setup_store();
+    let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
+    delivered.source_epoch = Some(8);
+    store.record_app_event(&delivered).unwrap();
+
+    // Source epoch is captured when the MLS message is encrypted, before a
+    // relay-assigned source id exists. The missing source id is therefore the
+    // authoritative pending signal even when the epoch is already present.
+    let mut pending = chat("pending", LOCAL, 100, "newer pending send");
+    pending.source_message_id_hex = None;
+    pending.source_epoch = Some(7);
+    store.record_app_event(&pending).unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    let preview = row.last_message.expect("latest preview");
+    assert_eq!(preview.message_id_hex, "pending");
+    assert_eq!(
+        preview.delivery_state,
+        ChatListMessageDeliveryState::Pending
+    );
+}
+
+#[test]
 fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview() {
     let store = setup_store();
     let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");

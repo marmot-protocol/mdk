@@ -773,9 +773,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<OutboundFanout>, EngineError> {
-        if self.quarantined_groups.contains_key(group_id)
-            || self.unhydrated_groups.contains(group_id)
-        {
+        if self.ensure_group_live(group_id).is_err() {
             return Ok(Vec::new());
         }
         Ok(self.storage.list_outbound_fanouts_for_group(group_id)?)

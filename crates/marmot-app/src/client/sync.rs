@@ -1057,17 +1057,18 @@ impl AppClient {
         // state. The two conditions are correlated rather than independent: this
         // drain publishes, so the failure and the refusal ride the same effects.
         self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
         // `runtime.drain()` also resumes durable outbound fanouts. That work
         // can publish an accepted-pending application message without emitting
         // any engine event, so it must be projected before the eventless fast
-        // path below. Otherwise the exact event reaches the relay while the
-        // sender's durable timeline row remains stuck in `Sending` forever.
+        // path or publish-failure gate below. A batch can contain one fanout
+        // that succeeded alongside another publish that failed; the successful
+        // row must not remain stuck in `Sending` after its fanout is deleted.
         self.remember_published_reports(effects);
         summary
             .projection_updates
             .extend(self.finalize_published_app_message_source_retention(effects)?);
+        fail_if_publish_failed(effects)?;
         if effects.events.is_empty() {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
@@ -3328,9 +3329,12 @@ impl AppClient {
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
         self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
+        // Preserve successful publications in a mixed batch before surfacing
+        // an unrelated hard failure. Their durable fanouts are already gone,
+        // so a later pass cannot reconstruct this source metadata.
+        fail_if_publish_failed(effects)?;
         let publish_new_message_notification =
             effects.published_app_messages.iter().any(|published| {
                 let group_id_hex = hex::encode(published.group_id.as_slice());

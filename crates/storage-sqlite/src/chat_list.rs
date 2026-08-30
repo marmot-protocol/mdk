@@ -1021,7 +1021,6 @@ pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
          END DESC,
          CASE
             WHEN {column_prefix}direction = 'sent'
-             AND {column_prefix}source_epoch IS NULL
              AND {column_prefix}source_message_id_hex IS NULL
              AND {column_prefix}invalidation_status IS NULL
              AND NOT EXISTS (
@@ -1035,7 +1034,6 @@ pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
                   AND accepted.invalidation_status IS NULL
                   AND NOT (
                       accepted.direction = 'sent'
-                      AND accepted.source_epoch IS NULL
                       AND accepted.source_message_id_hex IS NULL
                   )
                   AND accepted_source.insert_order > COALESCE((
@@ -1046,7 +1044,6 @@ pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
                   ), -1)
              ) THEN 2
             WHEN {column_prefix}direction = 'sent'
-             AND {column_prefix}source_epoch IS NULL
              AND {column_prefix}source_message_id_hex IS NULL
              AND {column_prefix}invalidation_status IS NULL THEN 0
             ELSE 1

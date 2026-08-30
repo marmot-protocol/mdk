@@ -753,7 +753,10 @@ async fn frozen_fanout_typed_unavailable_is_retryable_but_rejection_is_terminal(
     .await;
 }
 
-async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
+async fn assert_frozen_fanout_restart_edge(
+    send_before_ack_persist: bool,
+    resume_via_deferred_advance: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice-restart-edge.sqlite");
     let key_text = "marmot fanout restart edge key";
@@ -839,11 +842,22 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
     let pre_restart_publish_count = adapter.publishes().len();
     drop(alice);
 
-    let reopened = session(
-        &alice_path,
-        &SqlCipherKey::new(key_text).unwrap(),
-        b"alice-fanout-restart-edge",
-    );
+    let reopened = if resume_via_deferred_advance {
+        deferred_session(
+            &alice_path,
+            &SqlCipherKey::new(key_text).unwrap(),
+            b"alice-fanout-restart-edge",
+        )
+    } else {
+        session(
+            &alice_path,
+            &SqlCipherKey::new(key_text).unwrap(),
+            b"alice-fanout-restart-edge",
+        )
+    };
+    if resume_via_deferred_advance {
+        assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+    }
     let replacement_policy = StaticTransportRouting::new(vec![TransportEndpoint(
         "wss://replacement-inbox.example".into(),
     )])
@@ -858,10 +872,15 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
         replacement_policy,
         RecordingKeyPackages::default(),
     );
-    let effects = resumed.drain().await.unwrap();
+    let effects = if resume_via_deferred_advance {
+        resumed.advance_convergence(&group_id).await.unwrap()
+    } else {
+        resumed.drain().await.unwrap()
+    };
 
     assert!(effects.fanout[0].mls_confirmed);
     assert!(effects.fanout[0].fanout_complete);
+    assert!(resumed.session().unhydrated_group_ids().is_empty());
     assert_eq!(resumed.session().epoch(&group_id).unwrap().0, 2);
     let attempts = adapter.publishes();
     let resumed_attempts = &attempts[pre_restart_publish_count..];
@@ -883,8 +902,13 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
 
 #[tokio::test]
 async fn frozen_fanout_resumes_after_intent_and_after_send_before_ack_persistence() {
-    assert_frozen_fanout_restart_edge(false).await;
-    assert_frozen_fanout_restart_edge(true).await;
+    assert_frozen_fanout_restart_edge(false, false).await;
+    assert_frozen_fanout_restart_edge(true, false).await;
+}
+
+#[tokio::test]
+async fn scheduled_advance_hydrates_before_resuming_frozen_fanout() {
+    assert_frozen_fanout_restart_edge(false, true).await;
 }
 
 #[tokio::test]

@@ -2010,6 +2010,11 @@ where
         &mut self,
         group_id: &GroupId,
     ) -> AccountResult<AccountDeviceEffects> {
+        // A deferred-open session intentionally hides this group's durable
+        // fanouts until full hydration restores its pending lifecycle. Hydrate
+        // before the targeted lookup so this same scheduled pass can resume
+        // those exact frozen bytes instead of waiting for another wake.
+        let _ = self.session.ensure_group_hydrated(group_id)?;
         // Retry the group's already-frozen transport events before producing
         // any newer convergence work. This preserves send order and ensures a
         // scheduled outbound wake actually drives the exact retained bytes.

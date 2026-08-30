@@ -13321,6 +13321,118 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum MixedPublishObservation {
+    Drained,
+    Scheduled,
+    Retry,
+}
+
+async fn assert_mixed_publish_batch_finalizes_successful_message(
+    observation: MixedPublishObservation,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://mixed-publish.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("mixed publish", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let app_event_id = "successful-app-message";
+
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: app_event_id.to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex,
+            plaintext: "successful sibling publish".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(10),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+
+    let published_message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
+    let retention = AppMessageRetentionDecision::new(10, 0);
+    let effects = marmot_account::AccountDeviceEffects {
+        published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: app_event_id.to_owned(),
+            message_id: published_message_id.clone(),
+            source_epoch: cgka_traits::EpochId(1),
+            retention,
+        }],
+        failures: vec![marmot_account::PublishFailure {
+            message_id: cgka_traits::MessageId::new(vec![0xee; 32]),
+            reason: "unrelated sibling publish failed".to_owned(),
+        }],
+        ..Default::default()
+    };
+
+    let result = match observation {
+        MixedPublishObservation::Drained => client.observe_drained_session_events(&effects).await,
+        MixedPublishObservation::Scheduled => {
+            client
+                .observe_scheduled_convergence_effects(&group_id, &effects)
+                .await
+        }
+        MixedPublishObservation::Retry => client
+            .observe_convergence_retry_effects(&group_id, &effects)
+            .map(|_| SyncSummary::default()),
+    };
+    assert!(
+        result.is_err(),
+        "the unrelated hard failure must still surface"
+    );
+
+    let row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == app_event_id)
+        .expect("successful local message remains in the timeline");
+    assert_eq!(
+        row.source_message_id_hex,
+        Some(hex::encode(published_message_id.as_slice())),
+        "the successful sibling must leave Sending before the batch errors"
+    );
+    assert_eq!(row.source_epoch, Some(1));
+    assert_eq!(row.retention_seconds, Some(retention.retention_seconds));
+}
+
+#[tokio::test]
+async fn drained_mixed_publish_batch_finalizes_success_before_failure() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Drained).await;
+}
+
+#[tokio::test]
+async fn scheduled_mixed_publish_batch_finalizes_success_before_failure() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Scheduled)
+        .await;
+}
+
+#[tokio::test]
+async fn retry_mixed_publish_batch_finalizes_success_before_failure() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Retry).await;
+}
+
 /// A resource refusal carried by a host-requested convergence retry must arm
 /// epoch-gap recovery even when that same pass's publish check fails it.
 ///

@@ -224,6 +224,26 @@ fn session(
     session_with_registry(path, key, identity, FeatureRegistry::new())
 }
 
+fn deferred_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    let keys = deterministic_nostr_keys(identity);
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(MockPeeler),
+        )
+        .legacy_compatibility_profile()
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+        .defer_group_hydration(),
+    )
+    .unwrap()
+}
+
 fn current_session(
     path: impl Into<std::path::PathBuf>,
     key: &SqlCipherKey,

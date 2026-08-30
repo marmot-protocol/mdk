@@ -3830,7 +3830,6 @@ impl AppClient {
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
         self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
         // finalize updates carry the pending -> delivered flip for each of them.
@@ -3841,6 +3840,10 @@ impl AppClient {
         // every timeline and chat-list subscriber still shows pending.
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         self.pending_projection_updates.extend(finalize_updates);
+        // A manual retry can complete one frozen fanout while another publish
+        // in the same convergence batch fails. Finalize that success before
+        // surfacing the unrelated failure because its fanout is already gone.
+        fail_if_publish_failed(effects)?;
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
