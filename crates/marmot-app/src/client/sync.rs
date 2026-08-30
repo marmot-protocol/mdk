@@ -1043,13 +1043,15 @@ impl AppClient {
         }
         let display_names = self.app.display_names_by_id()?;
         let source_received_at = unix_now_seconds();
-        // Hydration re-emits a stored group's `GroupDisbanded` on every open
-        // (`restore_disband_tombstone`), and that replay is the only reconciler
-        // left for a disband whose live-session projection never completed — a
-        // crash, or a batch that failed after the engine had already drained the
-        // event. So this seam owes the same terminal sweep as the inbound one,
-        // which it discharges by running the shared
-        // `observe_event_projection_effects` below rather than a copy of it.
+        // Hydration replays a stored group's `GroupDisbanded` once ever
+        // (`restore_disband_tombstone`), as the belt-and-braces reconciler for a
+        // disband whose live-session projection never completed — a crash, or a
+        // batch that failed after the engine had already drained the event. So
+        // this seam owes the same terminal sweep as the inbound one, which it
+        // discharges by running the shared `observe_event_projection_effects`
+        // below rather than a copy of it. The durable writes that must not
+        // depend on that one replay arriving are reconciled from the guard rows
+        // instead, by `sweep_terminal_groups_from_guards` at account open.
         let local_account_id_hex = self
             .app
             .account_home()
@@ -2498,6 +2500,84 @@ impl AppClient {
         }
     }
 
+    /// Reconcile every terminal group's durable projection from the guard rows
+    /// themselves, once per account open.
+    ///
+    /// This used to ride the `GroupDisbanded` event arm alone, which worked only
+    /// because hydration re-emitted that event on *every* open: the replay was
+    /// the reconciler. Now that a guard announces itself once
+    /// (`Engine::restore_disband_tombstone`), an event-only sweep would run
+    /// exactly once ever — and a process death in the window between the engine
+    /// marking the guard at account open and the app committing its projection
+    /// would strand the group's held sends at "Sending…" permanently.
+    ///
+    /// So the sweep reads its input from the immortal guard rows instead of
+    /// from an event that fires once. Both writes are idempotent, group-keyed,
+    /// and no-ops when clean —
+    /// `invalidate_pending_sent_app_events_for_group` returns `None` without
+    /// writing when no unresolved send remains, and the token removal is a
+    /// `DELETE` of rows that may already be gone — so a steady-state open costs
+    /// one indexed read per terminal group and produces no projection churn.
+    ///
+    /// Best-effort per guard: one unreadable group must not fail account open,
+    /// and the next open retries it.
+    pub(crate) fn sweep_terminal_groups_from_guards(&mut self) {
+        use cgka_traits::storage::DisbandTombstoneStorage;
+
+        let guards = match self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| Ok(storage.list_disband_tombstones()?))
+        {
+            Ok(guards) => guards,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::terminal_sweep",
+                    method = "sweep_terminal_groups_from_guards",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not enumerate terminal guards; skipping the open-time sweep"
+                );
+                return;
+            }
+        };
+        let guard_count = guards.len();
+        let mut reconciled = 0_u64;
+        let mut failed = 0_u64;
+        for (group_id, _) in guards {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            match self
+                .app
+                .invalidate_timeline_pending_sends_for_group(&self.state.label, &group_id_hex)
+            {
+                Ok(Some(update)) => {
+                    reconciled = reconciled.saturating_add(1);
+                    self.pending_projection_updates.push(update);
+                }
+                Ok(None) => {}
+                Err(_) => failed = failed.saturating_add(1),
+            }
+            // A terminal group never advertises notification destinations
+            // again, so every cached peer token is stale by definition.
+            if self
+                .app
+                .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[])
+                .is_err()
+            {
+                failed = failed.saturating_add(1);
+            }
+        }
+        if reconciled > 0 || failed > 0 {
+            tracing::debug!(
+                target: "marmot_app::terminal_sweep",
+                method = "sweep_terminal_groups_from_guards",
+                terminal_groups = guard_count,
+                reconciled,
+                failed,
+                "reconciled terminal group projections from durable guards"
+            );
+        }
+    }
+
     /// Rebuild the frozen-epoch evidence a previous process gathered.
     pub(crate) fn restore_persisted_epoch_stall_evidence(
         &mut self,
@@ -3666,9 +3746,10 @@ impl AppClient {
     /// the account unread aggregate stale.
     ///
     /// Replay-safe by construction, which is what lets the drained seam call it:
-    /// hydration re-emits a stored group's `GroupDisbanded` on every open, and a
-    /// crash replays pending application events the live seam may already have
-    /// projected. Token removal is a `DELETE` of rows that may be gone;
+    /// hydration replays a stored group's `GroupDisbanded` once after the
+    /// settling session, and a crash replays pending application events the live
+    /// seam may already have projected. Token removal is a `DELETE` of rows that
+    /// may be gone;
     /// `set_group_self_membership` writes an absolute value and no-ops when the
     /// group has no projection row; the queued registration removal is an upsert
     /// keyed on the group; and both invalidation sweeps skip rows they already

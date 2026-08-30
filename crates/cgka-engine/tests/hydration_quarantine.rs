@@ -1061,6 +1061,94 @@ async fn a_failed_announce_mark_replays_again_instead_of_quarantining() {
     );
 }
 
+/// `retry_hydrate_quarantined_group` goes through `hydrate_one_stored_group`,
+/// which is the call site where the guard row must be read *before* the group
+/// record's `disbanded` mirror.
+///
+/// The mirror is written once, at settle, and never updated again — marking a
+/// guard announced does not touch it. So a mirror-first read would re-announce
+/// on every single retry, forever, for any group that keeps failing and
+/// recovering. This pins the ordering: both copies start unannounced, the first
+/// retry announces and marks the guard row, and the second retry is silent even
+/// though the mirror still says otherwise.
+#[tokio::test]
+async fn retrying_a_quarantined_terminal_group_announces_once_despite_a_stale_mirror() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    let mut record = initial.group_record(&group_id).unwrap();
+    let guard = cgka_traits::DisbandTombstone {
+        epoch: record.epoch,
+        actor: MemberId::new(pad32(b"alice-hydration")),
+        origin_commit_id: None,
+        commit_digest: [0x3c; 32],
+        local_was_committer_leaf: true,
+        former_members: Vec::new(),
+        announced: false,
+    };
+    // Both copies a settle writes, both unannounced — exactly what the durable
+    // transaction in `settle_disband_after_convergence` leaves behind.
+    storage
+        .put_disband_tombstone(&group_id, &guard)
+        .expect("write terminal guard");
+    record.disbanded = Some(guard);
+    storage.put_group(&record).expect("write mirror");
+    drop(initial);
+
+    let disband_replays = |engine: &mut Engine<FlakyGroupRecordStorage>| {
+        engine
+            .drain_events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GroupEvent::GroupStateChanged {
+                        change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+
+    let mut replays_per_retry = Vec::new();
+    for _ in 0..2 {
+        // A transiently unreadable record quarantines the group at open.
+        storage.set_fail_get_group(true);
+        let mut engine = build_flaky_engine(storage.clone());
+        engine.hydrate_all_stored_groups().expect("open");
+        assert_eq!(
+            engine.quarantined_groups(),
+            vec![(
+                group_id.clone(),
+                GroupHydrationQuarantineReason::GroupRecordLoadFailed,
+            )]
+        );
+        engine.drain_events();
+
+        storage.set_fail_get_group(false);
+        assert!(
+            engine
+                .retry_hydrate_quarantined_group(&group_id)
+                .expect("retry succeeds")
+        );
+        replays_per_retry.push(disband_replays(&mut engine));
+    }
+
+    assert_eq!(
+        replays_per_retry,
+        vec![1, 0],
+        "the retry path must read the guard row, not the never-updated mirror"
+    );
+    assert!(
+        storage
+            .disband_tombstone(&group_id)
+            .unwrap()
+            .expect("guard survives")
+            .announced
+    );
+}
+
 #[tokio::test]
 async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
     let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
