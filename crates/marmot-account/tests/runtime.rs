@@ -3742,8 +3742,9 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
     let key = SqlCipherKey::new("marmot published app metadata key").unwrap();
     let mut supported = default_group_components();
     supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let alice_path = dir.path().join("alice-published-app.sqlite");
     let mut alice = session_with_registry_and_components(
-        dir.path().join("alice-published-app.sqlite"),
+        &alice_path,
         &key,
         b"alice-published-app",
         selfremove_registry(),
@@ -3754,7 +3755,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         &key,
         b"bob-published-app",
         selfremove_registry(),
-        supported,
+        supported.clone(),
     );
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let alice_hex = hex::encode(alice.self_id().as_slice());
@@ -3794,8 +3795,12 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
             "wss://published-app-group.example".into(),
         )],
     );
-    let mut runtime =
-        AccountDeviceRuntime::new(alice, adapter, policy, RecordingKeyPackages::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    );
 
     let payload = app_payload_for(&alice_hex, b"typed metadata");
     let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
@@ -3811,15 +3816,57 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         adapter_handle.publishes()[0].message.id,
         "test adapter must exercise transport id replacement"
     );
+    let expected_publication = PublishedApplicationMessage {
+        group_id: group_id.clone(),
+        app_event_id: app_event_id.clone(),
+        message_id: reported_message_id,
+        source_epoch: EpochId(1),
+        retention: cgka_traits::AppMessageRetentionDecision::new(1_700_000_000, 90),
+    };
     assert_eq!(
         effects.published_app_messages,
-        vec![PublishedApplicationMessage {
-            group_id: group_id.clone(),
-            app_event_id,
-            message_id: reported_message_id,
-            source_epoch: EpochId(1),
-            retention: cgka_traits::AppMessageRetentionDecision::new(1_700_000_000, 90),
-        }]
+        vec![expected_publication.clone()]
+    );
+    assert_eq!(
+        runtime.session().outbound_fanouts().unwrap().len(),
+        1,
+        "an accepted app fanout must remain durable until app projection acknowledges it"
+    );
+
+    // Simulate termination after relay acceptance was persisted but before the
+    // app finalized its optimistic timeline row. Reopening must replay the
+    // exact publication metadata instead of deleting the only recovery record.
+    drop(runtime);
+    let reopened = session_with_registry_and_components(
+        &alice_path,
+        &key,
+        b"alice-published-app",
+        selfremove_registry(),
+        supported.clone(),
+    );
+    let mut runtime =
+        AccountDeviceRuntime::new(reopened, adapter, policy, RecordingKeyPackages::default());
+    let recovered = runtime.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(
+        recovered.published_app_messages,
+        vec![expected_publication],
+        "restart recovery must replay an accepted app publication for idempotent projection"
+    );
+    runtime
+        .acknowledge_published_app_messages(&recovered.published_app_messages)
+        .unwrap();
+    assert!(
+        runtime.session().outbound_fanouts().unwrap().is_empty(),
+        "app projection acknowledgement must retire the terminal recovery record"
+    );
+    assert!(
+        runtime
+            .resume_outbound_fanouts()
+            .await
+            .unwrap()
+            .published_app_messages
+            .is_empty(),
+        "an acknowledged app publication must not replay again"
     );
 
     let leave = bob

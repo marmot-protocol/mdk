@@ -1065,10 +1065,12 @@ impl AppClient {
         // that succeeded alongside another publish that failed; the successful
         // row must not remain stuck in `Sending` after its fanout is deleted.
         self.remember_published_reports(effects);
-        summary
-            .projection_updates
-            .extend(self.finalize_published_app_message_source_retention(effects)?);
-        fail_if_publish_failed(effects)?;
+        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
+        if let Err(error) = fail_if_publish_failed(effects) {
+            self.pending_projection_updates.extend(finalize_updates);
+            return Err(error);
+        }
+        summary.projection_updates.extend(finalize_updates);
         if effects.events.is_empty() {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
@@ -3334,7 +3336,10 @@ impl AppClient {
         // Preserve successful publications in a mixed batch before surfacing
         // an unrelated hard failure. Their durable fanouts are already gone,
         // so a later pass cannot reconstruct this source metadata.
-        fail_if_publish_failed(effects)?;
+        if let Err(error) = fail_if_publish_failed(effects) {
+            self.pending_projection_updates.extend(finalize_updates);
+            return Err(error);
+        }
         let publish_new_message_notification =
             effects.published_app_messages.iter().any(|published| {
                 let group_id_hex = hex::encode(published.group_id.as_slice());

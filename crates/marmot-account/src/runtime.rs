@@ -2222,6 +2222,39 @@ where
         self.resume_outbound_fanouts_for_group(None).await
     }
 
+    /// Retire terminal accepted application fanouts only after the app has
+    /// durably finalized their optimistic projections.
+    ///
+    /// Until this acknowledgement arrives, restart drains replay the same
+    /// publication metadata. App projection is idempotent, so a crash between
+    /// its database commit and this call leaves a harmless replay instead of a
+    /// permanently pending message.
+    pub fn acknowledge_published_app_messages(
+        &self,
+        published_messages: &[PublishedApplicationMessage],
+    ) -> AccountResult<()> {
+        for published in published_messages {
+            let fanouts = self
+                .session
+                .outbound_fanouts_for_group(&published.group_id)?;
+            for fanout in fanouts {
+                let outcome = fanout.outcome();
+                let matches_publication = fanout.application_message().is_some_and(|application| {
+                    application.app_event_id == published.app_event_id
+                        && outcome.message_id == published.message_id
+                });
+                if matches_publication
+                    && outcome.accepted_targets > 0
+                    && outcome.fanout_complete
+                    && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                {
+                    self.session.delete_outbound_fanout(fanout.message_id())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn resume_outbound_fanouts_for_group(
         &mut self,
         group_id: Option<&GroupId>,
@@ -2238,6 +2271,9 @@ where
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             {
                 Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None)).await?;
+            } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
+                record_published_application_fanout(&fanout, &mut output);
+                output.fanout.push(outcome);
             } else {
                 self.session.delete_outbound_fanout(fanout.message_id())?;
             }
@@ -3149,7 +3185,6 @@ where
     ) -> AccountResult<PublishStatus> {
         self.resolve_outbound_fanout_mls(&mut fanout, output, queue, context.clone())
             .await?;
-        let application_was_accepted = fanout.outcome().accepted_targets > 0;
         let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
         let due = fanout
@@ -3304,31 +3339,23 @@ where
                 });
             }
         }
-        if let Some(application) = fanout.application_message() {
-            if status.accepted_by_any_endpoint && !application_was_accepted {
-                output
-                    .published_app_messages
-                    .push(PublishedApplicationMessage {
-                        group_id: application.group_id.clone(),
-                        app_event_id: application.app_event_id.clone(),
-                        message_id: report.message_id.clone(),
-                        source_epoch: application.source_epoch,
-                        retention: application.retention,
-                    });
-            } else if status.retry_deferred && !status.accepted_by_any_endpoint {
-                output
-                    .unresolved_app_messages
-                    .push(UnresolvedApplicationMessage {
-                        group_id: application.group_id.clone(),
-                        app_event_id: application.app_event_id.clone(),
-                        message_id: report.message_id.clone(),
-                        reason: if possible_ambiguous_exposure {
-                            UnresolvedPublishReason::AcknowledgementUnknown
-                        } else {
-                            UnresolvedPublishReason::RetryableUnavailable
-                        },
-                    });
-            }
+        if status.accepted_by_any_endpoint {
+            record_published_application_fanout(&fanout, output);
+        } else if let Some(application) = fanout.application_message()
+            && status.retry_deferred
+        {
+            output
+                .unresolved_app_messages
+                .push(UnresolvedApplicationMessage {
+                    group_id: application.group_id.clone(),
+                    app_event_id: application.app_event_id.clone(),
+                    message_id: report.message_id.clone(),
+                    reason: if possible_ambiguous_exposure {
+                        UnresolvedPublishReason::AcknowledgementUnknown
+                    } else {
+                        UnresolvedPublishReason::RetryableUnavailable
+                    },
+                });
         }
         if fanout_outcome.outstanding_targets > 0
             && let Some(group_id) = fanout.group_id()
@@ -3343,6 +3370,7 @@ where
         output.fanout.push(fanout_outcome.clone());
         if fanout_outcome.fanout_complete
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+            && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
         {
             self.session.delete_outbound_fanout(fanout.message_id())?;
         }
@@ -3866,6 +3894,31 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
         failed,
         required_acks: fanout.request().required_acks,
     }
+}
+
+/// Replay the app-visible acknowledgement derived from a durable accepted
+/// fanout. The projection is an idempotent upsert, so emitting this on every
+/// recovery pass is safe until the app explicitly acknowledges persistence.
+fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut AccountDeviceEffects) {
+    if fanout.outcome().accepted_targets == 0 {
+        return;
+    }
+    let Some(application) = fanout.application_message() else {
+        return;
+    };
+    let message_id = fanout
+        .published_message_id()
+        .unwrap_or_else(|| fanout.message_id())
+        .clone();
+    output
+        .published_app_messages
+        .push(PublishedApplicationMessage {
+            group_id: application.group_id.clone(),
+            app_event_id: application.app_event_id.clone(),
+            message_id,
+            source_epoch: application.source_epoch,
+            retention: application.retention,
+        });
 }
 
 fn apply_report_to_fanout(

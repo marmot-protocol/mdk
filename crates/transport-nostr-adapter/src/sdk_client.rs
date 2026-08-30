@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -142,6 +144,8 @@ pub struct NostrSdkRelayClient {
     publish_connect_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
     #[cfg(test)]
     publish_release_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
+    #[cfg(test)]
+    publish_relay_pin_failure_stage: Arc<AtomicU8>,
     /// Relays that explicitly rejected NIP-77 are skipped for the rest of this
     /// process. Transient connection failures are never cached here.
     reconciliation_unsupported_relays: Arc<RwLock<HashSet<RelayUrl>>>,
@@ -227,6 +231,8 @@ impl NostrSdkRelayClient {
             publish_connect_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             publish_release_attempts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             reconciliation_unsupported_relays: Arc::new(RwLock::new(HashSet::new())),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1032,6 +1038,10 @@ impl NostrSdkRelayClient {
     /// limited to the caller that observed `add_*_relay == true` while holding
     /// `publish_relay_refs`, before any connection task can start.
     async fn pin_new_relay_retry_interval(&self, endpoint: &RelayUrl) -> Result<(), ()> {
+        #[cfg(test)]
+        if self.publish_relay_pin_failure_stage.load(Ordering::Relaxed) == 1 {
+            return Err(());
+        }
         let options = self
             .client
             .relays()
@@ -1045,6 +1055,10 @@ impl NostrSdkRelayClient {
             .remove_relay(endpoint.clone())
             .await
             .map_err(|_| ())?;
+        #[cfg(test)]
+        if self.publish_relay_pin_failure_stage.load(Ordering::Relaxed) == 2 {
+            return Err(());
+        }
         match self
             .client
             .pool()
@@ -1100,6 +1114,15 @@ impl NostrSdkRelayClient {
         match self.client.add_write_relay(endpoint.clone()).await {
             Ok(true) => {
                 if self.pin_new_relay_retry_interval(endpoint).await.is_err() {
+                    if self.client.relays().await.contains_key(endpoint) {
+                        tracing::warn!(
+                            target: "transport_nostr_adapter::sdk_client",
+                            method = "retain_publish_relay",
+                            "new publish relay kept SDK retry defaults after configuration failed"
+                        );
+                        publish_relay_refs.insert(endpoint.clone(), 1);
+                        return Ok(true);
+                    }
                     return Err(TransportEndpointFailure {
                         endpoint: transport_endpoint,
                         reason: "configure publish relay failed".to_owned(),
@@ -2611,6 +2634,61 @@ mod tests {
         assert_eq!(outcome.accepted.len(), 1);
         assert_eq!(outcome.accepted[0].endpoint, endpoint);
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
+    async fn publish_relay_pin_failure_tracks_only_a_relay_that_remains_registered() {
+        let registered_endpoint = RelayUrl::parse("wss://registered-pin-failure.example").unwrap();
+        let registered_sdk = NostrSdkRelayClient::new(Client::builder().build());
+        registered_sdk
+            .publish_relay_pin_failure_stage
+            .store(1, Ordering::Relaxed);
+
+        assert!(
+            registered_sdk
+                .retain_publish_relay(&registered_endpoint)
+                .await
+                .expect("an unpinned relay that remains registered must stay cleanup-tracked")
+        );
+        assert_eq!(
+            registered_sdk
+                .publish_relay_refs
+                .lock()
+                .await
+                .get(&registered_endpoint),
+            Some(&1)
+        );
+        registered_sdk
+            .release_publish_relay(registered_endpoint.clone())
+            .await
+            .unwrap();
+        assert!(
+            !registered_sdk
+                .client
+                .relays()
+                .await
+                .contains_key(&registered_endpoint),
+            "the tracked degraded relay must still be removed at lease release"
+        );
+
+        let removed_endpoint = RelayUrl::parse("wss://removed-pin-failure.example").unwrap();
+        let removed_sdk = NostrSdkRelayClient::new(Client::builder().build());
+        removed_sdk
+            .publish_relay_pin_failure_stage
+            .store(2, Ordering::Relaxed);
+
+        removed_sdk
+            .retain_publish_relay(&removed_endpoint)
+            .await
+            .expect_err("a pin failure that removed the relay must remain unavailable");
+        assert!(removed_sdk.publish_relay_refs.lock().await.is_empty());
+        assert!(
+            !removed_sdk
+                .client
+                .relays()
+                .await
+                .contains_key(&removed_endpoint)
+        );
     }
 
     #[tokio::test]

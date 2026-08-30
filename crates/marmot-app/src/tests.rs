@@ -13394,6 +13394,11 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         result.is_err(),
         "the unrelated hard failure must still surface"
     );
+    assert_eq!(
+        client.take_pending_projection_updates().len(),
+        1,
+        "a committed pending-to-sent flip must remain available for runtime broadcast after the batch errors"
+    );
 
     let row = app
         .timeline_messages_with_query(
@@ -15473,6 +15478,15 @@ async fn eventless_drain_projects_every_retained_send_it_publishes() {
         summary.projection_updates.len(),
         2,
         "both pending-to-sent transitions must reach runtime subscribers"
+    );
+    assert!(
+        client
+            .runtime
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .is_empty(),
+        "durably projected publications must acknowledge and retire their recovery fanouts"
     );
 
     let recovered = app

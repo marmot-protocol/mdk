@@ -590,6 +590,8 @@ impl AppClient {
                 updates.push(update);
             }
         }
+        self.runtime
+            .acknowledge_published_app_messages(&effects.published_app_messages)?;
         Ok(updates)
     }
 
