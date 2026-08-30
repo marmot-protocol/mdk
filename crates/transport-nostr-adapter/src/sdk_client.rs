@@ -755,6 +755,7 @@ impl NostrSdkRelayClient {
         request: PreparedPublish,
         unavailable: &HashMap<RelayUrl, TransportEndpointFailure>,
         connect_before_send: bool,
+        deadline: tokio::time::Instant,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         // A configured threshold of zero relaxes the quorum but never permits
         // confirming work that no relay accepted.
@@ -783,7 +784,6 @@ impl NostrSdkRelayClient {
             });
         }
 
-        let deadline = tokio::time::Instant::now() + SDK_RELAY_PUBLISH_OVERALL_WAIT;
         let mut aborted_publishes = false;
         let mut timed_out = false;
         let (accepted, failed, timed_out) = loop {
@@ -860,8 +860,9 @@ impl NostrSdkRelayClient {
         // goal aborts relays that are still connecting. The multi-event path
         // below may pre-connect because it amortizes those connections across
         // the batch.
+        let deadline = tokio::time::Instant::now() + SDK_RELAY_PUBLISH_OVERALL_WAIT;
         let outcome = self
-            .publish_prepared_event(request, &unavailable, true)
+            .publish_prepared_event(request, &unavailable, true, deadline)
             .await;
         lease.release().await;
         outcome
@@ -872,7 +873,12 @@ impl NostrSdkRelayClient {
         requests: Vec<Result<PreparedPublish, TransportAdapterError>>,
         batch_started_at: std::time::Instant,
     ) -> NostrPublishBatch {
-        let deadline = tokio::time::Instant::now() + SDK_RELAY_BATCH_OVERALL_WAIT;
+        let publish_started_at = tokio::time::Instant::now();
+        // The first concurrent request window starts before shared relay
+        // connection. A bounded `try_connect_relay` must not silently extend
+        // the existing end-to-end event budget from 20s to 25s.
+        let mut request_window_deadline = publish_started_at + SDK_RELAY_PUBLISH_OVERALL_WAIT;
+        let batch_deadline = publish_started_at + SDK_RELAY_BATCH_OVERALL_WAIT;
         let mut unique_endpoints = Vec::new();
         let mut seen_endpoints = HashSet::new();
         for request in requests.iter().filter_map(|request| request.as_ref().ok()) {
@@ -908,7 +914,7 @@ impl NostrSdkRelayClient {
             connects.spawn(async move { client.connect_publish_relay(endpoint).await });
         }
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = batch_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 connects.abort_all();
                 break;
@@ -946,19 +952,34 @@ impl NostrSdkRelayClient {
                         request_durations[index] = batch_started_at.elapsed();
                     }
                     Some((index, Ok(request))) => {
-                        if tokio::time::Instant::now() >= deadline {
+                        let now = tokio::time::Instant::now();
+                        if now >= batch_deadline {
                             outcomes[index] = Some(Err(TransportAdapterError::Publish(
                                 "publish batch timed out".to_owned(),
                             )));
                             request_durations[index] = batch_started_at.elapsed();
                             continue;
                         }
+                        // Requests admitted during one concurrency window share
+                        // its deadline. Once that window expires, later
+                        // backpressured requests receive the next bounded
+                        // window, capped by the whole-batch deadline.
+                        if now >= request_window_deadline {
+                            request_window_deadline =
+                                (now + SDK_RELAY_PUBLISH_OVERALL_WAIT).min(batch_deadline);
+                        }
+                        let request_deadline = request_window_deadline;
                         let client = self.clone();
                         let unavailable = unavailable.clone();
                         publishes.spawn(async move {
                             let outcome = match timeout_at(
-                                deadline,
-                                client.publish_prepared_event(request, &unavailable, false),
+                                batch_deadline,
+                                client.publish_prepared_event(
+                                    request,
+                                    &unavailable,
+                                    false,
+                                    request_deadline,
+                                ),
                             )
                             .await
                             {
@@ -2340,23 +2361,43 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn publish_event_cleans_one_shot_relay_after_overall_timeout() {
-        let silent = TransportEndpoint(silent_relay_url().await);
+        let stored_ids = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = TransportEndpoint(storing_no_ack_relay_url(stored_ids.clone()).await);
         let keys = Keys::generate();
         let client = Client::builder().signer(keys).build();
         let sdk = NostrSdkRelayClient::new(client);
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
+        let expected_id = dto.id.clone();
+        let publish_sdk = sdk.clone();
+        let publish_endpoint = endpoint.clone();
+        let publish = tokio::spawn(async move {
+            publish_sdk
+                .publish_event(std::slice::from_ref(&publish_endpoint), &dto, 1)
+                .await
+        });
 
-        let err = sdk
-            .publish_event(std::slice::from_ref(&silent), &dto, 1)
+        for _ in 0..100 {
+            if stored_ids.lock().await.contains(&expected_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stored_ids.lock().await.contains(&expected_id),
+            "the relay must receive the event before withholding OK"
+        );
+        advance(SDK_RELAY_PUBLISH_OVERALL_WAIT + Duration::from_secs(1)).await;
+        let err = publish
             .await
-            .expect_err("silent relay should miss the required ack deadline");
+            .expect("publish task must not panic")
+            .expect_err("a relay withholding OK should miss the required ack deadline");
 
         assert!(err.to_string().contains("publish timed out"));
         assert_eq!(
             err.publish_message_id().unwrap().as_slice(),
-            hex::decode(&dto.id).unwrap()
+            hex::decode(expected_id).unwrap()
         );
         assert!(
             err.publish_endpoint_failures()
@@ -2748,7 +2789,7 @@ mod tests {
         assert_eq!(outcomes.len(), 2);
         assert!(
             outcomes[0].is_err(),
-            "stalled request must fail in slot zero"
+            "unavailable request must fail in slot zero"
         );
         assert_eq!(
             outcomes[0]
@@ -2756,7 +2797,7 @@ mod tests {
                 .unwrap_err()
                 .publish_endpoint_failures()[0]
                 .kind,
-            TransportEndpointFailureKind::PossiblyExposed
+            TransportEndpointFailureKind::RetryableUnavailable
         );
         assert!(
             outcomes[1].is_ok(),
@@ -2790,7 +2831,8 @@ mod tests {
         assert!(outcomes.iter().all(Result::is_err));
         assert!(
             started_at.elapsed() <= SDK_RELAY_PUBLISH_OVERALL_WAIT + Duration::from_secs(1),
-            "all-unavailable latency must stay within one concurrent request window"
+            "all-unavailable latency {:?} must stay within one concurrent request window",
+            started_at.elapsed(),
         );
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
