@@ -218,6 +218,34 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
             .map(|(group_id, record)| Ok((GroupId::new(group_id), deserialize(&record)?)))
             .collect()
     }
+
+    fn mark_disband_tombstone_announced(&self, group_id: &GroupId) -> StorageResult<()> {
+        // One connection guard spans the read and the write, so the
+        // read-modify-write cannot interleave with a concurrent caller.
+        let conn = self.lock()?;
+        let Some(record) = conn
+            .query_row(
+                "SELECT record FROM cgka_disband_tombstones WHERE group_id = ?1",
+                params![group_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .storage()?
+        else {
+            return Ok(());
+        };
+        let mut tombstone: DisbandTombstone = deserialize(&record)?;
+        if tombstone.announced {
+            return Ok(());
+        }
+        tombstone.announced = true;
+        conn.execute(
+            "UPDATE cgka_disband_tombstones SET record = ?2 WHERE group_id = ?1",
+            params![group_id.as_slice(), serialize(&tombstone)?],
+        )
+        .storage()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +333,7 @@ mod tests {
             commit_digest: candidate.commit_digest,
             local_was_committer_leaf: true,
             former_members: candidate.former_members,
+            announced: false,
         };
         store.put_disband_tombstone(&group.id, &tombstone).unwrap();
         assert!(
@@ -328,5 +357,73 @@ mod tests {
             store.list_disband_tombstones().unwrap(),
             vec![(group.id, tombstone)]
         );
+    }
+
+    /// A guard written before the announce-once marker existed is stored as a
+    /// JSON record with no `announced` key. It must read back as unannounced,
+    /// take the mark, and — this is the part that matters — still be there
+    /// afterwards: the marker suppresses a replay, it never consumes the
+    /// anti-resurrection guard.
+    #[test]
+    fn an_old_guard_row_reads_unannounced_marks_once_and_survives_the_mark() {
+        use rusqlite::params;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = gid(9);
+        let legacy = serde_json::json!({
+            "epoch": 8,
+            "actor": member_id(2),
+            "origin_commit_id": null,
+            "commit_digest": vec![0x5au8; 32],
+            "local_was_committer_leaf": true,
+            "former_members": []
+        });
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_disband_tombstones (group_id, record) VALUES (?1, ?2)",
+                params![group_id.as_slice(), serde_json::to_vec(&legacy).unwrap()],
+            )
+            .unwrap();
+
+        let before = store.disband_tombstone(&group_id).unwrap().unwrap();
+        assert!(!before.announced, "an old row must read as unannounced");
+
+        store.mark_disband_tombstone_announced(&group_id).unwrap();
+        let after = store.disband_tombstone(&group_id).unwrap().unwrap();
+        assert!(after.announced);
+        assert_eq!(
+            DisbandTombstone {
+                announced: false,
+                ..after.clone()
+            },
+            before,
+            "marking must change nothing but the marker"
+        );
+
+        // Idempotent, and still listed: the guard outlives its announcement.
+        store.mark_disband_tombstone_announced(&group_id).unwrap();
+        assert!(
+            store
+                .disband_tombstone(&group_id)
+                .unwrap()
+                .unwrap()
+                .announced
+        );
+        assert_eq!(
+            store.list_disband_tombstones().unwrap(),
+            vec![(group_id, after)]
+        );
+    }
+
+    /// Marking a group that has no guard is a no-op, not an error: hydration
+    /// calls this on a best-effort path and must not turn a missing row into a
+    /// failed open.
+    #[test]
+    fn marking_a_group_without_a_guard_is_a_no_op() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.mark_disband_tombstone_announced(&gid(4)).unwrap();
+        assert!(store.list_disband_tombstones().unwrap().is_empty());
     }
 }

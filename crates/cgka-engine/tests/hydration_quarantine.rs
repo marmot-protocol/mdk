@@ -392,6 +392,7 @@ struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
     fail_get_group: Arc<AtomicBool>,
     fail_disband_tombstone: Arc<AtomicBool>,
+    fail_mark_disband_tombstone_announced: Arc<AtomicBool>,
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
 }
 
@@ -401,6 +402,7 @@ impl FlakyGroupRecordStorage {
             inner,
             fail_get_group: Arc::new(AtomicBool::new(false)),
             fail_disband_tombstone: Arc::new(AtomicBool::new(false)),
+            fail_mark_disband_tombstone_announced: Arc::new(AtomicBool::new(false)),
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -411,6 +413,11 @@ impl FlakyGroupRecordStorage {
 
     fn set_fail_disband_tombstone(&self, fail: bool) {
         self.fail_disband_tombstone.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_mark_disband_tombstone_announced(&self, fail: bool) {
+        self.fail_mark_disband_tombstone_announced
+            .store(fail, Ordering::SeqCst);
     }
 
     fn set_fail_list_queued_outbound_intents(&self, fail: bool) {
@@ -631,6 +638,17 @@ impl DisbandTombstoneStorage for FlakyGroupRecordStorage {
         &self,
     ) -> StorageResult<Vec<(GroupId, cgka_traits::DisbandTombstone)>> {
         self.inner.list_disband_tombstones()
+    }
+    fn mark_disband_tombstone_announced(&self, group_id: &GroupId) -> StorageResult<()> {
+        if self
+            .fail_mark_disband_tombstone_announced
+            .load(Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "injected mark_disband_tombstone_announced failure".into(),
+            ));
+        }
+        self.inner.mark_disband_tombstone_announced(group_id)
     }
 }
 
@@ -964,6 +982,82 @@ async fn tombstone_read_failure_quarantines_instead_of_hydrating_live_state() {
         reopened
             .retry_hydrate_quarantined_group(&group_id)
             .expect("retry succeeds")
+    );
+}
+
+/// The announce-once marker fails safe. If the mark cannot be written the
+/// terminal guard stays unannounced, so the next open replays `GroupDisbanded`
+/// again — the pre-marker behavior — and the group is never quarantined over a
+/// deduplication write. The opposite failure (a mark that sticks while the
+/// replay is lost) is the one the design forbids.
+#[tokio::test]
+async fn a_failed_announce_mark_replays_again_instead_of_quarantining() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    let epoch = initial.group_record(&group_id).unwrap().epoch;
+    // The durable terminal guard a settled disband commits, born unannounced.
+    storage
+        .put_disband_tombstone(
+            &group_id,
+            &cgka_traits::DisbandTombstone {
+                epoch,
+                actor: MemberId::new(pad32(b"alice-hydration")),
+                origin_commit_id: None,
+                commit_digest: [0x7a; 32],
+                local_was_committer_leaf: true,
+                former_members: Vec::new(),
+                announced: false,
+            },
+        )
+        .expect("write terminal guard");
+    drop(initial);
+
+    let disband_replays = |engine: &mut Engine<FlakyGroupRecordStorage>| {
+        engine
+            .drain_events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GroupEvent::GroupStateChanged {
+                        change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+
+    storage.set_fail_mark_disband_tombstone_announced(true);
+    for open in 1..=2 {
+        let mut reopened = build_flaky_engine(storage.clone());
+        reopened
+            .hydrate_all_stored_groups()
+            .expect("an unmarkable guard must not fail account open");
+        assert!(
+            reopened.quarantined_groups().is_empty(),
+            "open {open} quarantined a terminal group over a deduplication write"
+        );
+        assert_eq!(
+            disband_replays(&mut reopened),
+            1,
+            "open {open} must keep replaying while the marker cannot be written"
+        );
+    }
+
+    storage.set_fail_mark_disband_tombstone_announced(false);
+    let mut recovering = build_flaky_engine(storage.clone());
+    recovering.hydrate_all_stored_groups().expect("open");
+    assert_eq!(disband_replays(&mut recovering), 1);
+    drop(recovering);
+
+    let mut settled = build_flaky_engine(storage.clone());
+    settled.hydrate_all_stored_groups().expect("open");
+    assert_eq!(
+        disband_replays(&mut settled),
+        0,
+        "once the mark lands the guard must go silent"
     );
 }
 

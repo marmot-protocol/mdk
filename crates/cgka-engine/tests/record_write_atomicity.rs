@@ -501,6 +501,10 @@ impl DisbandTombstoneStorage for FaultStorage {
     ) -> StorageResult<Vec<(GroupId, cgka_traits::DisbandTombstone)>> {
         self.inner.list_disband_tombstones()
     }
+
+    fn mark_disband_tombstone_announced(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.mark_disband_tombstone_announced(group_id)
+    }
 }
 
 impl WelcomeStorage for FaultStorage {

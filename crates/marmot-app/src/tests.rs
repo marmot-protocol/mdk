@@ -11728,6 +11728,91 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     );
 }
 
+/// A disband tombstone is immortal, but its announcement is not.
+///
+/// The application's terminal `GroupDisbanded` arm marks the transport routes
+/// dirty and synthesizes a durable kind-1210 system row, so an unconditional
+/// hydration replay bills every account open a no-op route-refreshing
+/// `sync_runtime_groups` plus a redundant projection for every group the user
+/// ever disbanded — forever. Hydration owes exactly one belt-and-braces replay
+/// (the reconciler for a live delivery the application never projected) and
+/// silence after that.
+#[tokio::test]
+async fn reopening_an_account_replays_a_disband_once_and_then_stays_silent() {
+    use cgka_traits::storage::DisbandTombstoneStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://announce-once.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("announce once", &[]).await.unwrap();
+
+    // The durable terminal guard a settled disband commits. Written directly so
+    // the test pins the hydration seam instead of re-driving convergence.
+    app.account_storage("alice")
+        .unwrap()
+        .put_disband_tombstone(
+            &group_id,
+            &cgka_traits::DisbandTombstone {
+                epoch: cgka_traits::EpochId(1),
+                actor: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                origin_commit_id: None,
+                commit_digest: [0x11; 32],
+                local_was_committer_leaf: true,
+                former_members: Vec::new(),
+                announced: false,
+            },
+        )
+        .unwrap();
+    drop(client);
+
+    let mut replays_per_open = Vec::new();
+    let mut system_rows_per_open = Vec::new();
+    for _ in 0..3 {
+        let mut reopened = app.client("alice").await.unwrap();
+        let effects = reopened.runtime.drain().await.unwrap();
+        replays_per_open.push(
+            effects
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        cgka_traits::engine::GroupEvent::GroupStateChanged {
+                            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+        );
+        let summary = reopened
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        system_rows_per_open.push(summary.projection_updates.len());
+        drop(reopened);
+    }
+
+    assert_eq!(
+        replays_per_open,
+        vec![1, 0, 0],
+        "hydration owes one reconciling GroupDisbanded, then silence"
+    );
+    assert!(
+        system_rows_per_open[0] > 0,
+        "the one replay must still do its reconciling projection work: {system_rows_per_open:?}"
+    );
+    assert_eq!(
+        system_rows_per_open[1..],
+        [0, 0],
+        "a re-announced disband re-projects its terminal system row and dirties the routes"
+    );
+}
+
 fn drained_seam_push_token(
     group_id_hex: &str,
     member_id_hex: &str,

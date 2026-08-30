@@ -1316,14 +1316,18 @@ impl<S: StorageProvider> Engine<S> {
             {
                 continue;
             }
-            let tombstone = group
-                .disbanded
-                .clone()
-                .or_else(|| tombstones.remove(&group.id));
+            // The guard row is the authority on the `announced` marker: the
+            // group record's mirror is written once at settle and never
+            // updated, and the row outlives the record when the user deletes
+            // local history. The mirror is the payload fallback only.
+            let tombstone = tombstones
+                .remove(&group.id)
+                .or_else(|| group.disbanded.clone());
             if let Some(tombstone) = tombstone {
-                // Reconcile the single deterministic system row after a
-                // crash. The application projection canonicalizes this event,
-                // so replaying it on open is idempotent.
+                // Reconcile the single deterministic system row after a crash.
+                // The replay is idempotent (the application projection
+                // canonicalizes it) *and* announced-once, so an already
+                // announced guard restores its epoch entry in silence.
                 self.restore_disband_tombstone(group.id, tombstone)?;
                 continue;
             }
@@ -1464,6 +1468,32 @@ impl<S: StorageProvider> Engine<S> {
             .collect())
     }
 
+    /// Restore one terminal guard's epoch entry, and replay its
+    /// `GroupDisbanded` to the application at most once ever.
+    ///
+    /// The epoch entry is in-memory and is restored unconditionally on every
+    /// open; only the replay is marked. The marking moment is *here*, when the
+    /// replay is produced, and deliberately not at settle time. A settle
+    /// commits the guard durably, but the live `GroupDisbanded` it emits only
+    /// reaches the application through a later drain that can drop the whole
+    /// batch without a crash — `observe_drained_session_events` runs
+    /// `fail_if_publish_failed(effects)?` before it projects any event — so a
+    /// marker written at settle could suppress an announcement the application
+    /// never received. Marking at replay time instead guarantees live delivery
+    /// plus exactly one belt-and-braces replay, then silence.
+    ///
+    /// Residual crash window: the process can die (or the drain can fail its
+    /// publish gate) after this replay is buffered and marked, losing both the
+    /// live delivery and the one replay. What survives that is bounded, because
+    /// the user-visible terminal projection is derived from the guard row on
+    /// every read rather than accumulated from this event: `Group::disbanded`,
+    /// the chat-list terminal flag, the unread-aggregate exclusion, and the
+    /// transport-route exclusion all re-derive from `cgka_disband_tombstones`.
+    /// What is lost is the kind-1210 system row and the terminal push-token
+    /// sweep — the group can never resurface as live, routable, or unread. An
+    /// application-acknowledged marker would close even that, but no ack seam
+    /// covers `GroupStateChanged` today (only `MessageReceived` /
+    /// `GroupJoined`), so the plumbing is not proportionate to the residual.
     fn restore_disband_tombstone(
         &mut self,
         group_id: GroupId,
@@ -1471,13 +1501,32 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<(), EngineError> {
         self.epoch_manager
             .restore_disbanded(group_id.clone(), tombstone.epoch)?;
+        if tombstone.announced {
+            return Ok(());
+        }
         self.events_buf.push_back(GroupEvent::GroupStateChanged {
-            group_id,
+            group_id: group_id.clone(),
             epoch: tombstone.epoch,
             actor: Some(tombstone.actor),
             change: GroupStateChange::GroupDisbanded,
             origin_commit_id: tombstone.origin_commit_id,
         });
+        // Best-effort by design. A failed mark leaves the guard unannounced, so
+        // the next open replays again — the pre-fix behavior, and the safe
+        // direction. Propagating instead would quarantine a terminal group over
+        // a deduplication write.
+        if self
+            .storage
+            .mark_disband_tombstone_announced(&group_id)
+            .is_err()
+        {
+            tracing::debug!(
+                target: "cgka_engine::hydrate",
+                method = "restore_disband_tombstone",
+                error_kind = "mark_disband_tombstone_announced_failed",
+                "terminal guard replayed but not marked announced; the next open replays it again"
+            );
+        }
         Ok(())
     }
 
@@ -1541,17 +1590,17 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
-        let tombstone = match group.disbanded.clone() {
-            Some(tombstone) => Some(tombstone),
-            None => self
-                .storage
-                .disband_tombstone(group_id)
-                .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?,
-        };
+        // Same guard-row-first precedence as the cheap hydration pass, for the
+        // same reason. Live groups already paid this lookup, so the query count
+        // is unchanged for them; a terminal group gains one indexed read.
+        let tombstone = self
+            .storage
+            .disband_tombstone(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .or_else(|| group.disbanded.clone());
         if let Some(tombstone) = tombstone {
-            // Reconcile the single deterministic system row after a crash. The
-            // application projection canonicalizes this event, so replaying it
-            // on open is idempotent.
+            // Same once-only reconciliation as the cheap pass: idempotent if it
+            // does replay, and silent once the guard is marked announced.
             let epoch = tombstone.epoch;
             self.restore_disband_tombstone(group_id.clone(), tombstone)
                 .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;

@@ -537,6 +537,12 @@ impl<S: StorageProvider> Engine<S> {
             commit_digest: selected.commit_digest,
             local_was_committer_leaf: selected.local_was_committer_leaf,
             former_members: selected.former_members.clone(),
+            // The live `GroupDisbanded` this settle emits reaches the
+            // application through a later, non-transactional drain that can
+            // drop the whole batch (a failed publish gate, or a crash). Marking
+            // here would suppress the one hydration replay that reconciles
+            // exactly that loss, so the guard is born unannounced.
+            announced: false,
         };
 
         self.storage

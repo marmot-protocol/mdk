@@ -497,6 +497,14 @@ pub trait DisbandTombstoneStorage {
     fn list_disband_tombstones(
         &self,
     ) -> StorageResult<Vec<(GroupId, crate::group::DisbandTombstone)>>;
+
+    /// Flip this guard's `announced` marker so later opens stop replaying its
+    /// terminal `GroupDisbanded`.
+    ///
+    /// Not a destructive read: the guard row itself must survive, or a
+    /// disbanded MLS group id becomes joinable again. Idempotent, and a no-op
+    /// when no guard is stored for `group_id`.
+    fn mark_disband_tombstone_announced(&self, group_id: &GroupId) -> StorageResult<()>;
 }
 
 // ── WelcomeStorage ──────────────────────────────────────────────────────────

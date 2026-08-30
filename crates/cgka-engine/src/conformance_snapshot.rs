@@ -880,6 +880,7 @@ mod tests {
             commit_digest: [0xd4; 32],
             local_was_committer_leaf: true,
             former_members: vec![bob.clone(), alice.clone(), bob],
+            announced: false,
         };
         let sibling_device = DisbandTombstone {
             local_was_committer_leaf: false,
