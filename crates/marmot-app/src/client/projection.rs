@@ -621,6 +621,37 @@ impl AppClient {
         Ok(updates)
     }
 
+    /// Invalidates local projections for application messages whose durable
+    /// fanouts reached a terminal publish failure.
+    ///
+    /// A direct send excludes its own optimistic row because the caller owns
+    /// that row's callback-delivered retraction. Sibling failures and recovery
+    /// batches have no such caller, so their updates are returned for the
+    /// account worker to broadcast.
+    pub(crate) fn invalidate_failed_app_message_projections(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+        excluded: Option<(&GroupId, &str)>,
+    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        let mut updates = Vec::new();
+        for failed in &effects.failed_app_messages {
+            if excluded.is_some_and(|(group_id, app_event_id)| {
+                failed.group_id == *group_id && failed.app_event_id == app_event_id
+            }) {
+                continue;
+            }
+            if let Some(update) = self.app.invalidate_timeline_app_event(
+                &self.state.label,
+                &hex::encode(failed.group_id.as_slice()),
+                &failed.app_event_id,
+                crate::LOCAL_PUBLISH_FAILED_REASON,
+            )? {
+                updates.push(update);
+            }
+        }
+        Ok(updates)
+    }
+
     pub(crate) fn prune_plaintext_retention_for_group(
         &self,
         group_id: &GroupId,

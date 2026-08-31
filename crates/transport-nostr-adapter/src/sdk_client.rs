@@ -1097,12 +1097,18 @@ impl NostrSdkRelayClient {
             // The sdk error Display can carry the relay URL; keep the error
             // operation-only so `TransportAdapterError` Display stays URL-free.
             .map_err(|_| TransportAdapterError::Subscription("add relay failed".to_owned()))?;
-        if added {
-            self.pin_new_relay_retry_interval(&endpoint)
-                .await
-                .map_err(|_| {
-                    TransportAdapterError::Subscription("configure relay failed".to_owned())
-                })?;
+        if added && self.pin_new_relay_retry_interval(&endpoint).await.is_err() {
+            if self.client.relays().await.contains_key(&endpoint) {
+                tracing::warn!(
+                    target: "transport_nostr_adapter::sdk_client",
+                    method = "add_subscription_relay",
+                    "new subscription relay kept SDK retry defaults after configuration failed"
+                );
+            } else {
+                return Err(TransportAdapterError::Subscription(
+                    "configure relay failed".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -2697,6 +2703,47 @@ mod tests {
             .await
             .expect_err("a pin failure that removed the relay must remain unavailable");
         assert!(removed_sdk.publish_relay_refs.lock().await.is_empty());
+        assert!(
+            !removed_sdk
+                .client
+                .relays()
+                .await
+                .contains_key(&removed_endpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_relay_pin_failure_uses_registered_relay_defaults_only() {
+        let registered_endpoint =
+            RelayUrl::parse("wss://registered-subscription-pin-failure.example").unwrap();
+        let registered_sdk = NostrSdkRelayClient::new(Client::builder().build());
+        registered_sdk
+            .publish_relay_pin_failure_stage
+            .store(1, Ordering::Relaxed);
+
+        registered_sdk
+            .add_subscription_relay(registered_endpoint.clone())
+            .await
+            .expect("an unpinned subscription relay that remains registered is usable");
+        assert!(
+            registered_sdk
+                .client
+                .relays()
+                .await
+                .contains_key(&registered_endpoint)
+        );
+
+        let removed_endpoint =
+            RelayUrl::parse("wss://removed-subscription-pin-failure.example").unwrap();
+        let removed_sdk = NostrSdkRelayClient::new(Client::builder().build());
+        removed_sdk
+            .publish_relay_pin_failure_stage
+            .store(2, Ordering::Relaxed);
+
+        removed_sdk
+            .add_subscription_relay(removed_endpoint.clone())
+            .await
+            .expect_err("a pin failure that removed the subscription relay must fail");
         assert!(
             !removed_sdk
                 .client

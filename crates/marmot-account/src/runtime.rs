@@ -96,6 +96,7 @@ struct PublishStatus {
     accepted_by_any_endpoint: bool,
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
+    terminal_failure: bool,
 }
 
 struct PendingFanoutContinuation {
@@ -2018,9 +2019,12 @@ where
         // Retry the group's already-frozen transport events before producing
         // any newer convergence work. This preserves send order and ensures a
         // scheduled outbound wake actually drives the exact retained bytes.
-        let mut output = self
+        let (mut output, blocked_groups) = self
             .resume_outbound_fanouts_for_group(Some(group_id))
             .await?;
+        if blocked_groups.contains(group_id) {
+            return Ok(output);
+        }
         let effects = self.session.advance_convergence(group_id).await?;
         output.extend(self.publish_session_effects(effects).await?);
         Ok(output)
@@ -2262,7 +2266,9 @@ where
 
     /// Resume every incomplete frozen fanout in original staging order.
     pub async fn resume_outbound_fanouts(&mut self) -> AccountResult<AccountDeviceEffects> {
-        self.resume_outbound_fanouts_for_group(None).await
+        self.resume_outbound_fanouts_for_group(None)
+            .await
+            .map(|(effects, _blocked_groups)| effects)
     }
 
     /// Retire terminal accepted application fanouts only after the app has
@@ -2301,7 +2307,7 @@ where
     async fn resume_outbound_fanouts_for_group(
         &mut self,
         group_id: Option<&GroupId>,
-    ) -> AccountResult<AccountDeviceEffects> {
+    ) -> AccountResult<(AccountDeviceEffects, HashSet<GroupId>)> {
         let fanouts = match group_id {
             Some(group_id) => self.session.outbound_fanouts_for_group(group_id)?,
             None => self.session.outbound_fanouts()?,
@@ -2337,13 +2343,23 @@ where
                 record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
             } else {
+                let reason = "insufficient publish acknowledgements".to_owned();
+                output.failures.push(PublishFailure {
+                    message_id: fanout
+                        .published_message_id()
+                        .unwrap_or_else(|| fanout.message_id())
+                        .clone(),
+                    reason: reason.clone(),
+                });
+                record_failed_application_fanout(&fanout, reason, &mut output);
+                output.fanout.push(outcome);
                 self.session.delete_outbound_fanout(fanout.message_id())?;
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
         self.reconcile_superseded_maintenance(&output.events)?;
-        Ok(output)
+        Ok((output, blocked_groups))
     }
 
     fn reconcile_confirmed_own_leaf_rotations(
@@ -2498,9 +2514,28 @@ where
                     "published queued message but could not clear its durable intent"
                 );
             }
+        } else if status.terminal_failure {
+            if self
+                .session
+                .confirm_regenerated_queued_intent(&intent)
+                .is_err()
+            {
+                // Every target failed terminally, so the logical queued intent
+                // is complete even though it was not delivered. If durable
+                // cleanup fails, retain and re-arm it rather than losing the
+                // obligation.
+                self.session.retry_regenerated_queued_intent(&intent);
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "resolve_regenerated_queued_intent",
+                    error_kind = "terminal_queued_intent_cleanup",
+                    "terminal queued message failed but its durable intent could not be cleared"
+                );
+            }
         } else {
-            // Nothing accepted the publish. The durable intent was never
-            // deleted; re-arm its group for the normal convergence retry.
+            // Nothing accepted, but routing/setup failure or at least one
+            // retryable or ambiguously exposed target means terminal failure
+            // has not been proved. Preserve and re-arm the durable intent.
             self.session.retry_regenerated_queued_intent(&intent);
         }
     }
@@ -3359,6 +3394,8 @@ where
             accepted_by_any_endpoint: report.accepted_count() > 0,
             possible_ambiguous_exposure,
             retry_deferred: fanout_outcome.outstanding_targets > 0,
+            terminal_failure: report.accepted_count() == 0
+                && fanout_outcome.outstanding_targets == 0,
         };
         let publish_failure_reason =
             if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
@@ -3403,6 +3440,8 @@ where
         }
         if status.accepted_by_any_endpoint {
             record_published_application_fanout(&fanout, output);
+        } else if let Some(reason) = publish_failure_reason {
+            record_failed_application_fanout(&fanout, reason, output);
         } else if let Some(application) = fanout.application_message()
             && status.retry_deferred
         {
@@ -3680,6 +3719,7 @@ where
                 accepted_by_any_endpoint: accepted_before > 0,
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
+                terminal_failure: false,
             }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
@@ -3783,6 +3823,7 @@ where
                     accepted_by_any_endpoint: accepted_before > 0,
                     possible_ambiguous_exposure: true,
                     retry_deferred: false,
+                    terminal_failure: false,
                 });
             }
         };
@@ -3857,6 +3898,7 @@ where
             accepted_by_any_endpoint,
             possible_ambiguous_exposure: fanout.possible_exposure,
             retry_deferred: false,
+            terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
         })
     }
 }
@@ -3994,6 +4036,29 @@ fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut Acc
             source_epoch: application.source_epoch,
             retention: application.retention,
         });
+}
+
+/// Report a terminal application publish with the app-event identity retained
+/// on its durable fanout. This remains replayable across the crash window
+/// between persisting the terminal target states and deleting the fanout.
+fn record_failed_application_fanout(
+    fanout: &OutboundFanout,
+    reason: String,
+    output: &mut AccountDeviceEffects,
+) {
+    let Some(application) = fanout.application_message() else {
+        return;
+    };
+    let message_id = fanout
+        .published_message_id()
+        .unwrap_or_else(|| fanout.message_id())
+        .clone();
+    output.failed_app_messages.push(FailedApplicationMessage {
+        group_id: application.group_id.clone(),
+        app_event_id: application.app_event_id.clone(),
+        message_id,
+        reason,
+    });
 }
 
 fn apply_report_to_fanout(
@@ -4261,6 +4326,10 @@ pub struct AccountDeviceEffects {
     /// Application-message identity attached to unresolved publication so app
     /// consumers can keep exactly the affected local row in a sending state.
     pub unresolved_app_messages: Vec<UnresolvedApplicationMessage>,
+    /// Application messages whose publication reached a definitive terminal
+    /// failure, carrying the local app-event identity needed to invalidate only
+    /// the affected optimistic projection.
+    pub failed_app_messages: Vec<FailedApplicationMessage>,
     /// Application messages accepted by at least one transport endpoint,
     /// carrying source-state metadata captured by the exact MLS encryption
     /// operation and the adapter-visible transport id.
@@ -4281,6 +4350,14 @@ pub struct PublishedApplicationMessage {
     pub message_id: cgka_traits::MessageId,
     pub source_epoch: EpochId,
     pub retention: cgka_traits::app_event::AppMessageRetentionDecision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedApplicationMessage {
+    pub group_id: GroupId,
+    pub app_event_id: String,
+    pub message_id: cgka_traits::MessageId,
+    pub reason: String,
 }
 
 impl AccountDeviceEffects {
@@ -4311,6 +4388,8 @@ impl AccountDeviceEffects {
             .append(&mut other.unresolved_publishes);
         self.unresolved_app_messages
             .append(&mut other.unresolved_app_messages);
+        self.failed_app_messages
+            .append(&mut other.failed_app_messages);
         self.published_app_messages
             .append(&mut other.published_app_messages);
         self.welcome_failures.append(&mut other.welcome_failures);

@@ -13343,6 +13343,8 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let group_id = client.create_group("mixed publish", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     let app_event_id = "successful-app-message";
+    let failed_app_event_id = "failed-app-message";
+    let local_account_id_hex = account.account_id_hex;
 
     app.record_account_app_event(
         "alice",
@@ -13351,7 +13353,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             source_message_id_hex: None,
             direction: "sent".to_owned(),
             group_id_hex: group_id_hex.clone(),
-            sender: account.account_id_hex,
+            sender: local_account_id_hex.clone(),
             plaintext: "successful sibling publish".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -13363,8 +13365,28 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         },
     )
     .unwrap();
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: failed_app_event_id.to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: local_account_id_hex,
+            plaintext: "failed sibling publish".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(11),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
 
     let published_message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
+    let failed_message_id = cgka_traits::MessageId::new(vec![0xee; 32]);
     let retention = AppMessageRetentionDecision::new(10, 0);
     let effects = marmot_account::AccountDeviceEffects {
         published_app_messages: vec![marmot_account::PublishedApplicationMessage {
@@ -13375,7 +13397,13 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             retention,
         }],
         failures: vec![marmot_account::PublishFailure {
-            message_id: cgka_traits::MessageId::new(vec![0xee; 32]),
+            message_id: failed_message_id.clone(),
+            reason: "unrelated sibling publish failed".to_owned(),
+        }],
+        failed_app_messages: vec![marmot_account::FailedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: failed_app_event_id.to_owned(),
+            message_id: failed_message_id,
             reason: "unrelated sibling publish failed".to_owned(),
         }],
         ..Default::default()
@@ -13421,15 +13449,15 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     }
     assert_eq!(
         client.take_pending_projection_updates().len(),
-        1,
-        "a committed pending-to-sent flip must remain available for runtime broadcast after the batch errors"
+        2,
+        "the delivered and failed sibling updates must remain available for runtime broadcast"
     );
 
     let row = app
         .timeline_messages_with_query(
             "alice",
             storage_sqlite::TimelineMessageQuery {
-                group_id_hex: Some(group_id_hex),
+                group_id_hex: Some(group_id_hex.clone()),
                 ..storage_sqlite::TimelineMessageQuery::default()
             },
         )
@@ -13445,6 +13473,24 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     );
     assert_eq!(row.source_epoch, Some(1));
     assert_eq!(row.retention_seconds, Some(retention.retention_seconds));
+    let failed_row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == failed_app_event_id)
+        .expect("failed sibling remains visible in the timeline");
+    assert_eq!(
+        failed_row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "a terminally failed sibling must leave Sending without failing the delivered current send"
+    );
 }
 
 #[tokio::test]

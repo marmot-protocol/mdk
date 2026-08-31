@@ -3115,6 +3115,21 @@ impl AppClient {
     ) -> Result<(), AppError> {
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
+        match self
+            .invalidate_failed_app_message_projections(effects, Some((group_id, app_event_id)))
+        {
+            Ok(failed_updates) => self.pending_projection_updates.extend(failed_updates),
+            Err(error) => {
+                // A sibling projection failure must not retract the current
+                // send when its own fanout was accepted or retained.
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_kind = error.privacy_safe_kind(),
+                    "failed to invalidate a terminally failed sibling from a send batch"
+                );
+            }
+        }
         let current_send_is_retained =
             effects.published_app_messages.iter().any(|published| {
                 published.group_id == *group_id && published.app_event_id == app_event_id
@@ -3877,6 +3892,8 @@ impl AppClient {
         // every timeline and chat-list subscriber still shows pending.
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         self.pending_projection_updates.extend(finalize_updates);
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
+        self.pending_projection_updates.extend(failed_updates);
         // A manual retry can complete one frozen fanout while another publish
         // in the same convergence batch fails. Finalize that success before
         // surfacing the unrelated failure because its fanout is already gone.

@@ -12,7 +12,9 @@ use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
 use cgka_traits::app_components::{
     AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
 };
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+use cgka_traits::app_event::{
+    AppMessageRetentionDecision, MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent,
+};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::PeelerError;
@@ -25,11 +27,12 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId, OutboundFanout,
-    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
-    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointFailureKind, TransportEndpointReceipt, TransportEndpointRejectionCategory,
-    TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
+    EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId,
+    OutboundApplicationMessage, OutboundFanout, TransportAccountActivation, TransportAdapter,
+    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointReceipt, TransportEndpointRejectionCategory, TransportGroupSync,
+    TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
     TransportPublishTarget,
 };
 use marmot_account::{

@@ -599,6 +599,8 @@ impl AppClient {
     ) -> Result<(), AppError> {
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
+        self.pending_projection_updates.extend(failed_updates);
         fail_if_publish_failed(effects)
     }
 
@@ -1072,11 +1074,14 @@ impl AppClient {
         // row must not remain stuck in `Sending` after its fanout is deleted.
         self.remember_published_reports(effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
         if let Err(error) = fail_if_publish_failed(effects) {
             self.pending_projection_updates.extend(finalize_updates);
+            self.pending_projection_updates.extend(failed_updates);
             return Err(error);
         }
         summary.projection_updates.extend(finalize_updates);
+        summary.projection_updates.extend(failed_updates);
         if effects.events.is_empty() {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
@@ -3339,11 +3344,13 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         self.remember_published_reports(effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
         // Preserve successful publications in a mixed batch before surfacing
         // an unrelated hard failure. Their durable fanouts are already gone,
         // so a later pass cannot reconstruct this source metadata.
         if let Err(error) = fail_if_publish_failed(effects) {
             self.pending_projection_updates.extend(finalize_updates);
+            self.pending_projection_updates.extend(failed_updates);
             return Err(error);
         }
         let publish_new_message_notification =
@@ -3364,6 +3371,7 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
+        summary.projection_updates.extend(failed_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
         let routes_dirty = self
