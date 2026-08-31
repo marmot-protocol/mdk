@@ -1234,22 +1234,22 @@ fn latest_preview_carries_exact_media_and_delivery_projection() {
     assert_eq!(failed.message_id_hex, "pending");
     assert_eq!(failed.delivery_state, ChatListMessageDeliveryState::Failed);
 
-    // A successful retry re-records the same durable app event with its MLS
-    // source id, clearing the local publish invalidation. The chat row must
-    // transition that exact preview back to delivered rather than waiting for
-    // a different message to replace it.
-    pending.source_message_id_hex = Some("source-after-retry".to_owned());
+    // Re-recording the same durable app event — relay redelivery, backfill
+    // replay, rejoin reprocessing — is not evidence that the send reached the
+    // group, so the preview stays failed. A send that does publish is finalized
+    // through `finalize_app_event_source_retention`, which never re-records.
+    pending.source_message_id_hex = Some("source-after-replay".to_owned());
     store.record_app_event(&pending).unwrap();
-    let retried = store
+    let replayed = store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row")
         .last_message
-        .expect("retried preview");
-    assert_eq!(retried.message_id_hex, "pending");
+        .expect("replayed preview");
+    assert_eq!(replayed.message_id_hex, "pending");
     assert_eq!(
-        retried.delivery_state,
-        ChatListMessageDeliveryState::Delivered
+        replayed.delivery_state,
+        ChatListMessageDeliveryState::Failed
     );
 
     store

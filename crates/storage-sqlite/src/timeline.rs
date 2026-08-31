@@ -568,8 +568,14 @@ impl SqliteAccountStorage {
                         WHEN app_events.retention_seconds IS NULL THEN excluded.retention_expires_at
                         ELSE app_events.retention_expires_at
                     END,
-                    invalidated = 0,
-                    invalidation_reason = NULL",
+                    -- Invalidation is terminal, and re-recording is not evidence
+                    -- that a withdrawn row reached the group: the same message
+                    -- arrives again from relay redelivery, backfill replay, or
+                    -- rejoin reprocessing, and a synthesized system row is
+                    -- re-derived under its deterministic id by any later batch.
+                    -- Only the invalidate_* primitives write these columns.
+                    invalidated = app_events.invalidated,
+                    invalidation_reason = app_events.invalidation_reason",
                 params![
                     &event.group_id_hex,
                     &event.message_id_hex,
