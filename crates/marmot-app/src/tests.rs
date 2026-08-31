@@ -15788,7 +15788,11 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
         .notify_connectivity_restored()
         .await
         .expect("the host connectivity signal must wake the retained invite");
-    tokio::time::timeout(std::time::Duration::from_millis(750), async {
+    // Keep the end-to-end allowance below the five-second unavailable-target
+    // backoff while leaving enough headroom for MLS and SQLite work on a busy
+    // CI runner. The scheduler's immediate deadline reset is covered
+    // deterministically in `connectivity_restore_wakes_pending_outbound_before_durable_cutoff`.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             if relay
                 .published_event_ids()

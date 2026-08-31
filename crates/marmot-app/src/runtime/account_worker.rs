@@ -5942,6 +5942,32 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn connectivity_restore_wakes_pending_outbound_before_durable_cutoff() {
+        let group_id = test_group_id(17);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let before = TokioInstant::now();
+
+        scheduled.schedule_after_pass(
+            &group_id,
+            ConvergenceScheduleState::PendingOutbound {
+                retry_after_ms: Some(5_000),
+            },
+        );
+        assert_eq!(
+            scheduled.deadlines[&group_id],
+            before + Duration::from_secs(5)
+        );
+
+        scheduled.wake_after_connectivity_restored();
+
+        assert_eq!(
+            scheduled.deadlines[&group_id],
+            TokioInstant::now(),
+            "connectivity recovery must make a backpressured fanout immediately eligible"
+        );
+    }
+
     #[tokio::test]
     async fn collecting_tick_does_not_increment_rearm_counter() {
         let group_id = test_group_id(13);
