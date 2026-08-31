@@ -13324,6 +13324,7 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
 #[derive(Clone, Copy)]
 enum MixedPublishObservation {
     DirectSend,
+    DirectSendCurrentFailed,
     Drained,
     Scheduled,
     Retry,
@@ -13389,6 +13390,14 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
                 client.pending_projection_updates.extend(updates);
                 Ok(SyncSummary::default())
             }),
+        MixedPublishObservation::DirectSendCurrentFailed => client
+            .observe_recovery_evidence_then_gate_send_publish(
+                &effects,
+                &group_id,
+                "failed-current-message",
+            )
+            .await
+            .map(|()| SyncSummary::default()),
         MixedPublishObservation::Drained => client.observe_drained_session_events(&effects).await,
         MixedPublishObservation::Scheduled => {
             client
@@ -13442,6 +13451,14 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
 async fn direct_send_mixed_batch_preserves_the_current_delivered_message() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::DirectSend)
         .await;
+}
+
+#[tokio::test]
+async fn direct_send_mixed_batch_finalizes_successful_sibling_before_current_error() {
+    assert_mixed_publish_batch_finalizes_successful_message(
+        MixedPublishObservation::DirectSendCurrentFailed,
+    )
+    .await;
 }
 
 #[tokio::test]

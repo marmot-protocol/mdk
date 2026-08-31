@@ -3128,6 +3128,24 @@ impl AppClient {
             Ok(()) => return Ok(()),
             Err(publish_err) => publish_err,
         };
+        // This send failed, but the aggregate batch can still contain a
+        // successfully published sibling. Finalize and broadcast that sibling
+        // before returning the current send's error; otherwise its durable row
+        // remains visibly pending until an unrelated recovery pass. Keep this
+        // best-effort so projection trouble cannot mask the primary publish
+        // failure.
+        self.remember_published_reports(effects);
+        match self.finalize_published_app_message_source_retention(effects) {
+            Ok(updates) => self.pending_projection_updates.extend(updates),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_kind = error.privacy_safe_kind(),
+                    "failed to finalize a successful sibling from a failed send batch"
+                );
+            }
+        }
         // The send itself failed to reach anyone, but any peer commits it
         // folded are durably applied — broadcast them before surfacing the
         // publish failure, best-effort so a projection error cannot mask
