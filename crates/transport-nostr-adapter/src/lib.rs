@@ -124,6 +124,11 @@ impl SubscriptionAttempt {
     pub const INITIAL: Self = Self(0);
 
     /// The attempt an account's next activation issues under.
+    ///
+    /// Saturating: monotonicity would silently stop at `u64::MAX`. Unreachable
+    /// in practice — that is one activation per nanosecond for ~584 years on a
+    /// single in-process adapter — and saturating beats wrapping back onto ids
+    /// a live attempt may still be using.
     fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }
@@ -450,6 +455,13 @@ pub trait NostrRelayClient: Send + Sync {
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError>;
 
+    /// Tear down every subscription this client holds for an account.
+    ///
+    /// Must be a no-op returning `Ok` for an account the client knows nothing
+    /// about: `activate_account` calls this unconditionally — before the first
+    /// activation as well as before a replacement — and propagates the error
+    /// with `?`, so an implementation that faulted on an unknown account would
+    /// make every first activation fail.
     async fn unsubscribe_account(&self, account_id: &MemberId)
     -> Result<(), TransportAdapterError>;
 
@@ -961,6 +973,13 @@ impl TransportAdapter for NostrTransportAdapter {
             // Some concurrent REQs may already have succeeded. Tear those
             // down best-effort, then always remove the pre-registered local
             // routes so callers never observe a half-active account.
+            //
+            // `state.activate` above already ran, so this activation's attempt
+            // is in the high-water map before `subscribe_all` was even tried.
+            // The retry depends on that ordering: `deactivate` below drops the
+            // routes but not the high-water mark, so the retry issues a fresh
+            // attempt rather than reusing the ids of REQs that did reach a
+            // relay and are still streaming.
             let relay_cleanup_failed = self
                 .relay_client
                 .unsubscribe_account(&account_id)
@@ -1012,16 +1031,18 @@ impl TransportAdapter for NostrTransportAdapter {
 
         let (to_add, to_remove) = {
             let state = self.state.read().await;
+            // The `AccountNotActive` guard above ran under the subscription
+            // lock this call holds, and only activate/sync/deactivate can
+            // remove an account's routes — all three serialize on that lock.
+            let routes = state
+                .accounts
+                .get(&sync.account_id)
+                .expect("the AccountNotActive guard above proved the account is active");
             // A sync amends the live activation's route set; it does not open a
             // new attempt, so both sides of the diff carry the activation's own
             // attempt and the ids stay stable across it.
-            let routes = state.accounts.get(&sync.account_id);
-            let attempt = routes
-                .map(|routes| routes.attempt)
-                .unwrap_or(SubscriptionAttempt::INITIAL);
-            let current_groups = routes
-                .map(|routes| routes.groups.as_slice())
-                .unwrap_or_default();
+            let attempt = routes.attempt;
+            let current_groups = routes.groups.as_slice();
             diff_group_subscriptions(
                 &sync.account_id,
                 current_groups,
