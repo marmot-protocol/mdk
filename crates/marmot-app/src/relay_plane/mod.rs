@@ -25,7 +25,7 @@ use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrPublishOutcome, NostrReconciliationItem,
     NostrReconciliationSummary, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
     NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
-    RelayRegistrationOutcome,
+    RelayRegistrationOutcome, SubscriptionAttempt,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -1766,6 +1766,9 @@ impl MarmotRelayPlaneAccountAdapter {
                     account_id: self.account_id.clone(),
                     endpoints: activation.inbox_endpoints,
                     since: None,
+                    // A one-shot reconciliation REQ is not owned by an account
+                    // activation and never feeds the replay-coverage gate.
+                    attempt: SubscriptionAttempt::INITIAL,
                 },
                 local_items,
                 reconcile_since,
@@ -1827,6 +1830,9 @@ impl MarmotRelayPlaneAccountAdapter {
                     transport_group_id: group.transport_group_id,
                     endpoints: group.endpoints,
                     since: None,
+                    // A one-shot reconciliation REQ is not owned by an account
+                    // activation and never feeds the replay-coverage gate.
+                    attempt: SubscriptionAttempt::INITIAL,
                 },
                 local_items,
                 reconcile_since,

@@ -100,6 +100,44 @@ fn unix_now_seconds() -> u64 {
         .as_secs()
 }
 
+/// Which account-activation attempt issued a subscription.
+///
+/// A relay reports end-of-stored-events by subscription id and nothing else
+/// (`RelayMessage::EndOfStoredEvents` carries only the id), so the id is the
+/// only identity an EOSE can carry back. Without an attempt in it, a report
+/// answering a REQ that has already been torn down is indistinguishable from a
+/// report answering the REQ that replaced it — and lands on the replacement's
+/// freshly reset replay coverage. Stamping the attempt into the id makes the
+/// superseded report simply not match.
+///
+/// [`Self::INITIAL`] marks a subscription that no account activation owns —
+/// one-shot reconciliation REQs and post-join maintenance. Activations count
+/// from one.
+///
+/// Deliberately not [`Default`]: a silently zero-valued attempt on an account's
+/// routes is the exact shape of the bug this type exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubscriptionAttempt(u64);
+
+impl SubscriptionAttempt {
+    /// Not scoped to an account activation.
+    pub const INITIAL: Self = Self(0);
+
+    /// The attempt an account's next activation issues under.
+    ///
+    /// Saturating: monotonicity would silently stop at `u64::MAX`. Unreachable
+    /// in practice — that is one activation per nanosecond for ~584 years on a
+    /// single in-process adapter — and saturating beats wrapping back onto ids
+    /// a live attempt may still be using.
+    fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+}
+
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrSubscription {
@@ -107,6 +145,8 @@ pub enum NostrSubscription {
         account_id: MemberId,
         endpoints: Vec<TransportEndpoint>,
         since: Option<Timestamp>,
+        /// Activation attempt that issued this REQ; see [`SubscriptionAttempt`].
+        attempt: SubscriptionAttempt,
     },
     Group {
         account_id: MemberId,
@@ -114,6 +154,8 @@ pub enum NostrSubscription {
         transport_group_id: Vec<u8>,
         endpoints: Vec<TransportEndpoint>,
         since: Option<Timestamp>,
+        /// Activation attempt that issued this REQ; see [`SubscriptionAttempt`].
+        attempt: SubscriptionAttempt,
     },
     /// Temporary full-history subscription used only by post-join maintenance.
     ///
@@ -133,12 +175,14 @@ impl NostrSubscription {
             Self::AccountInbox {
                 account_id,
                 endpoints,
+                attempt,
                 ..
             } => compact_subscription_id(
                 "inbox",
                 &[
                     account_id.as_slice(),
                     endpoint_set_digest(endpoints).as_bytes(),
+                    &attempt.to_be_bytes(),
                 ],
             ),
             Self::Group {
@@ -146,6 +190,7 @@ impl NostrSubscription {
                 group_id,
                 transport_group_id,
                 endpoints,
+                attempt,
                 ..
             } => {
                 let h_tag = hex::encode(transport_group_id);
@@ -156,6 +201,7 @@ impl NostrSubscription {
                         group_id.as_slice(),
                         h_tag.as_bytes(),
                         endpoint_set_digest(endpoints).as_bytes(),
+                        &attempt.to_be_bytes(),
                     ],
                 )
             }
@@ -185,6 +231,15 @@ impl NostrSubscription {
             Self::AccountInbox { endpoints, .. }
             | Self::Group { endpoints, .. }
             | Self::GroupMaintenance { endpoints, .. } => endpoints,
+        }
+    }
+
+    /// Activation attempt this subscription was issued under. See
+    /// [`SubscriptionAttempt`].
+    pub fn attempt(&self) -> SubscriptionAttempt {
+        match self {
+            Self::AccountInbox { attempt, .. } | Self::Group { attempt, .. } => *attempt,
+            Self::GroupMaintenance { .. } => SubscriptionAttempt::INITIAL,
         }
     }
 
@@ -400,6 +455,13 @@ pub trait NostrRelayClient: Send + Sync {
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError>;
 
+    /// Tear down every subscription this client holds for an account.
+    ///
+    /// Must be a no-op returning `Ok` for an account the client knows nothing
+    /// about: `activate_account` calls this unconditionally — before the first
+    /// activation as well as before a replacement — and propagates the error
+    /// with `?`, so an implementation that faulted on an unknown account would
+    /// make every first activation fail.
     async fn unsubscribe_account(&self, account_id: &MemberId)
     -> Result<(), TransportAdapterError>;
 
@@ -636,6 +698,22 @@ impl NostrTransportAdapter {
             .account_subscription_eose(account_id)
     }
 
+    /// The activation attempt an account's live subscriptions were issued
+    /// under, or `None` when the account is not active.
+    ///
+    /// Subscription ids are attempt-scoped (see [`SubscriptionAttempt`]), so a
+    /// caller that rebuilds the id of a live subscription from route state —
+    /// rather than reading it off the [`NostrSubscription`] the adapter issued —
+    /// must stamp the same attempt. `None` keeps "unknown account" distinct from
+    /// [`SubscriptionAttempt::INITIAL`], which means "not activation-owned". It
+    /// reports an ordinal only: no ids, endpoints, or routes cross the boundary.
+    pub async fn account_subscription_attempt(
+        &self,
+        account_id: &MemberId,
+    ) -> Option<SubscriptionAttempt> {
+        self.state.read().await.activation_attempt(account_id)
+    }
+
     /// Install the temporary, full-history subscription used by the post-join
     /// maintenance gate. The caller owns its eventual removal.
     pub async fn install_group_maintenance_subscription(
@@ -830,33 +908,46 @@ impl TransportAdapter for NostrTransportAdapter {
             group_subscription_count = activation.group_subscriptions.len(),
             "activating transport account"
         );
-        let replaced_count = {
+        // Read the replaced route count and the attempt this activation issues
+        // under together, under the subscription lock that serializes every
+        // activate/sync/deactivate. Stamping the attempt into the re-issued ids
+        // is what keeps a superseded attempt's in-flight EOSE from landing on
+        // the coverage this activation is about to reset.
+        let (replaced_count, attempt) = {
             let state = self.state.read().await;
-            state
-                .accounts
-                .get(&account_id)
-                .map(|routes| 1 + routes.groups.len())
-                .unwrap_or_default()
+            (
+                state
+                    .accounts
+                    .get(&account_id)
+                    .map(|routes| 1 + routes.groups.len())
+                    .unwrap_or_default(),
+                state.next_activation_attempt(&account_id),
+            )
         };
-        if replaced_count > 0 {
-            self.relay_client.unsubscribe_account(&account_id).await?;
-        }
+        // Unconditional, not gated on live local routes. Attempt-scoped ids mean
+        // a re-issued REQ no longer replaces its predecessor relay-side, and a
+        // rolled-back activation can leave `accounts` empty while the relay
+        // client still holds this account's subscriptions. An orphaned REQ
+        // double-delivers, because routing is content-keyed rather than
+        // subscription-keyed. The SDK client is a no-op on an empty id list.
+        self.relay_client.unsubscribe_account(&account_id).await?;
 
         let mut issued = Vec::with_capacity(1 + activation.group_subscriptions.len());
         issued.push(account_inbox_subscription(
             &account_id,
             activation.inbox_endpoints.clone(),
             inbox_since(activation.since),
+            attempt,
         ));
         let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
         for group in &activation.group_subscriptions {
-            let route_key = group_subscription(&account_id, group, None).route_key();
+            let route_key = group_route_key(&account_id, group);
             let since = if prior_route_keys.contains(&route_key) {
                 None
             } else {
                 activation.since
             };
-            issued.push(group_subscription(&account_id, group, since));
+            issued.push(group_subscription(&account_id, group, since, attempt));
         }
         // Register routing/telemetry state BEFORE the relay REQs go out: a
         // relay may stream stored events the moment it sees a subscription,
@@ -870,20 +961,25 @@ impl TransportAdapter for NostrTransportAdapter {
             // the old subscription ids first (before recording the new starts,
             // since unchanged endpoint sets reuse the same ids).
             state.forget_account_subscription_starts(&account_id);
-            if replaced_count > 0 {
-                // The blanket `unsubscribe_account` above supersedes any queued
-                // per-subscription unsubscribes for this account.
-                state.clear_pending_unsubscribes_for_account(&account_id);
-            }
+            // The blanket `unsubscribe_account` above supersedes any queued
+            // per-subscription unsubscribes for this account.
+            state.clear_pending_unsubscribes_for_account(&account_id);
             state.record_subscription_starts(&issued, now_ms);
             state.record_account_replay_start(&account_id, &issued);
-            state.activate(activation, replaced_count);
+            state.activate(activation, replaced_count, attempt);
         }
 
         if let Err(error) = self.subscribe_all("activate_account", &issued).await {
             // Some concurrent REQs may already have succeeded. Tear those
             // down best-effort, then always remove the pre-registered local
             // routes so callers never observe a half-active account.
+            //
+            // `state.activate` above already ran, so this activation's attempt
+            // is in the high-water map before `subscribe_all` was even tried.
+            // The retry depends on that ordering: `deactivate` below drops the
+            // routes but not the high-water mark, so the retry issues a fresh
+            // attempt rather than reusing the ids of REQs that did reach a
+            // relay and are still streaming.
             let relay_cleanup_failed = self
                 .relay_client
                 .unsubscribe_account(&account_id)
@@ -935,16 +1031,24 @@ impl TransportAdapter for NostrTransportAdapter {
 
         let (to_add, to_remove) = {
             let state = self.state.read().await;
-            let current_groups = state
+            // The `AccountNotActive` guard above ran under the subscription
+            // lock this call holds, and only activate/sync/deactivate can
+            // remove an account's routes — all three serialize on that lock.
+            let routes = state
                 .accounts
                 .get(&sync.account_id)
-                .map(|routes| routes.groups.as_slice())
-                .unwrap_or_default();
+                .expect("the AccountNotActive guard above proved the account is active");
+            // A sync amends the live activation's route set; it does not open a
+            // new attempt, so both sides of the diff carry the activation's own
+            // attempt and the ids stay stable across it.
+            let attempt = routes.attempt;
+            let current_groups = routes.groups.as_slice();
             diff_group_subscriptions(
                 &sync.account_id,
                 current_groups,
                 &sync.group_subscriptions,
                 sync.since,
+                attempt,
             )
         };
 
@@ -1166,13 +1270,18 @@ struct DeliveryRoute {
     plane: TransportDeliveryPlane,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AccountRoutes {
     /// Pre-canonicalized so the Welcome/inbox arm of `routes_for` never re-parses
     /// the same stored inbox endpoint per event (#698/#752), mirroring the group
     /// arm's `by_transport_group` entries.
     inbox_endpoints: Vec<CanonicalEndpoint>,
     groups: Vec<TransportGroupSubscription>,
+    /// Attempt the live subscriptions for this account were issued under. Held
+    /// here so `account_subscription_ids` can rebuild exactly the ids that went
+    /// on the wire, and so a group sync reuses the activation's attempt rather
+    /// than minting a new one.
+    attempt: SubscriptionAttempt,
 }
 
 /// Immutable endpoint coverage for the most recent account activation.
@@ -1283,6 +1392,15 @@ struct AdapterState {
     /// recent activation of each account. This is intentionally independent of
     /// `accounts`, whose live group routes may change during the drain.
     account_replay_coverage: HashMap<MemberId, AccountReplayCoverage>,
+    /// Highest activation attempt ever issued for each account in this process.
+    ///
+    /// Deliberately never cleared — not by `deactivate`, not by the failed
+    /// activation rollback. Both drop the account's routes while the relay
+    /// sockets stay open and the superseded attempt's REQs keep streaming, so
+    /// recovering the ordinal from the routes would hand the next activation
+    /// the ids its predecessor is still using. Bounded by the number of distinct
+    /// accounts activated in this process.
+    activation_attempt_high_water: HashMap<MemberId, SubscriptionAttempt>,
     /// Derived accelerator for `routes_for` group delivery (#698/#752): maps a
     /// `transport_group_id` to its candidate routes, so an inbound group event is
     /// resolved in O(matching groups) instead of scanning O(accounts × groups)
@@ -1367,9 +1485,19 @@ impl AdapterState {
         }
     }
 
-    fn activate(&mut self, activation: TransportAccountActivation, replaced: usize) {
+    fn activate(
+        &mut self,
+        activation: TransportAccountActivation,
+        replaced: usize,
+        attempt: SubscriptionAttempt,
+    ) {
         self.metrics.subscriptions_created += 1 + activation.group_subscriptions.len();
         self.metrics.subscriptions_removed += replaced;
+        // Raise the high-water mark before the routes take a copy of it: the
+        // routes are the reconstruction source for `account_subscription_ids`,
+        // the high-water map is what survives their removal.
+        self.activation_attempt_high_water
+            .insert(activation.account_id.clone(), attempt);
         self.accounts.insert(
             activation.account_id,
             AccountRoutes {
@@ -1379,6 +1507,7 @@ impl AdapterState {
                     .map(CanonicalEndpoint::new)
                     .collect(),
                 groups: activation.group_subscriptions,
+                attempt,
             },
         );
         self.rebuild_transport_group_index();
@@ -1438,7 +1567,7 @@ impl AdapterState {
                 routes
                     .groups
                     .iter()
-                    .map(|group| group_subscription(account_id, group, None).route_key())
+                    .map(|group| group_route_key(account_id, group))
             })
             .collect()
     }
@@ -1452,6 +1581,28 @@ impl AdapterState {
 
     fn record_confirmed_unsubscribes(&mut self, count: usize) {
         self.metrics.subscriptions_removed += count;
+    }
+
+    /// Attempt ordinal the account's next activation issues under.
+    ///
+    /// Read from the high-water map rather than from the account's routes:
+    /// deactivation and the failed-activation rollback both remove the routes,
+    /// and neither closes the relay sockets the superseded attempt's REQs are
+    /// still streaming on. Strictly increasing per account for the lifetime of
+    /// this adapter, so a re-issued subscription never reuses a superseded
+    /// attempt's id.
+    fn next_activation_attempt(&self, account_id: &MemberId) -> SubscriptionAttempt {
+        self.activation_attempt_high_water
+            .get(account_id)
+            .copied()
+            .unwrap_or(SubscriptionAttempt::INITIAL)
+            .next()
+    }
+
+    /// Attempt the account's live subscriptions were issued under, or `None`
+    /// when the account is not active.
+    fn activation_attempt(&self, account_id: &MemberId) -> Option<SubscriptionAttempt> {
+        self.accounts.get(account_id).map(|routes| routes.attempt)
     }
 
     fn deactivate(&mut self, account_id: &MemberId, removed_count: usize) {
@@ -1542,9 +1693,16 @@ impl AdapterState {
     }
 
     /// Subscription ids implied by an account's stored routes: its inbox plus
-    /// one per group. Ids are derived from account/group/endpoint state, never
-    /// `since`, so the reconstructed ids match the ones recorded at subscribe
-    /// time. Empty for an account with no stored routes.
+    /// one per group.
+    ///
+    /// Ids are derived from account/group/endpoint state plus the activation
+    /// attempt stored alongside those routes — never `since`. `since` is not
+    /// recorded with the routes and could not be reconstructed here, which is
+    /// why it stays out of the id; the attempt is recorded, so it can. That
+    /// keeps the reconstructed ids byte-identical to the ones recorded at
+    /// subscribe time while still separating one attempt's REQs from the next
+    /// attempt's over the same routes. Empty for an account with no stored
+    /// routes.
     fn account_subscription_ids(&self, account_id: &MemberId) -> Vec<String> {
         let Some(routes) = self.accounts.get(account_id) else {
             return Vec::new();
@@ -1559,11 +1717,12 @@ impl AdapterState {
                     .map(|endpoint| endpoint.verbatim.clone())
                     .collect(),
                 None,
+                routes.attempt,
             )
             .subscription_id(),
         );
         for group in &routes.groups {
-            ids.push(group_subscription(account_id, group, None).subscription_id());
+            ids.push(group_subscription(account_id, group, None, routes.attempt).subscription_id());
         }
         ids
     }
@@ -1696,11 +1855,13 @@ fn account_inbox_subscription(
     account_id: &MemberId,
     endpoints: Vec<TransportEndpoint>,
     since: Option<Timestamp>,
+    attempt: SubscriptionAttempt,
 ) -> NostrSubscription {
     NostrSubscription::AccountInbox {
         account_id: account_id.clone(),
         endpoints,
         since,
+        attempt,
     }
 }
 
@@ -1708,6 +1869,7 @@ fn group_subscription(
     account_id: &MemberId,
     group: &TransportGroupSubscription,
     since: Option<Timestamp>,
+    attempt: SubscriptionAttempt,
 ) -> NostrSubscription {
     NostrSubscription::Group {
         account_id: account_id.clone(),
@@ -1715,6 +1877,22 @@ fn group_subscription(
         transport_group_id: group.transport_group_id.clone(),
         endpoints: group.endpoints.clone(),
         since,
+        attempt,
+    }
+}
+
+/// Route identity of a group subscription, independent of both the `since`
+/// floor and the issuing attempt. Route comparison spans activations, so it
+/// must not see either.
+fn group_route_key(
+    account_id: &MemberId,
+    group: &TransportGroupSubscription,
+) -> NostrSubscriptionRouteKey {
+    NostrSubscriptionRouteKey::Group {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: normalized_endpoints(&group.endpoints),
     }
 }
 
@@ -1723,23 +1901,24 @@ fn diff_group_subscriptions(
     current: &[TransportGroupSubscription],
     desired: &[TransportGroupSubscription],
     since: Option<Timestamp>,
+    attempt: SubscriptionAttempt,
 ) -> (Vec<NostrSubscription>, Vec<NostrSubscription>) {
     let current_subscriptions = current
         .iter()
-        .map(|group| group_subscription(account_id, group, None))
+        .map(|group| group_subscription(account_id, group, None, attempt))
         .collect::<Vec<_>>();
     let current_prior_keys = prior_group_route_keys(account_id, current);
     let desired_prior_keys = prior_group_route_keys(account_id, desired);
     let desired_subscriptions = desired
         .iter()
         .map(|group| {
-            let route_key = group_subscription(account_id, group, None).route_key();
+            let route_key = group_route_key(account_id, group);
             let since = if desired_prior_keys.contains(&route_key) {
                 None
             } else {
                 since
             };
-            group_subscription(account_id, group, since)
+            group_subscription(account_id, group, since, attempt)
         })
         .collect::<Vec<_>>();
     let current_keys = current_subscriptions
@@ -1780,7 +1959,7 @@ fn prior_group_route_keys(
     let mut prior_route_keys = HashSet::new();
     for group in groups {
         if !seen_groups.insert(group.group_id.clone()) {
-            prior_route_keys.insert(group_subscription(account_id, group, None).route_key());
+            prior_route_keys.insert(group_route_key(account_id, group));
         }
     }
     prior_route_keys
