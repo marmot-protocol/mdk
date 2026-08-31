@@ -38,11 +38,17 @@ impl Marmot {
     /// An own send commits and projects locally *before* it publishes, so a
     /// message sent while offline (or when the relay was unreachable) lands in
     /// the timeline with `source_message_id_hex == null` — committed, not yet
-    /// delivered. Re-sending the same text would mint a fresh commit and event
-    /// id, duplicating the bubble. This drives the existing pending commit to
-    /// the relays via convergence instead, so the original timeline row flips
-    /// to delivered (`source_message_id_hex == Some(..)`) on success and no new
-    /// event is created. Returns the delivery summary; `published == 0` means
+    /// delivered. Re-sending the same text mints a fresh commit, so it is the
+    /// wrong tool here: it either duplicates the bubble or — inside the same
+    /// second as the original, where the NIP-01 id collides — silently reuses
+    /// the same timeline row. This drives the existing pending commit to the
+    /// relays via convergence instead, so the original timeline row flips to
+    /// delivered (`source_message_id_hex == Some(..)`) on success and no new
+    /// event is created.
+    ///
+    /// (A resend after a send that *failed* is still safe and still supported:
+    /// the send path clears that row's `local_publish_failed` retraction before
+    /// re-recording it. This call is for sends that are pending, not failed.) Returns the delivery summary; `published == 0` means
     /// nothing was pending or publishing is still failing.
     pub async fn retry_group_convergence(
         &self,

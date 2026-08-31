@@ -12401,14 +12401,132 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
     );
 }
 
+/// A send that failed and is retried inside the same second must end delivered.
+///
+/// Inner app-event ids are NIP-01 hashes over
+/// (pubkey, created_at, kind, tags, content), and `created_at` is whole seconds
+/// (`unix_now_seconds`), with no nonce. So identical text resent inside the same
+/// second as a failed send is not a *similar* event — it is bit-for-bit the same
+/// event, under the same id, landing on the row the failure retracted. Hosts are
+/// told to do exactly this: `marmot-uniffi` prescribes an automatic retry for
+/// `StorageBusy` (milliseconds later) and a user resend for the rest.
+///
+/// `record_app_event`'s upsert keeps invalidation terminal, because it cannot
+/// tell this retry from a relay redelivery or a backfill replay. Left there, the
+/// second send publishes to the whole group while the sender's own row stays
+/// `Failed` forever — nothing else clears `invalidated`. The send intent is the
+/// missing evidence, so `record_send_intent_projection` clears the retraction.
+///
+/// The two sends are built at one fixed `created_at` rather than by sending
+/// twice through the relay harness: that is precisely what a same-second resend
+/// produces, and it pins the collision instead of racing a clock edge.
+#[tokio::test]
+async fn a_same_second_resend_revives_the_row_its_failed_send_retracted() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://same-second-resend.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("same second resend", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let sender = account.account_id_hex.clone();
+
+    let chat = || AppMessageIntent::Chat {
+        content: "resent inside the same second".to_owned(),
+    };
+    let first = build_inner_event(&chat(), &sender, 1_700_000_000).unwrap();
+    let resend = build_inner_event(&chat(), &sender, 1_700_000_000).unwrap();
+    assert_eq!(
+        first.id, resend.id,
+        "the premise: a same-second resend of identical text is the same event id"
+    );
+
+    let status = |app: &MarmotApp| {
+        app.timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|row| row.message_id_hex == first.id)
+        .map(|row| (row.invalidation_status, row.source_message_id_hex))
+    };
+
+    // The first send projects optimistically, then its publish fails and
+    // `retract_failed_local_projection` withdraws the row.
+    client
+        .record_send_intent_projection(&group_id, &sender, &first)
+        .unwrap();
+    app.invalidate_timeline_app_event(
+        "alice",
+        &group_id_hex,
+        &first.id,
+        crate::LOCAL_PUBLISH_FAILED_REASON,
+    )
+    .unwrap()
+    .expect("the failed send is retracted");
+    assert_eq!(
+        status(&app),
+        Some((Some("local_publish_failed".to_owned()), None)),
+        "control: the failed send renders as a failed, sourceless row"
+    );
+
+    // The resend: same id, so the optimistic record lands on the tombstone.
+    client
+        .record_send_intent_projection(&group_id, &sender, &resend)
+        .unwrap();
+    assert_eq!(
+        status(&app),
+        Some((None, None)),
+        "a fresh send intent revives its own retracted row to pending"
+    );
+
+    // This time the publish lands, and the post-publish record stamps the source.
+    client
+        .record_local_app_event_projection(
+            &group_id,
+            &sender,
+            &resend,
+            Some("published-source-id".to_owned()),
+            Some((
+                7,
+                crate::AppMessageRetentionDecision::new(1_700_000_000, 300),
+            )),
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(
+        status(&app),
+        Some((None, Some("published-source-id".to_owned()))),
+        "a message the group received must never keep rendering as Failed"
+    );
+}
+
 /// A batch that supersedes a commit must not leave that commit's kind-1210 row
 /// standing, whichever seam projects the batch.
 ///
 /// Both seams invalidate per event inside their projection loop and synthesize
 /// system rows once at the tail, so every `GroupStateInvalidated` in a batch has
-/// already been applied by the time the tail upserts. The storage upsert clears
-/// `invalidated` on conflict, so an unfiltered tail either revives a row the
-/// same batch just withdrew or creates one the batch never should have had.
+/// already been applied by the time the tail upserts. An unfiltered tail then
+/// creates a row the batch never should have had: with nothing to sweep, the
+/// upsert INSERTs a live row for a change that canonically never happened.
+///
+/// The shapes below pin both halves deliberately. Shape 1 is the filter's own
+/// job — storage cannot help when no row exists to preserve. Shape 2 is
+/// defence in depth: the filter withholds the upsert *and* storage would
+/// preserve the withdrawal if it ran, so the row stays dead even if one layer
+/// regresses.
 ///
 /// The engine reaches this by buffering two convergence passes into one batch:
 /// `events_buf` has a single take site, and
@@ -12538,7 +12656,9 @@ async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() 
     );
 
     // Shape 2 — the row already exists from an earlier batch. Here the sweep
-    // does withdraw it, and the tail's upsert would clear `invalidated` again.
+    // does withdraw it, and both layers must keep it withdrawn: the filter
+    // withholds the tail's upsert, and storage preserves the withdrawal even if
+    // the upsert did run.
     let synthesized = MessageId::new(vec![0xA1; 32]);
     client
         .observe_drained_session_events(&batch(vec![renamed(

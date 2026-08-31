@@ -297,8 +297,10 @@ const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-m
 /// Invalidation reason for a sent app event that will never reach anyone,
 /// whether it was refused at send time or its group turned terminal while the
 /// engine still held it. The derived-state SQL keys the app-facing `Failed`
-/// delivery state off this exact literal, so both producers must share it.
-pub(crate) const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
+/// delivery state off this exact literal, so both producers must share it —
+/// which is why storage owns the definition and this is a re-export rather than
+/// a second copy of the string.
+pub(crate) use storage_sqlite::LOCAL_PUBLISH_FAILED_REASON;
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
 const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
@@ -5269,6 +5271,32 @@ impl MarmotApp {
         let update = self
             .account_storage(label)?
             .invalidate_app_event_by_message_id(group_id_hex, message_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Clear a `local_publish_failed` retraction on one locally-sent row, so a
+    /// fresh send intent for an id a failed send already retracted starts from a
+    /// live pending row instead of a permanent tombstone.
+    ///
+    /// Inner app-event ids are NIP-01 hashes over
+    /// (pubkey, created_at, kind, tags, content) with second-granular
+    /// `created_at`, so a resend of identical text inside the same second as a
+    /// failed send reuses that send's id. `record_app_event`'s upsert keeps
+    /// invalidation terminal, so the revival has to be explicit and has to carry
+    /// evidence — and the send intent is the evidence. Only this path can
+    /// produce one: replay seams (`observe_drained_session_events`, backfill,
+    /// rejoin reprocessing) re-record rows without ever entering a send.
+    pub(crate) fn clear_timeline_local_publish_failure(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .clear_local_publish_failure(group_id_hex, message_id_hex)?;
         update
             .map(|update| self.app_projection_update(label, update))
             .transpose()

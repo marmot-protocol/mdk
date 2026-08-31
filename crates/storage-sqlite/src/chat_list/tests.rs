@@ -1234,10 +1234,9 @@ fn latest_preview_carries_exact_media_and_delivery_projection() {
     assert_eq!(failed.message_id_hex, "pending");
     assert_eq!(failed.delivery_state, ChatListMessageDeliveryState::Failed);
 
-    // Re-recording the same durable app event — relay redelivery, backfill
-    // replay, rejoin reprocessing — is not evidence that the send reached the
-    // group, so the preview stays failed. A send that does publish is finalized
-    // through `finalize_app_event_source_retention`, which never re-records.
+    // A bare re-record — relay redelivery, backfill replay, rejoin
+    // reprocessing — is not evidence that the send reached the group, so the
+    // preview stays failed.
     pending.source_message_id_hex = Some("source-after-replay".to_owned());
     store.record_app_event(&pending).unwrap();
     let replayed = store
@@ -1250,6 +1249,30 @@ fn latest_preview_carries_exact_media_and_delivery_projection() {
     assert_eq!(
         replayed.delivery_state,
         ChatListMessageDeliveryState::Failed
+    );
+
+    // A successful retry does clear it. A resend inside the same second mints
+    // the same NIP-01 id, so the send path re-records this very row — but only
+    // after `clear_local_publish_failure`, because the fresh send intent is the
+    // evidence the bare re-record above lacks. The chat row must transition that
+    // exact preview back to delivered rather than waiting for a different
+    // message to replace it.
+    store
+        .clear_local_publish_failure(GROUP, "pending")
+        .unwrap()
+        .expect("a retracted local send clears");
+    pending.source_message_id_hex = Some("source-after-retry".to_owned());
+    store.record_app_event(&pending).unwrap();
+    let retried = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row")
+        .last_message
+        .expect("retried preview");
+    assert_eq!(retried.message_id_hex, "pending");
+    assert_eq!(
+        retried.delivery_state,
+        ChatListMessageDeliveryState::Delivered
     );
 
     store

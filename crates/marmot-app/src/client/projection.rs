@@ -24,6 +24,42 @@ use crate::{
 use super::AppClient;
 
 impl AppClient {
+    /// Project a fresh send intent optimistically, before the publish is tried.
+    ///
+    /// Two things happen here, and the order matters. Inner app-event ids are
+    /// NIP-01 hashes over (pubkey, created_at, kind, tags, content) with
+    /// second-granular `created_at`, so a resend of identical text inside the
+    /// same second as a failed send mints that send's *exact* id — and lands on
+    /// the row `retract_failed_local_projection` tombstoned as
+    /// `local_publish_failed`. `record_app_event`'s upsert keeps invalidation
+    /// terminal by design (it cannot tell a retry from a relay redelivery, a
+    /// backfill replay, or a re-synthesized system row), so the retraction has
+    /// to be cleared explicitly first, and only where there is evidence to clear
+    /// it. A fresh send intent is that evidence: replay seams re-record rows
+    /// without ever reaching this function.
+    ///
+    /// Only the pre-publish projection clears. The post-publish one runs on a
+    /// row this call already revived, and anything that invalidated it *during*
+    /// the send — the terminal-group sweep, a convergence withdrawal — is a
+    /// verdict the send flow has no evidence to overturn.
+    ///
+    /// The clear's own projection update is dropped: the record below reprojects
+    /// the same row and returns that update, so forwarding both would emit the
+    /// same flip twice.
+    pub(crate) fn record_send_intent_projection(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        event: &MarmotInnerEvent,
+    ) -> Result<crate::AppProjectionUpdate, AppError> {
+        let _revived = self.app.clear_timeline_local_publish_failure(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            &event.id,
+        )?;
+        self.record_local_app_event_projection(group_id, sender, event, None, None, false)
+    }
+
     /// `advance_read_marker`: pre-publish projections must pass `false` so a
     /// failed publish never leaves the group read marker advanced past inbound
     /// unreads or pointing at an invalidated own message (#338); only the
@@ -732,10 +768,13 @@ impl AppClient {
     /// already dispatched each `GroupStateInvalidated` through
     /// [`MarmotApp::projection_update_for_invalidation_event`] — so by the time
     /// the upsert below runs, the batch's withdrawals are all applied and it
-    /// would be the last writer. The storage upsert clears `invalidated` on
-    /// conflict, so without this filter the tail either revives a row the batch
-    /// just tombstoned or synthesizes one for a change that canonically never
-    /// happened (the withdrawal swept a row that did not exist yet).
+    /// would be the last writer. Without this filter the tail synthesizes a row
+    /// for a change that canonically never happened: when no row existed yet,
+    /// the withdrawal swept nothing and the upsert INSERTs a *live* row.
+    ///
+    /// When the row does already exist, storage is the second line of defence —
+    /// its upsert preserves the withdrawal rather than clearing it — so that
+    /// shape is pinned at both layers by design, not by this filter alone.
     ///
     /// One batch carries both because the engine buffers convergence passes:
     /// `events_buf` has a single take site and
