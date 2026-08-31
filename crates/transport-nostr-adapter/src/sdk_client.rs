@@ -539,6 +539,9 @@ impl NostrSdkRelayClient {
                 account_id,
                 endpoints,
                 since,
+                // The issuing attempt reaches the wire through
+                // `subscription_id()` below; the filter does not carry it.
+                ..
             } => {
                 let pubkey = member_id_to_pubkey(account_id, "account inbox subscription")?;
                 let mut filter = Filter::new().kind(Kind::GiftWrap).pubkey(pubkey);
@@ -559,6 +562,7 @@ impl NostrSdkRelayClient {
                 transport_group_id,
                 endpoints,
                 since,
+                ..
             } => {
                 let h_tag = hex::encode(transport_group_id);
                 let mut filter = Filter::new()
@@ -1565,7 +1569,7 @@ fn relay_rejection_endpoint_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NostrKeyPackagePublication;
+    use crate::{NostrKeyPackagePublication, SubscriptionAttempt};
     use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
     use futures::{SinkExt, StreamExt};
@@ -1835,6 +1839,7 @@ mod tests {
             transport_group_id: transport_group_id.clone(),
             endpoints: vec![endpoint.clone()],
             since: Some(Timestamp(1_700_000_000)),
+            attempt: SubscriptionAttempt::INITIAL,
         };
         let expected_subscription_id = SubscriptionId::new(subscription.subscription_id());
         let plan = NostrSdkRelayClient::plan_subscription(&subscription).expect("plan");
@@ -2031,6 +2036,7 @@ mod tests {
             account_id: account_id.clone(),
             endpoints: vec![endpoint.clone()],
             since: None,
+            attempt: SubscriptionAttempt::INITIAL,
         };
         let expected_subscription_id = SubscriptionId::new(subscription.subscription_id());
         let plan = NostrSdkRelayClient::plan_subscription(&subscription).expect("plan");
@@ -2063,6 +2069,7 @@ mod tests {
             transport_group_id: transport_group_id.clone(),
             endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
             since: None,
+            attempt: SubscriptionAttempt::INITIAL,
         })
         .expect("first plan");
         let second = NostrSdkRelayClient::plan_subscription(&NostrSubscription::Group {
@@ -2071,6 +2078,7 @@ mod tests {
             transport_group_id,
             endpoints: vec![endpoint_b, endpoint_a],
             since: None,
+            attempt: SubscriptionAttempt::INITIAL,
         })
         .expect("second plan");
 
@@ -2957,6 +2965,7 @@ mod tests {
             transport_group_id: vec![0xC3; 32],
             endpoints: vec![TransportEndpoint("not a relay url".into())],
             since: None,
+            attempt: SubscriptionAttempt::INITIAL,
         })
         .unwrap_err();
 

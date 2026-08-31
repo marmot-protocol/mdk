@@ -232,6 +232,16 @@ struct FakeRelayClient {
     published: Mutex<Vec<(Vec<TransportEndpoint>, NostrTransportEvent, usize)>>,
 }
 
+impl FakeRelayClient {
+    /// Subscriptions the adapter has actually put on the wire since the last
+    /// call, in issue order. Tests read issued ids from here rather than
+    /// re-deriving them from route state, because a subscription id is scoped
+    /// to the activation attempt that issued it.
+    fn take_issued_subscriptions(&self) -> Vec<NostrSubscription> {
+        self.subscriptions.lock().unwrap().drain(..).collect()
+    }
+}
+
 #[async_trait]
 impl NostrRelayClient for FakeRelayClient {
     async fn subscribe(
@@ -631,6 +641,7 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
         since: None,
+        attempt: adapter.account_subscription_attempt(&alice).await,
     }
     .subscription_id();
     let bob_subscription_id = NostrSubscription::Group {
@@ -639,6 +650,7 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
         since: None,
+        attempt: adapter.account_subscription_attempt(&bob).await,
     }
     .subscription_id();
 
@@ -1077,12 +1089,14 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
         .await
         .expect("group sync succeeds");
 
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
     let old_subscription_id = NostrSubscription::Group {
         account_id: account_id.clone(),
         group_id: group_id.clone(),
         transport_group_id: old_transport_group_id,
         endpoints: vec![endpoint.clone()],
         since: None,
+        attempt,
     }
     .subscription_id();
     let new_subscription_id = NostrSubscription::Group {
@@ -1091,6 +1105,7 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
         transport_group_id: new_transport_group_id,
         endpoints: vec![endpoint],
         since: None,
+        attempt,
     }
     .subscription_id();
     assert_eq!(relay.replayed_deliveries.load(Ordering::SeqCst), 2);
@@ -1153,6 +1168,7 @@ async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
         transport_group_id: old_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
         since: None,
+        attempt: adapter.account_subscription_attempt(&account_id).await,
     }
     .subscription_id();
     adapter
@@ -1253,6 +1269,7 @@ async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
         transport_group_id: new_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
         since: None,
+        attempt: adapter.account_subscription_attempt(&account_id).await,
     }
     .subscription_id();
 
@@ -1346,23 +1363,6 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
         transport_group_id: vec![0xC3; 32],
         endpoints: vec![endpoint.clone()],
     };
-    let synced_old_subscription_id = NostrSubscription::Group {
-        account_id: account_id.clone(),
-        group_id: synced_group_id.clone(),
-        transport_group_id: synced_old.transport_group_id.clone(),
-        endpoints: vec![endpoint.clone()],
-        since: None,
-    }
-    .subscription_id();
-    let unsynced_old_subscription_id = NostrSubscription::Group {
-        account_id: account_id.clone(),
-        group_id: unsynced_group_id.clone(),
-        transport_group_id: unsynced_old.transport_group_id.clone(),
-        endpoints: vec![endpoint.clone()],
-        since: None,
-    }
-    .subscription_id();
-
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
@@ -1372,6 +1372,25 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
         })
         .await
         .expect("activation succeeds");
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
+    let synced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: synced_group_id.clone(),
+        transport_group_id: synced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+        attempt,
+    }
+    .subscription_id();
+    let unsynced_old_subscription_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: unsynced_group_id.clone(),
+        transport_group_id: unsynced_old.transport_group_id.clone(),
+        endpoints: vec![endpoint.clone()],
+        since: None,
+        attempt,
+    }
+    .subscription_id();
     adapter
         .handle_relay_eose(endpoint.clone(), synced_old_subscription_id.clone())
         .await;
@@ -1691,13 +1710,16 @@ async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
         .await
         .expect("activation succeeds");
 
-    // Reconstruct the group subscription id the adapter issued.
+    // Reconstruct the group subscription id the adapter issued, stamped with
+    // the attempt that issued it.
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
     let sub_id = NostrSubscription::Group {
         account_id,
         group_id,
         transport_group_id: transport_group_id.clone(),
         endpoints: vec![endpoint_a.clone(), endpoint_b.clone()],
         since: None,
+        attempt,
     }
     .subscription_id();
 
@@ -1790,6 +1812,9 @@ async fn synced_group_subscriptions_replace_old_routes() {
     let delivery = adapter.receive().await.unwrap().unwrap();
     assert_eq!(delivery.group_id_hint, Some(new_group_id));
 
+    let attempt = adapter
+        .account_subscription_attempt(&MemberId::new(vec![0xA1; 32]))
+        .await;
     let unsubscribed = relay.unsubscribed.lock().unwrap();
     assert_eq!(
         unsubscribed.as_slice(),
@@ -1799,6 +1824,7 @@ async fn synced_group_subscriptions_replace_old_routes() {
             transport_group_id: old_transport_group_id,
             endpoints: vec![TransportEndpoint("wss://group.example".into())],
             since: None,
+            attempt,
         }]
     );
 }
@@ -1918,6 +1944,9 @@ async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_o
         .await
         .expect("route rotation sync succeeds");
 
+    // A sync amends the live activation rather than opening a new attempt, so
+    // the re-issued routes carry the activation's own attempt.
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
     let issued_after_rotation = relay
         .subscriptions
         .lock()
@@ -1935,6 +1964,7 @@ async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_o
                 transport_group_id: route_b.transport_group_id.clone(),
                 endpoints: route_b.endpoints.clone(),
                 since,
+                attempt,
             },
             NostrSubscription::Group {
                 account_id: account_id.clone(),
@@ -1942,6 +1972,7 @@ async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_o
                 transport_group_id: route_a.transport_group_id.clone(),
                 endpoints: route_a.endpoints.clone(),
                 since: None,
+                attempt,
             },
         ],
         "the new current route is bounded while the displaced route is reissued without a cursor"
@@ -2079,6 +2110,7 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
         .await
         .expect("retry sync succeeds");
 
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
     {
         let unsubscribed = relay.unsubscribed.lock().unwrap();
         assert_eq!(
@@ -2089,6 +2121,7 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
                 transport_group_id: old_transport_group_id,
                 endpoints: vec![endpoint],
                 since: None,
+                attempt,
             }],
             "the failed unsubscribe is replayed exactly once"
         );
@@ -2124,22 +2157,26 @@ async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
         transport_group_id: new_transport_group_id.clone(),
         endpoints: vec![endpoint.clone()],
     };
-    let expected_unsubscribes = [
-        NostrSubscription::Group {
-            account_id: account_id.clone(),
-            group_id: old_group_a.group_id.clone(),
-            transport_group_id: old_group_a.transport_group_id.clone(),
-            endpoints: old_group_a.endpoints.clone(),
-            since: None,
-        },
-        NostrSubscription::Group {
-            account_id: account_id.clone(),
-            group_id: old_group_b.group_id.clone(),
-            transport_group_id: old_group_b.transport_group_id.clone(),
-            endpoints: old_group_b.endpoints.clone(),
-            since: None,
-        },
-    ];
+    let expected_unsubscribes = |attempt| {
+        [
+            NostrSubscription::Group {
+                account_id: account_id.clone(),
+                group_id: old_group_a.group_id.clone(),
+                transport_group_id: old_group_a.transport_group_id.clone(),
+                endpoints: old_group_a.endpoints.clone(),
+                since: None,
+                attempt,
+            },
+            NostrSubscription::Group {
+                account_id: account_id.clone(),
+                group_id: old_group_b.group_id.clone(),
+                transport_group_id: old_group_b.transport_group_id.clone(),
+                endpoints: old_group_b.endpoints.clone(),
+                since: None,
+                attempt,
+            },
+        ]
+    };
 
     adapter
         .activate_account(TransportAccountActivation {
@@ -2234,11 +2271,12 @@ async fn cancelled_sync_drain_retries_unsubscribe_and_metrics_converge() {
     .expect("retry sync must complete before timeout")
     .expect("retry sync succeeds");
 
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
     {
         let unsubscribed = relay.unsubscribed.lock().unwrap();
         assert_eq!(
             unsubscribed.as_slice(),
-            &expected_unsubscribes,
+            &expected_unsubscribes(attempt),
             "both old subscription teardowns are recorded exactly once in vector order"
         );
     }
@@ -2915,6 +2953,7 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
         transport_group_id: vec![1; 32],
         endpoints: vec![TransportEndpoint("wss://relay-1.example".into())],
         since: None,
+        attempt: adapter.account_subscription_attempt(&account_id).await,
     }
     .subscription_id();
     assert_eq!(adapter.subscription_synced(&stale_group_id).await, None);
@@ -2959,19 +2998,25 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
         endpoints: vec![TransportEndpoint(format!("wss://group-{index}.example"))],
     };
     let group_endpoint = |index: u8| TransportEndpoint(format!("wss://group-{index}.example"));
-    let inbox_id = NostrSubscription::AccountInbox {
-        account_id: account_id.clone(),
-        endpoints: vec![inbox.clone()],
-        since: None,
-    }
-    .subscription_id();
-    let group_id_for = |index: u8| {
+    // Ids are scoped to the activation attempt that issued them, so both
+    // reconstructions take the attempt they belong to.
+    let inbox_id = |attempt| {
+        NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: vec![inbox.clone()],
+            since: None,
+            attempt,
+        }
+        .subscription_id()
+    };
+    let group_id_for = |index: u8, attempt| {
         NostrSubscription::Group {
             account_id: account_id.clone(),
             group_id: cgka_traits::GroupId::new(vec![index; 32]),
             transport_group_id: vec![index; 32],
             endpoints: vec![group_endpoint(index)],
             since: None,
+            attempt,
         }
         .subscription_id()
     };
@@ -2985,13 +3030,14 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
     };
 
     activate(group_for(1)).await.expect("activation succeeds");
+    let first = adapter.account_subscription_attempt(&account_id).await;
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert_eq!(progress.subscriptions, 2);
     assert!(!progress.any(), "no relay has reported yet");
     assert!(!progress.complete());
 
     adapter
-        .handle_relay_eose(inbox.clone(), inbox_id.clone())
+        .handle_relay_eose(inbox.clone(), inbox_id(first))
         .await;
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert!(progress.any());
@@ -3001,7 +3047,7 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
     );
 
     adapter
-        .handle_relay_eose(group_endpoint(1), group_id_for(1))
+        .handle_relay_eose(group_endpoint(1), group_id_for(1, first))
         .await;
     assert!(
         adapter
@@ -3015,6 +3061,8 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
     // must be evicted rather than left tracked, and both re-issued ids must be
     // confirmed again.
     activate(group_for(2)).await.expect("reactivation succeeds");
+    let second = adapter.account_subscription_attempt(&account_id).await;
+    assert_ne!(first, second, "reactivation opens a new attempt");
     assert_eq!(
         adapter.relay_sync().await.tracked_subscriptions,
         2,
@@ -3027,19 +3075,28 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
         "a re-issued subscription must be confirmed again"
     );
 
-    // A report for the retired route cannot stand in for the live one.
+    // A report for the retired route cannot stand in for the live one, and
+    // neither can the superseded attempt's report for a route that survived.
     adapter
-        .handle_relay_eose(group_endpoint(1), group_id_for(1))
+        .handle_relay_eose(group_endpoint(1), group_id_for(1, second))
         .await;
     adapter
-        .handle_relay_eose(inbox.clone(), inbox_id.clone())
+        .handle_relay_eose(inbox.clone(), inbox_id(first))
+        .await;
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(
+        progress.with_eose, 0,
+        "neither the retired route nor the superseded attempt may count"
+    );
+    adapter
+        .handle_relay_eose(inbox.clone(), inbox_id(second))
         .await;
     let progress = adapter.account_subscription_eose(&account_id).await;
     assert_eq!(progress.with_eose, 1, "the retired route must not count");
     assert!(!progress.complete());
 
     adapter
-        .handle_relay_eose(group_endpoint(2), group_id_for(2))
+        .handle_relay_eose(group_endpoint(2), group_id_for(2, second))
         .await;
     assert!(
         adapter
@@ -3089,21 +3146,6 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         transport_group_id: vec![0x44; 32],
         endpoints: vec![group_a.clone(), group_b.clone()],
     };
-    let inbox_id = NostrSubscription::AccountInbox {
-        account_id: account_id.clone(),
-        endpoints: vec![inbox_a.clone(), inbox_b.clone()],
-        since: None,
-    }
-    .subscription_id();
-    let group_id = NostrSubscription::Group {
-        account_id: account_id.clone(),
-        group_id: group.group_id.clone(),
-        transport_group_id: group.transport_group_id.clone(),
-        endpoints: group.endpoints.clone(),
-        since: None,
-    }
-    .subscription_id();
-
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
@@ -3113,6 +3155,23 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         })
         .await
         .expect("activation succeeds");
+    let attempt = adapter.account_subscription_attempt(&account_id).await;
+    let inbox_id = NostrSubscription::AccountInbox {
+        account_id: account_id.clone(),
+        endpoints: vec![inbox_a.clone(), inbox_b.clone()],
+        since: None,
+        attempt,
+    }
+    .subscription_id();
+    let group_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: group.endpoints.clone(),
+        since: None,
+        attempt,
+    }
+    .subscription_id();
 
     // Relay A is fast but empty. Its EOSE covers neither subscription on B.
     adapter
@@ -3189,6 +3248,8 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         transport_group_id: shrunk_group.transport_group_id,
         endpoints: shrunk_group.endpoints,
         since: None,
+        // A sync does not open a new attempt.
+        attempt,
     }
     .subscription_id();
     adapter.handle_relay_eose(group_a, shrunk_group_id).await;
@@ -3208,6 +3269,114 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
             .complete(),
         "the frozen snapshot completes once B serves its relevant EOSE"
     );
+}
+
+/// A superseded activation's end-of-stored-events report must not satisfy the
+/// replay gate the next activation opened.
+///
+/// Reactivation tears the previous REQs down, zeroes the account's replay
+/// coverage, and re-issues. A relay's EOSE for a torn-down attempt can still be
+/// in flight and land after that reset. It answered a different REQ — here the
+/// `since`-floored live subscription, superseded by an unfloored history replay
+/// over the same routes — so it is no evidence that the replay reached the end
+/// of the relay's stored history.
+#[tokio::test]
+async fn superseded_activation_eose_does_not_satisfy_the_replay_gate() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone() as Arc<dyn NostrRelayClient>);
+    let account_id = MemberId::new(vec![0xD4; 32]);
+    let inbox = TransportEndpoint("wss://inbox.example".to_owned());
+    let group_endpoint = TransportEndpoint("wss://group.example".to_owned());
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0x55; 16]),
+        transport_group_id: vec![0x66; 32],
+        endpoints: vec![group_endpoint.clone()],
+    };
+    let activate = |since: Option<Timestamp>| {
+        adapter.activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![inbox.clone()],
+            group_subscriptions: vec![group.clone()],
+            since,
+        })
+    };
+
+    activate(Some(Timestamp(1_700_000_000)))
+        .await
+        .expect("floored activation succeeds");
+    let superseded = relay.take_issued_subscriptions();
+    assert!(
+        superseded
+            .iter()
+            .all(|subscription| subscription_since(subscription).is_some()),
+        "the superseded attempt must be the floored one"
+    );
+
+    activate(None).await.expect("unfloored replay succeeds");
+    let replay = relay.take_issued_subscriptions();
+    assert!(
+        replay
+            .iter()
+            .all(|subscription| subscription_since(subscription).is_none()),
+        "the replay attempt must be unfloored"
+    );
+
+    assert!(
+        superseded
+            .iter()
+            .zip(&replay)
+            .all(|(old, new)| old.attempt() != new.attempt()),
+        "reactivation must re-issue under a new attempt"
+    );
+
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(progress.subscriptions, 2);
+    assert!(!progress.any(), "the replay has not been served yet");
+
+    // The superseded attempt's buffered EOSEs are delivered after the reset.
+    for subscription in &superseded {
+        adapter
+            .handle_relay_eose(
+                subscription.endpoints()[0].clone(),
+                subscription.subscription_id(),
+            )
+            .await;
+    }
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert!(
+        !progress.any(),
+        "an EOSE answering the superseded REQ is not replay evidence"
+    );
+    assert!(
+        !progress.complete(),
+        "a stale EOSE must not complete the unfloored replay gate"
+    );
+
+    // The live attempt's own reports still complete the gate.
+    for subscription in &replay {
+        adapter
+            .handle_relay_eose(
+                subscription.endpoints()[0].clone(),
+                subscription.subscription_id(),
+            )
+            .await;
+    }
+    assert!(
+        adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete(),
+        "the replay attempt's own EOSEs complete its coverage"
+    );
+}
+
+fn subscription_since(subscription: &NostrSubscription) -> Option<Timestamp> {
+    match subscription {
+        NostrSubscription::AccountInbox { since, .. } | NostrSubscription::Group { since, .. } => {
+            *since
+        }
+        NostrSubscription::GroupMaintenance { .. } => None,
+    }
 }
 
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {

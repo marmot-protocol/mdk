@@ -32,6 +32,11 @@ for reconnect/backoff and relay status mechanics.
 - Keep Nostr event DTO conversion delegated to `transport-nostr-peeler`.
 - Keep `TransportDeliverySource` metadata diagnostic only; do not feed it into consensus decisions.
 - Preserve account-scoped deliveries even when group subscriptions share relay endpoints.
+- Keep account-inbox and group subscription ids scoped to the activation attempt that issued them
+  (`SubscriptionAttempt`, stored on the account's routes). A relay reports end-of-stored-events by subscription id and
+  nothing else, so a shared id would let a superseded attempt's in-flight EOSE satisfy the replay-coverage gate the next
+  activation just reset. Ids stay derived from account/group/endpoint state plus the attempt, never from `since`, which
+  is not recorded with the routes and so could not be reconstructed at eviction time.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
