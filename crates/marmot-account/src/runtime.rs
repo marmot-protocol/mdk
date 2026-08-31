@@ -2022,10 +2022,17 @@ where
         let (mut output, blocked_groups) = self
             .resume_outbound_fanouts_for_group(Some(group_id))
             .await?;
-        if blocked_groups.contains(group_id) {
-            return Ok(output);
-        }
-        let effects = self.session.advance_convergence(group_id).await?;
+        // An older deferred transport fanout blocks only newly queued
+        // outbound intents. Convergence inputs must still settle: otherwise a
+        // permanently unavailable relay can wedge epoch progression and fork
+        // healing forever. Any protocol effects produced by settlement remain
+        // observable while the queued-intent drain stays ordered behind the
+        // frozen fanout.
+        let effects = if blocked_groups.contains(group_id) {
+            self.session.advance_convergence_inputs(group_id).await?
+        } else {
+            self.session.advance_convergence(group_id).await?
+        };
         output.extend(self.publish_session_effects(effects).await?);
         Ok(output)
     }

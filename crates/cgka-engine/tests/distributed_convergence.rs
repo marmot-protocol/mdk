@@ -4427,6 +4427,13 @@ async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
         .await
         .expect("durable halt pauses queued drain");
     assert!(drained.is_empty());
+    assert!(
+        !alice
+            .advance_convergence_inputs(&group_id)
+            .await
+            .expect("durable halt also pauses convergence-only advance"),
+        "a durable unrecoverable halt must gate the narrower convergence path"
+    );
     assert_eq!(
         storage
             .list_queued_outbound_intents(&group_id)

@@ -663,32 +663,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<Vec<SendResult>, EngineError> {
-        // Draining a seeded-but-unhydrated group promotes it first
-        // (mdk#1161); a hydration failure quarantines it and the gate below
-        // reports UnknownGroup.
-        let _ = self.ensure_hydrated(group_id);
-        // Quarantined groups vanish from every live surface; convergence and
-        // queued-intent drains must not touch their state (mdk#364).
-        self.ensure_group_live(group_id)?;
-        // A drain can be invoked directly without session-open hydration.
-        // Synchronize the durable halt before convergence or queued work can
-        // run so restart never bypasses `Unrecoverable`.
-        if self.sync_unrecoverable_halt_from_storage(group_id)? {
-            return Ok(Vec::new());
-        }
-        // Terminal: a removed copy must never publish, and the removed-copy
-        // gate in `do_send_ready` would turn every queued record into a
-        // permanent drain error that the app retries forever. Discard the
-        // queue and report nothing to drain. This is the defense-in-depth
-        // side; the marker sites (realization, commit-apply seam, convergence
-        // reorg) also purge at the moment the copy becomes removed.
-        if self.group_record_is_removed(group_id)? {
-            self.discard_queued_outbound_intents_for_removed_group(group_id)?;
-            return Ok(Vec::new());
-        }
-        if let Some(state) = self.epoch_manager.state(group_id)
-            && !matches!(state, EpochState::Stable { .. })
-        {
+        if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
         }
 
@@ -809,6 +784,41 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(drained)
+    }
+
+    fn prepare_convergence_input_advance(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        // Advancing a seeded-but-unhydrated group promotes it first
+        // (mdk#1161); a hydration failure quarantines it and the gate below
+        // reports UnknownGroup.
+        let _ = self.ensure_hydrated(group_id);
+        // Quarantined groups vanish from every live surface; convergence and
+        // queued-intent drains must not touch their state (mdk#364).
+        self.ensure_group_live(group_id)?;
+        // An advance can be invoked directly without session-open hydration.
+        // Synchronize the durable halt before convergence or queued work can
+        // run so restart never bypasses `Unrecoverable`.
+        if self.sync_unrecoverable_halt_from_storage(group_id)? {
+            return Ok(false);
+        }
+        // Terminal: a removed copy must never publish, and the removed-copy
+        // gate in `do_send_ready` would turn every queued record into a
+        // permanent drain error that the app retries forever. Discard the
+        // queue and report nothing to drain. This is the defense-in-depth
+        // side; the marker sites (realization, commit-apply seam, convergence
+        // reorg) also purge at the moment the copy becomes removed.
+        if self.group_record_is_removed(group_id)? {
+            self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+            return Ok(false);
+        }
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     async fn run_drain_maintenance(
@@ -1091,6 +1101,23 @@ impl<S: StorageProvider> Engine<S> {
     /// opaque transport bytes do not participate in canonicalization until a
     /// selected branch gives the peeler the epoch context needed to unwrap
     /// them.
+    pub async fn advance_convergence_inputs(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if !self.prepare_convergence_input_advance(group_id)? {
+            return Ok(false);
+        }
+        let now_ms = self.convergence_now_ms();
+        self.advance_convergence_inputs_until_settled(group_id, now_ms)
+            .await
+    }
+
+    /// Drive stored OpenMLS inputs to stability at an explicit monotonic time.
+    ///
+    /// This lower-level form is used by deterministic harnesses. Hosts should
+    /// normally call [`Self::advance_convergence_inputs`] so the engine owns
+    /// the convergence clock.
     pub async fn advance_convergence_inputs_until_settled(
         &mut self,
         group_id: &GroupId,

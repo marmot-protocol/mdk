@@ -1522,10 +1522,25 @@ async fn drain_on_removed_copy_discards_queued_intents_without_error() {
         "realization must discard queued outbound intents"
     );
 
-    // Drain-side defense in depth: an intent queued after the copy is already
-    // marked removed (any ordering the marker-site purges missed) is
-    // discarded by the drain itself — no error, nothing drained, queue empty.
+    // Convergence-only defense in depth: an intent queued after the copy is
+    // already marked removed (any ordering the marker-site purges missed) is
+    // discarded before protocol settlement can touch the removed copy.
     queue_app_message_intent(&bob_storage, &bob, &group_id, 0x53);
+    assert!(
+        !bob.advance_convergence_inputs(&group_id)
+            .await
+            .expect("convergence-only advance on a removed copy must not error")
+    );
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "convergence-only advance must discard queued intents for a removed copy"
+    );
+
+    // The ordinary drain retains the same defense.
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x54);
     let drained = bob
         .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
         .await

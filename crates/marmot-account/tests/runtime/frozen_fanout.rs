@@ -455,15 +455,17 @@ async fn queued_app_message_with_missing_route_remains_retryable() {
 }
 
 #[tokio::test]
-async fn deferred_fanout_blocks_newer_same_group_fanouts_and_convergence_work() {
+async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
     let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
     let created = alice
         .create_group(CreateGroupRequest {
             name: "ordered fanout".into(),
             description: String::new(),
-            members: Vec::new(),
+            members: vec![bob_key_package],
             required_features: Vec::new(),
             app_components: Vec::new(),
             initial_admins: Vec::new(),
@@ -471,11 +473,31 @@ async fn deferred_fanout_blocks_newer_same_group_fanouts_and_convergence_work() 
         .await
         .unwrap();
     let group_id = created.group_id;
-    let pending = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { pending, .. } => *pending,
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
         other => panic!("expected GroupCreated publish work, got {other:?}"),
     };
     alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let bob_update = bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (commit, update_pending) = match &bob_update.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    bob.confirm_published(update_pending).await.unwrap();
+    let buffered = alice.ingest(commit).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    assert!(alice.has_pending_convergence_inputs(&group_id).unwrap());
+
     let sender_hex = hex::encode(alice.self_id().as_slice());
     alice
         .queue_app_message_with_audit_context(
@@ -542,10 +564,16 @@ async fn deferred_fanout_blocks_newer_same_group_fanouts_and_convergence_work() 
         Arc::new(TestRandom::new(0)),
     );
 
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
     let effects = runtime.advance_convergence(&group_id).await.unwrap();
 
     assert!(effects.reports.is_empty());
     assert!(adapter.publishes().is_empty());
+    assert!(
+        !runtime.has_pending_convergence_inputs(&group_id).unwrap(),
+        "the older transport fanout must not wedge convergence settlement"
+    );
     assert_eq!(
         runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
         Some(30_000),
@@ -563,7 +591,7 @@ async fn deferred_fanout_blocks_newer_same_group_fanouts_and_convergence_work() 
     );
     assert!(
         runtime.has_queued_outbound_intents(&group_id).unwrap(),
-        "newer queued convergence work must remain behind the older durable fanout"
+        "newer queued outbound work must remain behind the older durable fanout"
     );
 }
 

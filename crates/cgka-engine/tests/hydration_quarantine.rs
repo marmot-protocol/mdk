@@ -1310,6 +1310,10 @@ async fn quarantined_group_blocks_convergence_and_send() {
             .await,
         Err(EngineError::UnknownGroup(id)) if id == group_id
     ));
+    assert!(matches!(
+        alice.advance_convergence_inputs(&group_id).await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
 
     let result = alice
         .converge_stored_openmls_messages_at(&group_id, 1_000_000)

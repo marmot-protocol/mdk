@@ -997,6 +997,32 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(results))
     }
 
+    /// Settle retained convergence inputs without draining queued outbound
+    /// intents.
+    ///
+    /// A host uses this narrower operation when an older durable transport
+    /// fanout still blocks newer user-authored sends. Protocol settlement,
+    /// epoch progression, and fork healing remain live while queued work stays
+    /// behind the fanout ordering barrier.
+    pub async fn advance_convergence_inputs(
+        &mut self,
+        group_id: &GroupId,
+    ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "advance_convergence_inputs",
+            "advancing convergence inputs without draining queued outbound intents"
+        );
+        let settled = self.engine.advance_convergence_inputs(group_id).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "advance_convergence_inputs",
+            settled,
+            "convergence inputs advanced"
+        );
+        Ok(self.collect_effects(Vec::new()))
+    }
+
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
