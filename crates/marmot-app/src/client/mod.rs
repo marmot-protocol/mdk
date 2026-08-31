@@ -346,6 +346,10 @@ pub struct AppClient {
     /// acknowledged on the durable engine-to-app outbox. The acknowledgement is
     /// committed with the account projection and any frontier clear.
     pub(crate) pending_application_event_acks: HashSet<MessageId>,
+    /// One-shot test-policy fault at the projection/fanout cleanup boundary.
+    /// Kept on the client rather than re-reading config so the first failure
+    /// leaves the autonomous retry free to succeed.
+    pub(crate) fail_next_published_app_message_acknowledgement: bool,
     /// A live ingest changed the in-memory transport routing table after its
     /// durable projection was committed. The account worker publishes the
     /// resulting app summary before it asks the relay plane to rebuild its
@@ -3008,7 +3012,7 @@ impl AppClient {
             }
         };
         if let Err(publish_err) = self
-            .observe_recovery_evidence_then_gate_send_publish(&effects)
+            .observe_recovery_evidence_then_gate_send_publish(&effects, group_id, &app_event_id)
             .await
         {
             self.retract_failed_local_projection(
@@ -3092,23 +3096,71 @@ impl AppClient {
         ))
     }
 
-    /// Apply the publish gate to a completed send's effects — observing the same
-    /// batch's epoch-gap recovery evidence first — and, when the gate fails,
-    /// broadcast the peer commits the send folded before the caller surfaces the
-    /// error.
+    /// Apply the publish gate to one completed application send's effects —
+    /// observing the same batch's epoch-gap recovery evidence first — and,
+    /// when that send failed, broadcast peer commits the batch folded before
+    /// the caller surfaces the error.
     ///
     /// Split out of `send_app_event_with_local_projection` so the ordering is
-    /// exercisable against a given batch of effects. The caller keeps the
-    /// local-projection retraction, which needs that send's own locals.
+    /// exercisable against a given batch of effects. An aggregate effects batch
+    /// can contain an accepted or retained current send plus an unrelated
+    /// sibling failure; that sibling must not retract an already-delivered row.
+    /// The caller keeps the local-projection retraction, which needs the send's
+    /// own locals.
     pub(crate) async fn observe_recovery_evidence_then_gate_send_publish(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
+        group_id: &GroupId,
+        app_event_id: &str,
     ) -> Result<(), AppError> {
-        let publish_err = match self.observe_recovery_evidence_then_fail_if_publish_failed(effects)
+        self.observe_recovery_evidence(effects);
+        self.remember_pending_convergence_groups(effects);
+        match self
+            .invalidate_failed_app_message_projections(effects, Some((group_id, app_event_id)))
         {
+            Ok(failed_updates) => self.pending_projection_updates.extend(failed_updates),
+            Err(error) => {
+                // A sibling projection failure must not retract the current
+                // send when its own fanout was accepted or retained.
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_kind = error.privacy_safe_kind(),
+                    "failed to invalidate a terminally failed sibling from a send batch"
+                );
+            }
+        }
+        let current_send_is_retained =
+            effects.published_app_messages.iter().any(|published| {
+                published.group_id == *group_id && published.app_event_id == app_event_id
+            }) || effects.unresolved_app_messages.iter().any(|unresolved| {
+                unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
+            });
+        if current_send_is_retained {
+            return Ok(());
+        }
+        let publish_err = match fail_if_publish_failed(effects) {
             Ok(()) => return Ok(()),
             Err(publish_err) => publish_err,
         };
+        // This send failed, but the aggregate batch can still contain a
+        // successfully published sibling. Finalize and broadcast that sibling
+        // before returning the current send's error; otherwise its durable row
+        // remains visibly pending until an unrelated recovery pass. Keep this
+        // best-effort so projection trouble cannot mask the primary publish
+        // failure.
+        self.remember_published_reports(effects);
+        match self.finalize_published_app_message_source_retention(effects) {
+            Ok(updates) => self.pending_projection_updates.extend(updates),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_kind = error.privacy_safe_kind(),
+                    "failed to finalize a successful sibling from a failed send batch"
+                );
+            }
+        }
         // The send itself failed to reach anyone, but any peer commits it
         // folded are durably applied — broadcast them before surfacing the
         // publish failure, best-effort so a projection error cannot mask
@@ -3830,7 +3882,6 @@ impl AppClient {
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
         self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
         // finalize updates carry the pending -> delivered flip for each of them.
@@ -3841,6 +3892,12 @@ impl AppClient {
         // every timeline and chat-list subscriber still shows pending.
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         self.pending_projection_updates.extend(finalize_updates);
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
+        self.pending_projection_updates.extend(failed_updates);
+        // A manual retry can complete one frozen fanout while another publish
+        // in the same convergence batch fails. Finalize that success before
+        // surfacing the unrelated failure because its fanout is already gone.
+        fail_if_publish_failed(effects)?;
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;

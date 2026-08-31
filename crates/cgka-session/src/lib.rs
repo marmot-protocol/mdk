@@ -997,6 +997,35 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(results))
     }
 
+    /// Settle retained convergence inputs without draining queued outbound
+    /// intents.
+    ///
+    /// A host uses this narrower operation when an older durable transport
+    /// fanout still blocks newer user-authored sends. Protocol settlement,
+    /// epoch progression, and fork healing remain live while queued outbound
+    /// intents, pending disband work, and drain maintenance (including a due
+    /// self-remove auto-commit) stay behind the fanout ordering barrier. That
+    /// deferral can remain unbounded while the oldest fanout has an outstanding
+    /// target.
+    pub async fn advance_convergence_inputs(
+        &mut self,
+        group_id: &GroupId,
+    ) -> SessionResult<SessionEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "advance_convergence_inputs",
+            "advancing convergence inputs without draining queued outbound intents"
+        );
+        let settled = self.engine.advance_convergence_inputs(group_id).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "advance_convergence_inputs",
+            settled,
+            "convergence inputs advanced"
+        );
+        Ok(self.collect_effects(Vec::new()))
+    }
+
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> SessionResult<bool> {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
@@ -1158,6 +1187,13 @@ impl AccountDeviceSession {
 
     pub fn outbound_fanouts(&self) -> SessionResult<Vec<OutboundFanout>> {
         Ok(self.engine.outbound_fanouts()?)
+    }
+
+    pub fn outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<OutboundFanout>> {
+        Ok(self.engine.outbound_fanouts_for_group(group_id)?)
     }
 
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> SessionResult<()> {

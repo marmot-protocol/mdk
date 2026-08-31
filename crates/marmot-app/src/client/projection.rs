@@ -590,6 +590,65 @@ impl AppClient {
                 updates.push(update);
             }
         }
+        let fail_acknowledgement = cfg!(feature = "test-policy-overrides")
+            && std::mem::take(&mut self.fail_next_published_app_message_acknowledgement);
+        let acknowledgement = if fail_acknowledgement {
+            Err(AppError::BlockingTask(
+                "injected published application-message acknowledgement failure".to_owned(),
+            ))
+        } else {
+            self.runtime
+                .acknowledge_published_app_messages(&effects.published_app_messages)
+                .map_err(AppError::from)
+        };
+        if let Err(error) = acknowledgement {
+            // Projection is already durable, and the accepted fanout remains
+            // durable when acknowledgement fails. Schedule its group so a
+            // cleanup-only replay runs without waiting for unrelated traffic;
+            // resume recognizes this terminal fanout and never republishes its
+            // network bytes.
+            for published in &effects.published_app_messages {
+                self.pending_convergence_groups
+                    .insert(published.group_id.clone());
+            }
+            tracing::warn!(
+                target: "marmot_app::client::projection",
+                method = "finalize_published_app_message_source_retention",
+                error_kind = error.privacy_safe_kind(),
+                "published application-message cleanup deferred",
+            );
+        }
+        Ok(updates)
+    }
+
+    /// Invalidates local projections for application messages whose durable
+    /// fanouts reached a terminal publish failure.
+    ///
+    /// A direct send excludes its own optimistic row because the caller owns
+    /// that row's callback-delivered retraction. Sibling failures and recovery
+    /// batches have no such caller, so their updates are returned for the
+    /// account worker to broadcast.
+    pub(crate) fn invalidate_failed_app_message_projections(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+        excluded: Option<(&GroupId, &str)>,
+    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        let mut updates = Vec::new();
+        for failed in &effects.failed_app_messages {
+            if excluded.is_some_and(|(group_id, app_event_id)| {
+                failed.group_id == *group_id && failed.app_event_id == app_event_id
+            }) {
+                continue;
+            }
+            if let Some(update) = self.app.invalidate_timeline_app_event(
+                &self.state.label,
+                &hex::encode(failed.group_id.as_slice()),
+                &failed.app_event_id,
+                crate::LOCAL_PUBLISH_FAILED_REASON,
+            )? {
+                updates.push(update);
+            }
+        }
         Ok(updates)
     }
 

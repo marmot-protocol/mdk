@@ -218,6 +218,388 @@ async fn frozen_fanout_ambiguous_adapter_errors_remain_unresolved() {
 }
 
 #[tokio::test]
+async fn terminal_application_fanout_replays_failure_after_restart_before_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot terminal app fanout key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-terminal-app-fanout",
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "terminal app fanout".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let endpoint = TransportEndpoint("wss://terminal-app-fanout.example".into());
+    let message_id = MessageId::new(vec![0xA1; 32]);
+    let mut fanout = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: alice.self_id(),
+            message: TransportMessage {
+                id: message_id.clone(),
+                payload: vec![0xA1],
+                timestamp: Timestamp(100),
+                causal_deps: Vec::new(),
+                source: TransportSource("terminal-app-fanout-test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+            },
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: group_id.as_slice().to_vec(),
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        },
+        None,
+        None,
+        100_000,
+    )
+    .unwrap();
+    fanout
+        .set_application_message(OutboundApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: "terminal-app-event".into(),
+            source_epoch: EpochId(1),
+            retention: AppMessageRetentionDecision::new(100, 0),
+        })
+        .unwrap();
+    fanout.mark_attempt_started_at(0, 100_000).unwrap();
+    fanout
+        .record_target_failure(
+            0,
+            TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: "relay rejected the event".into(),
+                kind: TransportEndpointFailureKind::TerminalRejected,
+                rejection_category: Some(TransportEndpointRejectionCategory::Blocked),
+            },
+        )
+        .unwrap();
+    assert!(fanout.outcome().fanout_complete);
+    alice.put_outbound_fanout(&fanout).unwrap();
+
+    let policy = StaticTransportRouting::new(Vec::new()).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        RecordingAdapter::default(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let effects = runtime.resume_outbound_fanouts().await.unwrap();
+
+    assert!(matches!(
+        effects.failures.as_slice(),
+        [marmot_account::PublishFailure {
+            message_id: failed_message_id,
+            reason,
+        }] if failed_message_id == &message_id
+            && reason == "insufficient publish acknowledgements"
+    ));
+    assert!(matches!(
+        effects.failed_app_messages.as_slice(),
+        [marmot_account::FailedApplicationMessage {
+            group_id: failed_group_id,
+            app_event_id,
+            message_id: failed_message_id,
+            reason,
+        }] if failed_group_id == &group_id
+            && app_event_id == "terminal-app-event"
+            && failed_message_id == &message_id
+            && reason == "insufficient publish acknowledgements"
+    ));
+    assert!(runtime.session().outbound_fanouts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn terminally_failed_queued_app_message_is_retired_instead_of_rearmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot terminal queued app key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-terminal-queued-app",
+    );
+    let sender_hex = hex::encode(alice.self_id().as_slice());
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "terminal queued app".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let endpoint = TransportEndpoint("wss://terminal-queued-app.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_as(
+        vec![endpoint.clone()],
+        TransportEndpointFailureKind::TerminalRejected,
+    );
+    let policy = StaticTransportRouting::new(Vec::new()).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let queued = runtime
+        .queue_app_message_with_audit_context(
+            group_id.clone(),
+            app_payload_for(&sender_hex, b"terminal queued message"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(queued.failures.is_empty());
+    assert!(adapter.publishes().is_empty());
+
+    let failed = runtime.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(failed.failed_app_messages.len(), 1);
+    let publish_count = adapter.publishes().len();
+    assert_eq!(publish_count, 1);
+
+    let repeated = runtime.advance_convergence(&group_id).await.unwrap();
+    assert!(repeated.failed_app_messages.is_empty());
+    assert_eq!(
+        adapter.publishes().len(),
+        publish_count,
+        "a terminally failed queued intent must not regenerate on the next convergence pass"
+    );
+}
+
+#[tokio::test]
+async fn queued_app_message_with_missing_route_remains_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot queued app missing route key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-queued-app-missing-route",
+    );
+    let sender_hex = hex::encode(alice.self_id().as_slice());
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "queued app missing route".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(Vec::new()),
+        RecordingKeyPackages::default(),
+    );
+    runtime
+        .queue_app_message_with_audit_context(
+            group_id.clone(),
+            app_payload_for(&sender_hex, b"wait for a route"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let failed = runtime.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(failed.failures.len(), 1);
+    assert!(failed.failed_app_messages.is_empty());
+    assert!(
+        runtime.has_queued_outbound_intents(&group_id).unwrap(),
+        "a routing failure has not proved terminal delivery failure"
+    );
+}
+
+#[tokio::test]
+async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot ordered fanout key").unwrap();
+    let mut alice = session(dir.path().join("alice.sqlite"), &key, b"alice-ordered-fanout");
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-ordered-fanout");
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "ordered fanout".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let (pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let bob_update = bob
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (commit, update_pending) = match &bob_update.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    bob.confirm_published(update_pending).await.unwrap();
+    let buffered = alice.ingest(commit).await.unwrap();
+    assert!(matches!(
+        buffered.outcome,
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    assert!(alice.has_pending_convergence_inputs(&group_id).unwrap());
+
+    let sender_hex = hex::encode(alice.self_id().as_slice());
+    alice
+        .queue_app_message_with_audit_context(
+            group_id.clone(),
+            app_payload_for(&sender_hex, b"newer queued message"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let endpoint = TransportEndpoint("wss://ordered-fanout.example".into());
+    let make_request = |id: u8| TransportPublishRequest {
+        account_id: alice.self_id(),
+        message: TransportMessage {
+            id: MessageId::new(vec![id; 32]),
+            payload: vec![id],
+            timestamp: Timestamp(100),
+            causal_deps: Vec::new(),
+            source: TransportSource("ordered-fanout-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+        },
+        target: TransportPublishTarget::Group {
+            group_id: group_id.clone(),
+            transport_group_id: group_id.as_slice().to_vec(),
+            endpoints: vec![endpoint.clone()],
+        },
+        required_acks: 1,
+    };
+    let mut older = OutboundFanout::stage(make_request(1), None, None, 100_000).unwrap();
+    older.mark_attempt_started_at(0, 100_000).unwrap();
+    older
+        .record_target_failure(
+            0,
+            TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: "acknowledgement unknown".into(),
+                kind: TransportEndpointFailureKind::PossiblyExposed,
+                rejection_category: None,
+            },
+        )
+        .unwrap();
+    let newer = OutboundFanout::stage(make_request(2), None, None, 100_001).unwrap();
+    alice.put_outbound_fanout(&older).unwrap();
+    alice.put_outbound_fanout(&newer).unwrap();
+    let convergence_delay = alice
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+        .expect("buffered commit must open a convergence pass");
+
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(100));
+    let policy = StaticTransportRouting::new(Vec::new()).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![endpoint],
+    );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    tokio::time::sleep(Duration::from_millis(convergence_delay.saturating_add(1))).await;
+
+    let effects = runtime.advance_convergence(&group_id).await.unwrap();
+
+    assert!(effects.reports.is_empty());
+    assert!(adapter.publishes().is_empty());
+    assert!(
+        !runtime.has_pending_convergence_inputs(&group_id).unwrap(),
+        "the older transport fanout must not wedge convergence settlement"
+    );
+    assert_eq!(
+        runtime.outbound_fanout_retry_delay_ms(&group_id).unwrap(),
+        Some(30_000),
+        "the later NotAttempted fanout must not pull the older retry cutoff forward"
+    );
+    let stored = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(
+        stored[1].target_status(0),
+        Some(FanoutTargetStatus::NotAttempted),
+        "the newer event must remain untouched until the older obligation is retryable"
+    );
+    assert!(
+        runtime.has_queued_outbound_intents(&group_id).unwrap(),
+        "newer queued outbound work must remain behind the older durable fanout"
+    );
+}
+
+#[tokio::test]
 async fn ambiguous_commit_retries_exact_event_after_restart_and_peer_can_advance() {
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice-unknown-retry.sqlite");
@@ -753,7 +1135,10 @@ async fn frozen_fanout_typed_unavailable_is_retryable_but_rejection_is_terminal(
     .await;
 }
 
-async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
+async fn assert_frozen_fanout_restart_edge(
+    send_before_ack_persist: bool,
+    resume_via_deferred_advance: bool,
+) {
     let dir = tempfile::tempdir().unwrap();
     let alice_path = dir.path().join("alice-restart-edge.sqlite");
     let key_text = "marmot fanout restart edge key";
@@ -839,11 +1224,22 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
     let pre_restart_publish_count = adapter.publishes().len();
     drop(alice);
 
-    let reopened = session(
-        &alice_path,
-        &SqlCipherKey::new(key_text).unwrap(),
-        b"alice-fanout-restart-edge",
-    );
+    let reopened = if resume_via_deferred_advance {
+        deferred_session(
+            &alice_path,
+            &SqlCipherKey::new(key_text).unwrap(),
+            b"alice-fanout-restart-edge",
+        )
+    } else {
+        session(
+            &alice_path,
+            &SqlCipherKey::new(key_text).unwrap(),
+            b"alice-fanout-restart-edge",
+        )
+    };
+    if resume_via_deferred_advance {
+        assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+    }
     let replacement_policy = StaticTransportRouting::new(vec![TransportEndpoint(
         "wss://replacement-inbox.example".into(),
     )])
@@ -858,10 +1254,15 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
         replacement_policy,
         RecordingKeyPackages::default(),
     );
-    let effects = resumed.drain().await.unwrap();
+    let effects = if resume_via_deferred_advance {
+        resumed.advance_convergence(&group_id).await.unwrap()
+    } else {
+        resumed.drain().await.unwrap()
+    };
 
     assert!(effects.fanout[0].mls_confirmed);
     assert!(effects.fanout[0].fanout_complete);
+    assert!(resumed.session().unhydrated_group_ids().is_empty());
     assert_eq!(resumed.session().epoch(&group_id).unwrap().0, 2);
     let attempts = adapter.publishes();
     let resumed_attempts = &attempts[pre_restart_publish_count..];
@@ -883,8 +1284,13 @@ async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
 
 #[tokio::test]
 async fn frozen_fanout_resumes_after_intent_and_after_send_before_ack_persistence() {
-    assert_frozen_fanout_restart_edge(false).await;
-    assert_frozen_fanout_restart_edge(true).await;
+    assert_frozen_fanout_restart_edge(false, false).await;
+    assert_frozen_fanout_restart_edge(true, false).await;
+}
+
+#[tokio::test]
+async fn scheduled_advance_hydrates_before_resuming_frozen_fanout() {
+    assert_frozen_fanout_restart_edge(false, true).await;
 }
 
 #[tokio::test]

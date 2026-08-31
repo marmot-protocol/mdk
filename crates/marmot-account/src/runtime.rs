@@ -24,11 +24,11 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, OutboundFanout,
-    OutboundFanoutOutcome, StorageError, Timestamp, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportEndpoint, TransportEndpointFailure,
-    TransportEndpointFailureKind, TransportEndpointReceipt, TransportGroupSync,
-    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, OutboundApplicationMessage,
+    OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp, TransportAccountActivation,
+    TransportAdapter, TransportAdapterError, TransportDelivery, TransportEndpoint,
+    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -58,8 +58,12 @@ const MAINTENANCE_QUIET_SECS: u64 = 60;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
 const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
-const FROZEN_FANOUT_RETRY_BASE_MS: u64 = 30 * 1_000;
-const FROZEN_FANOUT_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
+const FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS: u64 = 30 * 1_000;
+const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
+/// A relay that proved it never accepted the event can be retried promptly.
+/// Keep this aligned with the adapter's fixed reconnect interval so restoring
+/// connectivity does not leave a user send behind the ambiguity backoff.
+const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
 
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. Completion order therefore cannot reorder reports or select a
@@ -92,6 +96,7 @@ struct PublishStatus {
     accepted_by_any_endpoint: bool,
     possible_ambiguous_exposure: bool,
     retry_deferred: bool,
+    terminal_failure: bool,
 }
 
 struct PendingFanoutContinuation {
@@ -2006,8 +2011,30 @@ where
         &mut self,
         group_id: &GroupId,
     ) -> AccountResult<AccountDeviceEffects> {
-        let effects = self.session.advance_convergence(group_id).await?;
-        self.publish_session_effects(effects).await
+        // A deferred-open session intentionally hides this group's durable
+        // fanouts until full hydration restores its pending lifecycle. Hydrate
+        // before the targeted lookup so this same scheduled pass can resume
+        // those exact frozen bytes instead of waiting for another wake.
+        let _ = self.session.ensure_group_hydrated(group_id)?;
+        // Retry the group's already-frozen transport events before producing
+        // any newer convergence work. This preserves send order and ensures a
+        // scheduled outbound wake actually drives the exact retained bytes.
+        let (mut output, blocked_groups) = self
+            .resume_outbound_fanouts_for_group(Some(group_id))
+            .await?;
+        // An older deferred transport fanout blocks only newly queued
+        // outbound intents. Convergence inputs must still settle: otherwise a
+        // permanently unavailable relay can wedge epoch progression and fork
+        // healing forever. Any protocol effects produced by settlement remain
+        // observable while the queued-intent drain stays ordered behind the
+        // frozen fanout.
+        let effects = if blocked_groups.contains(group_id) {
+            self.session.advance_convergence_inputs(group_id).await?
+        } else {
+            self.session.advance_convergence(group_id).await?
+        };
+        output.extend(self.publish_session_effects(effects).await?);
+        Ok(output)
     }
 
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> AccountResult<bool> {
@@ -2016,6 +2043,60 @@ where
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.has_queued_outbound_intents(group_id)?)
+    }
+
+    pub fn has_pending_outbound_fanouts(&self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .outbound_fanouts_for_group(group_id)?
+            .iter()
+            .any(|fanout| {
+                let outcome = fanout.outcome();
+                outcome.outstanding_targets > 0
+                    || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || (outcome.accepted_targets > 0 && fanout.application_message().is_some())
+            }))
+    }
+
+    /// Return the earliest durable retry cutoff for an incomplete frozen
+    /// fanout in `group_id`.
+    ///
+    /// `None` means the group has no network retry cutoff to honor. It may
+    /// still have local-only work, such as acknowledgement cleanup for an
+    /// accepted application-message fanout; callers should schedule that on
+    /// their ordinary retry delay. A zero delay means at least one exact event
+    /// is eligible now (including after a connectivity-restored wake).
+    pub fn outbound_fanout_retry_delay_ms(&self, group_id: &GroupId) -> AccountResult<Option<u64>> {
+        let now_ms = self.wall_clock.now_ms();
+        for fanout in self.session.outbound_fanouts_for_group(group_id)? {
+            let outcome = fanout.outcome();
+            if outcome.accepted_targets > 0
+                && outcome.fanout_complete
+                && fanout.application_message().is_some()
+            {
+                // Local projection acknowledgement cleanup should not wait
+                // behind an unrelated transport backoff in the same group.
+                return Ok(None);
+            }
+            if outcome.outstanding_targets == 0 {
+                if matches!(fanout.mls_state(), FanoutMlsState::Pending(_)) {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let mut earliest = None;
+            for index in fanout.outstanding_target_indexes() {
+                if let Some(delay_ms) = frozen_fanout_target_retry_delay_ms(&fanout, index, now_ms)
+                {
+                    earliest = Some(earliest.map_or(delay_ms, |prior: u64| prior.min(delay_ms)));
+                }
+            }
+            // The first incomplete fanout is the group-scoped ordering
+            // barrier, so later NotAttempted records cannot pull this cutoff
+            // forward and cause a scheduler polling loop.
+            return Ok(earliest);
+        }
+        Ok(None)
     }
 
     pub fn prepare_convergence_cutoff_delay_ms(
@@ -2130,51 +2211,25 @@ where
                     source_epoch,
                     retention,
                 } => {
-                    let reports_before = output.reports.len();
-                    let unresolved_before = output.unresolved_publishes.len();
-                    let status =
-                        Box::pin(self.publish_one(msg, None, output, queue, context.clone()))
-                            .await?;
-                    if status.accepted_by_any_endpoint {
-                        if let Some(message_id) = output
-                            .reports
-                            .get(reports_before)
-                            .map(|report| report.message_id.clone())
-                        {
-                            output
-                                .published_app_messages
-                                .push(PublishedApplicationMessage {
-                                    group_id,
-                                    app_event_id,
-                                    message_id,
-                                    source_epoch,
-                                    retention,
-                                });
-                        } else {
-                            tracing::warn!(
-                                target: TRACE_TARGET,
-                                method = "publish_session_effects_with_audit_context",
-                                error_kind = "accepted_app_publish_report_missing",
-                                "accepted application publish had no transport report"
-                            );
-                        }
-                    } else if status.retry_deferred
-                        && let Some(unresolved) = output.unresolved_publishes.get(unresolved_before)
-                    {
-                        output
-                            .unresolved_app_messages
-                            .push(UnresolvedApplicationMessage {
-                                group_id,
-                                app_event_id,
-                                message_id: unresolved.message_id.clone(),
-                                reason: unresolved.reason,
-                            });
-                    }
+                    let status = Box::pin(self.publish_one(
+                        msg,
+                        None,
+                        Some(OutboundApplicationMessage {
+                            group_id,
+                            app_event_id,
+                            source_epoch,
+                            retention,
+                        }),
+                        output,
+                        queue,
+                        context.clone(),
+                    ))
+                    .await?;
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
                 PublishWork::Proposal { msg, queued_intent } => {
                     let status =
-                        Box::pin(self.publish_one(msg, None, output, queue, context.clone()))
+                        Box::pin(self.publish_one(msg, None, None, output, queue, context.clone()))
                             .await?;
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
@@ -2218,23 +2273,100 @@ where
 
     /// Resume every incomplete frozen fanout in original staging order.
     pub async fn resume_outbound_fanouts(&mut self) -> AccountResult<AccountDeviceEffects> {
-        let fanouts = self.session.outbound_fanouts()?;
+        self.resume_outbound_fanouts_for_group(None)
+            .await
+            .map(|(effects, _blocked_groups)| effects)
+    }
+
+    /// Retire terminal accepted application fanouts only after the app has
+    /// durably finalized their optimistic projections.
+    ///
+    /// Until this acknowledgement arrives, restart drains replay the same
+    /// publication metadata. App projection is idempotent, so a crash between
+    /// its database commit and this call leaves a harmless replay instead of a
+    /// permanently pending message.
+    pub fn acknowledge_published_app_messages(
+        &self,
+        published_messages: &[PublishedApplicationMessage],
+    ) -> AccountResult<()> {
+        for published in published_messages {
+            let fanouts = self
+                .session
+                .outbound_fanouts_for_group(&published.group_id)?;
+            for fanout in fanouts {
+                let outcome = fanout.outcome();
+                let matches_publication = fanout.application_message().is_some_and(|application| {
+                    application.app_event_id == published.app_event_id
+                        && outcome.message_id == published.message_id
+                });
+                if matches_publication
+                    && outcome.accepted_targets > 0
+                    && outcome.fanout_complete
+                    && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                {
+                    self.session.delete_outbound_fanout(fanout.message_id())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume_outbound_fanouts_for_group(
+        &mut self,
+        group_id: Option<&GroupId>,
+    ) -> AccountResult<(AccountDeviceEffects, HashSet<GroupId>)> {
+        let fanouts = match group_id {
+            Some(group_id) => self.session.outbound_fanouts_for_group(group_id)?,
+            None => self.session.outbound_fanouts()?,
+        };
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
+        let mut blocked_groups = HashSet::new();
         for fanout in fanouts {
+            if fanout
+                .group_id()
+                .is_some_and(|fanout_group| blocked_groups.contains(fanout_group))
+            {
+                continue;
+            }
             let outcome = fanout.outcome();
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             {
-                Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None)).await?;
+                let fanout_group = fanout.group_id().cloned();
+                let status =
+                    Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None))
+                        .await?;
+                if status.retry_deferred
+                    && let Some(fanout_group) = fanout_group
+                {
+                    // Preserve per-group staging order. An older exact event
+                    // that is still in durable backoff is a barrier for newer
+                    // fanouts in this group, but must not block unrelated
+                    // groups during an account-wide drain.
+                    blocked_groups.insert(fanout_group);
+                }
+            } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
+                record_published_application_fanout(&fanout, &mut output);
+                output.fanout.push(outcome);
             } else {
+                let reason = "insufficient publish acknowledgements".to_owned();
+                output.failures.push(PublishFailure {
+                    message_id: fanout
+                        .published_message_id()
+                        .unwrap_or_else(|| fanout.message_id())
+                        .clone(),
+                    reason: reason.clone(),
+                });
+                record_failed_application_fanout(&fanout, reason, &mut output);
+                output.fanout.push(outcome);
                 self.session.delete_outbound_fanout(fanout.message_id())?;
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
         self.reconcile_superseded_maintenance(&output.events)?;
-        Ok(output)
+        Ok((output, blocked_groups))
     }
 
     fn reconcile_confirmed_own_leaf_rotations(
@@ -2389,9 +2521,28 @@ where
                     "published queued message but could not clear its durable intent"
                 );
             }
+        } else if status.terminal_failure {
+            if self
+                .session
+                .confirm_regenerated_queued_intent(&intent)
+                .is_err()
+            {
+                // Every target failed terminally, so the logical queued intent
+                // is complete even though it was not delivered. If durable
+                // cleanup fails, retain and re-arm it rather than losing the
+                // obligation.
+                self.session.retry_regenerated_queued_intent(&intent);
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "resolve_regenerated_queued_intent",
+                    error_kind = "terminal_queued_intent_cleanup",
+                    "terminal queued message failed but its durable intent could not be cleared"
+                );
+            }
         } else {
-            // Nothing accepted the publish. The durable intent was never
-            // deleted; re-arm its group for the normal convergence retry.
+            // Nothing accepted, but routing/setup failure or at least one
+            // retryable or ambiguously exposed target means terminal failure
+            // has not been proved. Preserve and re-arm the durable intent.
             self.session.retry_regenerated_queued_intent(&intent);
         }
     }
@@ -2543,7 +2694,7 @@ where
             return Ok(());
         };
         debug_assert!(messages.next().is_none());
-        Box::pin(self.publish_one(message, Some(pending), output, queue, context)).await?;
+        Box::pin(self.publish_one(message, Some(pending), None, output, queue, context)).await?;
         Ok(())
     }
 
@@ -2571,6 +2722,7 @@ where
                 kind: FanoutPendingKind::CreateGroup,
                 post_confirmation_welcomes: welcomes.collect(),
             }),
+            None,
             output,
             queue,
             context,
@@ -2764,6 +2916,7 @@ where
                 kind: self.session.pending_fanout_kind(pending)?,
                 post_confirmation_welcomes: welcomes,
             }),
+            None,
             output,
             queue,
             context,
@@ -2990,6 +3143,7 @@ where
         &mut self,
         message: TransportMessage,
         pending: Option<PendingStateRef>,
+        application_message: Option<OutboundApplicationMessage>,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
@@ -3005,6 +3159,7 @@ where
         self.publish_one_with_post_confirmation_welcomes(
             message,
             continuation,
+            application_message,
             output,
             queue,
             context,
@@ -3016,6 +3171,7 @@ where
         &mut self,
         message: TransportMessage,
         continuation: Option<PendingFanoutContinuation>,
+        application_message: Option<OutboundApplicationMessage>,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
@@ -3069,7 +3225,7 @@ where
                     }
                 }
             };
-            let fanout = match OutboundFanout::stage_with_post_confirmation_welcomes(
+            let mut fanout = match OutboundFanout::stage_with_post_confirmation_welcomes(
                 TransportPublishRequest {
                     account_id: self.session.self_id(),
                     message,
@@ -3090,6 +3246,13 @@ where
                     return Err(error.into());
                 }
             };
+            if let Some(application_message) = application_message
+                && let Err(error) = fanout.set_application_message(application_message)
+            {
+                self.rollback_unstaged_pending(pending, output, queue)
+                    .await?;
+                return Err(error.into());
+            }
             if let Err(error) = self.session.put_outbound_fanout(&fanout) {
                 self.rollback_unstaged_pending(pending, output, queue)
                     .await?;
@@ -3238,6 +3401,8 @@ where
             accepted_by_any_endpoint: report.accepted_count() > 0,
             possible_ambiguous_exposure,
             retry_deferred: fanout_outcome.outstanding_targets > 0,
+            terminal_failure: report.accepted_count() == 0
+                && fanout_outcome.outstanding_targets == 0,
         };
         let publish_failure_reason =
             if fanout_outcome.outstanding_targets > 0 && !status.met_required_acks {
@@ -3280,9 +3445,40 @@ where
                 });
             }
         }
+        if status.accepted_by_any_endpoint {
+            record_published_application_fanout(&fanout, output);
+        } else if let Some(reason) = publish_failure_reason {
+            record_failed_application_fanout(&fanout, reason, output);
+        } else if let Some(application) = fanout.application_message()
+            && status.retry_deferred
+        {
+            output
+                .unresolved_app_messages
+                .push(UnresolvedApplicationMessage {
+                    group_id: application.group_id.clone(),
+                    app_event_id: application.app_event_id.clone(),
+                    message_id: report.message_id.clone(),
+                    reason: if possible_ambiguous_exposure {
+                        UnresolvedPublishReason::AcknowledgementUnknown
+                    } else {
+                        UnresolvedPublishReason::RetryableUnavailable
+                    },
+                });
+        }
+        if fanout_outcome.outstanding_targets > 0
+            && let Some(group_id) = fanout.group_id()
+            && !output.pending_convergence.contains(group_id)
+        {
+            // The exact event is already durable, but the app worker still
+            // needs a scheduling edge that survives the current command. It
+            // will query the stored fanout before arming and retry these same
+            // bytes when the per-target delay expires.
+            output.pending_convergence.push(group_id.clone());
+        }
         output.fanout.push(fanout_outcome.clone());
         if fanout_outcome.fanout_complete
             && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+            && !(fanout_outcome.accepted_targets > 0 && fanout.application_message().is_some())
         {
             self.session.delete_outbound_fanout(fanout.message_id())?;
         }
@@ -3530,6 +3726,7 @@ where
                 accepted_by_any_endpoint: accepted_before > 0,
                 possible_ambiguous_exposure: fanout.possible_exposure,
                 retry_deferred,
+                terminal_failure: false,
             }));
         }
         let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
@@ -3633,6 +3830,7 @@ where
                     accepted_by_any_endpoint: accepted_before > 0,
                     possible_ambiguous_exposure: true,
                     retry_deferred: false,
+                    terminal_failure: false,
                 });
             }
         };
@@ -3707,6 +3905,7 @@ where
             accepted_by_any_endpoint,
             possible_ambiguous_exposure: fanout.possible_exposure,
             retry_deferred: false,
+            terminal_failure: !published && !accepted_by_any_endpoint && !fanout.possible_exposure,
         })
     }
 }
@@ -3742,21 +3941,39 @@ fn ambiguous_endpoint_failure(endpoint: TransportEndpoint) -> TransportEndpointF
 }
 
 fn frozen_fanout_target_retry_due(fanout: &OutboundFanout, index: usize, now_ms: u64) -> bool {
+    frozen_fanout_target_retry_delay_ms(fanout, index, now_ms) == Some(0)
+}
+
+fn frozen_fanout_target_retry_delay_ms(
+    fanout: &OutboundFanout,
+    index: usize,
+    now_ms: u64,
+) -> Option<u64> {
     use cgka_traits::FanoutTargetStatus;
 
     match fanout.target_status(index) {
-        Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::Attempting) => true,
-        Some(FanoutTargetStatus::PossiblyExposed | FanoutTargetStatus::RetryableUnavailable) => {
+        Some(FanoutTargetStatus::NotAttempted | FanoutTargetStatus::Attempting) => Some(0),
+        Some(FanoutTargetStatus::PossiblyExposed) => {
             let attempt_count = fanout.target_attempt_count(index);
             let shift = attempt_count.saturating_sub(1).min(7);
-            let backoff_ms = FROZEN_FANOUT_RETRY_BASE_MS
+            let backoff_ms = FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS
                 .saturating_mul(1_u64 << shift)
-                .min(FROZEN_FANOUT_RETRY_MAX_MS);
+                .min(FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS);
             fanout
                 .target_last_attempt_at_ms(index)
-                .is_none_or(|last| now_ms >= last.saturating_add(backoff_ms))
+                .map_or(Some(0), |last| {
+                    Some(last.saturating_add(backoff_ms).saturating_sub(now_ms))
+                })
         }
-        Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => false,
+        Some(FanoutTargetStatus::RetryableUnavailable) => fanout
+            .target_last_attempt_at_ms(index)
+            .map_or(Some(0), |last| {
+                Some(
+                    last.saturating_add(FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS)
+                        .saturating_sub(now_ms),
+                )
+            }),
+        Some(FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed) | None => None,
     }
 }
 
@@ -3801,6 +4018,54 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
         failed,
         required_acks: fanout.request().required_acks,
     }
+}
+
+/// Replay the app-visible acknowledgement derived from a durable accepted
+/// fanout. The projection is an idempotent upsert, so emitting this on every
+/// recovery pass is safe until the app explicitly acknowledges persistence.
+fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut AccountDeviceEffects) {
+    if fanout.outcome().accepted_targets == 0 {
+        return;
+    }
+    let Some(application) = fanout.application_message() else {
+        return;
+    };
+    let message_id = fanout
+        .published_message_id()
+        .unwrap_or_else(|| fanout.message_id())
+        .clone();
+    output
+        .published_app_messages
+        .push(PublishedApplicationMessage {
+            group_id: application.group_id.clone(),
+            app_event_id: application.app_event_id.clone(),
+            message_id,
+            source_epoch: application.source_epoch,
+            retention: application.retention,
+        });
+}
+
+/// Report a terminal application publish with the app-event identity retained
+/// on its durable fanout. This remains replayable across the crash window
+/// between persisting the terminal target states and deleting the fanout.
+fn record_failed_application_fanout(
+    fanout: &OutboundFanout,
+    reason: String,
+    output: &mut AccountDeviceEffects,
+) {
+    let Some(application) = fanout.application_message() else {
+        return;
+    };
+    let message_id = fanout
+        .published_message_id()
+        .unwrap_or_else(|| fanout.message_id())
+        .clone();
+    output.failed_app_messages.push(FailedApplicationMessage {
+        group_id: application.group_id.clone(),
+        app_event_id: application.app_event_id.clone(),
+        message_id,
+        reason,
+    });
 }
 
 fn apply_report_to_fanout(
@@ -4068,6 +4333,10 @@ pub struct AccountDeviceEffects {
     /// Application-message identity attached to unresolved publication so app
     /// consumers can keep exactly the affected local row in a sending state.
     pub unresolved_app_messages: Vec<UnresolvedApplicationMessage>,
+    /// Application messages whose publication reached a definitive terminal
+    /// failure, carrying the local app-event identity needed to invalidate only
+    /// the affected optimistic projection.
+    pub failed_app_messages: Vec<FailedApplicationMessage>,
     /// Application messages accepted by at least one transport endpoint,
     /// carrying source-state metadata captured by the exact MLS encryption
     /// operation and the adapter-visible transport id.
@@ -4088,6 +4357,14 @@ pub struct PublishedApplicationMessage {
     pub message_id: cgka_traits::MessageId,
     pub source_epoch: EpochId,
     pub retention: cgka_traits::app_event::AppMessageRetentionDecision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedApplicationMessage {
+    pub group_id: GroupId,
+    pub app_event_id: String,
+    pub message_id: cgka_traits::MessageId,
+    pub reason: String,
 }
 
 impl AccountDeviceEffects {
@@ -4118,6 +4395,8 @@ impl AccountDeviceEffects {
             .append(&mut other.unresolved_publishes);
         self.unresolved_app_messages
             .append(&mut other.unresolved_app_messages);
+        self.failed_app_messages
+            .append(&mut other.failed_app_messages);
         self.published_app_messages
             .append(&mut other.published_app_messages);
         self.welcome_failures.append(&mut other.welcome_failures);
@@ -4190,6 +4469,56 @@ pub enum PendingResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_frozen_fanout(kind: TransportEndpointFailureKind) -> OutboundFanout {
+        let group_id = GroupId::new(vec![0x11; 16]);
+        let transport_group_id = vec![0x22; 32];
+        let endpoint = TransportEndpoint("wss://relay.example".into());
+        let request = TransportPublishRequest {
+            account_id: MemberId::new(vec![0x33; 32]),
+            message: TransportMessage {
+                id: cgka_traits::MessageId::new(vec![0x44; 32]),
+                payload: vec![0x55],
+                timestamp: Timestamp(1),
+                causal_deps: Vec::new(),
+                source: cgka_traits::transport::TransportSource("nostr".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: transport_group_id.clone(),
+                },
+            },
+            target: TransportPublishTarget::Group {
+                group_id,
+                transport_group_id,
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        };
+        let mut fanout = OutboundFanout::stage(request, None, None, 1_000).unwrap();
+        fanout.mark_attempt_started_at(0, 1_000).unwrap();
+        fanout
+            .record_target_failure(
+                0,
+                TransportEndpointFailure {
+                    endpoint,
+                    reason: "test failure".into(),
+                    kind,
+                    rejection_category: None,
+                },
+            )
+            .unwrap();
+        fanout
+    }
+
+    #[test]
+    fn unavailable_fanout_retries_promptly_without_shortening_ambiguous_backoff() {
+        let unavailable = failed_frozen_fanout(TransportEndpointFailureKind::RetryableUnavailable);
+        assert!(!frozen_fanout_target_retry_due(&unavailable, 0, 5_999));
+        assert!(frozen_fanout_target_retry_due(&unavailable, 0, 6_000));
+
+        let ambiguous = failed_frozen_fanout(TransportEndpointFailureKind::PossiblyExposed);
+        assert!(!frozen_fanout_target_retry_due(&ambiguous, 0, 30_999));
+        assert!(frozen_fanout_target_retry_due(&ambiguous, 0, 31_000));
+    }
 
     fn published_message(id: u8) -> PublishedApplicationMessage {
         PublishedApplicationMessage {

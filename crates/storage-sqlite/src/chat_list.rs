@@ -1002,19 +1002,108 @@ pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
     )
 }
 
+fn accepted_activity_insert_order_high_water_sql(group_id_expression: &str) -> String {
+    let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    format!(
+        "MAX(
+            COALESCE((
+                SELECT boundary.accepted_activity_insert_order
+                FROM chat_list_rows AS boundary
+                WHERE boundary.group_id_hex = {group_id_expression}
+            ), 0),
+            COALESCE((
+                SELECT MAX(accepted_source.insert_order)
+                FROM message_timeline AS accepted
+                JOIN app_events AS accepted_source
+                  ON accepted_source.group_id_hex = accepted.group_id_hex
+                 AND accepted_source.message_id_hex = accepted.message_id_hex
+                WHERE accepted.group_id_hex = {group_id_expression}
+                  AND {accepted_activity_filter}
+                  AND accepted.invalidation_status IS NULL
+                  AND NOT (
+                      accepted.direction = 'sent'
+                      AND accepted.source_message_id_hex IS NULL
+                  )
+            ), 0)
+         )"
+    )
+}
+
+/// SQL predicate excluding a pending local preview after later accepted
+/// activity has durably displaced it. The live accepted-row maximum covers a
+/// first rebuild; the persisted high-water mark preserves the decision after
+/// secure pruning removes that evidence.
+pub(crate) fn chat_list_preview_eligibility_sql(column_prefix: &str) -> String {
+    let accepted_high_water =
+        accepted_activity_insert_order_high_water_sql(&format!("{column_prefix}group_id_hex"));
+    format!(
+        "NOT (
+            {column_prefix}direction = 'sent'
+            AND {column_prefix}source_message_id_hex IS NULL
+            AND {column_prefix}invalidation_status IS NULL
+            AND COALESCE((
+                SELECT current_source.insert_order
+                FROM app_events AS current_source
+                WHERE current_source.group_id_hex = {column_prefix}group_id_hex
+                  AND current_source.message_id_hex = {column_prefix}message_id_hex
+            ), -1) < {accepted_high_water}
+         )"
+    )
+}
+
 /// One authoritative latest-preview order for rebuild, completeness, and
-/// secure-prune repair. Failed local sends remain visible in the timeline but
-/// do not outrank accepted history in the chat-list projection.
-pub(crate) const CHAT_LIST_PREVIEW_ORDER_DESC: &str = "CASE
-        WHEN direction = 'sent'
-         AND invalidation_status = 'local_publish_failed' THEN 0
-        ELSE 1
-    END DESC,
-    timeline_order_class DESC,
-    timeline_order_primary DESC,
-    timeline_order_phase DESC,
-    timeline_order_at DESC,
-    message_id_hex DESC";
+/// secure-prune repair. A pending local send stays at the preview head only
+/// until accepted activity is first persisted later on this device. The stable
+/// `app_events.insert_order` boundary is intentional: relay replay can rewrite
+/// `received_at` on an older row and must not make old history look new. The
+/// canonical timeline deliberately keeps every unresolved local row at its
+/// head, but reusing that unconditional class here lets one orphaned send pin a
+/// chat-list preview forever. Failed local sends remain visible in the timeline
+/// without outranking accepted history.
+pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
+    let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    format!(
+        "CASE
+            WHEN {column_prefix}direction = 'sent'
+             AND {column_prefix}invalidation_status = 'local_publish_failed' THEN 0
+            ELSE 1
+         END DESC,
+         CASE
+            WHEN {column_prefix}direction = 'sent'
+             AND {column_prefix}source_message_id_hex IS NULL
+             AND {column_prefix}invalidation_status IS NULL
+             AND NOT EXISTS (
+                SELECT 1
+                FROM message_timeline AS accepted
+                JOIN app_events AS accepted_source
+                  ON accepted_source.group_id_hex = accepted.group_id_hex
+                 AND accepted_source.message_id_hex = accepted.message_id_hex
+                WHERE accepted.group_id_hex = {column_prefix}group_id_hex
+                  AND {accepted_activity_filter}
+                  AND accepted.invalidation_status IS NULL
+                  AND NOT (
+                      accepted.direction = 'sent'
+                      AND accepted.source_message_id_hex IS NULL
+                  )
+                  AND accepted_source.insert_order > COALESCE((
+                      SELECT current_source.insert_order
+                      FROM app_events AS current_source
+                      WHERE current_source.group_id_hex = {column_prefix}group_id_hex
+                        AND current_source.message_id_hex = {column_prefix}message_id_hex
+                  ), -1)
+             ) THEN 2
+            WHEN {column_prefix}direction = 'sent'
+             AND {column_prefix}source_message_id_hex IS NULL
+             AND {column_prefix}invalidation_status IS NULL THEN 0
+            ELSE 1
+         END DESC,
+         {column_prefix}timeline_order_class DESC,
+         {column_prefix}timeline_order_primary DESC,
+         {column_prefix}timeline_order_phase DESC,
+         {column_prefix}timeline_order_at DESC,
+         {column_prefix}message_id_hex DESC"
+    )
+}
 
 struct LatestChatListMessage {
     preview: ChatListMessagePreview,
@@ -1052,6 +1141,9 @@ fn chat_list_projection_complete_tx(
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<bool> {
     let activity_filter = chat_list_activity_filter_sql("mt.");
+    let preview_order = chat_list_preview_order_desc("mt.");
+    let preview_eligibility = chat_list_preview_eligibility_sql("mt.");
+    let accepted_high_water = accepted_activity_insert_order_high_water_sql("ag.group_id_hex");
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(
@@ -1146,11 +1238,20 @@ fn chat_list_projection_complete_tx(
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                      ), 0)
-                   OR row.last_message_id_hex IS NOT (
-                        SELECT mt.message_id_hex
+                   OR (
+                        row.last_message_id_hex,
+                        row.last_message_sender,
+                        row.last_message_preview,
+                        row.last_message_kind,
+                        row.last_message_timeline_at,
+                        row.last_message_media_json
+                     ) IS NOT (
+                        SELECT mt.message_id_hex, mt.sender, mt.plaintext,
+                               mt.kind, mt.timeline_at, mt.media_json
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND {activity_filter}
+                          AND {preview_eligibility}
                           AND (
                               mt.invalidation_status IS NULL
                               OR (
@@ -1158,99 +1259,15 @@ fn chat_list_projection_complete_tx(
                                   AND mt.invalidation_status = 'local_publish_failed'
                               )
                           )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
-                     )
-                   OR row.last_message_sender IS NOT (
-                        SELECT mt.sender
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
-                     )
-                   OR row.last_message_preview IS NOT (
-                        SELECT mt.plaintext
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
-                     )
-                   OR row.last_message_kind IS NOT (
-                        SELECT mt.kind
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
-                     )
-                   OR row.last_message_timeline_at IS NOT (
-                        SELECT mt.timeline_at
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
+                        ORDER BY {preview_order}
                         LIMIT 1
                      )
                    OR row.last_message_deleted IS NOT COALESCE((
                         SELECT mt.deleted
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
+                          AND mt.message_id_hex = row.last_message_id_hex
                      ), 0)
-                   OR row.last_message_media_json IS NOT (
-                        SELECT mt.media_json
-                        FROM message_timeline AS mt
-                        WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
-                     )
                    OR row.last_message_delivery_state IS NOT COALESCE((
                         SELECT CASE
                             WHEN mt.direction != 'sent' THEN 'not_applicable'
@@ -1260,34 +1277,11 @@ fn chat_list_projection_complete_tx(
                         END
                         FROM message_timeline AS mt
                         WHERE mt.group_id_hex = ag.group_id_hex
-                          AND {activity_filter}
-                          AND (
-                              mt.invalidation_status IS NULL
-                              OR (
-                                  mt.direction = 'sent'
-                                  AND mt.invalidation_status = 'local_publish_failed'
-                              )
-                          )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                        LIMIT 1
+                          AND mt.message_id_hex = row.last_message_id_hex
                      ), 'not_applicable')
                    OR row.activity_sort_at IS NOT MAX(
                         row.retained_activity_sort_at,
-                        COALESCE((
-                            SELECT mt.timeline_at
-                            FROM message_timeline AS mt
-                            WHERE mt.group_id_hex = ag.group_id_hex
-                              AND {activity_filter}
-                              AND (
-                                  mt.invalidation_status IS NULL
-                                  OR (
-                                      mt.direction = 'sent'
-                                      AND mt.invalidation_status = 'local_publish_failed'
-                                  )
-                              )
-                        ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
-                            LIMIT 1
-                        ), 0),
+                        COALESCE(row.last_message_timeline_at, 0),
                         COALESCE((
                             SELECT read_state.last_read_timeline_at
                             FROM conversation_read_state AS read_state
@@ -1295,6 +1289,7 @@ fn chat_list_projection_complete_tx(
                         ), 0),
                         ag.conversation_created_at
                      )
+                   OR row.accepted_activity_insert_order < {accepted_high_water}
              )"
         ),
         [],
@@ -1378,6 +1373,8 @@ fn rebuild_chat_list_row_for_group_tx(
 ) -> StorageResult<()> {
     let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
     let latest_message = latest.as_ref().map(|latest| &latest.preview);
+    let accepted_activity_insert_order =
+        latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
     let unread = unread_summary_tx(
         tx,
@@ -1409,12 +1406,12 @@ fn rebuild_chat_list_row_for_group_tx(
             first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
             conversation_created_at, activity_sort_at, retained_activity_sort_at,
-            updated_at, self_membership
+            accepted_activity_insert_order, updated_at, self_membership
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1447,6 +1444,10 @@ fn rebuild_chat_list_row_for_group_tx(
                 chat_list_rows.retained_activity_sort_at
             ),
             retained_activity_sort_at = chat_list_rows.retained_activity_sort_at,
+            accepted_activity_insert_order = MAX(
+                chat_list_rows.accepted_activity_insert_order,
+                excluded.accepted_activity_insert_order
+            ),
             updated_at = excluded.updated_at,
             self_membership = excluded.self_membership",
         params![
@@ -1510,6 +1511,7 @@ fn rebuild_chat_list_row_for_group_tx(
             )?,
             u64_to_i64(group.conversation_created_at)?,
             u64_to_i64(activity_sort_at)?,
+            accepted_activity_insert_order,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
         ],
@@ -1736,19 +1738,27 @@ fn latest_chat_list_activity_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<LatestChatListMessage>> {
-    let activity_filter = chat_list_activity_filter_sql("");
+    let activity_filter = chat_list_activity_filter_sql("preview.");
+    let preview_order = chat_list_preview_order_desc("preview.");
+    let preview_eligibility = chat_list_preview_eligibility_sql("preview.");
     let sql = format!(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted,
-                media_json, direction, source_message_id_hex, invalidation_status,
-                timeline_order_class, timeline_order_primary,
-                timeline_order_phase, timeline_order_at
-         FROM message_timeline
-         WHERE group_id_hex = ?1 AND {activity_filter}
+        "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
+                preview.kind, preview.timeline_at, preview.deleted,
+                preview.media_json, preview.direction,
+                preview.source_message_id_hex, preview.invalidation_status,
+                preview.timeline_order_class, preview.timeline_order_primary,
+                preview.timeline_order_phase, preview.timeline_order_at
+         FROM message_timeline AS preview
+         WHERE preview.group_id_hex = ?1 AND {activity_filter}
+           AND {preview_eligibility}
            AND (
-               invalidation_status IS NULL
-               OR (direction = 'sent' AND invalidation_status = 'local_publish_failed')
+               preview.invalidation_status IS NULL
+               OR (
+                   preview.direction = 'sent'
+                   AND preview.invalidation_status = 'local_publish_failed'
+               )
            )
-         ORDER BY {CHAT_LIST_PREVIEW_ORDER_DESC}
+         ORDER BY {preview_order}
          LIMIT 1"
     );
     tx.query_row(&sql, params![group_id_hex], |row| {
@@ -1763,6 +1773,32 @@ fn latest_chat_list_activity_tx(
         })
     })
     .optional()
+    .storage()
+}
+
+fn latest_accepted_activity_insert_order_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<Option<i64>> {
+    let activity_filter = chat_list_activity_filter_sql("accepted.");
+    tx.query_row(
+        &format!(
+            "SELECT MAX(accepted_source.insert_order)
+             FROM message_timeline AS accepted
+             JOIN app_events AS accepted_source
+               ON accepted_source.group_id_hex = accepted.group_id_hex
+              AND accepted_source.message_id_hex = accepted.message_id_hex
+             WHERE accepted.group_id_hex = ?1
+               AND {activity_filter}
+               AND accepted.invalidation_status IS NULL
+               AND NOT (
+                   accepted.direction = 'sent'
+                   AND accepted.source_message_id_hex IS NULL
+               )"
+        ),
+        params![group_id_hex],
+        |row| row.get(0),
+    )
     .storage()
 }
 

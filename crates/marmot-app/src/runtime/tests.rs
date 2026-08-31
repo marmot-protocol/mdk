@@ -2415,6 +2415,115 @@ async fn account_worker_response_deadline_reports_unknown_completion() {
     assert!(matches!(error, AppError::AccountWorkerResponseTimedOut));
 }
 
+fn transient_transport_catch_up_failure() -> AccountCatchUpFailure {
+    AccountCatchUpFailure::new(
+        "runtime catch-up failed: account_transport".into(),
+        SyncFailureClassification::new(
+            SyncFailureStage::TransportActivation,
+            SyncErrorClass::Unknown,
+        ),
+    )
+}
+
+#[tokio::test]
+async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
+    let (flaky_tx, mut flaky_rx) = mpsc::channel(4);
+    let flaky = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Some(command) = flaky_rx.recv().await {
+            let AccountWorkerCommand::CatchUp { respond } = command else {
+                panic!("unexpected worker command");
+            };
+            attempts += 1;
+            let result = if attempts == 1 {
+                Err(transient_transport_catch_up_failure())
+            } else {
+                Ok(())
+            };
+            let _ = respond.send(result);
+            if attempts == 2 {
+                return attempts;
+            }
+        }
+        attempts
+    });
+    let (healthy_tx, mut healthy_rx) = mpsc::channel(4);
+    let healthy = tokio::spawn(async move {
+        let Some(AccountWorkerCommand::CatchUp { respond }) = healthy_rx.recv().await else {
+            panic!("expected catch-up command");
+        };
+        let _ = respond.send(Ok(()));
+        1
+    });
+
+    catch_up_account_commands_with_retry(
+        vec![flaky_tx, healthy_tx],
+        Duration::from_secs(1),
+        &[Duration::ZERO],
+    )
+    .await
+    .expect("the transient worker should recover");
+
+    assert_eq!(flaky.await.unwrap(), 2);
+    assert_eq!(healthy.await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
+    let (worker_tx, mut worker_rx) = mpsc::channel(8);
+    let worker = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Some(command) = worker_rx.recv().await {
+            let AccountWorkerCommand::CatchUp { respond } = command else {
+                panic!("unexpected worker command");
+            };
+            attempts += 1;
+            let _ = respond.send(Err(transient_transport_catch_up_failure()));
+            if attempts == 3 {
+                return attempts;
+            }
+        }
+        attempts
+    });
+
+    let error = catch_up_account_commands_with_retry(
+        vec![worker_tx],
+        Duration::from_secs(1),
+        &[Duration::ZERO, Duration::ZERO],
+    )
+    .await
+    .expect_err("a permanently failing worker must still surface its error");
+
+    assert!(matches!(error, AppError::AccountCatchUp(_)));
+    assert_eq!(worker.await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn catch_up_does_not_retry_a_closed_worker_response() {
+    let (worker_tx, mut worker_rx) = mpsc::channel(2);
+    let worker = tokio::spawn(async move {
+        let Some(AccountWorkerCommand::CatchUp { respond }) = worker_rx.recv().await else {
+            panic!("expected catch-up command");
+        };
+        drop(respond);
+
+        if let Ok(Some(_)) = timeout(Duration::from_millis(50), worker_rx.recv()).await {
+            panic!("a closed worker response cannot recover on the same channel");
+        }
+    });
+
+    let error = catch_up_account_commands_with_retry(
+        vec![worker_tx],
+        Duration::from_secs(1),
+        &[Duration::ZERO],
+    )
+    .await
+    .expect_err("a closed worker response must remain terminal");
+
+    assert!(matches!(error, AppError::TransportClosed));
+    worker.await.unwrap();
+}
+
 #[test]
 fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_categories() {
     use crate::KeyPackageDeletionResult;

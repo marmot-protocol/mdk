@@ -108,6 +108,8 @@ mod migration_0053_account_delivery_recovery;
 mod migration_0054_transport_reconciliation_items;
 #[path = "migrations/0055_epoch_stall_evidence.rs"]
 mod migration_0055_epoch_stall_evidence;
+#[path = "migrations/0056_chat_list_accepted_activity_high_water.rs"]
+mod migration_0056_chat_list_accepted_activity_high_water;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -397,6 +399,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 55,
         name: "0055_epoch_stall_evidence",
         apply: migration_0055_epoch_stall_evidence::apply,
+    },
+    Migration {
+        version: 56,
+        name: "0056_chat_list_accepted_activity_high_water",
+        apply: migration_0056_chat_list_accepted_activity_high_water::apply,
     },
 ];
 
@@ -925,7 +932,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 55,
+                found: 56,
                 latest_supported: 46,
             }
         ));
@@ -981,7 +988,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 55,
+                found: 56,
                 latest_supported: 46,
             }
         ));
@@ -1285,7 +1292,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 55,
+                found: 56,
                 latest_supported: 46,
             }
         ));
@@ -1639,6 +1646,70 @@ mod tests {
             .refresh_chat_list_rows("local-account", &no_mentions)
             .unwrap();
         assert_eq!(semantic_chat_list_timestamps(&store), expected);
+    }
+
+    #[test]
+    fn accepted_activity_high_water_migration_backfills_existing_chat_history() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Versions 1-55 are the schema immediately before the durable preview
+        // demotion boundary.
+        run(&mut conn, &MIGRATIONS[..55]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, profile_name, updated_at)
+             VALUES ('active', 'relay', 'Migration group', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, source_message_id_hex, direction,
+                sender, plaintext, kind, tags_json, recorded_at, received_at
+             ) VALUES
+                ('active', 'pending', NULL, 'sent', 'alice', 'pending', 9, '[]', 20, 20),
+                ('active', 'accepted', 'source-accepted', 'received', 'bob',
+                 'accepted', 9, '[]', 10, 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, source_message_id_hex, direction,
+                sender, plaintext, kind, tags_json, timeline_at, received_at,
+                reactions_json
+             ) VALUES
+                ('active', 'pending', NULL, 'sent', 'alice', 'pending', 9, '[]', 20, 20, '[]'),
+                ('active', 'accepted', 'source-accepted', 'received', 'bob',
+                 'accepted', 9, '[]', 10, 10, '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_list_rows (group_id_hex, updated_at)
+             VALUES ('active', 1)",
+            [],
+        )
+        .unwrap();
+        let accepted_insert_order: i64 = conn
+            .query_row(
+                "SELECT insert_order FROM app_events
+                 WHERE group_id_hex = 'active' AND message_id_hex = 'accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let high_water: i64 = conn
+            .query_row(
+                "SELECT accepted_activity_insert_order FROM chat_list_rows
+                 WHERE group_id_hex = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(high_water, accepted_insert_order);
     }
 
     #[test]

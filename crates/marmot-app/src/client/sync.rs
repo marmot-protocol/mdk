@@ -366,12 +366,12 @@ pub(crate) enum ConvergenceScheduleState {
     /// trigger). Re-check on the fallback delay; only this state counts
     /// toward the unsettled re-arm cap.
     PendingUnopenable,
-    /// No convergence work, but durable queued outbound intents remain. The
-    /// scheduled drain regenerates and publishes them (and a failed sync on
-    /// that tick triggers transport reactivation), so the wakeup stays armed
-    /// on the fallback delay — but a healthy waiting queue is not unsettled
-    /// convergence and never counts toward the re-arm cap.
-    PendingOutbound,
+    /// No convergence work, but durable outbound work remains. A frozen
+    /// transport event carries its earliest retry cutoff; queued intents and
+    /// local-only acknowledgement cleanup use the scheduler's ordinary delay.
+    /// This state is not unsettled convergence and never counts toward the
+    /// re-arm cap.
+    PendingOutbound { retry_after_ms: Option<u64> },
 }
 
 enum SyncCheckpointError {
@@ -391,6 +391,26 @@ impl StagedSyncError {
 }
 
 impl AppClient {
+    /// Persist a host connectivity-restored edge into every exact fanout whose
+    /// prior attempt was proven unavailable, then schedule its group for an
+    /// immediate worker pass. Ambiguous fanouts keep their original clocks.
+    pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
+        let mut woken_targets = 0;
+        for mut fanout in self.runtime.session().outbound_fanouts()? {
+            let woken = fanout.wake_retryable_unavailable_targets();
+            if woken == 0 {
+                continue;
+            }
+            let group_id = fanout.group_id().cloned();
+            self.runtime.session().put_outbound_fanout(&fanout)?;
+            if let Some(group_id) = group_id {
+                self.pending_convergence_groups.insert(group_id);
+            }
+            woken_targets += woken;
+        }
+        Ok(woken_targets)
+    }
+
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
     }
@@ -424,7 +444,13 @@ impl AppClient {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)? {
-                    Ok(ConvergenceScheduleState::PendingOutbound)
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: None,
+                    })
+                } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
+                    })
                 } else {
                     match self.runtime.deferred_peel_cutoff_delay_ms(group_id)? {
                         Some(0) => Ok(ConvergenceScheduleState::Ready),
@@ -444,7 +470,9 @@ impl AppClient {
         }
     }
 
-    fn remember_pending_convergence_groups(
+    /// Retain engine-provided scheduling edges from an effects batch until the
+    /// account worker can arm their group timers.
+    pub(crate) fn remember_pending_convergence_groups(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) {
@@ -561,16 +589,18 @@ impl AppClient {
     /// a device that recovered stays counted as stuck — so it is observed on the
     /// same side of the gate.
     ///
-    /// Recovery evidence only. `remember_pending_convergence_groups` is
-    /// deliberately not paired here the way it is at the convergence and inbound
-    /// seams: the callers of this gate do not remember pending convergence on
-    /// their success paths either, so recording it on the failure path alone
-    /// would invent a scheduling contract they do not otherwise hold.
+    /// Retained exact fanouts are non-failure effects, but they still require a
+    /// worker wake. Remember their engine-provided scheduling edge here so all
+    /// direct send operations (messages and group-state changes alike) retry
+    /// automatically after temporary transport loss.
     pub(crate) fn observe_recovery_evidence_then_fail_if_publish_failed(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         self.observe_recovery_evidence(effects);
+        self.remember_pending_convergence_groups(effects);
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
+        self.pending_projection_updates.extend(failed_updates);
         fail_if_publish_failed(effects)
     }
 
@@ -1035,8 +1065,23 @@ impl AppClient {
         // state. The two conditions are correlated rather than independent: this
         // drain publishes, so the failure and the refusal ride the same effects.
         self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
         let mut summary = SyncSummary::default();
+        // `runtime.drain()` also resumes durable outbound fanouts. That work
+        // can publish an accepted-pending application message without emitting
+        // any engine event, so it must be projected before the eventless fast
+        // path or publish-failure gate below. A batch can contain one fanout
+        // that succeeded alongside another publish that failed; the successful
+        // row must not remain stuck in `Sending` after its fanout is deleted.
+        self.remember_published_reports(effects);
+        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
+        if let Err(error) = fail_if_publish_failed(effects) {
+            self.pending_projection_updates.extend(finalize_updates);
+            self.pending_projection_updates.extend(failed_updates);
+            return Err(error);
+        }
+        summary.projection_updates.extend(finalize_updates);
+        summary.projection_updates.extend(failed_updates);
         if effects.events.is_empty() {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
@@ -3377,9 +3422,17 @@ impl AppClient {
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
         self.observe_recovery_evidence(effects);
-        fail_if_publish_failed(effects)?;
         self.remember_published_reports(effects);
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
+        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
+        // Preserve successful publications in a mixed batch before surfacing
+        // an unrelated hard failure. Their durable fanouts are already gone,
+        // so a later pass cannot reconstruct this source metadata.
+        if let Err(error) = fail_if_publish_failed(effects) {
+            self.pending_projection_updates.extend(finalize_updates);
+            self.pending_projection_updates.extend(failed_updates);
+            return Err(error);
+        }
         let publish_new_message_notification =
             effects.published_app_messages.iter().any(|published| {
                 let group_id_hex = hex::encode(published.group_id.as_slice());
@@ -3398,6 +3451,7 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         summary.projection_updates.extend(finalize_updates);
+        summary.projection_updates.extend(failed_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
         let routes_dirty = self

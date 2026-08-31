@@ -203,8 +203,9 @@ mod tests {
     use cgka_traits::engine_state::PendingStateRef;
     use cgka_traits::storage::{GroupStorage, OutboundFanoutStorage, OutboundIntentStorage};
     use cgka_traits::{
-        MemberId, OutboundFanout, Timestamp, TransportEndpoint, TransportEnvelope,
-        TransportMessage, TransportPublishRequest, TransportPublishTarget, TransportSource,
+        AppMessageRetentionDecision, EpochId, MemberId, OutboundApplicationMessage, OutboundFanout,
+        Timestamp, TransportEndpoint, TransportEnvelope, TransportMessage, TransportPublishRequest,
+        TransportPublishTarget, TransportSource,
     };
 
     fn sample_fanout(id: u8) -> OutboundFanout {
@@ -274,7 +275,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fanout.sqlite");
         let key = crate::SqlCipherKey::new("durable fanout key").unwrap();
-        let expected = sample_fanout(8);
+        let mut expected = sample_fanout(8);
+        expected
+            .set_application_message(OutboundApplicationMessage {
+                group_id: gid(1),
+                app_event_id: "durable-app-event".into(),
+                source_epoch: EpochId(7),
+                retention: AppMessageRetentionDecision::new(100, 30),
+            })
+            .unwrap();
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store.put_group(&sample_group(gid(1), 0, 0)).unwrap();

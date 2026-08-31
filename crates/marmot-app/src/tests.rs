@@ -268,6 +268,7 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
 pub(crate) struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
@@ -284,6 +285,7 @@ pub(crate) struct ScriptedPushRelayClient {
     block_account_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     block_account_group_subscribe: std::sync::Mutex<Option<Vec<u8>>>,
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
+    fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
@@ -357,6 +359,15 @@ impl ScriptedPushRelayClient {
 
     fn published_event_ids(&self) -> Vec<String> {
         self.published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.id.clone())
+            .collect()
+    }
+
+    fn attempted_event_ids(&self) -> Vec<String> {
+        self.attempted_events
             .lock()
             .unwrap()
             .iter()
@@ -467,6 +478,16 @@ impl ScriptedPushRelayClient {
     fn zero_ack_next_publish(&self) {
         self.zero_ack_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_publishes_as_unavailable(&self) {
+        self.fail_publish_unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn allow_publishes(&self) {
+        self.fail_publish_unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn fail_publishes_of_kind(&self, kind: u64) {
@@ -661,6 +682,27 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         event: &NostrTransportEvent,
         _required_acks: usize,
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        self.attempted_events.lock().unwrap().push(event.clone());
+        if self
+            .fail_publish_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
+                cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                    "relay unavailable",
+                    endpoints
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            endpoint,
+                            reason: "relay unavailable".into(),
+                            kind: cgka_traits::TransportEndpointFailureKind::RetryableUnavailable,
+                            rejection_category: None,
+                        })
+                        .collect(),
+                ),
+            ));
+        }
         let block_counted_publish = self
             .block_publish_count
             .fetch_update(
@@ -11541,7 +11583,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
 /// The swept row's terminal outcome is asserted where it is stored, on the row
 /// itself. #1384 deliberately demotes a failed local send out of the chat
 /// preview ("keep failed local sends visible without letting them pin chat
-/// previews", `CHAT_LIST_PREVIEW_ORDER_DESC` in `storage-sqlite/src/chat_list.rs`),
+/// previews", `chat_list_preview_order_desc` in `storage-sqlite/src/chat_list.rs`),
 /// so once a send that did reach the relay exists the preview falls back to it
 /// rather than rendering the swept row's `Failed`. That fallback is asserted
 /// here too, because it is the same thing this test guards: after the sweep
@@ -13480,6 +13522,291 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum MixedPublishObservation {
+    DirectSend,
+    DirectSendCurrentFailed,
+    Drained,
+    Scheduled,
+    Retry,
+}
+
+async fn assert_mixed_publish_batch_finalizes_successful_message(
+    observation: MixedPublishObservation,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://mixed-publish.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("mixed publish", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let app_event_id = "successful-app-message";
+    let failed_app_event_id = "failed-app-message";
+    let local_account_id_hex = account.account_id_hex;
+
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: app_event_id.to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: local_account_id_hex.clone(),
+            plaintext: "successful sibling publish".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(10),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: failed_app_event_id.to_owned(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: local_account_id_hex,
+            plaintext: "failed sibling publish".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(11),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+
+    let published_message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
+    let failed_message_id = cgka_traits::MessageId::new(vec![0xee; 32]);
+    let retention = AppMessageRetentionDecision::new(10, 0);
+    let effects = marmot_account::AccountDeviceEffects {
+        published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: app_event_id.to_owned(),
+            message_id: published_message_id.clone(),
+            source_epoch: cgka_traits::EpochId(1),
+            retention,
+        }],
+        failures: vec![marmot_account::PublishFailure {
+            message_id: failed_message_id.clone(),
+            reason: "unrelated sibling publish failed".to_owned(),
+        }],
+        failed_app_messages: vec![marmot_account::FailedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: failed_app_event_id.to_owned(),
+            message_id: failed_message_id,
+            reason: "unrelated sibling publish failed".to_owned(),
+        }],
+        ..Default::default()
+    };
+
+    let result = match observation {
+        MixedPublishObservation::DirectSend => client
+            .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, app_event_id)
+            .await
+            .and_then(|()| {
+                let updates = client.finalize_published_app_message_source_retention(&effects)?;
+                client.pending_projection_updates.extend(updates);
+                Ok(SyncSummary::default())
+            }),
+        MixedPublishObservation::DirectSendCurrentFailed => client
+            .observe_recovery_evidence_then_gate_send_publish(
+                &effects,
+                &group_id,
+                "failed-current-message",
+            )
+            .await
+            .map(|()| SyncSummary::default()),
+        MixedPublishObservation::Drained => client.observe_drained_session_events(&effects).await,
+        MixedPublishObservation::Scheduled => {
+            client
+                .observe_scheduled_convergence_effects(&group_id, &effects)
+                .await
+        }
+        MixedPublishObservation::Retry => client
+            .observe_convergence_retry_effects(&group_id, &effects)
+            .map(|_| SyncSummary::default()),
+    };
+    if matches!(observation, MixedPublishObservation::DirectSend) {
+        assert!(
+            result.is_ok(),
+            "an unrelated sibling failure must not fail the current delivered send"
+        );
+    } else {
+        assert!(
+            result.is_err(),
+            "the unrelated hard failure must still surface to aggregate observers"
+        );
+    }
+    assert_eq!(
+        client.take_pending_projection_updates().len(),
+        2,
+        "the delivered and failed sibling updates must remain available for runtime broadcast"
+    );
+
+    let row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == app_event_id)
+        .expect("successful local message remains in the timeline");
+    assert_eq!(
+        row.source_message_id_hex,
+        Some(hex::encode(published_message_id.as_slice())),
+        "the successful sibling must leave Sending before the batch errors"
+    );
+    assert_eq!(row.source_epoch, Some(1));
+    assert_eq!(row.retention_seconds, Some(retention.retention_seconds));
+    let failed_row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == failed_app_event_id)
+        .expect("failed sibling remains visible in the timeline");
+    assert_eq!(
+        failed_row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "a terminally failed sibling must leave Sending without failing the delivered current send"
+    );
+}
+
+#[tokio::test]
+async fn direct_send_mixed_batch_preserves_the_current_delivered_message() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::DirectSend)
+        .await;
+}
+
+#[tokio::test]
+async fn direct_send_mixed_batch_finalizes_successful_sibling_before_current_error() {
+    assert_mixed_publish_batch_finalizes_successful_message(
+        MixedPublishObservation::DirectSendCurrentFailed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn drained_mixed_publish_batch_finalizes_success_before_failure() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Drained).await;
+}
+
+#[tokio::test]
+async fn scheduled_mixed_publish_batch_finalizes_success_before_failure() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Scheduled)
+        .await;
+}
+
+#[tokio::test]
+async fn retry_mixed_publish_batch_finalizes_success_before_failure() {
+    assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Retry).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn published_message_acknowledgement_failure_retries_cleanup_without_republishing() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let config = MarmotAppConfig::default().with_dev_fail_published_app_message_acknowledgement();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://ack-failure.example".to_owned(),
+        config,
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("acknowledgement failure", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let publish_attempts_before = relay.attempted_event_ids().len();
+
+    let summary = client
+        .send(&group_id, b"delivery survives cleanup failure")
+        .await
+        .expect("cleanup failure must not hide an accepted message");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    let app_event_id = summary.message_ids[0].clone();
+    assert_eq!(
+        client.runtime.session().outbound_fanouts().unwrap().len(),
+        1,
+        "the accepted fanout must remain durable after the injected acknowledgement failure"
+    );
+    assert!(
+        client.take_pending_convergence_groups().contains(&group_id),
+        "acknowledgement failure must create its own cleanup scheduling edge"
+    );
+    assert!(matches!(
+        client.convergence_schedule_state(&group_id).unwrap(),
+        ConvergenceScheduleState::PendingOutbound {
+            retry_after_ms: None
+        }
+    ));
+
+    client
+        .retry_group_convergence(&group_id)
+        .await
+        .expect("the autonomous cleanup replay must succeed after the one-shot fault");
+    assert!(
+        client
+            .runtime
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .is_empty(),
+        "the replayed publication metadata must be acknowledged and retired"
+    );
+    assert_eq!(
+        relay.attempted_event_ids().len(),
+        publish_attempts_before + 1,
+        "cleanup retry must not republish the already-accepted network event"
+    );
+
+    let row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|message| message.message_id_hex == app_event_id)
+        .expect("the finalized local message remains in the timeline");
+    assert!(row.source_message_id_hex.is_some());
+}
+
 /// A resource refusal carried by a host-requested convergence retry must arm
 /// epoch-gap recovery even when that same pass's publish check fails it.
 ///
@@ -13575,7 +13902,7 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
     let result = client
-        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, "current-send")
         .await;
 
     assert!(
@@ -13615,7 +13942,7 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
 
     let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
     let result = client
-        .observe_recovery_evidence_then_gate_send_publish(&effects)
+        .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, "current-send")
         .await;
 
     assert!(
@@ -15189,6 +15516,515 @@ async fn a_send_that_reaches_the_transport_reports_published() {
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::Published,
         "the message reached the transport, so nothing is being held"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-recovery.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("sender").await.unwrap();
+    let group_id = setup_client
+        .create_group("send recovery", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+
+    let summary = runtime
+        .send_message("sender", &group_id, b"recover exact event".to_vec())
+        .await
+        .expect("a temporary transport failure must retain the send");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let failed_event_id = relay
+        .attempted_event_ids()
+        .get(attempts_before)
+        .cloned()
+        .expect("the initial transport attempt must expose its signed event id");
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app
+        .timeline_messages_with_query(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.messages.len(), 1);
+    assert!(pending.messages[0].source_message_id_hex.is_none());
+    assert!(pending.messages[0].invalidation_status.is_none());
+
+    relay.allow_publishes();
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "sender",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages[0].source_message_id_hex.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovery.is_ok(),
+        "the retained send must publish promptly after connectivity returns; attempts={:?}; published={:?}",
+        relay.attempted_event_ids(),
+        relay.published_event_ids()
+    );
+
+    let recovered = app
+        .timeline_messages_with_query(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        recovered.messages[0].source_message_id_hex.as_deref(),
+        Some(failed_event_id.as_str()),
+        "recovery must reuse the exact signed transport event"
+    );
+    assert_eq!(
+        relay
+            .published_event_ids()
+            .iter()
+            .filter(|event_id| *event_id == &failed_event_id)
+            .count(),
+        1,
+        "the retained event must be accepted exactly once"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://send-recovery-wake.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("sender").await.unwrap();
+    let group_id = setup_client
+        .create_group("send recovery wake", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+
+    for plaintext in ["first wake retained send", "second wake retained send"] {
+        let summary = runtime
+            .send_message("sender", &group_id, plaintext.as_bytes().to_vec())
+            .await
+            .expect("a temporary transport failure must retain the send");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
+    }
+    let failed_ids = relay.attempted_event_ids()[attempts_before..].to_vec();
+    assert_eq!(failed_ids.len(), 2);
+
+    relay.allow_publishes();
+    runtime
+        .notify_connectivity_restored()
+        .await
+        .expect("the host connectivity signal must reach every account worker");
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    tokio::time::timeout(std::time::Duration::from_millis(750), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "sender",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 2
+                && timeline
+                    .messages
+                    .iter()
+                    .all(|message| message.source_message_id_hex.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("connectivity recovery must not wait for the normal 1.1 second convergence timer");
+
+    let published_in_order = relay
+        .published_event_ids()
+        .into_iter()
+        .filter(|event_id| failed_ids.contains(event_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        published_in_order, failed_ids,
+        "one recovery wake must finalize retained sends once and in order"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://reconnect-send-recovery.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("sender").await.unwrap();
+    let group_id = setup_client
+        .create_group("reconnect send recovery", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+    let summary = runtime
+        .send_message("sender", &group_id, b"retained across reconnect".to_vec())
+        .await
+        .expect("a temporary transport failure must retain the send");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let failed_event_id = relay.attempted_event_ids()[attempts_before].clone();
+
+    relay.allow_publishes();
+    runtime
+        .shared_services()
+        .relay_plane()
+        .simulate_notification_recovery_for_test(1);
+    let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match runtime.unhydrated_group_count_for_test("sender").await {
+            Err(AppError::TransportClosed) => break,
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < backoff_deadline,
+            "account worker did not enter reconnect backoff"
+        );
+    }
+
+    runtime
+        .notify_connectivity_restored()
+        .await
+        .expect("the reconnecting worker must retain the connectivity wake");
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    tokio::time::timeout(Duration::from_millis(750), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "sender",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 1 && timeline.messages[0].source_message_id_hex.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retained connectivity wake must retry before the normal timer");
+
+    assert_eq!(
+        relay
+            .published_event_ids()
+            .iter()
+            .filter(|event_id| *event_id == &failed_event_id)
+            .count(),
+        1,
+        "reconnect recovery must accept the exact retained event once"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn eventless_drain_projects_every_retained_send_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://eventless-drain.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("sender").await.unwrap();
+    let group_id = client.create_group("eventless drain", &[]).await.unwrap();
+    relay.fail_publishes_as_unavailable();
+
+    for plaintext in ["first eventless retained", "second eventless retained"] {
+        let summary = client
+            .send_with_local_projection(&group_id, plaintext.as_bytes(), |_| {})
+            .await
+            .expect("a temporary transport failure must retain the send");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
+    }
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = app
+        .timeline_messages_with_query(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.messages.len(), 2);
+    assert!(
+        pending
+            .messages
+            .iter()
+            .all(|message| message.source_message_id_hex.is_none())
+    );
+
+    relay.allow_publishes();
+    assert_eq!(
+        client
+            .note_connectivity_restored()
+            .expect("the connectivity edge must wake exact unavailable fanouts"),
+        2
+    );
+    let summary = client
+        .drain_pending_session_events()
+        .await
+        .expect("the eventless drain must resume the durable fanouts");
+    assert_eq!(
+        summary.projection_updates.len(),
+        2,
+        "both pending-to-sent transitions must reach runtime subscribers"
+    );
+    assert!(
+        client
+            .runtime
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .is_empty(),
+        "durably projected publications must acknowledge and retire their recovery fanouts"
+    );
+
+    let recovered = app
+        .timeline_messages_with_query(
+            "sender",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(recovered.messages.len(), 2);
+    assert!(
+        recovered
+            .messages
+            .iter()
+            .all(|message| message.source_message_id_hex.is_some()),
+        "eventless drain publication must persist every pending-to-sent transition"
+    );
+}
+
+#[tokio::test]
+async fn two_unavailable_sends_retry_once_in_order_after_transport_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("sender")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://ordered-recovery.example")
+        .with_test_relay_client(relay.clone());
+    let mut setup_client = app.client("sender").await.unwrap();
+    let group_id = setup_client
+        .create_group("ordered recovery", &[])
+        .await
+        .unwrap();
+    drop(setup_client);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+
+    for plaintext in ["first retained", "second retained"] {
+        let summary = runtime
+            .send_message("sender", &group_id, plaintext.as_bytes().to_vec())
+            .await
+            .expect("each temporary failure must remain accepted");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
+    }
+    let failed_ids = relay.attempted_event_ids()[attempts_before..].to_vec();
+    assert_eq!(failed_ids.len(), 2);
+
+    relay.allow_publishes();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        loop {
+            let timeline = app
+                .timeline_messages_with_query(
+                    "sender",
+                    TimelineMessageQuery {
+                        group_id_hex: Some(group_id_hex.clone()),
+                        ..TimelineMessageQuery::default()
+                    },
+                )
+                .unwrap();
+            if timeline.messages.len() == 2
+                && timeline
+                    .messages
+                    .iter()
+                    .all(|message| message.source_message_id_hex.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("one recovered drain must finalize both retained sends");
+
+    let published_in_order = relay
+        .published_event_ids()
+        .into_iter()
+        .filter(|event_id| failed_ids.contains(event_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        published_in_order, failed_ids,
+        "recovery must accept each exact event once in original send order"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let invited = home.create_account("invited").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://invite-recovery.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("sender", "invite recovery", &[], None)
+        .await
+        .unwrap();
+
+    let attempts_before = relay.attempted_event_ids().len();
+    relay.fail_publishes_as_unavailable();
+    let summary = runtime
+        .invite_members("sender", &group_id, &[invited.account_id_hex])
+        .await
+        .expect("a temporary invite publish failure must retain the exact commit");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let failed_commit_id = relay
+        .attempted_event_ids()
+        .get(attempts_before)
+        .cloned()
+        .expect("the invite commit must reach the transport boundary");
+
+    relay.allow_publishes();
+    runtime
+        .notify_connectivity_restored()
+        .await
+        .expect("the host connectivity signal must wake the retained invite");
+    // Keep the end-to-end allowance below the five-second unavailable-target
+    // backoff while leaving enough headroom for MLS and SQLite work on a busy
+    // CI runner. The scheduler's immediate deadline reset is covered
+    // deterministically in `connectivity_restore_wakes_pending_outbound_before_durable_cutoff`.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if relay
+                .published_event_ids()
+                .iter()
+                .any(|event_id| event_id == &failed_commit_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retained invite commit must finalize without waiting for its retry timer");
+
+    assert_eq!(
+        runtime
+            .group_members("sender", &group_id)
+            .await
+            .expect("the confirmed group remains readable")
+            .len(),
+        2
+    );
+
+    assert_eq!(
+        relay
+            .published_event_ids()
+            .iter()
+            .filter(|event_id| *event_id == &failed_commit_id)
+            .count(),
+        1,
+        "group recovery must accept the original commit exactly once"
     );
 
     runtime.shutdown().await;

@@ -1700,6 +1700,11 @@ impl MarmotApp {
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
+            fail_next_published_app_message_acknowledgement: cfg!(
+                feature = "test-policy-overrides"
+            ) && self
+                .config
+                .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
             checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,

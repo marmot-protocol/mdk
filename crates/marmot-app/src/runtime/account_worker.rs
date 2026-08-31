@@ -102,6 +102,12 @@ pub(crate) enum AccountWorkerCommand {
     CatchUp {
         respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
     },
+    /// The host observed usable connectivity after an outage. Interrupt
+    /// transport-failure backoff for already-durable convergence work; this
+    /// signal never creates or replays application work on its own.
+    ConnectivityRestored {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     /// Startup-coalesced catch-up response held in the same FIFO as deferred
     /// mutations so later live reads cannot bypass those mutations.
     StartupCatchUpResult {
@@ -947,6 +953,7 @@ async fn run_app_runtime_account_worker(
                         account_label: &account_label,
                         shared: &shared,
                         media_http: &media_http,
+                        scheduled_convergence: &mut scheduled_convergence,
                     },
                 )
                 .await;
@@ -1191,6 +1198,7 @@ async fn run_app_runtime_account_worker(
                                             account_label: &account_label,
                                             shared: &shared,
                                             media_http: &media_http,
+                                            scheduled_convergence: &mut scheduled_convergence,
                                         },
                                     )
                                     .await;
@@ -1337,19 +1345,22 @@ async fn run_app_runtime_account_worker(
                                     _ = &mut retry_delay => break,
                                     command = commands.recv() => {
                                         match command {
-                                            Some(command @ AccountWorkerCommand::CatchUp { .. }) => {
-                                                // A host connectivity-restored edge is the one
-                                                // command that is meaningful without an engine
-                                                // session: retain its response and use it to end
-                                                // only this stale sleep. Coalesce an already
-                                                // queued burst into the same reopen attempt; new
-                                                // signals can still interrupt later sleeps, so
-                                                // extra attempts remain bounded by host signal
-                                                // rate while the network stays unavailable.
+                                            Some(
+                                                command @ (AccountWorkerCommand::CatchUp { .. }
+                                                | AccountWorkerCommand::ConnectivityRestored { .. }),
+                                            ) => {
+                                                // Host recovery commands are meaningful without
+                                                // an engine session: retain their responses and use
+                                                // them to end only this stale sleep. Coalesce an
+                                                // already queued burst into the same reopen attempt;
+                                                // new signals can still interrupt later sleeps, so
+                                                // extra attempts remain bounded by host signal rate
+                                                // while the network stays unavailable.
                                                 pending.push_back(command);
                                                 while let Ok(command) = commands.try_recv() {
                                                     match command {
-                                                        command @ AccountWorkerCommand::CatchUp { .. } => {
+                                                        command @ (AccountWorkerCommand::CatchUp { .. }
+                                                        | AccountWorkerCommand::ConnectivityRestored { .. }) => {
                                                             pending.push_back(command);
                                                         }
                                                         command => drop(command),
@@ -2529,6 +2540,7 @@ struct AccountWorkerCommandContext<'a> {
     account_label: &'a str,
     shared: &'a RuntimeSharedServices,
     media_http: &'a MediaHttpContext,
+    scheduled_convergence: &'a mut ScheduledConvergence,
 }
 
 /// Commands that arrived while a previous handler held `&mut client` stay in
@@ -2550,8 +2562,14 @@ async fn handle_account_worker_command(
         account_label,
         shared,
         media_http,
+        scheduled_convergence,
     } = context;
     match command {
+        AccountWorkerCommand::ConnectivityRestored { respond } => {
+            let result = client.note_connectivity_restored().map(|_| ());
+            scheduled_convergence.wake_after_connectivity_restored();
+            let _ = respond.send(result);
+        }
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
             let _ = respond.send(());
         }
@@ -4108,17 +4126,24 @@ impl ScheduledConvergence {
             ConvergenceScheduleState::PendingUnopenable => {
                 self.schedule_unsettled_groups([group_id.clone()]);
             }
-            ConvergenceScheduleState::PendingOutbound => {
+            ConvergenceScheduleState::PendingOutbound { retry_after_ms } => {
                 // A waiting outbound queue keeps the wakeup armed on the
-                // normal delay but is not unsettled convergence: it never
-                // feeds the re-arm cap, so a healthy queue cannot be demoted
-                // to error backoff (transport failures reach backoff through
-                // the sync/drain error paths instead). It also clears the
-                // counter: this state means pending inputs are gone, so any
-                // prior unopenable streak genuinely ended.
+                // durable fanout's exact cutoff (or the normal delay for
+                // queued/local-only work) but is not unsettled convergence:
+                // it never feeds the re-arm cap. It also clears the counter:
+                // this state means pending inputs are gone, so any prior
+                // unopenable streak genuinely ended.
                 self.retry_attempts.remove(group_id);
                 self.unsettled_rearm_attempts.remove(group_id);
-                self.arm_no_later(group_id.clone(), TokioInstant::now() + self.normal_delay());
+                let delay = retry_after_ms.map_or_else(
+                    || self.normal_delay(),
+                    |remaining_ms| {
+                        Duration::from_millis(remaining_ms)
+                            .max(MIN_CONVERGENCE_SETTLEMENT_DELAY)
+                            .saturating_add(self.test_delay)
+                    },
+                );
+                self.arm_no_later(group_id.clone(), TokioInstant::now() + delay);
                 self.reset_timer_to_earliest();
             }
         }
@@ -4152,6 +4177,24 @@ impl ScheduledConvergence {
             let group_delay = retry_delay_for_attempt(*attempts);
             self.arm_no_later(group_id, now + group_delay);
         }
+        self.reset_timer_to_earliest();
+    }
+
+    /// A host-provided usable-connectivity edge invalidates transport-failure
+    /// backoff. Wake every already-scheduled group now; an in-window
+    /// convergence pass will simply re-arm its true cutoff, while pending
+    /// outbound work gets an immediate chance to drain. Reset only error
+    /// retries so a relay that is still reconnecting starts again from the
+    /// short backoff instead of returning directly to the 60-second cap.
+    fn wake_after_connectivity_restored(&mut self) {
+        if self.deadlines.is_empty() {
+            return;
+        }
+        let now = TokioInstant::now();
+        self.deadlines
+            .values_mut()
+            .for_each(|deadline| *deadline = now);
+        self.retry_attempts.clear();
         self.reset_timer_to_earliest();
     }
 
@@ -5378,6 +5421,7 @@ mod tests {
             worker_lifetime: media_http_worker_lifetime,
         };
         let (mut unused_commands, mut unused_pending) = unused_account_worker_command_io();
+        let mut scheduled_convergence = ScheduledConvergence::new(Duration::ZERO);
         handle_account_worker_command(
             &mut client,
             AccountWorkerCommand::RepairFullHistory { respond },
@@ -5390,6 +5434,7 @@ mod tests {
                 account_label: "alice",
                 shared: &shared,
                 media_http: &media_http,
+                scheduled_convergence: &mut scheduled_convergence,
             },
         )
         .await;
@@ -5840,7 +5885,12 @@ mod tests {
         let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
 
         for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
-            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingOutbound);
+            scheduled.schedule_after_pass(
+                &group_id,
+                ConvergenceScheduleState::PendingOutbound {
+                    retry_after_ms: None,
+                },
+            );
             scheduled.take_ready();
         }
 
@@ -5855,11 +5905,67 @@ mod tests {
         for _ in 0..=CONVERGENCE_UNSETTLED_MAX_REARMS {
             scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingUnopenable);
             scheduled.take_ready();
-            scheduled.schedule_after_pass(&group_id, ConvergenceScheduleState::PendingOutbound);
+            scheduled.schedule_after_pass(
+                &group_id,
+                ConvergenceScheduleState::PendingOutbound {
+                    retry_after_ms: None,
+                },
+            );
             scheduled.take_ready();
         }
         assert!(!scheduled.unsettled_rearm_attempts.contains_key(&group_id));
         assert!(!scheduled.retry_attempts.contains_key(&group_id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_outbound_arms_at_the_durable_retry_cutoff() {
+        let group_id = test_group_id(16);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let before = TokioInstant::now();
+
+        scheduled.schedule_after_pass(
+            &group_id,
+            ConvergenceScheduleState::PendingOutbound {
+                retry_after_ms: Some(30_000),
+            },
+        );
+
+        assert_eq!(
+            scheduled.deadlines[&group_id],
+            before + Duration::from_secs(30),
+            "a frozen fanout must sleep until its durable cutoff instead of polling every settlement interval"
+        );
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        assert!(
+            scheduled.deadlines[&group_id] > TokioInstant::now(),
+            "the ordinary convergence delay must not wake a backpressured fanout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connectivity_restore_wakes_pending_outbound_before_durable_cutoff() {
+        let group_id = test_group_id(17);
+        let mut scheduled = ScheduledConvergence::new(Duration::from_millis(1_100));
+        let before = TokioInstant::now();
+
+        scheduled.schedule_after_pass(
+            &group_id,
+            ConvergenceScheduleState::PendingOutbound {
+                retry_after_ms: Some(5_000),
+            },
+        );
+        assert_eq!(
+            scheduled.deadlines[&group_id],
+            before + Duration::from_secs(5)
+        );
+
+        scheduled.wake_after_connectivity_restored();
+
+        assert_eq!(
+            scheduled.deadlines[&group_id],
+            TokioInstant::now(),
+            "connectivity recovery must make a backpressured fanout immediately eligible"
+        );
     }
 
     #[tokio::test]
