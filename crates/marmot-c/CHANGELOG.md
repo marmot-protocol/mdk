@@ -29,3 +29,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   ([#1545](https://github.com/marmot-protocol/mdk/pull/1545))
 
   Closes [#328](https://github.com/marmot-protocol/mdk/issues/328)
+- `marmot_user_relay_lists` and `marmot_refresh_user_relay_lists`: read or
+  fetch the NIP-65 and inbox relay lists any account id has published, not
+  just a local account's. Both return `MarmotAccountRelayLists`.
+  ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))

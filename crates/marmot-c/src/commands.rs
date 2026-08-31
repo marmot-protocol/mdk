@@ -868,6 +868,14 @@ c_cmd! {
     /// Refresh the cached profile for an account id from `relays`.
     async fn marmot_refresh_profile(account_id_hex: str, relays/relays_len: str_arr) -> unit = refresh_profile;
 
+    /// Cached NIP-65 and inbox relay lists for any account id; no network.
+    /// Free with `marmot_account_relay_lists_free`.
+    sync fn marmot_user_relay_lists(account_id_hex: str) -> rec(MarmotAccountRelayLists) = user_relay_lists;
+
+    /// Fetch an account's published relay lists from `relays`, updating
+    /// the cache. Free with `marmot_account_relay_lists_free`.
+    async fn marmot_refresh_user_relay_lists(account_id_hex: str, relays/relays_len: str_arr) -> rec(MarmotAccountRelayLists) = refresh_user_relay_lists;
+
     /// The account ids this account follows (NIP-02). Free with
     /// `marmot_string_list_free`.
     sync fn marmot_account_follows(account_ref: str) -> rec(MarmotStringList) = account_follows;
