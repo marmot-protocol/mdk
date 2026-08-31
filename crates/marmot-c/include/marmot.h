@@ -5019,6 +5019,36 @@ MarmotStatus marmot_refresh_profile(const struct MarmotClient *client,
                                     uintptr_t relays_len);
 
 /**
+ * Cached NIP-65 and inbox relay lists for any account id; no network.
+ * Free with `marmot_account_relay_lists_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_user_relay_lists(const struct MarmotClient *client,
+                                     const char *account_id_hex,
+                                     struct MarmotAccountRelayLists **out);
+
+/**
+ * Fetch an account's published relay lists from `relays`, updating
+ * the cache. Free with `marmot_account_relay_lists_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_refresh_user_relay_lists(const struct MarmotClient *client,
+                                             const char *account_id_hex,
+                                             const char *const *relays,
+                                             uintptr_t relays_len,
+                                             struct MarmotAccountRelayLists **out);
+
+/**
  * The account ids this account follows (NIP-02). Free with
  * `marmot_string_list_free`.
  *

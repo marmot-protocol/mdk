@@ -10,7 +10,7 @@ use crate::conversions::{
 use crate::errors::MarmotKitError;
 use crate::markdown::{self, MarkdownDocumentFfi};
 use crate::subscriptions::UserSearchSubscription;
-use crate::{Marmot, endpoints};
+use crate::{Marmot, conversions, endpoints};
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
@@ -115,6 +115,35 @@ impl Marmot {
         Ok(())
     }
 
+    /// Cached NIP-65 and inbox relay lists for any account id — no network.
+    /// An account with nothing cached yet returns an empty status with both
+    /// kinds in `missing` rather than erroring; call
+    /// `refresh_user_relay_lists` to fetch.
+    pub fn user_relay_lists(
+        &self,
+        account_id_hex: String,
+    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
+        Ok(self
+            .app
+            .account_relay_list_status_for_account_id(&account_id_hex)?
+            .into())
+    }
+
+    /// Fetch an account's published NIP-65 and inbox relay lists from
+    /// `relays`, updating the cache. An account with nothing published
+    /// reports both kinds in `missing` rather than erroring.
+    pub async fn refresh_user_relay_lists(
+        &self,
+        account_id_hex: String,
+        relays: Vec<String>,
+    ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
+        Ok(self
+            .app
+            .fetch_account_relay_list_status_for_account_id(&account_id_hex, endpoints(&relays))
+            .await?
+            .into())
+    }
+
     /// Search the searcher's web of trust, streaming matches as each radius
     /// resolves.
     ///
@@ -192,6 +221,79 @@ mod tests {
         })
         .await
         .expect("generated identity must become network-ready");
+    }
+
+    #[test]
+    fn user_relay_lists_cached_path_reads_without_network() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+
+        // Valid but unknown id: empty status reporting both kinds missing,
+        // not an error. The relay URL above is never dialed.
+        let unknown = format!("{:064x}", 47);
+        let status = kit.user_relay_lists(unknown).expect("unknown id");
+        assert!(!status.complete);
+        assert_eq!(status.missing.len(), 2);
+        assert!(status.nip65.relays.is_empty());
+        assert!(status.inbox.relays.is_empty());
+
+        let error = kit
+            .user_relay_lists("not-a-public-key".to_owned())
+            .expect_err("malformed id");
+        assert!(matches!(error, MarmotKitError::InvalidIdentity { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn user_relay_list_bindings_cover_published_missing_and_invalid_ids() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relays(root.path(), vec![relay_url.clone()]);
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let endpoint = TransportEndpoint(relay_url.clone());
+        let account = kit
+            .runtime
+            .create_identity(AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: false,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("create identity");
+        let account_id_hex = account.account.account_id_hex;
+        wait_for_network_ready(&kit.runtime, &account_id_hex).await;
+
+        let fetched = kit
+            .refresh_user_relay_lists(account_id_hex.clone(), vec![relay_url.clone()])
+            .await
+            .expect("fetch published lists");
+        assert!(fetched.complete);
+        assert!(!fetched.nip65.relays.is_empty());
+        assert!(!fetched.inbox.relays.is_empty());
+
+        let cached = kit
+            .user_relay_lists(account_id_hex)
+            .expect("cached read after fetch");
+        assert!(cached.complete);
+
+        let unknown = format!("{:064x}", 47);
+        let absent = kit
+            .refresh_user_relay_lists(unknown, vec![relay_url])
+            .await
+            .expect("unpublished id reports missing, not error");
+        assert!(!absent.complete);
+        assert_eq!(absent.missing.len(), 2);
+
+        let error = kit
+            .refresh_user_relay_lists("not-a-public-key".to_owned(), Vec::new())
+            .await
+            .expect_err("malformed id");
+        assert!(matches!(error, MarmotKitError::InvalidIdentity { .. }));
     }
 
     #[test]
