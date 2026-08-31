@@ -1002,8 +1002,11 @@ impl AccountDeviceSession {
     ///
     /// A host uses this narrower operation when an older durable transport
     /// fanout still blocks newer user-authored sends. Protocol settlement,
-    /// epoch progression, and fork healing remain live while queued work stays
-    /// behind the fanout ordering barrier.
+    /// epoch progression, and fork healing remain live while queued outbound
+    /// intents, pending disband work, and drain maintenance (including a due
+    /// self-remove auto-commit) stay behind the fanout ordering barrier. That
+    /// deferral can remain unbounded while the oldest fanout has an outstanding
+    /// target.
     pub async fn advance_convergence_inputs(
         &mut self,
         group_id: &GroupId,

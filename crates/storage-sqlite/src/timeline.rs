@@ -1244,8 +1244,8 @@ fn retain_pruned_chat_activity_tx(
     // Every id in this set was selected from `app_events` earlier in the
     // caller's same IMMEDIATE transaction, and retention runs before the
     // source rows are scrubbed or deleted. Source-row existence is therefore
-    // an invariant here; the inner join makes a violation visible instead of
-    // silently treating it like an orphan-tolerant read.
+    // an invariant here, so an inner join is intentional rather than an
+    // orphan-tolerant read.
     let sql = format!(
         "SELECT timeline.timeline_at,
                 CASE

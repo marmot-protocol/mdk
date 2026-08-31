@@ -544,6 +544,10 @@ async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
     let newer = OutboundFanout::stage(make_request(2), None, None, 100_001).unwrap();
     alice.put_outbound_fanout(&older).unwrap();
     alice.put_outbound_fanout(&newer).unwrap();
+    let convergence_delay = alice
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+        .expect("buffered commit must open a convergence pass");
 
     let adapter = RecordingAdapter::default();
     let wall = Arc::new(TestWallClock::new(100));
@@ -564,7 +568,7 @@ async fn deferred_fanout_blocks_newer_sends_but_not_convergence_settlement() {
         Arc::new(TestRandom::new(0)),
     );
 
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    tokio::time::sleep(Duration::from_millis(convergence_delay.saturating_add(1))).await;
 
     let effects = runtime.advance_convergence(&group_id).await.unwrap();
 
