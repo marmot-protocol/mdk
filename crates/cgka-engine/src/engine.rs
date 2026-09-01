@@ -318,7 +318,9 @@ pub struct Engine<S: StorageProvider> {
     /// it was built from. A convergence drain runs the pass up to 16× and
     /// previously re-hex-encoded the whole (up to 100k-entry) set every pass;
     /// this rebuilds only when the set actually changed. `None` until first use.
-    pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
+    /// `Arc` so a cache hit hands out the snapshot without a deep copy.
+    pub(crate) seen_message_ids_hex_cache:
+        Option<(u64, std::sync::Arc<std::collections::BTreeSet<String>>)>,
 
     /// Per-group deferred-peel performance state: aggregate sweep count and
     /// cached row-count/cap bookkeeping. Correctness-critical completion and

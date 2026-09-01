@@ -37,7 +37,6 @@ use crate::canonicalization::{
     CanonicalizationState, ConvergenceStatus, DeferredMessage, DeferredMessageReason,
     DroppedMessage, DroppedMessageReason, InvalidatedAppMessageReason, MaterializedCandidate,
     MessageKind, OutboundIntent, PeeledMessage, PeeledMessageKind,
-    canonicalize_with_materialized_candidates,
 };
 use crate::convergence::BranchCandidate;
 
@@ -240,12 +239,17 @@ pub(crate) struct ReplayProfilePolicy {
     pub(crate) reject_legacy_group_additions: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredCanonicalizationOptions<'a> {
     pub(crate) replay_profile: ReplayProfilePolicy,
     pub(crate) admitted_message_ids: Option<&'a HashSet<MessageId>>,
     pub(crate) admit_app_witnesses: bool,
     pub(crate) replay_probe_budget_override: Option<u64>,
+    /// Engine-path seen-id snapshot, shared instead of copied into
+    /// `CanonicalizationState.seen_message_ids` (up to 100k ids, up to 16
+    /// canonicalizations per drain). `None` for public callers, whose state
+    /// carries its own owned set.
+    pub(crate) shared_seen_message_ids: Option<std::sync::Arc<BTreeSet<String>>>,
 }
 
 impl Default for StoredCanonicalizationOptions<'_> {
@@ -255,6 +259,7 @@ impl Default for StoredCanonicalizationOptions<'_> {
             admitted_message_ids: None,
             admit_app_witnesses: true,
             replay_probe_budget_override: None,
+            shared_seen_message_ids: None,
         }
     }
 }
@@ -262,6 +267,7 @@ impl Default for StoredCanonicalizationOptions<'_> {
 #[derive(Clone, Debug)]
 struct StoredOpenMlsCanonicalizationWork {
     state: CanonicalizationState,
+    shared_seen_message_ids: Option<std::sync::Arc<BTreeSet<String>>>,
     commit_messages: Vec<StoredCommitMessage>,
     pending_messages: Vec<TransportMessage>,
     /// App ids in `pending_messages` re-admitted for witness scoring only (stored
@@ -950,7 +956,10 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
     canonicalize_openmls_batch_prevalidated(
         storage,
         group_id,
-        batch,
+        SharedSeenBatch {
+            batch,
+            shared_seen_message_ids: None,
+        },
         &PrevalidatedOwnCommits::default(),
         ReplayProfilePolicy::default(),
         true,
@@ -958,18 +967,26 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
     )
 }
 
+/// [`OpenMlsCanonicalizationBatch`] plus the engine-path shared seen-id
+/// snapshot (see `StoredCanonicalizationOptions::shared_seen_message_ids`);
+/// the batch type itself is public and must not grow the field.
+struct SharedSeenBatch {
+    batch: OpenMlsCanonicalizationBatch,
+    shared_seen_message_ids: Option<std::sync::Arc<BTreeSet<String>>>,
+}
+
 fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
-    batch: OpenMlsCanonicalizationBatch,
+    batch: SharedSeenBatch,
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
     admit_app_witnesses: bool,
     replay_budget: &mut ReplayBudget,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let candidate_paths = candidate_paths_with_pending_replay_messages(
-        &batch.candidate_paths,
-        &batch.pending_messages,
+        &batch.batch.candidate_paths,
+        &batch.batch.pending_messages,
     )?;
     let materialized = materialize_openmls_candidate_paths_budgeted(
         storage,
@@ -990,10 +1007,14 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
 /// `branch_id`); the caller guarantees this only on the app-free reuse path.
 fn canonicalize_openmls_batch_with_materialized(
     group_id: &GroupId,
-    batch: OpenMlsCanonicalizationBatch,
+    batch: SharedSeenBatch,
     materialized: Vec<OpenMlsMaterializedCandidate>,
     admit_app_witnesses: bool,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+    let SharedSeenBatch {
+        batch,
+        shared_seen_message_ids,
+    } = batch;
     let proposal_id_by_ref = proposal_id_by_ref(&materialized);
     let materialized_candidates: Vec<_> = materialized
         .iter()
@@ -1019,24 +1040,16 @@ fn canonicalize_openmls_batch_with_materialized(
         policy: batch.policy,
         now_ms: batch.now_ms,
     };
-    #[cfg(feature = "test-policy-overrides")]
-    if !admit_app_witnesses {
-        return Ok(
-            crate::canonicalization::canonicalize_with_materialized_candidates_for_test(
-                input,
-                materialized_candidates,
-                false,
-            ),
-        );
-    }
     #[cfg(not(feature = "test-policy-overrides"))]
     debug_assert!(
         admit_app_witnesses,
         "production canonicalization must admit application witnesses"
     );
-    Ok(canonicalize_with_materialized_candidates(
+    Ok(crate::canonicalization::canonicalize_with_shared_seen(
         input,
+        shared_seen_message_ids.as_ref(),
         materialized_candidates,
+        admit_app_witnesses,
     ))
 }
 
@@ -1101,6 +1114,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                 profile_policy,
                 admit_app_witnesses: options.admit_app_witnesses,
                 replay_probe_budget_override: options.replay_probe_budget_override,
+                shared_seen_message_ids: options.shared_seen_message_ids,
             },
         )?;
         append_dropped_messages(&mut result, stale_commit_drops);
@@ -1123,6 +1137,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
             profile_policy,
             admit_app_witnesses: options.admit_app_witnesses,
             replay_probe_budget_override: options.replay_probe_budget_override,
+            shared_seen_message_ids: options.shared_seen_message_ids.clone(),
         },
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
@@ -1481,14 +1496,17 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         path_result.materialized.len(),
         path_result.candidate_paths.len(),
     );
-    let batch = OpenMlsCanonicalizationBatch {
-        state: work.state,
-        candidate_paths: path_result.candidate_paths,
-        pending_messages: work.pending_messages,
-        already_delivered_app_ids: work.already_delivered_app_ids,
-        outbound_intents: work.outbound_intents,
-        policy: work.policy,
-        now_ms: work.now_ms,
+    let batch = SharedSeenBatch {
+        batch: OpenMlsCanonicalizationBatch {
+            state: work.state,
+            candidate_paths: path_result.candidate_paths,
+            pending_messages: work.pending_messages,
+            already_delivered_app_ids: work.already_delivered_app_ids,
+            outbound_intents: work.outbound_intents,
+            policy: work.policy,
+            now_ms: work.now_ms,
+        },
+        shared_seen_message_ids: work.shared_seen_message_ids,
     };
     let mut result = if can_reuse_materialized {
         let mut materialized = path_result.materialized;
