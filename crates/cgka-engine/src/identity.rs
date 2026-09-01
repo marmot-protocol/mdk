@@ -18,6 +18,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Bundle of everything needed to sign + identify the local client.
 pub struct Identity {
@@ -102,8 +103,8 @@ impl Identity {
             credential: credential.into(),
             signature_key: signer.public().into(),
         };
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
             .as_secs();
         let account_identity_proof =

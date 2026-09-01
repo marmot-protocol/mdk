@@ -61,6 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 httpdate = "1.0"
 getrandom = "0.3"
+web-time = "1.1"
 hmac = "0.12"
 libc = "0.2"
 hkdf = "0.12"
