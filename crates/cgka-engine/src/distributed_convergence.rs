@@ -288,19 +288,23 @@ impl<S: StorageProvider> Engine<S> {
     /// re-hex-encoding the whole (up to 100k-entry) set every pass was pure heap
     /// churn. The cache is rebuilt only when the set changed since it was last
     /// encoded, so a settled multi-pass drain encodes it at most once.
-    fn seen_message_ids_hex_for_convergence(&mut self) -> std::collections::BTreeSet<String> {
+    /// Returned behind `Arc`: hit or rebuild, no deep copy of the set.
+    fn seen_message_ids_hex_for_convergence(
+        &mut self,
+    ) -> std::sync::Arc<std::collections::BTreeSet<String>> {
         let generation = self.seen_message_ids.generation();
         if let Some((cached_generation, snapshot)) = &self.seen_message_ids_hex_cache
             && *cached_generation == generation
         {
-            return snapshot.clone();
+            return std::sync::Arc::clone(snapshot);
         }
-        let snapshot: std::collections::BTreeSet<String> = self
-            .seen_message_ids
-            .iter()
-            .map(|message_id| hex::encode(message_id.as_slice()))
-            .collect();
-        self.seen_message_ids_hex_cache = Some((generation, snapshot.clone()));
+        let snapshot: std::sync::Arc<std::collections::BTreeSet<String>> = std::sync::Arc::new(
+            self.seen_message_ids
+                .iter()
+                .map(|message_id| hex::encode(message_id.as_slice()))
+                .collect(),
+        );
+        self.seen_message_ids_hex_cache = Some((generation, std::sync::Arc::clone(&snapshot)));
         snapshot
     }
 

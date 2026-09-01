@@ -5,6 +5,7 @@
 //! materialize the candidate states from stored protocol bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::convergence::{
     AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, ConvergencePolicyError,
@@ -132,7 +133,9 @@ pub struct CanonicalizationState {
     pub current_tip_epoch: u64,
     pub retained_anchor_epoch: u64,
     pub last_convergence_relevant_input_ms: u64,
-    pub seen_message_ids: BTreeSet<String>,
+    // Shared, not owned: the engine's dedup snapshot holds up to 100k ids and
+    // a convergence drain builds this state up to 16 times per drain.
+    pub seen_message_ids: Arc<BTreeSet<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -355,7 +358,10 @@ fn canonicalize_internal(
     admit_app_witnesses: bool,
 ) -> CanonicalizationResult {
     let mut already_seen = Vec::new();
-    let mut observed_ids = input.state.seen_message_ids.clone();
+    // Dedup against the (large, shared) base set by lookup; only ids first
+    // observed in this batch need an owned set.
+    let base_seen_ids = &input.state.seen_message_ids;
+    let mut batch_observed_ids = BTreeSet::new();
     let mut unique_messages = Vec::new();
 
     for message in input.pending_messages.iter() {
@@ -371,7 +377,10 @@ fn canonicalize_internal(
                 ..
             }
         );
-        if !readmitted_witness && !observed_ids.insert(message.message_id.clone()) {
+        if !readmitted_witness
+            && (base_seen_ids.contains(&message.message_id)
+                || !batch_observed_ids.insert(message.message_id.clone()))
+        {
             already_seen.push(AlreadySeen {
                 message_id: message.message_id.clone(),
                 kind: message.kind_name(),

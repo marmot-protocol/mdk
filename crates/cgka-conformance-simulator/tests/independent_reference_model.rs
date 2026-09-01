@@ -152,7 +152,7 @@ fn canonical_input(messages: Vec<PeeledMessage>) -> CanonicalizationInput {
             current_tip_epoch: 3,
             retained_anchor_epoch: 1,
             last_convergence_relevant_input_ms: 0,
-            seen_message_ids: BTreeSet::new(),
+            seen_message_ids: std::sync::Arc::new(BTreeSet::new()),
         },
         pending_messages: messages,
         outbound_intents: Vec::new(),
