@@ -49,7 +49,9 @@ k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
+openmls = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 storage-sqlite = { workspace = true, features = ["storage-format-benchmarks"] }
