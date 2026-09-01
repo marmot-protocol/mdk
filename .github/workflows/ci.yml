@@ -187,6 +187,43 @@ jobs:
       - name: Check all features
         run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --all-features --locked
 
+  rust-wasm-check:
+    name: Rust WASM check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+          cargo --version
+          clang --version
+          clang --print-targets | grep wasm32
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Compile-only regression gate. Browser runtime behavior belongs in
+      # downstream headless-browser acceptance tests.
+      - name: Build browser WASM libraries
+        env:
+          CC_wasm32_unknown_unknown: clang
+        run: |
+          cargo build --locked --target wasm32-unknown-unknown \
+            -p cgka-traits \
+            -p cgka-engine \
+            -p transport-nostr-peeler
+
   rust-clippy:
     name: Rust clippy
     needs: changes
