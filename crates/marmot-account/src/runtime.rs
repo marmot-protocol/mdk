@@ -393,6 +393,15 @@ where
         Ok(self.session.app_component(group_id, component_id)?)
     }
 
+    /// Batched [`Self::app_component`]: one engine state load answers every id.
+    pub fn app_components(
+        &self,
+        group_id: &GroupId,
+        component_ids: &[AppComponentId],
+    ) -> AccountResult<Vec<Option<Vec<u8>>>> {
+        Ok(self.session.app_components(group_id, component_ids)?)
+    }
+
     pub fn safe_export_secret(
         &mut self,
         group_id: &GroupId,

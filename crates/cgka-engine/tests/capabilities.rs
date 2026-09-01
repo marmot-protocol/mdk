@@ -349,6 +349,53 @@ async fn optional_initial_component_state_is_not_a_membership_requirement() {
 }
 
 #[tokio::test]
+async fn batched_app_components_match_per_id_reads() {
+    const ABSENT_COMPONENT: u16 = 0x8102;
+    let mut supported = default_group_components();
+    supported.insert(TEST_APP_COMPONENT);
+    let mut alice = build_engine_with_components(b"alice", supported);
+    let state = vec![0x01, 0x02, 0x03];
+
+    let (group_id, _) = alice
+        .create_group_with_optional_app_components(
+            CreateGroupRequest {
+                name: "batched-reads".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            vec![AppComponentData {
+                component_id: TEST_APP_COMPONENT,
+                data: state,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let ids = [
+        TEST_APP_COMPONENT,
+        ABSENT_COMPONENT,
+        GROUP_PROFILE_COMPONENT_ID,
+    ];
+    let batched = alice.app_components(&group_id, &ids).unwrap();
+    let individual: Vec<_> = ids
+        .iter()
+        .map(|id| alice.app_component(&group_id, *id).unwrap())
+        .collect();
+    assert_eq!(batched, individual);
+    assert!(batched[0].is_some());
+    assert!(batched[1].is_none());
+
+    let unknown = cgka_traits::GroupId::new(vec![0xAB; 16]);
+    assert!(matches!(
+        alice.app_components(&unknown, &ids),
+        Err(EngineError::UnknownGroup(_))
+    ));
+}
+
+#[tokio::test]
 async fn optional_initial_component_state_requires_creator_support() {
     let mut alice = build_engine_with_components(b"alice", default_group_components());
 
