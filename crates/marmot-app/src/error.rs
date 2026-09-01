@@ -56,6 +56,11 @@ pub enum AppError {
     MissingKeyPackage(String),
     #[error("unknown local group")]
     UnknownGroup(String),
+    /// Invite acceptance requires a current, non-terminal membership projection
+    /// that is still waiting for host confirmation. This stable variant lets
+    /// bindings reject stale invite actions without string parsing.
+    #[error("group invite is not pending")]
+    GroupInviteNotPending,
     /// Canonical MLS creation completed, but the host-facing derived row could
     /// not be committed. The group id lets detailed callers refresh instead of
     /// retrying creation and producing a duplicate group.
@@ -233,6 +238,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
+            Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",

@@ -93,6 +93,7 @@ pub enum MarmotStatus {
     GroupUnrecoverableRepairRequired = 58,
     AccountWorkerBusy = 59,
     AccountWorkerResponseTimedOut = 60,
+    GroupInviteNotPending = 61,
 }
 
 thread_local! {
@@ -116,6 +117,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::DuplicateIdentity { .. } => MarmotStatus::DuplicateIdentity,
         MarmotKitError::UnknownAccount { .. } => MarmotStatus::UnknownAccount,
         MarmotKitError::UnknownGroup { .. } => MarmotStatus::UnknownGroup,
+        MarmotKitError::GroupInviteNotPending => MarmotStatus::GroupInviteNotPending,
         MarmotKitError::InvalidHex { .. } => MarmotStatus::InvalidHex,
         MarmotKitError::InvalidIdentity { .. } => MarmotStatus::InvalidIdentity,
         MarmotKitError::MissingKeyPackage { .. } => MarmotStatus::MissingKeyPackage,
@@ -200,6 +202,7 @@ mod tests {
             MarmotKitError::UnknownGroup {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupInviteNotPending,
             MarmotKitError::InvalidHex {
                 details: "d".into(),
             },
