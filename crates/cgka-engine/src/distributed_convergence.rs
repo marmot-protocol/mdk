@@ -1190,6 +1190,10 @@ impl<S: StorageProvider> Engine<S> {
         let retained_anchor_epoch = previous_tip
             .0
             .saturating_sub(policy.convergence.max_rewind_commits);
+        // #636: reuse the cached hex snapshot across the up-to-16 passes of a
+        // convergence drain; it is re-encoded only when the seen set changed,
+        // and shared (never copied) into canonicalization via the options.
+        let shared_seen_message_ids = self.seen_message_ids_hex_for_convergence();
         let state = CanonicalizationState {
             current_tip_epoch: previous_tip.0,
             retained_anchor_epoch,
@@ -1198,9 +1202,7 @@ impl<S: StorageProvider> Engine<S> {
             // membership, not a live re-enumeration, now controls the batch.
             last_convergence_relevant_input_ms: now_ms
                 .saturating_sub(policy.settlement_quiescence_ms),
-            // #636: reuse the cached hex snapshot across the up-to-16 passes of a
-            // convergence drain; it is re-encoded only when the seen set changed.
-            seen_message_ids: self.seen_message_ids_hex_for_convergence(),
+            seen_message_ids: std::collections::BTreeSet::new(),
         };
 
         let max_rewind_commits = policy.convergence.max_rewind_commits;
@@ -1235,6 +1237,7 @@ impl<S: StorageProvider> Engine<S> {
             StoredCanonicalizationOptions {
                 replay_profile: replay_profile_policy,
                 admitted_message_ids: Some(&admitted_message_ids),
+                shared_seen_message_ids: Some(shared_seen_message_ids),
                 admit_app_witnesses: {
                     #[cfg(feature = "test-policy-overrides")]
                     {
@@ -2254,4 +2257,161 @@ fn decode_convergence_policy(
         .validate()
         .map_err(|e| OpenMlsProjectionError::InvalidPolicy(e.to_string()))?;
     Ok(policy)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use cgka_traits::error::PeelerError;
+    use cgka_traits::group_context::GroupContextSnapshot;
+    use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+    use cgka_traits::peeler::TransportPeeler;
+    use cgka_traits::transport::{
+        EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+    };
+    use cgka_traits::types::{MemberId, MessageId};
+    use sha2::{Digest, Sha256};
+
+    struct PassthroughPeeler;
+
+    fn hash_id(bytes: &[u8]) -> MessageId {
+        MessageId::new(Sha256::digest(bytes).to_vec())
+    }
+
+    #[async_trait]
+    impl TransportPeeler for PassthroughPeeler {
+        async fn peel_group_message(
+            &self,
+            msg: &TransportMessage,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<PeeledMessage, PeelerError> {
+            Ok(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::MlsMessage {
+                    bytes: msg.payload.clone(),
+                },
+                origin: msg.clone(),
+            })
+        }
+        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+            Ok(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::Welcome {
+                    bytes: msg.payload.clone(),
+                },
+                origin: msg.clone(),
+            })
+        }
+        async fn wrap_group_message(
+            &self,
+            payload: &EncryptedPayload,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<TransportMessage, PeelerError> {
+            Ok(TransportMessage {
+                id: hash_id(&payload.ciphertext),
+                payload: payload.ciphertext.clone(),
+                timestamp: Timestamp(0),
+                causal_deps: vec![],
+                source: TransportSource("test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![],
+                },
+            })
+        }
+        async fn wrap_welcome(
+            &self,
+            payload: &EncryptedPayload,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            Ok(TransportMessage {
+                id: hash_id(&payload.ciphertext),
+                payload: payload.ciphertext.clone(),
+                timestamp: Timestamp(0),
+                causal_deps: vec![],
+                source: TransportSource("test".into()),
+                envelope: TransportEnvelope::Welcome {
+                    recipient: recipient.clone(),
+                },
+            })
+        }
+    }
+
+    struct TestProofSigner(k256::schnorr::SigningKey);
+
+    impl crate::account_identity_proof::AccountIdentityProofSigner for TestProofSigner {
+        fn sign_account_identity_proof(
+            &self,
+            request: &crate::account_identity_proof::AccountIdentityProofRequest,
+        ) -> Result<[u8; 64], String> {
+            use k256::schnorr::signature::hazmat::PrehashSigner;
+            let signature = self
+                .0
+                .sign_prehash(&request.proof_event_id()?)
+                .map_err(|e| e.to_string())?;
+            Ok(signature.to_bytes())
+        }
+    }
+
+    /// Deterministic, spec-valid x-only secp256k1 signing key.
+    fn signing_key() -> k256::schnorr::SigningKey {
+        let mut counter = 0u64;
+        loop {
+            let mut material = [0u8; 32];
+            let mut hasher = Sha256::new();
+            hasher.update(b"cgka-engine-seen-id-unit-test");
+            hasher.update(counter.to_be_bytes());
+            material.copy_from_slice(&hasher.finalize());
+            if let Ok(sk) = k256::schnorr::SigningKey::from_bytes(&material) {
+                return sk;
+            }
+            counter += 1;
+        }
+    }
+
+    fn test_engine() -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
+        let key = signing_key();
+        let identity = key.verifying_key().to_bytes().to_vec();
+        crate::EngineBuilder::new(storage_sqlite::SqliteAccountStorage::in_memory().unwrap())
+            .legacy_compatibility_profile()
+            .identity(identity)
+            .account_identity_proof_signer(Arc::new(TestProofSigner(key)))
+            .peeler(Box::new(PassthroughPeeler))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn seen_id_snapshot_is_shared_until_the_set_changes() {
+        let mut engine = test_engine();
+        let first_id = MessageId::new(vec![0x11; 32]);
+        engine.seen_message_ids.insert(first_id.clone());
+
+        let first = engine.seen_message_ids_hex_for_convergence();
+        let second = engine.seen_message_ids_hex_for_convergence();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged generation must hand out the same snapshot"
+        );
+        assert!(first.contains(&hex::encode(first_id.as_slice())));
+
+        let second_id = MessageId::new(vec![0x22; 32]);
+        engine.seen_message_ids.insert(second_id.clone());
+        let rebuilt = engine.seen_message_ids_hex_for_convergence();
+        assert!(
+            !Arc::ptr_eq(&first, &rebuilt),
+            "a membership change must re-encode the snapshot"
+        );
+        let expected: std::collections::BTreeSet<String> = [
+            hex::encode(first_id.as_slice()),
+            hex::encode(second_id.as_slice()),
+        ]
+        .into();
+        assert_eq!(*rebuilt, expected);
+    }
 }

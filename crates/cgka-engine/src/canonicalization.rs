@@ -133,9 +133,7 @@ pub struct CanonicalizationState {
     pub current_tip_epoch: u64,
     pub retained_anchor_epoch: u64,
     pub last_convergence_relevant_input_ms: u64,
-    // Shared, not owned: the engine's dedup snapshot holds up to 100k ids and
-    // a convergence drain builds this state up to 16 times per drain.
-    pub seen_message_ids: Arc<BTreeSet<String>>,
+    pub seen_message_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -327,40 +325,51 @@ pub enum CanonicalizationError {
 }
 
 pub fn canonicalize(input: CanonicalizationInput) -> CanonicalizationResult {
-    canonicalize_internal(input, &[], true)
+    canonicalize_internal(input, &[], true, None)
 }
 
 pub fn canonicalize_with_materialized_candidates(
     input: CanonicalizationInput,
     materialized_candidates: Vec<MaterializedCandidate>,
 ) -> CanonicalizationResult {
-    canonicalize_internal(input, &materialized_candidates, true)
+    canonicalize_internal(input, &materialized_candidates, true, None)
 }
 
-/// Canonicalize with an explicit application-witness admission switch.
-///
-/// This is an engine-internal test seam used by the conformance simulator to
-/// compare the complete stored-message engine path with and without the
-/// speculative app-witness ranking term. Production callers always use
-/// [`canonicalize_with_materialized_candidates`].
-#[cfg(feature = "test-policy-overrides")]
-pub(crate) fn canonicalize_with_materialized_candidates_for_test(
+/// Crate-private entry for the engine's stored-message convergence path: the
+/// dedup snapshot holds up to 100k ids and a drain canonicalizes up to 16
+/// times, so the engine hands it in shared (`Arc`) instead of copying it into
+/// `CanonicalizationState.seen_message_ids`, which stays a plain owned set on
+/// the public model type. Both sources are honored: ids in the shared set and
+/// ids in the state's own set dedup identically.
+pub(crate) fn canonicalize_with_shared_seen(
     input: CanonicalizationInput,
+    shared_seen_message_ids: Option<&Arc<BTreeSet<String>>>,
     materialized_candidates: Vec<MaterializedCandidate>,
     admit_app_witnesses: bool,
 ) -> CanonicalizationResult {
-    canonicalize_internal(input, &materialized_candidates, admit_app_witnesses)
+    canonicalize_internal(
+        input,
+        &materialized_candidates,
+        admit_app_witnesses,
+        shared_seen_message_ids.map(Arc::as_ref),
+    )
 }
 
+// `admit_app_witnesses` is the engine-internal test seam the conformance
+// simulator uses (through `canonicalize_with_shared_seen` under
+// `test-policy-overrides`) to compare the stored-message path with and
+// without the speculative app-witness ranking term. Production callers
+// always admit witnesses.
 fn canonicalize_internal(
     input: CanonicalizationInput,
     materialized_candidates: &[MaterializedCandidate],
     admit_app_witnesses: bool,
+    shared_seen_message_ids: Option<&BTreeSet<String>>,
 ) -> CanonicalizationResult {
     let mut already_seen = Vec::new();
-    // Dedup against the (large, shared) base set by lookup; only ids first
-    // observed in this batch need an owned set.
-    let base_seen_ids = &input.state.seen_message_ids;
+    // Dedup against the base sets by lookup; only ids first observed in this
+    // batch need an owned set. The shared set (engine path) and the state's
+    // own set (public callers) are one logical base.
     let mut batch_observed_ids = BTreeSet::new();
     let mut unique_messages = Vec::new();
 
@@ -378,7 +387,8 @@ fn canonicalize_internal(
             }
         );
         if !readmitted_witness
-            && (base_seen_ids.contains(&message.message_id)
+            && (shared_seen_message_ids.is_some_and(|seen| seen.contains(&message.message_id))
+                || input.state.seen_message_ids.contains(&message.message_id)
                 || !batch_observed_ids.insert(message.message_id.clone()))
         {
             already_seen.push(AlreadySeen {

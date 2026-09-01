@@ -45,7 +45,7 @@ fn state(current_tip_epoch: u64, retained_anchor_epoch: u64) -> Canonicalization
         current_tip_epoch,
         retained_anchor_epoch,
         last_convergence_relevant_input_ms: 0,
-        seen_message_ids: std::sync::Arc::new(BTreeSet::new()),
+        seen_message_ids: BTreeSet::new(),
     }
 }
 

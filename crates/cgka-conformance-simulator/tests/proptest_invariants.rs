@@ -428,7 +428,7 @@ fn canonical_state() -> CanonicalizationState {
         current_tip_epoch: 4,
         retained_anchor_epoch: 1,
         last_convergence_relevant_input_ms: 0,
-        seen_message_ids: std::sync::Arc::new(BTreeSet::new()),
+        seen_message_ids: BTreeSet::new(),
     }
 }
 
@@ -727,12 +727,10 @@ proptest! {
 
 fn canonicalization_replay_is_already_seen(case: CanonicalDispositionCase) {
     let messages = build_canonical_messages(&case);
-    let seen_message_ids = std::sync::Arc::new(
-        messages
-            .iter()
-            .map(|message| message.message_id.clone())
-            .collect::<BTreeSet<_>>(),
-    );
+    let seen_message_ids = messages
+        .iter()
+        .map(|message| message.message_id.clone())
+        .collect::<BTreeSet<_>>();
     let observed = canonicalize_with_materialized_candidates(
         CanonicalizationInput {
             state: CanonicalizationState {
@@ -858,7 +856,7 @@ fn canonicalization_quiescence_gate_holds(
             current_tip_epoch: 1,
             retained_anchor_epoch: 1,
             last_convergence_relevant_input_ms: last_input_ms,
-            seen_message_ids: std::sync::Arc::new(BTreeSet::new()),
+            seen_message_ids: BTreeSet::new(),
         },
         pending_messages: vec![commit.clone()],
         outbound_intents: vec![OutboundIntent::SendAppMessage {

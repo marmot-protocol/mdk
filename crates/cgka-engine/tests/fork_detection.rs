@@ -2181,7 +2181,7 @@ async fn own_commit_checkpoint_survives_rival_anchor_overwrite_and_restart() {
             current_tip_epoch: 3,
             retained_anchor_epoch: 0,
             last_convergence_relevant_input_ms: 0,
-            seen_message_ids: std::sync::Arc::new(BTreeSet::new()),
+            seen_message_ids: BTreeSet::new(),
         },
         Vec::new(),
         policy.clone(),

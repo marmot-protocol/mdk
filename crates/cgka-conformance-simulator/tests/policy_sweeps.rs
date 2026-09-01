@@ -14,7 +14,7 @@ fn fixed_input() -> CanonicalizationInput {
             current_tip_epoch: 10,
             retained_anchor_epoch: 5,
             last_convergence_relevant_input_ms: 0,
-            seen_message_ids: std::sync::Arc::new(BTreeSet::new()),
+            seen_message_ids: BTreeSet::new(),
         },
         pending_messages: vec![],
         outbound_intents: vec![],
