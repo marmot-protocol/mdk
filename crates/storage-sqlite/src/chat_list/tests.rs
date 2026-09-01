@@ -1252,17 +1252,18 @@ fn latest_preview_carries_exact_media_and_delivery_projection() {
     );
 
     // A successful retry does clear it. A resend inside the same second mints
-    // the same NIP-01 id, so the send path re-records this very row — but only
-    // after `clear_local_publish_failure`, because the fresh send intent is the
-    // evidence the bare re-record above lacks. The chat row must transition that
-    // exact preview back to delivered rather than waiting for a different
-    // message to replace it.
+    // the same NIP-01 id, so the send path re-records this very row and only
+    // then calls `clear_local_publish_failure` — that order, because the fresh
+    // send intent is the evidence the bare re-record above lacks, and the
+    // tombstone must stand until the revival itself commits. The chat row must
+    // transition that exact preview back to delivered rather than waiting for a
+    // different message to replace it.
+    pending.source_message_id_hex = Some("source-after-retry".to_owned());
+    store.record_app_event(&pending).unwrap();
     store
         .clear_local_publish_failure(GROUP, "pending")
         .unwrap()
         .expect("a retracted local send clears");
-    pending.source_message_id_hex = Some("source-after-retry".to_owned());
-    store.record_app_event(&pending).unwrap();
     let retried = store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()

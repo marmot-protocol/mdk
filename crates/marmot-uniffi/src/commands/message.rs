@@ -47,9 +47,11 @@ impl Marmot {
     /// event is created.
     ///
     /// (A resend after a send that *failed* is still safe and still supported:
-    /// the send path clears that row's `local_publish_failed` retraction before
-    /// re-recording it. This call is for sends that are pending, not failed.) Returns the delivery summary; `published == 0` means
-    /// nothing was pending or publishing is still failing.
+    /// the send path re-records that row and clears its `local_publish_failed`
+    /// retraction. This call is for sends that are pending, not failed.)
+    ///
+    /// Returns the delivery summary; `published == 0` means nothing was pending
+    /// or publishing is still failing.
     pub async fn retry_group_convergence(
         &self,
         account_ref: String,

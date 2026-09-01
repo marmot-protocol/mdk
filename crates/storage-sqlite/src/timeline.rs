@@ -61,6 +61,17 @@ pub const MAX_TIMELINE_LIMIT: usize = 200;
 /// rather than vanishing), and because it is the one reason
 /// [`SqliteAccountStorage::clear_local_publish_failure`] may clear.
 pub const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
+
+/// The one row shape [`SqliteAccountStorage::clear_local_publish_failure`] may
+/// revive, bound to `?1` group id, `?2` message id, `?3` reason. Its early-exit
+/// probe and its UPDATE interpolate this same fragment: the probe decides
+/// whether a revival happens, so a conjunct present in one and not the other
+/// would either skip a legitimate revival or report one that never landed.
+const CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE: &str = "group_id_hex = ?1
+       AND message_id_hex = ?2
+       AND direction = 'sent'
+       AND invalidated = 1
+       AND invalidation_reason = ?3";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
     pub group_id_hex: String,
@@ -586,7 +597,9 @@ impl SqliteAccountStorage {
                     -- send intent reusing the id of a send that failed in the
                     -- same second — and it carries evidence this statement does
                     -- not have. It goes through `clear_local_publish_failure`,
-                    -- which the send path calls before re-recording.
+                    -- which the send path calls immediately after re-recording,
+                    -- so this statement's preserved tombstone is what survives
+                    -- if the revival never commits.
                     invalidated = app_events.invalidated,
                     invalidation_reason = app_events.invalidation_reason",
                 params![
@@ -698,8 +711,10 @@ impl SqliteAccountStorage {
     /// `created_at`, so a user who resends identical text in the same second as
     /// a failed send mints the *same* id and re-enters the row that send just
     /// retracted. `record_app_event`'s upsert deliberately will not revive it,
-    /// so the send path calls this first: the fresh send intent is the evidence,
-    /// and only the local send path can produce one.
+    /// so the send path calls this *after* re-recording: the fresh send intent
+    /// is the evidence, only the local send path can produce one, and running
+    /// last keeps the tombstone standing until the revival itself commits (see
+    /// `AppClient::record_send_intent_projection`).
     ///
     /// The predicate is deliberately narrow, and every conjunct earns its place:
     ///
@@ -708,6 +723,11 @@ impl SqliteAccountStorage {
     ///   withdrawals (`LosingBranch`, `SupersededByBranchSelection`, ...) stay
     ///   terminal.
     /// - `invalidated = 1` — a live row is left untouched rather than rewritten.
+    ///
+    /// Because the send path re-records first, every ordinary send arrives here
+    /// on a row that exists and is live. A primary-key probe on the same
+    /// predicate ([`CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE`]) short-circuits
+    /// that case before the projection walk below.
     ///
     /// The reason literal is shared, by design, with the terminal-group sweep
     /// ([`Self::invalidate_pending_sent_app_events_for_group`]), so reason alone
@@ -725,6 +745,21 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            if conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM app_events
+                         WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
+                    ),
+                    params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+                    |_| Ok(()),
+                )
+                .optional()
+                .storage()?
+                .is_none()
+            {
+                return Ok(None);
+            }
             let Some((kind, tags)) =
                 app_event_projection_parts_tx(&conn, group_id_hex, message_id_hex)?
             else {
@@ -741,16 +776,16 @@ impl SqliteAccountStorage {
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             let cleared = conn
                 .execute(
-                    "UPDATE app_events
-                     SET invalidated = 0, invalidation_reason = NULL
-                     WHERE group_id_hex = ?1
-                       AND message_id_hex = ?2
-                       AND direction = 'sent'
-                       AND invalidated = 1
-                       AND invalidation_reason = ?3",
+                    &format!(
+                        "UPDATE app_events
+                         SET invalidated = 0, invalidation_reason = NULL
+                         WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
+                    ),
                     params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
                 )
                 .storage()?;
+            // Unreachable while the probe above shares this predicate, and kept
+            // so a drift reports no revival rather than a phantom one.
             if cleared == 0 {
                 return Ok(None);
             }

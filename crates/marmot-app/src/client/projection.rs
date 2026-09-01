@@ -26,38 +26,51 @@ use super::AppClient;
 impl AppClient {
     /// Project a fresh send intent optimistically, before the publish is tried.
     ///
-    /// Two things happen here, and the order matters. Inner app-event ids are
-    /// NIP-01 hashes over (pubkey, created_at, kind, tags, content) with
-    /// second-granular `created_at`, so a resend of identical text inside the
-    /// same second as a failed send mints that send's *exact* id — and lands on
-    /// the row `retract_failed_local_projection` tombstoned as
-    /// `local_publish_failed`. `record_app_event`'s upsert keeps invalidation
-    /// terminal by design (it cannot tell a retry from a relay redelivery, a
-    /// backfill replay, or a re-synthesized system row), so the retraction has
-    /// to be cleared explicitly first, and only where there is evidence to clear
-    /// it. A fresh send intent is that evidence: replay seams re-record rows
-    /// without ever reaching this function.
+    /// Inner app-event ids are NIP-01 hashes over
+    /// (pubkey, created_at, kind, tags, content) with second-granular
+    /// `created_at`, so a resend of identical text inside the same second as a
+    /// failed send mints that send's *exact* id and lands on the row
+    /// `retract_failed_local_projection` tombstoned as `local_publish_failed`.
+    /// `record_app_event`'s upsert keeps invalidation terminal by design — it
+    /// cannot tell a retry from a relay redelivery, a backfill replay, or a
+    /// re-synthesized system row — so reviving that row needs an explicit clear
+    /// carrying evidence the upsert lacks. A fresh send intent is that evidence,
+    /// and only this function sees one: replay seams re-record rows without ever
+    /// entering a send.
+    ///
+    /// **Record first, then clear**, because the two writes commit separately
+    /// and only this order is truthful at every prefix. The record alone
+    /// preserves the tombstone, so a failing record, a failing clear, and a
+    /// crash between the two commits all leave the row `Failed` — the state the
+    /// user last saw, still retryable. Clearing first would commit a revival the
+    /// send never earned: a live `pending` row with no publish attempt behind
+    /// it, which nothing short of a terminal-group sweep re-invalidates. See
+    /// `docs/marmot-architecture/overview/multi-step-state-changes.md`.
+    ///
+    /// The clear reprojects the same row against the post-record snapshot, so
+    /// its update supersedes the record's and exactly one flip is forwarded;
+    /// with no tombstone to clear, the record's update is the only one.
     ///
     /// Only the pre-publish projection clears. The post-publish one runs on a
     /// row this call already revived, and anything that invalidated it *during*
     /// the send — the terminal-group sweep, a convergence withdrawal — is a
     /// verdict the send flow has no evidence to overturn.
-    ///
-    /// The clear's own projection update is dropped: the record below reprojects
-    /// the same row and returns that update, so forwarding both would emit the
-    /// same flip twice.
     pub(crate) fn record_send_intent_projection(
         &self,
         group_id: &GroupId,
         sender: &str,
         event: &MarmotInnerEvent,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
-        let _revived = self.app.clear_timeline_local_publish_failure(
-            &self.state.label,
-            &hex::encode(group_id.as_slice()),
-            &event.id,
-        )?;
-        self.record_local_app_event_projection(group_id, sender, event, None, None, false)
+        let recorded =
+            self.record_local_app_event_projection(group_id, sender, event, None, None, false)?;
+        Ok(self
+            .app
+            .clear_timeline_local_publish_failure(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                &event.id,
+            )?
+            .unwrap_or(recorded))
     }
 
     /// `advance_read_marker`: pre-publish projections must pass `false` so a
