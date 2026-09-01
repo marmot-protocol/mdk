@@ -3104,6 +3104,12 @@ typedef enum MarmotGroupEventKind_Tag {
    * matches: branch selection superseded that commit.
    */
   MARMOT_GROUP_EVENT_KIND_GROUP_STATE_INVALIDATED,
+  /**
+   * Takes a `GroupStateInvalidated` withdrawal back: a later convergence
+   * pass re-adopted the commit, so every notification it produced describes
+   * canonical history again.
+   */
+  MARMOT_GROUP_EVENT_KIND_GROUP_STATE_REVALIDATED,
   MARMOT_GROUP_EVENT_KIND_GROUP_UNRECOVERABLE,
   MARMOT_GROUP_EVENT_KIND_PENDING_COMMIT_RECOVERED,
   MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_RECOVERED,
@@ -3169,6 +3175,11 @@ typedef struct MarmotGroupEventKind_GroupStateInvalidated_Body {
   char *reason;
 } MarmotGroupEventKind_GroupStateInvalidated_Body;
 
+typedef struct MarmotGroupEventKind_GroupStateRevalidated_Body {
+  uint64_t epoch;
+  char *revalidated_commit_id_hex;
+} MarmotGroupEventKind_GroupStateRevalidated_Body;
+
 typedef struct MarmotGroupEventKind_PendingCommitRecovered_Body {
   uint64_t recovered_epoch;
 } MarmotGroupEventKind_PendingCommitRecovered_Body;
@@ -3189,6 +3200,7 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_EpochChanged_Body EPOCH_CHANGED;
     MarmotGroupEventKind_CommitRolledBack_Body COMMIT_ROLLED_BACK;
     MarmotGroupEventKind_GroupStateInvalidated_Body GROUP_STATE_INVALIDATED;
+    MarmotGroupEventKind_GroupStateRevalidated_Body GROUP_STATE_REVALIDATED;
     MarmotGroupEventKind_PendingCommitRecovered_Body PENDING_COMMIT_RECOVERED;
     MarmotGroupEventKind_GroupHydrationRecovered_Body GROUP_HYDRATION_RECOVERED;
   };

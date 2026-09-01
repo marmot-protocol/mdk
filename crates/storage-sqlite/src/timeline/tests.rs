@@ -622,6 +622,137 @@ fn rerecording_an_origin_commit_invalidated_row_keeps_its_tombstone() {
 }
 
 #[test]
+fn revalidating_an_origin_commit_revives_only_branch_selection_withdrawals() {
+    // A convergence pass parks a losing commit and the app tombstones every
+    // kind-1210 row it synthesized. A later pass holding deeper evidence
+    // re-adopts that commit, so those rows describe canonical history again and
+    // the revalidation must bring all of them back — while leaving rows another
+    // commit owns, and rows withdrawn for a reason convergence cannot reverse,
+    // exactly where they are.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (id, system_type, at, commit) in [
+        ("parked-added", "member_added", 10, "commit-parked"),
+        ("parked-admin", "admin_added", 11, "commit-parked"),
+        ("other-added", "member_added", 12, "commit-other"),
+    ] {
+        store
+            .record_app_event(&group_system_from_commit(id, system_type, at, commit))
+            .unwrap();
+    }
+    store
+        .invalidate_app_events_by_origin_commit("commit-parked", BRANCH_SELECTION_WITHDRAWAL_REASON)
+        .unwrap()
+        .expect("the park must tombstone both rows");
+    store
+        .invalidate_app_events_by_origin_commit("commit-other", "LosingBranch")
+        .unwrap()
+        .expect("the other commit's row is withdrawn terminally");
+
+    let update = store
+        .clear_branch_selection_withdrawal_by_origin_commit("commit-parked")
+        .unwrap()
+        .expect("re-adoption must project an update");
+
+    let changed_ids: Vec<&str> = update
+        .changes
+        .iter()
+        .map(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+            TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+        })
+        .collect();
+    assert!(changed_ids.contains(&"parked-added"));
+    assert!(changed_ids.contains(&"parked-admin"));
+    assert!(!changed_ids.contains(&"other-added"));
+
+    let rows = list(&store);
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(status("parked-added"), Some(None));
+    assert_eq!(status("parked-admin"), Some(None));
+    assert_eq!(
+        status("other-added"),
+        Some(Some("LosingBranch".to_owned())),
+        "a withdrawal convergence cannot reverse must stay terminal"
+    );
+}
+
+#[test]
+fn revalidating_leaves_other_withdrawal_reasons_and_live_rows_alone() {
+    // The predicate is reason-scoped AND state-scoped: a row withdrawn under a
+    // reason this primitive does not own is untouched even when the named
+    // commit matches, and a live row is never rewritten. Both cases return
+    // `None` so the caller can tell a real revival from a no-op.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&group_system_from_commit(
+            "terminal",
+            "member_added",
+            10,
+            "commit-terminal",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&group_system_from_commit(
+            "live",
+            "member_added",
+            11,
+            "commit-live",
+        ))
+        .unwrap();
+    store
+        .invalidate_app_events_by_origin_commit("commit-terminal", "LosingBranch")
+        .unwrap()
+        .expect("withdrawal");
+
+    assert!(
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit("commit-terminal")
+            .unwrap()
+            .is_none(),
+        "only a branch-selection withdrawal may be taken back"
+    );
+    assert!(
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit("commit-live")
+            .unwrap()
+            .is_none(),
+        "a live row is left untouched rather than rewritten"
+    );
+    assert!(
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit("commit-unknown")
+            .unwrap()
+            .is_none()
+    );
+    let rows = list(&store);
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(status("terminal"), Some(Some("LosingBranch".to_owned())));
+    assert_eq!(status("live"), Some(None));
+}
+
+#[test]
+fn branch_selection_withdrawal_reason_matches_the_engine_variant() {
+    // The app writes this literal by formatting the engine's reason; storage
+    // reads it back as a predicate. Nothing else couples the two, so a rename
+    // on either side has to fail here rather than silently stop reviving.
+    assert_eq!(
+        format!(
+            "{:?}",
+            cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection
+        ),
+        BRANCH_SELECTION_WITHDRAWAL_REASON
+    );
+}
+
+#[test]
 fn rerecording_a_source_invalidated_message_keeps_its_tombstone() {
     // A delivered app message the engine withdrew as a fork loser is
     // redelivered by a relay and re-recorded under the same inner id in a later

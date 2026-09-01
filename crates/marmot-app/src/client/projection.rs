@@ -910,12 +910,26 @@ impl AppClient {
     ///
     /// Membership is the test rather than event order: a batch may carry the
     /// withdrawal before or after the change it names, and neither ordering
-    /// makes the change canonical.
+    /// makes the change canonical. For the same reason a commit the batch also
+    /// REVALIDATES is not withheld: a multi-pass batch can park a commit and
+    /// then re-adopt it, and the net verdict is that it is canonical. Withholding
+    /// it would leave no row at all — the withdrawal dispatch has nothing to
+    /// tombstone and the revalidation nothing to revive.
     pub(crate) fn project_group_system_rows(
         &self,
         events: &[cgka_traits::engine::GroupEvent],
         recorded_at: u64,
     ) -> Vec<crate::AppProjectionUpdate> {
+        let revalidated_commits: std::collections::HashSet<&[u8]> = events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+                    revalidated_commit_id,
+                    ..
+                } => Some(revalidated_commit_id.as_slice()),
+                _ => None,
+            })
+            .collect();
         let superseded_commits: std::collections::HashSet<&[u8]> = events
             .iter()
             .filter_map(|event| match event {
@@ -925,6 +939,7 @@ impl AppClient {
                 } => Some(invalidated_commit_id.as_slice()),
                 _ => None,
             })
+            .filter(|commit_id| !revalidated_commits.contains(commit_id))
             .collect();
         let mut updates = Vec::new();
         for event in events {

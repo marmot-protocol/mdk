@@ -463,6 +463,16 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   is only half the obligation: the failed inbound apply must also hand the still-retained commit back to stored
   convergence via `schedule_pending_convergence_group`. Otherwise the group parks one epoch behind holding a durable
   commit nothing will ever apply.
+- **A branch-selection withdrawal is provisional, so it is announced once and can be taken back.** A losing commit is
+  parked `ConvergenceDeferred` — still a canonicalization input — precisely so a later pass holding deeper evidence can
+  re-adopt it. Both halves of `distributed_convergence.rs` therefore key on the commit's stored state as it was BEFORE
+  the pass's own disposition persistence ran (`pre_apply_commit_states`, captured outside the apply transaction):
+  `emit_rolled_back_commits` announces `CommitRolledBack` + `GroupStateInvalidated` only for a commit this pass is
+  parking, and `emit_revalidated_commits` emits `GroupStateRevalidated` when an accepted commit entered the pass parked.
+  Reading the state after the apply cannot tell those apart — the persistence has already written `ConvergenceDeferred`
+  for every deferral. The app side must mirror the asymmetry: its tombstone is terminal by default (#1608), and only the
+  explicitly evidenced `GroupStateRevalidated` path clears a `SupersededByBranchSelection` row. Withdrawals under every
+  other reason stay terminal on both sides.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

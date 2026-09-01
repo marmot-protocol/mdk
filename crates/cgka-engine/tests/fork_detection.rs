@@ -3392,6 +3392,228 @@ async fn committers_losing_rival_is_reconsidered_onto_the_fleets_deeper_branch()
     );
 }
 
+/// RED (defects (a) + (e) on the rollback-announcement seam).
+///
+/// `emit_rolled_back_commits` announces the `CommitRolledBack` +
+/// `GroupStateInvalidated` withdrawal pair for every commit a pass parks
+/// `ConvergenceDeferred` / `NonSelectedEligibleBranch`. That state is
+/// *reconsiderable*, so the same commit can be parked by pass after pass and
+/// can later be RE-ADOPTED onto the selected branch. Neither is handled:
+///
+/// - (a) every pass that re-parks the same commit re-announces the identical
+///   withdrawal pair, so announcement history is not evidence of anything.
+/// - (e) the withdrawal is never taken back. Since #1608 made storage-side
+///   invalidation terminal, the re-adopted commit's kind-1210 rows stay
+///   tombstoned forever.
+///
+/// The scenario walks one commit through park → re-park → re-adoption on a
+/// single device.
+#[tokio::test]
+async fn reparked_and_readopted_commit_announces_once_and_is_revalidated() {
+    // A's identity must sort before the rival's so A's own commit wins the
+    // equal-depth ordering race in every pass below.
+    let first = b"wd-first".as_slice();
+    let second = b"wd-second".as_slice();
+    let (a_id, rival_id) = if pad32(first) < pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let (mut a, a_storage) = build_client_with_storage(a_id);
+    let mut rival = build_client(rival_id);
+    let mut eve = build_client(b"wd-eve");
+    let mut frank = build_client(b"wd-frank");
+
+    let rival_kp = rival.fresh_key_package().await.unwrap();
+    let (group_id, create) = a
+        .create_group(CreateGroupRequest {
+            name: "withdrawal-lifecycle".into(),
+            description: String::new(),
+            members: vec![rival_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![rival.self_id()],
+        })
+        .await
+        .unwrap();
+    let rival_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            a.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    rival.join_welcome(rival_welcome).await.unwrap();
+    assert_eq!(a.epoch(&group_id).unwrap().0, 1);
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+    let rename = |name: &str| SendIntent::UpdateGroupData {
+        group_id: group_id.clone(),
+        name: Some(name.to_owned()),
+        description: None,
+    };
+
+    // Rival branch root, authored from epoch 1 and never delivered to A until
+    // after A has committed its own epoch-1 rival.
+    let rival_root = match rival.send(rename("rival-branch")).await.unwrap() {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let rival_root_id = MessageId::new(Sha256::digest(&rival_root.payload).to_vec());
+
+    let a_root = match a.send(rename("a-branch")).await.unwrap() {
+        SendResult::GroupEvolution { pending, msg, .. } => {
+            a.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let a_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(a_id)),
+        &a_root.payload,
+    );
+    let rival_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        MemberId::new(pad32(rival_id)),
+        &rival_root.payload,
+    );
+    assert!(a_key < rival_key, "A must win the equal-depth ordering key");
+
+    // --- Pass 1: A parks the rival root and announces its withdrawal. -------
+    a.ingest(route(rival_root.clone())).await.unwrap();
+    a.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the equal-depth fork settles on A");
+    assert_eq!(
+        a_storage.get_message(&rival_root_id).unwrap().state,
+        MessageState::ConvergenceDeferred
+    );
+    let pass_1 = a.drain_events();
+    assert_eq!(
+        withdrawals_naming(&pass_1, &rival_root_id),
+        1,
+        "pass 1 must announce the parked rival's withdrawal exactly once: {pass_1:?}"
+    );
+
+    // A deepens its own branch to depth 2 so the next pass re-parks the rival
+    // root (equal depth, A still wins the ordering key) instead of adopting it.
+    match a.send(rename("a-branch-2")).await.unwrap() {
+        SendResult::GroupEvolution { pending, .. } => a.confirm_published(pending).await.unwrap(),
+        _ => unreachable!(),
+    };
+    assert_eq!(a.epoch(&group_id).unwrap().0, 3);
+
+    // The rival branch grows two follow-ons; A learns them one at a time.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let follow_on_1 = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let follow_on_2 = match rival
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            rival.confirm_published(pending).await.unwrap();
+            msg
+        }
+        _ => unreachable!(),
+    };
+
+    // --- Pass 2: the rival root is RE-parked. No second announcement. ------
+    a.ingest(route(follow_on_1)).await.unwrap();
+    a.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the equal-depth fork settles again on A");
+    assert_eq!(
+        a_storage.get_message(&rival_root_id).unwrap().state,
+        MessageState::ConvergenceDeferred,
+        "pass 2 must re-park the rival root, not adopt it"
+    );
+    let pass_2 = a.drain_events();
+    assert_eq!(
+        withdrawals_naming(&pass_2, &rival_root_id),
+        0,
+        "(a) a re-parked commit must not re-announce a withdrawal: {pass_2:?}"
+    );
+
+    // --- Pass 3: the rival branch outgrows A's; the parked root is adopted. -
+    a.ingest(route(follow_on_2)).await.unwrap();
+    a.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("A reorgs onto the deeper rival branch");
+    assert_eq!(
+        a_storage.get_message(&rival_root_id).unwrap().state,
+        MessageState::Processed,
+        "the parked root must become canonical"
+    );
+    assert_eq!(
+        a_storage.get_group(&group_id).unwrap().name,
+        "rival-branch",
+        "A must surface the adopted branch's group data"
+    );
+    let pass_3 = a.drain_events();
+    assert_eq!(
+        pass_3
+            .iter()
+            .filter(|event| matches!(
+                event,
+                GroupEvent::GroupStateRevalidated { revalidated_commit_id, .. }
+                    if revalidated_commit_id == &rival_root_id
+            ))
+            .count(),
+        1,
+        "(e) re-adopting a withdrawn commit must take its withdrawal back: {pass_3:?}"
+    );
+    assert_eq!(
+        withdrawals_naming(&pass_3, &rival_root_id),
+        0,
+        "an adopted commit must never be named by a withdrawal: {pass_3:?}"
+    );
+}
+
+/// Number of `GroupStateInvalidated` withdrawals in `events` naming `commit_id`.
+fn withdrawals_naming(events: &[GroupEvent], commit_id: &MessageId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GroupEvent::GroupStateInvalidated { invalidated_commit_id, .. }
+                    if invalidated_commit_id == commit_id
+            )
+        })
+        .count()
+}
+
 // --- U4 event fidelity: what a convergence apply tells the app --------------
 //
 // `emit_rolled_back_commits` / `emit_superseded_processed_commits`

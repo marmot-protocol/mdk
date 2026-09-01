@@ -11574,6 +11574,139 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     );
 }
 
+/// The other end of the #363 withdrawal lifecycle: a branch-selection
+/// withdrawal is provisional, because the commit it names is parked
+/// reconsiderable and a later convergence pass can re-adopt it. The engine's
+/// `GroupStateRevalidated` must flip the tombstoned system rows back visible —
+/// and only those, and only for the one reason convergence can reverse.
+///
+/// The re-record in the middle is the #1608 evidence rule: replay re-deriving
+/// the same deterministic row id is not proof the withdrawal was reversed, so
+/// the row stays tombstoned until the revalidation itself arrives.
+#[test]
+fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "alpha".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )],
+    })
+    .unwrap();
+
+    let parked_commit_id = cgka_traits::types::MessageId::new(vec![0xBE; 32]);
+    let parked_commit_hex = hex::encode(parked_commit_id.as_slice());
+    let system_row = |message_id_hex: &str, origin_commit_id: String| AppMessageProjection {
+        message_id_hex: message_id_hex.to_owned(),
+        source_message_id_hex: None,
+        direction: "system".to_owned(),
+        group_id_hex: "aa".to_owned(),
+        sender: account.account_id_hex.clone(),
+        plaintext: "renamed the group".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        tags: Vec::new(),
+        source_epoch: Some(2),
+        retention: None,
+        recorded_at: Some(10),
+        origin_commit_id: Some(origin_commit_id),
+        moderation_grant: false,
+    };
+    let parked_row = system_row("parked-rename", parked_commit_hex.clone());
+    app.record_account_app_event("alice", &parked_row).unwrap();
+    app.record_account_app_event("alice", &system_row("other-rename", "cf".repeat(32)))
+        .unwrap();
+
+    let group_id = GroupId::new(vec![0xAA]);
+    app.projection_update_for_invalidation_event(
+        "alice",
+        &cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            invalidated_commit_id: parked_commit_id.clone(),
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        },
+    )
+    .unwrap()
+    .expect("the park must tombstone the parked commit's row");
+    // The other commit is withdrawn under a reason convergence cannot reverse.
+    app.projection_update_for_invalidation_event(
+        "alice",
+        &cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+            group_id: group_id.clone(),
+            message_id: cgka_traits::types::MessageId::new(vec![0xCF; 32]),
+            epoch: cgka_traits::EpochId(1),
+            reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+            decrypted_payload_ref: None,
+        },
+    )
+    .unwrap();
+
+    // Replay re-derives the row while the withdrawal still stands.
+    app.record_account_app_event("alice", &parked_row).unwrap();
+    assert_eq!(
+        invalidation_status(&app, "parked-rename"),
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "re-recording is not evidence the withdrawal was reversed"
+    );
+
+    let revalidation = cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+        group_id,
+        epoch: cgka_traits::EpochId(1),
+        revalidated_commit_id: parked_commit_id,
+    };
+    let update = app
+        .projection_update_for_invalidation_event("alice", &revalidation)
+        .unwrap()
+        .expect("re-adoption must project an update");
+    assert_eq!(update.group_id_hex, "aa");
+    assert_eq!(
+        invalidation_status(&app, "parked-rename"),
+        Some(None),
+        "the re-adopted commit's row must be visible again"
+    );
+    assert_eq!(
+        invalidation_status(&app, "other-rename"),
+        Some(None),
+        "an unrelated live row is untouched"
+    );
+
+    assert!(
+        app.projection_update_for_invalidation_event("alice", &revalidation)
+            .unwrap()
+            .is_none(),
+        "a replayed revalidation must not produce another projection update"
+    );
+}
+
+fn invalidation_status(app: &MarmotApp, message_id_hex: &str) -> Option<Option<String>> {
+    app.timeline_messages_with_query(
+        "alice",
+        storage_sqlite::TimelineMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            ..storage_sqlite::TimelineMessageQuery::default()
+        },
+    )
+    .unwrap()
+    .messages
+    .iter()
+    .find(|row| row.message_id_hex == message_id_hex)
+    .map(|row| row.invalidation_status.clone())
+}
+
 /// Issue #1177: a send the engine accepted but never published derives as
 /// `Pending`, which is truthful only while convergence can still release it.
 /// Once the group is terminal the queue is purged, so the sweep the sync loop

@@ -62,6 +62,14 @@ pub const MAX_TIMELINE_LIMIT: usize = 200;
 /// [`SqliteAccountStorage::clear_local_publish_failure`] may clear.
 pub const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
 
+/// The invalidation reason a kind-1210 system row carries when branch selection
+/// withdrew the commit that synthesized it. Storage owns the literal because it
+/// is the one reason [`SqliteAccountStorage::clear_branch_selection_withdrawal_by_origin_commit`]
+/// may clear; the app writes it by formatting
+/// `cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection`,
+/// and `timeline::tests` pins the two to the same string.
+pub const BRANCH_SELECTION_WITHDRAWAL_REASON: &str = "SupersededByBranchSelection";
+
 /// The one row shape [`SqliteAccountStorage::clear_local_publish_failure`] may
 /// revive, bound to `?1` group id, `?2` message id, `?3` reason. Its early-exit
 /// probe and its UPDATE interpolate this same fragment: the probe decides
@@ -889,6 +897,117 @@ impl SqliteAccountStorage {
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             // One change set covers all invalidated rows. Each invalidated row's own
             // message id anchors its change; pass each in turn and merge.
+            let mut changes = Vec::new();
+            for (_, message_id_hex, kind, tags) in &rows {
+                changes.extend(timeline_changes_for_invalidation(
+                    message_id_hex,
+                    *kind,
+                    tags,
+                    &before,
+                    &messages,
+                ));
+            }
+            dedup_timeline_changes(&mut changes);
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex,
+                messages,
+                changes,
+            }))
+        })
+    }
+
+    /// Exact inverse of [`Self::invalidate_app_events_by_origin_commit`] for
+    /// the one withdrawal reason convergence can reverse.
+    ///
+    /// A branch-selection withdrawal is provisional: the engine parks the
+    /// losing commit reconsiderable, and a later convergence pass holding
+    /// deeper evidence can re-adopt it. When that happens the engine emits
+    /// `GroupEvent::GroupStateRevalidated` naming the commit, and the rows it
+    /// synthesized describe canonical history again.
+    ///
+    /// The re-adoption is evidence [`Self::record_app_event`] does not have —
+    /// re-recording a row is not proof the withdrawal was reversed, which is
+    /// why that upsert never revives — so this is a primitive the revalidation
+    /// dispatch calls explicitly, exactly as the send path calls
+    /// [`Self::clear_local_publish_failure`].
+    ///
+    /// The predicate is reason-scoped by design. `SupersededByBranchSelection`
+    /// is the only reason whose underlying decision a later pass can reverse;
+    /// every other withdrawal (`LosingBranch`, `BeyondAnchor`, the terminal
+    /// sweep's `local_publish_failed`) stays terminal, and a commit-scoped
+    /// predicate alone would reach rows those reasons own.
+    ///
+    /// Returns `None` when no row matched, so a caller can tell a real revival
+    /// from a no-op without a second read.
+    ///
+    /// Scoping on `origin_commit_id` inherits that column's re-record rule: the
+    /// upsert repoints it to the newest non-NULL attribution, so a row a
+    /// *different* commit later re-recorded under the same deterministic id
+    /// answers to that commit and not to the one being revalidated. It stays
+    /// tombstoned, exactly as `invalidate_app_events_by_origin_commit` would
+    /// already have missed it.
+    pub fn clear_branch_selection_withdrawal_by_origin_commit(
+        &self,
+        origin_commit_id: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT group_id_hex, message_id_hex, kind, tags_json
+                         FROM app_events
+                         WHERE origin_commit_id = ?1
+                           AND invalidated = 1
+                           AND invalidation_reason = ?2",
+                    )
+                    .storage()?;
+                stmt.query_map(
+                    params![origin_commit_id, BRANCH_SELECTION_WITHDRAWAL_REASON],
+                    |row| {
+                        let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                        let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?;
+                        Ok((row.get(0)?, row.get(1)?, kind, tags))
+                    },
+                )
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+            };
+            let Some(group_id_hex) = rows.first().map(|(group_id_hex, ..)| group_id_hex.clone())
+            else {
+                return Ok(None);
+            };
+            let mut affected_message_ids = BTreeSet::new();
+            for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
+                affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
+                    &conn,
+                    row_group_id_hex,
+                    message_id_hex,
+                    *kind,
+                    tags,
+                )?);
+            }
+            let before =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            conn.execute(
+                "UPDATE app_events
+                 SET invalidated = 0, invalidation_reason = NULL
+                 WHERE origin_commit_id = ?1
+                   AND invalidated = 1
+                   AND invalidation_reason = ?2",
+                params![origin_commit_id, BRANCH_SELECTION_WITHDRAWAL_REASON],
+            )
+            .storage()?;
+            rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
+            let messages =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
             let mut changes = Vec::new();
             for (_, message_id_hex, kind, tags) in &rows {
                 changes.extend(timeline_changes_for_invalidation(
