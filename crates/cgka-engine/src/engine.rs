@@ -3088,7 +3088,8 @@ impl<S: StorageProvider> Engine<S> {
 // Trait methods stay thin: validate the trait boundary, then delegate to
 // the module that owns the behavior.
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError> {
         self.ingest_with_audit_context(msg, None).await

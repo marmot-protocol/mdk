@@ -647,7 +647,8 @@ pub struct CreateGroupRequest {
 /// The application-facing contract of the engine.
 ///
 /// Method docs describe legal state transitions and error classes.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait CgkaEngine: Send + Sync {
     // ── Inbound ─────────────────────────────────────────────────────────────
 

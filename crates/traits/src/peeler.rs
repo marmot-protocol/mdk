@@ -109,7 +109,8 @@ impl GroupMessageMetadata {
 ///   harness asserts on this where applicable.
 /// - Implementations are `Send + Sync`; the `#[async_trait]` macro handles
 ///   the lifetime gymnastics.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TransportPeeler: Send + Sync {
     async fn peel_group_message(
         &self,

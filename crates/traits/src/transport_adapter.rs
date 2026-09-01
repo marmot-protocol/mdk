@@ -1109,7 +1109,8 @@ impl TransportAdapterError {
 }
 
 /// Account-aware network adapter that moves wrapped transport messages.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TransportAdapter: Send + Sync {
     /// Activate inbox and group subscriptions for an account.
     async fn activate_account(

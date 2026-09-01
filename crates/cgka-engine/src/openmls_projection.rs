@@ -4586,7 +4586,8 @@ mod candidate_branch_peel_halt_tests {
     /// Transport is not under test here: every message is carried verbatim.
     struct PassthroughPeeler;
 
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TransportPeeler for PassthroughPeeler {
         async fn peel_group_message(
             &self,
