@@ -10,6 +10,10 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    /// The named group is terminal or no longer has a pending invitation.
+    /// Stable host-facing rejection for stale notification actions (mdk#1606).
+    #[error("group invite is not pending")]
+    GroupInviteNotPending,
     /// Canonical creation succeeded, but its derived chat row was not durable.
     /// Refresh account state; retrying creation would produce a duplicate.
     #[error("group was created but its local chat projection is unavailable: {group_id_hex}")]
@@ -268,6 +272,7 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::GroupInviteNotPending => Self::GroupInviteNotPending,
             AppError::CreatedGroupProjectionUnavailable(group_id_hex) => {
                 Self::CreatedGroupProjectionUnavailable { group_id_hex }
             }
@@ -423,6 +428,13 @@ mod tests {
     use cgka_traits::storage::StorageError;
     use marmot_account::{AccountError, AccountHomeError};
     use marmot_app::AppError;
+
+    #[test]
+    fn stale_group_invite_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError = AppError::GroupInviteNotPending.into();
+        assert!(matches!(ffi, MarmotKitError::GroupInviteNotPending));
+        assert_eq!(ffi.to_string(), "group invite is not pending");
+    }
 
     #[test]
     fn oversized_membership_page_crosses_ffi_as_typed_variant() {

@@ -1480,6 +1480,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
         AppError::MissingKeyPackage(_)
         | AppError::UnknownGroup(_)
+        | AppError::GroupInviteNotPending
         | AppError::GroupDisbanding(_)
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
