@@ -915,6 +915,20 @@ pub trait CgkaEngine: Send + Sync {
         component_id: AppComponentId,
     ) -> Result<Option<Vec<u8>>, EngineError>;
 
+    /// Batched [`Self::app_component`]: one entry per requested id, in
+    /// request order. Implementations that load group state per read should
+    /// override this to answer every id from a single load.
+    fn app_components(
+        &self,
+        group_id: &GroupId,
+        component_ids: &[AppComponentId],
+    ) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+        component_ids
+            .iter()
+            .map(|component_id| self.app_component(group_id, *component_id))
+            .collect()
+    }
+
     /// Local client's current MLS leaf index in this group.
     ///
     /// This is the MLS tree leaf index, not the current roster enumeration

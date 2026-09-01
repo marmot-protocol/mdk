@@ -219,19 +219,24 @@ impl AppClient {
         }
         let previous = self.state_group_record(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
-        let Ok(nostr_routing) = self.nostr_routing_for_group(group_id) else {
+        let protocol_profile = group_metadata
+            .as_ref()
+            .map(|group| group.protocol_profile)
+            .unwrap_or(ProtocolProfile::Legacy);
+        let components = self.read_group_components(group_id, protocol_profile);
+        let Ok(nostr_routing) = components.nostr_routing else {
             return;
         };
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
-            profile: self.profile_for_group(group_id),
+            profile: components.profile,
             admin_policy: self.admin_policy_for_group(group_id),
-            message_retention: self.message_retention_for_group(group_id),
-            agent_text_stream: self.agent_text_stream_for_group(group_id),
-            avatar_url: self.avatar_url_for_group(group_id),
-            encrypted_media: self.encrypted_media_for_group(group_id),
-            image: self.image_for_group(group_id),
+            message_retention: components.message_retention,
+            agent_text_stream: components.agent_text_stream,
+            avatar_url: components.avatar_url,
+            encrypted_media: components.encrypted_media,
+            image: components.image,
         };
         add_group(
             &mut self.state,
@@ -247,17 +252,22 @@ impl AppClient {
     pub(crate) fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let previous = self.state_group_record(group_id);
         let group_metadata = self.runtime.group_record(group_id).ok();
-        let nostr_routing = self.nostr_routing_for_group(group_id)?;
+        let protocol_profile = group_metadata
+            .as_ref()
+            .map(|group| group.protocol_profile)
+            .unwrap_or(ProtocolProfile::Legacy);
+        let components = self.read_group_components(group_id, protocol_profile);
+        let nostr_routing = components.nostr_routing?;
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
-            profile: self.profile_for_group(group_id),
+            profile: components.profile,
             admin_policy: self.admin_policy_for_group(group_id),
-            message_retention: self.message_retention_for_group(group_id),
-            agent_text_stream: self.agent_text_stream_for_group(group_id),
-            avatar_url: self.avatar_url_for_group(group_id),
-            encrypted_media: self.encrypted_media_for_group(group_id),
-            image: self.image_for_group(group_id),
+            message_retention: components.message_retention,
+            agent_text_stream: components.agent_text_stream,
+            avatar_url: components.avatar_url,
+            encrypted_media: components.encrypted_media,
+            image: components.image,
         };
         add_group(
             &mut self.state,
@@ -541,12 +551,52 @@ impl AppClient {
     }
 
     pub(crate) fn profile_for_group(&self, group_id: &GroupId) -> AppGroupProfileComponent {
-        self.runtime
-            .app_component(group_id, GROUP_PROFILE_COMPONENT_ID)
-            .ok()
-            .flatten()
-            .map(|bytes| AppGroupProfileComponent::from_bytes(&bytes))
-            .unwrap_or_else(AppGroupProfileComponent::absent)
+        parse_profile_component(
+            self.runtime
+                .app_component(group_id, GROUP_PROFILE_COMPONENT_ID)
+                .ok()
+                .flatten(),
+        )
+    }
+
+    /// One batched engine read for every component the group projection needs:
+    /// 7 components on a single engine state load instead of 7 loads.
+    /// Per-component fallbacks match the individual `*_for_group` helpers.
+    pub(crate) fn read_group_components(
+        &self,
+        group_id: &GroupId,
+        protocol_profile: ProtocolProfile,
+    ) -> GroupComponentReads {
+        let media_component_id = Self::encrypted_media_component_id(protocol_profile);
+        let component_ids = [
+            NOSTR_ROUTING_COMPONENT_ID,
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            GROUP_AVATAR_URL_COMPONENT_ID,
+            media_component_id,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ];
+        let components = match self.runtime.app_components(group_id, &component_ids) {
+            Ok(components) => components,
+            Err(error) => {
+                return GroupComponentReads::unavailable(error.into(), protocol_profile);
+            }
+        };
+
+        // `next()` consumes in `component_ids` order; struct-literal fields
+        // evaluate in source order, which matches.
+        let mut components = components.into_iter();
+        let mut next = || components.next().flatten();
+        GroupComponentReads {
+            nostr_routing: parse_routing_component(next()),
+            profile: parse_profile_component(next()),
+            message_retention: parse_retention_component(next()),
+            agent_text_stream: parse_agent_stream_component(next()),
+            avatar_url: parse_avatar_component(next()),
+            encrypted_media: parse_media_component(media_component_id, protocol_profile, next()),
+            image: parse_image_component(next()),
+        }
     }
 
     pub(crate) fn admin_policy_for_group(
@@ -563,12 +613,12 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> AppGroupMessageRetentionComponent {
-        self.runtime
-            .app_component(group_id, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
-            .ok()
-            .flatten()
-            .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
-            .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
+        parse_retention_component(
+            self.runtime
+                .app_component(group_id, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
+                .ok()
+                .flatten(),
+        )
     }
 
     pub(crate) fn finalize_published_app_message_source_retention(
@@ -683,21 +733,21 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> AppAgentTextStreamComponent {
-        self.runtime
-            .app_component(group_id, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID)
-            .ok()
-            .flatten()
-            .map(|bytes| AppAgentTextStreamComponent::from_bytes(&bytes))
-            .unwrap_or_else(AppAgentTextStreamComponent::disabled)
+        parse_agent_stream_component(
+            self.runtime
+                .app_component(group_id, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID)
+                .ok()
+                .flatten(),
+        )
     }
 
     pub(crate) fn avatar_url_for_group(&self, group_id: &GroupId) -> AppGroupAvatarUrlComponent {
-        self.runtime
-            .app_component(group_id, GROUP_AVATAR_URL_COMPONENT_ID)
-            .ok()
-            .flatten()
-            .map(|bytes| AppGroupAvatarUrlComponent::from_bytes(&bytes))
-            .unwrap_or_else(AppGroupAvatarUrlComponent::absent)
+        parse_avatar_component(
+            self.runtime
+                .app_component(group_id, GROUP_AVATAR_URL_COMPONENT_ID)
+                .ok()
+                .flatten(),
+        )
     }
 
     pub(crate) fn encrypted_media_component_id(profile: ProtocolProfile) -> u16 {
@@ -717,14 +767,14 @@ impl AppClient {
             .map(|group| group.protocol_profile)
             .unwrap_or(ProtocolProfile::Legacy);
         let component_id = Self::encrypted_media_component_id(profile);
-        self.runtime
-            .app_component(group_id, component_id)
-            .ok()
-            .flatten()
-            .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(component_id, &bytes))
-            .unwrap_or_else(|| {
-                AppGroupEncryptedMediaComponent::disabled_for_profile(profile.into())
-            })
+        parse_media_component(
+            component_id,
+            profile,
+            self.runtime
+                .app_component(group_id, component_id)
+                .ok()
+                .flatten(),
+        )
     }
 
     /// Authoritative encrypted-media component lookup for the epoch-secret warm
@@ -750,12 +800,12 @@ impl AppClient {
     }
 
     pub(crate) fn image_for_group(&self, group_id: &GroupId) -> AppGroupImageInput {
-        self.runtime
-            .app_component(group_id, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
-            .ok()
-            .flatten()
-            .and_then(|bytes| AppGroupImageInput::from_component_bytes(&bytes))
-            .unwrap_or_default()
+        parse_image_component(
+            self.runtime
+                .app_component(group_id, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+                .ok()
+                .flatten(),
+        )
     }
 
     /// Persist and queue kind-1210 system rows for our own authenticated commits.
@@ -887,16 +937,91 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<AppGroupNostrRoutingComponent, AppError> {
-        let bytes = self
-            .runtime
-            .app_component(group_id, NOSTR_ROUTING_COMPONENT_ID)?
-            .ok_or_else(|| {
-                AppError::InvalidNostrRouting(
-                    "group is missing marmot.transport.nostr.routing.v1".into(),
-                )
-            })?;
-        AppGroupNostrRoutingComponent::from_bytes(&bytes)
+        parse_routing_component(
+            self.runtime
+                .app_component(group_id, NOSTR_ROUTING_COMPONENT_ID)?,
+        )
     }
+}
+
+/// Every component the group projection reads, from one batched engine call.
+/// Only routing distinguishes error from absence; the rest fall back the way
+/// their `*_for_group` helpers do.
+pub(crate) struct GroupComponentReads {
+    pub(crate) nostr_routing: Result<AppGroupNostrRoutingComponent, AppError>,
+    pub(crate) profile: AppGroupProfileComponent,
+    pub(crate) message_retention: AppGroupMessageRetentionComponent,
+    pub(crate) agent_text_stream: AppAgentTextStreamComponent,
+    pub(crate) avatar_url: AppGroupAvatarUrlComponent,
+    pub(crate) encrypted_media: AppGroupEncryptedMediaComponent,
+    pub(crate) image: AppGroupImageInput,
+}
+
+impl GroupComponentReads {
+    fn unavailable(error: AppError, protocol_profile: ProtocolProfile) -> Self {
+        Self {
+            nostr_routing: Err(error),
+            profile: AppGroupProfileComponent::absent(),
+            message_retention: AppGroupMessageRetentionComponent::disabled(),
+            agent_text_stream: AppAgentTextStreamComponent::disabled(),
+            avatar_url: AppGroupAvatarUrlComponent::absent(),
+            encrypted_media: AppGroupEncryptedMediaComponent::disabled_for_profile(
+                protocol_profile.into(),
+            ),
+            image: AppGroupImageInput::default(),
+        }
+    }
+}
+
+fn parse_routing_component(
+    bytes: Option<Vec<u8>>,
+) -> Result<AppGroupNostrRoutingComponent, AppError> {
+    let bytes = bytes.ok_or_else(|| {
+        AppError::InvalidNostrRouting("group is missing marmot.transport.nostr.routing.v1".into())
+    })?;
+    AppGroupNostrRoutingComponent::from_bytes(&bytes)
+}
+
+fn parse_profile_component(bytes: Option<Vec<u8>>) -> AppGroupProfileComponent {
+    bytes
+        .map(|bytes| AppGroupProfileComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppGroupProfileComponent::absent)
+}
+
+fn parse_retention_component(bytes: Option<Vec<u8>>) -> AppGroupMessageRetentionComponent {
+    bytes
+        .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
+}
+
+fn parse_agent_stream_component(bytes: Option<Vec<u8>>) -> AppAgentTextStreamComponent {
+    bytes
+        .map(|bytes| AppAgentTextStreamComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppAgentTextStreamComponent::disabled)
+}
+
+fn parse_avatar_component(bytes: Option<Vec<u8>>) -> AppGroupAvatarUrlComponent {
+    bytes
+        .map(|bytes| AppGroupAvatarUrlComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppGroupAvatarUrlComponent::absent)
+}
+
+fn parse_media_component(
+    component_id: u16,
+    protocol_profile: ProtocolProfile,
+    bytes: Option<Vec<u8>>,
+) -> AppGroupEncryptedMediaComponent {
+    bytes
+        .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(component_id, &bytes))
+        .unwrap_or_else(|| {
+            AppGroupEncryptedMediaComponent::disabled_for_profile(protocol_profile.into())
+        })
+}
+
+fn parse_image_component(bytes: Option<Vec<u8>>) -> AppGroupImageInput {
+    bytes
+        .and_then(|bytes| AppGroupImageInput::from_component_bytes(&bytes))
+        .unwrap_or_default()
 }
 
 /// Build the durable kind-1210 group system row projection for one

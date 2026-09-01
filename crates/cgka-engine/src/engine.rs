@@ -2941,21 +2941,27 @@ impl<S: StorageProvider> Engine<S> {
         self.update_stored_message_state(id, MessageState::Processed)
     }
 
-    /// Return the current Marmot admin policy keys mirrored from signed MLS
-    /// group state.
-    pub fn admin_pubkeys(&self, group_id: &GroupId) -> Result<Vec<[u8; 32]>, EngineError> {
+    /// One liveness-gated `MlsGroup::load` for read-only accessors. A missing
+    /// group maps to `UnknownGroup`.
+    fn live_mls_group(&self, group_id: &GroupId) -> Result<openmls::group::MlsGroup, EngineError> {
         self.ensure_group_live(group_id)?;
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
         );
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
+        openmls::group::MlsGroup::load(
             <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
             &mls_gid,
         )
         .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+    }
+
+    /// Return the current Marmot admin policy keys mirrored from signed MLS
+    /// group state.
+    pub fn admin_pubkeys(&self, group_id: &GroupId) -> Result<Vec<[u8; 32]>, EngineError> {
+        let mls_group = self.live_mls_group(group_id)?;
         let mut admins = crate::app_components::admins_of_group(&mls_group)?;
         admins.sort();
         admins.dedup();
@@ -3016,18 +3022,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<EpochId, EngineError> {
-        self.ensure_group_live(group_id)?;
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.live_mls_group(group_id)?;
 
         let required_components =
             crate::app_components::required_app_components_of_group(&mls_group)?;
@@ -3308,22 +3303,27 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<Option<Vec<u8>>, EngineError> {
-        self.ensure_group_live(group_id)?;
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self.live_mls_group(group_id)?;
         Ok(crate::app_components::app_component_data_of_group(
             &mls_group,
             component_id,
         ))
+    }
+
+    // One `MlsGroup::load` (13 storage reads + a ratchet-tree deserialize)
+    // answers every requested id, instead of one load per id.
+    fn app_components(
+        &self,
+        group_id: &GroupId,
+        component_ids: &[AppComponentId],
+    ) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+        let mls_group = self.live_mls_group(group_id)?;
+        Ok(component_ids
+            .iter()
+            .map(|component_id| {
+                crate::app_components::app_component_data_of_group(&mls_group, *component_id)
+            })
+            .collect())
     }
 
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
