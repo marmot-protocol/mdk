@@ -54,6 +54,24 @@ const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// materialized window kept above this cannot be re-fetched in one query, so
 /// window owners should not exceed it.
 pub const MAX_TIMELINE_LIMIT: usize = 200;
+
+/// The invalidation reason a locally-sent row carries when its publish reached
+/// no one. Storage owns the literal because it is both a stored column value
+/// and a projection predicate (a retracted own send stays visible as `failed`
+/// rather than vanishing), and because it is the one reason
+/// [`SqliteAccountStorage::clear_local_publish_failure`] may clear.
+pub const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
+
+/// The one row shape [`SqliteAccountStorage::clear_local_publish_failure`] may
+/// revive, bound to `?1` group id, `?2` message id, `?3` reason. Its early-exit
+/// probe and its UPDATE interpolate this same fragment: the probe decides
+/// whether a revival happens, so a conjunct present in one and not the other
+/// would either skip a legitimate revival or report one that never landed.
+const CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE: &str = "group_id_hex = ?1
+       AND message_id_hex = ?2
+       AND direction = 'sent'
+       AND invalidated = 1
+       AND invalidation_reason = ?3";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
     pub group_id_hex: String,
@@ -568,8 +586,22 @@ impl SqliteAccountStorage {
                         WHEN app_events.retention_seconds IS NULL THEN excluded.retention_expires_at
                         ELSE app_events.retention_expires_at
                     END,
-                    invalidated = 0,
-                    invalidation_reason = NULL",
+                    -- A withdrawal is terminal here, and re-recording is not
+                    -- evidence that a withdrawn row reached the group: the same
+                    -- message arrives again from relay redelivery, backfill
+                    -- replay, or rejoin reprocessing, and a synthesized system
+                    -- row is re-derived under its deterministic id by any later
+                    -- batch. This statement cannot tell those apart from a
+                    -- retry, so it never revives.
+                    -- There is exactly one legitimate revival — a fresh local
+                    -- send intent reusing the id of a send that failed in the
+                    -- same second — and it carries evidence this statement does
+                    -- not have. It goes through `clear_local_publish_failure`,
+                    -- which the send path calls immediately after re-recording,
+                    -- so this statement's preserved tombstone is what survives
+                    -- if the revival never commits.
+                    invalidated = app_events.invalidated,
+                    invalidation_reason = app_events.invalidation_reason",
                 params![
                     &event.group_id_hex,
                     &event.message_id_hex,
@@ -668,6 +700,117 @@ impl SqliteAccountStorage {
             &[&group_id_hex, &message_id_hex],
             reason,
         )
+    }
+
+    /// Clear the `local_publish_failed` retraction on one locally-sent row.
+    ///
+    /// This is the **only** revival path for an invalidated app event, and it
+    /// exists because `local_publish_failed` is the one reason a later, wholly
+    /// legitimate event can contradict. Inner app-event ids are NIP-01 hashes
+    /// over (pubkey, created_at, kind, tags, content) with second-granular
+    /// `created_at`, so a user who resends identical text in the same second as
+    /// a failed send mints the *same* id and re-enters the row that send just
+    /// retracted. `record_app_event`'s upsert deliberately will not revive it,
+    /// so the send path calls this *after* re-recording: the fresh send intent
+    /// is the evidence, only the local send path can produce one, and running
+    /// last keeps the tombstone standing until the revival itself commits (see
+    /// `AppClient::record_send_intent_projection`).
+    ///
+    /// The predicate is deliberately narrow, and every conjunct earns its place:
+    ///
+    /// - `direction = 'sent'` — only a local send can be retried at all.
+    /// - `invalidation_reason = 'local_publish_failed'` — convergence
+    ///   withdrawals (`LosingBranch`, `SupersededByBranchSelection`, ...) stay
+    ///   terminal.
+    /// - `invalidated = 1` — a live row is left untouched rather than rewritten.
+    ///
+    /// Because the send path re-records first, every ordinary send arrives here
+    /// on a row that exists and is live. A primary-key probe on the same
+    /// predicate ([`CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE`]) short-circuits
+    /// that case before the projection walk below.
+    ///
+    /// The reason literal is shared, by design, with the terminal-group sweep
+    /// ([`Self::invalidate_pending_sent_app_events_for_group`]), so reason alone
+    /// would not be a safe predicate anywhere the send intent is absent. That is
+    /// exactly why this is a primitive the send path calls explicitly and not a
+    /// carve-out in the upsert: replay seams re-record swept rows without ever
+    /// entering the send path, and an upsert-level carve-out would revive them.
+    ///
+    /// Returns `None` when no row matched, so a caller can tell a real revival
+    /// from a no-op without a second read.
+    pub fn clear_local_publish_failure(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM app_events
+                         WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
+                    ),
+                    params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+                    |_| Ok(()),
+                )
+                .optional()
+                .storage()?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let Some((kind, tags)) =
+                app_event_projection_parts_tx(&conn, group_id_hex, message_id_hex)?
+            else {
+                return Ok(None);
+            };
+            let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+                &conn,
+                group_id_hex,
+                message_id_hex,
+                kind,
+                &tags,
+            )?;
+            let before =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            let cleared = conn
+                .execute(
+                    &format!(
+                        "UPDATE app_events
+                         SET invalidated = 0, invalidation_reason = NULL
+                         WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
+                    ),
+                    params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+                )
+                .storage()?;
+            // Unreachable while the probe above shares this predicate, and kept
+            // so a drift reports no revival rather than a phantom one.
+            if cleared == 0 {
+                return Ok(None);
+            }
+            rebuild_message_timeline_for_group_tx(&conn, group_id_hex)?;
+            let messages =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            let mut changes =
+                timeline_changes_for_invalidation(message_id_hex, kind, &tags, &before, &messages);
+            // Only the revived row's own delivery state changed. Rows it merely
+            // affects (a reply preview, say) keep the trigger their own content
+            // warrants — the same split `finalize_app_event_source_retention`
+            // makes when a held send publishes.
+            for change in &mut changes {
+                if let TimelineMessageChange::Upsert { trigger, message } = change
+                    && message.message_id_hex == message_id_hex
+                {
+                    *trigger = TimelineUpdateTrigger::DeliveryOrSendStateChanged;
+                }
+            }
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex: group_id_hex.to_owned(),
+                messages,
+                changes,
+            }))
+        })
     }
 
     /// Invalidate every app event whose `origin_commit_id` matches the given

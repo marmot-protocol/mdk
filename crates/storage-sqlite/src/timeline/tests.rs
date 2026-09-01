@@ -266,6 +266,16 @@ fn group_system(id: &str, system_type: &str, at: u64) -> StoredAppEvent {
     }
 }
 
+fn list_for_group(store: &SqliteAccountStorage, group_id_hex: &str) -> Vec<TimelineMessageRecord> {
+    store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_id_hex.to_owned()),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap()
+        .messages
+}
+
 fn list(store: &SqliteAccountStorage) -> Vec<TimelineMessageRecord> {
     store
         .message_timeline(TimelineMessageQuery {
@@ -575,6 +585,138 @@ fn reupsert_with_none_origin_preserves_existing_commit_link() {
         .find(|row| row.message_id_hex == "row")
         .map(|row| row.invalidation_status.clone());
     assert_eq!(status, Some(Some("LosingBranch".to_owned())));
+}
+
+#[test]
+fn rerecording_an_origin_commit_invalidated_row_keeps_its_tombstone() {
+    // Fork recovery tombstones a kind-1210 row in one batch; a later batch
+    // (session replay, rejoin reprocessing) re-synthesizes the same
+    // deterministic id and re-records it. The re-record must not revive the row
+    // or erase the reason that explains it, or two members that agree on the
+    // CGKA state still render different histories.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let event = group_system_from_commit("losing-added", "member_added", 10, "commit-losing");
+    store.record_app_event(&event).unwrap();
+    store
+        .invalidate_app_events_by_origin_commit("commit-losing", "SupersededByBranchSelection")
+        .unwrap()
+        .expect("matched rows should produce an update");
+
+    let update = store.record_app_event(&event).unwrap();
+
+    assert_eq!(
+        update
+            .messages
+            .iter()
+            .find(|message| message.message_id_hex == "losing-added")
+            .map(|message| message.invalidation_status.clone()),
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "the re-record must project the row as the tombstone it already is"
+    );
+    let rows = list(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].invalidation_status.as_deref(),
+        Some("SupersededByBranchSelection")
+    );
+}
+
+#[test]
+fn rerecording_a_source_invalidated_message_keeps_its_tombstone() {
+    // A delivered app message the engine withdrew as a fork loser is
+    // redelivered by a relay and re-recorded under the same inner id in a later
+    // batch. `AppMessageInvalidated` is terminal by construction — the engine
+    // withholds it for retryable decrypt misses — so redelivery is never a
+    // reason to bring the message back.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let event = chat("target", "alice", 1, "hello");
+    store.record_app_event(&event).unwrap();
+    store
+        .invalidate_app_event_by_source("source-target", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+
+    let update = store.record_app_event(&event).unwrap();
+
+    assert_eq!(
+        update
+            .messages
+            .iter()
+            .find(|message| message.message_id_hex == "target")
+            .map(|message| message.invalidation_status.clone()),
+        Some(Some("LosingBranch".to_owned()))
+    );
+    let rows = list(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].invalidation_status.as_deref(), Some("LosingBranch"));
+}
+
+#[test]
+fn rerecording_a_message_id_invalidated_message_keeps_its_tombstone() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let event = chat("target", "alice", 1, "hello");
+    store.record_app_event(&event).unwrap();
+    store
+        .invalidate_app_event_by_message_id(
+            &"11".repeat(32),
+            "target",
+            "UndecryptableInCanonicalState",
+        )
+        .unwrap()
+        .expect("projection update");
+
+    store.record_app_event(&event).unwrap();
+
+    let rows = list(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].invalidation_status.as_deref(),
+        Some("UndecryptableInCanonicalState")
+    );
+}
+
+#[test]
+fn rerecording_a_swept_pending_send_keeps_its_tombstone() {
+    // The terminal-group sweep withdraws sends the engine will never publish.
+    // The group is terminal, so nothing can legitimately publish those rows
+    // later; a re-record from any replay seam must leave them failed.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    let event = pending_sent(&group_id_hex, "held", 10);
+    store.record_app_event(&event).unwrap();
+    store
+        .invalidate_pending_sent_app_events_for_group(&group_id_hex, "local_publish_failed")
+        .unwrap()
+        .expect("held rows should produce an update");
+
+    store.record_app_event(&event).unwrap();
+
+    assert_eq!(
+        list(&store)
+            .into_iter()
+            .find(|row| row.message_id_hex == "held")
+            .map(|row| row.invalidation_status),
+        Some(Some("local_publish_failed".to_owned()))
+    );
+}
+
+#[test]
+fn rerecording_a_live_row_updates_it_and_leaves_it_live() {
+    // The common path: re-recording a row that was never invalidated still
+    // refreshes its content and leaves it delivered.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "first"))
+        .unwrap();
+
+    store
+        .record_app_event(&chat("target", "alice", 1, "reprojected"))
+        .unwrap();
+
+    let rows = list(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].plaintext, "reprojected");
+    assert_eq!(rows[0].invalidation_status, None);
 }
 
 #[test]
@@ -2640,4 +2782,214 @@ fn finalizing_an_already_published_send_is_not_a_delivery_state_change() {
         })
         .expect("the finalized row must be reported as changed");
     assert_ne!(trigger, TimelineUpdateTrigger::DeliveryOrSendStateChanged);
+}
+
+#[test]
+fn clearing_a_local_publish_failure_revives_the_send() {
+    // A send that failed to publish is retracted as `local_publish_failed`. A
+    // same-second resend mints the *same* NIP-01 id, so the send path re-enters
+    // the row it just tombstoned. The upsert deliberately will not revive it —
+    // invalidation is terminal there — so the send intent clears the failure
+    // explicitly, and the row goes back to a live pending send.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+    let event = pending_sent(&group_id_hex, "resent", 10);
+    store.record_app_event(&event).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group_id_hex, "resent", "local_publish_failed")
+        .unwrap()
+        .expect("retract");
+
+    let update = store
+        .clear_local_publish_failure(&group_id_hex, "resent")
+        .unwrap()
+        .expect("clearing a retracted send must project an update");
+
+    assert_eq!(
+        update
+            .messages
+            .iter()
+            .find(|message| message.message_id_hex == "resent")
+            .map(|message| message.invalidation_status.clone()),
+        Some(None),
+        "the revived send must project live"
+    );
+    assert!(
+        update.changes.iter().any(|change| matches!(
+            change,
+            TimelineMessageChange::Upsert {
+                trigger: TimelineUpdateTrigger::DeliveryOrSendStateChanged,
+                message,
+            } if message.message_id_hex == "resent"
+        )),
+        "reviving a retracted send is a delivery-state change, not new content"
+    );
+    let rows = list_for_group(&store, &group_id_hex);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].invalidation_status, None);
+}
+
+#[test]
+fn clearing_a_local_publish_failure_refuses_every_row_it_does_not_own() {
+    // Mutation strength: each arm below pins one conjunct of the WHERE clause.
+    // Widening the predicate — dropping the direction guard, the reason guard,
+    // or the invalidated guard — revives a row that no send intent owns. The
+    // reason literal is shared with the #1604 terminal-group sweep, so the
+    // direction and reason guards are not interchangeable.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id_hex = "11".repeat(32);
+
+    // A *received* row carrying the same reason: only a local send can be
+    // retried, so direction alone must disqualify it.
+    let mut received = chat("received-row", "bob", 10, "peer text");
+    received.group_id_hex = group_id_hex.clone();
+    store.record_app_event(&received).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group_id_hex, "received-row", "local_publish_failed")
+        .unwrap()
+        .expect("retract");
+
+    // A sent row withdrawn by convergence, not by a publish failure.
+    let losing = pending_sent(&group_id_hex, "losing-send", 11);
+    store.record_app_event(&losing).unwrap();
+    store
+        .invalidate_app_event_by_message_id(&group_id_hex, "losing-send", "LosingBranch")
+        .unwrap()
+        .expect("retract");
+
+    // A live sent row: nothing to clear.
+    let live = pending_sent(&group_id_hex, "live-send", 12);
+    store.record_app_event(&live).unwrap();
+
+    for message_id_hex in ["received-row", "losing-send", "live-send", "absent"] {
+        assert!(
+            store
+                .clear_local_publish_failure(&group_id_hex, message_id_hex)
+                .unwrap()
+                .is_none(),
+            "{message_id_hex} is not a retracted local send and must not be cleared"
+        );
+    }
+
+    let statuses = list_for_group(&store, &group_id_hex)
+        .into_iter()
+        .map(|row| (row.message_id_hex, row.invalidation_status))
+        .collect::<Vec<_>>();
+    assert!(statuses.contains(&(
+        "received-row".to_owned(),
+        Some("local_publish_failed".to_owned())
+    )));
+    assert!(statuses.contains(&("losing-send".to_owned(), Some("LosingBranch".to_owned()))));
+    assert!(statuses.contains(&("live-send".to_owned(), None)));
+}
+
+#[test]
+fn clearing_a_local_publish_failure_is_group_scoped() {
+    // Inner app-event ids carry no group binding, so the same account sending
+    // identical content to two groups in the same second produces one id in
+    // both. Clearing one group's retracted send must not revive the other's.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let first = "11".repeat(32);
+    let second = "22".repeat(32);
+    for group_id_hex in [&first, &second] {
+        store
+            .record_app_event(&pending_sent(group_id_hex, "shared-id", 10))
+            .unwrap();
+        store
+            .invalidate_app_event_by_message_id(group_id_hex, "shared-id", "local_publish_failed")
+            .unwrap()
+            .expect("retract");
+    }
+
+    store
+        .clear_local_publish_failure(&first, "shared-id")
+        .unwrap()
+        .expect("the addressed group's send clears");
+
+    assert_eq!(list_for_group(&store, &first)[0].invalidation_status, None);
+    assert_eq!(
+        list_for_group(&store, &second)[0].invalidation_status,
+        Some("local_publish_failed".to_owned()),
+        "the unrelated group's copy must stay retracted"
+    );
+    // The assertion above reads the materialized projection, which the first
+    // call only rebuilds for the group it addressed — so an unscoped UPDATE
+    // would leave it stale and still passing. Ask the primitive itself: the
+    // second group's row must still be there to clear.
+    assert!(
+        store
+            .clear_local_publish_failure(&second, "shared-id")
+            .unwrap()
+            .is_some(),
+        "the unrelated group's row must still be retracted in app_events, not just in its projection"
+    );
+}
+
+#[test]
+fn rerecording_a_tombstone_under_a_new_kind_keeps_it_tombstoned() {
+    // A re-record may change kind and tags, which repoints the modifier edges
+    // and reprojects a different target set. None of that is evidence the
+    // withdrawn row came back, and the reaction must not re-apply to its target.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("modifier", "bob", "target", 2, "\u{1f44d}"))
+        .unwrap();
+    store
+        .invalidate_app_event_by_message_id(&"11".repeat(32), "modifier", "LosingBranch")
+        .unwrap()
+        .expect("retract");
+
+    // Same id, now a chat: kind and tags both change on conflict.
+    store
+        .record_app_event(&chat("modifier", "bob", 2, "no longer a reaction"))
+        .unwrap();
+
+    let rows = list(&store);
+    let modifier = rows
+        .iter()
+        .find(|row| row.message_id_hex == "modifier")
+        .expect("the tombstone still projects as its own row now that it is a chat");
+    assert_eq!(
+        modifier.invalidation_status.as_deref(),
+        Some("LosingBranch"),
+        "changing kind/tags is not evidence the withdrawn row came back"
+    );
+    let target = rows
+        .iter()
+        .find(|row| row.message_id_hex == "target")
+        .expect("target");
+    assert!(
+        target.reactions.user_reactions.is_empty(),
+        "a tombstoned modifier must never re-apply to its target"
+    );
+}
+
+#[test]
+fn rerecording_with_retention_keeps_the_tombstone() {
+    // `record_app_event_with_retention` shares `record_app_event_inner`, so the
+    // retention-carrying variant owes the same terminality.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let event = chat("retained", "alice", 10, "hello");
+    store.record_app_event(&event).unwrap();
+    store
+        .invalidate_app_event_by_source("source-retained", "BeyondAppRetention")
+        .unwrap()
+        .expect("retract");
+
+    store
+        .record_app_event_with_retention(
+            &event,
+            Some(AppMessageRetentionDecision::new(event.recorded_at, 300)),
+        )
+        .unwrap();
+
+    let rows = list(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].invalidation_status.as_deref(),
+        Some("BeyondAppRetention")
+    );
 }

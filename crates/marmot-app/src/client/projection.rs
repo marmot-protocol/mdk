@@ -24,6 +24,55 @@ use crate::{
 use super::AppClient;
 
 impl AppClient {
+    /// Project a fresh send intent optimistically, before the publish is tried.
+    ///
+    /// Inner app-event ids are NIP-01 hashes over
+    /// (pubkey, created_at, kind, tags, content) with second-granular
+    /// `created_at`, so a resend of identical text inside the same second as a
+    /// failed send mints that send's *exact* id and lands on the row
+    /// `retract_failed_local_projection` tombstoned as `local_publish_failed`.
+    /// `record_app_event`'s upsert keeps invalidation terminal by design — it
+    /// cannot tell a retry from a relay redelivery, a backfill replay, or a
+    /// re-synthesized system row — so reviving that row needs an explicit clear
+    /// carrying evidence the upsert lacks. A fresh send intent is that evidence,
+    /// and only this function sees one: replay seams re-record rows without ever
+    /// entering a send.
+    ///
+    /// **Record first, then clear**, because the two writes commit separately
+    /// and only this order is truthful at every prefix. The record alone
+    /// preserves the tombstone, so a failing record, a failing clear, and a
+    /// crash between the two commits all leave the row `Failed` — the state the
+    /// user last saw, still retryable. Clearing first would commit a revival the
+    /// send never earned: a live `pending` row with no publish attempt behind
+    /// it, which nothing short of a terminal-group sweep re-invalidates. See
+    /// `docs/marmot-architecture/overview/multi-step-state-changes.md`.
+    ///
+    /// The clear reprojects the same row against the post-record snapshot, so
+    /// its update supersedes the record's and exactly one flip is forwarded;
+    /// with no tombstone to clear, the record's update is the only one.
+    ///
+    /// Only the pre-publish projection clears. The post-publish one runs on a
+    /// row this call already revived, and anything that invalidated it *during*
+    /// the send — the terminal-group sweep, a convergence withdrawal — is a
+    /// verdict the send flow has no evidence to overturn.
+    pub(crate) fn record_send_intent_projection(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        event: &MarmotInnerEvent,
+    ) -> Result<crate::AppProjectionUpdate, AppError> {
+        let recorded =
+            self.record_local_app_event_projection(group_id, sender, event, None, None, false)?;
+        Ok(self
+            .app
+            .clear_timeline_local_publish_failure(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                &event.id,
+            )?
+            .unwrap_or(recorded))
+    }
+
     /// `advance_read_marker`: pre-publish projections must pass `false` so a
     /// failed publish never leaves the group read marker advanced past inbound
     /// unreads or pointing at an invalidated own message (#338); only the
@@ -841,10 +890,13 @@ impl AppClient {
     /// already dispatched each `GroupStateInvalidated` through
     /// [`MarmotApp::projection_update_for_invalidation_event`] — so by the time
     /// the upsert below runs, the batch's withdrawals are all applied and it
-    /// would be the last writer. The storage upsert clears `invalidated` on
-    /// conflict, so without this filter the tail either revives a row the batch
-    /// just tombstoned or synthesizes one for a change that canonically never
-    /// happened (the withdrawal swept a row that did not exist yet).
+    /// would be the last writer. Without this filter the tail synthesizes a row
+    /// for a change that canonically never happened: when no row existed yet,
+    /// the withdrawal swept nothing and the upsert INSERTs a *live* row.
+    ///
+    /// When the row does already exist, storage is the second line of defence —
+    /// its upsert preserves the withdrawal rather than clearing it — so that
+    /// shape is pinned at both layers by design, not by this filter alone.
     ///
     /// One batch carries both because the engine buffers convergence passes:
     /// `events_buf` has a single take site and
