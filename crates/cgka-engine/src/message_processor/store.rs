@@ -813,7 +813,8 @@ mod tests {
 
     struct UnreachablePeeler;
 
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TransportPeeler for UnreachablePeeler {
         async fn peel_group_message(
             &self,
