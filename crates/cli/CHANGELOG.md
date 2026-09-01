@@ -9,28 +9,123 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-09-01
+
+### Added
+
+- The new `marmot-c` track exposes the app runtime through a generated,
+  allocation-audited C ABI, including lifecycle, accounts, groups, messages,
+  media, notifications, push, relays, telemetry, audit logs, timeline reads,
+  Markdown parsing, subscriptions, host-owned secret storage, connectivity
+  recovery, and relay-list reads for arbitrary account ids.
+  ([#1545](https://github.com/marmot-protocol/mdk/pull/1545),
+  [#1575](https://github.com/marmot-protocol/mdk/pull/1575),
+  [#1603](https://github.com/marmot-protocol/mdk/pull/1603),
+  [#1605](https://github.com/marmot-protocol/mdk/pull/1605))
+
+- Apps can send custom chat events with any non-reserved kind and fetch them
+  again by kind. `wn messages send-event <group> <kind> [content]` publishes
+  one, while CLI and MarmotKit list/subscription APIs accept kind filters.
+  Reserved protocol-owned kinds remain rejected.
+  ([#1544](https://github.com/marmot-protocol/mdk/pull/1544))
+
+- WN Agent terminal harnesses add shared chat-management commands, backend
+  artifact delivery through the encrypted media path, and ordered inbound
+  attachment batches for agent turns.
+  ([#1573](https://github.com/marmot-protocol/mdk/pull/1573),
+  [#1574](https://github.com/marmot-protocol/mdk/pull/1574),
+  [#1587](https://github.com/marmot-protocol/mdk/pull/1587))
+
+### Changed
+
+- Account databases advance through schema migrations 52–56 for durable epoch
+  backfill, account delivery recovery, transport reconciliation, stall
+  evidence, and accepted chat-activity ordering. Upgrades are transactional;
+  downgrade is unsupported, so re-upgrade or restore a pre-upgrade backup
+  instead of removing migration rows. Devices upgrading from before `0.9.15`
+  also cross migration 47 and should back up first with at least 3.25 times the
+  account database size free. The 2,048-row release benchmark measured a
+  4,676 ms migration, 4,584 ms gradual promotion, 92 ms maximum 32-row batch,
+  and a 4.01-times peak footprint (3.01 times additional space). See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+
+- Audit logging is now privacy-safe by construction: the sensitive-data mode
+  and its runtime configuration were removed, leaving only the redacted audit
+  schema and aggregate diagnostics.
+  ([#1580](https://github.com/marmot-protocol/mdk/pull/1580))
+
+- Group projection and convergence recovery do less repeated work: app
+  components are read with one MLS group load, candidate-branch peel contexts
+  are reused only across matching durable state, and replay guards restore
+  canonical group state without rewriting live message and outbound queues.
+  ([#1563](https://github.com/marmot-protocol/mdk/pull/1563),
+  [#1564](https://github.com/marmot-protocol/mdk/pull/1564),
+  [#1615](https://github.com/marmot-protocol/mdk/pull/1615))
+
+- A disbanded group now emits its host-facing disband event once, with at most
+  one compatibility replay for an older tombstone. Account open still heals
+  terminal projections from the durable guard row without repeating events on
+  every launch.
+  ([#1604](https://github.com/marmot-protocol/mdk/pull/1604))
+
 ### Fixed
 
 - Multi-relay full-history recovery now requires end-of-stored-events from
   every endpoint in the activation's frozen route snapshot. A fast, empty
   relay or repeated unavailability can no longer falsely complete replay and
   clear its durable recovery intent.
-  ([#1578](https://github.com/marmot-protocol/mdk/issues/1578))
+  Recovery also reconciles history below cursor floors and rejects stale EOSE
+  signals from superseded subscription attempts.
+  ([#1578](https://github.com/marmot-protocol/mdk/issues/1578),
+  [#1581](https://github.com/marmot-protocol/mdk/pull/1581),
+  [#1583](https://github.com/marmot-protocol/mdk/pull/1583),
+  [#1584](https://github.com/marmot-protocol/mdk/pull/1584),
+  [#1586](https://github.com/marmot-protocol/mdk/pull/1586),
+  [#1607](https://github.com/marmot-protocol/mdk/pull/1607))
+
+- Capacity-refused or unknown-group ingests remain fetchable instead of being
+  marked seen below the relay cursor. Epoch recovery now persists and resumes
+  bounded work, re-arms only affected groups after fruitless drains, paces
+  failures, and distinguishes contested-fork evidence from ordinary lag.
+  ([#1565](https://github.com/marmot-protocol/mdk/pull/1565),
+  [#1566](https://github.com/marmot-protocol/mdk/pull/1566),
+  [#1569](https://github.com/marmot-protocol/mdk/pull/1569),
+  [#1590](https://github.com/marmot-protocol/mdk/pull/1590),
+  [#1591](https://github.com/marmot-protocol/mdk/pull/1591),
+  [#1593](https://github.com/marmot-protocol/mdk/pull/1593),
+  [#1602](https://github.com/marmot-protocol/mdk/pull/1602))
+
+- Durable outbound messages and invite commits retry their exact signed event
+  and targets after connectivity returns, wake promptly from reconnect
+  backoff, and finalize optimistic timeline rows without duplicate sends.
+  Relay queue overflow, ambiguous publish timeouts, and stale relay sockets now
+  retain enough state for safe recovery.
+  ([#1567](https://github.com/marmot-protocol/mdk/pull/1567),
+  [#1582](https://github.com/marmot-protocol/mdk/pull/1582),
+  [#1588](https://github.com/marmot-protocol/mdk/pull/1588),
+  [#1589](https://github.com/marmot-protocol/mdk/pull/1589),
+  [#1603](https://github.com/marmot-protocol/mdk/pull/1603))
+
+- Invite acceptance now refuses stale invitations after the account has
+  already observed terminal removal from that group.
+  ([#1614](https://github.com/marmot-protocol/mdk/pull/1614))
+
+- Preview mutations, terminal-harness result delivery, and Hermes inbound
+  queue shedding are recoverable without duplicating completed work or
+  permanently suppressing replayable messages.
+  ([#1555](https://github.com/marmot-protocol/mdk/pull/1555),
+  [#1568](https://github.com/marmot-protocol/mdk/pull/1568),
+  [#1571](https://github.com/marmot-protocol/mdk/pull/1571))
+
+- Incident replay detects and classifies rolled-back devices using their
+  current timed epoch instead of understating divergence with a high-water
+  mark.
+  ([#1559](https://github.com/marmot-protocol/mdk/pull/1559))
 
 ## [0.9.15] - 2026-08-25
 
 ### Added
 
-- Apps can send custom chat events with any non-reserved kind and fetch them
-  again by kind. `wn messages send-event <group> <kind> [content]` publishes
-  one (with repeatable `--tag '["name","value"]'` options), while `messages
-  list` and `messages subscribe` take repeatable `--kind` filters. MarmotKit
-  adds `send_custom_event` and a `kinds` filter on `messages` and
-  `subscribe_messages`. Custom kinds materialize as standalone timeline rows
-  with the new `CustomEvent` update trigger; kinds MDK owns (chat, reactions,
-  edits, deletes, agent, group system, push token) are rejected so apps cannot
-  forge protocol events.
-  ([#1544](https://github.com/marmot-protocol/mdk/pull/1544))
 - Local notification projection and UniFFI `NotificationTrigger` now include
   `RemovedFromGroup`, `MadeAdmin`, and `RemovedAsAdmin` for authenticated
   self-affecting membership and admin-role changes. Kind 446 wake delivery
@@ -1869,7 +1964,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.15...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...HEAD
+[0.9.16]: https://github.com/marmot-protocol/mdk/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/marmot-protocol/mdk/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/marmot-protocol/mdk/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/marmot-protocol/mdk/compare/v0.9.12...v0.9.13

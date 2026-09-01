@@ -110,7 +110,7 @@ Environment:
 
 Verified download (then choose one invocation below):
   set -eu
-  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.15
+  base_url=https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.16
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
   installer_script=install-openclaw-marmot.sh

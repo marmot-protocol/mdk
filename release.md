@@ -189,12 +189,13 @@ storage artifact:
    MDK_STORAGE_OPS_ROWS=2048 just bench-storage-upgrade
    ```
 
-   The 2026-08-14 baseline peaked at 4.01 times the starting database footprint
-   and needed 3.01 times that footprint as additional temporary space. Release
-   notes should require at least 3.25 times the account database size free
-   before upgrade, report the newly measured duration, peak footprint, and
-   maximum 32-row batch latency, and explain that the estimate must be refreshed
-   if the format or journal policy changes.
+   The 2026-09-01 baseline used 2,048 rows and peaked at 4.01 times the starting
+   database footprint, needing 3.01 times that footprint as additional
+   temporary space. Migration took 4,676 ms, gradual promotion took 4,584 ms,
+   and the slowest 32-row promotion batch took 92 ms. Release notes should
+   require at least 3.25 times the account database size free before upgrade
+   and explain that the estimate must be refreshed if the format or journal
+   policy changes.
 6. Do not run `VACUUM` during automatic account open. If page reclamation is
    useful, expose it as explicit keyed-connection maintenance and report its
    expected duration and temporary free-space requirement.
@@ -353,7 +354,7 @@ workspace release looks like:
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.15"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.16"
 
 install_verified() (
   set -eu
