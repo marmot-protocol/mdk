@@ -34,7 +34,7 @@ use cgka_traits::storage::{
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -174,6 +174,14 @@ pub(crate) struct DeferredPeelGroupState {
     /// logged, or copied into durable generation state, and process restart
     /// drops it naturally.
     candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
+    /// Per-row verdicts backing `stored_convergence_commit_digests`: the
+    /// commit digest, or `None` for a row that is not an MLS-wire commit.
+    /// Sound to remember without invalidation because a row id never maps to
+    /// different wire bytes (content rows are keyed by their content dedup
+    /// id, and payload rewrites only attach metadata around the same wire
+    /// message). Rebuilt to the currently listed rows on every use, so it
+    /// cannot outgrow the group's stored history.
+    commit_digest_memo: HashMap<MessageId, Option<[u8; 32]>>,
 }
 
 struct DeferredPeelCandidateCacheEntry {
@@ -2218,7 +2226,7 @@ impl<S: StorageProvider> Engine<S> {
     /// While all three are unchanged, re-peeling a deferred row is guaranteed
     /// wasted work.
     fn deferred_peel_context_fingerprint(
-        &self,
+        &mut self,
         group_id: &GroupId,
     ) -> Result<[u8; 32], EngineError> {
         let epoch = self.epoch_manager.epoch(group_id).unwrap_or_default();
@@ -2251,12 +2259,27 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Content digests of the stored commits that can contribute to this
     /// group's convergence graph, in a stable order.
+    ///
+    /// The fingerprint gate computes this set at least twice per sweep, so a
+    /// row's decode + TLS parse + digest is remembered in
+    /// `DeferredPeelGroupState::commit_digest_memo` and paid once per row
+    /// lifetime instead of once per computation. State membership is re-read
+    /// from the fresh listing every call; only the payload verdict is memoized.
     fn stored_convergence_commit_digests(
-        &self,
+        &mut self,
         group_id: &GroupId,
     ) -> Result<BTreeSet<[u8; 32]>, EngineError> {
+        let records = self.storage.list_messages(group_id, EpochId(0))?;
+        let mut memo = std::mem::take(
+            &mut self
+                .deferred_peel
+                .entry(group_id.clone())
+                .or_default()
+                .commit_digest_memo,
+        );
+        let mut next_memo = HashMap::with_capacity(records.len());
         let mut digests = BTreeSet::new();
-        for record in self.storage.list_messages(group_id, EpochId(0))? {
+        for record in records {
             // Share the graph's own membership predicate rather than restating
             // it: this set must describe exactly the commits a pass would build
             // candidate branches from, and a private copy of that match drifts
@@ -2266,14 +2289,23 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 continue;
             }
-            let Some((_message, projection)) = decode_openmls_wire_projection(&record.payload)
-            else {
-                continue;
+            let verdict = match memo.remove(&record.id) {
+                Some(verdict) => verdict,
+                None => decode_openmls_wire_projection(&record.payload)
+                    .filter(|(_message, projection)| {
+                        projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit
+                    })
+                    .map(|(_message, projection)| projection.message_digest),
             };
-            if projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit {
-                digests.insert(projection.message_digest);
+            if let Some(digest) = verdict {
+                digests.insert(digest);
             }
+            next_memo.insert(record.id, verdict);
         }
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .commit_digest_memo = next_memo;
         Ok(digests)
     }
 
