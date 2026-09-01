@@ -2598,7 +2598,27 @@ impl AppClient {
     }
 
     pub fn accept_group_invite(&mut self, group_id: &GroupId) -> Result<AppGroupRecord, AppError> {
-        self.set_group_invite_confirmation(group_id, false, false)
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let authoritative = self
+            .app
+            .group(&self.state.label, &group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        if authoritative.self_membership != SelfMembership::Member
+            || !authoritative.pending_confirmation
+        {
+            return Err(AppError::GroupInviteNotActionable(group_id_hex));
+        }
+        let mut accepted = self.set_group_invite_confirmation(group_id, false, false)?;
+        accepted.self_membership = authoritative.self_membership;
+        if let Some(group) = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == accepted.group_id_hex)
+        {
+            group.self_membership = authoritative.self_membership;
+        }
+        Ok(accepted)
     }
 
     pub async fn decline_group_invite(
@@ -4060,11 +4080,24 @@ impl AppClient {
             .iter_mut()
             .find(|group| group.group_id_hex == group_id_hex)
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+        let previous_pending_confirmation = group.pending_confirmation;
+        let previous_archived = group.archived;
         group.pending_confirmation = pending_confirmation;
         group.archived = archived;
         let group = group.clone();
-        self.mark_group_projection_dirty_hex(group_id_hex);
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.mark_group_projection_dirty_hex(group_id_hex.clone());
+        if let Err(err) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
+            if let Some(group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == group_id_hex)
+            {
+                group.pending_confirmation = previous_pending_confirmation;
+                group.archived = previous_archived;
+            }
+            return Err(err);
+        }
         Ok(group)
     }
 

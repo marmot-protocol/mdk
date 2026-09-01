@@ -10,6 +10,11 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    /// The group exists, but the authoritative projection no longer carries
+    /// an invitation this caller may accept. Hosts should refresh and render
+    /// the current membership state instead of retrying the stale action.
+    #[error("group invitation is no longer actionable: {group_id_hex}")]
+    GroupInviteNotActionable { group_id_hex: String },
     /// Canonical creation succeeded, but its derived chat row was not durable.
     /// Refresh account state; retrying creation would produce a duplicate.
     #[error("group was created but its local chat projection is unavailable: {group_id_hex}")]
@@ -268,6 +273,9 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::GroupInviteNotActionable(group_id_hex) => {
+                Self::GroupInviteNotActionable { group_id_hex }
+            }
             AppError::CreatedGroupProjectionUnavailable(group_id_hex) => {
                 Self::CreatedGroupProjectionUnavailable { group_id_hex }
             }
@@ -452,6 +460,16 @@ mod tests {
         assert!(matches!(
             ffi,
             MarmotKitError::CreatedGroupProjectionUnavailable { group_id_hex }
+                if group_id_hex == "010203"
+        ));
+    }
+
+    #[test]
+    fn stale_group_invite_crosses_ffi_as_typed_variant() {
+        let ffi = MarmotKitError::from(AppError::GroupInviteNotActionable("010203".to_owned()));
+        assert!(matches!(
+            ffi,
+            MarmotKitError::GroupInviteNotActionable { group_id_hex }
                 if group_id_hex == "010203"
         ));
     }

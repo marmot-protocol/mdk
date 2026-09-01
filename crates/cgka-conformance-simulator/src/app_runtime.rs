@@ -1480,6 +1480,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
         AppError::MissingKeyPackage(_)
         | AppError::UnknownGroup(_)
+        | AppError::GroupInviteNotActionable(_)
         | AppError::GroupDisbanding(_)
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
@@ -1597,6 +1598,10 @@ mod tests {
 
         let resource = app_error(AppError::RuntimeBusy);
         assert_eq!(resource.category, SubjectFailureCategory::Resource);
+
+        let refusal = app_error(AppError::GroupInviteNotActionable(marker.into()));
+        assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);
+        assert!(!refusal.message.contains(marker));
     }
 
     #[test]

@@ -56,6 +56,12 @@ pub enum AppError {
     MissingKeyPackage(String),
     #[error("unknown local group")]
     UnknownGroup(String),
+    /// Invite acceptance reached a group whose authoritative projection no
+    /// longer carries an open invitation. This includes terminal `Left` /
+    /// `Removed` membership and an already accepted or otherwise resolved
+    /// confirmation. Callers must refresh instead of retrying the stale action.
+    #[error("group invitation is no longer actionable")]
+    GroupInviteNotActionable(String),
     /// Canonical MLS creation completed, but the host-facing derived row could
     /// not be committed. The group id lets detailed callers refresh instead of
     /// retrying creation and producing a duplicate group.
@@ -233,6 +239,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
+            Self::GroupInviteNotActionable(_) => "group_invite_not_actionable",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
             Self::InvalidGroupMembershipPage(_) => "invalid_group_membership_page",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",

@@ -12119,6 +12119,235 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     );
 }
 
+/// Invite acceptance is a projection-only acknowledgement, so it must consult
+/// the storage-owned self-membership before clearing the pending invitation.
+/// The worker's in-memory group record may still say `Member` after a removal
+/// or leave because those terminal transitions are written directly to the
+/// durable projection.
+#[test]
+fn terminal_self_membership_rejects_stale_invite_acceptance_without_mutation() {
+    run_composed_app_runtime_test("terminal-invite-acceptance", || async {
+        for terminal_membership in [SelfMembership::Removed, SelfMembership::Left] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let mut client = app.client("alice").await.unwrap();
+            let group_id = client.create_group("stale invite", &[]).await.unwrap();
+            let group_id_hex = hex::encode(group_id.as_slice());
+
+            let group = client
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == group_id_hex)
+                .expect("created group projection");
+            group.pending_confirmation = true;
+            group.via_welcome_message_id_hex = Some("aa".repeat(32));
+            client.mark_group_projection_dirty(&group_id);
+            client
+                .save_state_with_pending_local_group_deletion_frontier_clears()
+                .unwrap();
+
+            app.set_group_self_membership("alice", &group_id_hex, terminal_membership)
+                .unwrap();
+            assert_eq!(
+                client
+                    .state
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id_hex == group_id_hex)
+                    .expect("in-memory group projection")
+                    .self_membership,
+                SelfMembership::Member,
+                "the regression requires a stale in-memory membership projection"
+            );
+            let before = serde_json::to_vec(
+                &app.group("alice", &group_id_hex)
+                    .unwrap()
+                    .expect("durable group before acceptance"),
+            )
+            .unwrap();
+
+            let error = client
+                .accept_group_invite(&group_id)
+                .expect_err("terminal membership must make the invite non-actionable");
+            assert!(
+                matches!(error, AppError::GroupInviteNotActionable(ref id) if id == &group_id_hex)
+            );
+            drop(client);
+            drop(app);
+
+            let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let after = serde_json::to_vec(
+                &reopened
+                    .group("alice", &group_id_hex)
+                    .unwrap()
+                    .expect("durable group after reopen"),
+            )
+            .unwrap();
+            assert_eq!(after, before, "failed acceptance must not mutate the group");
+        }
+    });
+}
+
+#[test]
+fn resolved_invite_cannot_be_accepted_again() {
+    run_composed_app_runtime_test("resolved-invite-acceptance", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("accepted invite", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let before = serde_json::to_vec(
+            &app.group("alice", &group_id_hex)
+                .unwrap()
+                .expect("created group projection"),
+        )
+        .unwrap();
+
+        let error = client
+            .accept_group_invite(&group_id)
+            .expect_err("a resolved invitation must not accept again");
+        assert!(matches!(error, AppError::GroupInviteNotActionable(ref id) if id == &group_id_hex));
+        let after = serde_json::to_vec(
+            &app.group("alice", &group_id_hex)
+                .unwrap()
+                .expect("group projection after refusal"),
+        )
+        .unwrap();
+        assert_eq!(
+            after, before,
+            "refusing a resolved invite must not mutate it"
+        );
+    });
+}
+
+#[test]
+fn genuine_reinvite_acceptance_returns_authoritative_member_projection() {
+    run_composed_app_runtime_test("genuine-reinvite-acceptance", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("genuine re-invite", &[]).await.unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+
+        let group = client
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .expect("created group projection");
+        group.pending_confirmation = true;
+        group.via_welcome_message_id_hex = Some("cc".repeat(32));
+        group.self_membership = SelfMembership::Removed;
+        client.mark_group_projection_dirty(&group_id);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        let durable_before = app
+            .group("alice", &group_id_hex)
+            .unwrap()
+            .expect("durable re-invite projection");
+        assert!(durable_before.pending_confirmation);
+        assert_eq!(durable_before.self_membership, SelfMembership::Member);
+
+        let accepted = client.accept_group_invite(&group_id).unwrap();
+        assert!(!accepted.pending_confirmation);
+        assert_eq!(accepted.self_membership, SelfMembership::Member);
+        assert_eq!(
+            client
+                .state
+                .groups
+                .iter()
+                .find(|group| group.group_id_hex == group_id_hex)
+                .expect("worker projection after acceptance")
+                .self_membership,
+            SelfMembership::Member
+        );
+    });
+}
+
+#[test]
+fn account_worker_terminal_invite_refusal_emits_no_success_update() {
+    run_composed_app_runtime_test("terminal-invite-worker-ordering", || async {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("worker stale invite", &[])
+            .await
+            .unwrap();
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group = client
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .expect("created group projection");
+        group.pending_confirmation = true;
+        group.via_welcome_message_id_hex = Some("bb".repeat(32));
+        client.mark_group_projection_dirty(&group_id);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        app.set_group_self_membership("alice", &group_id_hex, SelfMembership::Removed)
+            .unwrap();
+        drop(client);
+
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.reconcile_accounts().await.unwrap();
+        runtime.pause_maintenance("alice").await.unwrap();
+        let mut events = runtime.subscribe();
+        let error = runtime
+            .accept_group_invite("alice", &group_id)
+            .await
+            .expect_err("removal linearized before acceptance must win");
+        assert!(matches!(error, AppError::GroupInviteNotActionable(ref id) if id == &group_id_hex));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), async {
+                loop {
+                    match events.recv().await {
+                        Ok(MarmotAppEvent::GroupStateUpdated {
+                            group_id: updated, ..
+                        }) if updated == group_id => {
+                            return;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "a refused acceptance must not publish a successful group-state update"
+        );
+        let stored = app
+            .group("alice", &group_id_hex)
+            .unwrap()
+            .expect("durable group after worker refusal");
+        assert!(stored.pending_confirmation);
+        assert_eq!(stored.self_membership, SelfMembership::Removed);
+        runtime.shutdown().await;
+    });
+}
+
 /// A terminal group never advertises notification destinations again. The
 /// inbound seam queues the current registration's removal and discards every
 /// cached peer token; hydration re-emits a stored group's `GroupDisbanded`
