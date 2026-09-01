@@ -30,7 +30,10 @@ cargo build --release --locked -p "$CRATE_NAME"
 
 # Darwin has no libdl: dlopen lives in libSystem.
 case "$(uname -s)" in
-  Darwin) DYLIB_EXT="dylib"; LIBS_PRIVATE="-lm -lpthread" ;;
+  Darwin)
+    DYLIB_EXT="dylib"
+    LIBS_PRIVATE="-lm -lpthread -framework Security -framework CoreFoundation -liconv"
+    ;;
   *) DYLIB_EXT="so"; LIBS_PRIVATE="-lm -lpthread -ldl" ;;
 esac
 
