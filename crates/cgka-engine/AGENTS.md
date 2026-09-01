@@ -428,8 +428,8 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   repair the apply.
 - **Hydration quarantine is enforced through `Engine::ensure_group_live`.** A quarantined group vanishes from every
   live surface (mdk#364 / #365): every public accessor that reads durable or MLS group state (`members`,
-  `group_record`, `group_context`, `admin_pubkeys`, `app_component`, `feature_status`, capability queries, the
-  safe-export family, `own_leaf_index`) calls `ensure_group_live` first and returns `UnknownGroup`; `do_send` and
+  `group_record`, `group_context`, `admin_pubkeys`, `app_component`, `app_components`, `feature_status`, capability
+  queries, the safe-export family, `own_leaf_index`) calls `ensure_group_live` first and returns `UnknownGroup`; `do_send` and
   `converge_and_drain_queued_outbound_intents` refuse to run; `ingest_group_message` retains inbound input as
   `PeelDeferred` and classifies it `Stale { reason: Quarantined }`; `converge_stored_openmls_messages` reports a
   `Blocked` run without touching state; `retry_deferred_peels` skips the group. When you add a new accessor or data

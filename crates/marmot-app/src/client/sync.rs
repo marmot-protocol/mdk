@@ -22,9 +22,8 @@ use crate::groups::{
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AccountState, AppError, AppGroupAdminPolicyComponent, AppMessageProjection,
-    AppPerformanceTelemetry, ClassifiedSyncFailure, EPOCH_BACKFILL_EOSE_WAIT,
-    EPOCH_BACKFILL_EXECUTION_QUANTUM, EPOCH_BACKFILL_RETRY_BACKOFF,
+    AccountState, AppError, AppMessageProjection, AppPerformanceTelemetry, ClassifiedSyncFailure,
+    EPOCH_BACKFILL_EOSE_WAIT, EPOCH_BACKFILL_EXECUTION_QUANTUM, EPOCH_BACKFILL_RETRY_BACKOFF,
     EPOCH_BACKFILL_RETRY_BACKOFF_CAP, SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership,
     SyncFailure, SyncSummary, TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
@@ -1331,22 +1330,7 @@ impl AppClient {
         if self.force_event_group_projection_unavailable {
             return None;
         }
-        let nostr_routing = self.nostr_routing_for_group(group_id).ok()?;
-        Some(EventGroupProjection {
-            nostr_routing,
-            group_metadata,
-            profile: self.profile_for_group(group_id),
-            admin_policy: self
-                .runtime
-                .admin_pubkeys(group_id)
-                .map(AppGroupAdminPolicyComponent::new)
-                .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
-            message_retention: self.message_retention_for_group(group_id),
-            agent_text_stream: self.agent_text_stream_for_group(group_id),
-            avatar_url: self.avatar_url_for_group(group_id),
-            encrypted_media: self.encrypted_media_for_group(group_id),
-            image: self.image_for_group(group_id),
-        })
+        self.event_group_projection(group_id, group_metadata).ok()
     }
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
@@ -3947,23 +3931,7 @@ impl AppClient {
             let group_metadata =
                 event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
             let group_projection = event_group_id(event)
-                .map(|group_id| {
-                    Ok::<_, AppError>(EventGroupProjection {
-                        nostr_routing: self.nostr_routing_for_group(group_id)?,
-                        group_metadata: group_metadata.as_ref(),
-                        profile: self.profile_for_group(group_id),
-                        admin_policy: self
-                            .runtime
-                            .admin_pubkeys(group_id)
-                            .map(AppGroupAdminPolicyComponent::new)
-                            .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new())),
-                        message_retention: self.message_retention_for_group(group_id),
-                        agent_text_stream: self.agent_text_stream_for_group(group_id),
-                        avatar_url: self.avatar_url_for_group(group_id),
-                        encrypted_media: self.encrypted_media_for_group(group_id),
-                        image: self.image_for_group(group_id),
-                    })
-                })
+                .map(|group_id| self.event_group_projection(group_id, group_metadata.as_ref()))
                 .transpose()?;
             if let Some(message) = observe_event(
                 &mut self.state,

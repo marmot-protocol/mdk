@@ -34,8 +34,8 @@ use zeroize::Zeroizing;
 
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
-    EventGroupProjection, GroupConfirmationProjection, add_group, fail_if_publish_failed,
-    publish_failure_error, send_summary_from_effects, validate_group_profile,
+    GroupConfirmationProjection, add_group, fail_if_publish_failed, publish_failure_error,
+    send_summary_from_effects, validate_group_profile,
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
@@ -3970,18 +3970,7 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let group_metadata = self.runtime.group_record(group_id).ok();
-        let nostr_routing = self.nostr_routing_for_group(group_id)?;
-        let projection = EventGroupProjection {
-            nostr_routing,
-            group_metadata: group_metadata.as_ref(),
-            profile: self.profile_for_group(group_id),
-            admin_policy: self.admin_policy_for_group(group_id),
-            message_retention: self.message_retention_for_group(group_id),
-            agent_text_stream: self.agent_text_stream_for_group(group_id),
-            avatar_url: self.avatar_url_for_group(group_id),
-            encrypted_media: self.encrypted_media_for_group(group_id),
-            image: self.image_for_group(group_id),
-        };
+        let projection = self.event_group_projection(group_id, group_metadata.as_ref())?;
         add_group(
             &mut self.state,
             group_id,
