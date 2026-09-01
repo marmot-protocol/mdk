@@ -1934,7 +1934,7 @@ impl<S: StorageProvider> Engine<S> {
             attempted += 1;
             let reingest = self.reingest_deferred_peel_row(group_id, &record, sweep);
             let result = if let Some(remaining) = execution.remaining() {
-                match tokio::time::timeout(remaining, reingest).await {
+                match crate::deadline::timeout(remaining, reingest).await {
                     Ok(result) => result,
                     Err(_) => {
                         timed_out = true;
