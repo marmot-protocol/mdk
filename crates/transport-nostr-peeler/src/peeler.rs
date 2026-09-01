@@ -20,6 +20,8 @@ use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr::{EventBuilder, Keys, Kind, NostrSigner, PublicKey, RelayUrl, Tag, UnsignedEvent};
 use rand::RngCore;
 use std::sync::Arc;
+#[cfg(test)]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 const NONCE_LEN: usize = 12;
 const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
@@ -749,8 +751,8 @@ mod tests {
             HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
             Some(group_id),
         );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
