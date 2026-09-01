@@ -91,22 +91,18 @@ impl ConvergenceInputContext {
     ) -> Self {
         let mut context = Self::default();
         for member in members {
-            context.fold_member(member);
+            if member.role == ConvergencePassMemberRole::CommitEdge {
+                context
+                    .commit_edges_by_source_epoch
+                    .entry(member.source_epoch)
+                    .or_default()
+                    .insert(member.payload_digest);
+            }
         }
         context
     }
 
-    /// Fold one pass member's contribution, so a caller already walking the
-    /// member list builds the context in the same pass instead of rescanning.
-    pub(crate) fn fold_member(&mut self, member: &ConvergencePassMember) {
-        if member.role == ConvergencePassMemberRole::CommitEdge {
-            self.commit_edges_by_source_epoch
-                .entry(member.source_epoch)
-                .or_default()
-                .insert(member.payload_digest);
-        }
-    }
-
+    #[cfg(test)]
     fn has_commit_at(&self, source_epoch: u64) -> bool {
         self.commit_edges_by_source_epoch
             .get(&source_epoch)
@@ -127,6 +123,10 @@ impl ConvergenceInputContext {
     /// proposal is only potentially relevant when a commit at the same source
     /// epoch may depend on it. Authentication and actual dependency/witness
     /// contribution are still proven by OpenMLS during frozen resolution.
+    ///
+    /// Test-only since pass admission moved to [`scan_selection_relevance`]:
+    /// this stays as the map-based oracle the parity test compares against.
+    #[cfg(test)]
     pub(crate) fn is_potentially_selection_relevant(
         &self,
         input: ClassifiedConvergenceInput,
@@ -179,9 +179,103 @@ impl ConvergenceInputContext {
     }
 }
 
+/// One input's [`ConvergenceInputContext::is_potentially_selection_relevant`]
+/// verdict in a single member scan, without materializing the commit-edge
+/// map. Pass admission answers exactly one input per call, so building the
+/// full context there is wasted work; equivalence with the context-based
+/// verdict is pinned by `scan_relevance_matches_context_relevance`.
+pub(crate) fn scan_selection_relevance(
+    members: &[ConvergencePassMember],
+    input: ClassifiedConvergenceInput,
+) -> bool {
+    use std::collections::hash_map::Entry;
+
+    match input.role {
+        ConvergencePassMemberRole::CommitEdge => true,
+        ConvergencePassMemberRole::ProposalDependency => members.iter().any(|member| {
+            member.role == ConvergencePassMemberRole::CommitEdge
+                && member.source_epoch == input.source_epoch
+        }),
+        ConvergencePassMemberRole::AppWitnessCandidate => {
+            // Competing commit edges strictly before the witness epoch: two
+            // distinct digests sharing one source epoch. Short-circuits on
+            // the first competing pair.
+            let mut first_digest_by_epoch = std::collections::HashMap::new();
+            for member in members {
+                if member.role != ConvergencePassMemberRole::CommitEdge
+                    || member.source_epoch >= input.source_epoch
+                {
+                    continue;
+                }
+                match first_digest_by_epoch.entry(member.source_epoch) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(member.payload_digest);
+                    }
+                    Entry::Occupied(entry) => {
+                        if *entry.get() != member.payload_digest {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgka_traits::types::MessageId;
+
+    fn member(
+        role: ConvergencePassMemberRole,
+        source_epoch: u64,
+        digest_byte: u8,
+    ) -> ConvergencePassMember {
+        ConvergencePassMember {
+            message_id: MessageId::new(vec![digest_byte; 32]),
+            payload_digest: [digest_byte; 32],
+            role,
+            source_epoch,
+        }
+    }
+
+    #[test]
+    fn scan_relevance_matches_context_relevance() {
+        use ConvergencePassMemberRole::*;
+
+        // Competing commits at epoch 1, a lone commit at epoch 3, a proposal
+        // and an app scattered around them.
+        let member_sets: Vec<Vec<ConvergencePassMember>> = vec![
+            vec![],
+            vec![member(CommitEdge, 1, 1)],
+            vec![member(CommitEdge, 1, 1), member(CommitEdge, 1, 2)],
+            vec![
+                member(CommitEdge, 1, 1),
+                member(CommitEdge, 1, 2),
+                member(CommitEdge, 3, 3),
+                member(ProposalDependency, 1, 4),
+                member(AppWitnessCandidate, 2, 5),
+            ],
+            // Duplicate digest at one epoch is one edge, not a competition.
+            vec![member(CommitEdge, 2, 6), member(CommitEdge, 2, 6)],
+        ];
+
+        for members in &member_sets {
+            let context = ConvergenceInputContext::from_pass_members(members);
+            for role in [CommitEdge, ProposalDependency, AppWitnessCandidate] {
+                for source_epoch in 0..=4 {
+                    let candidate = input(role, source_epoch, MessageState::Created, 9);
+                    assert_eq!(
+                        scan_selection_relevance(members, candidate),
+                        context.is_potentially_selection_relevant(candidate),
+                        "verdicts diverge for {role:?} at epoch {source_epoch} over {members:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn input(
         role: ConvergencePassMemberRole,

@@ -30,6 +30,7 @@ use crate::canonicalization::{
 use crate::convergence_clock::ConvergenceTime;
 use crate::convergence_input::{
     ClassifiedConvergenceInput, ConvergenceInputContext, role_for_content_kind,
+    scan_selection_relevance,
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
@@ -524,16 +525,12 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase != ConvergencePassPhase::Collecting {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
-        // One walk answers both admission questions: is this id already a
-        // member, and what commit-edge context do the current members form.
-        // Previously the id check and `from_pass_members` each rescanned the
-        // whole member list per admitted input (O(members²) per pass).
-        let mut context = ConvergenceInputContext::default();
-        for member in &pass.members {
-            if &member.message_id == message_id {
-                return Ok((ConvergenceAdmissionOutcome::Retained, opened));
-            }
-            context.fold_member(member);
+        if pass
+            .members
+            .iter()
+            .any(|member| &member.message_id == message_id)
+        {
+            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         if now.monotonic_ms >= pass.cutoff_monotonic_ms() {
             self.freeze_collecting_convergence_pass(&mut pass, now)?;
@@ -569,17 +566,18 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         let admitted_input = candidate.input;
+        // One scan of the pre-push members, no commit-edge map: the full
+        // `from_pass_members` context rebuild here was O(members) BTreeMap
+        // work per admitted input. Pre-push is sufficient for the new input's
+        // own verdict — a CommitEdge is relevant unconditionally, and a
+        // Proposal/AppWitness member contributes no commit edge.
+        let selection_relevant = scan_selection_relevance(&pass.members, admitted_input);
         pass.members.push(candidate.member);
-        // The pre-push context is sufficient here: a CommitEdge is relevant
-        // unconditionally, and a Proposal/AppWitness member contributes no
-        // commit edge, so folding the new member in cannot change its own
-        // relevance verdict.
-        //
         // Restart quiescence only for an input role that can change this
         // batch's deterministic resolution. Ordinary app delivery never
         // reaches this path; a future app without competing candidate edges is
         // retained but does not move the pass boundary.
-        if context.is_potentially_selection_relevant(admitted_input) {
+        if selection_relevant {
             pass.quiescence_deadline_monotonic_ms = now
                 .monotonic_ms
                 .saturating_add(policy.settlement_quiescence_ms);
