@@ -1598,6 +1598,10 @@ mod tests {
 
         let resource = app_error(AppError::RuntimeBusy);
         assert_eq!(resource.category, SubjectFailureCategory::Resource);
+
+        let refusal = app_error(AppError::GroupInviteNotPending);
+        assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);
+        assert!(!refusal.message.contains(marker));
     }
 
     #[test]

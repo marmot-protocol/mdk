@@ -4873,15 +4873,39 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
         "authoritative removal leaves no pending invite to accept"
     );
     assert!(removed.archived);
+    let removed_bytes = serde_json::to_vec(&removed).unwrap();
+    let mut stale_accept_events = runtime.subscribe();
 
     let stale_accept = accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .expect_err("a terminal removed projection must reject stale invite acceptance");
     assert!(matches!(stale_accept, AppError::GroupInviteNotPending));
     let still_removed = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
-    assert_eq!(still_removed.self_membership, SelfMembership::Removed);
-    assert!(!still_removed.pending_confirmation);
-    assert!(still_removed.archived);
+    assert_eq!(
+        serde_json::to_vec(&still_removed).unwrap(),
+        removed_bytes,
+        "terminal invite refusal must leave the complete durable projection unchanged"
+    );
+    let success_update = timeout(Duration::from_millis(250), async {
+        loop {
+            match stale_accept_events.recv().await {
+                Ok(MarmotAppEvent::GroupStateUpdated {
+                    ref account_id_hex,
+                    group_id: ref updated_group_id,
+                    ..
+                }) if account_id_hex == &bob_id && updated_group_id == &group_id => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime event channel closed while checking invite refusal")
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        success_update.is_err(),
+        "a refused invite acceptance must not publish GroupStateUpdated"
+    );
 
     runtime.shutdown().await;
     let app = MarmotApp::with_relay_and_config(
@@ -5224,14 +5248,17 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     assert_eq!(reloaded.self_membership, SelfMembership::Left);
     assert!(!reloaded.pending_confirmation);
     assert!(reloaded.archived);
+    let reloaded_bytes = serde_json::to_vec(&reloaded).unwrap();
     let stale_accept = accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .expect_err("a terminal left projection must reject stale invite acceptance");
     assert!(matches!(stale_accept, AppError::GroupInviteNotPending));
     let still_left = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
-    assert_eq!(still_left.self_membership, SelfMembership::Left);
-    assert!(!still_left.pending_confirmation);
-    assert!(still_left.archived);
+    assert_eq!(
+        serde_json::to_vec(&still_left).unwrap(),
+        reloaded_bytes,
+        "left invite refusal must leave the complete durable projection unchanged"
+    );
     assert!(
         !app.visible_groups(&bob_label)
             .unwrap()
