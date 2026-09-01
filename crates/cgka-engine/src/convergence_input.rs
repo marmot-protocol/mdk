@@ -91,15 +91,20 @@ impl ConvergenceInputContext {
     ) -> Self {
         let mut context = Self::default();
         for member in members {
-            if member.role == ConvergencePassMemberRole::CommitEdge {
-                context
-                    .commit_edges_by_source_epoch
-                    .entry(member.source_epoch)
-                    .or_default()
-                    .insert(member.payload_digest);
-            }
+            context.fold_member(member);
         }
         context
+    }
+
+    /// Fold one pass member's contribution, so a caller already walking the
+    /// member list builds the context in the same pass instead of rescanning.
+    pub(crate) fn fold_member(&mut self, member: &ConvergencePassMember) {
+        if member.role == ConvergencePassMemberRole::CommitEdge {
+            self.commit_edges_by_source_epoch
+                .entry(member.source_epoch)
+                .or_default()
+                .insert(member.payload_digest);
+        }
     }
 
     fn has_commit_at(&self, source_epoch: u64) -> bool {

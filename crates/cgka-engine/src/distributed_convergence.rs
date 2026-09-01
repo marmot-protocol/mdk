@@ -524,12 +524,16 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase != ConvergencePassPhase::Collecting {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
-        if pass
-            .members
-            .iter()
-            .any(|member| &member.message_id == message_id)
-        {
-            return Ok((ConvergenceAdmissionOutcome::Retained, opened));
+        // One walk answers both admission questions: is this id already a
+        // member, and what commit-edge context do the current members form.
+        // Previously the id check and `from_pass_members` each rescanned the
+        // whole member list per admitted input (O(members²) per pass).
+        let mut context = ConvergenceInputContext::default();
+        for member in &pass.members {
+            if &member.message_id == message_id {
+                return Ok((ConvergenceAdmissionOutcome::Retained, opened));
+            }
+            context.fold_member(member);
         }
         if now.monotonic_ms >= pass.cutoff_monotonic_ms() {
             self.freeze_collecting_convergence_pass(&mut pass, now)?;
@@ -566,7 +570,11 @@ impl<S: StorageProvider> Engine<S> {
         }
         let admitted_input = candidate.input;
         pass.members.push(candidate.member);
-        let context = ConvergenceInputContext::from_pass_members(&pass.members);
+        // The pre-push context is sufficient here: a CommitEdge is relevant
+        // unconditionally, and a Proposal/AppWitness member contributes no
+        // commit edge, so folding the new member in cannot change its own
+        // relevance verdict.
+        //
         // Restart quiescence only for an input role that can change this
         // batch's deterministic resolution. Ordinary app delivery never
         // reaches this path; a future app without competing candidate edges is
