@@ -1783,35 +1783,78 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
 /// Whether this group's stored commit graph is contested: two retained commits
 /// at or above the retained anchor fork from the same source epoch.
 ///
-/// The replay-free half of [`candidate_branch_peel`], and deliberately the
-/// same predicate over the same seeded inputs — a second, privately restated
-/// notion of "forked" would drift from the one branch enumeration acts on
-/// without any test noticing. Costs the seeding scan and nothing more: no
-/// snapshot, no rewind, no OpenMLS replay.
+/// The replay-free half of [`candidate_branch_peel`]. Deliberately the same
+/// record-contribution rules as the commit arm of
+/// [`seed_stored_openmls_graph_inputs`] and the same fork predicate
+/// ([`SourceEpochForkDetector`], shared with [`commits_share_a_source_epoch`])
+/// — a privately restated notion of "forked" would drift from the one branch
+/// enumeration acts on without any test noticing; the deferral-lineage pair in
+/// `tests/distributed_convergence.rs` pins the parity. Unlike the full seed it
+/// touches commits only — no payload clones, no proposal/app/own-commit
+/// materialization — and returns at the first fork. No snapshot, no rewind,
+/// no OpenMLS replay.
 pub(crate) fn stored_graph_is_contested<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     retained_anchor_epoch: u64,
 ) -> Result<bool, OpenMlsProjectionError> {
-    let inputs = seed_stored_openmls_graph_inputs(storage, group_id, retained_anchor_epoch, None)?;
-    Ok(commits_share_a_source_epoch(&inputs.commit_messages))
+    let records = storage
+        .list_messages(group_id, EpochId(0))
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    let mut detector = SourceEpochForkDetector::default();
+    for record in records {
+        if !record_state_can_contribute_to_openmls_graph(record.state) {
+            continue;
+        }
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
+        let Some(message) = payload.as_openmls_wire() else {
+            continue;
+        };
+        if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            continue;
+        }
+        let projection = project_mls_message(&message.payload)?;
+        if projection.kind != OpenMlsContentKind::Commit {
+            continue;
+        }
+        let Some(source_epoch) = projection.source_epoch else {
+            continue;
+        };
+        if source_epoch < retained_anchor_epoch {
+            continue;
+        }
+        if detector.observe(source_epoch, projection.message_digest) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Incremental form of the fork predicate: `observe` reports true the moment
+/// two distinct commit digests share a source epoch. Both contested-ness
+/// answers ([`stored_graph_is_contested`] and [`commits_share_a_source_epoch`])
+/// fold through this one detector so they cannot drift.
+#[derive(Default)]
+struct SourceEpochForkDetector {
+    by_epoch: BTreeMap<u64, BTreeSet<[u8; 32]>>,
+}
+
+impl SourceEpochForkDetector {
+    fn observe(&mut self, source_epoch: u64, digest: [u8; 32]) -> bool {
+        let edges = self.by_epoch.entry(source_epoch).or_default();
+        edges.insert(digest);
+        edges.len() > 1
+    }
 }
 
 /// Whether two distinct stored commits fork from the same source epoch — the
 /// structural precondition for more than one candidate branch.
 fn commits_share_a_source_epoch(commits: &[StoredCommitMessage]) -> bool {
-    let mut by_epoch: BTreeMap<u64, BTreeSet<[u8; 32]>> = BTreeMap::new();
-    for commit in commits {
-        if by_epoch
-            .entry(commit.source_epoch)
-            .or_default()
-            .insert(commit.digest)
-            && by_epoch[&commit.source_epoch].len() > 1
-        {
-            return true;
-        }
-    }
-    false
+    let mut detector = SourceEpochForkDetector::default();
+    commits
+        .iter()
+        .any(|commit| detector.observe(commit.source_epoch, commit.digest))
 }
 
 /// Enumerate and capture branch tips from the state currently restored.
