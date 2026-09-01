@@ -27,7 +27,10 @@ CFLAGS=(-std=c11 -Wall -Wextra -Werror -I"$CRATE_DIR/include")
 # Darwin has no libdl (dlopen lives in libSystem) and looks up shared
 # libraries through DYLD_LIBRARY_PATH.
 case "$(uname -s)" in
-  Darwin) STATIC_LIBS=(-lm -pthread); LIB_PATH_VAR="DYLD_LIBRARY_PATH" ;;
+  Darwin)
+    STATIC_LIBS=(-lm -pthread -framework Security -framework CoreFoundation -liconv)
+    LIB_PATH_VAR="DYLD_LIBRARY_PATH"
+    ;;
   *) STATIC_LIBS=(-lm -pthread -ldl); LIB_PATH_VAR="LD_LIBRARY_PATH" ;;
 esac
 

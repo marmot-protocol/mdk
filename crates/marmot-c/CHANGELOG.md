@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-09-01
+
 ### Added
 
 - `marmot_notify_connectivity_restored`, allowing C hosts to wake durable
@@ -35,3 +37,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   fetch the NIP-65 and inbox relay lists any account id has published, not
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
+
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.16...HEAD
+[0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16
