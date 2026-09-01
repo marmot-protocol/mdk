@@ -798,7 +798,7 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| {
+    path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "atomic private write target must name a file",
@@ -808,9 +808,9 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut allocated = None;
     for _ in 0..32 {
         let attempt = ATOMIC_PRIVATE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = OsString::from(".");
-        temp_name.push(file_name);
-        temp_name.push(format!(".tmp.{}.{}", std::process::id(), attempt));
+        // Keep the sibling component short. Embedding `file_name` would overflow
+        // NAME_MAX when the target is already at the filesystem limit.
+        let temp_name = OsString::from(format!(".atomic.tmp.{}.{}", std::process::id(), attempt));
         let temp_path = parent.join(temp_name);
         match create_new_private(&temp_path) {
             Ok(file) => {
@@ -1218,6 +1218,25 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn write_private_atomic_replaces_maximum_length_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        // POSIX NAME_MAX is 255. Do not query libc::NAME_MAX; it is not
+        // portable across the libc crate's Unix cfgs.
+        let name = "a".repeat(255);
+        let path = dir.path().join(&name);
+
+        write_private_atomic(&path, b"old").unwrap();
+        write_private_atomic(&path, b"complete replacement").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete replacement");
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![path.file_name().unwrap()]);
     }
 }
 
