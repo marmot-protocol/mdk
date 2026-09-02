@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::maintenance::{
@@ -123,7 +124,7 @@ impl MaintenanceStorage for SqliteAccountStorage {
     fn periodic_maintenance_policy(&self) -> StorageResult<PeriodicMaintenancePolicy> {
         let value: i64 = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT periodic_policy FROM cgka_maintenance_settings WHERE singleton = 1",
                 [],
                 |row| row.get(0),
@@ -148,7 +149,7 @@ impl MaintenanceStorage for SqliteAccountStorage {
         };
         write(self, || {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "UPDATE cgka_maintenance_settings
                      SET periodic_policy = ?1
                      WHERE singleton = 1",
@@ -288,7 +289,7 @@ fn list_ordered_records<T: serde::de::DeserializeOwned>(
 ) -> StorageResult<Vec<T>> {
     let sql = format!("SELECT record FROM {table} ORDER BY insert_order");
     let connection = store.lock()?;
-    let mut statement = connection.prepare(&sql).storage()?;
+    let mut statement = connection.prepare_cached(&sql).storage()?;
     let records = statement
         .query_map([], |row| row.get::<_, Vec<u8>>(0))
         .storage()?
@@ -304,7 +305,7 @@ fn list_ordered_records_for_group<T: serde::de::DeserializeOwned>(
 ) -> StorageResult<Vec<T>> {
     let sql = format!("SELECT record FROM {table} WHERE group_id = ?1 ORDER BY insert_order");
     let connection = store.lock()?;
-    let mut statement = connection.prepare(&sql).storage()?;
+    let mut statement = connection.prepare_cached(&sql).storage()?;
     let records = statement
         .query_map(params![group_id.as_slice()], |row| row.get::<_, Vec<u8>>(0))
         .storage()?

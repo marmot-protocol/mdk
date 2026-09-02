@@ -250,6 +250,36 @@ impl CloseableConnection {
     }
 }
 
+/// rusqlite's default statement cache holds 16 entries; this crate issues
+/// well over a hundred distinct statement texts on the engine paths alone.
+pub(crate) const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 256;
+
+/// `Connection::execute` / `Connection::query_row` compile the SQL text on
+/// every call. Every statement this crate issues has a fixed text, so route
+/// the hot paths through the connection's prepared-statement cache instead.
+pub(crate) trait CachedSql {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl CachedSql for rusqlite::Connection {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SharedConnection {
     inner: Arc<SharedConnectionInner>,
@@ -489,7 +519,9 @@ impl SharedConnection {
             let Ok(conn) = self.inner.connection.lock() else {
                 return Err(BoundaryOutcome::Closed);
             };
-            conn.execute_batch(sql).map_err(BoundaryOutcome::Sqlite)
+            conn.execute_cached(sql, [])
+                .map(|_| ())
+                .map_err(BoundaryOutcome::Sqlite)
         })
     }
 
@@ -507,7 +539,8 @@ impl SharedConnection {
             self.inner
                 .connection
                 .lock()?
-                .execute_batch("BEGIN IMMEDIATE")
+                .execute_cached("BEGIN IMMEDIATE", [])
+                .map(|_| ())
                 .map_err(crate::codec::map_sqlite_error)
         })
     }
@@ -774,6 +807,7 @@ impl SqliteAccountStorage {
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
         apply_operational_pragmas(&connection, &options)?;
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         migrations::run_all(&mut connection)?;
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
@@ -832,7 +866,7 @@ fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) ->
         .pragma_update(None, "key", key.as_secret_str())
         .storage()?;
     let _: i64 = connection
-        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .query_row_cached("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
         .storage()?;
     Ok(())
 }

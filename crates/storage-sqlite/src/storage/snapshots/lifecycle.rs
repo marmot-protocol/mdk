@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::GroupId;
@@ -6,7 +7,7 @@ use rusqlite::params;
 pub(super) fn list(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<String>> {
     let conn = store.lock()?;
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT name FROM cgka_group_snapshots
                  WHERE group_id = ?1
                  ORDER BY name",
@@ -25,7 +26,7 @@ pub(super) fn release(
 ) -> StorageResult<()> {
     let changed = store
         .lock()?
-        .execute(
+        .execute_cached(
             "DELETE FROM cgka_group_snapshots
                  WHERE group_id = ?1 AND name = ?2",
             params![group_id.as_slice(), name],

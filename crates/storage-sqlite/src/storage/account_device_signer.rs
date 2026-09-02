@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::storage::{AccountDeviceSignerBinding, AccountDeviceSignerStorage, StorageResult};
 use cgka_traits::types::MemberId;
@@ -6,7 +7,7 @@ use rusqlite::{OptionalExtension, params};
 impl AccountDeviceSignerStorage for SqliteAccountStorage {
     fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_account_device_signers (marmot_identity, record)
                  VALUES (?1, ?2)",
                 params![binding.marmot_identity.as_slice(), serialize(binding)?],
@@ -21,7 +22,7 @@ impl AccountDeviceSignerStorage for SqliteAccountStorage {
     ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
         let record: Option<Vec<u8>> = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_account_device_signers WHERE marmot_identity = ?1",
                 params![marmot_identity.as_slice()],
                 |row| row.get(0),

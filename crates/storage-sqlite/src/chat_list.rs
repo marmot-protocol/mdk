@@ -1,4 +1,5 @@
 use crate::account_projection::chat_mute_is_effective;
+use crate::connection::CachedSql;
 use crate::storage::disband_requests::{
     disband_requests_by_group_hex_tx, disbanding_group_ids_hex_tx,
     disbanding_group_ids_hex_with_requests_tx,
@@ -467,7 +468,7 @@ impl SqliteAccountStorage {
         }
         let conn = self.lock()?;
         let sql = format!("EXPLAIN QUERY PLAN {}", direct_conversation_candidate_sql());
-        let mut statement = conn.prepare(&sql).storage()?;
+        let mut statement = conn.prepare_cached(&sql).storage()?;
         statement
             .query_map(params![peer_account_id_hex], |row| row.get::<_, String>(3))
             .storage()?
@@ -483,7 +484,7 @@ impl SqliteAccountStorage {
     pub fn unindexed_direct_conversation_group_ids(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         let mut statement = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT ag.group_id_hex
                  FROM account_groups AS ag
                  JOIN chat_list_rows AS row ON row.group_id_hex = ag.group_id_hex
@@ -520,7 +521,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let archived = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT archived FROM account_groups WHERE group_id_hex = ?1",
                     params![group_id_hex],
                     |row| row.get::<_, i64>(0),
@@ -567,7 +568,7 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             for group_id_hex in ordered_group_ids {
                 let exists = conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT EXISTS(
                             SELECT 1 FROM account_groups WHERE group_id_hex = ?1
                          )",
@@ -614,7 +615,7 @@ impl SqliteAccountStorage {
     /// `attention_only_conversations`.
     pub fn account_unread_total(&self) -> StorageResult<AccountUnreadTotal> {
         let conn = self.lock()?;
-        conn.query_row(
+        conn.query_row_cached(
             "SELECT COALESCE(SUM(row.unread_count), 0),
                     COUNT(CASE
                         WHEN row.unread_count > 0
@@ -783,7 +784,7 @@ impl SqliteAccountStorage {
                 // "mark unread" does not suddenly count the whole backlog.
                 insert_initial_read_state_tx(&conn, group_id_hex, manually_unread)?;
             } else {
-                conn.execute(
+                conn.execute_cached(
                     "UPDATE conversation_read_state
                      SET manually_marked_unread = ?2, updated_at = ?3
                      WHERE group_id_hex = ?1",
@@ -834,7 +835,7 @@ impl SqliteAccountStorage {
 
                 if should_advance {
                     let (order_class, order_primary, order_phase, order_at, _id) = target_order;
-                    conn.execute(
+                    conn.execute_cached(
                         "INSERT INTO conversation_read_state (
                             group_id_hex, last_read_message_id_hex, last_read_timeline_at,
                             last_read_order_class, last_read_order_primary,
@@ -867,7 +868,7 @@ impl SqliteAccountStorage {
             }
             // Explicitly marking a message read clears a manual-only reminder
             // even when the target does not advance the already-newer marker.
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE conversation_read_state
                  SET manually_marked_unread = 0, updated_at = ?2
                  WHERE group_id_hex = ?1 AND manually_marked_unread != 0",
@@ -886,7 +887,7 @@ impl SqliteAccountStorage {
 
 fn pinned_chat_order_tx(tx: &Connection) -> Result<Vec<String>, ChatPinError> {
     let mut statement = tx
-        .prepare(
+        .prepare_cached(
             "SELECT group_id_hex
              FROM chat_pin_positions
              ORDER BY ordinal ASC, group_id_hex ASC",
@@ -904,9 +905,10 @@ fn rewrite_pinned_chat_order_tx(
     tx: &Connection,
     ordered_group_ids: &[String],
 ) -> Result<(), ChatPinError> {
-    tx.execute("DELETE FROM chat_pin_positions", []).storage()?;
+    tx.execute_cached("DELETE FROM chat_pin_positions", [])
+        .storage()?;
     for (ordinal, group_id_hex) in ordered_group_ids.iter().enumerate() {
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO chat_pin_positions (group_id_hex, ordinal)
              VALUES (?1, ?2)",
             params![
@@ -932,7 +934,7 @@ fn rebuild_all_chat_list_rows_tx(
     // Upsert in place so durable activity anchors survive a projection rebuild
     // after their preview rows have been securely pruned. Remove only true
     // orphans; normal account-group deletion already cascades this table.
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM chat_list_rows
          WHERE NOT EXISTS (
              SELECT 1 FROM account_groups AS ag
@@ -954,7 +956,7 @@ fn refresh_chat_list_row_tx(
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<Option<ChatListRow>> {
     let Some(group) = account_group_tx(tx, group_id_hex)? else {
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
             params![group_id_hex],
         )
@@ -1112,7 +1114,7 @@ struct LatestChatListMessage {
 
 fn chat_list_projection_version_tx(tx: &Connection) -> StorageResult<i64> {
     Ok(tx
-        .query_row(
+        .query_row_cached(
             "SELECT mention_counts_version FROM chat_list_projection_meta WHERE id = 1",
             [],
             |row| row.get::<_, i64>(0),
@@ -1123,7 +1125,7 @@ fn chat_list_projection_version_tx(tx: &Connection) -> StorageResult<i64> {
 }
 
 fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> StorageResult<()> {
-    tx.execute(
+    tx.execute_cached(
         "UPDATE chat_list_projection_meta SET mention_counts_version = ?1 WHERE id = 1",
         params![version],
     )
@@ -1327,7 +1329,7 @@ fn chat_list_stored_unread_summaries_tx(
     tx: &Connection,
 ) -> StorageResult<Vec<(String, UnreadSummary)>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT group_id_hex, unread_count, unread_mention_count,
                     first_unread_message_id_hex
              FROM chat_list_rows",
@@ -1393,7 +1395,7 @@ fn rebuild_chat_list_row_for_group_tx(
         )
         .fold(group.conversation_created_at, u64::max);
     let now = unix_now_seconds();
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO chat_list_rows (
             group_id_hex, archived, pending_confirmation, title, group_name,
             avatar_url,
@@ -1603,7 +1605,7 @@ fn unread_summary_tx(
         rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
     ];
     query_params.extend(marker_params);
-    let mut scan_stmt = tx.prepare(&scan_sql).storage()?;
+    let mut scan_stmt = tx.prepare_cached(&scan_sql).storage()?;
     let mut scan_rows = scan_stmt
         .query(rusqlite::params_from_iter(query_params))
         .storage()?;
@@ -1645,7 +1647,7 @@ pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
-    tx.execute(
+    tx.execute_cached(
         "UPDATE chat_list_rows
          SET unread_count = ?2,
              unread_mention_count = ?3,
@@ -1664,7 +1666,7 @@ pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
 
 fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                     image_hash_hex, image_key_hex, image_nonce_hex,
                     image_upload_key_hex, image_media_type, avatar_url.component_data_hex,
@@ -1685,7 +1687,7 @@ fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
 }
 
 fn account_group_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<AccountGroupRow>> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                 image_hash_hex, image_key_hex, image_nonce_hex,
                 image_upload_key_hex, image_media_type, avatar_url.component_data_hex,
@@ -1885,7 +1887,7 @@ fn insert_initial_read_state_tx(
     // activity there is no read anchor yet, so a subsequently recorded row
     // counts even when its sender timestamp predates this local interaction.
     let initialized_at = timeline_at.unwrap_or(0);
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO conversation_read_state (
             group_id_hex, last_read_message_id_hex, last_read_timeline_at,
             last_read_order_class, last_read_order_primary,
@@ -1914,7 +1916,7 @@ fn read_state_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<ConversationReadState>> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT last_read_message_id_hex, last_read_timeline_at,
                 last_read_order_class, last_read_order_primary,
                 last_read_order_phase, last_read_order_at,
@@ -1965,7 +1967,7 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
         )
     };
     let now_ms = unix_now_ms();
-    let mut stmt = tx.prepare(&sql).storage()?;
+    let mut stmt = tx.prepare_cached(&sql).storage()?;
     let mut rows = stmt
         .query_map([], |row| chat_list_row_from_row(row, now_ms))
         .storage()?
@@ -2017,7 +2019,7 @@ fn direct_conversation_candidate_rows_tx(
     }
     let sql = direct_conversation_candidate_sql();
     let now_ms = unix_now_ms();
-    let mut stmt = tx.prepare(&sql).storage()?;
+    let mut stmt = tx.prepare_cached(&sql).storage()?;
     let mut rows = stmt
         .query_map(params![peer_account_id_hex], |row| {
             chat_list_row_from_row(row, now_ms)

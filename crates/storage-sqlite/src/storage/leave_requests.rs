@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::storage::{LeaveRequest, LeaveRequestStorage, StorageResult};
 use cgka_traits::types::GroupId;
@@ -21,7 +22,7 @@ pub(crate) fn pending_leave_requests_by_group_hex_tx(
     tx: &Connection,
 ) -> StorageResult<HashMap<String, u64>> {
     let mut statement = tx
-        .prepare("SELECT group_id, record FROM cgka_leave_requests")
+        .prepare_cached("SELECT group_id, record FROM cgka_leave_requests")
         .storage()?;
     let rows = statement
         .query_map([], |row| {
@@ -54,7 +55,7 @@ impl LeaveRequestStorage for SqliteAccountStorage {
     fn put_leave_request(&self, request: &LeaveRequest) -> StorageResult<()> {
         let serialized = serialize(request)?;
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_leave_requests (group_id, record)
                  VALUES (?1, ?2)",
                 params![request.group_id.as_slice(), serialized],
@@ -65,7 +66,7 @@ impl LeaveRequestStorage for SqliteAccountStorage {
 
     fn leave_request(&self, group_id: &GroupId) -> StorageResult<Option<LeaveRequest>> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_leave_requests WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -78,7 +79,7 @@ impl LeaveRequestStorage for SqliteAccountStorage {
 
     fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_leave_requests WHERE group_id = ?1",
                 params![group_id.as_slice()],
             )

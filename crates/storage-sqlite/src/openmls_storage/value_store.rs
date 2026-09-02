@@ -1,6 +1,7 @@
 use super::labels::{OpenMlsValueLabel, ValueSensitivity, build_key, build_key_legacy};
 use super::{SqliteOpenMlsStorage, SqliteOpenMlsStorageError};
 use crate::codec::{SensitiveBytes, serialize_sensitive_json};
+use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
 use openmls_traits::storage::{CURRENT_VERSION, Entity, Key};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -400,7 +401,7 @@ fn read_value_on_connection(
     label: OpenMlsValueLabel,
 ) -> Result<Option<SerializedBuffer>, SqliteOpenMlsStorageError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             "SELECT value FROM openmls_values
              WHERE provider_version = ?1 AND storage_key = ?2",
             params![CURRENT_VERSION, storage_key],
@@ -418,7 +419,7 @@ fn write_value_on_connection(
     group_key: Option<&[u8]>,
     value: &[u8],
 ) -> Result<(), SqliteOpenMlsStorageError> {
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR REPLACE INTO openmls_values
             (provider_version, label, storage_key, group_key, value)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -469,7 +470,7 @@ fn write_list_on_connection(
     list: &SerializedList,
 ) -> Result<(), SqliteOpenMlsStorageError> {
     let encoded = serialize_buffer(label, list)?;
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR REPLACE INTO openmls_values
             (provider_version, label, storage_key, group_key, value)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -526,7 +527,7 @@ fn delete_value_on_connection(
     conn: &rusqlite::Connection,
     storage_key: &[u8],
 ) -> Result<(), SqliteOpenMlsStorageError> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM openmls_values
          WHERE provider_version = ?1 AND storage_key = ?2",
         params![CURRENT_VERSION, storage_key],
@@ -540,7 +541,7 @@ fn delete_group_labels_on_connection(
     labels: &[OpenMlsValueLabel],
 ) -> Result<(), SqliteOpenMlsStorageError> {
     for label in labels {
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM openmls_values
              WHERE provider_version = ?1 AND group_key = ?2 AND label = ?3",
             params![CURRENT_VERSION, group_key, label.as_bytes()],

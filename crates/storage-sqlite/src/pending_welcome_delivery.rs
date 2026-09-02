@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::params;
@@ -46,7 +47,7 @@ impl SqliteAccountStorage {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         for record in records {
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO app_pending_welcome_delivery (
                     message_id_hex, group_id_hex, recipient_hex, recorded_at
                  )
@@ -74,7 +75,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Vec<PendingWelcomeDeliveryRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT message_id_hex, group_id_hex, recipient_hex, recorded_at
                  FROM app_pending_welcome_delivery
                  ORDER BY recorded_at ASC, message_id_hex ASC",
@@ -105,7 +106,7 @@ impl SqliteAccountStorage {
     /// Clear the pending welcome delivery for `message_id_hex`, if any.
     pub fn clear_pending_welcome_delivery(&self, message_id_hex: &str) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM app_pending_welcome_delivery WHERE message_id_hex = ?1",
                 params![message_id_hex],
             )

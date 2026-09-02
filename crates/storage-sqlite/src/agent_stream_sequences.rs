@@ -1,5 +1,6 @@
 //! Durable, fail-closed publisher sequence reservations for QUIC previews.
 
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, unix_now_ms};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -53,7 +54,7 @@ impl SqliteAccountStorage {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
             let row = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT next_seq, transcript_hash, chunk_count,
                             reservation_token, disabled
                      FROM agent_stream_publisher_sequences
@@ -75,7 +76,7 @@ impl SqliteAccountStorage {
             let (first_seq, current_hash, current_chunks) = match row {
                 Some((next_seq, transcript_hash, chunk_count, reservation, disabled)) => {
                     if disabled || reservation.is_some() {
-                        tx.execute(
+                        tx.execute_cached(
                             "UPDATE agent_stream_publisher_sequences
                              SET disabled = 1, updated_at_ms = ?2
                              WHERE context_id = ?1",
@@ -113,7 +114,7 @@ impl SqliteAccountStorage {
                 }
                 None => {
                     let count = tx
-                        .query_row(
+                        .query_row_cached(
                             "SELECT count(*) FROM agent_stream_publisher_sequences",
                             [],
                             |row| row.get::<_, i64>(0),
@@ -126,7 +127,7 @@ impl SqliteAccountStorage {
                             "agent stream publisher state limit reached".to_owned(),
                         ));
                     }
-                    tx.execute(
+                    tx.execute_cached(
                         "INSERT INTO agent_stream_publisher_sequences (
                             context_id, next_seq, transcript_hash, chunk_count,
                             reservation_token, disabled, updated_at_ms
@@ -157,7 +158,7 @@ impl SqliteAccountStorage {
             let next_seq = first_seq.checked_add(request.record_count).ok_or_else(|| {
                 StorageError::Backend("agent stream publisher sequence exhausted".to_owned())
             })?;
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE agent_stream_publisher_sequences
                  SET next_seq = ?2, transcript_hash = ?3, chunk_count = ?4,
                      reservation_token = ?5, updated_at_ms = ?6
@@ -195,7 +196,7 @@ impl SqliteAccountStorage {
             let changed = self
                 .connection
                 .lock()?
-                .execute(
+                .execute_cached(
                     "UPDATE agent_stream_publisher_sequences
              SET reservation_token = NULL, updated_at_ms = ?3
              WHERE context_id = ?1 AND reservation_token = ?2 AND disabled = 0",
@@ -217,7 +218,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<AgentStreamPublisherState>> {
         self.connection
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT next_seq, transcript_hash, chunk_count,
                         reservation_token IS NOT NULL OR disabled
                  FROM agent_stream_publisher_sequences

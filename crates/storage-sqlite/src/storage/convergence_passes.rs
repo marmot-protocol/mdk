@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::convergence_pass::DurableConvergencePass;
 use cgka_traits::storage::{ConvergencePassStorage, StorageResult};
@@ -11,7 +12,7 @@ impl ConvergencePassStorage for SqliteAccountStorage {
     ) -> StorageResult<Option<DurableConvergencePass>> {
         let encoded: Option<Vec<u8>> = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_convergence_passes WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get(0),
@@ -24,7 +25,7 @@ impl ConvergencePassStorage for SqliteAccountStorage {
     fn put_convergence_pass(&self, pass: &DurableConvergencePass) -> StorageResult<()> {
         let record = serialize(pass)?;
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT INTO cgka_convergence_passes (group_id, record)
                  VALUES (?1, ?2)
                  ON CONFLICT(group_id) DO UPDATE SET record = excluded.record",
@@ -37,7 +38,7 @@ impl ConvergencePassStorage for SqliteAccountStorage {
     fn list_convergence_passes(&self) -> StorageResult<Vec<DurableConvergencePass>> {
         let connection = self.lock()?;
         let mut statement = connection
-            .prepare("SELECT record FROM cgka_convergence_passes ORDER BY group_id")
+            .prepare_cached("SELECT record FROM cgka_convergence_passes ORDER BY group_id")
             .storage()?;
         let rows = statement
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
@@ -47,7 +48,7 @@ impl ConvergencePassStorage for SqliteAccountStorage {
 
     fn delete_convergence_pass(&self, group_id: &GroupId) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_convergence_passes WHERE group_id = ?1",
                 params![group_id.as_slice()],
             )

@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use std::collections::BTreeSet;
 
 use crate::{
@@ -138,7 +139,7 @@ WHERE group_id_hex = ?1
     ) -> StorageResult<bool> {
         Ok(self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT
                      EXISTS (
                          SELECT 1
@@ -203,7 +204,7 @@ pub(crate) fn replace_encrypted_media_secret_references_tx(
     // epoch. Always bind references to that durable value, not to a conflicting
     // replay's in-memory event.
     let source_epoch = tx
-        .query_row(
+        .query_row_cached(
             "SELECT source_epoch
              FROM app_events
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
@@ -233,7 +234,7 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
 ) -> StorageResult<()> {
     let retiring_epochs =
         encrypted_media_secret_reference_epochs_for_message_tx(tx, group_id_hex, message_id_hex)?;
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM encrypted_media_epoch_secret_references
          WHERE group_id_hex = ?1 AND message_id_hex = ?2",
         params![group_id_hex, message_id_hex],
@@ -245,7 +246,7 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
     {
         let source_epoch = u64_to_i64(source_epoch)?;
         for component_id in encrypted_media_component_ids(tags) {
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO encrypted_media_epoch_secret_references (
                      group_id_hex, message_id_hex, component_id, source_epoch
                  ) VALUES (?1, ?2, ?3, ?4)",
@@ -257,7 +258,7 @@ pub(crate) fn replace_encrypted_media_secret_references_for_parts_tx(
                 ],
             )
             .storage()?;
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE encrypted_media_epoch_secrets
                  SET retention_managed = 1
                  WHERE group_id_hex = ?1
@@ -278,7 +279,7 @@ fn encrypted_media_secret_reference_epochs_for_message_tx(
     message_id_hex: &str,
 ) -> StorageResult<BTreeSet<i64>> {
     let mut statement = tx
-        .prepare(
+        .prepare_cached(
             "SELECT DISTINCT source_epoch
              FROM encrypted_media_epoch_secret_references
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
@@ -304,7 +305,7 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
     let mut deleted = 0usize;
     for source_epoch in candidate_epochs {
         let referenced = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS (
                      SELECT 1
                      FROM encrypted_media_epoch_secret_references
@@ -319,7 +320,7 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
             continue;
         }
 
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks (
                  group_id_hex, retired_through_epoch, retired_at_unix_seconds
              ) VALUES (?1, ?2, ?3)
@@ -332,7 +333,7 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
             params![group_id_hex, source_epoch, unix_now_seconds_i64()],
         )
         .storage()?;
-        tx.execute(
+        tx.execute_cached(
             "UPDATE encrypted_media_epoch_secrets
              SET secret = zeroblob(length(secret))
              WHERE retention_managed = 1
@@ -342,7 +343,7 @@ pub(crate) fn retire_unreferenced_encrypted_media_secret_epochs_tx(
         )
         .storage()?;
         deleted = deleted.saturating_add(
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM encrypted_media_epoch_secrets
                  WHERE retention_managed = 1
                    AND group_id_hex = ?1
@@ -365,7 +366,7 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
     group_id_hex: &str,
 ) -> StorageResult<usize> {
     let has_group_data = tx
-        .query_row(
+        .query_row_cached(
             "SELECT
                  EXISTS (SELECT 1 FROM account_groups WHERE group_id_hex = ?1)
                  OR EXISTS (SELECT 1 FROM app_events WHERE group_id_hex = ?1)
@@ -385,7 +386,7 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
         return Ok(0);
     }
 
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks (
              group_id_hex, retired_through_epoch, retired_at_unix_seconds
          ) VALUES (?1, ?2, ?3)
@@ -395,14 +396,14 @@ pub(crate) fn retire_all_encrypted_media_secrets_for_group_tx(
         params![group_id_hex, i64::MAX, unix_now_seconds_i64()],
     )
     .storage()?;
-    tx.execute(
+    tx.execute_cached(
         "UPDATE encrypted_media_epoch_secrets
          SET secret = zeroblob(length(secret))
          WHERE group_id_hex = ?1",
         params![group_id_hex],
     )
     .storage()?;
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1",
         params![group_id_hex],
     )
