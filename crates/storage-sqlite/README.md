@@ -55,7 +55,9 @@ The default connection settings are privacy/durability oriented:
 - `secure_delete=ON`
 - `temp_store=MEMORY`
 - `trusted_schema=OFF`
-- `cipher_memory_security=ON` when supported by the linked SQLCipher build
+- `cipher_memory_security=ON` process-wide; Android reports a once-per-process
+  `platform_limited` diagnostic because its finite `mlock` budget makes memory
+  residency best effort while SQLCipher still sanitizes allocations on free
 
 Use `open_encrypted_with_options` or `in_memory_with_options` to override these runtime settings. The crate does not
 expose first-class key rotation for v1; rotate by creating a new encrypted database, migrating data, and replacing the

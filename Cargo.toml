@@ -147,3 +147,7 @@ marmot-terminal-harness = { path = "integrations/terminal-harness" }
 # release contains it, then remove this patch and update the libcrux path.
 [patch.crates-io]
 hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
+# libsqlite3-sys 0.38.2 still bundles SQLCipher 4.14.0, whose enhanced
+# memory-security allocator emits one WARN for every mlock failure. Pin the
+# merged 4.17.0 amalgamation until a crates.io release contains that lineage.
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7fdf83085c595fd54f977b3a56ccacabaf16b" }

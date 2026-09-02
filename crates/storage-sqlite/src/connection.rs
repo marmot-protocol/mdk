@@ -7,6 +7,8 @@ use cgka_traits::types::Backend;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+#[cfg(any(target_os = "android", test))]
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -31,6 +33,26 @@ const BUSY_BACKOFF_BASE: Duration = Duration::from_millis(20);
 
 /// Upper bound on a single busy-retry backoff sleep.
 const BUSY_BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+/// Android imposes a finite process-wide `mlock` budget (64 KiB on API 34+),
+/// so SQLCipher's enhanced whole-library memory locking is necessarily best
+/// effort there. SQLCipher 4.17 keeps allocation failures below its default
+/// log level; retain one bounded MDK-owned diagnostic instead.
+#[cfg(target_os = "android")]
+static SQLCIPHER_PLATFORM_LIMIT_REPORTED: Once = Once::new();
+
+#[cfg(any(target_os = "android", test))]
+fn report_sqlcipher_platform_limit_once(report_once: &Once) {
+    report_once.call_once(|| {
+        tracing::warn!(
+            target: "storage_sqlite::connection",
+            method = "configure_cipher_memory_security",
+            configured = true,
+            lock_posture = "platform_limited",
+            "SQLCipher memory locking is best effort on Android"
+        );
+    });
+}
 
 /// An error that may represent transient SQLite lock contention worth retrying.
 /// Implemented for the two storage error types so [`retry_on_busy`] can drive a
@@ -663,6 +685,10 @@ pub struct SqliteStorageOptions {
     pub secure_delete: bool,
     pub temp_store_memory: bool,
     pub trusted_schema: bool,
+    /// Enable SQLCipher's process-global enhanced memory allocator. Once any
+    /// connection enables it, it remains enabled for every SQLite connection
+    /// in the process. Android receives a once-per-process diagnostic because
+    /// its finite `mlock` budget makes page locking best effort.
     pub cipher_memory_security: bool,
     pub cipher_compatibility: u8,
 }
@@ -852,6 +878,8 @@ fn apply_cipher_pragmas(
         connection
             .execute_batch("PRAGMA cipher_memory_security = ON;")
             .storage()?;
+        #[cfg(target_os = "android")]
+        report_sqlcipher_platform_limit_once(&SQLCIPHER_PLATFORM_LIMIT_REPORTED);
     }
     Ok(())
 }
@@ -1019,9 +1047,42 @@ mod tests {
         atomic::{AtomicU32, Ordering},
         mpsc,
     };
+    use tracing::{Event, Subscriber, field::Visit};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TRACED_SQLCIPHER_SETUP: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    #[derive(Clone)]
+    struct PlatformLimitLayer {
+        events: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[derive(Default)]
+    struct PlatformLimitVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for PlatformLimitVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S> Layer<S> for PlatformLimitLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().target() == "storage_sqlite::connection"
+                && event.metadata().level() == &tracing::Level::WARN
+            {
+                let mut visitor = PlatformLimitVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(visitor.fields);
+            }
+        }
+    }
 
     fn delete_journal_options() -> SqliteStorageOptions {
         SqliteStorageOptions {
@@ -1081,7 +1142,35 @@ mod tests {
     }
 
     #[test]
-    fn bundled_sqlcipher_contains_the_wal_reset_corruption_fix() {
+    fn android_memory_lock_platform_limit_is_reported_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(PlatformLimitLayer {
+            events: Arc::clone(&events),
+        });
+        let report_once = Once::new();
+
+        tracing::subscriber::with_default(subscriber, || {
+            report_sqlcipher_platform_limit_once(&report_once);
+            report_sqlcipher_platform_limit_once(&report_once);
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .iter()
+                .any(|field| field == "method=\"configure_cipher_memory_security\"")
+        );
+        assert!(events[0].iter().any(|field| field == "configured=true"));
+        assert!(
+            events[0]
+                .iter()
+                .any(|field| field == "lock_posture=\"platform_limited\"")
+        );
+    }
+
+    #[test]
+    fn bundled_sqlcipher_contains_android_mlock_warning_fix() {
         fn version_tuple(value: &str) -> (u64, u64, u64) {
             let numeric = value.split_ascii_whitespace().next().unwrap_or(value);
             let mut components = numeric.split('.').map(|part| {
@@ -1108,8 +1197,8 @@ mod tests {
             "SQLite {sqlite_version} predates the WAL-reset corruption fix"
         );
         assert!(
-            version_tuple(&sqlcipher_version) >= (4, 14, 0),
-            "SQLCipher {sqlcipher_version} does not contain fixed SQLite 3.51.3"
+            version_tuple(&sqlcipher_version) >= (4, 17, 0),
+            "SQLCipher {sqlcipher_version} predates the Android mlock warning fix"
         );
     }
 
