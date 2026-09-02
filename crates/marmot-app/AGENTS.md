@@ -52,6 +52,14 @@ App runtime bridge for the first real Marmot app surfaces.
   Do not add a trigger path that bypasses the size-1 coalescing queue in `runtime/audit_tracker.rs`, and do not let one
   oversized or failing file block the files behind it. Retention/deletion of sealed segments is mdk#1014, not this
   contract.
+- Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
+  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
+  segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and
+  rewrites the whole sidecar. Do not add a per-upload or per-line entry, and do not treat the sidecar as durable state:
+  losing it costs one repeat transfer per file and nothing else.
+- A file above `AUDIT_LOG_UPLOAD_MAX_BYTES` has no app-level transfer path. `post_audit_log_file` enforces the same
+  ceiling, so the tracker's skip is the whole story: the file stays on disk for manual handling. Do not document an
+  escape hatch that does not exist, and do not widen the ceiling to invent one.
 - Keep SQLCipher key derivation, per-database salt persistence, legacy-key migration/recovery, and the in-process
   v2-open probe-verdict cache (mdk#1439) in `src/sqlcipher.rs`. The verdict cache is advisory only: a durable
   migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their

@@ -1047,6 +1047,10 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
   re-mints a line just because it moved to a new file name.
 - A file already over the threshold at open — the upgrade path from builds without rotation, including one already past
   the 64 MiB request ceiling — is rolled aside on the first open, so a session always starts on an uploadable file.
+- A failed roll is compensated and retried later, not absorbed: the rename is the only step that moves data, so a failed
+  reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
+  attempting rolls until something proves the directory writable again — a fresh open, or a `rotate()` — so a transient
+  `ENOSPC`/`EMFILE` costs a delayed roll, not a session with rotation disabled.
 - Retention, deletion, and disk bounding of sealed segments are out of scope here; they belong to mdk#1014.
 
 ### Explicit upload
@@ -1154,8 +1158,16 @@ it, plus whether that was an accepted upload or a file above the request ceiling
   falls back to re-uploading, which the endpoint short-circuits on `file_sha256` without parsing a line.
 - Losing or corrupting the sidecar costs one repeat transfer per still-present file and nothing else.
 - A file above the 64 MiB ceiling is recorded as such, logged once with aggregate counts, and skipped on later runs
-  instead of failing on every trigger. It never blocks the files behind it, and `post_audit_log_file` remains the
-  deliberate escape hatch.
+  instead of failing on every trigger. It never blocks the files behind it.
+- There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
+  it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
+  for manual handling (copy it off the device and hand it to the endpoint out of band, or split it). Deleting it is
+  mdk#1014's contract. Segment rotation is what keeps any newly produced file well under the ceiling, so this is an
+  upgrade-path condition only.
+- The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
+  are pruned each run. Because sealed segments are never deleted (mdk#1014), that bound still grows with cumulative
+  audit volume — each tracker run stats every enumerated file and rewrites the whole sidecar. Both costs are linear in
+  file count and small next to the HTTP request each run already makes.
 
 The runtime has a coalescing uploader queue of size `1`: triggers arriving while an update is scheduled or running
 collapse into exactly one follow-up run, and two updates never upload concurrently. It schedules tracker updates after
@@ -1185,8 +1197,12 @@ these triggers:
 - `catch_up`
 - `receive`
 
-Tracker scheduling itself logs only the trigger, skip reason, uploaded/acknowledged/too-large/failed counts, file
-sizes, and file index for failed uploads. It does not log audit file names, paths, or contents.
+Tracker scheduling itself logs only the trigger, skip reason, file sizes, the file index for failed and skipped
+uploads, and aggregate counts: `uploaded`, `acknowledged` (already accepted by the endpoint), `too_large_recorded`
+(newly found above the ceiling this run, which is what warrants the warning), `too_large_known` (already recorded as
+above the ceiling, so skipped without a repeat warning), and `failed`. Acknowledged-and-uploaded is kept distinct from
+skipped-as-too-large so the counts never report a permanently untransferable file as delivered. It does not log audit
+file names, paths, or contents.
 
 ## Coverage audit
 

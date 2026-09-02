@@ -1404,3 +1404,195 @@ fn rolled_segment_is_owner_only() {
     assert_eq!(mode(&segment_paths(&path)[0]), 0o600);
     assert_eq!(mode(&path), 0o600);
 }
+
+/// Record `rows` `send_entry` rows whose payloads differ per row, so a
+/// boundary that dropped, duplicated, or truncated a line cannot pass by
+/// accident.
+fn record_numbered_rows(recorder: &JsonlRecorder, rows: usize) {
+    for row in 0..rows {
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: format!("app_message_{row}"),
+            },
+        ));
+    }
+}
+
+/// Record until the recorder has attempted a roll — i.e. the active file has
+/// crossed the threshold at least once — returning the number of rows written.
+fn record_until_roll_attempted(recorder: &JsonlRecorder, path: &Path) -> usize {
+    for rows in 1..500_000 {
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: "app_message".into(),
+            },
+        ));
+        if fs::metadata(path).map(|meta| meta.len()).unwrap_or(0) >= AUDIT_LOG_SEGMENT_MAX_BYTES {
+            return rows;
+        }
+    }
+    panic!("recorder never reached the segment threshold");
+}
+
+/// Blank the two values that legitimately differ between two recorder runs —
+/// the per-open session id and the wall clock — leaving everything a segment
+/// roll could have damaged to compare exactly.
+fn normalize_run(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for line in std::str::from_utf8(bytes).unwrap().lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("wall_time_ms".to_owned(), serde_json::json!(0));
+        object.insert(
+            "recorder_session_id".to_owned(),
+            serde_json::json!("normalized"),
+        );
+        out.push_str(&serde_json::to_string(&value).unwrap());
+        out.push('\n');
+    }
+    out
+}
+
+/// mdk#1181: a transient roll failure must not stop rotation for the rest of
+/// the recorder's life.
+///
+/// This is the counter-lifetime hazard class. `segment_roll_failed` is a latch
+/// whose lifetime is the *directory-unwritable episode*, not the recorder's,
+/// so every site that resets the other per-episode fields (`active_bytes`,
+/// `seq`, the session id, the health counters) must reset it too. Leaving it
+/// set through `swap_to_fresh_file` meant a single `EACCES`/`ENOSPC`/`EMFILE`
+/// let the active file grow back past the app's 64 MiB upload ceiling — the
+/// permanent-failure cliff this issue exists to close. Adding another
+/// per-episode field means enumerating reset-sites x fields again.
+#[test]
+#[cfg(unix)]
+fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    fs::write(
+        &path,
+        "x".repeat(usize::try_from(AUDIT_LOG_SEGMENT_MAX_BYTES).unwrap() + 1),
+    )
+    .unwrap();
+
+    // The episode: the directory is momentarily unwritable, so the roll-on-open
+    // cannot rename and latches.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    assert!(
+        segment_paths(&path).is_empty(),
+        "the roll must have failed for this test to mean anything"
+    );
+
+    // The episode ends. `rotate` is the proof it ended: it cannot succeed
+    // unless it created a sibling in this directory and renamed it over the
+    // live path.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    recorder.rotate().unwrap();
+
+    record_until_segment_rolls(&recorder, &path, 0);
+    assert_eq!(
+        segment_paths(&path).len(),
+        1,
+        "rotation must resume once the directory is writable again"
+    );
+    assert!(
+        fs::metadata(&path).unwrap().len() < AUDIT_LOG_SEGMENT_MAX_BYTES,
+        "the active file must be back under the threshold"
+    );
+}
+
+/// mdk#1181 / `multi-step-state-changes.md`: the rename is the one applied
+/// step of a roll, so a failed reopen must take it back.
+#[test]
+fn a_failed_segment_reopen_renames_the_segment_back_and_keeps_recording() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+
+    recorder.fail_next_segment_reopen();
+    let rows = record_until_roll_attempted(&recorder, &path);
+    let before = fs::read(&path).expect("the active path must exist again after compensation");
+
+    assert!(
+        segment_paths(&path).is_empty(),
+        "the sealed segment must have been renamed back, leaving no orphan"
+    );
+    assert_eq!(
+        before.iter().filter(|byte| **byte == b'\n').count(),
+        rows + 1,
+        "nothing recorded before the failed roll may be lost"
+    );
+
+    // The writer fd and the active path agree again, so recording continues
+    // into the same file.
+    record_numbered_rows(&recorder, 3);
+    let after = fs::read(&path).unwrap();
+    assert!(
+        after.starts_with(&before),
+        "compensation must leave the pre-roll bytes untouched"
+    );
+    let events: Vec<AuditEvent> = std::str::from_utf8(&after)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), rows + 4);
+    assert!(
+        events.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1),
+        "seq must stay continuous across a compensated roll"
+    );
+}
+
+/// mdk#1181: the concatenation of a session's segments and its active file is
+/// byte-identical to the single file the recorder would otherwise have
+/// written.
+#[test]
+fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
+    // Enough rows to seal more than one segment, so this covers two boundaries
+    // rather than one.
+    const ROWS: usize = 8_000;
+
+    let rotated_dir = TempDir::new().unwrap();
+    let rotated_path = default_jsonl_path(rotated_dir.path(), "engine-abc");
+    let rotated = JsonlRecorder::open(&rotated_path, "engine-abc".to_string()).unwrap();
+    record_numbered_rows(&rotated, ROWS);
+    let segments = segment_paths(&rotated_path);
+    assert!(
+        segments.len() >= 2,
+        "the rotated run must cross at least two boundaries, got {}",
+        segments.len()
+    );
+    let mut rotated_bytes = Vec::new();
+    for segment in &segments {
+        rotated_bytes.extend_from_slice(&fs::read(segment).unwrap());
+    }
+    rotated_bytes.extend_from_slice(&fs::read(&rotated_path).unwrap());
+
+    // The baseline: one recorder, the same rows, no rotation. Failing its first
+    // reopen latches `segment_roll_failed`, so after the compensating
+    // rename-back it writes one continuous file for the rest of the run.
+    let plain_dir = TempDir::new().unwrap();
+    let plain_path = default_jsonl_path(plain_dir.path(), "engine-abc");
+    let plain = JsonlRecorder::open(&plain_path, "engine-abc".to_string()).unwrap();
+    plain.fail_next_segment_reopen();
+    record_numbered_rows(&plain, ROWS);
+    assert!(
+        segment_paths(&plain_path).is_empty(),
+        "the baseline run must not have rotated"
+    );
+    let plain_bytes = fs::read(&plain_path).unwrap();
+
+    // Only the session id and the wall clock may differ, and both are
+    // fixed-width here, so even the raw lengths must match.
+    assert_eq!(
+        rotated_bytes.len(),
+        plain_bytes.len(),
+        "rotation must not add, drop, or pad a single byte"
+    );
+    assert_eq!(normalize_run(&rotated_bytes), normalize_run(&plain_bytes));
+}

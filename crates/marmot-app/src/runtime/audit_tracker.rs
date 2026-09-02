@@ -222,7 +222,8 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
     let mut uploaded = Vec::new();
     let mut failed = 0_usize;
     let mut acknowledged = 0_usize;
-    let mut too_large = 0_usize;
+    let mut too_large_recorded = 0_usize;
+    let mut too_large_known = 0_usize;
     // `audit_log_files` sorts by account first, so each account's files arrive
     // as one contiguous run and its checkpoint is loaded and stored once.
     for account_files in group_by_account(files) {
@@ -238,9 +239,21 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
             // That residual is accepted by design and is bounded by the
             // recorder's segment threshold — a byte-offset acknowledgment
             // protocol was considered and rejected as overkill (mdk#1181).
-            if checkpoint.acknowledged(file).is_some() {
-                acknowledged += 1;
-                continue;
+            // Both outcomes skip the file, but they are not the same fact: one
+            // means the endpoint has the content, the other means it never
+            // will. Keep them apart in the aggregates so an operator reading
+            // the counts is not told a permanently untransferable file was
+            // delivered.
+            match checkpoint.acknowledged(file) {
+                Some(AuditUploadOutcome::Uploaded) => {
+                    acknowledged += 1;
+                    continue;
+                }
+                Some(AuditUploadOutcome::TooLargeToUpload) => {
+                    too_large_known += 1;
+                    continue;
+                }
+                None => {}
             }
             if file.size_bytes > AUDIT_LOG_UPLOAD_MAX_BYTES {
                 // Upgrade path: a file grown past the per-request ceiling by a
@@ -248,10 +261,16 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
                 // under the ceiling, so this can only be a legacy artifact.
                 // Splitting it is out of scope; record the verdict so it
                 // surfaces once instead of failing silently on every trigger,
-                // and keep going so it never wedges the other files. A host can
-                // still transfer it deliberately via `post_audit_log_file`, and
-                // deleting it belongs to mdk#1014.
-                too_large += 1;
+                // and keep going so it never wedges the other files.
+                //
+                // There is no app-level escape hatch: `post_audit_log_file`
+                // enforces the same ceiling before it opens a body
+                // (`audit_log.rs`, pinned by
+                // `post_audit_log_file_rejects_oversized_files_before_upload`),
+                // so a file this size is not transferable through any app API.
+                // It stays on disk for manual handling, and deleting it belongs
+                // to mdk#1014.
+                too_large_recorded += 1;
                 checkpoint.acknowledge(file, file.size_bytes, AuditUploadOutcome::TooLargeToUpload);
                 checkpoint_changed = true;
                 tracing::warn!(
@@ -299,13 +318,17 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
             );
         }
     }
-    if failed > 0 || too_large > 0 {
+    // Only a newly recorded over-ceiling file warrants a warning: one already
+    // in the checkpoint has been reported, and re-warning every trigger is the
+    // noise this contract removes. Counts only — no file names or paths.
+    if failed > 0 || too_large_recorded > 0 {
         tracing::warn!(
             target: "marmot_app::audit_log",
             method = "post_audit_log_tracker_update",
             uploaded = uploaded.len(),
             acknowledged,
-            too_large,
+            too_large_recorded,
+            too_large_known,
             failed,
             "completed forensic audit log tracker update with file upload failures"
         );
@@ -315,6 +338,7 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
             method = "post_audit_log_tracker_update",
             uploaded = uploaded.len(),
             acknowledged,
+            too_large_known,
             "completed forensic audit log tracker update"
         );
     }

@@ -14,6 +14,12 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   is written, so a session's segments plus its active file concatenate back to one continuous log. Retention and disk
   bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
   separate, explicit operation.
+- Keep `segment_roll_failed` scoped to the directory-unwritable episode, not to the recorder. It exists only to stop a
+  persistently unwritable directory from re-attempting (and re-scanning) on every `record`, so every site that proves
+  the directory writable again — a fresh open, and `swap_to_fresh_file` — must clear it alongside the other per-episode
+  fields (`active_bytes`, `seq`, the session id, the health counters). Latching it for the recorder's lifetime lets one
+  transient `ENOSPC`/`EMFILE` stop rotation for the whole session and grow the active file back past the app's upload
+  ceiling. When adding a per-episode field, enumerate reset-sites x fields.
 - Keep audit logging opt-in and explicit. The sole supported event model is privacy-safe: hashed/truncated identifiers,
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.

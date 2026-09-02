@@ -901,6 +901,22 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
         64 * 1024 * 1024 + 1
     );
 
+    // The verdict is recorded, which is what makes the skip a one-time report
+    // rather than a silent re-evaluation on every trigger. Asserted through the
+    // sidecar because the skip never reaches the network, so the capture sink
+    // cannot tell "recorded once" from "retried forever" on its own.
+    let checkpoint = std::fs::read_to_string(checkpoint_path(&home, &account.label))
+        .expect("checkpoint written");
+    let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+    assert_eq!(
+        checkpoint["files"]["audit-engine-v3-seg000001.jsonl"]["outcome"],
+        serde_json::json!("too_large_to_upload")
+    );
+    assert_eq!(
+        checkpoint["files"]["audit-engine-v3.jsonl"]["outcome"],
+        serde_json::json!("uploaded")
+    );
+
     // A second run neither retries the oversized file nor re-posts the small
     // one it already acknowledged.
     runtime.post_audit_log_tracker_update().await.unwrap();

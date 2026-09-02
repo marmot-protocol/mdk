@@ -1259,6 +1259,14 @@ pub struct JsonlRecorder {
     /// reopens the same path, so this is held outside the mutex.
     path: PathBuf,
     inner: Mutex<JsonlInner>,
+    /// Test seam: forces [`Self::reopen_active`] to fail, so the compensating
+    /// rename-back in [`Self::roll_into_segment`] — the only step that must
+    /// undo an applied rename — has a deterministic red. One-shot. There is no
+    /// way to fail the reopen and not the rename from outside the process:
+    /// both need the same directory permission, and the rename removes the
+    /// very path the reopen would recreate.
+    #[cfg(test)]
+    fail_segment_reopen: std::sync::atomic::AtomicBool,
 }
 
 struct JsonlInner {
@@ -1270,11 +1278,27 @@ struct JsonlInner {
     health: AuditRecorderHealthSnapshot,
     /// Bytes in the file the writer currently owns, driving segment rolls.
     active_bytes: u64,
-    /// Latched for the lifetime of this recorder when a segment roll fails, so
-    /// a persistently unwritable directory cannot make every subsequent
-    /// `record` re-attempt (and re-scan the directory). A fresh recorder — the
-    /// next session open — clears it.
+    /// Set when a segment roll fails, so a persistently unwritable directory
+    /// cannot make every subsequent `record` re-attempt (and re-scan the
+    /// directory).
+    ///
+    /// Its lifetime is the *directory-unwritable episode*, not the recorder's:
+    /// it is cleared by anything that proves the directory writable again — a
+    /// fresh recorder open, and [`JsonlRecorder::swap_to_fresh_file`], which
+    /// cannot succeed unless it created and renamed a sibling in that same
+    /// directory. Latching it for the whole recorder lifetime instead would
+    /// mean one transient `ENOSPC`/`EMFILE` stops rotation for the rest of the
+    /// session and lets the active file grow back past the app's upload
+    /// ceiling — the permanent-failure cliff mdk#1181 exists to close.
     segment_roll_failed: bool,
+    /// Lower-bound hint for the next unclaimed segment index, so a roll does
+    /// not `read_dir` the account directory on the engine hot path once per
+    /// segment. Scanned once when absent and advanced after each sealed
+    /// segment; the `exists()` probe in [`JsonlRecorder::next_segment_path`]
+    /// stays the authority that no roll ever overwrites a segment, so a stale
+    /// or absent hint costs a gap in the numbering at worst. Unbounded segment
+    /// counts are mdk#1014's to bound.
+    next_segment_index: Option<u32>,
 }
 
 fn validate_account_ref_hex(account_ref: &str) -> std::io::Result<()> {
@@ -1320,7 +1344,10 @@ impl JsonlRecorder {
                 health: AuditRecorderHealthSnapshot::default(),
                 active_bytes,
                 segment_roll_failed: false,
+                next_segment_index: None,
             }),
+            #[cfg(test)]
+            fail_segment_reopen: std::sync::atomic::AtomicBool::new(false),
         };
         // Upgrade path: a file left over-threshold by a build without segment
         // rotation — including one already past the app's upload ceiling, which
@@ -1518,6 +1545,14 @@ impl JsonlRecorder {
         inner.recorder_session_id = generate_recorder_session_id();
         inner.health = AuditRecorderHealthSnapshot::default();
         inner.active_bytes = 0;
+        // The latch's lifetime is the directory-unwritable episode, not the
+        // recorder's: reaching here means a sibling was created and renamed
+        // over the live path, which proves the directory writable again. Left
+        // set, one transient roll failure would stop rotation for the rest of
+        // the session and let the active file grow back past the upload
+        // ceiling (mdk#1181). Counter-lifetime hazard: every per-episode field
+        // reset here must be enumerated against every site that sets one.
+        inner.segment_roll_failed = false;
         Ok(())
     }
 
@@ -1548,12 +1583,13 @@ impl JsonlRecorder {
         // Best-effort flush so the sealed segment holds everything recorded so
         // far; the fd survives the rename either way.
         let _ = inner.writer.flush();
-        let segment = next_segment_path(&self.path)?;
+        let (segment, index) = self.next_segment_path(inner)?;
         std::fs::rename(&self.path, &segment)?;
-        match fs_private::open_private_append(&self.path) {
+        match self.reopen_active() {
             Ok(file) => {
                 inner.writer = BufWriter::new(file);
                 inner.active_bytes = 0;
+                inner.next_segment_index = Some(index.saturating_add(1));
                 Ok(())
             }
             Err(err) => {
@@ -1563,6 +1599,56 @@ impl JsonlRecorder {
                 let _ = std::fs::rename(&segment, &self.path);
                 Err(err)
             }
+        }
+    }
+
+    /// Reopen the active path after a seal.
+    fn reopen_active(&self) -> std::io::Result<std::fs::File> {
+        #[cfg(test)]
+        if self
+            .fail_segment_reopen
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(std::io::Error::other("forced segment reopen failure"));
+        }
+        fs_private::open_private_append(&self.path)
+    }
+
+    /// Make the *next* segment reopen fail, so a test can drive the
+    /// compensating rename-back and the `segment_roll_failed` latch it sets.
+    /// One-shot, so a test can also observe recovery afterwards.
+    #[cfg(test)]
+    fn fail_next_segment_reopen(&self) {
+        self.fail_segment_reopen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Next unclaimed segment name for the active path, and its index.
+    ///
+    /// Segments keep the audit path's stem so the app's `audit-*.jsonl`
+    /// enumeration still finds them, and sort ahead of the active file (`-`
+    /// precedes `.`), so the uploader drains sealed segments before the growing
+    /// one.
+    ///
+    /// The starting index comes from `inner.next_segment_index` so the common
+    /// case costs no directory read at all; only the first roll of a recorder
+    /// (or one following a failed roll) scans. The `exists()` probe below is
+    /// what actually guarantees a roll never renames over an existing segment,
+    /// which would destroy already-recorded data — the hint only decides where
+    /// the probe starts.
+    fn next_segment_path(&self, inner: &mut JsonlInner) -> std::io::Result<(PathBuf, u32)> {
+        let mut next = match inner.next_segment_index {
+            Some(next) => next,
+            None => scan_next_segment_index(&self.path),
+        };
+        loop {
+            let candidate = segment_path(&self.path, next);
+            if !candidate.exists() {
+                return Ok((candidate, next));
+            }
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("audit log segment indexes exhausted"))?;
         }
     }
 }
@@ -1587,14 +1673,10 @@ fn segment_path(path: &Path, index: u32) -> PathBuf {
     }
 }
 
-/// Next unclaimed segment name for `path`.
-///
-/// Segments keep the audit path's stem so the app's `audit-*.jsonl` enumeration
-/// still finds them, and sort ahead of the active file (`-` precedes `.`), so
-/// the uploader drains sealed segments before the growing one. The scan-then-
-/// probe walk guarantees a roll never renames over an existing segment, which
-/// would destroy already-recorded data.
-fn next_segment_path(path: &Path) -> std::io::Result<PathBuf> {
+/// One directory scan for the highest segment index already sitting next to
+/// `path`, plus one. Used to seed the cached hint on a recorder's first roll —
+/// after a crash mid-roll, or an earlier session, left segments behind.
+fn scan_next_segment_index(path: &Path) -> u32 {
     let prefix = format!("{}-seg", segment_base_name(path));
     let mut next = 1u32;
     if let Some(parent) = path
@@ -1615,15 +1697,7 @@ fn next_segment_path(path: &Path) -> std::io::Result<PathBuf> {
             next = next.max(index.saturating_add(1));
         }
     }
-    loop {
-        let candidate = segment_path(path, next);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-        next = next
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("audit log segment indexes exhausted"))?;
-    }
+    next
 }
 
 /// Staging sibling for [`JsonlRecorder::swap_to_fresh_file`]: the audit path

@@ -129,9 +129,17 @@ impl AuditUploadCheckpoint {
     }
 
     /// Record `outcome` for `file`. `acknowledged_bytes` is the length actually
-    /// handed to the endpoint, which can trail the enumerated size when the
-    /// recorder appended mid-run; recording the smaller number keeps a later
-    /// match from claiming unsent bytes were acknowledged.
+    /// handed to the endpoint, re-stat'd inside the upload and therefore taken
+    /// *after* `file` was enumerated — so for an append-only audit file it is
+    /// greater than or equal to `file.size_bytes`, never less.
+    ///
+    /// Pairing it with the enumerated `modified_at_ms` is what makes that safe.
+    /// Size only grows and mtime only moves forward, so if the recorder
+    /// appended between enumeration and upload, the stored pair describes no
+    /// state the file will ever be in again and every later run re-uploads.
+    /// The identity can therefore cost a redundant transfer, which the
+    /// endpoint's `file_sha256` short-circuit absorbs, but it cannot claim
+    /// unsent bytes were acknowledged.
     pub(crate) fn acknowledge(
         &mut self,
         file: &AuditLogFile,

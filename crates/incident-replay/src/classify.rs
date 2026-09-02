@@ -344,9 +344,13 @@ impl HaltLifecycle<'_> {
     /// Both rows also come from a single engine — one clock, one recorder file —
     /// so none of rule 6's cross-device [`CATCH_UP_GRACE_MS`] skew allowance
     /// applies and a strict comparison is sound. (`seq` must never be substituted
-    /// for the clock: it restarts at 0 on every recorder open *within the same
-    /// file*, so it does not order rows across a restart — the exact boundary a
-    /// durable halt survives. See `docs/marmot-architecture/audit-logging.md`.)
+    /// for the clock. It restarts at 0 on every recorder open, so it does not
+    /// order rows across a restart — the exact boundary a durable halt
+    /// survives — and since mdk#1181 it does not identify a file either: a
+    /// segment roll carries `seq` across into an `audit-*-seg<NNNNNN>.jsonl`
+    /// sibling, so one session's rows span several source files and a file can
+    /// start at a nonzero `seq`. Neither direction is orderable by `seq`. See
+    /// `docs/marmot-architecture/audit-logging.md`.)
     ///
     /// Absence fails closed in both directions: an unrepaired halt keeps its
     /// quarantine, and so does a halt whose evidence cannot be ordered — arming
