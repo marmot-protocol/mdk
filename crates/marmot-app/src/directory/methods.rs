@@ -1167,12 +1167,14 @@ impl MarmotApp {
         // publication, matching the profile ingest rule (mdk#920).
         match record.event.kind {
             KIND_NIP65_RELAY_LIST
-                if entry.relay_lists.nip65.created_at >= record.event.created_at =>
+                if entry.relay_lists.nip65.created_at != 0
+                    && entry.relay_lists.nip65.created_at >= record.event.created_at =>
             {
                 return Ok(());
             }
             KIND_MARMOT_INBOX_RELAY_LIST
-                if entry.relay_lists.inbox.created_at >= record.event.created_at =>
+                if entry.relay_lists.inbox.created_at != 0
+                    && entry.relay_lists.inbox.created_at >= record.event.created_at =>
             {
                 return Ok(());
             }
