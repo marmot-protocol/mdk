@@ -40,6 +40,10 @@ impl OpenMlsValueLabel {
         self.sensitivity
     }
 
+    pub(in crate::openmls_storage) const fn is_key_package(self) -> bool {
+        matches!(self.bytes, b"KeyPackage")
+    }
+
     #[cfg(test)]
     pub(in crate::openmls_storage) const fn test_public(bytes: &'static [u8]) -> Self {
         Self::public(bytes)
