@@ -30,7 +30,8 @@ const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// A candidate that cannot resolve, connect, return headers, and yield its first
 /// body bytes within this bound gives the next ordered locator a chance. The
-/// longer transfer deadline and read-idle timeout still govern an active body.
+/// longer transfer deadline and read-idle timeout still govern an active body,
+/// so a peer that continuously trickles bytes can occupy the transfer deadline.
 const BLOSSOM_CANDIDATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reusing a pinned client inside this lease amortizes DNS and TLS setup without
 /// turning one resolution result into a process-lifetime routing decision.
@@ -90,7 +91,8 @@ struct BlossomHttpTransportInner {
 ///
 /// Every cached client is bound to one exact origin and one vetted address set.
 /// Expiry creates a fresh client generation, forcing DNS resolution, vetting,
-/// and pinning again before any later request can use the origin.
+/// and pinning again before any later request can use the origin. A rehomed
+/// origin can therefore retain a failing stale pin only until the lease ends.
 #[derive(Clone)]
 pub(crate) struct BlossomHttpTransport {
     inner: Arc<BlossomHttpTransportInner>,
@@ -204,6 +206,8 @@ impl BlossomHttpTransport {
     }
 
     pub(super) fn with_loopback_disabled(&self) -> Self {
+        // The stricter view may share the pool because client_for_url validates
+        // its own loopback policy before consulting a cached generation.
         Self {
             inner: self.inner.clone(),
             allow_loopback_http: false,

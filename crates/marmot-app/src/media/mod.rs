@@ -728,11 +728,6 @@ pub(crate) async fn download_encrypted_media_with_transport(
         transport,
     )
     .await?;
-    if !encrypted_media_hash_matches(&encrypted, &reference.ciphertext_sha256) {
-        return Err(AppError::InvalidEncryptedMedia(
-            "encrypted blob hash does not match media reference".into(),
-        ));
-    }
     let plaintext_hash = media_hash_from_reference(&reference)?;
     let media_type = match version {
         EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)?,

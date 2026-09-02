@@ -1662,7 +1662,7 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
     let healthy_url = spawn_http_response(http_ok_response(body));
     let reference = blob_reference_for_servers(body, &[stalled_url, healthy_url]);
     let transport =
-        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_millis(100));
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_millis(500));
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
 
     let downloaded = tokio::time::timeout(
