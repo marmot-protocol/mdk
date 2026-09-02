@@ -615,17 +615,21 @@ impl<S: StorageProvider> Engine<S> {
         let group = self.stored_group_record(&group_id)?;
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && matches!(intent, SendIntent::Invite { .. })
-            && group.as_ref().is_some_and(|group| {
-                group.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
-            })
         {
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: "LegacyProfile",
-                    to: "Invite",
-                    reason: "strict cutover forbids adding members to legacy groups",
-                },
-            ));
+            // An Invite needs the record to read its profile; an unknown group
+            // fails here with the storage error the direct read used to raise.
+            let Some(group) = group.as_ref() else {
+                return Err(EngineError::Storage(StorageError::NotFound));
+            };
+            if group.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy {
+                return Err(EngineError::InvalidTransition(
+                    cgka_traits::engine_state::InvalidTransition {
+                        from: "LegacyProfile",
+                        to: "Invite",
+                        reason: "strict cutover forbids adding members to legacy groups",
+                    },
+                ));
+            }
         }
         // Terminal gate before queueing: a local copy marked removed (realized
         // self-eviction) must never accept or queue outbound work. Checked
