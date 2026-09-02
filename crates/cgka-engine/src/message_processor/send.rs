@@ -888,12 +888,16 @@ impl<S: StorageProvider> Engine<S> {
         let wrap_metadata =
             GroupMessageMetadata::application(app_event.created_at, source_retention_seconds);
 
-        let out: MlsMessageOut = mls_group
-            .create_message(&provider, &self.identity.signer, &payload)
-            .map_err(|e| EngineError::Backend(format!("create_message: {e:?}")))?;
-        let out_bytes = out
-            .tls_serialize_detached()
-            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        // `create_message` ratchets the sender secret tree and writes it back;
+        // one transaction turns that write's two autocommits into one COMMIT
+        // (one fsync under `synchronous = FULL`).
+        let out_bytes = self.storage.with_transaction(|_storage| {
+            let out: MlsMessageOut = mls_group
+                .create_message(&provider, &self.identity.signer, &payload)
+                .map_err(|e| EngineError::Backend(format!("create_message: {e:?}")))?;
+            out.tls_serialize_detached()
+                .map_err(|e| EngineError::Serialize(format!("{e:?}")))
+        })?;
 
         let ctx = group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
         let wrapped = self
