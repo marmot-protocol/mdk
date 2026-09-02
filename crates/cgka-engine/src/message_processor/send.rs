@@ -45,7 +45,8 @@ impl<S: StorageProvider> Engine<S> {
         // here (not just `do_send`) so queued-intent drains hit the same
         // deterministic terminal error. Every intent kind is blocked,
         // including `Leave` — there is nothing left to leave.
-        if self.group_record_is_removed(&group_id)? {
+        let group = self.stored_group_record(&group_id)?;
+        if group.as_ref().is_some_and(|group| group.removed) {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Removed",
@@ -57,7 +58,7 @@ impl<S: StorageProvider> Engine<S> {
         // Queued drains call this method directly, bypassing `do_send`.
         // Recheck the durable lifecycle marker here so no outbound work can
         // escape an `Unrecoverable` halt after restart.
-        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
+        if self.sync_unrecoverable_halt_from_record(&group_id, group.as_ref()) {
             // Same condition and same typed error as the `validate_send_acceptance`
             // gate (mdk#1177): a drain reaching a halted group must not report it
             // differently just because it bypassed `do_send`.

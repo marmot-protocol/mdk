@@ -611,10 +611,13 @@ impl<S: StorageProvider> Engine<S> {
         // Strict cutover freezes membership growth in legacy groups. Existing
         // members may continue messaging and applying other group changes, but
         // no add (including a re-add) may be staged or queued.
+        // One record read serves this gate and the two terminal gates below.
+        let group = self.stored_group_record(&group_id)?;
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && matches!(intent, SendIntent::Invite { .. })
-            && self.storage.get_group(&group_id)?.protocol_profile
-                == cgka_traits::group::ProtocolProfile::Legacy
+            && group.as_ref().is_some_and(|group| {
+                group.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
+            })
         {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
@@ -628,7 +631,7 @@ impl<S: StorageProvider> Engine<S> {
         // self-eviction) must never accept or queue outbound work. Checked
         // again in `do_send_ready` so queued-intent drains for a copy removed
         // after queueing hit the same deterministic error.
-        if self.group_record_is_removed(&group_id)? {
+        if group.as_ref().is_some_and(|group| group.removed) {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
                     from: "Removed",
@@ -639,7 +642,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         // mdk#971: durable Unrecoverable halt — sync into memory and refuse
         // outbound work until a verified repair path clears the marker.
-        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
+        if self.sync_unrecoverable_halt_from_record(&group_id, group.as_ref()) {
             // mdk#1177: typed, not `InvalidTransition`. A halted group is a
             // durable condition whose only exit is another member's repair
             // Welcome, so the host has something to tell the user and act on —
@@ -810,7 +813,8 @@ impl<S: StorageProvider> Engine<S> {
         // An advance can be invoked directly without session-open hydration.
         // Synchronize the durable halt before convergence or queued work can
         // run so restart never bypasses `Unrecoverable`.
-        if self.sync_unrecoverable_halt_from_storage(group_id)? {
+        let group = self.stored_group_record(group_id)?;
+        if self.sync_unrecoverable_halt_from_record(group_id, group.as_ref()) {
             return Ok(false);
         }
         // Terminal: a removed copy must never publish, and the removed-copy
@@ -819,7 +823,7 @@ impl<S: StorageProvider> Engine<S> {
         // queue and report nothing to drain. This is the defense-in-depth
         // side; the marker sites (realization, commit-apply seam, convergence
         // reorg) also purge at the moment the copy becomes removed.
-        if self.group_record_is_removed(group_id)? {
+        if group.is_some_and(|group| group.removed) {
             self.discard_queued_outbound_intents_for_removed_group(group_id)?;
             return Ok(false);
         }
