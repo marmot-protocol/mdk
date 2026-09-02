@@ -1162,7 +1162,22 @@ impl MarmotApp {
         let mut entry = self
             .directory_entry_for_account_id(account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
+        // Replaceable-event timestamps have second resolution. Keep the cache
+        // on equality so a lagging relay cannot revert an accepted same-second
+        // publication, matching the profile ingest rule (mdk#920).
         match record.event.kind {
+            KIND_NIP65_RELAY_LIST
+                if entry.relay_lists.nip65.created_at != 0
+                    && entry.relay_lists.nip65.created_at >= record.event.created_at =>
+            {
+                return Ok(());
+            }
+            KIND_MARMOT_INBOX_RELAY_LIST
+                if entry.relay_lists.inbox.created_at != 0
+                    && entry.relay_lists.inbox.created_at >= record.event.created_at =>
+            {
+                return Ok(());
+            }
             KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65 = state,
             KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox = state,
             _ => return Ok(()),

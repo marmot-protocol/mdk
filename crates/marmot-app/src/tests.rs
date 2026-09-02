@@ -7863,7 +7863,6 @@ fn nip65_relay_list_targets_only_include_write_capable_entries() {
         ],
         String::new(),
     );
-
     assert_eq!(
         relays_from_relay_list_event(&event),
         vec![
@@ -7943,26 +7942,33 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let account_id = "22".repeat(32);
-    let record = |tags| crate::relay_plane::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://source.example".into())],
-        event: NostrTransportEvent::new_unsigned(
+    let record = |created_at, tags| {
+        let mut event = NostrTransportEvent::new_unsigned(
             account_id.clone(),
             KIND_NIP65_RELAY_LIST,
             tags,
             String::new(),
-        ),
+        );
+        event.created_at = created_at;
+        crate::relay_plane::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://source.example".into())],
+            event,
+        }
     };
 
-    app.ingest_directory_relay_event(record(vec![vec![
-        "r".into(),
-        "wss://stale-write.example".into(),
-    ]]))
+    app.ingest_directory_relay_event(record(
+        1,
+        vec![vec!["r".into(), "wss://stale-write.example".into()]],
+    ))
     .unwrap();
-    app.ingest_directory_relay_event(record(vec![vec![
-        "r".into(),
-        "wss://read-only.example".into(),
-        "read".into(),
-    ]]))
+    app.ingest_directory_relay_event(record(
+        2,
+        vec![vec![
+            "r".into(),
+            "wss://read-only.example".into(),
+            "read".into(),
+        ]],
+    ))
     .unwrap();
 
     let cached = app
@@ -7978,9 +7984,86 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
 }
 
 #[test]
+fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_id = "23".repeat(32);
+
+    for (kind, tag_name) in [
+        (KIND_NIP65_RELAY_LIST, "r"),
+        (KIND_MARMOT_INBOX_RELAY_LIST, "relay"),
+    ] {
+        let record = |created_at, relay: &str| {
+            let mut event = NostrTransportEvent::new_unsigned(
+                account_id.clone(),
+                kind,
+                vec![vec![tag_name.into(), relay.into()]],
+                String::new(),
+            );
+            event.created_at = created_at;
+            crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://source.example".into())],
+                event,
+            }
+        };
+
+        app.ingest_directory_relay_event(record(20, "wss://new.example"))
+            .unwrap();
+        app.ingest_directory_relay_event(record(10, "wss://old.example"))
+            .unwrap();
+        app.ingest_directory_relay_event(record(20, "wss://equal.example"))
+            .unwrap();
+
+        let cached = app
+            .directory_entry_for_account_id(&account_id)
+            .unwrap()
+            .expect("cached relay list");
+        let state = if kind == KIND_NIP65_RELAY_LIST {
+            cached.relay_lists.nip65
+        } else {
+            cached.relay_lists.inbox
+        };
+        assert_eq!(state.relays, vec!["wss://new.example"]);
+    }
+}
+
+#[test]
+fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_id = "24".repeat(32);
+    let mut event = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        vec![vec!["relay".into(), "wss://inbox.example".into()]],
+        String::new(),
+    );
+    event.created_at = 0;
+
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://source.example".into())],
+        event,
+    })
+    .unwrap();
+
+    let cached = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .expect("zero-timestamp relay list is cached");
+    assert_eq!(cached.relay_lists.inbox.relays, vec!["wss://inbox.example"]);
+}
+
+#[test]
 fn nip65_setter_round_trip_preserves_existing_roles() {
     let current = AccountRelayListState {
         kind: KIND_NIP65_RELAY_LIST,
+        created_at: 0,
         relays: vec!["wss://both.example".into(), "wss://write.example".into()],
         read_relays: vec!["wss://both.example".into(), "wss://read.example".into()],
         write_relays: vec!["wss://both.example".into(), "wss://write.example".into()],
@@ -8528,6 +8611,102 @@ fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
     assert_eq!(
         app.display_name_for_account_id(&contact).unwrap(),
         Some("new-shared".to_owned())
+    );
+}
+
+#[test]
+fn directory_entry_reconciles_nostr_components_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let cache = app.directory_cache_for_account(&account).unwrap();
+    let contact = format!("{:064x}", 920);
+
+    let mut cached = test_directory_record(&contact, "new-profile", 100);
+    cached.relay_lists.nip65.created_at = 10;
+    cached.relay_lists.nip65.relays = vec!["wss://old.example".into()];
+    cached.relay_lists.nip65.write_relays = cached.relay_lists.nip65.relays.clone();
+    cached.relay_lists.inbox.created_at = 30;
+    cached.relay_lists.inbox.relays = vec!["wss://cached-inbox.example".into()];
+    cached.key_package = Some(DirectoryKeyPackage {
+        key_package_id: "old-package".into(),
+        key_package_ref_hex: String::new(),
+        key_package_event_id: String::new(),
+        key_package_hex: "00".into(),
+        created_at: 30,
+        source_relays: Vec::new(),
+    });
+    cached.relay_lists.refresh();
+    cache.put(&cached).unwrap();
+
+    let mut shared = test_directory_record(&contact, "old-profile", 1);
+    shared.relay_lists.nip65.created_at = 20;
+    shared.relay_lists.nip65.relays = vec!["wss://new.example".into()];
+    shared.relay_lists.nip65.write_relays = shared.relay_lists.nip65.relays.clone();
+    shared.relay_lists.inbox.created_at = 20;
+    shared.relay_lists.inbox.relays = vec!["wss://shared-inbox.example".into()];
+    shared.key_package = Some(DirectoryKeyPackage {
+        key_package_id: "new-package".into(),
+        key_package_ref_hex: String::new(),
+        key_package_event_id: String::new(),
+        key_package_hex: "00".into(),
+        created_at: 40,
+        source_relays: Vec::new(),
+    });
+    shared.relay_lists.refresh();
+    app.shared_storage()
+        .unwrap()
+        .put_public_directory_user(&public_directory_user_record(&shared).unwrap())
+        .unwrap();
+
+    let reconciled = app
+        .directory_entry_for_account_id(&contact)
+        .unwrap()
+        .expect("reconciled directory entry");
+    assert_eq!(
+        reconciled.profile.and_then(|profile| profile.name),
+        Some("new-profile".into())
+    );
+    assert_eq!(reconciled.relay_lists.nip65.created_at, 20);
+    assert_eq!(
+        reconciled.relay_lists.nip65.relays,
+        vec!["wss://new.example"]
+    );
+    assert_eq!(reconciled.relay_lists.inbox.created_at, 30);
+    assert_eq!(
+        reconciled.relay_lists.inbox.relays,
+        vec!["wss://cached-inbox.example"]
+    );
+    assert_eq!(
+        reconciled
+            .key_package
+            .as_ref()
+            .map(|key_package| key_package.key_package_id.as_str()),
+        Some("new-package")
+    );
+
+    let mut stale_event = NostrTransportEvent::new_unsigned(
+        contact.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec!["r".into(), "wss://stale.example".into()]],
+        String::new(),
+    );
+    stale_event.created_at = 15;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        event: stale_event,
+        endpoints: vec![TransportEndpoint("wss://source.example".into())],
+    })
+    .unwrap();
+
+    let after_stale_replay = app
+        .directory_entry_for_account_id(&contact)
+        .unwrap()
+        .expect("directory entry after stale replay");
+    assert_eq!(after_stale_replay.relay_lists.nip65.created_at, 20);
+    assert_eq!(
+        after_stale_replay.relay_lists.nip65.relays,
+        vec!["wss://new.example"]
     );
 }
 

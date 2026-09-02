@@ -23,6 +23,7 @@ fn profile_relay_status(
             .collect(),
         nip65: crate::AccountRelayListState {
             kind: crate::KIND_NIP65_RELAY_LIST,
+            created_at: 0,
             relays: publish_relays
                 .iter()
                 .map(|relay| (*relay).to_owned())
@@ -35,6 +36,7 @@ fn profile_relay_status(
         },
         inbox: crate::AccountRelayListState {
             kind: crate::KIND_MARMOT_INBOX_RELAY_LIST,
+            created_at: 0,
             relays: Vec::new(),
             read_relays: Vec::new(),
             write_relays: Vec::new(),

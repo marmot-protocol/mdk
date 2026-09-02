@@ -250,39 +250,56 @@ pub(crate) fn user_directory_record_from_public(
     })
 }
 
-fn directory_record_recency(entry: &UserDirectoryRecord) -> u64 {
-    entry
-        .profile
-        .as_ref()
-        .map(|profile| profile.created_at)
-        .into_iter()
-        .chain(
-            entry
-                .key_package
-                .as_ref()
-                .map(|key_package| key_package.created_at),
-        )
-        .max()
-        .unwrap_or_default()
+/// Merge independently replaceable Nostr components without allowing a fresh
+/// sibling field to drag an older component across cache boundaries.
+///
+/// The first record wins equal timestamps. Nostr timestamps have one-second
+/// resolution, so this preserves a just-published local value against a stale
+/// same-second relay copy. Fields without event recency remain from the first
+/// record; public/shared records do not carry local-account or source hints.
+fn merge_directory_entries(
+    mut preferred: UserDirectoryRecord,
+    alternate: UserDirectoryRecord,
+) -> UserDirectoryRecord {
+    if alternate.profile.as_ref().is_some_and(|candidate| {
+        preferred
+            .profile
+            .as_ref()
+            .is_none_or(|current| candidate.created_at > current.created_at)
+    }) {
+        preferred.profile = alternate.profile;
+    }
+    if alternate.key_package.as_ref().is_some_and(|candidate| {
+        preferred
+            .key_package
+            .as_ref()
+            .is_none_or(|current| candidate.created_at > current.created_at)
+    }) {
+        preferred.key_package = alternate.key_package;
+    }
+    if alternate.relay_lists.nip65.created_at > preferred.relay_lists.nip65.created_at {
+        preferred.relay_lists.nip65 = alternate.relay_lists.nip65;
+    }
+    if alternate.relay_lists.inbox.created_at > preferred.relay_lists.inbox.created_at {
+        preferred.relay_lists.inbox = alternate.relay_lists.inbox;
+    }
+    preferred.relay_lists.refresh();
+    preferred
 }
 
+/// Reconcile account-cache and shared-cache directory records component-wise.
 pub(crate) fn select_newer_directory_entry(
     cached: Option<UserDirectoryRecord>,
     shared: Option<UserDirectoryRecord>,
 ) -> Option<UserDirectoryRecord> {
     match (cached, shared) {
-        (Some(cached), Some(shared)) => {
-            if directory_record_recency(&shared) > directory_record_recency(&cached) {
-                Some(shared)
-            } else {
-                Some(cached)
-            }
-        }
+        (Some(cached), Some(shared)) => Some(merge_directory_entries(cached, shared)),
         (Some(entry), None) | (None, Some(entry)) => Some(entry),
         (None, None) => None,
     }
 }
 
+/// Insert a directory record or merge each timestamped component independently.
 pub(crate) fn upsert_newer_directory_entry(
     entries_by_id: &mut BTreeMap<String, UserDirectoryRecord>,
     entry: UserDirectoryRecord,
@@ -292,9 +309,8 @@ pub(crate) fn upsert_newer_directory_entry(
             slot.insert(entry);
         }
         std::collections::btree_map::Entry::Occupied(mut slot) => {
-            if directory_record_recency(&entry) > directory_record_recency(slot.get()) {
-                *slot.get_mut() = entry;
-            }
+            let current = slot.get().clone();
+            *slot.get_mut() = merge_directory_entries(current, entry);
         }
     }
 }

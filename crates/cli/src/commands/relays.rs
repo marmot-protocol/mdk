@@ -201,6 +201,7 @@ mod tests {
     fn nip65_update_preserves_unmodified_directional_relays() {
         let state = AccountRelayListState {
             kind: 10_002,
+            created_at: 0,
             relays: vec!["wss://both.example".into(), "wss://write.example".into()],
             read_relays: vec!["wss://both.example".into(), "wss://read.example".into()],
             write_relays: vec!["wss://both.example".into(), "wss://write.example".into()],
