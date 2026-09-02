@@ -1088,16 +1088,6 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(waiting_result(epoch));
         }
 
-        let previous_group = self
-            .storage
-            .get_group(group_id)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // Pre-apply admin/avatar component snapshot, mirroring the direct
-        // inbound seam's before-state capture so the reorg path can emit the
-        // same profile/admin state-change events. Best-effort: a group whose
-        // MLS state isn't loadable just skips those diffs.
-        let previous_components = self.reorg_component_snapshot(group_id);
-        let previous_name = previous_group.name.clone();
         let previous_tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let (pass, opened) =
@@ -1192,6 +1182,21 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
         }
+        // Pre-apply captures for the reorg diff, taken only once a pass is
+        // actually resolving. Capturing them before the Collecting/no-input
+        // early returns above paid a group-record read plus a full
+        // `MlsGroup::load` (via `reorg_component_snapshot`) on every scheduler
+        // poll of a not-yet-frozen pass, for a result those returns discard.
+        let previous_group = self
+            .storage
+            .get_group(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        // Pre-apply admin/avatar component snapshot, mirroring the direct
+        // inbound seam's before-state capture so the reorg path can emit the
+        // same profile/admin state-change events. Best-effort: a group whose
+        // MLS state isn't loadable just skips those diffs.
+        let previous_components = self.reorg_component_snapshot(group_id);
+        let previous_name = previous_group.name.clone();
         let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
         let retained_anchor_epoch = previous_tip
             .0

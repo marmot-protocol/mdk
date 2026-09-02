@@ -794,13 +794,11 @@ mod tests {
         }
     }
 
-    /// Regression for mdk#369: the idempotency short-circuit must compare the
-    /// encoded payload, not just (group, epoch, state) — a second persist of
-    /// the same id under a different `StoredMessagePayload` variant must
-    /// overwrite, or a reader on the other processing path silently loses the
-    /// record.
-    #[test]
-    fn same_key_persist_with_different_payload_variant_overwrites() {
+    fn engine_with_stored_group() -> (
+        SqliteAccountStorage,
+        crate::engine::Engine<SqliteAccountStorage>,
+        GroupId,
+    ) {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let signing_key = test_signing_key();
         let identity = signing_key.verifying_key().to_bytes().to_vec();
@@ -828,6 +826,49 @@ mod tests {
                 join_epoch: EpochId(0),
             })
             .unwrap();
+        (storage, engine, group_id)
+    }
+
+    /// Genuine OpenMLS commit wire bytes from a standalone one-member group.
+    /// The projection only parses the wire format, so the group needs no
+    /// relation to the engine under test.
+    fn real_commit_wire_bytes() -> Vec<u8> {
+        use openmls::group::{MlsGroupCreateConfig, PURE_PLAINTEXT_WIRE_FORMAT_POLICY};
+        use openmls::prelude::{
+            BasicCredential, Ciphersuite, CredentialWithKey, LeafNodeParameters,
+        };
+        use openmls_basic_credential::SignatureKeyPair;
+        use tls_codec::Serialize as _;
+
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+        let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+        let credential_with_key = CredentialWithKey {
+            credential: BasicCredential::new(b"memo-test-member".to_vec()).into(),
+            signature_key: signer.public().into(),
+        };
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(ciphersuite)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .build();
+        let mut group =
+            openmls::group::MlsGroup::new(&provider, &signer, &config, credential_with_key)
+                .unwrap();
+        let (commit_out, _welcome, _group_info) = group
+            .self_update(&provider, &signer, LeafNodeParameters::default())
+            .unwrap()
+            .into_contents();
+        commit_out.tls_serialize_detached().unwrap()
+    }
+
+    /// Regression for mdk#369: the idempotency short-circuit must compare the
+    /// encoded payload, not just (group, epoch, state) — a second persist of
+    /// the same id under a different `StoredMessagePayload` variant must
+    /// overwrite, or a reader on the other processing path silently loses the
+    /// record.
+    #[test]
+    fn same_key_persist_with_different_payload_variant_overwrites() {
+        let (storage, engine, group_id) = engine_with_stored_group();
         let msg = transport_message(b"colliding-id", b"wire-bytes");
 
         engine
@@ -886,6 +927,43 @@ mod tests {
             stored.as_staged_invite_welcome().map(|(_, origin)| origin),
             Some(&origin_commit_id),
             "own echo must preserve staged Welcome ownership"
+        );
+    }
+
+    /// The commit-digest memo behind `deferred_peel_context_fingerprint`
+    /// remembers a per-payload verdict keyed by `MessageId`. A same-id row
+    /// overwritten under a different payload variant (RawTransport re-persisted
+    /// as an OpenMLS-wire commit, the mdk#369 path above) must re-classify:
+    /// a stale `None` verdict would hide the stored commit from the
+    /// fingerprint and keep the deferred-peel gate armed.
+    #[test]
+    fn overwritten_payload_changes_peel_context_fingerprint() {
+        let (_storage, mut engine, group_id) = engine_with_stored_group();
+        let raw_row = transport_message(b"memo-overwritten-id", b"opaque-transport-bytes");
+        engine
+            .persist_transport_message(&raw_row, &group_id, EpochId(3), MessageState::Sent)
+            .unwrap();
+
+        let before = engine.deferred_peel_context_fingerprint(&group_id).unwrap();
+        // Second call runs against the now-populated memo; it must agree.
+        assert_eq!(
+            before,
+            engine.deferred_peel_context_fingerprint(&group_id).unwrap()
+        );
+
+        let commit_row = TransportMessage {
+            payload: real_commit_wire_bytes(),
+            ..raw_row
+        };
+        engine
+            .persist_openmls_wire_message(&commit_row, &group_id, EpochId(3), MessageState::Sent)
+            .unwrap();
+
+        let after = engine.deferred_peel_context_fingerprint(&group_id).unwrap();
+        assert_ne!(
+            before, after,
+            "a RawTransport row overwritten as an OpenMLS-wire commit must \
+             re-classify instead of reusing the memoized non-commit verdict"
         );
     }
 }
