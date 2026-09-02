@@ -1702,6 +1702,9 @@ impl MarmotApp {
             routing: open.routing,
             relay_plane: relay_plane.clone(),
             transport_signer: open.signer,
+            blossom_http_transport: crate::media::BlossomHttpTransport::new(
+                self.allow_loopback_blob_endpoints(),
+            ),
             state: open.state,
             seen_events_index,
             pending_seen_event_count: 0,

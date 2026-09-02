@@ -12,7 +12,9 @@ use zeroize::Zeroizing;
 use cgka_traits::app_components::canonicalize_marmot_media_type;
 
 use super::DEFAULT_BLOSSOM_SERVER_URL;
-use super::blossom::{blossom_blob_url, fetch_blossom_blob, upload_blossom_blob};
+use super::blossom::{
+    BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_with_transport, upload_blossom_blob,
+};
 use crate::{AppError, AppGroupImageInput};
 
 const GROUP_IMAGE_VERSION: &str = "marmot-group-image-v1";
@@ -88,7 +90,7 @@ fn validate_group_image_input(plaintext: &[u8], media_type: &str) -> Result<Stri
 /// MLS-protected component bytes and the SQLCipher-protected projections, but
 /// must never be logged or `Debug`-rendered — do not add a `Debug` derive
 /// here, and keep the raw key buffers in `upload_group_image`/
-/// `fetch_group_image` wrapped in `Zeroizing`.
+/// `fetch_group_image_with_transport` wrapped in `Zeroizing`.
 pub(crate) struct GroupImageUpload {
     pub(crate) image_hash_hex: String,
     pub(crate) image_key_hex: String,
@@ -223,12 +225,13 @@ pub(crate) async fn upload_prepared_group_image(
 
 /// Fetch a group avatar's ciphertext from Blossom (addressed by `image_hash_hex`)
 /// and decrypt it with the in-band content key + nonce.
-pub(crate) async fn fetch_group_image(
+pub(crate) async fn fetch_group_image_with_transport(
     image_hash_hex: &str,
     image_key_hex: &str,
     image_nonce_hex: &str,
     media_type: &str,
     server: Option<&str>,
+    transport: &BlossomHttpTransport,
 ) -> Result<Vec<u8>, AppError> {
     let media_type = canonical_group_image_media_type(media_type)?;
     let content_key: Zeroizing<[u8; 32]> = Zeroizing::new(
@@ -247,7 +250,8 @@ pub(crate) async fn fetch_group_image(
     // Group images are content-addressed over the public default Blossom server
     // and are not part of the loopback-blob-endpoint dev/test path, so loopback
     // HTTP is never permitted here.
-    let encrypted = fetch_blossom_blob(&url, false).await?;
+    let encrypted =
+        fetch_blossom_blob_with_transport(&url, &transport.with_loopback_disabled()).await?;
     let actual_hash = hex::encode(Sha256::digest(&encrypted));
     if actual_hash != image_hash_hex.to_ascii_lowercase() {
         return Err(AppError::InvalidEncryptedMedia(

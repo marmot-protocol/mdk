@@ -1,15 +1,18 @@
 use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use url::Url;
 
 use super::blossom::{
-    MAX_BLOSSOM_DESCRIPTOR_BYTES, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body,
+    BlossomHttpTransport, DnsResolver, MAX_BLOSSOM_DESCRIPTOR_BYTES,
+    MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_transport, read_limited_blossom_body,
 };
 use super::host_safety::validate_blossom_fetch_url;
 
@@ -342,6 +345,77 @@ pub(super) fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
 
 pub(super) fn spawn_http_response(response: Vec<u8>) -> String {
     spawn_http_responses(vec![response])
+}
+
+async fn spawn_keep_alive_http_server(
+    body: &'static [u8],
+    requests_expected: usize,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_accepted = accepted.clone();
+    let server = tokio::spawn(async move {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut requests = 0_usize;
+        while requests < requests_expected {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.unwrap();
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                    let request_tx = request_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut request = Vec::new();
+                            let mut buffer = [0_u8; 1024];
+                            loop {
+                                let read = stream.read(&mut buffer).await.unwrap();
+                                if read == 0 {
+                                    break;
+                                }
+                                request.extend_from_slice(&buffer[..read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            if request.is_empty() {
+                                break;
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            stream.write_all(response.as_bytes()).await.unwrap();
+                            stream.write_all(body).await.unwrap();
+                            let _ = request_tx.send(());
+                        }
+                    });
+                }
+                request = request_rx.recv() => {
+                    if request.is_some() {
+                        requests += 1;
+                    }
+                }
+            }
+        }
+    });
+    (url, accepted, server)
+}
+
+async fn spawn_stalled_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer).await;
+        std::future::pending::<()>().await;
+    });
+    (url, server)
 }
 
 fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
@@ -1452,6 +1526,173 @@ fn blossom_redirect_validation_rejects_cross_scheme_private_ip_and_cross_domain(
             "expected {expected:?}, got {err}"
         );
     }
+}
+
+fn blob_reference_for_servers(body: &[u8], servers: &[String]) -> MediaAttachmentReference {
+    let hash = hex::encode(Sha256::digest(body));
+    let mut reference = blossom_reference();
+    reference.ciphertext_sha256 = hash.clone();
+    reference.locators = servers
+        .iter()
+        .map(|server| MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{server}/{hash}.bin"),
+        })
+        .collect();
+    reference
+}
+
+#[tokio::test]
+async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
+    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let url = format!("{server_url}/{}.bin", valid_hash());
+
+    assert_eq!(
+        fetch_blossom_blob_with_transport(&url, &transport)
+            .await
+            .unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        fetch_blossom_blob_with_transport(&url, &transport)
+            .await
+            .unwrap(),
+        b"hello"
+    );
+    server.await.unwrap();
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "compatible same-origin downloads should reuse the vetted connection"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_origin_client_setup_resolves_and_vets_once() {
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_resolutions = resolutions.clone();
+    let resolver: DnsResolver = Arc::new(move |_domain, port| {
+        resolver_resolutions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            Ok(vec![format!("1.1.1.1:{port}").parse().unwrap()])
+        })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let url = Url::parse(&format!("https://media.example/{}.bin", valid_hash())).unwrap();
+
+    let clients = futures::future::join_all((0..4).map(|_| transport.client_for_url(&url))).await;
+
+    assert!(clients.into_iter().all(|client| client.is_ok()));
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "concurrent setup for one origin should share resolution and vetting"
+    );
+}
+
+#[tokio::test]
+async fn separate_download_transports_do_not_share_connections() {
+    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let first =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let second =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let url = format!("{server_url}/{}.bin", valid_hash());
+
+    fetch_blossom_blob_with_transport(&url, &first)
+        .await
+        .unwrap();
+    fetch_blossom_blob_with_transport(&url, &second)
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "account-scoped transports must not share connection pools"
+    );
+}
+
+#[tokio::test]
+async fn expired_origin_lease_is_resolved_and_vetted_again() {
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_resolutions = resolutions.clone();
+    let resolver: DnsResolver = Arc::new(move |_domain, port| {
+        let attempt = resolver_resolutions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let ip = if attempt == 0 { "1.1.1.1" } else { "127.0.0.1" };
+            Ok(vec![format!("{ip}:{port}").parse().unwrap()])
+        })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::ZERO,
+        Duration::from_secs(1),
+        resolver,
+    );
+    let url = Url::parse(&format!("https://media.example/{}.bin", valid_hash())).unwrap();
+
+    transport
+        .client_for_url(&url)
+        .await
+        .expect("first public address set should be accepted");
+    let error = transport
+        .client_for_url(&url)
+        .await
+        .expect_err("expired lease must reject the newly resolved loopback address");
+
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    assert!(error.to_string().contains("public unicast"));
+}
+
+#[tokio::test]
+async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
+    let body = b"healthy ciphertext";
+    let (stalled_url, stalled_server) = spawn_stalled_http_server().await;
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[stalled_url, healthy_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_millis(100));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let downloaded = tokio::time::timeout(
+        Duration::from_secs(2),
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport),
+    )
+    .await
+    .expect("healthy fallback must be reached promptly")
+    .expect("healthy fallback must succeed");
+    stalled_server.abort();
+
+    assert_eq!(downloaded, body);
+}
+
+#[tokio::test]
+async fn corrupt_first_locator_does_not_prevent_integrity_valid_fallback() {
+    let body = b"integrity-valid ciphertext";
+    let corrupt_url = spawn_http_response(http_ok_response(b"corrupt"));
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[corrupt_url, healthy_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let downloaded =
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect("corrupt first candidate must fall through to the healthy locator");
+
+    assert_eq!(downloaded, body);
 }
 
 #[tokio::test]
