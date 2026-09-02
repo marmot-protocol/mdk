@@ -1977,14 +1977,30 @@ impl<S: StorageProvider> Engine<S> {
             if matches!(pre_apply, Some((MessageState::ConvergenceDeferred, _))) {
                 continue;
             }
-            // `NonSelectedEligibleBranch` is a losing branch this device could
-            // materialize. A commit deferred for any other reason is merely
-            // unreplayable here — but if this device had already APPLIED it,
-            // its state notifications are live and losing the selected branch
-            // withdraws them just the same.
+            // `NonSelectedEligibleBranch` is the only deferral that means
+            // "branch selection put this commit on the losing side", which is
+            // the one thing a withdrawal is entitled to say.
+            //
+            // The other commit deferral, `MissingCandidateParent`, does NOT
+            // mean that, and widening to it — even restricted to commits this
+            // device had already applied — is unsound. `handle_commit` reaches
+            // it either when the commit's branch could not be materialized or
+            // when the pass selected NO branch at all
+            // (`selected_branch_id.is_none()`), and the second case is the one
+            // that actually occurs: nothing superseded the commit, because
+            // nothing was selected. Withdrawing there would tombstone a
+            // device's own applied history on a pass that decided nothing.
+            // `emit_superseded_processed_commits` guards the same hazard
+            // explicitly with its `selected_tip.is_none()` early return.
+            //
+            // A genuinely superseded commit that lands here anyway is not left
+            // standing: the apply persists it `ConvergenceDeferred`, and
+            // `SqliteAccountStorage::diverged_branch_selection_withdrawals`
+            // reconciles any parked commit whose rows are still live on the
+            // next account open, whatever reason parked it. Derived-state
+            // repair covers that residue without a speculative arm here.
             if deferred.reason
                 != crate::canonicalization::DeferredMessageReason::NonSelectedEligibleBranch
-                && !matches!(pre_apply, Some((MessageState::Processed, _)))
             {
                 continue;
             }

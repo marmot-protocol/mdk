@@ -2545,6 +2545,92 @@ impl AppClient {
         }
     }
 
+    /// Reconcile branch-selection tombstones against the engine's own commit
+    /// dispositions, once per account open.
+    ///
+    /// Same shape, and the same reason, as
+    /// [`Self::sweep_terminal_groups_from_guards`]: the engine announces a
+    /// branch-selection withdrawal exactly once (on the transition into
+    /// `ConvergenceDeferred`) and takes it back exactly once (on re-adoption),
+    /// but those announcements travel in the engine's in-memory `events_buf`.
+    /// A process death between the convergence apply transaction — which is
+    /// where the disposition becomes durable — and this app's projection commit
+    /// loses the announcement, and announce-once means no later pass re-derives
+    /// it. Before announce-once every later pass re-announced and the
+    /// already-invalidated filter turned the repeat into a no-op, which made the
+    /// old seam accidentally self-healing; this is the deliberate replacement.
+    ///
+    /// It can be a total reconciliation rather than a durable queue because both
+    /// sides live in the same account database, so the correct tombstone state
+    /// is *derivable*, never information the app can lose: a commit parked
+    /// `ConvergenceDeferred` owes its rows a withdrawal, and a commit back at
+    /// `Processed` owes them a revival. `diverged_branch_selection_withdrawals`
+    /// reports only the commits where the two disagree, so a converged account
+    /// performs no writes at all.
+    ///
+    /// Reads no live group state, only durable rows, so — like the terminal
+    /// sweep — it runs on deferred opens too. Best-effort per commit: one
+    /// failure must not fail account open, and the next open retries it.
+    pub(crate) fn reconcile_branch_selection_withdrawals(&mut self) {
+        let divergence = match self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| Ok(storage.diverged_branch_selection_withdrawals()?))
+        {
+            Ok(divergence) => divergence,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::branch_selection_sweep",
+                    method = "reconcile_branch_selection_withdrawals",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not enumerate branch-selection divergences; skipping the open-time sweep"
+                );
+                return;
+            }
+        };
+        if divergence.is_empty() {
+            return;
+        }
+        let mut withdrawn = 0_u64;
+        let mut revived = 0_u64;
+        let mut failed = 0_u64;
+        for origin_commit_id in &divergence.to_withdraw {
+            match self.app.invalidate_timeline_origin_commit(
+                &self.state.label,
+                origin_commit_id,
+                storage_sqlite::BRANCH_SELECTION_WITHDRAWAL_REASON,
+            ) {
+                Ok(Some(update)) => {
+                    withdrawn = withdrawn.saturating_add(1);
+                    self.pending_projection_updates.push(update);
+                }
+                Ok(None) => {}
+                Err(_) => failed = failed.saturating_add(1),
+            }
+        }
+        for origin_commit_id in &divergence.to_revive {
+            match self
+                .app
+                .revalidate_timeline_origin_commit(&self.state.label, origin_commit_id)
+            {
+                Ok(Some(update)) => {
+                    revived = revived.saturating_add(1);
+                    self.pending_projection_updates.push(update);
+                }
+                Ok(None) => {}
+                Err(_) => failed = failed.saturating_add(1),
+            }
+        }
+        tracing::debug!(
+            target: "marmot_app::branch_selection_sweep",
+            method = "reconcile_branch_selection_withdrawals",
+            withdrawn,
+            revived,
+            failed,
+            "reconciled branch-selection withdrawals against stored commit dispositions"
+        );
+    }
+
     /// Reconcile every terminal group's durable projection from the guard rows
     /// themselves, once per account open.
     ///

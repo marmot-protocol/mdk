@@ -11627,7 +11627,9 @@ fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
     };
     let parked_row = system_row("parked-rename", parked_commit_hex.clone());
     app.record_account_app_event("alice", &parked_row).unwrap();
-    app.record_account_app_event("alice", &system_row("other-rename", "cf".repeat(32)))
+    let other_commit_id = cgka_traits::types::MessageId::new(vec![0xCF; 32]);
+    let other_commit_hex = hex::encode(other_commit_id.as_slice());
+    app.record_account_app_event("alice", &system_row("other-rename", other_commit_hex))
         .unwrap();
 
     let group_id = GroupId::new(vec![0xAA]);
@@ -11642,18 +11644,25 @@ fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
     )
     .unwrap()
     .expect("the park must tombstone the parked commit's row");
-    // The other commit is withdrawn under a reason convergence cannot reverse.
+    // A SECOND commit is parked in its own right, under the same reason. Only
+    // the commit scope separates its tombstone from the one being taken back
+    // below, so it is the row that catches a revalidation reaching too far.
     app.projection_update_for_invalidation_event(
         "alice",
-        &cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+        &cgka_traits::engine::GroupEvent::GroupStateInvalidated {
             group_id: group_id.clone(),
-            message_id: cgka_traits::types::MessageId::new(vec![0xCF; 32]),
             epoch: cgka_traits::EpochId(1),
-            reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
-            decrypted_payload_ref: None,
+            invalidated_commit_id: other_commit_id,
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
         },
     )
-    .unwrap();
+    .unwrap()
+    .expect("the second park must tombstone its own row");
+    assert_eq!(
+        invalidation_status(&app, "other-rename"),
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "control: the second commit's row really is tombstoned"
+    );
 
     // Replay re-derives the row while the withdrawal still stands.
     app.record_account_app_event("alice", &parked_row).unwrap();
@@ -11680,8 +11689,8 @@ fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
     );
     assert_eq!(
         invalidation_status(&app, "other-rename"),
-        Some(None),
-        "an unrelated live row is untouched"
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "another commit's withdrawal is not this commit's to take back"
     );
 
     assert!(
@@ -12748,6 +12757,18 @@ mod superseded_system_row_shapes {
         }
     }
 
+    pub(super) fn revalidated(
+        group_id: &GroupId,
+        epoch: u64,
+        revalidated_commit_id: &MessageId,
+    ) -> cgka_traits::engine::GroupEvent {
+        cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(epoch),
+            revalidated_commit_id: revalidated_commit_id.clone(),
+        }
+    }
+
     pub(super) fn batch(
         events: Vec<cgka_traits::engine::GroupEvent>,
     ) -> marmot_account::AccountDeviceEffects {
@@ -12882,6 +12903,263 @@ async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() 
         system_row(&app, &group_id_hex, 4),
         Some(None),
         "a change attributed to a commit the batch did not withdraw stays live"
+    );
+}
+
+/// Crash repair, end to end: the window announce-once opened, and the derived
+/// state that closes it.
+///
+/// The engine persists a commit's parking inside the convergence apply
+/// transaction and announces the withdrawal afterwards, through the in-memory
+/// `events_buf`. A process death between the two loses the announcement, and
+/// announce-once guarantees no later pass repeats it — so before this repair the
+/// commit's kind-1210 rows stood forever, describing a change branch selection
+/// had already reversed. (Under the old always-re-announce behavior the next
+/// pass happened to fix it, which is the accidental self-healing announce-once
+/// removed.)
+///
+/// The repair is not a queue. Engine message state and `app_events` live in the
+/// same account database, so the correct tombstone state is *derivable*: a
+/// commit parked `ConvergenceDeferred` owes its rows a withdrawal, and one back
+/// at `Processed` owes them a revival. Account open reconciles both directions.
+///
+/// The crash is modelled the only way it can be — durable engine state advanced,
+/// announcement never delivered — by writing the disposition the apply
+/// transaction would have committed and never handing the app the event.
+#[tokio::test]
+async fn account_open_repairs_a_branch_selection_announcement_a_crash_lost() {
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://crash-repair.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("crash repair", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    // Two commits the app has already projected system rows for, exactly as an
+    // accepted commit's `GroupStateChanged` would have.
+    let parked = MessageId::new(vec![0xBE; 32]);
+    let readopted = MessageId::new(vec![0xA1; 32]);
+    {
+        use superseded_system_row_shapes::{batch, renamed};
+        client
+            .observe_drained_session_events(&batch(vec![
+                renamed(&group_id, &actor, 2, "parked rename", Some(&parked)),
+                renamed(&group_id, &actor, 3, "re-adopted rename", Some(&readopted)),
+            ]))
+            .await
+            .unwrap();
+    }
+    // The re-adopted commit's rows are tombstoned by a withdrawal that DID
+    // arrive, so the row this test watches for revival is a real one.
+    app.projection_update_for_invalidation_event(
+        "alice",
+        &cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(3),
+            invalidated_commit_id: readopted.clone(),
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        },
+    )
+    .unwrap()
+    .expect("the earlier park tombstoned the re-adopted commit's row");
+
+    let live = |epoch: u64| superseded_system_row_shapes::system_row(&app, &group_id_hex, epoch);
+    assert_eq!(
+        live(2),
+        Some(None),
+        "control: the parked commit's row is live"
+    );
+    assert_eq!(
+        live(3),
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "control: the re-adopted commit's row is tombstoned"
+    );
+
+    // The crash. Both convergence apply transactions committed their
+    // dispositions; neither announcement ever reached this app.
+    {
+        let storage = app.account_storage("alice").unwrap();
+        for (commit, state) in [
+            (
+                &parked,
+                cgka_traits::message::MessageState::ConvergenceDeferred,
+            ),
+            (&readopted, cgka_traits::message::MessageState::Processed),
+        ] {
+            storage
+                .put_message(&cgka_traits::message::MessageRecord {
+                    id: commit.clone(),
+                    group_id: group_id.clone(),
+                    epoch: cgka_traits::EpochId(1),
+                    state,
+                    payload: cgka_traits::message::StoredMessagePayload::openmls_wire(
+                        cgka_traits::transport::TransportMessage {
+                            id: commit.clone(),
+                            payload: vec![0u8; 4],
+                            timestamp: cgka_traits::transport::Timestamp(0),
+                            causal_deps: Vec::new(),
+                            source: cgka_traits::transport::TransportSource("crash".into()),
+                            envelope: cgka_traits::transport::TransportEnvelope::GroupMessage {
+                                transport_group_id: group_id.as_slice().to_vec(),
+                            },
+                        },
+                    )
+                    .encode()
+                    .unwrap(),
+                    deferred_peel: None,
+                })
+                .unwrap();
+        }
+    }
+    drop(client);
+
+    // Restart. Account open reconciles both directions off stored state alone.
+    let reopened = client_on_app_relay_plane(&app, "alice").await;
+    assert_eq!(
+        live(2),
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "the withdrawal the crash lost is re-derived from the parked disposition"
+    );
+    assert_eq!(
+        live(3),
+        Some(None),
+        "and the revalidation the crash lost is re-derived from the re-adoption"
+    );
+    drop(reopened);
+
+    // Exactly once, and stable: a second open finds no divergence and writes
+    // nothing, so the repair cannot flap a converged account.
+    let storage = app.account_storage("alice").unwrap();
+    assert!(
+        storage
+            .diverged_branch_selection_withdrawals()
+            .unwrap()
+            .is_empty(),
+        "the repair must be a fixed point"
+    );
+    let reopened = client_on_app_relay_plane(&app, "alice").await;
+    assert_eq!(
+        live(2),
+        Some(Some("SupersededByBranchSelection".to_owned()))
+    );
+    assert_eq!(live(3), Some(None));
+    drop(reopened);
+}
+
+/// Shape 3 — a batch whose verdict on one commit FLIPS. A withdrawal and a
+/// revalidation of the same commit are opposite answers to one question, and a
+/// multi-pass batch can carry both: pass A re-adopts a parked commit (emitting
+/// its `GroupStateChanged` and `GroupStateRevalidated`), pass B parks it again.
+/// Only the last verdict is the batch's answer, so the tail must resolve them in
+/// event order rather than by membership.
+///
+/// Both directions are pinned. Withdrawn-last must leave no live row (a
+/// membership test exempts the commit and the tail's INSERT resurrects the
+/// #1593 shape, because with no pre-existing row the dispatch loop has nothing
+/// to tombstone). Revalidated-last must leave one, or the re-adoption has no
+/// row to be entitled to.
+#[tokio::test]
+async fn a_batch_that_flips_its_verdict_projects_the_last_one() {
+    use superseded_system_row_shapes::{
+        SUPERSEDED, batch, renamed, revalidated, superseded, system_row,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://flipped-verdict-rows.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("flipped verdict rows", &[])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+
+    // Withdrawn last, with no pre-existing row: net verdict is withdrawn.
+    let reparked = MessageId::new(vec![0xBE; 32]);
+    client
+        .observe_drained_session_events(&batch(vec![
+            renamed(&group_id, &actor, 2, "re-adopted rename", Some(&reparked)),
+            revalidated(&group_id, 2, &reparked),
+            superseded(&group_id, 2, &reparked),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 2),
+        None,
+        "a commit the batch ends by withdrawing must not get a live row, \
+         however many times the batch changed its mind"
+    );
+
+    // Revalidated last: net verdict is canonical, so the row must exist and be
+    // live. This is the direction the exemption was reaching for.
+    let readopted = MessageId::new(vec![0xA1; 32]);
+    client
+        .observe_drained_session_events(&batch(vec![
+            superseded(&group_id, 3, &readopted),
+            renamed(&group_id, &actor, 3, "settled rename", Some(&readopted)),
+            revalidated(&group_id, 3, &readopted),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 3),
+        Some(None),
+        "a commit the batch ends by re-adopting keeps a live row"
+    );
+
+    // Control: withdrawal-only is unchanged by the ordering rewrite.
+    let parked = MessageId::new(vec![0xC2; 32]);
+    client
+        .observe_drained_session_events(&batch(vec![
+            renamed(&group_id, &actor, 4, "parked rename", Some(&parked)),
+            superseded(&group_id, 4, &parked),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(system_row(&app, &group_id_hex, 4), None);
+
+    // And a batch that only revalidates a commit whose row an EARLIER batch
+    // tombstoned still revives it, since the dispatch loop owns that write.
+    let earlier = MessageId::new(vec![0xD3; 32]);
+    client
+        .observe_drained_session_events(&batch(vec![renamed(
+            &group_id,
+            &actor,
+            5,
+            "earlier rename",
+            Some(&earlier),
+        )]))
+        .await
+        .unwrap();
+    client
+        .observe_drained_session_events(&batch(vec![superseded(&group_id, 5, &earlier)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 5),
+        Some(Some(SUPERSEDED.to_owned()))
+    );
+    client
+        .observe_drained_session_events(&batch(vec![revalidated(&group_id, 5, &earlier)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        system_row(&app, &group_id_hex, 5),
+        Some(None),
+        "a later batch's revalidation revives the earlier batch's tombstone"
     );
 }
 

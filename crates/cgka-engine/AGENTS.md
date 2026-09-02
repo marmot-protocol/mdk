@@ -473,6 +473,20 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   for every deferral. The app side must mirror the asymmetry: its tombstone is terminal by default (#1608), and only the
   explicitly evidenced `GroupStateRevalidated` path clears a `SupersededByBranchSelection` row. Withdrawals under every
   other reason stay terminal on both sides.
+- **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `MissingCandidateParent` is the other commit deferral and
+  it does not mean "branch selection put this commit on the losing side": `handle_commit` also reaches it when the pass
+  selected NO branch at all, which is the case that actually occurs in practice. Withdrawing there would tombstone a
+  device's own applied history on a pass that decided nothing — the same hazard
+  `emit_superseded_processed_commits` guards with its `selected_tip.is_none()` early return.
+- **Announce-once is paid for by derived-state reconciliation, not by a durable event queue.** `events_buf` is
+  in-memory, so a crash between the convergence apply transaction and the app's projection loses an announcement that
+  announce-once will never repeat. The repair is not a queue: a commit's branch-selection tombstone state is fully
+  derivable from `cgka_messages.state`, and engine messages and `app_events` share one account database.
+  `SqliteAccountStorage::diverged_branch_selection_withdrawals` reports the disagreements (`ConvergenceDeferred` with
+  live rows owes a withdrawal; `Processed` with a `SupersededByBranchSelection` tombstone owes a revival) and
+  `AppClient::reconcile_branch_selection_withdrawals` applies them on every account open. Keep that derivation total:
+  if a future change makes a withdrawal mean something the stored disposition cannot express, it needs its own durable
+  evidence rather than a widened event.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

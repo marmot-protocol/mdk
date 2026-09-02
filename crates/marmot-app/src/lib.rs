@@ -1732,6 +1732,11 @@ impl MarmotApp {
         // runs on deferred opens too — and it must, because it is now the sole
         // reconciler for a disband whose live projection never completed.
         client.sweep_terminal_groups_from_guards();
+        // Same durable-input rule as the terminal sweep: this reads stored
+        // commit dispositions and stored tombstones, never live group state, so
+        // it repairs a crash-lost branch-selection announcement on every open,
+        // deferred ones included.
+        client.reconcile_branch_selection_withdrawals();
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
