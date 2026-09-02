@@ -1349,15 +1349,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     pub(crate) fn do_own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        Ok(mls_group.own_leaf_index().u32())
+        self.with_mls_group(group_id, |mls_group| Ok(mls_group.own_leaf_index().u32()))
     }
 
     /// `constructable_capabilities` implementation.

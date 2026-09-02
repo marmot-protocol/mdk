@@ -169,6 +169,7 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &SerializedBuffer,
     ) -> Result<(), SqliteOpenMlsStorageError> {
+        self.connection.note_openmls_write();
         let storage_key = build_key(label.as_bytes(), key.clone());
         let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
@@ -256,6 +257,7 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
+        self.connection.note_openmls_write();
         let storage_key = build_key(label.as_bytes(), key.clone());
         let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
@@ -299,6 +301,7 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
+        self.connection.note_openmls_write();
         let encoded = [
             serialize_buffer(label, value)?,
             encode_legacy_json(label, value)?,
@@ -408,6 +411,7 @@ impl SqliteOpenMlsStorage {
         label: OpenMlsValueLabel,
         key: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
+        self.connection.note_openmls_write();
         let storage_key = build_key(label.as_bytes(), key.clone());
         let legacy_storage_key = build_key_legacy(label.as_bytes(), key);
         if self.connection.is_current_thread_transaction_owner() {
@@ -443,6 +447,7 @@ impl SqliteOpenMlsStorage {
         group_id: &GroupId,
         labels: &[OpenMlsValueLabel],
     ) -> Result<(), SqliteOpenMlsStorageError> {
+        self.connection.note_openmls_write();
         let group_key = Self::group_key(group_id)?;
         // Wrap every label delete in a single transaction so the operation is
         // atomic. clear_proposal_queue deletes QUEUED_PROPOSAL_LABEL and

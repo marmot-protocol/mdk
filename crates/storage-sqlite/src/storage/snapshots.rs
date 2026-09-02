@@ -34,6 +34,7 @@ pub(super) fn rollback(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     restore::rollback(store, group_id, name)
 }
 
@@ -42,6 +43,7 @@ pub(super) fn rollback_group_state(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     restore::rollback_group_state(store, group_id, name)
 }
 
@@ -98,6 +100,7 @@ pub(crate) fn import_replay(
     group_id: &GroupId,
     snapshot: &[u8],
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     restore::import(store, group_id, snapshot)
 }
 
