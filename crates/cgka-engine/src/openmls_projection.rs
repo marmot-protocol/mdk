@@ -4158,6 +4158,56 @@ mod reuse_scope_tests {
 }
 
 #[cfg(test)]
+mod unresolved_commit_state_tests {
+    use super::unresolved_commit_state;
+    use cgka_traits::message::MessageState;
+
+    /// `Processed` staying OUT of this set is load-bearing well past the BFS.
+    ///
+    /// `build_stored_openmls_candidate_paths` filters `unresolved_commit_ids`
+    /// through this predicate, and whatever the BFS then fails to materialize
+    /// becomes a `MissingCandidateParent` deferral in
+    /// `append_missing_parent_deferred_commits`. Excluding `Processed` is what
+    /// makes "a `MissingCandidateParent` deferral never names a previously
+    /// applied commit" true, and therefore what makes losing to a *selected*
+    /// branch the only route from `Processed` to `ConvergenceDeferred`.
+    ///
+    /// Two state-derived reconcilers rest on exactly that. Both treat a parked
+    /// commit as a genuine branch-selection withdrawal without consulting the
+    /// reason that parked it:
+    ///
+    /// - `marmot_app::AppClient::reconcile_branch_selection_withdrawals`, which
+    ///   tombstones the app rows a parked commit synthesized, and
+    /// - `marmot_account::AccountDeviceRuntime::reconcile_superseded_maintenance_from_state`,
+    ///   which retires the `DurableGroupEvolution` behind it and re-arms the
+    ///   self-update obligation it owed.
+    ///
+    /// Widening this set to admit `Processed` would let a pass that selected no
+    /// branch park an applied commit, and both reconcilers would then withdraw
+    /// history nothing superseded. That is the blast radius; this test is the
+    /// tripwire.
+    #[test]
+    fn processed_is_not_an_unresolved_commit_state() {
+        for state in [
+            MessageState::Sent,
+            MessageState::Created,
+            MessageState::Retryable,
+            MessageState::ConvergenceDeferred,
+        ] {
+            assert!(
+                unresolved_commit_state(state),
+                "{state:?} is an unresolved commit input and must stay one"
+            );
+        }
+        assert!(
+            !unresolved_commit_state(MessageState::Processed),
+            "an already-applied commit must never be reported unresolved: two \
+             state-derived reconcilers withdraw history on the strength of it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod checkpoint_prefix_tests {
     use super::checkpoint_realizable_own_commit_prefix;
     use crate::canonicalization::{CanonicalizationResult, ConvergenceStatus};

@@ -698,6 +698,16 @@ impl<S: StorageProvider> Engine<S> {
     /// withdrawal seam announces once. The apply transaction already made the
     /// answer durable, and this exposes exactly that field so a consumer can
     /// re-derive it. Exposes no payload bytes and never affects processing.
+    ///
+    /// Ungated by the crate's accessor convention, not by omission: an id-keyed
+    /// read of durable metadata takes no group liveness gate, exactly like
+    /// [`Self::maintenance_obligation`] and [`Self::list_group_evolutions`].
+    /// `ensure_group_live` guards the group-keyed and payload-bearing
+    /// surfaces — [`Self::list_group_evolutions_for_group`],
+    /// [`Self::group_maintenance`], [`Self::own_leaf_hash`] — because those
+    /// answer questions about a group that may be quarantined or disbanded. A
+    /// single row's disposition is not such a question, and gating it would
+    /// break the repair precisely on the groups that need it.
     pub fn stored_message_state(
         &self,
         id: &MessageId,

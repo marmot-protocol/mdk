@@ -2594,6 +2594,7 @@ impl AppClient {
         let mut withdrawn = 0_u64;
         let mut revived = 0_u64;
         let mut failed = 0_u64;
+        let mut first_error_kind: Option<&'static str> = None;
         for origin_commit_id in &divergence.to_withdraw {
             match self.app.invalidate_timeline_origin_commit(
                 &self.state.label,
@@ -2605,7 +2606,10 @@ impl AppClient {
                     self.pending_projection_updates.push(update);
                 }
                 Ok(None) => {}
-                Err(_) => failed = failed.saturating_add(1),
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    first_error_kind.get_or_insert(error.privacy_safe_kind());
+                }
             }
         }
         for origin_commit_id in &divergence.to_revive {
@@ -2618,7 +2622,10 @@ impl AppClient {
                     self.pending_projection_updates.push(update);
                 }
                 Ok(None) => {}
-                Err(_) => failed = failed.saturating_add(1),
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    first_error_kind.get_or_insert(error.privacy_safe_kind());
+                }
             }
         }
         tracing::debug!(
@@ -2629,6 +2636,21 @@ impl AppClient {
             failed,
             "reconciled branch-selection withdrawals against stored commit dispositions"
         );
+        // A partial sweep leaves real divergence standing — a live row for a
+        // parked commit, or a tombstone over a re-adopted one — and nothing
+        // else notices until the next account open re-derives it. Say so above
+        // debug, with the first kind observed so the failure has a shape.
+        if failed > 0 {
+            tracing::warn!(
+                target: "marmot_app::branch_selection_sweep",
+                method = "reconcile_branch_selection_withdrawals",
+                withdrawn,
+                revived,
+                failed,
+                error_kind = first_error_kind.unwrap_or("unknown"),
+                "some branch-selection divergences stayed unreconciled; the next account open retries them"
+            );
+        }
     }
 
     /// Reconcile every terminal group's durable projection from the guard rows
@@ -2674,6 +2696,7 @@ impl AppClient {
         let guard_count = guards.len();
         let mut reconciled = 0_u64;
         let mut failed = 0_u64;
+        let mut first_error_kind: Option<&'static str> = None;
         for (group_id, _) in guards {
             let group_id_hex = hex::encode(group_id.as_slice());
             match self
@@ -2685,16 +2708,19 @@ impl AppClient {
                     self.pending_projection_updates.push(update);
                 }
                 Ok(None) => {}
-                Err(_) => failed = failed.saturating_add(1),
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    first_error_kind.get_or_insert(error.privacy_safe_kind());
+                }
             }
             // A terminal group never advertises notification destinations
             // again, so every cached peer token is stale by definition.
-            if self
-                .app
-                .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[])
-                .is_err()
+            if let Err(error) =
+                self.app
+                    .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[])
             {
                 failed = failed.saturating_add(1);
+                first_error_kind.get_or_insert(error.privacy_safe_kind());
             }
         }
         if reconciled > 0 || failed > 0 {
@@ -2705,6 +2731,20 @@ impl AppClient {
                 reconciled,
                 failed,
                 "reconciled terminal group projections from durable guards"
+            );
+        }
+        // Same reasoning as the branch-selection sweep: a guard this open could
+        // not reconcile leaves a terminal group's held sends stuck at
+        // "Sending…", and only the next open retries it.
+        if failed > 0 {
+            tracing::warn!(
+                target: "marmot_app::terminal_sweep",
+                method = "sweep_terminal_groups_from_guards",
+                terminal_groups = guard_count,
+                reconciled,
+                failed,
+                error_kind = first_error_kind.unwrap_or("unknown"),
+                "some terminal group projections stayed unreconciled; the next account open retries them"
             );
         }
     }

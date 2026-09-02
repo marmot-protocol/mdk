@@ -3392,22 +3392,24 @@ async fn committers_losing_rival_is_reconsidered_onto_the_fleets_deeper_branch()
     );
 }
 
-/// RED (defects (a) + (e) on the rollback-announcement seam).
+/// Pins both halves of the rollback-announcement seam (defects (a) + (e)).
 ///
 /// `emit_rolled_back_commits` announces the `CommitRolledBack` +
 /// `GroupStateInvalidated` withdrawal pair for every commit a pass parks
 /// `ConvergenceDeferred` / `NonSelectedEligibleBranch`. That state is
 /// *reconsiderable*, so the same commit can be parked by pass after pass and
-/// can later be RE-ADOPTED onto the selected branch. Neither is handled:
+/// can later be RE-ADOPTED onto the selected branch. Neither used to be handled:
 ///
-/// - (a) every pass that re-parks the same commit re-announces the identical
-///   withdrawal pair, so announcement history is not evidence of anything.
-/// - (e) the withdrawal is never taken back. Since #1608 made storage-side
-///   invalidation terminal, the re-adopted commit's kind-1210 rows stay
+/// - (a) every pass that re-parked the same commit re-announced the identical
+///   withdrawal pair, so announcement history was not evidence of anything.
+/// - (e) the withdrawal was never taken back. Since #1608 made storage-side
+///   invalidation terminal, the re-adopted commit's kind-1210 rows stayed
 ///   tombstoned forever.
 ///
-/// The scenario walks one commit through park → re-park → re-adoption on a
-/// single device.
+/// Both are fixed, and this test is what holds them fixed: the scenario walks
+/// one commit through park → re-park → re-adoption on a single device, and
+/// asserts one withdrawal across the two parkings plus a revalidation on the
+/// re-adoption.
 #[tokio::test]
 async fn reparked_and_readopted_commit_announces_once_and_is_revalidated() {
     // A's identity must sort before the rival's so A's own commit wins the

@@ -493,11 +493,14 @@ impl GroupStall {
     /// mark to pace against, wedging [`Self::may_rearm_wedged`] shut for good on
     /// a group whose epoch never moves again — the exact failure the paced
     /// re-arm exists to prevent. Dropping the frozen-epoch evidence would hand a
-    /// recurring reorg the power to silence the wedge report, and reorgs do
-    /// recur: a losing commit is parked rather than consumed, so stored
-    /// convergence re-derives and re-announces the same withdrawal on every pass
-    /// it runs, and one unresolved fork plus ordinary member traffic produces a
-    /// reorg per pass indefinitely.
+    /// recurring reorg the power to silence the wedge report, and reorgs still
+    /// recur under announce-once. A withdrawal now arrives once per *parking*
+    /// rather than once per pass, so recurrence is bounded by genuinely new
+    /// adjudications instead of by pass count — but an unresolved fork keeps
+    /// attracting rival commits, and each fresh one this device parks is a new
+    /// adjudication that reaches this seam. Bounded recurrence is still
+    /// recurrence, and it is more than enough to keep clearing the evidence, so
+    /// the frozen-epoch retention argument is unchanged.
     fn end_arm_run_keeping_epoch_evidence(&mut self) {
         self.arms = 0;
         self.escalated = false;

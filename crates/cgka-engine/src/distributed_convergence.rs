@@ -1979,26 +1979,34 @@ impl<S: StorageProvider> Engine<S> {
             }
             // `NonSelectedEligibleBranch` is the only deferral that means
             // "branch selection put this commit on the losing side", which is
-            // the one thing a withdrawal is entitled to say.
+            // the one thing a withdrawal is entitled to say. On the production
+            // path a stored commit reaches it through
+            // `classify_losing_materialized_candidate_commits`, which early
+            // returns unless a branch was actually selected.
             //
-            // The other commit deferral, `MissingCandidateParent`, does NOT
-            // mean that, and widening to it — even restricted to commits this
-            // device had already applied — is unsound. `handle_commit` reaches
-            // it either when the commit's branch could not be materialized or
-            // when the pass selected NO branch at all
-            // (`selected_branch_id.is_none()`), and the second case is the one
-            // that actually occurs: nothing superseded the commit, because
-            // nothing was selected. Withdrawing there would tombstone a
-            // device's own applied history on a pass that decided nothing.
-            // `emit_superseded_processed_commits` guards the same hazard
-            // explicitly with its `selected_tip.is_none()` early return.
+            // The other commit deferral, `MissingCandidateParent`, cannot mean
+            // that, and the reason is a state invariant rather than a judgement
+            // call. Production emits it from
+            // `append_missing_parent_deferred_commits`, over the stored commits
+            // the candidate-path BFS could not materialize; that set is filtered
+            // by `unresolved_commit_state`, which admits `Sent`, `Created`,
+            // `Retryable`, and `ConvergenceDeferred` and excludes `Processed`.
+            // So a `MissingCandidateParent` deferral can never name a commit
+            // this device previously applied — the commit has no applied
+            // notifications to withdraw, and widening this filter to it would
+            // reach nothing but rows that were never live.
             //
-            // A genuinely superseded commit that lands here anyway is not left
-            // standing: the apply persists it `ConvergenceDeferred`, and
+            // That invariant is what the branch's two state-derived reconcilers
+            // rest on. The only route from `Processed` to `ConvergenceDeferred`
+            // is losing to a *selected* branch, so a parked commit that was once
+            // applied is always a genuine branch-selection withdrawal whatever
+            // the pass recorded as its reason. Reason-agnostic repair is
+            // therefore sound, and it is how the residue is covered:
             // `SqliteAccountStorage::diverged_branch_selection_withdrawals`
-            // reconciles any parked commit whose rows are still live on the
-            // next account open, whatever reason parked it. Derived-state
-            // repair covers that residue without a speculative arm here.
+            // reconciles any parked commit whose rows are still live at the next
+            // account open, and `mark_evolution_superseded`'s state-derived
+            // caller does the same for the maintenance record behind it. Neither
+            // needs a speculative arm here.
             if deferred.reason
                 != crate::canonicalization::DeferredMessageReason::NonSelectedEligibleBranch
             {

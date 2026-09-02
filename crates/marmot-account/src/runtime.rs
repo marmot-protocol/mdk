@@ -2555,6 +2555,30 @@ where
         let Some(mut obligation) = self.session.maintenance_obligation(&obligation_id)? else {
             return Ok(());
         };
+        // `Failed` is terminal here, and deliberately `Complete` is not.
+        //
+        // [`Self::reconcile_confirmed_own_leaf_rotations`] fails every live
+        // obligation in a group whose epoch change shows this device is no
+        // longer a member, stamping `local_member_removed`. There is no local
+        // leaf left to rotate, so no self-update can ever satisfy it. The same
+        // fork parks the commits it displaced, so the state-derived reconciler
+        // reaches that obligation with a genuine supersession — and re-arming it
+        // to `Quiet` would put `run_due_maintenance` back on a `SelfUpdate` in a
+        // group the device has left, failing once per tick forever and
+        // invisibly: `MaintenanceRunSummary.failures` counts only obligations
+        // sitting in `Failed`.
+        //
+        // A `Complete` obligation gets no such guard because un-completing it is
+        // the point. A withdrawn commit takes back the very rotation that
+        // completed the obligation behind it, and re-arming there is this
+        // branch's PCS re-arm mechanism, not a bug. Completion by some *other*
+        // rotation is already idempotent through the leaf-hash discriminator
+        // below: that rotation left `own_leaf_hash` different from the
+        // evolution's `own_leaf_before_hash`, so the branch taken is
+        // `complete_maintenance_obligation` again.
+        if obligation.phase == MaintenancePhase::Failed {
+            return Ok(());
+        }
         let selected_branch_rotated_own_leaf =
             evolution
                 .own_leaf_before_hash
