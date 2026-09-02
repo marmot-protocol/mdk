@@ -17,18 +17,19 @@ use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{
-    DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceStatus,
-    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
-    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
-    TransportFanoutAttemptState, TransportFanoutTarget,
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
+    GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
+    MaintenanceTrigger, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
+    SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, OutboundApplicationMessage,
-    OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp, TransportAccountActivation,
-    TransportAdapter, TransportAdapterError, TransportDelivery, TransportEndpoint,
-    TransportEndpointFailure, TransportEndpointFailureKind, TransportEndpointReceipt,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
+    OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
+    TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    TransportPublishTarget,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -1277,6 +1278,11 @@ where
             output.absorb_account_effects(recovered);
         }
         let now = self.wall_clock.now();
+        // Before anything reads an evolution or an obligation: repair the
+        // supersessions whose announcement never reached
+        // `reconcile_superseded_maintenance`. This is the maintenance sweep, so
+        // it is where a stranded evolution would otherwise do its damage.
+        self.reconcile_superseded_maintenance_from_state(now)?;
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
         if self.key_package_has_pending_fanout()?
@@ -2461,46 +2467,114 @@ where
         let now = self.wall_clock.now();
         for (group_id, invalidated_commit_id) in superseded {
             let evolutions = self.session.group_evolutions_for_group(&group_id)?;
-            for mut evolution in evolutions.into_iter().filter(|evolution| {
+            for evolution in evolutions.into_iter().filter(|evolution| {
                 evolution.signed_message_id.as_ref() == Some(&invalidated_commit_id)
                     && evolution.phase != GroupEvolutionPhase::SupersededByConvergence
             }) {
-                evolution.phase = GroupEvolutionPhase::SupersededByConvergence;
-                self.session.put_group_evolution(&evolution)?;
-
-                let GroupEvolutionSemantic::SelfUpdate { obligation_id, .. } = evolution.semantic
-                else {
-                    continue;
-                };
-                let Some(obligation_id) = obligation_id else {
-                    continue;
-                };
-                let Some(mut obligation) = self.session.maintenance_obligation(&obligation_id)?
-                else {
-                    continue;
-                };
-                let selected_branch_rotated_own_leaf = evolution
-                    .own_leaf_before_hash
-                    .as_ref()
-                    .is_some_and(|before| {
-                        self.session
-                            .own_leaf_hash(&group_id)
-                            .is_ok_and(|current| current.as_slice() != before.as_slice())
-                    });
-                if selected_branch_rotated_own_leaf {
-                    self.complete_maintenance_obligation(&mut obligation, now)?;
-                } else {
-                    obligation.phase = MaintenancePhase::Quiet;
-                    obligation.quiet_since = Some(now);
-                    obligation.not_before = None;
-                    obligation.semantic_rearm_count =
-                        obligation.semantic_rearm_count.saturating_add(1);
-                    obligation.last_failure_code = Some("superseded_by_convergence".into());
-                    self.maintenance_quiet_monotonic
-                        .insert(obligation.id.clone(), self.monotonic_clock.elapsed());
-                    self.session.put_maintenance_obligation(&obligation)?;
-                }
+                self.mark_evolution_superseded(evolution, now)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Re-derive a supersession whose `GroupStateInvalidated` announcement was
+    /// never consumed, from the disposition the engine already made durable.
+    ///
+    /// [`Self::reconcile_superseded_maintenance`] is purely event-driven, and
+    /// engine events live in an in-memory buffer. The convergence apply
+    /// transaction persists a superseded commit's disposition, and only *then*
+    /// does this layer publish the pass's outbound work — awaited transport
+    /// round trips, any of which can also return `Err` and abandon the batch —
+    /// before the event reconciler runs. A process death or an error anywhere in
+    /// that window loses the announcement, and both withdrawal emitters announce
+    /// at most once: `emit_rolled_back_commits` skips a commit an earlier pass
+    /// already parked, and `emit_superseded_processed_commits` durably retires
+    /// its record so no later pass sees it as previously applied.
+    ///
+    /// A stranded evolution is not inert. [`Self::run_due_maintenance`] takes
+    /// the first non-superseded `SelfUpdate` evolution behind an obligation: a
+    /// `Confirmed` one completes the obligation outright, so the leaf rotation it
+    /// owed is dropped and the next periodic rotation is rescheduled from a leaf
+    /// that never actually changed; a `Prepared`/`Attempting` one keeps
+    /// republishing the exact commit convergence already withdrew.
+    ///
+    /// Same philosophy as `AppClient::reconcile_branch_selection_withdrawals`,
+    /// and derivable for the same reason: an evolution and its commit's
+    /// disposition live in one account database, so the answer is a total
+    /// function of stored state rather than information this layer can lose.
+    /// `ConvergenceDeferred` (parked off the selected branch) and
+    /// `EpochInvalidated` (terminally retired) are exactly what the two
+    /// withdrawal emitters leave behind; every other state means the commit is
+    /// still live or still in flight, and is left alone.
+    ///
+    /// Flips forward only, exactly as the event path does. Re-adoption has no
+    /// account-layer consumer at all — `GroupStateRevalidated` is not handled
+    /// here — and the event path never un-marks a superseded evolution, so
+    /// neither does this. It is therefore a fixed point: a converged account
+    /// writes nothing, and a flipped evolution is skipped on every later run.
+    fn reconcile_superseded_maintenance_from_state(&mut self, now: Timestamp) -> AccountResult<()> {
+        for evolution in self.session.group_evolutions()? {
+            if evolution.phase == GroupEvolutionPhase::SupersededByConvergence {
+                continue;
+            }
+            let Some(commit_id) = evolution.signed_message_id.clone() else {
+                continue;
+            };
+            if !matches!(
+                self.session.stored_message_state(&commit_id)?,
+                Some(MessageState::ConvergenceDeferred | MessageState::EpochInvalidated)
+            ) {
+                continue;
+            }
+            self.mark_evolution_superseded(evolution, now)?;
+        }
+        Ok(())
+    }
+
+    /// Retire an evolution that branch selection superseded, and settle the
+    /// self-update obligation behind it.
+    ///
+    /// Sole writer of [`GroupEvolutionPhase::SupersededByConvergence`], shared
+    /// by the event-driven and state-derived reconcilers so the two cannot
+    /// disagree about what a supersession does.
+    fn mark_evolution_superseded(
+        &mut self,
+        mut evolution: DurableGroupEvolution,
+        now: Timestamp,
+    ) -> AccountResult<()> {
+        let group_id = evolution.group_id.clone();
+        evolution.phase = GroupEvolutionPhase::SupersededByConvergence;
+        self.session.put_group_evolution(&evolution)?;
+
+        let GroupEvolutionSemantic::SelfUpdate { obligation_id, .. } = evolution.semantic else {
+            return Ok(());
+        };
+        let Some(obligation_id) = obligation_id else {
+            return Ok(());
+        };
+        let Some(mut obligation) = self.session.maintenance_obligation(&obligation_id)? else {
+            return Ok(());
+        };
+        let selected_branch_rotated_own_leaf =
+            evolution
+                .own_leaf_before_hash
+                .as_ref()
+                .is_some_and(|before| {
+                    self.session
+                        .own_leaf_hash(&group_id)
+                        .is_ok_and(|current| current.as_slice() != before.as_slice())
+                });
+        if selected_branch_rotated_own_leaf {
+            self.complete_maintenance_obligation(&mut obligation, now)?;
+        } else {
+            obligation.phase = MaintenancePhase::Quiet;
+            obligation.quiet_since = Some(now);
+            obligation.not_before = None;
+            obligation.semantic_rearm_count = obligation.semantic_rearm_count.saturating_add(1);
+            obligation.last_failure_code = Some("superseded_by_convergence".into());
+            self.maintenance_quiet_monotonic
+                .insert(obligation.id.clone(), self.monotonic_clock.elapsed());
+            self.session.put_maintenance_obligation(&obligation)?;
         }
         Ok(())
     }

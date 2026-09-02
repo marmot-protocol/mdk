@@ -45,6 +45,12 @@ relay auth, or transport-specific relay discovery.
 - Keep `AccountDeviceSession` as the owner of engine state.
 - Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `wn` and `marmot-app`.
 - Confirm pending work only after the adapter reports enough acknowledgements.
+- Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
+  consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
+  retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored
+  disposition (`ConvergenceDeferred`/`EpochInvalidated`) so a lost announcement cannot strand it. Both paths go through
+  `mark_evolution_superseded`; keep it the sole writer of `SupersededByConvergence`, and keep the derivation forward-only
+  — nothing here un-marks a supersession on re-adoption.
 - Roll back pending work when publication fails before any external exposure is possible. Once publication intent is durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication instead.
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.
 

@@ -487,6 +487,16 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   `AppClient::reconcile_branch_selection_withdrawals` applies them on every account open. Keep that derivation total:
   if a future change makes a withdrawal mean something the stored disposition cannot express, it needs its own durable
   evidence rather than a widened event.
+
+  The app timeline is not the only consumer that can lose the announcement. `GroupStateInvalidated` also retires the
+  maintenance `DurableGroupEvolution` behind a superseded commit, and that consumer sits *after* the account layer's
+  awaited relay publishes, so the window is network-wide rather than instantaneous.
+  `AccountDeviceRuntime::reconcile_superseded_maintenance_from_state` is the matching derived-state repair, keyed on the
+  same durable field: an evolution whose `signed_message_id` reads `ConvergenceDeferred` (parked) or `EpochInvalidated`
+  (retired) is superseded. Note that the *own-commit* emitter, `emit_superseded_processed_commits`, has always
+  announced once — it durably flips its record to `EpochInvalidated`, so a later pass no longer sees it as previously
+  applied. That half of the hole predates announce-once. Both repairs flip forward only; `GroupStateRevalidated` has no
+  account-layer consumer and neither reconciler un-marks a supersession.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

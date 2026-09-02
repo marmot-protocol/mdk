@@ -565,6 +565,15 @@ impl AccountDeviceSession {
         Ok(self.engine.delete_maintenance_obligation(id)?)
     }
 
+    /// Durable disposition of one stored message, for state-derived repair of
+    /// an announcement the engine's in-memory event buffer could not deliver.
+    pub fn stored_message_state(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<Option<cgka_traits::MessageState>> {
+        Ok(self.engine.stored_message_state(id)?)
+    }
+
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {
         Ok(self.engine.list_group_evolutions()?)
     }

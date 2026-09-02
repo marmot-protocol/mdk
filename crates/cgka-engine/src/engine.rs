@@ -689,6 +689,26 @@ impl<S: StorageProvider> Engine<S> {
         crate::conformance_snapshot::capture_structural_progress_snapshot(self, group_id)
     }
 
+    /// Read the durable disposition of one stored message, or `None` when no
+    /// row exists under that id.
+    ///
+    /// State-derived repair only. Engine events are in-memory, so a crash or an
+    /// error between the convergence apply transaction and the consumer that
+    /// acts on a `GroupStateInvalidated` loses the announcement for good — the
+    /// withdrawal seam announces once. The apply transaction already made the
+    /// answer durable, and this exposes exactly that field so a consumer can
+    /// re-derive it. Exposes no payload bytes and never affects processing.
+    pub fn stored_message_state(
+        &self,
+        id: &MessageId,
+    ) -> Result<Option<cgka_traits::MessageState>, EngineError> {
+        match self.storage.get_message(id) {
+            Ok(record) => Ok(Some(record.state)),
+            Err(cgka_traits::storage::StorageError::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Read the durable state of one synthetic scenario input under either its
     /// transport or content-derived id.
     ///
