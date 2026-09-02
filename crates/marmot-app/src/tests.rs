@@ -4703,10 +4703,10 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
             .lock()
             .unwrap()
             .remove("alice");
-        app.chat_list_projection_stale
-            .lock()
-            .unwrap()
-            .insert("alice".to_owned());
+        app.chat_list_projection_stale.lock().unwrap().insert(
+            "alice".to_owned(),
+            HashSet::from(["stale-group".to_owned()]),
+        );
 
         relay.block_next_publish();
         let created = runtime
@@ -4742,7 +4742,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
             app.chat_list_projection_stale
                 .lock()
                 .unwrap()
-                .contains("alice"),
+                .contains_key("alice"),
             "create refreshes only its returned row and must preserve a pre-existing full-list rebuild obligation"
         );
         assert!(
@@ -9054,7 +9054,7 @@ fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
         !app.chat_list_projection_stale
             .lock()
             .unwrap()
-            .contains(&alice.label)
+            .contains_key(&alice.label)
     );
 }
 

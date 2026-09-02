@@ -606,7 +606,10 @@ pub struct MarmotApp {
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
-    chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
+    /// Per account label, the group ids whose chat-list row must be refreshed
+    /// before the next `chat_list()` answers. A single received message used
+    /// to mark the whole projection stale and rebuild every row.
+    chat_list_projection_stale: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
@@ -1454,7 +1457,7 @@ impl MarmotApp {
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
-            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::new(Mutex::new(HashMap::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -1528,7 +1531,7 @@ impl MarmotApp {
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
-            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::new(Mutex::new(HashMap::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -3369,13 +3372,24 @@ impl MarmotApp {
     pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
         self.ensure_account_state(label)?;
         let mut groups = self.load_state(label)?.groups;
-        // `leave_requested_at_ms` is not part of the stored projection, so stamp
-        // it from the engine-owned leave-request table here. This is the single
-        // population point for the group record: `visible_groups`, `group`, and
-        // `subscribe_chats` all read through this method.
+        self.stamp_group_lifecycle(label, &mut groups)?;
+        Ok(groups)
+    }
+
+    /// Fill the engine-owned lifecycle fields the stored projection does not
+    /// carry. `leave_requested_at_ms` comes from the leave-request table
+    /// because the engine clears those rows from paths that never notify the
+    /// app layer; the disband fields likewise read the engine's tables. This
+    /// is the single population point for the group record: `visible_groups`,
+    /// `group`, and `subscribe_chats` all read through it.
+    fn stamp_group_lifecycle(
+        &self,
+        label: &str,
+        groups: &mut [AppGroupRecord],
+    ) -> Result<(), AppError> {
         let pending = self.pending_leave_requests(label)?;
         if !pending.is_empty() {
-            for group in &mut groups {
+            for group in groups.iter_mut() {
                 group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
             }
         }
@@ -3387,12 +3401,12 @@ impl MarmotApp {
             .into_iter()
             .map(|(group_id, _)| hex::encode(group_id.as_slice()))
             .collect::<HashSet<_>>();
-        for group in &mut groups {
+        for group in groups.iter_mut() {
             group.disbanding = disbanding.contains(&group.group_id_hex);
             group.disband_request = requests.get(&group.group_id_hex).cloned().map(Into::into);
             group.disbanded = disbanded.contains(&group.group_id_hex);
         }
-        Ok(groups)
+        Ok(())
     }
 
     /// Outstanding durable leave requests for this account, keyed by group id hex
@@ -3471,15 +3485,25 @@ impl MarmotApp {
             .collect())
     }
 
+    /// One group by id. Reads that group's projection row alone rather than
+    /// the whole account projection (every group plus the seen-event window),
+    /// which is what opening a conversation used to cost.
     pub fn group(
         &self,
         label: &str,
         group_id_hex: &str,
     ) -> Result<Option<AppGroupRecord>, AppError> {
-        Ok(self
-            .groups(label)?
-            .into_iter()
-            .find(|group| group.group_id_hex == group_id_hex))
+        self.ensure_account_state(label)?;
+        let Some(stored) = self
+            .account_storage(label)?
+            .load_account_group(label, group_id_hex)?
+        else {
+            return Ok(None);
+        };
+        let mut group = [conversions::app_group_from_stored_group(stored)?];
+        self.stamp_group_lifecycle(label, &mut group)?;
+        let [group] = group;
+        Ok(Some(group))
     }
 
     pub fn set_group_archived(
@@ -4734,11 +4758,24 @@ impl MarmotApp {
                 MAX_SEEN_EVENT_IDS,
                 TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
             )?;
+        self.mark_chat_list_stale(
+            &state.label,
+            state
+                .groups
+                .iter()
+                .map(|group| group.group_id_hex.clone())
+                .collect(),
+        );
+        Ok(())
+    }
+
+    fn mark_chat_list_stale(&self, label: &str, group_ids_hex: HashSet<String>) {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(state.label.clone());
-        Ok(())
+            .entry(label.to_owned())
+            .or_default()
+            .extend(group_ids_hex);
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
@@ -4755,10 +4792,14 @@ impl MarmotApp {
                 frontiers_to_clear,
                 application_event_ids_to_ack,
             )?;
-        self.chat_list_projection_stale
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(delta.label.clone());
+        self.mark_chat_list_stale(
+            &delta.label,
+            delta
+                .groups
+                .iter()
+                .map(|group| group.group_id_hex.clone())
+                .collect(),
+        );
         Ok(())
     }
 
@@ -4771,10 +4812,12 @@ impl MarmotApp {
     ) -> Result<ChatListRow, AppError> {
         let account = self.account_home().account(&delta.label)?;
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
-        let has_other_dirty_groups = delta
+        let other_dirty_groups: HashSet<String> = delta
             .groups
             .iter()
-            .any(|group| group.group_id_hex != group_id_hex);
+            .filter(|group| group.group_id_hex != group_id_hex)
+            .map(|group| group.group_id_hex.clone())
+            .collect();
         let mut row = self
             .account_storage(&delta.label)?
             .save_account_projection_delta_and_refresh_chat_list_row(
@@ -4794,11 +4837,8 @@ impl MarmotApp {
         // pre-existing stale marker, and add one if this delta also persisted
         // another dirty group; a later full-list query performs that rebuild.
         // A single-row refresh does not prove the full projection is warmed.
-        if has_other_dirty_groups {
-            self.chat_list_projection_stale
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(delta.label.clone());
+        if !other_dirty_groups.is_empty() {
+            self.mark_chat_list_stale(&delta.label, other_dirty_groups);
         }
         Ok(row)
     }
@@ -4819,10 +4859,7 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
-        self.chat_list_projection_stale
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(label.to_owned());
+        self.mark_chat_list_stale(label, HashSet::from([normalized_group_id_hex]));
         self.chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4883,30 +4920,31 @@ impl MarmotApp {
             .chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&account.label);
+            .remove(&account.label);
         let warmed = self
             .chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(&account.label);
-        if warmed && !stale {
-            return Ok(());
-        }
         let storage = self.account_storage(&account.label)?;
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
-        if stale {
-            storage.refresh_chat_list_rows(&account.account_id_hex, &classifier)?;
-        } else {
-            storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?;
+        match stale {
+            None if warmed => return Ok(()),
+            Some(group_ids) if warmed => {
+                for group_id_hex in group_ids {
+                    storage.refresh_chat_list_row(
+                        &account.account_id_hex,
+                        &group_id_hex,
+                        &classifier,
+                    )?;
+                }
+            }
+            _ => storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?,
         }
         self.chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.label.clone());
-        self.chat_list_projection_stale
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&account.label);
         Ok(())
     }
 
