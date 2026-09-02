@@ -844,23 +844,56 @@ impl AppClient {
     /// superseded emitter skips accepted commits — so the single-pass shape is
     /// not what this guards.
     ///
-    /// Membership is the test rather than event order: a batch may carry the
-    /// withdrawal before or after the change it names, and neither ordering
-    /// makes the change canonical.
+    /// Ordering matters here in exactly one place. Whether a batch carries the
+    /// withdrawal before or after the `GroupStateChanged` it names is
+    /// irrelevant — neither ordering makes the change canonical, so membership
+    /// decides that pairing. But a withdrawal and a REVALIDATION of the *same*
+    /// commit are opposite verdicts on one question, and a multi-pass batch can
+    /// carry several: pass A re-adopts a parked commit (its `GroupStateChanged`
+    /// plus `GroupStateRevalidated`), pass B parks it again
+    /// (`GroupStateInvalidated`). Only the last one is the batch's answer.
+    ///
+    /// So the verdict is resolved per commit, in event order, and the row is
+    /// withheld iff that commit's final verdict is a withdrawal. Membership
+    /// alone would get this wrong in both directions: treating any revalidation
+    /// as exonerating synthesizes a live row for a commit the batch ends by
+    /// withdrawing (with no pre-existing row there is nothing for the dispatch
+    /// loop to tombstone, so the tail's INSERT is the last writer and the row
+    /// survives — issue #1593's exact shape), and treating any withdrawal as
+    /// damning withholds the row a re-adoption is entitled to, leaving nothing
+    /// for the revalidation to revive.
+    ///
+    /// This also keeps the tail consistent with the dispatch loop that ran just
+    /// before it, which applies the same events *in order* against storage. The
+    /// two must agree on which verdict is final or they fight over the row.
     pub(crate) fn project_group_system_rows(
         &self,
         events: &[cgka_traits::engine::GroupEvent],
         recorded_at: u64,
     ) -> Vec<crate::AppProjectionUpdate> {
-        let superseded_commits: std::collections::HashSet<&[u8]> = events
-            .iter()
-            .filter_map(|event| match event {
+        // Last verdict wins, per commit. `true` = withdrawn, `false` = revalidated.
+        let mut final_verdict: std::collections::HashMap<&[u8], bool> =
+            std::collections::HashMap::new();
+        for event in events {
+            match event {
                 cgka_traits::engine::GroupEvent::GroupStateInvalidated {
                     invalidated_commit_id,
                     ..
-                } => Some(invalidated_commit_id.as_slice()),
-                _ => None,
-            })
+                } => {
+                    final_verdict.insert(invalidated_commit_id.as_slice(), true);
+                }
+                cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+                    revalidated_commit_id,
+                    ..
+                } => {
+                    final_verdict.insert(revalidated_commit_id.as_slice(), false);
+                }
+                _ => {}
+            }
+        }
+        let superseded_commits: std::collections::HashSet<&[u8]> = final_verdict
+            .into_iter()
+            .filter_map(|(commit_id, withdrawn)| withdrawn.then_some(commit_id))
             .collect();
         let mut updates = Vec::new();
         for event in events {

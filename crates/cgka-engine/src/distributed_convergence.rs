@@ -21,11 +21,11 @@
 //! our active membership. Outbound intents purged at realization stay purged
 //! — the app re-issues sends against the reopened send gate.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::canonicalization::{
     CanonicalizationError, CanonicalizationPolicy, CanonicalizationResult, CanonicalizationState,
-    ConvergenceStatus, InvalidatedAppMessageReason,
+    ConvergenceStatus, InvalidatedAppMessageReason, MessageKind,
 };
 use crate::convergence_clock::ConvergenceTime;
 use crate::convergence_input::{
@@ -1423,6 +1423,7 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             Vec::new()
         };
+        let pre_apply_commit_states = self.pre_apply_commit_states(&result)?;
         let (observations, application_events) = self.storage.with_transaction(|storage| {
             let observations = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,
@@ -1530,8 +1531,12 @@ impl<S: StorageProvider> Engine<S> {
         self.events_buf.extend(application_events);
         self.emit_invalidated_app_events(group_id, &result)?;
         self.emit_rejected_proposal_convergence_audits(group_id, &result);
-        self.emit_rolled_back_commits(group_id, &result)?;
+        self.emit_rolled_back_commits(group_id, &result, &pre_apply_commit_states)?;
         self.emit_superseded_processed_commits(group_id, &result)?;
+        // Last, so the revival lands on rows the re-adopted commit's own
+        // `GroupStateChanged` re-record has already restored — the ordering
+        // `clear_local_publish_failure` needs for the same reason.
+        self.emit_revalidated_commits(group_id, &result, &pre_apply_commit_states)?;
 
         // A selected branch reached the canonical state (Settled): the run is
         // applied/stable. With no selected branch the pass simply settled with
@@ -1899,6 +1904,52 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// Stored `(state, epoch)` of every commit this pass is about to re-state,
+    /// read BEFORE the apply transaction overwrites it.
+    ///
+    /// `ConvergenceDeferred` has exactly one writer — a pass's own disposition
+    /// persistence — so it is the durable record of "a pass already parked this
+    /// commit". But that persistence runs inside the apply transaction, ahead
+    /// of every event emission, so by the time the withdrawal seam reads the
+    /// row it can no longer tell a commit this pass parked from one an earlier
+    /// pass parked and already announced. The pre-apply snapshot is where that
+    /// answer lives, and being durable state it survives the restart a
+    /// re-adoption days later depends on.
+    ///
+    /// Scoped to commits: proposals and application messages have their own
+    /// disposition seams and never carry a state-notification withdrawal.
+    fn pre_apply_commit_states(
+        &self,
+        result: &CanonicalizationResult,
+    ) -> Result<BTreeMap<String, (MessageState, EpochId)>, OpenMlsProjectionError> {
+        let deferred_commits = result
+            .deferred_messages
+            .iter()
+            .filter(|deferred| deferred.kind == MessageKind::Commit)
+            .map(|deferred| deferred.message_id.as_str());
+        let mut states = BTreeMap::new();
+        for message_id_hex in result
+            .accepted_commits
+            .iter()
+            .map(String::as_str)
+            .chain(deferred_commits)
+        {
+            let message_id = message_id_from_hex(message_id_hex)?;
+            match self.storage.get_message(&message_id) {
+                Ok(record) => {
+                    states.insert(message_id_hex.to_owned(), (record.state, record.epoch));
+                }
+                // No stored row: nothing was ever applied or parked under this
+                // id, so there is neither a withdrawal to suppress nor one to
+                // take back. Any other storage failure propagates — masking a
+                // locked or corrupt backend here would silently re-announce.
+                Err(StorageError::NotFound) => {}
+                Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
+            }
+        }
+        Ok(states)
+    }
+
     /// Emit a [`GroupEvent::CommitRolledBack`] for every commit that this
     /// convergence pass deferred because its still-eligible branch lost
     /// selection: a commit that was previously applied through stored
@@ -1913,15 +1964,60 @@ impl<S: StorageProvider> Engine<S> {
     /// attributed to the superseded commit (convergence.md "Applying the
     /// selected branch"). This covers the client's own published-and-confirmed
     /// commit when it loses branch selection.
+    ///
+    /// Announced at most once per parking. A parked commit stays a
+    /// canonicalization input, so every later pass re-states it until it is
+    /// adopted or retired; re-announcing an unchanged withdrawal costs the app
+    /// a storage round trip per pass and makes announcement history unusable as
+    /// evidence of what was actually withdrawn. `pre_apply_states` says which
+    /// side of that line a commit is on — see
+    /// [`Self::emit_revalidated_commits`] for the other end of the lifecycle.
     fn emit_rolled_back_commits(
         &mut self,
         group_id: &GroupId,
         result: &CanonicalizationResult,
+        pre_apply_states: &BTreeMap<String, (MessageState, EpochId)>,
     ) -> Result<(), OpenMlsProjectionError> {
         for deferred in &result.deferred_messages {
-            if deferred.kind != crate::canonicalization::MessageKind::Commit {
+            if deferred.kind != MessageKind::Commit {
                 continue;
             }
+            let pre_apply = pre_apply_states.get(&deferred.message_id).copied();
+            // An earlier pass parked this commit and announced its withdrawal
+            // then. Nothing about that withdrawal changed by parking again.
+            if matches!(pre_apply, Some((MessageState::ConvergenceDeferred, _))) {
+                continue;
+            }
+            // `NonSelectedEligibleBranch` is the only deferral that means
+            // "branch selection put this commit on the losing side", which is
+            // the one thing a withdrawal is entitled to say. On the production
+            // path a stored commit reaches it through
+            // `classify_losing_materialized_candidate_commits`, which early
+            // returns unless a branch was actually selected.
+            //
+            // The other commit deferral, `MissingCandidateParent`, cannot mean
+            // that, and the reason is a state invariant rather than a judgement
+            // call. Production emits it from
+            // `append_missing_parent_deferred_commits`, over the stored commits
+            // the candidate-path BFS could not materialize; that set is filtered
+            // by `unresolved_commit_state`, which admits `Sent`, `Created`,
+            // `Retryable`, and `ConvergenceDeferred` and excludes `Processed`.
+            // So a `MissingCandidateParent` deferral can never name a commit
+            // this device previously applied — the commit has no applied
+            // notifications to withdraw, and widening this filter to it would
+            // reach nothing but rows that were never live.
+            //
+            // That invariant is what the branch's two state-derived reconcilers
+            // rest on. The only route from `Processed` to `ConvergenceDeferred`
+            // is losing to a *selected* branch, so a parked commit that was once
+            // applied is always a genuine branch-selection withdrawal whatever
+            // the pass recorded as its reason. Reason-agnostic repair is
+            // therefore sound, and it is how the residue is covered:
+            // `SqliteAccountStorage::diverged_branch_selection_withdrawals`
+            // reconciles any parked commit whose rows are still live at the next
+            // account open, and `mark_evolution_superseded`'s state-derived
+            // caller does the same for the maintenance record behind it. Neither
+            // needs a speculative arm here.
             if deferred.reason
                 != crate::canonicalization::DeferredMessageReason::NonSelectedEligibleBranch
             {
@@ -1931,16 +2027,11 @@ impl<S: StorageProvider> Engine<S> {
             // The stored record's epoch is the commit's source epoch (the fork
             // it lost). A missing record falls back to the selected branch's
             // fork epoch — the id-matched withdrawal is what conformance
-            // requires; the epoch is presentation metadata. Any other storage
-            // failure propagates: masking a locked/corrupt backend here would
-            // emit a fabricated epoch and hide the failure from the caller.
-            let epoch = match self.storage.get_message(&invalidated_commit_id) {
-                Ok(record) => record.epoch,
-                Err(StorageError::NotFound) => {
-                    EpochId(result.selected_fork_epoch.unwrap_or(result.previous_tip))
-                }
-                Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
-            };
+            // requires; the epoch is presentation metadata.
+            let epoch = pre_apply.map_or_else(
+                || EpochId(result.selected_fork_epoch.unwrap_or(result.previous_tip)),
+                |(_, epoch)| epoch,
+            );
             self.events_buf.push_back(GroupEvent::CommitRolledBack {
                 group_id: group_id.clone(),
                 invalidated_commit_id: invalidated_commit_id.clone(),
@@ -1951,6 +2042,48 @@ impl<S: StorageProvider> Engine<S> {
                     epoch,
                     invalidated_commit_id,
                     reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+                });
+        }
+        Ok(())
+    }
+
+    /// Take back the withdrawal announced for a commit branch selection has
+    /// since RE-ADOPTED.
+    ///
+    /// A branch-selection withdrawal is provisional on the engine's side: the
+    /// pass parks the loser `ConvergenceDeferred`, still a canonicalization
+    /// input, precisely so a later pass holding deeper evidence can put it back
+    /// on the selected branch. On the app's side it is terminal — since #1608
+    /// the `app_events` upsert never revives a tombstone, because re-recording
+    /// the same row is not evidence that the withdrawal was reversed. So the
+    /// reversal has to arrive as its own explicit signal, or the re-adopted
+    /// commit's system rows stay dead under a branch decision that no longer
+    /// holds.
+    ///
+    /// An accepted commit whose pre-apply state was `ConvergenceDeferred` is
+    /// exactly that reversal. The signal is deliberately not narrowed further
+    /// to commits a withdrawal was actually announced for: revalidating a
+    /// commit that never had one is a scoped no-op on the app side (nothing
+    /// carries its `origin_commit_id` as a branch-selection tombstone), and
+    /// that is cheaper than a second durable mark that would have to agree with
+    /// this state for the life of the row.
+    fn emit_revalidated_commits(
+        &mut self,
+        group_id: &GroupId,
+        result: &CanonicalizationResult,
+        pre_apply_states: &BTreeMap<String, (MessageState, EpochId)>,
+    ) -> Result<(), OpenMlsProjectionError> {
+        for accepted in &result.accepted_commits {
+            let Some((MessageState::ConvergenceDeferred, epoch)) =
+                pre_apply_states.get(accepted).copied()
+            else {
+                continue;
+            };
+            self.events_buf
+                .push_back(GroupEvent::GroupStateRevalidated {
+                    group_id: group_id.clone(),
+                    epoch,
+                    revalidated_commit_id: message_id_from_hex(accepted)?,
                 });
         }
         Ok(())

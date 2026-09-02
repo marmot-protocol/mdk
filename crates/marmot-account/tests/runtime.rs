@@ -4111,3 +4111,482 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
         "the rotation the rejected publication owed must end up satisfied"
     );
 }
+
+type SelfUpdateRuntime =
+    AccountDeviceRuntime<RecordingAdapter, StaticTransportRouting, RecordingKeyPackages>;
+
+/// Stage a self-update whose exact commit is durably published-but-unconfirmed:
+/// the obligation sits in `PendingPublication`, the evolution is non-terminal,
+/// and the commit has not merged, so the local leaf still matches the
+/// evolution's `own_leaf_before_hash`.
+async fn staged_self_update_awaiting_publication(
+    database: std::path::PathBuf,
+    key: &SqlCipherKey,
+    adapter: RecordingAdapter,
+    wall: Arc<TestWallClock>,
+    monotonic: Arc<TestMonotonicClock>,
+) -> (SelfUpdateRuntime, GroupId, MessageId) {
+    let mut initial = current_session(database.clone(), key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "crash-lost withdrawal".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    drop(initial);
+
+    // The publish attempt errors after the bytes crossed the adapter boundary,
+    // so exposure cannot be disproved and the exact event is retained instead of
+    // rolled back. That is what leaves a live, non-terminal evolution behind.
+    adapter.error_next();
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, key, b"alice"),
+        adapter,
+        self_update_routing(&group_id),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(wall.now().0.saturating_add(60));
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::PendingPublication
+    );
+    (runtime, group_id, obligation_id)
+}
+
+fn self_update_routing(group_id: &GroupId) -> StaticTransportRouting {
+    StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://group.example".into())],
+        )
+}
+
+fn sole_evolution(
+    runtime: &SelfUpdateRuntime,
+    group_id: &GroupId,
+) -> cgka_traits::maintenance::DurableGroupEvolution {
+    let mut evolutions = runtime
+        .session()
+        .group_evolutions_for_group(group_id)
+        .unwrap();
+    assert_eq!(
+        evolutions.len(),
+        1,
+        "the harness stages exactly one evolution"
+    );
+    evolutions.remove(0)
+}
+
+// A convergence pass commits a superseded commit's disposition inside its apply
+// transaction, and only afterwards does the account layer publish the pass's
+// outbound work and reconcile `GroupStateInvalidated`. Engine events are
+// in-memory, so a crash — or any error — in that window drops the announcement,
+// and announce-once means no later pass repeats it. Without a state-derived
+// repair the evolution stays non-terminal forever and `run_due_maintenance`
+// keeps acting on a commit convergence already withdrew.
+//
+// The headline shape, and the costliest one. The publish acknowledgement already
+// promoted this evolution to `Confirmed` and merged its commit `Processed`, so
+// the obligation behind it is one `run_due_maintenance` away from completing
+// outright. Convergence then parks that commit off the selected branch and rolls
+// this device back onto the branch that won, which did not touch its leaf: after
+// the rollback `own_leaf_hash` reads exactly the evolution's
+// `own_leaf_before_hash` again, the same relation the staged harness holds
+// pre-merge. Lose the announcement there and the obligation completes off a
+// rotation convergence took back, dropping the leaf rotation it owed and
+// rescheduling `next_periodic_rotation_at` from a leaf that never changed.
+#[tokio::test]
+async fn maintenance_supersedes_an_evolution_whose_withdrawal_announcement_was_lost() {
+    use cgka_traits::MessageStorage;
+    use cgka_traits::maintenance::GroupEvolutionPhase;
+    use storage_sqlite::SqliteAccountStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot crash-lost withdrawal key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let (runtime, group_id, obligation_id) = staged_self_update_awaiting_publication(
+        database.clone(),
+        &key,
+        adapter.clone(),
+        wall.clone(),
+        monotonic.clone(),
+    )
+    .await;
+
+    let mut evolution = sole_evolution(&runtime, &group_id);
+    assert_ne!(
+        evolution.phase,
+        GroupEvolutionPhase::SupersededByConvergence
+    );
+    let commit_id = evolution.signed_message_id.clone().unwrap();
+    // The publish acknowledgement that promotes the evolution is durable; the
+    // obligation loop that would have settled the obligation behind it is not.
+    // That is the record pair a process death between the two leaves.
+    evolution.phase = GroupEvolutionPhase::Confirmed;
+    runtime.session().put_group_evolution(&evolution).unwrap();
+    assert_eq!(
+        runtime.session().own_leaf_hash(&group_id).unwrap(),
+        evolution.own_leaf_before_hash.clone().unwrap(),
+        "the rollback onto the winning branch leaves this device's leaf exactly \
+         where the evolution found it, so nothing satisfied the rotation"
+    );
+    drop(runtime);
+
+    // The pass's apply transaction parked the commit off the selected branch and
+    // committed. The `GroupStateInvalidated` it emitted was never consumed.
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        storage
+            .update_message_state(&commit_id, cgka_traits::MessageState::ConvergenceDeferred)
+            .unwrap();
+    }
+
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        self_update_routing(&group_id),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        sole_evolution(&runtime, &group_id).phase,
+        GroupEvolutionPhase::SupersededByConvergence,
+        "a maintenance run must re-derive the supersession from the stored disposition"
+    );
+    let rearmed = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        rearmed.phase,
+        cgka_traits::MaintenancePhase::Complete,
+        "the obligation must not complete off a rotation convergence took back"
+    );
+    assert_eq!(
+        rearmed.phase,
+        cgka_traits::MaintenancePhase::Quiet,
+        "the rotation the withdrawn commit owed must be re-armed, not settled by it"
+    );
+    assert_eq!(rearmed.semantic_rearm_count, 1);
+    assert_eq!(
+        rearmed.last_failure_code.as_deref(),
+        Some("superseded_by_convergence"),
+        "the repair must settle the obligation exactly as the event path does"
+    );
+
+    // Fixed point: a second run has nothing left to disagree about.
+    let publishes_before = adapter.publishes().len();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        sole_evolution(&runtime, &group_id).phase,
+        GroupEvolutionPhase::SupersededByConvergence
+    );
+    let settled = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.semantic_rearm_count, 1,
+        "re-running the repair must not re-arm an obligation it already settled"
+    );
+    assert_eq!(settled.phase, cgka_traits::MaintenancePhase::Quiet);
+    assert_eq!(
+        adapter.publishes().len(),
+        publishes_before,
+        "a withdrawn commit must not be republished by the obligation behind it"
+    );
+}
+
+// The mirror case, and the one that keeps the repair from being a blanket
+// retirement: a commit whose stored disposition is not a withdrawal is still on
+// the selected branch (or still in flight), so its evolution must be left alone
+// and its obligation must keep driving the exact-event retry.
+#[tokio::test]
+async fn maintenance_leaves_an_evolution_alone_while_its_commit_is_still_live() {
+    use cgka_traits::maintenance::GroupEvolutionPhase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot live commit evolution key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let (mut runtime, group_id, obligation_id) = staged_self_update_awaiting_publication(
+        database,
+        &key,
+        adapter.clone(),
+        wall.clone(),
+        monotonic.clone(),
+    )
+    .await;
+
+    let before = sole_evolution(&runtime, &group_id);
+    assert_ne!(before.phase, GroupEvolutionPhase::SupersededByConvergence);
+
+    // No convergence pass withdrew anything, so the durable disposition still
+    // says the commit is live and the retry past the backoff lands it.
+    wall.set(wall.now().0.saturating_add(30));
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        sole_evolution(&runtime, &group_id).phase,
+        GroupEvolutionPhase::Confirmed,
+        "a live commit's evolution must reach Confirmed, not be retired by the state-derived sweep"
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .semantic_rearm_count,
+        0,
+        "nothing superseded this obligation, so it must not be re-armed"
+    );
+}
+
+// The other `run_due_maintenance` hazard behind the same repair: an evolution
+// still in flight, whose obligation would otherwise keep republishing the exact
+// commit convergence withdrew.
+//
+// The storage pairing staged here is synthetic, and says so: an `Attempting`
+// evolution whose commit is still `Sent`. A real pass cannot park a `Sent` own
+// commit — that state means a publish is outstanding, and a convergence pass
+// only opens while the epoch is stable — so production reaches this arm one
+// publish resolution later, with a `Prepared`/`Attempting` evolution whose
+// commit has since been parked. What the case pins is the code path, not the
+// pairing: the repair keys on the stored disposition alone, so an in-flight
+// evolution is retired and its obligation re-armed exactly as a confirmed one
+// is, and the commit is not republished.
+#[tokio::test]
+async fn maintenance_supersedes_an_in_flight_evolution_whose_commit_reads_parked() {
+    use cgka_traits::MessageStorage;
+    use cgka_traits::maintenance::GroupEvolutionPhase;
+    use storage_sqlite::SqliteAccountStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot in-flight withdrawal key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let (runtime, group_id, obligation_id) = staged_self_update_awaiting_publication(
+        database.clone(),
+        &key,
+        adapter.clone(),
+        wall.clone(),
+        monotonic.clone(),
+    )
+    .await;
+
+    let evolution = sole_evolution(&runtime, &group_id);
+    assert_ne!(
+        evolution.phase,
+        GroupEvolutionPhase::SupersededByConvergence
+    );
+    let commit_id = evolution.signed_message_id.clone().unwrap();
+    drop(runtime);
+
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        storage
+            .update_message_state(&commit_id, cgka_traits::MessageState::ConvergenceDeferred)
+            .unwrap();
+    }
+
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        self_update_routing(&group_id),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let publishes_before = adapter.publishes().len();
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        sole_evolution(&runtime, &group_id).phase,
+        GroupEvolutionPhase::SupersededByConvergence,
+        "an in-flight evolution behind a parked commit must be retired too"
+    );
+    let rearmed = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rearmed.phase, cgka_traits::MaintenancePhase::Quiet);
+    assert_eq!(rearmed.semantic_rearm_count, 1);
+    assert_eq!(
+        adapter.publishes().len(),
+        publishes_before,
+        "the withdrawn commit must not be republished by the obligation behind it"
+    );
+}
+
+// `reconcile_confirmed_own_leaf_rotations` fails every live obligation in a
+// group whose epoch change shows this device is no longer a member, stamping
+// `local_member_removed`. That verdict is terminal by construction: there is no
+// local leaf left to rotate, so no self-update can ever satisfy the obligation.
+//
+// The evolution behind it is still non-terminal, and its commit can perfectly
+// well read `ConvergenceDeferred` — the fork that removed this device is exactly
+// the kind of adjudication that parks its commits. So the state-derived sweep
+// reaches the same obligation, and without a terminal guard
+// `mark_evolution_superseded` flips it `Failed` -> `Quiet`. `run_due_maintenance`
+// then attempts a `SelfUpdate` in a group this device has left, once per tick
+// forever — and invisibly, because `MaintenanceRunSummary.failures` counts only
+// obligations sitting in `Failed`.
+#[tokio::test]
+async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
+    use cgka_traits::MessageStorage;
+    use cgka_traits::maintenance::GroupEvolutionPhase;
+    use storage_sqlite::SqliteAccountStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot failed obligation key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let adapter = RecordingAdapter::default();
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let (runtime, group_id, obligation_id) = staged_self_update_awaiting_publication(
+        database.clone(),
+        &key,
+        adapter.clone(),
+        wall.clone(),
+        monotonic.clone(),
+    )
+    .await;
+
+    let evolution = sole_evolution(&runtime, &group_id);
+    assert_ne!(
+        evolution.phase,
+        GroupEvolutionPhase::SupersededByConvergence
+    );
+    let commit_id = evolution.signed_message_id.clone().unwrap();
+
+    // The fork removed this device, so the leaf-rotation reconciler failed the
+    // obligation terminally.
+    let mut failed = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    failed.phase = cgka_traits::MaintenancePhase::Failed;
+    failed.last_failure_code = Some("local_member_removed".into());
+    runtime
+        .session()
+        .put_maintenance_obligation(&failed)
+        .unwrap();
+    drop(runtime);
+
+    // ... and the same pass parked the commit behind it, with the
+    // `GroupStateInvalidated` never consumed.
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        storage
+            .update_message_state(&commit_id, cgka_traits::MessageState::ConvergenceDeferred)
+            .unwrap();
+    }
+
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        self_update_routing(&group_id),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let publishes_before = adapter.publishes().len();
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(
+        sole_evolution(&runtime, &group_id).phase,
+        GroupEvolutionPhase::SupersededByConvergence,
+        "the evolution is still retired: the commit behind it really was withdrawn"
+    );
+    let settled = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.phase,
+        cgka_traits::MaintenancePhase::Failed,
+        "a terminally failed obligation must not be re-armed by a supersession"
+    );
+    assert_eq!(
+        settled.last_failure_code.as_deref(),
+        Some("local_member_removed"),
+        "the terminal verdict must keep naming why it is terminal"
+    );
+    assert_eq!(
+        settled.semantic_rearm_count, 0,
+        "nothing re-armed, so nothing counted a semantic re-arm"
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Failed
+    );
+    assert_eq!(
+        adapter.publishes().len(),
+        publishes_before,
+        "no self-update may be attempted in a group this device has left"
+    );
+}

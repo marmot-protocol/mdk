@@ -551,6 +551,32 @@ pub enum GroupEvent {
         invalidated_commit_id: MessageId,
         reason: GroupStateInvalidationReason,
     },
+    /// The exact inverse of [`GroupEvent::GroupStateInvalidated`]: a commit
+    /// whose state notifications were withdrawn by
+    /// [`GroupStateInvalidationReason::SupersededByBranchSelection`] is back on
+    /// the selected branch, so those notifications describe canonical history
+    /// again and the application MUST restore them.
+    ///
+    /// A branch-selection withdrawal is not terminal, because the state it
+    /// reports on is not: convergence parks a losing commit *reconsiderable*
+    /// (`MessageState::ConvergenceDeferred`), and a later pass holding deeper
+    /// evidence can re-adopt it. Without this event the application's
+    /// withdrawal is permanent while the engine's is not, and the re-adopted
+    /// commit's system rows stay tombstoned under a branch decision that has
+    /// since been reversed.
+    ///
+    /// Scope: this revives only what `SupersededByBranchSelection` withdrew.
+    /// Every other withdrawal reason stays terminal.
+    GroupStateRevalidated {
+        group_id: GroupId,
+        /// Epoch the re-adopted commit branched from — the same value its
+        /// withdrawal carried.
+        epoch: EpochId,
+        /// Transport-layer `MessageId` of the re-adopted commit, in the same
+        /// identifier space as `invalidated_commit_id` and the
+        /// `origin_commit_id` stamped on [`GroupEvent::GroupStateChanged`].
+        revalidated_commit_id: MessageId,
+    },
     /// The group entered the `Unrecoverable` state: convergence reported a
     /// `MissingRetainedAnchor` inside the rollback horizon, so the client
     /// stopped applying group-state changes and now needs a verified repair

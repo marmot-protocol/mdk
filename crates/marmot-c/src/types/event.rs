@@ -60,6 +60,13 @@ pub enum MarmotGroupEventKind {
         invalidated_commit_id_hex: *mut c_char,
         reason: *mut c_char,
     },
+    /// Takes a `GroupStateInvalidated` withdrawal back: a later convergence
+    /// pass re-adopted the commit, so every notification it produced describes
+    /// canonical history again.
+    GroupStateRevalidated {
+        epoch: u64,
+        revalidated_commit_id_hex: *mut c_char,
+    },
     GroupUnrecoverable,
     PendingCommitRecovered {
         recovered_epoch: u64,
@@ -135,6 +142,13 @@ impl From<GroupEventKindFfi> for MarmotGroupEventKind {
                 invalidated_commit_id_hex: owned_c_string(invalidated_commit_id_hex),
                 reason: owned_c_string(reason),
             },
+            F::GroupStateRevalidated {
+                epoch,
+                revalidated_commit_id_hex,
+            } => Self::GroupStateRevalidated {
+                epoch,
+                revalidated_commit_id_hex: owned_c_string(revalidated_commit_id_hex),
+            },
             F::GroupUnrecoverable => Self::GroupUnrecoverable,
             F::PendingCommitRecovered { recovered_epoch } => {
                 Self::PendingCommitRecovered { recovered_epoch }
@@ -202,6 +216,10 @@ impl CFree for MarmotGroupEventKind {
                     free_c_string(*invalidated_commit_id_hex);
                     free_c_string(*reason);
                 }
+                Self::GroupStateRevalidated {
+                    revalidated_commit_id_hex,
+                    ..
+                } => free_c_string(*revalidated_commit_id_hex),
             }
         }
     }

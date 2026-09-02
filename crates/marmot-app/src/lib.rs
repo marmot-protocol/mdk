@@ -1743,6 +1743,11 @@ impl MarmotApp {
         // runs on deferred opens too — and it must, because it is now the sole
         // reconciler for a disband whose live projection never completed.
         client.sweep_terminal_groups_from_guards();
+        // Same durable-input rule as the terminal sweep: this reads stored
+        // commit dispositions and stored tombstones, never live group state, so
+        // it repairs a crash-lost branch-selection announcement on every open,
+        // deferred ones included.
+        client.reconcile_branch_selection_withdrawals();
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.
@@ -5339,6 +5344,30 @@ impl MarmotApp {
             .transpose()
     }
 
+    /// Restore every synthesized group system row a branch-selection withdrawal
+    /// tombstoned, after convergence re-adopted the commit that produced them.
+    ///
+    /// The inverse of [`Self::invalidate_timeline_origin_commit`], and scoped
+    /// the same way `clear_timeline_local_publish_failure` is: only the one
+    /// reason whose decision a later convergence pass can reverse is cleared,
+    /// and only for the named commit. The engine's
+    /// [`GroupEvent::GroupStateRevalidated`] is the evidence — re-recording the
+    /// rows is not, which is why the upsert keeps them tombstoned.
+    ///
+    /// [`GroupEvent::GroupStateRevalidated`]: cgka_traits::engine::GroupEvent::GroupStateRevalidated
+    pub(crate) fn revalidate_timeline_origin_commit(
+        &self,
+        label: &str,
+        origin_commit_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .clear_branch_selection_withdrawal_by_origin_commit(origin_commit_id_hex)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
     /// Withdraw every accepted-but-unpublished send in a group whose outbound
     /// queue the engine has permanently discarded.
     ///
@@ -5382,6 +5411,11 @@ impl MarmotApp {
     ///   pairs this event with the commit-rollback seam (`CommitRolledBack`),
     ///   so that commit-level event intentionally does NOT dispatch here: one
     ///   rollback must tombstone once, with one reason.
+    /// - [`GroupEvent::GroupStateRevalidated`] takes that withdrawal back when
+    ///   a later convergence pass re-adopts the commit. Storage-side
+    ///   invalidation is terminal by default (#1608), so this explicitly
+    ///   evidenced path is the only one that revives a branch-selection
+    ///   tombstone.
     ///
     /// Every other event carries no timeline invalidation and returns `None`.
     pub(crate) fn projection_update_for_invalidation_event(
@@ -5405,6 +5439,13 @@ impl MarmotApp {
                 label,
                 &hex::encode(invalidated_commit_id.as_slice()),
                 &format!("{reason:?}"),
+            ),
+            cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+                revalidated_commit_id,
+                ..
+            } => self.revalidate_timeline_origin_commit(
+                label,
+                &hex::encode(revalidated_commit_id.as_slice()),
             ),
             _ => Ok(None),
         }

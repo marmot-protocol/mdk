@@ -750,6 +750,14 @@ fn snapshot_group_events() {
         }
     );
     insta::assert_json_snapshot!(
+        "event_group_state_revalidated",
+        GroupEvent::GroupStateRevalidated {
+            group_id: gid(),
+            epoch: EpochId(1),
+            revalidated_commit_id: mid(),
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_pending_commit_recovered",
         GroupEvent::PendingCommitRecovered {
             group_id: gid(),

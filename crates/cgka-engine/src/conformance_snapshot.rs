@@ -798,6 +798,7 @@ fn event_group_id(event: &cgka_traits::engine::GroupEvent) -> &GroupId {
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupStateInvalidated { group_id, .. }
+        | GroupEvent::GroupStateRevalidated { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
         | GroupEvent::GroupHydrationRecovered { group_id, .. } => group_id,

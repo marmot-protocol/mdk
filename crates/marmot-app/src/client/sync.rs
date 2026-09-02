@@ -2529,6 +2529,114 @@ impl AppClient {
         }
     }
 
+    /// Reconcile branch-selection tombstones against the engine's own commit
+    /// dispositions, once per account open.
+    ///
+    /// Same shape, and the same reason, as
+    /// [`Self::sweep_terminal_groups_from_guards`]: the engine announces a
+    /// branch-selection withdrawal exactly once (on the transition into
+    /// `ConvergenceDeferred`) and takes it back exactly once (on re-adoption),
+    /// but those announcements travel in the engine's in-memory `events_buf`.
+    /// A process death between the convergence apply transaction — which is
+    /// where the disposition becomes durable — and this app's projection commit
+    /// loses the announcement, and announce-once means no later pass re-derives
+    /// it. Before announce-once every later pass re-announced and the
+    /// already-invalidated filter turned the repeat into a no-op, which made the
+    /// old seam accidentally self-healing; this is the deliberate replacement.
+    ///
+    /// It can be a total reconciliation rather than a durable queue because both
+    /// sides live in the same account database, so the correct tombstone state
+    /// is *derivable*, never information the app can lose: a commit parked
+    /// `ConvergenceDeferred` owes its rows a withdrawal, and a commit back at
+    /// `Processed` owes them a revival. `diverged_branch_selection_withdrawals`
+    /// reports only the commits where the two disagree, so a converged account
+    /// performs no writes at all.
+    ///
+    /// Reads no live group state, only durable rows, so — like the terminal
+    /// sweep — it runs on deferred opens too. Best-effort per commit: one
+    /// failure must not fail account open, and the next open retries it.
+    pub(crate) fn reconcile_branch_selection_withdrawals(&mut self) {
+        let divergence = match self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| Ok(storage.diverged_branch_selection_withdrawals()?))
+        {
+            Ok(divergence) => divergence,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::branch_selection_sweep",
+                    method = "reconcile_branch_selection_withdrawals",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not enumerate branch-selection divergences; skipping the open-time sweep"
+                );
+                return;
+            }
+        };
+        if divergence.is_empty() {
+            return;
+        }
+        let mut withdrawn = 0_u64;
+        let mut revived = 0_u64;
+        let mut failed = 0_u64;
+        let mut first_error_kind: Option<&'static str> = None;
+        for origin_commit_id in &divergence.to_withdraw {
+            match self.app.invalidate_timeline_origin_commit(
+                &self.state.label,
+                origin_commit_id,
+                storage_sqlite::BRANCH_SELECTION_WITHDRAWAL_REASON,
+            ) {
+                Ok(Some(update)) => {
+                    withdrawn = withdrawn.saturating_add(1);
+                    self.pending_projection_updates.push(update);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    first_error_kind.get_or_insert(error.privacy_safe_kind());
+                }
+            }
+        }
+        for origin_commit_id in &divergence.to_revive {
+            match self
+                .app
+                .revalidate_timeline_origin_commit(&self.state.label, origin_commit_id)
+            {
+                Ok(Some(update)) => {
+                    revived = revived.saturating_add(1);
+                    self.pending_projection_updates.push(update);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    first_error_kind.get_or_insert(error.privacy_safe_kind());
+                }
+            }
+        }
+        tracing::debug!(
+            target: "marmot_app::branch_selection_sweep",
+            method = "reconcile_branch_selection_withdrawals",
+            withdrawn,
+            revived,
+            failed,
+            "reconciled branch-selection withdrawals against stored commit dispositions"
+        );
+        // A partial sweep leaves real divergence standing — a live row for a
+        // parked commit, or a tombstone over a re-adopted one — and nothing
+        // else notices until the next account open re-derives it. Say so above
+        // debug, with the first kind observed so the failure has a shape.
+        if failed > 0 {
+            tracing::warn!(
+                target: "marmot_app::branch_selection_sweep",
+                method = "reconcile_branch_selection_withdrawals",
+                withdrawn,
+                revived,
+                failed,
+                error_kind = first_error_kind.unwrap_or("unknown"),
+                "some branch-selection divergences stayed unreconciled; the next account open retries them"
+            );
+        }
+    }
+
     /// Reconcile every terminal group's durable projection from the guard rows
     /// themselves, once per account open.
     ///
@@ -2572,6 +2680,7 @@ impl AppClient {
         let guard_count = guards.len();
         let mut reconciled = 0_u64;
         let mut failed = 0_u64;
+        let mut first_error_kind: Option<&'static str> = None;
         for (group_id, _) in guards {
             let group_id_hex = hex::encode(group_id.as_slice());
             match self
@@ -2583,16 +2692,19 @@ impl AppClient {
                     self.pending_projection_updates.push(update);
                 }
                 Ok(None) => {}
-                Err(_) => failed = failed.saturating_add(1),
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    first_error_kind.get_or_insert(error.privacy_safe_kind());
+                }
             }
             // A terminal group never advertises notification destinations
             // again, so every cached peer token is stale by definition.
-            if self
-                .app
-                .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[])
-                .is_err()
+            if let Err(error) =
+                self.app
+                    .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[])
             {
                 failed = failed.saturating_add(1);
+                first_error_kind.get_or_insert(error.privacy_safe_kind());
             }
         }
         if reconciled > 0 || failed > 0 {
@@ -2603,6 +2715,20 @@ impl AppClient {
                 reconciled,
                 failed,
                 "reconciled terminal group projections from durable guards"
+            );
+        }
+        // Same reasoning as the branch-selection sweep: a guard this open could
+        // not reconcile leaves a terminal group's held sends stuck at
+        // "Sending…", and only the next open retries it.
+        if failed > 0 {
+            tracing::warn!(
+                target: "marmot_app::terminal_sweep",
+                method = "sweep_terminal_groups_from_guards",
+                terminal_groups = guard_count,
+                reconciled,
+                failed,
+                error_kind = first_error_kind.unwrap_or("unknown"),
+                "some terminal group projections stayed unreconciled; the next account open retries them"
             );
         }
     }

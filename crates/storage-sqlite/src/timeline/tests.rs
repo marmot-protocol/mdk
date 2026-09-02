@@ -622,6 +622,307 @@ fn rerecording_an_origin_commit_invalidated_row_keeps_its_tombstone() {
 }
 
 #[test]
+fn revalidating_an_origin_commit_revives_only_branch_selection_withdrawals() {
+    // A convergence pass parks a losing commit and the app tombstones every
+    // kind-1210 row it synthesized. A later pass holding deeper evidence
+    // re-adopts that commit, so those rows describe canonical history again and
+    // the revalidation must bring all of them back — while leaving rows another
+    // commit owns, and rows withdrawn for a reason convergence cannot reverse,
+    // exactly where they are.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (id, system_type, at, commit) in [
+        ("parked-added", "member_added", 10, "commit-parked"),
+        ("parked-admin", "admin_added", 11, "commit-parked"),
+        ("other-added", "member_added", 12, "commit-other"),
+    ] {
+        store
+            .record_app_event(&group_system_from_commit(id, system_type, at, commit))
+            .unwrap();
+    }
+    store
+        .invalidate_app_events_by_origin_commit("commit-parked", BRANCH_SELECTION_WITHDRAWAL_REASON)
+        .unwrap()
+        .expect("the park must tombstone both rows");
+    store
+        .invalidate_app_events_by_origin_commit("commit-other", "LosingBranch")
+        .unwrap()
+        .expect("the other commit's row is withdrawn terminally");
+
+    // A SECOND branch-selection tombstone, under a DIFFERENT origin commit.
+    // Only the reason predicate separates this row from the parked commit's
+    // rows, so without the `origin_commit_id` conjunct the revalidation below
+    // would revive it too — which is the whole account's withdrawal history
+    // being cleared by one unrelated re-adoption.
+    store
+        .record_app_event(&group_system_from_commit(
+            "sibling-added",
+            "member_added",
+            13,
+            "commit-sibling",
+        ))
+        .unwrap();
+    store
+        .invalidate_app_events_by_origin_commit(
+            "commit-sibling",
+            BRANCH_SELECTION_WITHDRAWAL_REASON,
+        )
+        .unwrap()
+        .expect("a second commit is parked under the same reason");
+
+    let update = store
+        .clear_branch_selection_withdrawal_by_origin_commit("commit-parked")
+        .unwrap()
+        .expect("re-adoption must project an update");
+
+    let changed_ids: Vec<&str> = update
+        .changes
+        .iter()
+        .map(|change| match change {
+            TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+            TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+        })
+        .collect();
+    assert!(changed_ids.contains(&"parked-added"));
+    assert!(changed_ids.contains(&"parked-admin"));
+    assert!(!changed_ids.contains(&"other-added"));
+    assert!(!changed_ids.contains(&"sibling-added"));
+
+    let rows = list(&store);
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(status("parked-added"), Some(None));
+    assert_eq!(status("parked-admin"), Some(None));
+    assert_eq!(
+        status("other-added"),
+        Some(Some("LosingBranch".to_owned())),
+        "a withdrawal convergence cannot reverse must stay terminal"
+    );
+    assert_eq!(
+        status("sibling-added"),
+        Some(Some(BRANCH_SELECTION_WITHDRAWAL_REASON.to_owned())),
+        "another commit's branch-selection withdrawal is not this commit's to take back"
+    );
+}
+
+#[test]
+fn revalidating_leaves_other_withdrawal_reasons_and_live_rows_alone() {
+    // The predicate is reason-scoped AND state-scoped: a row withdrawn under a
+    // reason this primitive does not own is untouched even when the named
+    // commit matches, and a live row is never rewritten. Both cases return
+    // `None` so the caller can tell a real revival from a no-op.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&group_system_from_commit(
+            "terminal",
+            "member_added",
+            10,
+            "commit-terminal",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&group_system_from_commit(
+            "live",
+            "member_added",
+            11,
+            "commit-live",
+        ))
+        .unwrap();
+    store
+        .invalidate_app_events_by_origin_commit("commit-terminal", "LosingBranch")
+        .unwrap()
+        .expect("withdrawal");
+
+    assert!(
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit("commit-terminal")
+            .unwrap()
+            .is_none(),
+        "only a branch-selection withdrawal may be taken back"
+    );
+    assert!(
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit("commit-live")
+            .unwrap()
+            .is_none(),
+        "a live row is left untouched rather than rewritten"
+    );
+    assert!(
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit("commit-unknown")
+            .unwrap()
+            .is_none()
+    );
+    let rows = list(&store);
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(status("terminal"), Some(Some("LosingBranch".to_owned())));
+    assert_eq!(status("live"), Some(None));
+}
+
+#[test]
+fn branch_selection_withdrawal_reason_matches_the_engine_variant() {
+    // TRIPWIRE, not a coupling. `BRANCH_SELECTION_WITHDRAWAL_REASON` is frozen
+    // stored data: shipped databases already hold this exact string in
+    // `app_events.invalidation_reason`. The app happens to produce it today by
+    // `Debug`-formatting the traits variant, so a rename there would silently
+    // stop matching every stored row, and this assertion is what turns that
+    // silence into a build failure.
+    //
+    // When it fires, the fix is a DATA MIGRATION that rewrites the stored
+    // column (and re-points every reader), never an edit to the constant.
+    // Editing the constant to match a renamed variant makes the code
+    // self-consistent while orphaning every row an earlier release wrote.
+    //
+    // The FFI encodes the same variant as `superseded_by_branch_selection`
+    // (`group_state_invalidation_reason_tag`). That divergence is deliberate:
+    // one is a durable column value, the other a wire tag.
+    assert_eq!(
+        format!(
+            "{:?}",
+            cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection
+        ),
+        BRANCH_SELECTION_WITHDRAWAL_REASON
+    );
+}
+
+/// Seed a group plus one commit row in `cgka_messages` under `commit_hex`, in
+/// the stored disposition a convergence pass would have left behind.
+fn seed_commit(store: &SqliteAccountStorage, group: u8, commit_hex: &str, state: MessageState) {
+    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    let group_id = crate::storage::test_support::gid(group);
+    let _ = store.put_group(&crate::storage::test_support::sample_group(
+        group_id.clone(),
+        1,
+        1,
+    ));
+    let id = cgka_traits::types::MessageId::new(hex::decode(commit_hex).unwrap());
+    let mut record = crate::storage::test_support::sample_message(id, group_id, 1);
+    record.state = state;
+    store.put_message(&record).unwrap();
+}
+
+#[test]
+fn divergence_query_reports_only_tombstones_that_disagree_with_engine_state() {
+    // The crash-repair contract. `events_buf` is in-memory, so a process death
+    // between the convergence apply transaction and the app projection loses a
+    // withdrawal or a revalidation outright, and announce-once means no later
+    // pass re-derives it. Both sides live in this one database, so the
+    // divergence is always recomputable from `cgka_messages.state`.
+    //
+    // parked:  engine parked it, but its row is still live (withdrawal lost).
+    // adopted: engine re-adopted it, row still tombstoned (revalidation lost).
+    // settled: canonical commit with a live row -- agreement, no work.
+    // retired: aged out to EpochInvalidated; its rows stay withdrawn forever.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (row_id, commit, state) in [
+        ("parked-row", "aa11", MessageState::ConvergenceDeferred),
+        ("adopted-row", "bb22", MessageState::Processed),
+        ("settled-row", "cc33", MessageState::Processed),
+        ("retired-row", "dd44", MessageState::EpochInvalidated),
+    ] {
+        seed_commit(&store, 1, commit, state);
+        store
+            .record_app_event(&group_system_from_commit(
+                row_id,
+                "member_added",
+                10,
+                commit,
+            ))
+            .unwrap();
+    }
+    for commit in ["bb22", "dd44"] {
+        store
+            .invalidate_app_events_by_origin_commit(commit, BRANCH_SELECTION_WITHDRAWAL_REASON)
+            .unwrap()
+            .expect("seed withdrawal");
+    }
+
+    let divergence = store.diverged_branch_selection_withdrawals().unwrap();
+    assert_eq!(
+        divergence.to_withdraw,
+        vec!["aa11".to_owned()],
+        "a parked commit with a live row owes the withdrawal the crash lost"
+    );
+    assert_eq!(
+        divergence.to_revive,
+        vec!["bb22".to_owned()],
+        "a re-adopted commit still tombstoned owes the revalidation the crash lost,          while a retired commit stays withdrawn"
+    );
+
+    // Applying the divergence converges the account, and a second pass finds
+    // nothing: the fixed-point property that lets this run on every open.
+    for commit in &divergence.to_withdraw {
+        store
+            .invalidate_app_events_by_origin_commit(commit, BRANCH_SELECTION_WITHDRAWAL_REASON)
+            .unwrap();
+    }
+    for commit in &divergence.to_revive {
+        store
+            .clear_branch_selection_withdrawal_by_origin_commit(commit)
+            .unwrap();
+    }
+    assert!(
+        store
+            .diverged_branch_selection_withdrawals()
+            .unwrap()
+            .is_empty(),
+        "reconciliation must be a fixed point"
+    );
+
+    let rows = list(&store);
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(
+        status("parked-row"),
+        Some(Some(BRANCH_SELECTION_WITHDRAWAL_REASON.to_owned()))
+    );
+    assert_eq!(status("adopted-row"), Some(None));
+    assert_eq!(status("settled-row"), Some(None), "agreement is untouched");
+    assert_eq!(
+        status("retired-row"),
+        Some(Some(BRANCH_SELECTION_WITHDRAWAL_REASON.to_owned())),
+        "a retired commit is terminal: reconciliation must never revive it"
+    );
+}
+
+#[test]
+fn divergence_query_ignores_rows_withdrawn_for_other_reasons() {
+    // Reconciliation owns exactly one reason. A row withdrawn under a reason
+    // convergence cannot reverse must never be revived just because its origin
+    // commit is canonical.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed_commit(&store, 2, "ee55", MessageState::Processed);
+    store
+        .record_app_event(&group_system_from_commit(
+            "terminal-row",
+            "member_added",
+            10,
+            "ee55",
+        ))
+        .unwrap();
+    store
+        .invalidate_app_events_by_origin_commit("ee55", "LosingBranch")
+        .unwrap()
+        .expect("seed withdrawal");
+
+    assert!(
+        store
+            .diverged_branch_selection_withdrawals()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn rerecording_a_source_invalidated_message_keeps_its_tombstone() {
     // A delivered app message the engine withdrew as a fork loser is
     // redelivered by a relay and re-recorded under the same inner id in a later

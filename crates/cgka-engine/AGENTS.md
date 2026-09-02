@@ -463,6 +463,40 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   is only half the obligation: the failed inbound apply must also hand the still-retained commit back to stored
   convergence via `schedule_pending_convergence_group`. Otherwise the group parks one epoch behind holding a durable
   commit nothing will ever apply.
+- **A branch-selection withdrawal is provisional, so it is announced once and can be taken back.** A losing commit is
+  parked `ConvergenceDeferred` — still a canonicalization input — precisely so a later pass holding deeper evidence can
+  re-adopt it. Both halves of `distributed_convergence.rs` therefore key on the commit's stored state as it was BEFORE
+  the pass's own disposition persistence ran (`pre_apply_commit_states`, captured outside the apply transaction):
+  `emit_rolled_back_commits` announces `CommitRolledBack` + `GroupStateInvalidated` only for a commit this pass is
+  parking, and `emit_revalidated_commits` emits `GroupStateRevalidated` when an accepted commit entered the pass parked.
+  Reading the state after the apply cannot tell those apart — the persistence has already written `ConvergenceDeferred`
+  for every deferral. The app side must mirror the asymmetry: its tombstone is terminal by default (#1608), and only the
+  explicitly evidenced `GroupStateRevalidated` path clears a `SupersededByBranchSelection` row. Withdrawals under every
+  other reason stay terminal on both sides.
+- **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `MissingCandidateParent` is the other commit deferral and
+  it does not mean "branch selection put this commit on the losing side": `handle_commit` also reaches it when the pass
+  selected NO branch at all, which is the case that actually occurs in practice. Withdrawing there would tombstone a
+  device's own applied history on a pass that decided nothing — the same hazard
+  `emit_superseded_processed_commits` guards with its `selected_tip.is_none()` early return.
+- **Announce-once is paid for by derived-state reconciliation, not by a durable event queue.** `events_buf` is
+  in-memory, so a crash between the convergence apply transaction and the app's projection loses an announcement that
+  announce-once will never repeat. The repair is not a queue: a commit's branch-selection tombstone state is fully
+  derivable from `cgka_messages.state`, and engine messages and `app_events` share one account database.
+  `SqliteAccountStorage::diverged_branch_selection_withdrawals` reports the disagreements (`ConvergenceDeferred` with
+  live rows owes a withdrawal; `Processed` with a `SupersededByBranchSelection` tombstone owes a revival) and
+  `AppClient::reconcile_branch_selection_withdrawals` applies them on every account open. Keep that derivation total:
+  if a future change makes a withdrawal mean something the stored disposition cannot express, it needs its own durable
+  evidence rather than a widened event.
+
+  The app timeline is not the only consumer that can lose the announcement. `GroupStateInvalidated` also retires the
+  maintenance `DurableGroupEvolution` behind a superseded commit, and that consumer sits *after* the account layer's
+  awaited relay publishes, so the window is network-wide rather than instantaneous.
+  `AccountDeviceRuntime::reconcile_superseded_maintenance_from_state` is the matching derived-state repair, keyed on the
+  same durable field: an evolution whose `signed_message_id` reads `ConvergenceDeferred` (parked) or `EpochInvalidated`
+  (retired) is superseded. Note that the *own-commit* emitter, `emit_superseded_processed_commits`, has always
+  announced once — it durably flips its record to `EpochInvalidated`, so a later pass no longer sees it as previously
+  applied. That half of the hole predates announce-once. Both repairs flip forward only; `GroupStateRevalidated` has no
+  account-layer consumer and neither reconciler un-marks a supersession.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

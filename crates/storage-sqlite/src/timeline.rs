@@ -16,6 +16,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
     STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
 };
+use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,48 @@ pub const MAX_TIMELINE_LIMIT: usize = 200;
 /// rather than vanishing), and because it is the one reason
 /// [`SqliteAccountStorage::clear_local_publish_failure`] may clear.
 pub const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
+
+/// The invalidation reason a kind-1210 system row carries when branch selection
+/// withdrew the commit that synthesized it. Storage owns the literal because it
+/// is the one reason [`SqliteAccountStorage::clear_branch_selection_withdrawal_by_origin_commit`]
+/// may clear.
+///
+/// **Frozen.** This exact string is already persisted in shipped account
+/// databases, so it is stored data, not a view of the engine enum. The app
+/// happens to produce it today by formatting
+/// `cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection`
+/// with `Debug`, and `timeline::tests` pins the two together — but that pin is
+/// a *tripwire*, not a coupling to follow. Renaming the traits variant must be
+/// answered with a data migration that rewrites `app_events.invalidation_reason`
+/// (and re-points every reader), never by editing this constant: an edit here
+/// silently orphans every row an earlier release already wrote.
+///
+/// Note also that the FFI surface encodes the same variant differently — the
+/// uniffi/C boundary emits the snake_case tag `superseded_by_branch_selection`
+/// via `group_state_invalidation_reason_tag`. The two encodings are deliberate
+/// and independent: one is a durable column value, the other is a wire tag. Do
+/// not "unify" them without migrating the stored column.
+pub const BRANCH_SELECTION_WITHDRAWAL_REASON: &str = "SupersededByBranchSelection";
+
+/// Commits whose stored engine disposition disagrees with the branch-selection
+/// tombstones on the rows they synthesized. See
+/// [`SqliteAccountStorage::diverged_branch_selection_withdrawals`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BranchSelectionWithdrawalDivergence {
+    /// Hex commit ids parked `ConvergenceDeferred` that still have live rows.
+    pub to_withdraw: Vec<String>,
+    /// Hex commit ids back on the selected branch whose rows are still
+    /// tombstoned under [`BRANCH_SELECTION_WITHDRAWAL_REASON`].
+    pub to_revive: Vec<String>,
+}
+
+impl BranchSelectionWithdrawalDivergence {
+    /// Whether the account's tombstones already agree with engine state, in
+    /// which case reconciliation has no work and performs no writes.
+    pub fn is_empty(&self) -> bool {
+        self.to_withdraw.is_empty() && self.to_revive.is_empty()
+    }
+}
 
 /// The one row shape [`SqliteAccountStorage::clear_local_publish_failure`] may
 /// revive, bound to `?1` group id, `?2` message id, `?3` reason. Its early-exit
@@ -905,6 +948,221 @@ impl SqliteAccountStorage {
                 messages,
                 changes,
             }))
+        })
+    }
+
+    /// Exact inverse of [`Self::invalidate_app_events_by_origin_commit`] for
+    /// the one withdrawal reason convergence can reverse.
+    ///
+    /// A branch-selection withdrawal is provisional: the engine parks the
+    /// losing commit reconsiderable, and a later convergence pass holding
+    /// deeper evidence can re-adopt it. When that happens the engine emits
+    /// `GroupEvent::GroupStateRevalidated` naming the commit, and the rows it
+    /// synthesized describe canonical history again.
+    ///
+    /// The re-adoption is evidence [`Self::record_app_event`] does not have —
+    /// re-recording a row is not proof the withdrawal was reversed, which is
+    /// why that upsert never revives — so this is a primitive the revalidation
+    /// dispatch calls explicitly, exactly as the send path calls
+    /// [`Self::clear_local_publish_failure`].
+    ///
+    /// The predicate is reason-scoped by design. `SupersededByBranchSelection`
+    /// is the only reason whose underlying decision a later pass can reverse;
+    /// every other withdrawal (`LosingBranch`, `BeyondAnchor`, the terminal
+    /// sweep's `local_publish_failed`) stays terminal, and a commit-scoped
+    /// predicate alone would reach rows those reasons own.
+    ///
+    /// Returns `None` when no row matched, so a caller can tell a real revival
+    /// from a no-op without a second read.
+    ///
+    /// Scoping on `origin_commit_id` inherits that column's re-record rule.
+    /// [`Self::record_app_event`] repoints the column to the newest non-NULL
+    /// attribution (`origin_commit_id = COALESCE(excluded.origin_commit_id,
+    /// app_events.origin_commit_id)`), which cuts both ways:
+    ///
+    /// - **Missed revival.** A row a *different* commit later re-recorded
+    ///   answers to that commit, so revalidating the original misses it and it
+    ///   stays tombstoned — exactly as `invalidate_app_events_by_origin_commit`
+    ///   would already have missed it.
+    /// - **Revival by the "wrong" commit.** Symmetrically, revalidating the
+    ///   commit the row was re-pointed to clears a tombstone some *other*
+    ///   commit's withdrawal wrote.
+    ///
+    /// The second direction is benign, and the reason is row identity. A
+    /// synthesized system row is keyed by `group_system_event_material(group_id,
+    /// epoch, actor, change)` — content, not commit. Two commits can only
+    /// collide on that id by being the same actor making the same change at the
+    /// same epoch, i.e. by producing an *identical* row. So whichever of them is
+    /// canonical, the surviving row says the same thing, and reviving it under
+    /// the canonical commit is the correct verdict rather than a leak of some
+    /// unrelated change. (The common case is not even two commits: it is one
+    /// logical commit seen under both its wrap-time transport id and its content
+    /// dedup id.)
+    pub fn clear_branch_selection_withdrawal_by_origin_commit(
+        &self,
+        origin_commit_id: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT group_id_hex, message_id_hex, kind, tags_json
+                         FROM app_events
+                         WHERE origin_commit_id = ?1
+                           AND invalidated = 1
+                           AND invalidation_reason = ?2",
+                    )
+                    .storage()?;
+                stmt.query_map(
+                    params![origin_commit_id, BRANCH_SELECTION_WITHDRAWAL_REASON],
+                    |row| {
+                        let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                        let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?;
+                        Ok((row.get(0)?, row.get(1)?, kind, tags))
+                    },
+                )
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+            };
+            let Some(group_id_hex) = rows.first().map(|(group_id_hex, ..)| group_id_hex.clone())
+            else {
+                return Ok(None);
+            };
+            let mut affected_message_ids = BTreeSet::new();
+            for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
+                affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
+                    &conn,
+                    row_group_id_hex,
+                    message_id_hex,
+                    *kind,
+                    tags,
+                )?);
+            }
+            let before =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            conn.execute(
+                "UPDATE app_events
+                 SET invalidated = 0, invalidation_reason = NULL
+                 WHERE origin_commit_id = ?1
+                   AND invalidated = 1
+                   AND invalidation_reason = ?2",
+                params![origin_commit_id, BRANCH_SELECTION_WITHDRAWAL_REASON],
+            )
+            .storage()?;
+            rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
+            let messages =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            let mut changes = Vec::new();
+            for (_, message_id_hex, kind, tags) in &rows {
+                changes.extend(timeline_changes_for_invalidation(
+                    message_id_hex,
+                    *kind,
+                    tags,
+                    &before,
+                    &messages,
+                ));
+            }
+            dedup_timeline_changes(&mut changes);
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex,
+                messages,
+                changes,
+            }))
+        })
+    }
+
+    /// Commits whose stored engine disposition disagrees with the
+    /// branch-selection tombstones their synthesized rows currently carry.
+    ///
+    /// The engine announces a branch-selection withdrawal exactly once, on the
+    /// transition into `ConvergenceDeferred`, and takes it back exactly once, on
+    /// re-adoption. Those announcements travel in `events_buf`, which is
+    /// in-memory: a process death between the convergence apply transaction and
+    /// the app projection loses them, and because the engine will not repeat an
+    /// announcement it already made, nothing re-derives them. Before
+    /// announce-once, every later pass re-announced and the app's
+    /// already-invalidated filter turned the repeat into a no-op — accidental
+    /// self-healing that the once-only rule removed.
+    ///
+    /// This query is the deliberate replacement, and it is a total function
+    /// rather than a queue because the two sides live in the *same* account
+    /// database. A commit's branch-selection tombstone state is not independent
+    /// information the app has to be told and must not lose: it is derivable at
+    /// any moment from `cgka_messages.state`.
+    ///
+    /// - `ConvergenceDeferred` is precisely "a pass parked this commit off the
+    ///   selected branch", so every live row it synthesized owes a
+    ///   [`BRANCH_SELECTION_WITHDRAWAL_REASON`] tombstone.
+    /// - `Processed` is precisely "this commit is on the selected branch", so no
+    ///   row it synthesized may carry one.
+    ///
+    /// Every other stored state is left entirely alone. `EpochInvalidated` in
+    /// particular is the terminal retirement a parked commit ages into, and its
+    /// rows stay withdrawn under whatever reason retired them.
+    ///
+    /// Scoping to commits needs no message-kind decode: `origin_commit_id` is
+    /// only ever stamped with a commit id, so the join itself excludes proposals
+    /// and application messages.
+    ///
+    /// Returns hex commit ids, deterministically ordered, for the caller to feed
+    /// back through [`Self::invalidate_app_events_by_origin_commit`] and
+    /// [`Self::clear_branch_selection_withdrawal_by_origin_commit`]. Both are
+    /// already no-ops when the row set is in the state they would write, so a
+    /// reconciliation pass over a converged account performs no writes at all.
+    pub fn diverged_branch_selection_withdrawals(
+        &self,
+    ) -> StorageResult<BranchSelectionWithdrawalDivergence> {
+        let conn = self.lock()?;
+        // `state` is the integer encoding from `codec::message_state_to_i64`:
+        // 2 = Processed, 7 = ConvergenceDeferred. Bind them as parameters so the
+        // magic numbers stay at one call site with the mapping named beside it.
+        let processed = crate::codec::message_state_to_i64(MessageState::Processed);
+        let deferred = crate::codec::message_state_to_i64(MessageState::ConvergenceDeferred);
+        let collect =
+            |sql: &str, binds: Vec<rusqlite::types::Value>| -> StorageResult<Vec<String>> {
+                let mut stmt = conn.prepare(sql).storage()?;
+                let rows = stmt
+                    .query_map(params_from_iter(binds), |row| row.get(0))
+                    .storage()?
+                    .collect::<Result<Vec<String>, _>>()
+                    .storage()?;
+                Ok(rows)
+            };
+        let to_withdraw = collect(
+            "SELECT DISTINCT app_events.origin_commit_id
+             FROM app_events
+             JOIN cgka_messages
+               ON lower(hex(cgka_messages.id)) = app_events.origin_commit_id
+             WHERE cgka_messages.state = ?1
+               AND app_events.invalidated = 0
+             ORDER BY app_events.origin_commit_id",
+            vec![deferred.into()],
+        )?;
+        let to_revive = collect(
+            "SELECT DISTINCT app_events.origin_commit_id
+             FROM app_events
+             JOIN cgka_messages
+               ON lower(hex(cgka_messages.id)) = app_events.origin_commit_id
+             WHERE cgka_messages.state = ?1
+               AND app_events.invalidated = 1
+               AND app_events.invalidation_reason = ?2
+             ORDER BY app_events.origin_commit_id",
+            vec![
+                processed.into(),
+                BRANCH_SELECTION_WITHDRAWAL_REASON.to_owned().into(),
+            ],
+        )?;
+        Ok(BranchSelectionWithdrawalDivergence {
+            to_withdraw,
+            to_revive,
         })
     }
 

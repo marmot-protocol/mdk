@@ -24,6 +24,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
         | GroupEvent::GroupStateInvalidated { group_id, .. }
+        | GroupEvent::GroupStateRevalidated { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
         | GroupEvent::GroupHydrationQuarantined { group_id, .. }
@@ -154,6 +155,14 @@ pub enum GroupEventKindFfi {
         epoch: u64,
         invalidated_commit_id_hex: String,
         reason: String,
+    },
+    /// The inverse of `GroupStateInvalidated`: a later convergence pass
+    /// re-adopted `revalidated_commit_id_hex`, so every notification that
+    /// commit's withdrawal retracted describes canonical history again. Only a
+    /// `superseded_by_branch_selection` withdrawal is ever taken back.
+    GroupStateRevalidated {
+        epoch: u64,
+        revalidated_commit_id_hex: String,
     },
     GroupUnrecoverable,
     PendingCommitRecovered {
@@ -286,6 +295,14 @@ impl From<GroupEvent> for GroupEventKindFfi {
                 epoch: epoch.0,
                 invalidated_commit_id_hex: hex::encode(invalidated_commit_id.as_slice()),
                 reason: group_state_invalidation_reason_tag(&reason).to_string(),
+            },
+            GroupEvent::GroupStateRevalidated {
+                epoch,
+                revalidated_commit_id,
+                ..
+            } => Self::GroupStateRevalidated {
+                epoch: epoch.0,
+                revalidated_commit_id_hex: hex::encode(revalidated_commit_id.as_slice()),
             },
             GroupEvent::GroupUnrecoverable { .. } => Self::GroupUnrecoverable,
             GroupEvent::PendingCommitRecovered {

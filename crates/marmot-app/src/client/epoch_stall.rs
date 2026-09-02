@@ -493,11 +493,14 @@ impl GroupStall {
     /// mark to pace against, wedging [`Self::may_rearm_wedged`] shut for good on
     /// a group whose epoch never moves again — the exact failure the paced
     /// re-arm exists to prevent. Dropping the frozen-epoch evidence would hand a
-    /// recurring reorg the power to silence the wedge report, and reorgs do
-    /// recur: a losing commit is parked rather than consumed, so stored
-    /// convergence re-derives and re-announces the same withdrawal on every pass
-    /// it runs, and one unresolved fork plus ordinary member traffic produces a
-    /// reorg per pass indefinitely.
+    /// recurring reorg the power to silence the wedge report, and reorgs still
+    /// recur under announce-once. A withdrawal now arrives once per *parking*
+    /// rather than once per pass, so recurrence is bounded by genuinely new
+    /// adjudications instead of by pass count — but an unresolved fork keeps
+    /// attracting rival commits, and each fresh one this device parks is a new
+    /// adjudication that reaches this seam. Bounded recurrence is still
+    /// recurrence, and it is more than enough to keep clearing the evidence, so
+    /// the frozen-epoch retention argument is unchanged.
     fn end_arm_run_keeping_epoch_evidence(&mut self) {
         self.arms = 0;
         self.escalated = false;
@@ -897,9 +900,25 @@ impl EpochStallDetector {
     /// The caller passes the group off the engine's own
     /// [`GroupEvent::GroupStateInvalidated`] withdrawal, once per superseded
     /// commit. Ending an already-ended arm run is a no-op, so a pass that
-    /// withdraws several commits decides as one that withdrew one — and so does
-    /// the *next* pass re-announcing the same withdrawal, which is the ordinary
-    /// case for a fork that has not resolved.
+    /// withdraws several commits decides as one that withdrew one.
+    ///
+    /// **A withdrawal now arrives once per parking, not once per pass.** The
+    /// engine announces a branch-selection withdrawal only on the transition
+    /// into `ConvergenceDeferred`; a later pass that re-parks the same commit
+    /// stays silent (`distributed_convergence::emit_rolled_back_commits`).
+    /// This used to read the other way — every pass re-announced, so an
+    /// unresolved fork fed this seam continuously and kept resetting the run
+    /// for as long as it stayed unresolved.
+    ///
+    /// The consequence is deliberate and observable: a *contested* group that
+    /// makes no epoch progress is no longer held below the escalation threshold
+    /// by the repeat. Its arms now accumulate like any other stall, so a fork
+    /// that parks a commit once and then wedges can reach
+    /// [`Self::escalation_arm_threshold`] and escalate to backfill. Only a
+    /// genuinely *new* adjudication — a fresh parking or a re-adoption — resets
+    /// the run now. `stalled_contested_group_escalates_after_announce_once`
+    /// pins that behavior; this note is a description of what the seam does,
+    /// not an argument that the threshold is tuned correctly for it.
     ///
     /// `get_mut` like [`Self::observe_epoch_passage`]: a reorg is evidence
     /// about a stall run, never the start of one, so a group with no stall
@@ -1766,9 +1785,12 @@ mod tests {
     /// resolves still escalates, off the relays' own verdict.
     ///
     /// Reorgs are not rare punctuation on a forked group — they recur. A losing
-    /// commit is parked rather than consumed, so every convergence pass
-    /// re-derives and re-announces the same withdrawal, and ordinary member
-    /// traffic is enough to run a pass per round indefinitely. If a reorg reset
+    /// commit is parked rather than consumed, so an unsettled fork keeps
+    /// producing fresh adjudications round after round: each pass can park a
+    /// *newly arrived* rival, and ordinary member traffic is enough to run a
+    /// pass per round indefinitely. (Re-parking the *same* commit is silent
+    /// since announce-once, so the repetition here is new parkings, not a
+    /// re-announcement of one.) If a reorg reset
     /// the frozen-epoch evidence along with the arm run, the count below would
     /// return to zero every round and this group — wedged at one epoch, relays
     /// confirming round after round that they hold nothing that moves it —
@@ -1797,8 +1819,8 @@ mod tests {
             // The relays serve the account's stored history in full and it
             // recovers nothing.
             reports.extend(detector.observe_fruitless_completion([&g]));
-            // And the unresolved fork is re-adjudicated, announcing the same
-            // withdrawal again.
+            // And the unresolved fork is re-adjudicated, parking another
+            // newly arrived rival.
             detector.observe_convergence_reorg(&g);
         }
 
@@ -1811,12 +1833,12 @@ mod tests {
         assert_eq!(reports[0].stalled_epoch, 10);
     }
 
-    /// Re-announcement is the ordinary case, not an edge one, so it must cost
-    /// the evidence nothing. The engine has no idempotence guard on the
-    /// withdrawal it derives from a parked losing commit; every pass emits the
-    /// same pair again.
+    /// A burst of withdrawal signals must cost the frozen-epoch evidence
+    /// nothing. One pass can park several commits and announce one withdrawal
+    /// each, and successive passes keep parking newly arrived rivals, so this
+    /// seam sees runs of reorg observations as the ordinary case.
     #[test]
-    fn re_announcing_the_same_withdrawal_does_not_reset_the_frozen_epoch_evidence() {
+    fn repeated_reorg_signals_do_not_reset_the_frozen_epoch_evidence() {
         let mut detector = EpochStallDetector::new(1, 3).with_fruitless_completion_threshold(3);
         let g = group(0x01);
 
@@ -1835,9 +1857,84 @@ mod tests {
         assert_eq!(
             reports.len(),
             1,
-            "ten re-announcements of one withdrawal must not spend the two completions already banked",
+            "ten withdrawal signals must not spend the two completions already banked",
         );
         assert_eq!(reports[0].completions, 3);
+    }
+
+    /// Announce-once made this seam quieter, and the escalation path felt it.
+    ///
+    /// A branch-selection withdrawal now arrives once per *parking*, not once
+    /// per pass: `emit_rolled_back_commits` skips a commit an earlier pass
+    /// already parked. Before that, a group whose fork never resolved fed a
+    /// withdrawal into `observe_convergence_reorg` on every pass, and each one
+    /// reset the arm run — so a contested group that also stopped making epoch
+    /// progress could be held below the escalation threshold indefinitely by
+    /// the repetition alone.
+    ///
+    /// Now the parking speaks once and then goes quiet, so a group that wedges
+    /// *after* being adjudicated accumulates arms like any other stall and
+    /// escalates. This test pins that outcome. It is deliberately a description
+    /// of current behavior, not a claim that escalating this group is the right
+    /// recovery — the arm threshold's tuning for contested groups is a separate
+    /// question from whether the signal reaches it.
+    #[test]
+    fn stalled_contested_group_escalates_after_announce_once() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        // The fork is adjudicated once: one commit parked, one withdrawal. The
+        // run so far is ended by that signal, exactly as before.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m0".into(), EpochId(10), T0),
+            BackfillDecision::Arm
+        );
+        detector.observe_convergence_reorg(&g);
+
+        // The device then limps: recovers a little, advances an epoch, stalls
+        // again, three times over — the ordinary escalation shape. Re-parking
+        // that same commit is silent now, so nothing interrupts the run.
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m1".into(), EpochId(11), T0),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m2".into(), EpochId(12), T0),
+            BackfillDecision::Arm
+        );
+        assert_eq!(
+            detector.observe_undecryptable(g.clone(), "m3".into(), EpochId(13), T0),
+            BackfillDecision::ArmAndEscalate { arms: 3 },
+            "an adjudicated-then-stalling group now reaches escalation, because              the parking that adjudicated it no longer repeats",
+        );
+    }
+
+    /// The other half of the same seam, unchanged: a fork that keeps producing
+    /// *fresh* adjudications still suppresses escalation. Announce-once removed
+    /// the repeat of one parking, not the signal itself, so a device that is
+    /// still watching commits get adjudicated is still recognised as alive.
+    ///
+    /// Run this against the test above to see exactly what changed: identical
+    /// epoch progression, and the only difference is whether a withdrawal lands
+    /// between the arms.
+    #[test]
+    fn a_group_still_adjudicating_new_commits_stays_below_escalation() {
+        let mut detector = EpochStallDetector::new(1, 3);
+        let g = group(0x01);
+
+        for round in 0..6u64 {
+            assert_eq!(
+                detector.observe_undecryptable(
+                    g.clone(),
+                    format!("m{round}"),
+                    EpochId(11 + round),
+                    T0,
+                ),
+                BackfillDecision::Arm,
+                "round {round}: each newly parked rival ends the run before it can escalate",
+            );
+            detector.observe_convergence_reorg(&g);
+        }
     }
 
     /// A reorg is evidence about a run, never the start of one.
