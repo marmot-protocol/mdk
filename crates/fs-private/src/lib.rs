@@ -10,7 +10,7 @@
 //! the artifacts and the mode calls are no-ops.
 
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -879,7 +879,7 @@ fn replace_private_file(temp_path: &Path, path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn sync_private_parent(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
