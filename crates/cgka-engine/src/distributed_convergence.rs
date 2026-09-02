@@ -30,6 +30,7 @@ use crate::canonicalization::{
 use crate::convergence_clock::ConvergenceTime;
 use crate::convergence_input::{
     ClassifiedConvergenceInput, ConvergenceInputContext, role_for_content_kind,
+    scan_selection_relevance,
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
@@ -565,13 +566,18 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((ConvergenceAdmissionOutcome::Retained, opened));
         }
         let admitted_input = candidate.input;
+        // One scan of the pre-push members, no commit-edge map: the full
+        // `from_pass_members` context rebuild here was O(members) BTreeMap
+        // work per admitted input. Pre-push is sufficient for the new input's
+        // own verdict — a CommitEdge is relevant unconditionally, and a
+        // Proposal/AppWitness member contributes no commit edge.
+        let selection_relevant = scan_selection_relevance(&pass.members, admitted_input);
         pass.members.push(candidate.member);
-        let context = ConvergenceInputContext::from_pass_members(&pass.members);
         // Restart quiescence only for an input role that can change this
         // batch's deterministic resolution. Ordinary app delivery never
         // reaches this path; a future app without competing candidate edges is
         // retained but does not move the pass boundary.
-        if context.is_potentially_selection_relevant(admitted_input) {
+        if selection_relevant {
             pass.quiescence_deadline_monotonic_ms = now
                 .monotonic_ms
                 .saturating_add(policy.settlement_quiescence_ms);
