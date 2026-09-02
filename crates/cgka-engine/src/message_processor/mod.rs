@@ -175,13 +175,15 @@ pub(crate) struct DeferredPeelGroupState {
     /// drops it naturally.
     candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
     /// Per-row verdicts backing `stored_convergence_commit_digests`: the
-    /// commit digest, or `None` for a row that is not an MLS-wire commit.
-    /// Sound to remember without invalidation because a row id never maps to
-    /// different wire bytes (content rows are keyed by their content dedup
-    /// id, and payload rewrites only attach metadata around the same wire
-    /// message). Rebuilt to the currently listed rows on every use, so it
-    /// cannot outgrow the group's stored history.
-    commit_digest_memo: HashMap<MessageId, Option<[u8; 32]>>,
+    /// stored payload's hash, plus the commit digest or `None` for a row that
+    /// is not an MLS-wire commit. A row id CAN map to different payload bytes
+    /// over its lifetime — `persist_stored_message_payload` overwrites a
+    /// same-id row stored under a different payload variant (e.g. RawTransport
+    /// re-persisted as OpenMlsWire, #369) — so each reuse revalidates the
+    /// cheap payload hash and only then skips the decode + TLS parse. Rebuilt
+    /// to the currently listed rows on every use, so it cannot outgrow the
+    /// group's stored history.
+    commit_digest_memo: HashMap<MessageId, ([u8; 32], Option<[u8; 32]>)>,
 }
 
 struct DeferredPeelCandidateCacheEntry {
@@ -2262,9 +2264,10 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// The fingerprint gate computes this set at least twice per sweep, so a
     /// row's decode + TLS parse + digest is remembered in
-    /// `DeferredPeelGroupState::commit_digest_memo` and paid once per row
-    /// lifetime instead of once per computation. State membership is re-read
-    /// from the fresh listing every call; only the payload verdict is memoized.
+    /// `DeferredPeelGroupState::commit_digest_memo` and paid once per stored
+    /// payload version instead of once per computation. State membership is
+    /// re-read from the fresh listing every call, and each reuse revalidates
+    /// the payload hash; only the payload verdict is memoized.
     fn stored_convergence_commit_digests(
         &mut self,
         group_id: &GroupId,
@@ -2289,9 +2292,14 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 continue;
             }
+            // The memo entry is valid only for the payload bytes it was
+            // computed from: a same-id row can be overwritten under a
+            // different payload variant (RawTransport re-persisted as
+            // OpenMlsWire, #369), which must re-classify.
+            let payload_hash: [u8; 32] = Sha256::digest(&record.payload).into();
             let verdict = match memo.remove(&record.id) {
-                Some(verdict) => verdict,
-                None => decode_openmls_wire_projection(&record.payload)
+                Some((memo_hash, verdict)) if memo_hash == payload_hash => verdict,
+                _ => decode_openmls_wire_projection(&record.payload)
                     .filter(|(_message, projection)| {
                         projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit
                     })
@@ -2300,7 +2308,7 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(digest) = verdict {
                 digests.insert(digest);
             }
-            next_memo.insert(record.id, verdict);
+            next_memo.insert(record.id, (payload_hash, verdict));
         }
         self.deferred_peel
             .entry(group_id.clone())
