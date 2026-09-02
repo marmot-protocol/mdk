@@ -8,6 +8,12 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   implementations) used by engine/runtime incident capture.
 - Keep this crate independent of engine, app, storage, transport SDK, and simulator crates.
 - Keep static snapshot dump analysis out of this repo; external tools should consume JSONL audit files.
+- Keep `JsonlRecorder` segment rotation transparent (mdk#1181). Sealing the active file at
+  `AUDIT_LOG_SEGMENT_MAX_BYTES` is a rename into an `audit-*-seg<NNNNNN>.jsonl` sibling that deletes and truncates
+  nothing; `seq`, the recorder session id, and health counters carry across the boundary and no `recorder_started` row
+  is written, so a session's segments plus its active file concatenate back to one continuous log. Retention and disk
+  bounding of sealed segments belong to mdk#1014. Destructive `rotate()` — which discards the current file — stays a
+  separate, explicit operation.
 - Keep audit logging opt-in and explicit. The sole supported event model is privacy-safe: hashed/truncated identifiers,
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.

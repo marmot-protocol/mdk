@@ -57,6 +57,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 keyring-core.workspace = true
+marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

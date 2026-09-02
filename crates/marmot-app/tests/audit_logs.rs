@@ -593,3 +593,402 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
         "local_user"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Incremental upload contract (mdk#1181)
+// ---------------------------------------------------------------------------
+
+/// Capture sink that stays up across many tracker runs, so a test can assert on
+/// what was *not* re-transferred as well as what was.
+// The pacing/concurrency knobs exist for the coalescing regression, which needs
+// the `test-policy-overrides` trigger seam; without that feature they are unused.
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+struct CaptureSink {
+    addr: std::net::SocketAddr,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    statuses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u16>>>,
+    /// Milliseconds a handler holds a request open before answering, so a test
+    /// can schedule more triggers while an upload is genuinely in flight.
+    hold_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    default_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    in_flight: std::sync::Arc<std::sync::Mutex<(usize, usize)>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+impl CaptureSink {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let statuses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<u16>::new(),
+        ));
+        let hold_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let default_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204));
+        let in_flight = std::sync::Arc::new(std::sync::Mutex::new((0_usize, 0_usize)));
+        let handle = tokio::spawn({
+            use std::sync::atomic::Ordering;
+            let requests = requests.clone();
+            let statuses = statuses.clone();
+            let hold_ms = hold_ms.clone();
+            let default_status = default_status.clone();
+            let in_flight = in_flight.clone();
+            async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let requests = requests.clone();
+                    let statuses = statuses.clone();
+                    let hold_ms = hold_ms.clone();
+                    let default_status = default_status.clone();
+                    let in_flight = in_flight.clone();
+                    // One task per connection so overlapping uploads are
+                    // observable instead of serialized behind `accept`.
+                    tokio::spawn(async move {
+                        let Some(request) = read_captured_request(&mut stream).await else {
+                            return;
+                        };
+                        {
+                            let mut counts = in_flight.lock().unwrap();
+                            counts.0 += 1;
+                            counts.1 = counts.1.max(counts.0);
+                        }
+                        let hold = hold_ms.load(Ordering::Relaxed);
+                        if hold > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+                        }
+                        let status = statuses
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or_else(|| default_status.load(Ordering::Relaxed));
+                        write_http_response(&mut stream, status).await;
+                        let _ = stream.shutdown().await;
+                        in_flight.lock().unwrap().0 -= 1;
+                        requests.lock().unwrap().push(request);
+                    });
+                }
+            }
+        });
+        Self {
+            addr,
+            requests,
+            statuses,
+            hold_ms,
+            default_status,
+            in_flight,
+            handle,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}/api/v1/audit-logs/", self.addr)
+    }
+
+    fn script(&self, statuses: &[u16]) {
+        *self.statuses.lock().unwrap() = statuses.iter().copied().collect();
+    }
+
+    fn hold_each_request_for(&self, millis: u64) {
+        self.hold_ms
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn always_answer(&self, status: u16) {
+        self.default_status
+            .store(status, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn max_concurrent_requests(&self) -> usize {
+        self.in_flight.lock().unwrap().1
+    }
+
+    fn take_bodies(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.requests.lock().unwrap())
+            .into_iter()
+            .map(|request| request.body)
+            .collect()
+    }
+}
+
+impl Drop for CaptureSink {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn tracker_runtime(root: &std::path::Path, endpoint: &str) -> MarmotAppRuntime {
+    let app = MarmotApp::with_relay(root, "wss://relay.example");
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(app);
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(endpoint.to_owned()),
+            authorization_bearer_token: Some("goggles_dev_secret".to_owned()),
+            source: AuditLogUploadSource::default(),
+        })
+        .unwrap();
+    runtime
+}
+
+fn checkpoint_path(home: &AccountHome, label: &str) -> std::path::PathBuf {
+    home.account_dir(label).join("audit-upload-checkpoint.json")
+}
+
+#[tokio::test]
+async fn acknowledged_audit_files_are_not_re_posted_without_new_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let sealed = b"{\"seq\":1}\n{\"seq\":2}\n{\"seq\":3}\n";
+    std::fs::write(
+        home.account_dir(&account.label)
+            .join("audit-engine-v3-seg000001.jsonl"),
+        sealed,
+    )
+    .unwrap();
+
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(sink.take_bodies(), vec![sealed.to_vec()]);
+
+    for _ in 0..5 {
+        let repeat = runtime.post_audit_log_tracker_update().await.unwrap();
+        assert!(repeat.uploaded.is_empty(), "{repeat:?}");
+    }
+    assert!(
+        sink.take_bodies().is_empty(),
+        "an acknowledged segment must never be re-read or re-posted"
+    );
+}
+
+#[tokio::test]
+async fn appending_a_suffix_transfers_only_the_changed_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let dir = home.account_dir(&account.label);
+    let sealed = b"{\"seq\":1}\n";
+    std::fs::write(dir.join("audit-engine-v3-seg000001.jsonl"), sealed).unwrap();
+    std::fs::write(dir.join("audit-engine-v3.jsonl"), b"{\"seq\":2}\n").unwrap();
+
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(sink.take_bodies().len(), 2);
+
+    // A new immutable segment plus growth of the active file.
+    std::fs::write(
+        dir.join("audit-engine-v3-seg000002.jsonl"),
+        b"{\"seq\":3}\n",
+    )
+    .unwrap();
+    let active = b"{\"seq\":2}\n{\"seq\":4}\n";
+    std::fs::write(dir.join("audit-engine-v3.jsonl"), active).unwrap();
+
+    runtime.post_audit_log_tracker_update().await.unwrap();
+
+    let bodies = sink.take_bodies();
+    assert_eq!(
+        bodies,
+        vec![b"{\"seq\":3}\n".to_vec(), active.to_vec()],
+        "only the new segment and the grown active file should transfer"
+    );
+}
+
+#[tokio::test]
+async fn acknowledgement_survives_restart_and_a_lost_checkpoint_costs_one_repeat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let sealed = b"{\"seq\":1}\n";
+    std::fs::write(
+        home.account_dir(&account.label)
+            .join("audit-engine-v3-seg000001.jsonl"),
+        sealed,
+    )
+    .unwrap();
+
+    let sink = CaptureSink::start().await;
+    {
+        let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+        runtime.post_audit_log_tracker_update().await.unwrap();
+    }
+    assert_eq!(sink.take_bodies().len(), 1);
+
+    // Restart after acknowledgement: nothing re-transfers.
+    {
+        let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+        runtime.post_audit_log_tracker_update().await.unwrap();
+    }
+    assert!(sink.take_bodies().is_empty());
+
+    // Checkpoint loss is bounded: exactly one repeat transfer, which the
+    // endpoint's whole-file dedupe absorbs, and then quiet again.
+    std::fs::remove_file(checkpoint_path(&home, &account.label)).unwrap();
+    {
+        let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+        runtime.post_audit_log_tracker_update().await.unwrap();
+        assert_eq!(sink.take_bodies(), vec![sealed.to_vec()]);
+        runtime.post_audit_log_tracker_update().await.unwrap();
+    }
+    assert!(sink.take_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn failed_uploads_retry_while_acknowledged_files_do_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let dir = home.account_dir(&account.label);
+    let failing = b"{\"seq\":1}\n";
+    let succeeding = b"{\"seq\":2}\n";
+    std::fs::write(dir.join("audit-engine-v3-seg000001.jsonl"), failing).unwrap();
+    std::fs::write(dir.join("audit-engine-v3-seg000002.jsonl"), succeeding).unwrap();
+
+    let sink = CaptureSink::start().await;
+    sink.script(&[500, 204]);
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(
+        sink.take_bodies(),
+        vec![failing.to_vec(), succeeding.to_vec()]
+    );
+
+    let second = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(second.uploaded.len(), 1);
+    assert_eq!(
+        sink.take_bodies(),
+        vec![failing.to_vec()],
+        "only the unacknowledged file retries"
+    );
+}
+
+#[tokio::test]
+async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let dir = home.account_dir(&account.label);
+    // Upgrade path: an active file grown past the request ceiling by a build
+    // without segment rotation. It sorts first, so it also proves the oversized
+    // file does not block the files behind it.
+    let huge = std::fs::File::create(dir.join("audit-engine-v3-seg000001.jsonl")).unwrap();
+    huge.set_len(64 * 1024 * 1024 + 1).unwrap();
+    let normal = b"{\"seq\":1}\n";
+    std::fs::write(dir.join("audit-engine-v3.jsonl"), normal).unwrap();
+
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(sink.take_bodies(), vec![normal.to_vec()]);
+    // Never deleted or truncated: retention is mdk#1014's contract.
+    assert_eq!(
+        std::fs::metadata(dir.join("audit-engine-v3-seg000001.jsonl"))
+            .unwrap()
+            .len(),
+        64 * 1024 * 1024 + 1
+    );
+
+    // A second run neither retries the oversized file nor re-posts the small
+    // one it already acknowledged.
+    runtime.post_audit_log_tracker_update().await.unwrap();
+    assert!(sink.take_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let path = home
+        .account_dir(&account.label)
+        .join("audit-00112233445566778899aabbccddeeff-v3.jsonl");
+    let recorder = marmot_forensics::JsonlRecorder::open(&path, "0011".repeat(8)).unwrap();
+    {
+        use marmot_forensics::ForensicRecorder as _;
+        // Enough rows to seal several segments at the recorder's threshold.
+        while std::fs::read_dir(home.account_dir(&account.label))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-seg"))
+            .count()
+            < 2
+        {
+            recorder.record(marmot_forensics::AuditRecord::new(
+                None,
+                marmot_forensics::AuditEventKind::SendEntry {
+                    intent_kind: "app_message".into(),
+                },
+            ));
+        }
+    }
+
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    runtime.post_audit_log_tracker_update().await.unwrap();
+
+    let bodies = sink.take_bodies();
+    assert_eq!(bodies.len(), 3, "two sealed segments plus the active file");
+    for body in &bodies {
+        assert!(
+            (body.len() as u64) < 64 * 1024 * 1024,
+            "every transfer must stay under the per-request ceiling"
+        );
+        assert!((body.len() as u64) < 2 * marmot_forensics::AUDIT_LOG_SEGMENT_MAX_BYTES);
+    }
+
+    // No new rows: nothing at all is re-read or re-posted.
+    runtime.post_audit_log_tracker_update().await.unwrap();
+    assert!(sink.take_bodies().is_empty());
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn trigger_bursts_coalesce_into_one_follow_up_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let dir = home.account_dir(&account.label);
+    std::fs::write(dir.join("audit-engine-v3.jsonl"), b"{\"seq\":1}\n").unwrap();
+
+    let sink = CaptureSink::start().await;
+    // Hold each upload open so the burst lands while a run is in flight, which
+    // is the case the coalescing contract is about, and refuse every upload so
+    // nothing is ever acknowledged — then each run posts, and the request count
+    // measures runs rather than changed content.
+    sink.hold_each_request_for(400);
+    sink.always_answer(500);
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    runtime.schedule_audit_log_tracker_update_for_test("burst");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    for _ in 0..50 {
+        runtime.schedule_audit_log_tracker_update_for_test("burst");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    // 50 triggers arriving during a run collapse into exactly one follow-up,
+    // and no two uploads are ever in flight at once.
+    assert_eq!(
+        sink.take_bodies().len(),
+        2,
+        "a burst during an in-flight run must produce one follow-up, not one run per trigger"
+    );
+    assert_eq!(
+        sink.max_concurrent_requests(),
+        1,
+        "tracker updates must never upload concurrently"
+    );
+}

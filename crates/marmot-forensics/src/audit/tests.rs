@@ -1240,3 +1240,167 @@ fn sample_events_serialize_within_schema_property_names() {
     let value = serde_json::to_value(&event).unwrap();
     assert_keys_within_schema(&value, &schema, &defs, "event");
 }
+
+fn segment_paths(path: &Path) -> Vec<PathBuf> {
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let prefix = format!("{}-seg", name.strip_suffix(".jsonl").unwrap_or(&name));
+    let mut found: Vec<PathBuf> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Record rows until one more segment than `already_rolled` exists, returning
+/// the number of rows recorded.
+fn record_until_segment_rolls(
+    recorder: &JsonlRecorder,
+    path: &Path,
+    already_rolled: usize,
+) -> usize {
+    for rows in 1..500_000 {
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: "app_message".into(),
+            },
+        ));
+        if segment_paths(path).len() > already_rolled {
+            return rows;
+        }
+    }
+    panic!("recorder never rolled a segment");
+}
+
+#[test]
+fn active_audit_file_rolls_into_a_segment_at_the_size_threshold() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+
+    let mut rows = record_until_segment_rolls(&recorder, &path, 0);
+    // The roll seals the file the instant the threshold is crossed, so the
+    // fresh active file is empty until the next row lands in it.
+    assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    rows += 1;
+
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1, "one segment should have been rolled");
+    let segment_bytes = fs::metadata(&segments[0]).unwrap().len();
+    assert!(
+        segment_bytes >= AUDIT_LOG_SEGMENT_MAX_BYTES,
+        "the segment should hold the threshold-crossing prefix, got {segment_bytes}"
+    );
+    // The cliff: a segment is sealed as soon as it crosses the threshold, so it
+    // never approaches the app's per-request upload ceiling.
+    assert!(segment_bytes < 2 * AUDIT_LOG_SEGMENT_MAX_BYTES);
+    assert!(fs::metadata(&path).unwrap().len() < AUDIT_LOG_SEGMENT_MAX_BYTES);
+
+    // Nothing is lost, and the segment plus the active file concatenate back
+    // into one continuous session: the recorder session id is unchanged and
+    // `seq` keeps counting across the boundary.
+    let events = |at: &Path| -> Vec<AuditEvent> {
+        fs::read_to_string(at)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let segment_events = events(&segments[0]);
+    let active_events = events(&path);
+    assert!(!active_events.is_empty());
+    // `recorder_started` plus every recorded row.
+    assert_eq!(segment_events.len() + active_events.len(), rows + 1);
+    assert_eq!(
+        segment_events[0].recorder_session_id, active_events[0].recorder_session_id,
+        "a segment roll is not a new recorder session"
+    );
+    assert_eq!(
+        active_events[0].seq,
+        segment_events.last().unwrap().seq + 1,
+        "seq must stay continuous across the segment boundary"
+    );
+    assert!(
+        !active_events
+            .iter()
+            .any(|event| matches!(event.kind, AuditEventKind::RecorderStarted { .. })),
+        "a segment roll must not fabricate a new session boundary row"
+    );
+}
+
+#[test]
+fn oversized_pre_existing_audit_file_is_rolled_aside_on_open() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    // Upgrade path: a file left behind by a build without segment rotation,
+    // already past the point where automatic upload can succeed.
+    let legacy = "x".repeat(usize::try_from(AUDIT_LOG_SEGMENT_MAX_BYTES).unwrap() + 1);
+    fs::write(&path, &legacy).unwrap();
+
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        fs::read_to_string(&segments[0]).unwrap(),
+        legacy,
+        "the oversized file is preserved verbatim, never truncated"
+    );
+    let active = fs::read_to_string(&path).unwrap();
+    assert_eq!(active.lines().count(), 2);
+    assert!(active.len() < 4096);
+}
+
+#[test]
+fn segment_rolls_never_overwrite_an_existing_segment() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    record_until_segment_rolls(&recorder, &path, 0);
+    let first = segment_paths(&path);
+    let first_bytes = fs::read(&first[0]).unwrap();
+
+    record_until_segment_rolls(&recorder, &path, 1);
+
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 2, "the second roll must claim a fresh name");
+    assert_eq!(
+        fs::read(&segments[0]).unwrap(),
+        first_bytes,
+        "an earlier segment is immutable"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn rolled_segment_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    record_until_segment_rolls(&recorder, &path, 0);
+
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&segment_paths(&path)[0]), 0o600);
+    assert_eq!(mode(&path), 0o600);
+}

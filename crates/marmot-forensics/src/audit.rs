@@ -30,6 +30,29 @@ use serde::{Deserialize, Serialize};
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v3";
 
+/// Size at which [`JsonlRecorder`] seals the active file into an immutable
+/// segment and continues into a fresh one (mdk#1181).
+///
+/// The number is picked from measured rows, not from the upload ceiling:
+///
+/// - A recorded row measures ~597 bytes on average (p90 696, max 811 over a
+///   real create-group + 50-send session), so a 1 MiB segment holds ~1,750
+///   rows — roughly 250 sends of activity, still an analytically useful unit
+///   even for a 4x richer row mix in large groups.
+/// - The uploader re-posts the *active* file in full on every trigger, so the
+///   threshold is also the bound on that residual. Before rotation the active
+///   file grew without bound, which is what made cumulative transfer quadratic;
+///   1 MiB makes the per-trigger cost constant instead. Against the ~5.3 MiB
+///   mean upload measured in the field that is a 5-10x cut, and it does not
+///   decay as a device keeps running.
+/// - It leaves a 64x margin under the app's 64 MiB per-request upload ceiling,
+///   so no automatically produced file can reach the permanent-failure cliff.
+///
+/// Smaller segments would cut the residual further but multiply file count
+/// (segments are never deleted here — retention is mdk#1014); larger ones
+/// re-inflate the residual. 1 MiB is the balance point.
+pub const AUDIT_LOG_SEGMENT_MAX_BYTES: u64 = 1024 * 1024;
+
 /// Hex-encoded 16-byte account identity hash. Stable across devices for the
 /// same account when the caller supplies it.
 pub type AccountRefHex = String;
@@ -1245,6 +1268,13 @@ struct JsonlInner {
     engine_id: EngineIdHex,
     recorder_session_id: String,
     health: AuditRecorderHealthSnapshot,
+    /// Bytes in the file the writer currently owns, driving segment rolls.
+    active_bytes: u64,
+    /// Latched for the lifetime of this recorder when a segment roll fails, so
+    /// a persistently unwritable directory cannot make every subsequent
+    /// `record` re-attempt (and re-scan the directory). A fresh recorder — the
+    /// next session open — clears it.
+    segment_roll_failed: bool,
 }
 
 fn validate_account_ref_hex(account_ref: &str) -> std::io::Result<()> {
@@ -1277,6 +1307,7 @@ impl JsonlRecorder {
         // Audit files are private local operational artifacts. Create them
         // owner-only and tighten pre-existing permissive files.
         let file = fs_private::open_private_append(&path)?;
+        let active_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         let recorder_session_id = generate_recorder_session_id();
         let recorder = Self {
             path,
@@ -1287,8 +1318,27 @@ impl JsonlRecorder {
                 engine_id,
                 recorder_session_id,
                 health: AuditRecorderHealthSnapshot::default(),
+                active_bytes,
+                segment_roll_failed: false,
             }),
         };
+        // Upgrade path: a file left over-threshold by a build without segment
+        // rotation — including one already past the app's upload ceiling, which
+        // no automatic upload can ever accept — is sealed aside here so this
+        // session starts on a fresh, uploadable active file. Splitting the
+        // oversized file is deliberately not attempted; it stays an immutable
+        // segment and the uploader surfaces it. Best-effort: a roll failure
+        // must not cost the caller its audit log entirely, so recording
+        // continues into the existing file.
+        if active_bytes >= AUDIT_LOG_SEGMENT_MAX_BYTES {
+            let mut inner = recorder
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recorder.roll_into_segment(&mut inner).is_err() {
+                inner.segment_roll_failed = true;
+            }
+        }
         recorder.record(AuditRecord::new(None, recorder_started_kind()));
         Ok(recorder)
     }
@@ -1379,8 +1429,18 @@ impl ForensicRecorder for JsonlRecorder {
                 inner.health.write_failures = inner.health.write_failures.saturating_add(1);
                 return;
             }
+            inner.active_bytes = inner
+                .active_bytes
+                .saturating_add(line.len() as u64)
+                .saturating_add(1);
             if inner.writer.flush().is_err() {
                 inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+            }
+            if !inner.segment_roll_failed
+                && inner.active_bytes >= AUDIT_LOG_SEGMENT_MAX_BYTES
+                && self.roll_into_segment(&mut inner).is_err()
+            {
+                inner.segment_roll_failed = true;
             }
         } else {
             inner.health.serialization_failures =
@@ -1457,7 +1517,112 @@ impl JsonlRecorder {
         inner.seq = 0;
         inner.recorder_session_id = generate_recorder_session_id();
         inner.health = AuditRecorderHealthSnapshot::default();
+        inner.active_bytes = 0;
         Ok(())
+    }
+
+    /// Seal the active file into an immutable segment sibling and continue
+    /// recording into a fresh file at the same path (mdk#1181). The caller must
+    /// hold the inner lock.
+    ///
+    /// Nothing is deleted or truncated: the rename hands the *same inode* — and
+    /// therefore every recorded byte — to the segment name, and the concatenation
+    /// of the segments and the active file is byte-identical to the single file
+    /// this recorder would otherwise have written. Retention and disk bounding
+    /// of the sealed segments are deliberately out of scope here; they belong to
+    /// mdk#1014.
+    ///
+    /// Rotation is transparent to consumers on purpose: `seq`, the recorder
+    /// session id, and the health counters carry across the boundary and no
+    /// `recorder_started` row is fabricated, so an analyzer sees one continuous
+    /// session and the upload endpoint's content-keyed line dedupe never
+    /// re-mints a line just because it moved to a new filename.
+    ///
+    /// Crash safety (`multi-step-state-changes.md`): the rename is atomic and is
+    /// the only step that moves data. A crash between the rename and the fresh
+    /// open leaves the complete segment on disk and no active file, which the
+    /// next open converges from by creating one. If the fresh open fails, the
+    /// segment is renamed back so the still-open writer fd and the active path
+    /// agree again.
+    fn roll_into_segment(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
+        // Best-effort flush so the sealed segment holds everything recorded so
+        // far; the fd survives the rename either way.
+        let _ = inner.writer.flush();
+        let segment = next_segment_path(&self.path)?;
+        std::fs::rename(&self.path, &segment)?;
+        match fs_private::open_private_append(&self.path) {
+            Ok(file) => {
+                inner.writer = BufWriter::new(file);
+                inner.active_bytes = 0;
+                Ok(())
+            }
+            Err(err) => {
+                // Compensate the one applied step. If even this fails the data
+                // is still on disk under the segment name and the writer keeps
+                // appending to it, so no forensic line is lost.
+                let _ = std::fs::rename(&segment, &self.path);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Name stem shared by an audit path and its segments: the file name with a
+/// trailing `.jsonl` removed.
+fn segment_base_name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.strip_suffix(".jsonl")
+        .map(str::to_owned)
+        .unwrap_or(name)
+}
+
+fn segment_path(path: &Path, index: u32) -> PathBuf {
+    let name = format!("{}-seg{index:06}.jsonl", segment_base_name(path));
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Next unclaimed segment name for `path`.
+///
+/// Segments keep the audit path's stem so the app's `audit-*.jsonl` enumeration
+/// still finds them, and sort ahead of the active file (`-` precedes `.`), so
+/// the uploader drains sealed segments before the growing one. The scan-then-
+/// probe walk guarantees a roll never renames over an existing segment, which
+/// would destroy already-recorded data.
+fn next_segment_path(path: &Path) -> std::io::Result<PathBuf> {
+    let prefix = format!("{}-seg", segment_base_name(path));
+    let mut next = 1u32;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(index) = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".jsonl"))
+                .and_then(|digits| digits.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            next = next.max(index.saturating_add(1));
+        }
+    }
+    loop {
+        let candidate = segment_path(path, next);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("audit log segment indexes exhausted"))?;
     }
 }
 

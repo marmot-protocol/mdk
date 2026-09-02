@@ -44,8 +44,14 @@ App runtime bridge for the first real Marmot app surfaces.
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
-  the upload client, and the `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path
-  validation/resolution/removal, and HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+  the upload client, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for
+  audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and HTTP upload. Audit-log
+  unit tests live in its own `#[cfg(test)] mod tests`.
+- Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
+  never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
+  Do not add a trigger path that bypasses the size-1 coalescing queue in `runtime/audit_tracker.rs`, and do not let one
+  oversized or failing file block the files behind it. Retention/deletion of sealed segments is mdk#1014, not this
+  contract.
 - Keep SQLCipher key derivation, per-database salt persistence, legacy-key migration/recovery, and the in-process
   v2-open probe-verdict cache (mdk#1439) in `src/sqlcipher.rs`. The verdict cache is advisory only: a durable
   migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their
