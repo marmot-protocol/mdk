@@ -9,6 +9,20 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.17] - 2026-09-02
+
+### Changed
+
+- Group projection and deferred convergence recovery perform less repeated
+  MLS and storage work. Component projections now share one batched group
+  read, contested-state checks avoid materializing the full candidate graph,
+  pass admission reuses one member walk, and idle deferred-peel sweeps avoid
+  repeatedly recomputing unchanged fingerprints.
+  ([#1617](https://github.com/marmot-protocol/mdk/pull/1617),
+  [#1620](https://github.com/marmot-protocol/mdk/pull/1620),
+  [#1621](https://github.com/marmot-protocol/mdk/pull/1621),
+  [#1622](https://github.com/marmot-protocol/mdk/pull/1622))
+
 ## [0.9.16] - 2026-09-01
 
 ### Added
@@ -1973,7 +1987,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...HEAD
+[0.9.17]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...v0.9.17
 [0.9.16]: https://github.com/marmot-protocol/mdk/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/marmot-protocol/mdk/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/marmot-protocol/mdk/compare/v0.9.13...v0.9.14
