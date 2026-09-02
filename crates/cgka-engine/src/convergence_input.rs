@@ -45,10 +45,7 @@ impl ClassifiedConvergenceInput {
     }
 
     fn can_start_pass(self) -> bool {
-        matches!(
-            self.state,
-            MessageState::Sent | MessageState::Created | MessageState::Retryable
-        )
+        PASS_OPENING_STATES.contains(&self.state)
     }
 
     fn can_gate_outbound(self) -> bool {
@@ -63,6 +60,17 @@ impl ClassifiedConvergenceInput {
 /// same constant keeps the fast path and the classifier in lockstep.
 pub(crate) const OUTBOUND_GATING_STATES: [MessageState; 2] =
     [MessageState::Created, MessageState::Retryable];
+
+/// The states in which a retained input can open a convergence pass
+/// ([`ConvergenceInputContext::opens_pass`]). Pass seeding probes storage for
+/// these before projecting the retained window; the same constant backs
+/// [`ClassifiedConvergenceInput::can_start_pass`] so probe and classifier
+/// stay in lockstep.
+pub(crate) const PASS_OPENING_STATES: [MessageState; 3] = [
+    MessageState::Sent,
+    MessageState::Created,
+    MessageState::Retryable,
+];
 
 #[derive(Default)]
 pub(crate) struct ConvergenceInputContext {

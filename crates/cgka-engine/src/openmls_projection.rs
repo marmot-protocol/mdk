@@ -647,22 +647,35 @@ pub(crate) fn stamp_processed_own_commit_record<S: StorageProvider>(
 pub fn project_mls_message(
     bytes: &[u8],
 ) -> Result<OpenMlsMessageProjection, OpenMlsProjectionError> {
+    Ok(project_protocol_message(bytes)?.0)
+}
+
+/// [`project_mls_message`] that also hands back the parsed
+/// [`ProtocolMessage`] (`None` for a Welcome), so a caller that goes on to
+/// process the message pays one TLS parse instead of two.
+pub(crate) fn project_protocol_message(
+    bytes: &[u8],
+) -> Result<(OpenMlsMessageProjection, Option<ProtocolMessage>), OpenMlsProjectionError> {
     let digest = message_digest(bytes);
     let msg = MlsMessageIn::tls_deserialize_exact(bytes)
         .map_err(|e| OpenMlsProjectionError::Decode(format!("{e:?}")))?;
     let body = msg.extract();
     let Some(protocol) = protocol_message_from_body(body)? else {
-        return Ok(OpenMlsMessageProjection {
-            kind: OpenMlsContentKind::Welcome,
-            source_epoch: None,
-            message_digest: digest,
-        });
+        return Ok((
+            OpenMlsMessageProjection {
+                kind: OpenMlsContentKind::Welcome,
+                source_epoch: None,
+                message_digest: digest,
+            },
+            None,
+        ));
     };
-    Ok(OpenMlsMessageProjection {
+    let projection = OpenMlsMessageProjection {
         kind: kind_from_content_type(protocol.content_type()),
         source_epoch: Some(protocol.epoch().as_u64()),
         message_digest: digest,
-    })
+    };
+    Ok((projection, Some(protocol)))
 }
 
 /// Retire unresolved commits that a verified replacement Welcome superseded.
@@ -741,13 +754,14 @@ pub(crate) fn retire_stale_convergence_deferred_commits<S: StorageProvider>(
     retained_anchor_epoch: u64,
 ) -> Result<Vec<(MessageId, EpochId)>, OpenMlsProjectionError> {
     storage.with_transaction(|storage| {
-        let records = storage.list_messages(group_id, EpochId(0))?;
+        let records = storage.list_messages_in_states(
+            group_id,
+            &[MessageState::ConvergenceDeferred],
+            EpochId(0),
+        )?;
         let mut retired = Vec::new();
 
         for record in records {
-            if record.state != MessageState::ConvergenceDeferred {
-                continue;
-            }
             let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                 continue;
             };
@@ -1780,60 +1794,24 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
     contexts.map(CandidateBranchPeel::contested_over)
 }
 
-/// Whether this group's stored commit graph is contested: two retained commits
-/// at or above the retained anchor fork from the same source epoch.
-///
-/// The replay-free half of [`candidate_branch_peel`]. Deliberately the same
-/// record-contribution rules as the commit arm of
-/// [`seed_stored_openmls_graph_inputs`] and the same fork predicate
-/// ([`SourceEpochForkDetector`], shared with [`commits_share_a_source_epoch`])
-/// — a privately restated notion of "forked" would drift from the one branch
-/// enumeration acts on without any test noticing; the deferral-lineage pair in
-/// `tests/distributed_convergence.rs` pins the parity. Unlike the full seed it
-/// touches commits only — no payload clones, no proposal/app/own-commit
-/// materialization — and returns at the first fork. No snapshot, no rewind,
-/// no OpenMLS replay.
-pub(crate) fn stored_graph_is_contested<S: StorageProvider>(
-    storage: &S,
-    group_id: &GroupId,
-    retained_anchor_epoch: u64,
-) -> Result<bool, OpenMlsProjectionError> {
-    let records = storage
-        .list_messages(group_id, EpochId(0))
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+/// Whether the stored commit graph is contested: two distinct commits fork
+/// from one source epoch. `edges` are `(source_epoch, digest)` pairs of the
+/// retained commits at or above the anchor; the deferral-lineage caller reads
+/// them from the sweep's commit-digest memo, so a backlog of undecryptable
+/// input does not re-decode the group's history per message. Folds through
+/// the same detector as branch enumeration so the two cannot drift; the
+/// deferral-lineage pair in `tests/distributed_convergence.rs` pins the
+/// parity.
+pub(crate) fn commit_edges_are_contested(edges: impl IntoIterator<Item = (u64, [u8; 32])>) -> bool {
     let mut detector = SourceEpochForkDetector::default();
-    for record in records {
-        if !record_state_can_contribute_to_openmls_graph(record.state) {
-            continue;
-        }
-        let payload = StoredMessagePayload::decode(&record.payload)
-            .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
-        let Some(message) = payload.as_openmls_wire() else {
-            continue;
-        };
-        if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-            continue;
-        }
-        let projection = project_mls_message(&message.payload)?;
-        if projection.kind != OpenMlsContentKind::Commit {
-            continue;
-        }
-        let Some(source_epoch) = projection.source_epoch else {
-            continue;
-        };
-        if source_epoch < retained_anchor_epoch {
-            continue;
-        }
-        if detector.observe(source_epoch, projection.message_digest) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    edges
+        .into_iter()
+        .any(|(source_epoch, digest)| detector.observe(source_epoch, digest))
 }
 
 /// Incremental form of the fork predicate: `observe` reports true the moment
 /// two distinct commit digests share a source epoch. Both contested-ness
-/// answers ([`stored_graph_is_contested`] and [`commits_share_a_source_epoch`])
+/// answers ([`commit_edges_are_contested`] and [`commits_share_a_source_epoch`])
 /// fold through this one detector so they cannot drift.
 #[derive(Default)]
 struct SourceEpochForkDetector {
@@ -1851,10 +1829,11 @@ impl SourceEpochForkDetector {
 /// Whether two distinct stored commits fork from the same source epoch — the
 /// structural precondition for more than one candidate branch.
 fn commits_share_a_source_epoch(commits: &[StoredCommitMessage]) -> bool {
-    let mut detector = SourceEpochForkDetector::default();
-    commits
-        .iter()
-        .any(|commit| detector.observe(commit.source_epoch, commit.digest))
+    commit_edges_are_contested(
+        commits
+            .iter()
+            .map(|commit| (commit.source_epoch, commit.digest)),
+    )
 }
 
 /// Enumerate and capture branch tips from the state currently restored.
@@ -3073,8 +3052,20 @@ fn record_state_is_canonicalization_input(state: MessageState) -> bool {
 /// this rather than restating the match. A restatement drifts silently: the
 /// graph and its describer disagree, and nothing fails.
 pub(crate) fn record_state_can_contribute_to_openmls_graph(state: MessageState) -> bool {
-    record_state_is_canonicalization_input(state) || state == MessageState::Processed
+    OPENMLS_GRAPH_INPUT_STATES.contains(&state)
 }
+
+/// The states [`record_state_can_contribute_to_openmls_graph`] accepts, as a
+/// slice for indexed `list_messages_in_states` calls. Pass seeding lists on
+/// this so a bounded window is materialized instead of the group's whole
+/// retained history.
+pub(crate) const OPENMLS_GRAPH_INPUT_STATES: [MessageState; 5] = [
+    MessageState::Sent,
+    MessageState::Created,
+    MessageState::Retryable,
+    MessageState::ConvergenceDeferred,
+    MessageState::Processed,
+];
 
 fn unresolved_commit_state(state: MessageState) -> bool {
     matches!(
@@ -3485,9 +3476,9 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     // not be the state the commit actually produces there.
     let mut prefix_canonical = true;
     for message in messages {
-        let projection = project_mls_message(&message.payload)?;
+        let (projection, protocol) = project_protocol_message(&message.payload)?;
         let message_id = hex::encode(message.id.as_slice());
-        let Some(protocol) = protocol_message_from_bytes(&message.payload)? else {
+        let Some(protocol) = protocol else {
             observations.push(OpenMlsReplayObservation::Ignored {
                 message_id,
                 kind: projection.kind,
