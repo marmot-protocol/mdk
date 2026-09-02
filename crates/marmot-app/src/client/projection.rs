@@ -570,8 +570,9 @@ impl AppClient {
     /// Build the full [`EventGroupProjection`] for one group: one batched
     /// engine read answers all 7 components (instead of 7 state loads), plus
     /// the admin-policy lookup. Per-component fallbacks match the individual
-    /// `*_for_group` helpers. Errs only when the routing component is missing
-    /// or unreadable — the projection is unusable without a route.
+    /// `*_for_group` helpers. Errs when the batched component read itself
+    /// fails, or when the routing component is missing or unparseable — the
+    /// projection is unusable without a route.
     pub(crate) fn event_group_projection<'a>(
         &self,
         group_id: &GroupId,
