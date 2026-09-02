@@ -716,6 +716,11 @@ impl MissingRelayListKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountRelayListState {
     pub kind: u64,
+    /// Timestamp of the replaceable event that produced this cached state.
+    ///
+    /// Zero denotes a legacy or caller-constructed state with unknown recency.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub created_at: u64,
     /// Direction-appropriate relay targets for this list.
     ///
     /// For NIP-65 kind 10002 this is specifically the write-capable set:
@@ -734,6 +739,10 @@ pub struct AccountRelayListState {
     /// `relays` field. Empty for non-NIP-65 lists and for legacy cache records.
     #[serde(default)]
     pub write_relays: Vec<String>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -768,12 +777,14 @@ impl AccountRelayListStatus {
             bootstrap_relays: Vec::new(),
             nip65: AccountRelayListState {
                 kind: KIND_NIP65_RELAY_LIST,
+                created_at: 0,
                 relays: Vec::new(),
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),
             },
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                created_at: 0,
                 relays: Vec::new(),
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),
@@ -1957,12 +1968,14 @@ impl MarmotApp {
                 .collect(),
             nip65: AccountRelayListState {
                 kind: KIND_NIP65_RELAY_LIST,
+                created_at: requests[0].event.created_at,
                 relays: relays.clone(),
                 read_relays: relays.clone(),
                 write_relays: relays.clone(),
             },
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                created_at: requests[1].event.created_at,
                 relays,
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),
@@ -2254,7 +2267,7 @@ impl MarmotApp {
         // again adds no confirmation strength and used to turn a post-success
         // read outage into account-setup rollback (mdk#1436).
         let mut status = self.account_relay_list_status_for_account_id(&account_id_hex)?;
-        for list_kind in list_kinds {
+        for (list_kind, request) in list_kinds.iter().zip(&requests) {
             match list_kind {
                 NostrAccountRelayListKind::Nip65 => {
                     let (read_relays, write_relays) = nip65_relay_set
@@ -2282,6 +2295,7 @@ impl MarmotApp {
                         });
                     status.nip65 = AccountRelayListState {
                         kind: KIND_NIP65_RELAY_LIST,
+                        created_at: request.event.created_at,
                         relays: write_relays.clone(),
                         read_relays,
                         write_relays,
@@ -2290,6 +2304,7 @@ impl MarmotApp {
                 NostrAccountRelayListKind::Inbox => {
                     status.inbox = AccountRelayListState {
                         kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                        created_at: request.event.created_at,
                         relays: bootstrap
                             .default_relays
                             .iter()
@@ -6262,6 +6277,7 @@ fn relay_list_state_from_event(event: &NostrTransportEvent) -> Option<AccountRel
                 .collect::<Vec<_>>();
             Some(AccountRelayListState {
                 kind: KIND_NIP65_RELAY_LIST,
+                created_at: event.created_at,
                 relays: write_relays.clone(),
                 read_relays,
                 write_relays,
@@ -6278,6 +6294,7 @@ fn relay_list_state_from_event(event: &NostrTransportEvent) -> Option<AccountRel
             }
             Some(AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                created_at: event.created_at,
                 relays,
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),

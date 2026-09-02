@@ -7943,26 +7943,33 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let account_id = "22".repeat(32);
-    let record = |tags| crate::relay_plane::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://source.example".into())],
-        event: NostrTransportEvent::new_unsigned(
+    let record = |created_at, tags| {
+        let mut event = NostrTransportEvent::new_unsigned(
             account_id.clone(),
             KIND_NIP65_RELAY_LIST,
             tags,
             String::new(),
-        ),
+        );
+        event.created_at = created_at;
+        crate::relay_plane::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://source.example".into())],
+            event,
+        }
     };
 
-    app.ingest_directory_relay_event(record(vec![vec![
-        "r".into(),
-        "wss://stale-write.example".into(),
-    ]]))
+    app.ingest_directory_relay_event(record(
+        1,
+        vec![vec!["r".into(), "wss://stale-write.example".into()]],
+    ))
     .unwrap();
-    app.ingest_directory_relay_event(record(vec![vec![
-        "r".into(),
-        "wss://read-only.example".into(),
-        "read".into(),
-    ]]))
+    app.ingest_directory_relay_event(record(
+        2,
+        vec![vec![
+            "r".into(),
+            "wss://read-only.example".into(),
+            "read".into(),
+        ]],
+    ))
     .unwrap();
 
     let cached = app
@@ -7978,9 +7985,57 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
 }
 
 #[test]
+fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_id = "23".repeat(32);
+
+    for (kind, tag_name) in [
+        (KIND_NIP65_RELAY_LIST, "r"),
+        (KIND_MARMOT_INBOX_RELAY_LIST, "relay"),
+    ] {
+        let record = |created_at, relay: &str| {
+            let mut event = NostrTransportEvent::new_unsigned(
+                account_id.clone(),
+                kind,
+                vec![vec![tag_name.into(), relay.into()]],
+                String::new(),
+            );
+            event.created_at = created_at;
+            crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://source.example".into())],
+                event,
+            }
+        };
+
+        app.ingest_directory_relay_event(record(20, "wss://new.example"))
+            .unwrap();
+        app.ingest_directory_relay_event(record(10, "wss://old.example"))
+            .unwrap();
+        app.ingest_directory_relay_event(record(20, "wss://equal.example"))
+            .unwrap();
+
+        let cached = app
+            .directory_entry_for_account_id(&account_id)
+            .unwrap()
+            .expect("cached relay list");
+        let state = if kind == KIND_NIP65_RELAY_LIST {
+            cached.relay_lists.nip65
+        } else {
+            cached.relay_lists.inbox
+        };
+        assert_eq!(state.relays, vec!["wss://new.example"]);
+    }
+}
+
+#[test]
 fn nip65_setter_round_trip_preserves_existing_roles() {
     let current = AccountRelayListState {
         kind: KIND_NIP65_RELAY_LIST,
+        created_at: 0,
         relays: vec!["wss://both.example".into(), "wss://write.example".into()],
         read_relays: vec!["wss://both.example".into(), "wss://read.example".into()],
         write_relays: vec!["wss://both.example".into(), "wss://write.example".into()],

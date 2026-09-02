@@ -262,6 +262,10 @@ fn directory_record_recency(entry: &UserDirectoryRecord) -> u64 {
                 .as_ref()
                 .map(|key_package| key_package.created_at),
         )
+        .chain([
+            entry.relay_lists.nip65.created_at,
+            entry.relay_lists.inbox.created_at,
+        ])
         .max()
         .unwrap_or_default()
 }
