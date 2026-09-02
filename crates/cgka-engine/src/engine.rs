@@ -146,6 +146,7 @@ pub struct Engine<S: StorageProvider> {
     /// Per-group state-machine owner. Every transition, pending-ref
     /// allocation, and fork-detection marker flows through this struct.
     pub(crate) epoch_manager: crate::epoch_manager::EpochManager,
+    pub(crate) mls_group_cache: crate::mls_group_cache::MlsGroupCache,
 
     /// Storage-layer identity of the origin commit behind each in-flight
     /// pending publish, so `do_confirm_published` can mark the sent commit
@@ -556,6 +557,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             wall_clock: self.wall_clock,
             maintenance_random: self.maintenance_random,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
+            mls_group_cache: crate::mls_group_cache::MlsGroupCache::default(),
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
             auto_publish_buf: VecDeque::new(),
@@ -2943,28 +2945,23 @@ impl<S: StorageProvider> Engine<S> {
         self.update_stored_message_state(id, MessageState::Processed)
     }
 
-    /// One liveness-gated `MlsGroup::load` for read-only accessors. A missing
-    /// group maps to `UnknownGroup`.
-    fn live_mls_group(&self, group_id: &GroupId) -> Result<openmls::group::MlsGroup, EngineError> {
+    /// Liveness-gated read-only access to the group's `MlsGroup`, served from
+    /// the engine's group cache. A missing group maps to `UnknownGroup`.
+    fn with_live_mls_group<R>(
+        &self,
+        group_id: &GroupId,
+        f: impl FnOnce(&openmls::group::MlsGroup) -> Result<R, EngineError>,
+    ) -> Result<R, EngineError> {
         self.ensure_group_live(group_id)?;
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))
+        self.with_mls_group(group_id, f)
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS
     /// group state.
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> Result<Vec<[u8; 32]>, EngineError> {
-        let mls_group = self.live_mls_group(group_id)?;
-        let mut admins = crate::app_components::admins_of_group(&mls_group)?;
+        let mut admins = self.with_live_mls_group(group_id, |mls_group| {
+            crate::app_components::admins_of_group(mls_group)
+        })?;
         admins.sort();
         admins.dedup();
         Ok(admins)
@@ -3024,21 +3021,21 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<EpochId, EngineError> {
-        let mls_group = self.live_mls_group(group_id)?;
+        self.with_live_mls_group(group_id, |mls_group| {
+            let required_components =
+                crate::app_components::required_app_components_of_group(mls_group)?;
+            if !required_components.contains(component_id) {
+                return Err(EngineError::Other(format!(
+                    "group does not require app component {component_id:#06x}"
+                )));
+            }
 
-        let required_components =
-            crate::app_components::required_app_components_of_group(&mls_group)?;
-        if !required_components.contains(component_id) {
-            return Err(EngineError::Other(format!(
-                "group does not require app component {component_id:#06x}"
-            )));
-        }
-
-        if let Some(staged) = mls_group.pending_commit() {
-            Ok(EpochId(staged.group_context().epoch().as_u64()))
-        } else {
-            Ok(EpochId(mls_group.epoch().as_u64()))
-        }
+            if let Some(staged) = mls_group.pending_commit() {
+                Ok(EpochId(staged.group_context().epoch().as_u64()))
+            } else {
+                Ok(EpochId(mls_group.epoch().as_u64()))
+            }
+        })
     }
 }
 
@@ -3183,13 +3180,9 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         // MemberValidationFailed) — never export its secrets.
         self.ensure_group_live(group_id)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let mls_group = self
+            .take_mls_group(group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         // When the group is in `PendingPublish`, the MLS group is at the
         // pre-stage epoch but the staged commit carries the projected
         // future state. Project so callers see the same epoch the rest of
@@ -3282,13 +3275,15 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
             crate::group_lifecycle::AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY.to_string(),
             cgka_traits::SecretBytes::new(stream_secret),
         );
-        Ok(Box::new(crate::group_context_view::GroupContextView::new(
+        let view = crate::group_context_view::GroupContextView::new(
             EpochId(epoch),
             map,
             Some(crate::app_components::transport_group_id_of_group(
                 &mls_group,
             )?),
-        )))
+        );
+        self.return_mls_group(group_id, mls_group);
+        Ok(Box::new(view))
     }
 
     fn safe_export_secret(
@@ -3305,11 +3300,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<Option<Vec<u8>>, EngineError> {
-        let mls_group = self.live_mls_group(group_id)?;
-        Ok(crate::app_components::app_component_data_of_group(
-            &mls_group,
-            component_id,
-        ))
+        self.with_live_mls_group(group_id, |mls_group| {
+            Ok(crate::app_components::app_component_data_of_group(
+                mls_group,
+                component_id,
+            ))
+        })
     }
 
     // One `MlsGroup::load` (13 storage reads + a ratchet-tree deserialize)
@@ -3319,13 +3315,14 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         group_id: &GroupId,
         component_ids: &[AppComponentId],
     ) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
-        let mls_group = self.live_mls_group(group_id)?;
-        Ok(component_ids
-            .iter()
-            .map(|component_id| {
-                crate::app_components::app_component_data_of_group(&mls_group, *component_id)
-            })
-            .collect())
+        self.with_live_mls_group(group_id, |mls_group| {
+            Ok(component_ids
+                .iter()
+                .map(|component_id| {
+                    crate::app_components::app_component_data_of_group(mls_group, *component_id)
+                })
+                .collect())
+        })
     }
 
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {

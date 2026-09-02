@@ -381,11 +381,7 @@ impl<S: StorageProvider> Engine<S> {
 
         // Load MlsGroup from storage.
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = match MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        ) {
+        let mut mls_group = match self.take_mls_group(&group_id) {
             Ok(Some(g)) => g,
             Ok(None) => {
                 self.persist_transport_message_for_existing_group(
@@ -1235,6 +1231,7 @@ impl<S: StorageProvider> Engine<S> {
                 // the content-derived id so a re-wrapped duplicate is caught
                 // before the durable lookup.
                 self.seen_message_ids.insert(msg.id.clone());
+                self.return_mls_group(&group_id, mls_group);
                 Ok(IngestOutcome::Processed)
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
@@ -1607,6 +1604,7 @@ impl<S: StorageProvider> Engine<S> {
                 // the content-derived id so a re-wrapped duplicate commit is
                 // caught before the durable lookup.
                 self.seen_message_ids.insert(msg.id.clone());
+                self.return_mls_group(&group_id, mls_group);
                 Ok(IngestOutcome::Processed)
             }
             ProcessedMessageContent::ProposalMessage(queued) => {
@@ -1664,6 +1662,7 @@ impl<S: StorageProvider> Engine<S> {
                         self.convergence_now_ms(),
                     )?;
                 }
+                self.return_mls_group(&group_id, mls_group);
                 self.valid_proposal_groups.insert(group_id);
                 Ok(IngestOutcome::Processed)
             }

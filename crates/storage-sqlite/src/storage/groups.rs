@@ -40,6 +40,7 @@ impl GroupStorage for SqliteAccountStorage {
     }
 
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
+        self.connection.note_openmls_write();
         let mls_group_key = mls_group_key(id)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
