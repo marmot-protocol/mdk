@@ -99,6 +99,10 @@ pub enum SqliteOpenMlsStorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("encoding failure: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("decoding failure: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
     #[error("queued proposal reference was present without a queued proposal")]
     MissingQueuedProposal,
 }
