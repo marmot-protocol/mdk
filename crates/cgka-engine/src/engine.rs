@@ -2219,66 +2219,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// The durable group record, or `None` for an unknown group — callers
-    /// fail those with their own unknown-group handling.
-    ///
-    /// The outbound gates read this once and answer the removed,
-    /// unrecoverable, and legacy-profile checks from the same record instead
-    /// of paying one O(members) deserialize per check. `removed` marks a
-    /// realized self-eviction (member-departure.md "Realizing removal"),
-    /// terminal for outbound work; it clears through an authenticated re-join
-    /// (`do_join_welcome` rebuilds the record) or when branch selection
-    /// supersedes the removal that set it — the convergence reorg path
-    /// re-derives membership from the selected canonical branch
-    /// (`emit_convergence_events`).
-    pub(crate) fn stored_group_record(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<Group>, EngineError> {
-        match self.storage.get_group(group_id) {
-            Ok(group) => Ok(Some(group)),
-            Err(StorageError::NotFound) => Ok(None),
-            Err(err) => Err(EngineError::Storage(err)),
-        }
-    }
-
-    /// Ensure a durable `Unrecoverable` halt is reflected in the in-memory
-    /// epoch map (mdk#971). Returns `true` when the group is halted. Used as
-    /// defense-in-depth on paths that may run before or without session-open
-    /// hydration so a persisted marker cannot be skipped by a bare
-    /// `set_stable` overwrite.
-    pub(crate) fn sync_unrecoverable_halt_from_storage(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<bool, EngineError> {
-        if self.epoch_manager.is_unrecoverable(group_id) {
-            return Ok(true);
-        }
-        let group = self.stored_group_record(group_id)?;
-        Ok(self.sync_unrecoverable_halt_from_record(group_id, group.as_ref()))
-    }
-
-    /// [`Self::sync_unrecoverable_halt_from_storage`] for a caller that has
-    /// already read the group record (`None` for an unknown group).
-    pub(crate) fn sync_unrecoverable_halt_from_record(
-        &mut self,
-        group_id: &GroupId,
-        group: Option<&Group>,
-    ) -> bool {
-        if self.epoch_manager.is_unrecoverable(group_id) {
-            return true;
-        }
-        let Some(group) = group else {
-            return false;
-        };
-        if !group.unrecoverable {
-            return false;
-        }
-        self.epoch_manager
-            .restore_unrecoverable(group_id.clone(), group.epoch);
-        true
-    }
-
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
     /// retained artifact in place.
     ///
