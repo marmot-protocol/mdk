@@ -472,11 +472,19 @@ for every surviving member and also require global quiescence.
 `generate_offline_catchup_pressure_family(seed, cases)` specializes the production symptom where a founding member is
 offline for nearly the complete scenario and then processes a large retained-relay history at the end. Cost-ordered
 blocks contain 24, 96, 384, and 1,024 application messages interleaved with epoch commits. Six arms vary natural versus
-reverse history, duplicate replay, incremental plus full repair, restart before backlog processing, and competing
-commit waves. Terminal expectations require Bob's exact payload multiset, exact canonical equality, no pending work,
-and an active decryptability probe after recovery.
+reverse history, reverse three-copy replay, natural two-copy incremental plus full repair, reverse two-copy restart
+before backlog processing, and reverse three-copy competing commit waves. Terminal expectations require Bob's exact
+payload multiset, exact canonical equality, no pending work, and an active decryptability probe after recovery.
 
-Run the family directly:
+Run a stateful chat journey directly:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
+  --family chat-journey/v1 --seed 42 --cases 10 \
+  --out target/chat-journey-reports --storage file --strict-oracle
+```
+
+Run the offline catch-up family directly:
 
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \

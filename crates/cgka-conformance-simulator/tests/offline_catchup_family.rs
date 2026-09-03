@@ -64,6 +64,33 @@ fn complete_catalog_covers_volume_relay_and_recovery_boundaries() {
                     .count(),
                 profile.workload_commit_count
             );
+            let distinct_committers = case
+                .scenario
+                .steps
+                .iter()
+                .filter_map(|step| match step {
+                    ScenarioStep::UpdateGroupData { client, .. } => Some(client.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(profile.active_committer_count, distinct_committers.len());
+            assert_eq!(
+                profile.committer_mode,
+                if case.case_index % 6 == 5 {
+                    "rival-pair-per-round"
+                } else {
+                    "rotating-sequential"
+                }
+            );
+            let expected_copies = [1, 1, 3, 2, 2, 3]
+                [usize::try_from(case.case_index % 6).expect("arm index fits usize")];
+            assert_eq!(
+                profile.disruption,
+                format!(
+                    "{}/copies-{expected_copies}",
+                    case.scenario.name.rsplit('/').next().unwrap()
+                )
+            );
             compile_scenario(&case.scenario)
                 .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
         }
@@ -93,6 +120,14 @@ fn complete_catalog_covers_volume_relay_and_recovery_boundaries() {
         )));
         assert!(block[3].scenario.steps.iter().any(|step| matches!(
             step,
+            ScenarioStep::ConfigureRelay {
+                order: ScenarioRelayOrderV2::Natural,
+                duplicate_copies: 2,
+                ..
+            }
+        )));
+        assert!(block[3].scenario.steps.iter().any(|step| matches!(
+            step,
             ScenarioStep::SyncRelayHistory {
                 sync: ScenarioRelaySyncModeV2::Incremental,
                 ..
@@ -102,6 +137,14 @@ fn complete_catalog_covers_volume_relay_and_recovery_boundaries() {
             step,
             ScenarioStep::SyncRelayHistory {
                 sync: ScenarioRelaySyncModeV2::FullHistory,
+                ..
+            }
+        )));
+        assert!(block[4].scenario.steps.iter().any(|step| matches!(
+            step,
+            ScenarioStep::ConfigureRelay {
+                order: ScenarioRelayOrderV2::Reverse,
+                duplicate_copies: 2,
                 ..
             }
         )));

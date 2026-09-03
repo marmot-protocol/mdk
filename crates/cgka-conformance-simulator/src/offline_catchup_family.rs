@@ -16,8 +16,11 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
+/// Stable family identifier recorded in generated inputs and reports.
 pub const OFFLINE_CATCHUP_PRESSURE_FAMILY: &str = "offline-catchup-pressure/v1";
+/// Generator revision for replaying an exact seeded case.
 pub const OFFLINE_CATCHUP_PRESSURE_GENERATOR_VERSION: &str = "1";
+/// Workload-profile schema revision emitted by this family.
 pub const OFFLINE_CATCHUP_PRESSURE_PROFILE_VERSION: &str = "1";
 
 const ARM_COUNT: u64 = 6;
@@ -72,6 +75,7 @@ enum CatchupArm {
 }
 
 impl CatchupArm {
+    /// Maps consecutive case indices onto the six recovery shapes.
     fn from_index(case_index: u64) -> Self {
         match case_index % ARM_COUNT {
             0 => Self::NaturalFullHistory,
@@ -83,6 +87,7 @@ impl CatchupArm {
         }
     }
 
+    /// Returns the replay-stable arm label used in scenario metadata.
     fn name(self) -> &'static str {
         match self {
             Self::NaturalFullHistory => "natural-full-history",
@@ -94,6 +99,7 @@ impl CatchupArm {
         }
     }
 
+    /// Selects the retained-relay ordering applied during catch-up.
     fn relay_order(self) -> ScenarioRelayOrderV2 {
         match self {
             Self::NaturalFullHistory | Self::IncrementalThenFull => ScenarioRelayOrderV2::Natural,
@@ -101,6 +107,7 @@ impl CatchupArm {
         }
     }
 
+    /// Returns how many copies of each matching retained event a query returns.
     fn duplicate_copies(self) -> usize {
         match self {
             Self::ReverseDuplicateHistory | Self::CompetingCommitWaves => 3,
@@ -109,15 +116,13 @@ impl CatchupArm {
         }
     }
 
-    fn active_committer_count(self) -> usize {
-        if self == Self::CompetingCommitWaves {
-            2
-        } else {
-            3
-        }
+    /// Names the recovery shape and exact retained-event multiplicity.
+    fn disruption(self) -> String {
+        format!("{}/copies-{}", self.name(), self.duplicate_copies())
     }
 }
 
+/// Generates a stable prefix of offline catch-up pressure cases.
 pub fn generate_offline_catchup_pressure_family(
     seed: u64,
     cases: usize,
@@ -127,6 +132,7 @@ pub fn generate_offline_catchup_pressure_family(
         .collect()
 }
 
+/// Generates one replay-stable offline catch-up pressure case.
 pub fn generate_offline_catchup_pressure_case(seed: u64, case_index: u64) -> GeneratedScenarioCase {
     let mut rng = StdRng::seed_from_u64(seed ^ 0x0FF1_1ECA_7C4D_0001 ^ case_index.rotate_left(29));
     let arm = CatchupArm::from_index(case_index);
@@ -162,6 +168,7 @@ pub fn generate_offline_catchup_pressure_case(seed: u64, case_index: u64) -> Gen
     let mut remaining_messages = volume.application_messages;
     let mut message_index = 0_usize;
     let mut workload_commit_count = 0_usize;
+    let mut active_committers = std::collections::BTreeSet::new();
     let active_senders = ["alice", "carol", "david"];
 
     for round in 0..volume.commit_rounds {
@@ -188,6 +195,7 @@ pub fn generate_offline_catchup_pressure_case(seed: u64, case_index: u64) -> Gen
             1
         };
         for (branch, committer) in committers.iter().take(commits_this_round).enumerate() {
+            active_committers.insert(*committer);
             let pending = format!("state-{round}-{branch}");
             steps.push(ScenarioStep::UpdateGroupData {
                 client: (*committer).into(),
@@ -314,11 +322,11 @@ pub fn generate_offline_catchup_pressure_case(seed: u64, case_index: u64) -> Gen
             initial_admin_count: clients.len(),
             final_admin_count: clients.len(),
             committer_mode: if arm == CatchupArm::CompetingCommitWaves {
-                "rival-2".into()
+                "rival-pair-per-round".into()
             } else {
                 "rotating-sequential".into()
             },
-            active_committer_count: arm.active_committer_count(),
+            active_committer_count: active_committers.len(),
             traffic_profile: format!(
                 "offline-backlog-{}-applications",
                 volume.application_messages
@@ -326,7 +334,7 @@ pub fn generate_offline_catchup_pressure_case(seed: u64, case_index: u64) -> Gen
             application_message_count: volume.application_messages,
             workload_commit_count,
             formation: "founding-member-before-offline".into(),
-            disruption: arm.name().into(),
+            disruption: arm.disruption(),
         }),
         subject: GeneratedSubjectKind::RetainedRelay,
         scenario,
@@ -334,6 +342,7 @@ pub fn generate_offline_catchup_pressure_case(seed: u64, case_index: u64) -> Gen
     }
 }
 
+/// Appends one retained-history query followed by a processing tick.
 fn sync_and_tick(steps: &mut Vec<ScenarioStep>, sync: ScenarioRelaySyncModeV2) {
     steps.push(ScenarioStep::SyncRelayHistory {
         clients: vec![OFFLINE_CLIENT.into()],
@@ -344,6 +353,7 @@ fn sync_and_tick(steps: &mut Vec<ScenarioStep>, sync: ScenarioRelaySyncModeV2) {
     });
 }
 
+/// Builds an accepted acknowledgement for one named publication.
 fn accepted_publication(client: &str, publication: &str) -> ScenarioStep {
     ScenarioStep::AcknowledgeOutbound {
         client: client.into(),
@@ -353,6 +363,7 @@ fn accepted_publication(client: &str, publication: &str) -> ScenarioStep {
     }
 }
 
+/// Builds an accepted acknowledgement for every pending outbound artifact.
 fn accept_all_outbound(client: &str) -> ScenarioStep {
     ScenarioStep::AcknowledgeOutbound {
         client: client.into(),
@@ -362,6 +373,7 @@ fn accept_all_outbound(client: &str) -> ScenarioStep {
     }
 }
 
+/// Builds the explicit four-client, retain-all relay topology used by the family.
 fn retained_relay_topology(clients: &[String]) -> ScenarioTopologyV2 {
     ScenarioTopologyV2 {
         accounts: clients
@@ -398,6 +410,7 @@ fn retained_relay_topology(clients: &[String]) -> ScenarioTopologyV2 {
     }
 }
 
+/// Converts a fixed array of labels into owned scenario strings.
 fn labels<const N: usize>(items: [&str; N]) -> Vec<String> {
     items.into_iter().map(String::from).collect()
 }

@@ -147,10 +147,11 @@ generator tests already compile all 54 shapes without running the expensive larg
 
 For `offline-catchup-pressure/v1`, six consecutive cases form one volume block: 24, 96, 384, then 1,024 application
 messages, interleaved with 4, 8, 12, then 16 commit rounds. Each block covers natural full history, reverse history,
-reverse history with three copies, incremental followed by full repair, restart after sync but before processing, and
-reverse/duplicated history containing competing commit waves. Cases `0..5` are the smoke block, `0..11` run through
-96 messages, `0..17` through 384, and `0..23` complete the 1,024-message catalog. Every case uses the retained-relay
-subject and keeps Bob offline until the final catch-up phase. Use the isolated file-backed runner for volume campaigns:
+reverse history with three copies, natural two-copy incremental followed by full repair, reverse two-copy restart after
+sync but before processing, and reverse three-copy history containing competing commit waves. Cases `0..5` are the
+smoke block, `0..11` run through 96 messages, `0..17` through 384, and `0..23` complete the 1,024-message catalog. Every
+case uses the retained-relay subject and keeps Bob offline until the final catch-up phase. Use the isolated file-backed
+runner for volume campaigns:
 
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked -- \

@@ -892,11 +892,14 @@ cost-ordered six-arm blocks contain 24/96/384/1,024 application messages interle
 The competing-wave arm publishes two same-epoch group-state commits per round.
 
 Each block covers natural full-history recovery, reverse full history, reverse history with three returned copies,
-incremental followed by full repair, restart after history sync but before processing, and reverse/duplicated competing
-commit waves. A pre-reconnect assertion proves Bob has not received the first backlog payload; the terminal phase
-requires the last payload exactly once, the complete backlog payload multiset exactly once, exact canonical equality,
-no pending work, and active bidirectional decryptability involving Bob. The family always selects the retained-relay
-subject so reconnect means a durable history query rather than healing an in-memory packet partition.
+natural two-copy incremental followed by full repair, reverse two-copy restart after history sync but before
+processing, and reverse three-copy competing commit waves. A pre-reconnect assertion proves Bob has not received the
+first backlog payload; the terminal phase requires the last payload exactly once, the complete backlog payload multiset
+exactly once, exact canonical equality, no pending work, and active bidirectional decryptability involving Bob. The
+family always selects the retained-relay subject so reconnect means a durable history query rather than healing an
+in-memory packet partition.
+
+### General Simulator Integrity Checks
 
 These tests keep the simulator machinery honest.
 

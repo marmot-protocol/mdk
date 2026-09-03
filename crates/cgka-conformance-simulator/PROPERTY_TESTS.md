@@ -266,14 +266,15 @@ normal PR path.
 Generates a replay-stable retained-relay catalog for large terminal catch-up. Bob is a founding member, goes offline
 before workload generation, and reconnects only after every application and state commit has been retained. Four
 cost-ordered volume blocks contain 24/96/384/1,024 application messages and 4/8/12/16 commit rounds. Six arms cover
-natural and reverse history, duplicate replay, incremental plus full repair, restart after sync but before processing,
-and competing commit waves.
+natural and reverse history, reverse three-copy replay, natural two-copy incremental plus full repair, reverse two-copy
+restart after sync but before processing, and reverse three-copy competing commit waves.
 
 `tests/offline_catchup_family.rs` pins same-seed determinism, different-seed variation, prefix stability, registration,
-profile provenance, every volume/recovery arm, terminal-only reconnect, the pre-catch-up zero-delivery boundary, the
-post-catch-up exact-one boundary, full Bob payload multiplicity, exact canonical equivalence, no pending work, active
-decryptability, and encrypted file-backed natural/duplicate canaries. The ordinary test lane executes only two
-24-message cases; larger blocks belong in isolated manual or scheduled campaigns.
+profile provenance (including exact distinct-committer and retained-copy counts), every volume/recovery arm,
+terminal-only reconnect, the pre-catch-up zero-delivery boundary, the post-catch-up exact-one boundary, full Bob payload
+multiplicity, exact canonical equivalence, no pending work, active decryptability, and encrypted file-backed
+natural/duplicate canaries. The ordinary test lane executes only two 24-message cases; larger blocks belong in isolated
+manual or scheduled campaigns.
 
 ### `cross-route-restart-permutations/v1`
 
