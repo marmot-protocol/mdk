@@ -13,6 +13,7 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationResult};
+use cgka_engine::conformance_snapshot::ConformanceStructuralProgressSnapshot;
 use cgka_engine::engine_metrics::{EngineMetricsSnapshot, HistogramSnapshot};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, Engine, EngineBuilder};
@@ -200,10 +201,27 @@ fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
     target.overflow_count = target.overflow_count.saturating_add(source.overflow_count);
 }
 
+fn ensure_convergence_drain_progress(
+    attempts: usize,
+    continuation_scheduled: bool,
+    initial: &ConformanceStructuralProgressSnapshot,
+    current: &ConformanceStructuralProgressSnapshot,
+) -> Result<(), EngineError> {
+    if attempts == HARNESS_CONVERGENCE_DRAIN_PASSES && continuation_scheduled && initial == current
+    {
+        return Err(EngineError::Backend(
+            "convergence scheduler repeated a drain without structural progress".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod metric_tests {
     use super::*;
+    use cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot;
     use cgka_engine::engine_metrics::HistogramBucket;
+    use cgka_traits::engine_state::GroupLifecycleState;
 
     fn histogram(upper_bound: u64, count: u64, overflow_count: u64) -> HistogramSnapshot {
         HistogramSnapshot {
@@ -253,6 +271,85 @@ mod metric_tests {
         merge_engine_metrics(&mut target, &source);
 
         assert_eq!(target, source);
+    }
+
+    #[test]
+    fn eight_repeated_convergence_drain_states_are_a_typed_failure() {
+        let progress = structural_progress(7);
+
+        let error = ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &progress,
+            &progress,
+        )
+        .expect_err("identical scheduled state must not spin");
+
+        assert!(
+            matches!(error, EngineError::Backend(message) if message.contains("without structural progress"))
+        );
+    }
+
+    #[test]
+    fn seven_repeated_convergence_drain_states_can_continue() {
+        let progress = structural_progress(7);
+
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES - 1,
+            true,
+            &progress,
+            &progress,
+        )
+        .expect("the deterministic slice still has one attempt left");
+    }
+
+    #[test]
+    fn changed_convergence_drain_state_can_continue_after_eight_attempts() {
+        let previous = structural_progress(7);
+        let current = structural_progress(8);
+
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &previous,
+            &current,
+        )
+        .expect("a later pass generation is structural progress");
+    }
+
+    #[test]
+    fn large_retained_history_can_continue_in_a_later_bounded_slice() {
+        // The 384-message natural-history case advances through twelve commit
+        // rounds. Eight fit in the first harness slice; the remaining four are
+        // valid work for the following scenario tick.
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &structural_progress(1),
+            &structural_progress(9),
+        )
+        .expect("the first bounded slice made progress");
+        ensure_convergence_drain_progress(
+            4,
+            false,
+            &structural_progress(9),
+            &structural_progress(13),
+        )
+        .expect("the following tick can settle the retained history");
+    }
+
+    fn structural_progress(pass_generation: u64) -> ConformanceStructuralProgressSnapshot {
+        ConformanceStructuralProgressSnapshot {
+            current_epoch: pass_generation,
+            current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
+            lifecycle: GroupLifecycleState::Stable,
+            pending_work: ConformancePendingWorkSnapshot::default(),
+            pass_generation: Some(pass_generation),
+            pass_phase: Some(ConvergencePassPhase::Resolving),
+            earliest_next_wake_monotonic_ms: None,
+            runnable_work: 1,
+            terminal_unrecoverable: false,
+        }
     }
 }
 
@@ -1696,12 +1793,26 @@ impl HarnessClient {
         outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
     ) {
         let now_ms = self.harness_convergence_now_ms();
+        let mut successful_attempts =
+            HashMap::<GroupId, (usize, ConformanceStructuralProgressSnapshot)>::new();
+        let mut encountered_error = false;
         for _ in 0..HARNESS_CONVERGENCE_DRAIN_PASSES {
             let groups = self.engine_mut().drain_pending_convergence_groups();
             if groups.is_empty() {
                 return;
             }
             for group_id in groups {
+                let progress = match self
+                    .engine()
+                    .conformance_structural_progress_snapshot(&group_id)
+                {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        outcomes.push(Err(error));
+                        encountered_error = true;
+                        continue;
+                    }
+                };
                 let results = match self
                     .engine_mut()
                     .converge_and_drain_queued_outbound_intents(&group_id, now_ms)
@@ -1710,21 +1821,58 @@ impl HarnessClient {
                     Ok(results) => results,
                     Err(e) => {
                         outcomes.push(Err(e));
+                        encountered_error = true;
                         continue;
                     }
                 };
+                let mut attempt_succeeded = true;
                 self.capture_engine_events();
                 for result in results {
                     if let Err(e) = self.publish_send_result(result).await {
                         outcomes.push(Err(e));
+                        attempt_succeeded = false;
+                        encountered_error = true;
                     }
                 }
                 self.drain_auto_publish().await;
+                if attempt_succeeded {
+                    successful_attempts
+                        .entry(group_id)
+                        .and_modify(|(attempts, _)| {
+                            *attempts = attempts.saturating_add(1);
+                        })
+                        .or_insert((1, progress));
+                }
             }
         }
-        outcomes.push(Err(EngineError::Backend(
-            "convergence drain did not settle within harness pass limit".into(),
-        )));
+        if encountered_error {
+            return;
+        }
+        for (group_id, (attempts, initial)) in successful_attempts {
+            let mut current = match self
+                .engine()
+                .conformance_structural_progress_snapshot(&group_id)
+            {
+                Ok(progress) => progress,
+                Err(error) => {
+                    outcomes.push(Err(error));
+                    return;
+                }
+            };
+            let continuation_scheduled = current.pending_work.scheduled_convergence_groups > 0;
+            // The one-shot schedule edge was drained before the initial
+            // snapshot. Normalize a re-armed edge out of the comparison.
+            current.pending_work.scheduled_convergence_groups = 0;
+            if let Err(error) = ensure_convergence_drain_progress(
+                attempts,
+                continuation_scheduled,
+                &initial,
+                &current,
+            ) {
+                outcomes.push(Err(error));
+                return;
+            }
+        }
     }
 
     /// A subject switches to its injected clock on the first virtual-time
