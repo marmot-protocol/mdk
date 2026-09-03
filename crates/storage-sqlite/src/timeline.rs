@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
@@ -474,7 +475,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let existing_source: Option<Option<String>> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT source_message_id_hex
                      FROM app_events
                      WHERE group_id_hex = ?1
@@ -495,7 +496,7 @@ impl SqliteAccountStorage {
             // badge without re-reading the row.
             let publishes_held_send = existing_source.is_none() && source_message_id_hex.is_some();
             let updated = conn
-                .execute(
+                .execute_cached(
                     "UPDATE app_events
                      SET source_message_id_hex = COALESCE(source_message_id_hex, ?3),
                          source_epoch = COALESCE(source_epoch, ?4),
@@ -605,7 +606,7 @@ impl SqliteAccountStorage {
             };
             let mut affected_message_ids = new_affected_message_ids.clone();
             affected_message_ids.extend(existing_affected_message_ids.iter().cloned());
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id,
@@ -789,7 +790,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if conn
-                .query_row(
+                .query_row_cached(
                     &format!(
                         "SELECT 1 FROM app_events
                          WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
@@ -818,7 +819,7 @@ impl SqliteAccountStorage {
             let before =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             let cleared = conn
-                .execute(
+                .execute_cached(
                     &format!(
                         "UPDATE app_events
                          SET invalidated = 0, invalidation_reason = NULL
@@ -881,7 +882,7 @@ impl SqliteAccountStorage {
             // invalidation reason nor produces a redundant projection update.
             let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT group_id_hex, message_id_hex, kind, tags_json
                          FROM app_events
                          WHERE origin_commit_id = ?1 AND invalidated = 0",
@@ -920,7 +921,7 @@ impl SqliteAccountStorage {
             }
             let before =
                 timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE app_events
                  SET invalidated = 1, invalidation_reason = ?2
                  WHERE origin_commit_id = ?1 AND invalidated = 0",
@@ -1194,7 +1195,7 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let rows: Vec<(String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT message_id_hex, kind, tags_json
                          FROM app_events
                          WHERE group_id_hex = ?1
@@ -1233,7 +1234,7 @@ impl SqliteAccountStorage {
             }
             let before =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE app_events
                  SET invalidated = 1, invalidation_reason = ?2
                  WHERE group_id_hex = ?1
@@ -1288,7 +1289,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let row: Option<(String, String, u64, Vec<Vec<String>>)> = conn
-                .query_row(select_sql, lookup_params, |row| {
+                .query_row_cached(select_sql, lookup_params, |row| {
                     let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
                     let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -1316,7 +1317,7 @@ impl SqliteAccountStorage {
             // The UPDATE shares the lookup predicate and appends `reason` last.
             let mut update_params: Vec<&dyn rusqlite::ToSql> = lookup_params.to_vec();
             update_params.push(&reason);
-            conn.execute(update_sql, update_params.as_slice())
+            conn.execute_cached(update_sql, update_params.as_slice())
                 .storage()?;
             rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
             let messages =
@@ -1380,7 +1381,7 @@ impl SqliteAccountStorage {
                 method = "message_timeline"
             )
             .entered();
-            let mut stmt = conn.prepare(&sql).storage()?;
+            let mut stmt = conn.prepare_cached(&sql).storage()?;
             stmt.query_map(
                 rusqlite::params_from_iter(params.iter()),
                 timeline_record_from_row,
@@ -1428,7 +1429,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineMessageRecord>> {
         let conn = self.lock()?;
         let mut message = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
                         source.retention_seconds, source.retention_expires_at,
                         timeline.direction, timeline.group_id_hex, timeline.sender,
@@ -1466,7 +1467,7 @@ impl SqliteAccountStorage {
         message_id_hex: &str,
     ) -> StorageResult<Option<TimelineMessageTarget>> {
         let conn = self.lock()?;
-        conn.query_row(
+        conn.query_row_cached(
             "SELECT sender, plaintext, kind, deleted, invalidation_status
              FROM message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2
@@ -1493,12 +1494,12 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
 ) -> StorageResult<()> {
     let events = app_events_for_rebuild_tx(tx, group_id_hex)?;
     let (rows, stream_starts) = project_group_events(events);
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM message_timeline WHERE group_id_hex = ?1",
         params![group_id_hex],
     )
     .storage()?;
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM agent_stream_starts WHERE group_id_hex = ?1",
         params![group_id_hex],
     )
@@ -1525,7 +1526,7 @@ pub(crate) fn secure_prune_app_events_before_tx(
     mention_classifier: &crate::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     debug_assert_eq!(
-        tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+        tx.query_row_cached("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
             .unwrap_or(0),
         1,
         "secure_delete must be ON before the prune transaction is opened"
@@ -1551,7 +1552,7 @@ pub(crate) fn secure_prune_expired_app_events_tx(
     mention_classifier: &crate::chat_list::MentionClassifier<'_>,
 ) -> StorageResult<SecurePruneAppEventsResult> {
     debug_assert_eq!(
-        tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+        tx.query_row_cached("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
             .unwrap_or(0),
         1,
         "secure_delete must be ON before the prune transaction is opened"
@@ -1672,7 +1673,7 @@ fn retain_pruned_chat_activity_tx(
                )
            )"
     );
-    let mut statement = tx.prepare(&sql).storage()?;
+    let mut statement = tx.prepare_cached(&sql).storage()?;
     let mut latest_pruned_activity = None;
     let mut accepted_activity_insert_order = None;
     for message_id_hex in pruned_message_ids {
@@ -1689,7 +1690,7 @@ fn retain_pruned_chat_activity_tx(
         }
     }
     if latest_pruned_activity.is_some() || accepted_activity_insert_order.is_some() {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE chat_list_rows
              SET retained_activity_sort_at = MAX(retained_activity_sort_at, ?2),
                  activity_sort_at = MAX(activity_sort_at, ?2),
@@ -1741,7 +1742,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
          LIMIT 1",
     );
     let latest = tx
-        .query_row(&sql, params![group_id_hex], |row| {
+        .query_row_cached(&sql, params![group_id_hex], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1767,7 +1768,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
         delivery_state,
     )) = latest
     {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE chat_list_rows
              SET last_message_id_hex = ?1,
                  last_message_sender = ?2,
@@ -1804,7 +1805,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
         )
         .storage()?;
     } else {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE chat_list_rows
              SET last_message_id_hex = NULL,
                  last_message_sender = NULL,
@@ -1837,7 +1838,7 @@ fn app_event_projection_parts_tx(
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<(u64, Vec<Vec<String>>)>> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT kind, tags_json
          FROM app_events
          WHERE group_id_hex = ?1 AND message_id_hex = ?2",
@@ -1863,7 +1864,7 @@ fn upsert_message_timeline_projection_for_message_tx(
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<()> {
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM agent_stream_starts
          WHERE group_id_hex = ?1 AND message_id_hex = ?2",
         params![group_id_hex, message_id_hex],
@@ -1873,7 +1874,7 @@ fn upsert_message_timeline_projection_for_message_tx(
     let Some((row, stream_start)) =
         project_single_message_timeline_tx(tx, group_id_hex, message_id_hex)?
     else {
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex, message_id_hex],
@@ -1895,7 +1896,7 @@ fn project_single_message_timeline_tx(
     message_id_hex: &str,
 ) -> StorageResult<Option<(TimelineRow, Option<StreamStartRow>)>> {
     let Some(event) = tx
-        .query_row(
+        .query_row_cached(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
                     invalidated, invalidation_reason, moderation_grant
@@ -1956,7 +1957,7 @@ fn project_single_message_timeline_tx(
 /// so existing edges for this modifier are deleted first and re-inserted from
 /// the event's current tags, keeping edges consistent with any tag change.
 fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> StorageResult<()> {
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM message_modifier_edges
          WHERE group_id_hex = ?1 AND modifier_message_id_hex = ?2",
         params![&event.group_id_hex, &event.message_id_hex],
@@ -1971,7 +1972,7 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
     let kind = u64_to_i64(event.kind)?;
     let recorded_at = u64_to_i64(event.recorded_at)?;
     for target in tag_values(&event.tags, EVENT_REF_TAG) {
-        tx.execute(
+        tx.execute_cached(
             "INSERT OR IGNORE INTO message_modifier_edges (
                 group_id_hex, modifier_message_id_hex, target_message_id_hex,
                 kind, sender, recorded_at
@@ -2093,7 +2094,7 @@ fn deleted_reaction_ids_for_target_tx(
                 .iter()
                 .map(|reaction| rusqlite::types::Value::Text(reaction.message_id_hex.clone())),
         );
-        let mut stmt = tx.prepare(&sql).storage()?;
+        let mut stmt = tx.prepare_cached(&sql).storage()?;
         let chunk_pairs = stmt
             .query_map(params_from_iter(values.iter()), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2131,7 +2132,7 @@ fn app_events_targeting_message_tx(
     // indexed join is equivalent to the former JSON `LIKE` scan plus Rust-side
     // re-filter, without either. Ordering is preserved byte-for-byte.
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT app_events.group_id_hex, app_events.message_id_hex, app_events.source_message_id_hex,
                     app_events.source_epoch, app_events.direction, app_events.sender,
                     app_events.plaintext, app_events.kind, app_events.tags_json,
@@ -2159,7 +2160,7 @@ fn app_events_targeting_message_tx(
 }
 
 fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> StorageResult<()> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO message_timeline (
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
             plaintext, kind, tags_json, timeline_at, received_at,
@@ -2218,7 +2219,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
         row.timeline_at,
         &row.message_id_hex,
     );
-    tx.execute(
+    tx.execute_cached(
         "UPDATE conversation_read_state
          SET last_read_timeline_at = ?3,
              last_read_order_class = ?4,
@@ -2243,7 +2244,7 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
 }
 
 fn upsert_agent_stream_start_tx(tx: &Connection, start: &StreamStartRow) -> StorageResult<()> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO agent_stream_starts (
             group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
             tags_json, started_at, received_at
@@ -2280,7 +2281,7 @@ fn app_events_for_rebuild_tx(
     // `project_group_events` skips applying invalidated modifier events (reactions,
     // deletes) so a losing-branch event never mutates canonical content.
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
                     invalidated, invalidation_reason, moderation_grant
@@ -2301,7 +2302,7 @@ fn app_events_before_cutoff_tx(
     cutoff_recorded_at: u64,
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT message_id_hex, kind, source_epoch, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
@@ -2340,7 +2341,7 @@ fn expired_app_events_tx(
     now: u64,
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT message_id_hex, kind, source_epoch, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
@@ -2378,7 +2379,7 @@ fn scrub_app_event_rows_by_ids_tx(
             .collect::<Vec<_>>()
             .join(", ");
         let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute(
+        tx.execute_cached(
             &format!(
                 "UPDATE app_events
                  SET source_message_id_hex = NULL,
@@ -2414,7 +2415,7 @@ fn delete_app_event_rows_by_ids_tx(
             .join(", ");
         let values = group_and_message_id_values(group_id_hex, chunk);
         deleted = deleted.saturating_add(
-            tx.execute(
+            tx.execute_cached(
                 &format!(
                     "DELETE FROM app_events
                      WHERE group_id_hex = ?
@@ -2442,7 +2443,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
             .collect::<Vec<_>>()
             .join(", ");
         let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute(
+        tx.execute_cached(
             &format!(
                 "UPDATE message_timeline
                  SET source_message_id_hex = NULL,
@@ -2470,7 +2471,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
         )
         .storage()?;
         let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute(
+        tx.execute_cached(
             &format!(
                 "UPDATE agent_stream_starts
                  SET source_message_id_hex = NULL,
@@ -2544,7 +2545,7 @@ fn delete_timeline_projection_rows_by_ids_tx(
                 .collect::<Vec<_>>()
                 .join(", ");
             let values = group_and_message_id_values(group_id_hex, chunk);
-            tx.execute(
+            tx.execute_cached(
                 &format!(
                     "DELETE FROM {table}
                      WHERE group_id_hex = ?
@@ -2896,7 +2897,7 @@ fn reply_message_ids_for_targets_tx(
         let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
         values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
         values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
-        let mut stmt = tx.prepare(&sql).storage()?;
+        let mut stmt = tx.prepare_cached(&sql).storage()?;
         let chunk_ids = stmt
             .query_map(params_from_iter(values.iter()), |row| row.get(0))
             .storage()?
@@ -2913,7 +2914,7 @@ fn reaction_target_message_id_tx(
     message_id_hex: &str,
 ) -> StorageResult<Option<String>> {
     let row: Option<(u64, Vec<Vec<String>>)> = tx
-        .query_row(
+        .query_row_cached(
             "SELECT kind, tags_json
              FROM app_events
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
@@ -2973,7 +2974,7 @@ fn timeline_records_by_ids_tx(
         let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
         params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
         params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
-        let mut stmt = tx.prepare(&sql).storage()?;
+        let mut stmt = tx.prepare_cached(&sql).storage()?;
         let chunk_messages = stmt
             .query_map(params_from_iter(params.iter()), timeline_record_from_row)
             .storage()?
@@ -2992,7 +2993,7 @@ fn timeline_order_cursor_tx(
     message_id_hex: &str,
 ) -> StorageResult<OwnedTimelineOrderKey> {
     let row = tx
-        .query_row(
+        .query_row_cached(
             "SELECT source_message_id_hex, source_epoch, invalidation_status,
                     kind, timeline_at, message_id_hex
              FROM message_timeline
@@ -3675,7 +3676,7 @@ fn load_reply_previews(
             let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
             params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
             params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
-            let mut stmt = conn.prepare(&sql).storage()?;
+            let mut stmt = conn.prepare_cached(&sql).storage()?;
             let group_previews = stmt
                 .query_map(params_from_iter(params.iter()), reply_preview_from_row)
                 .storage()?

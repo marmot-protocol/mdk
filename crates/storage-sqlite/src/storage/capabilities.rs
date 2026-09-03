@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
@@ -61,7 +62,7 @@ impl CapabilityStorage for SqliteAccountStorage {
     fn register_feature(&self, feature: Feature, req: CapabilityRequirement) -> StorageResult<()> {
         let row = CapabilityRequirementRow::from(&req);
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_features (feature, requirement)
                  VALUES (?1, ?2)",
                 params![feature.0, serialize(&row)?],
@@ -76,7 +77,7 @@ impl CapabilityStorage for SqliteAccountStorage {
     ) -> StorageResult<Option<CapabilityRequirement>> {
         let record: Option<Vec<u8>> = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT requirement FROM cgka_features WHERE feature = ?1",
                 params![feature.0],
                 |row| row.get(0),
@@ -95,7 +96,7 @@ impl CapabilityStorage for SqliteAccountStorage {
         capabilities: GroupCapabilities,
     ) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_member_capabilities
                     (group_id, member_id, capabilities)
                  VALUES (?1, ?2, ?3)",
@@ -116,7 +117,7 @@ impl CapabilityStorage for SqliteAccountStorage {
     ) -> StorageResult<Option<GroupCapabilities>> {
         let record: Option<Vec<u8>> = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT capabilities FROM cgka_member_capabilities
                  WHERE group_id = ?1 AND member_id = ?2",
                 params![group_id.as_slice(), member_id.as_slice()],

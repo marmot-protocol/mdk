@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,7 +157,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO directory_users (
                 account_id_hex, npub, profile_json, relay_lists_json, key_package_json,
                 event_id_hex, event_kind, event_created_at
@@ -182,13 +183,13 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                 ],
             )
             .storage()?;
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM directory_user_follows WHERE account_id_hex = ?1",
                 params![&record.account_id_hex],
             )
             .storage()?;
             for (position, follow) in record.follows.iter().enumerate() {
-                tx.execute(
+                tx.execute_cached(
                     "INSERT OR IGNORE INTO directory_user_follows (
                     account_id_hex, follow_account_id_hex, position, event_id_hex, event_created_at
                  )
@@ -214,7 +215,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let Some(mut record) = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
                  FROM directory_users
@@ -241,7 +242,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
             return Ok(None);
         };
         let mut stmt = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT follow_account_id_hex FROM directory_user_follows
                  WHERE account_id_hex = ?1
                  ORDER BY position, follow_account_id_hex",
@@ -281,7 +282,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
             std::collections::HashMap::new();
         {
             let mut stmt = tx
-                .prepare(
+                .prepare_cached(
                     "SELECT account_id_hex, follow_account_id_hex FROM directory_user_follows
                      WHERE account_id_hex IN (
                          SELECT account_id_hex FROM directory_users
@@ -304,7 +305,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
             }
         }
         let mut stmt = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
                  FROM directory_users
@@ -355,7 +356,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     pub fn relay_telemetry_settings(&self) -> StorageResult<StoredRelayTelemetrySettings> {
         self.ensure_relay_telemetry_settings()?;
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT export_enabled, export_interval_seconds
                  FROM relay_telemetry_settings
                  WHERE id = 1",
@@ -377,7 +378,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     ) -> StorageResult<()> {
         retry_on_busy(|| {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "INSERT INTO relay_telemetry_settings (
                     id, export_enabled, export_interval_seconds, updated_at_ms
                  )
@@ -399,7 +400,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
 
     pub fn telemetry_install_id(&self) -> StorageResult<Option<String>> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT install_id
                  FROM telemetry_install
                  WHERE id = 1",
@@ -413,7 +414,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
         retry_on_busy(|| {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
                  VALUES (1, ?1, ?2)
                  ON CONFLICT(id) DO UPDATE SET
@@ -429,7 +430,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
         self.ensure_audit_log_settings()?;
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT enabled
                  FROM audit_log_settings
                  WHERE id = 1",
@@ -446,7 +447,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
         retry_on_busy(|| {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "INSERT INTO audit_log_settings (id, enabled, updated_at_ms)
                  VALUES (1, ?1, ?2)
                  ON CONFLICT(id) DO UPDATE SET
@@ -463,7 +464,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     fn table_columns(&self, table: &str) -> Vec<String> {
         let conn = self.lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
+            .prepare_cached(&format!("PRAGMA table_info({table})"))
             .unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -478,7 +479,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     fn ensure_relay_telemetry_settings(&self) -> StorageResult<()> {
         retry_on_busy(|| {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "INSERT INTO relay_telemetry_settings (
                     id, export_enabled, export_interval_seconds, updated_at_ms
                  )
@@ -494,7 +495,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     fn clear_legacy_relay_telemetry_endpoint(conn: &rusqlite::Connection) -> StorageResult<()> {
         let columns = {
             let mut stmt = conn
-                .prepare("PRAGMA table_info(relay_telemetry_settings)")
+                .prepare_cached("PRAGMA table_info(relay_telemetry_settings)")
                 .storage()?;
             stmt.query_map([], |row| row.get::<_, String>(1))
                 .storage()?
@@ -502,7 +503,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                 .storage()?
         };
         if columns.iter().any(|column| column == "otlp_endpoint") {
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE relay_telemetry_settings SET otlp_endpoint = NULL",
                 [],
             )
@@ -514,7 +515,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
     fn ensure_audit_log_settings(&self) -> StorageResult<()> {
         retry_on_busy(|| {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "INSERT INTO audit_log_settings (
                     id, enabled, updated_at_ms
                  )

@@ -1132,6 +1132,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
         AppError::BlobStore(_) => "read_marker_failed:blob_store",
+        AppError::MediaUploadTimedOut => "read_marker_failed:media_upload_timed_out",
         AppError::UnsafeMediaFetch(_) => "read_marker_failed:unsafe_media_fetch",
         AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",

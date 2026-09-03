@@ -141,6 +141,11 @@ pub enum AppError {
     InvalidEncryptedMedia(String),
     #[error("blob store request failed: {0}")]
     BlobStore(String),
+    /// A Blossom upload exhausted its bounded transfer/response budget before
+    /// the caller had a valid media descriptor. No message publication can
+    /// begin until this operation succeeds, so connector callers may retry.
+    #[error("media upload timed out")]
+    MediaUploadTimedOut,
     /// Pre-dial rejection for untrusted profile/media fetch URLs (SSRF boundary).
     #[error("unsafe media fetch: {0}")]
     UnsafeMediaFetch(String),
@@ -272,6 +277,7 @@ impl AppError {
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
             Self::BlobStore(_) => "blob_store",
+            Self::MediaUploadTimedOut => "media_upload_timed_out",
             Self::UnsafeMediaFetch(_) => "unsafe_media_fetch",
             Self::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             Self::InvalidPushToken(_) => "invalid_push_token",

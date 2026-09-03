@@ -1711,10 +1711,13 @@ class MarmotAgentControlClient:
     def _raise_if_error(envelope: Dict[str, Any]) -> None:
         if envelope.get("type") == "error":
             code = str(envelope.get("code") or "agent_control_error")
+            retryable = envelope.get("retryable")
+            if not isinstance(retryable, bool):
+                retryable = code == "send_in_progress"
             raise AgentControlError(
                 str(envelope.get("message") or "agent control error"),
                 code=code,
-                retryable=code == "send_in_progress",
+                retryable=retryable,
             )
 
 

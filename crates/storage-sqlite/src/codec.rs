@@ -72,6 +72,19 @@ impl SensitiveBytes {
     }
 }
 
+impl Write for SensitiveBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for byte in bytes {
+            self.push(*byte);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl AsRef<[u8]> for SensitiveBytes {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()

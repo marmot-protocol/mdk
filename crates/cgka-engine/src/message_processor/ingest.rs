@@ -1012,22 +1012,30 @@ impl<S: StorageProvider> Engine<S> {
             );
         }
 
-        self.persist_openmls_wire_message_with_processed_transport_id(
-            &openmls_msg,
-            &group_id,
-            current_epoch,
-            MessageState::Created,
-            &raw_msg_id,
-        )?;
-
+        // The retained row, exact wrapper identity, and the secret-tree
+        // ratchet `process_message` writes share one durable unit: under
+        // `synchronous = FULL` every COMMIT is an fsync, and these were three
+        // per inbound message. The processing result leaves the closure as a
+        // value so a decrypt failure still commits the row the error branches
+        // below transition.
+        //
         // Process via MLS. Commits may contain AppDataUpdate proposals,
         // which require the application to compute the resulting
         // AppDataDictionary before OpenMLS stages the commit.
-        let processed = match if msg_content_type == ContentType::Commit {
-            process_commit_with_app_data_updates(&mut mls_group, &provider, proto)
-        } else {
-            mls_group.process_message(&provider, proto)
-        } {
+        let processed = match self.storage.with_transaction(|_storage| {
+            self.persist_openmls_wire_message_with_processed_transport_id(
+                &openmls_msg,
+                &group_id,
+                current_epoch,
+                MessageState::Created,
+                &raw_msg_id,
+            )?;
+            Ok::<_, EngineError>(if msg_content_type == ContentType::Commit {
+                process_commit_with_app_data_updates(&mut mls_group, &provider, proto)
+            } else {
+                mls_group.process_message(&provider, proto)
+            })
+        })? {
             Ok(p) => p,
             Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
                 // Refine the historical classification (mdk#339):

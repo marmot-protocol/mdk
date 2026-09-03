@@ -82,15 +82,12 @@ unicode-properties = { version = "0.1", default-features = false, features = ["g
 # one emoji). Already in the tree via ratatui; declared here so wn-cli can depend
 # on it directly at the workspace-consistent version.
 unicode-segmentation = "1"
-unicode-normalization = "0.1"
 rand = "0.8"
 sha2 = "0.10"
 url = "2"
 psl = "2"
-bech32 = "0.11"
 chacha20poly1305 = "0.10"
 bytes = "1"
-scrypt = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"
 keyring-core = "1"
@@ -108,7 +105,7 @@ nostr-relay-builder = "0.44"
 # reqwest/rustls stack, so the SDK's record-time histogram API is not needed.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "metrics"] }
 prost = "0.14"
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "cache", "trace"] }
 tempfile = "3"
 
 # test
@@ -125,21 +122,17 @@ cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
-convergence-campaign-runner = { path = "crates/convergence-campaign-runner" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
 agent-stream-compose = { path = "crates/agent-stream-compose" }
 agent-control = { path = "crates/agent-control" }
-agent-connector = { path = "crates/agent-connector" }
 marmot-forensics = { path = "crates/marmot-forensics" }
 marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
-marmot-c = { path = "crates/marmot-c" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
-wn-cli = { path = "crates/cli" }
 marmot-terminal-harness = { path = "integrations/terminal-harness" }
 
 # hax-lib-macros 0.3.7 still declares the unmaintained proc-macro-error2

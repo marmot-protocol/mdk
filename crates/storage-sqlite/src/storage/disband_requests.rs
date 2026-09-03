@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::DisbandTombstone;
 use cgka_traits::storage::{
@@ -17,7 +18,7 @@ pub(crate) fn disband_requests_by_group_hex_tx(
     tx: &Connection,
 ) -> StorageResult<HashMap<String, DisbandRequest>> {
     let mut statement = tx
-        .prepare("SELECT group_id, record FROM cgka_disband_requests")
+        .prepare_cached("SELECT group_id, record FROM cgka_disband_requests")
         .storage()?;
     let rows = statement
         .query_map([], |row| {
@@ -49,7 +50,7 @@ pub(crate) fn disbanding_group_ids_hex_with_requests_tx(
         })
         .collect::<HashSet<_>>();
     let mut statement = tx
-        .prepare("SELECT DISTINCT group_id FROM cgka_disband_candidates")
+        .prepare_cached("SELECT DISTINCT group_id FROM cgka_disband_candidates")
         .storage()?;
     let candidate_group_ids = statement
         .query_map([], |row| row.get::<_, Vec<u8>>(0))
@@ -76,7 +77,7 @@ impl DisbandRequestStorage for SqliteAccountStorage {
     fn put_disband_request(&self, request: &DisbandRequest) -> StorageResult<()> {
         let serialized = serialize(request)?;
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_disband_requests (group_id, record)
                  VALUES (?1, ?2)",
                 params![request.group_id.as_slice(), serialized],
@@ -87,7 +88,7 @@ impl DisbandRequestStorage for SqliteAccountStorage {
 
     fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_disband_requests WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -100,7 +101,7 @@ impl DisbandRequestStorage for SqliteAccountStorage {
 
     fn clear_disband_request(&self, group_id: &GroupId) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_disband_requests WHERE group_id = ?1",
                 params![group_id.as_slice()],
             )
@@ -112,7 +113,7 @@ impl DisbandRequestStorage for SqliteAccountStorage {
 impl DisbandCandidateStorage for SqliteAccountStorage {
     fn put_disband_candidate(&self, candidate: &DisbandCandidate) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_disband_candidates (group_id, commit_id, record)
                  VALUES (?1, ?2, ?3)",
                 params![
@@ -131,7 +132,7 @@ impl DisbandCandidateStorage for SqliteAccountStorage {
         commit_id: &MessageId,
     ) -> StorageResult<Option<DisbandCandidate>> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_disband_candidates
                  WHERE group_id = ?1 AND commit_id = ?2",
                 params![group_id.as_slice(), commit_id.as_slice()],
@@ -146,7 +147,7 @@ impl DisbandCandidateStorage for SqliteAccountStorage {
     fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT record FROM cgka_disband_candidates
                  WHERE group_id = ?1 ORDER BY rowid",
             )
@@ -164,7 +165,7 @@ impl DisbandCandidateStorage for SqliteAccountStorage {
 
     fn clear_disband_candidates(&self, group_id: &GroupId) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_disband_candidates WHERE group_id = ?1",
                 params![group_id.as_slice()],
             )
@@ -187,7 +188,7 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
         // so OR it forward from any row already present.
         let conn = self.lock()?;
         let previously_announced = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_disband_tombstones WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -205,7 +206,7 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
         } else {
             serialize(tombstone)?
         };
-        conn.execute(
+        conn.execute_cached(
             "INSERT OR REPLACE INTO cgka_disband_tombstones (group_id, record)
              VALUES (?1, ?2)",
             params![group_id.as_slice(), record],
@@ -216,7 +217,7 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
 
     fn disband_tombstone(&self, group_id: &GroupId) -> StorageResult<Option<DisbandTombstone>> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_disband_tombstones WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -230,7 +231,9 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
     fn list_disband_tombstones(&self) -> StorageResult<Vec<(GroupId, DisbandTombstone)>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT group_id, record FROM cgka_disband_tombstones ORDER BY group_id")
+            .prepare_cached(
+                "SELECT group_id, record FROM cgka_disband_tombstones ORDER BY group_id",
+            )
             .storage()?;
         let rows = stmt
             .query_map([], |row| {
@@ -249,7 +252,7 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
         // read-modify-write cannot interleave with a concurrent caller.
         let conn = self.lock()?;
         let Some(record) = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_disband_tombstones WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -264,7 +267,7 @@ impl DisbandTombstoneStorage for SqliteAccountStorage {
             return Ok(());
         }
         tombstone.announced = true;
-        conn.execute(
+        conn.execute_cached(
             "UPDATE cgka_disband_tombstones SET record = ?2 WHERE group_id = ?1",
             params![group_id.as_slice(), serialize(&tombstone)?],
         )

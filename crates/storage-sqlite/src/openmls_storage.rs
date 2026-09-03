@@ -2,6 +2,7 @@ mod labels;
 mod provider;
 mod value_store;
 
+use crate::connection::CachedSql;
 use crate::connection::SharedConnection;
 use cgka_traits::storage::{StorageError, StorageResult, StoredKeyPackageBundle};
 use cgka_traits::types::GroupId as MarmotGroupId;
@@ -42,7 +43,7 @@ impl SqliteOpenMlsStorage {
 
         let connection = self.connection.lock()?;
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 "SELECT storage_key, value
                  FROM openmls_values
                  WHERE provider_version = ?1 AND label = ?2
@@ -70,7 +71,7 @@ impl SqliteOpenMlsStorage {
 
         let connection = self.connection.lock()?;
         connection
-            .execute(
+            .execute_cached(
                 "DELETE FROM openmls_values
                  WHERE provider_version = ?1 AND label = ?2 AND storage_key = ?3",
                 params![
@@ -98,6 +99,10 @@ pub enum SqliteOpenMlsStorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("encoding failure: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("decoding failure: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
     #[error("queued proposal reference was present without a queued proposal")]
     MissingQueuedProposal,
 }

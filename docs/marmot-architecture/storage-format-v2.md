@@ -83,7 +83,7 @@ an account never runs `VACUUM` implicitly.
 
 ## Processed transport identities
 
-Migration `0057_processed_transport_ids` separates exact-wrapper replay
+Migration `0058_processed_transport_ids` separates exact-wrapper replay
 evidence from the bounded `cgka_ingress_dedup` exceptional-input cache. An id
 enters `cgka_processed_transport_ids` only after a group wrapper peels and its
 content is durably admitted. The content row and processed transport id are one

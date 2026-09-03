@@ -652,6 +652,7 @@ async fn upload_blossom_blob_with_fallback(
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
     let mut failures = Vec::new();
+    let mut timed_out = false;
     for (idx, server) in servers.iter().enumerate() {
         match upload_blossom_blob(
             server,
@@ -664,12 +665,20 @@ async fn upload_blossom_blob_with_fallback(
         {
             Ok(url) => return Ok(url),
             Err(AppError::ExternalSignerRejected) => return Err(AppError::ExternalSignerRejected),
-            Err(err) => failures.push(format!(
-                "server {}: {}",
-                idx + 1,
-                upload_error_summary(&err)
-            )),
+            Err(err) => {
+                timed_out |= matches!(err, AppError::MediaUploadTimedOut);
+                failures.push(format!(
+                    "server {}: {}",
+                    idx + 1,
+                    upload_error_summary(&err)
+                ));
+            }
         }
+    }
+    if timed_out {
+        // Any pre-publication timeout keeps the aggregate safely retryable,
+        // even when another fallback also returned a terminal rejection.
+        return Err(AppError::MediaUploadTimedOut);
     }
     Err(AppError::BlobStore(format!(
         "upload failed for all Blossom servers: {}",
@@ -682,6 +691,7 @@ fn upload_error_summary(err: &AppError) -> String {
         AppError::BlobStore(message)
         | AppError::InvalidEncryptedMedia(message)
         | AppError::InvalidAppMessagePayload(message) => message.clone(),
+        AppError::MediaUploadTimedOut => "request timed out".to_owned(),
         // `upload_blossom_blob` should currently surface upload failures through
         // the privacy-scrubbed variants above. Keep this fallback as a defensive
         // catch-all only; do not route URL-bearing transport errors here without

@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::openmls_storage::mls_group_key;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, serialize};
 use cgka_traits::group::Group;
@@ -8,7 +9,7 @@ use rusqlite::{OptionalExtension, params};
 impl GroupStorage for SqliteAccountStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT INTO cgka_groups (id, epoch, record)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
@@ -27,7 +28,7 @@ impl GroupStorage for SqliteAccountStorage {
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
         let record: Vec<u8> = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_groups WHERE id = ?1",
                 params![id.as_slice()],
                 |row| row.get(0),
@@ -42,7 +43,7 @@ impl GroupStorage for SqliteAccountStorage {
         let mls_group_key = mls_group_key(id)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM transport_reconciliation_items
              WHERE route_kind = 1 AND route_id IN (
                  SELECT transport_group_id
@@ -52,7 +53,7 @@ impl GroupStorage for SqliteAccountStorage {
             params![id.as_slice()],
         )
         .storage()?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
              WHERE route_kind = 1 AND route_id IN (
                  SELECT transport_group_id
@@ -62,7 +63,7 @@ impl GroupStorage for SqliteAccountStorage {
             params![id.as_slice()],
         )
         .storage()?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM transport_reconciliation_scheduler
              WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
                  SELECT transport_group_id
@@ -73,7 +74,7 @@ impl GroupStorage for SqliteAccountStorage {
         )
         .storage()?;
         let deleted = tx
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_groups WHERE id = ?1",
                 params![id.as_slice()],
             )
@@ -81,12 +82,12 @@ impl GroupStorage for SqliteAccountStorage {
         if deleted == 0 {
             return Err(StorageError::NotFound);
         }
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM pending_application_events WHERE group_id = ?1",
             params![id.as_slice()],
         )
         .storage()?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM openmls_values WHERE provider_version = ?1 AND group_key = ?2",
             params![openmls_traits::storage::CURRENT_VERSION, mls_group_key],
         )
@@ -98,7 +99,7 @@ impl GroupStorage for SqliteAccountStorage {
     fn list_groups(&self) -> StorageResult<Vec<GroupId>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT id FROM cgka_groups ORDER BY id")
+            .prepare_cached("SELECT id FROM cgka_groups ORDER BY id")
             .storage()?;
         stmt.query_map([], |row| row.get::<_, Vec<u8>>(0).map(GroupId::new))
             .storage()?
@@ -109,7 +110,7 @@ impl GroupStorage for SqliteAccountStorage {
     fn list_group_records(&self) -> StorageResult<Vec<Group>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT record FROM cgka_groups ORDER BY id")
+            .prepare_cached("SELECT record FROM cgka_groups ORDER BY id")
             .storage()?;
         let records = stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))

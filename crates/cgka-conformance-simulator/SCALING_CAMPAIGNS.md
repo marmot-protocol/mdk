@@ -172,8 +172,8 @@ it enforces a named motif, has a distinct subject or budget, or needs a focused 
 
 High-value motifs that should drive future profiles include:
 
-- an offline founding member returning to a large application/commit backlog while group profile and membership
-  change;
+- an offline founding member returning to a large application/commit backlog while group state changes (implemented
+  as the retained-relay `offline-catchup-pressure/v1` family; membership-changing extensions remain future work);
 - sustained application traffic interspersed with proposals, commits, administrator handoff, removals, and re-adds;
 - bounded self-update pressure racing administrator/profile commits, with explicit input closure;
 - restart after publication acceptance, ingest, freeze, selection, application, confirmation, rollback, or retained

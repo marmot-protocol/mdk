@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -111,7 +112,7 @@ impl SqliteAccountStorage {
         let tx = conn.transaction().storage()?;
         let mut drafts = {
             let mut statement = tx
-                .prepare(
+                .prepare_cached(
                     "SELECT group_id_hex, content, reply_to_message_id_hex,
                             created_at_ms, updated_at_ms
                      FROM message_drafts
@@ -168,7 +169,7 @@ impl SqliteAccountStorage {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
             let group_exists = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex = ?1)",
                     params![group_id_hex],
                     |row| row.get::<_, bool>(0),
@@ -177,7 +178,7 @@ impl SqliteAccountStorage {
             if !group_exists {
                 return Err(StorageError::NotFound);
             }
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO message_drafts (
                     group_id_hex, content, reply_to_message_id_hex, created_at_ms, updated_at_ms
                  )
@@ -201,7 +202,7 @@ impl SqliteAccountStorage {
     /// Delete one draft and its cascading attachment rows.
     pub fn delete_message_draft(&self, group_id_hex: &str) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM message_drafts WHERE group_id_hex = ?1",
                 params![group_id_hex],
             )
@@ -228,7 +229,7 @@ fn load_message_draft_attachment_summaries(
     group_id_hex: &str,
 ) -> StorageResult<Vec<StoredMessageDraftAttachmentSummary>> {
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT attachment_id, file_name, media_type, length(plaintext)
              FROM message_draft_attachments
              WHERE group_id_hex = ?1
@@ -301,7 +302,7 @@ fn sync_message_draft_attachments(
         .ok_or_else(|| StorageError::Backend("too many message draft attachments".to_owned()))?;
 
     if !existing.is_empty() {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE message_draft_attachments
              SET position = position + ?2
              WHERE group_id_hex = ?1",
@@ -315,7 +316,7 @@ fn sync_message_draft_attachments(
             .map_err(|_| StorageError::Backend("too many message draft attachments".to_owned()))?;
         match existing_by_id.get(attachment.id.as_str()) {
             Some(stored) if *stored == attachment => {
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE message_draft_attachments
                      SET position = ?3
                      WHERE group_id_hex = ?1 AND attachment_id = ?2",
@@ -334,7 +335,7 @@ fn sync_message_draft_attachments(
 
     for attachment in &existing {
         if !incoming_ids.contains(attachment.id.as_str()) {
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM message_draft_attachments
                  WHERE group_id_hex = ?1 AND attachment_id = ?2",
                 params![group_id_hex, attachment.id],
@@ -352,7 +353,7 @@ fn insert_message_draft_attachment(
     attachment: &StoredMessageDraftAttachment,
 ) -> StorageResult<()> {
     let waveform_samples = encoded_waveform_samples(attachment)?;
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO message_draft_attachments (
             group_id_hex, position, attachment_id, file_name, media_type,
             plaintext, dim, thumbhash, duration_seconds, waveform_samples_json
@@ -383,7 +384,7 @@ fn update_message_draft_attachment(
 ) -> StorageResult<()> {
     let waveform_samples = encoded_waveform_samples(attachment)?;
     if let Some(position) = position {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE message_draft_attachments
              SET position = ?3, file_name = ?4, media_type = ?5, plaintext = ?6,
                  dim = ?7, thumbhash = ?8, duration_seconds = ?9,
@@ -404,7 +405,7 @@ fn update_message_draft_attachment(
         )
         .storage()?;
     } else {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE message_draft_attachments
              SET file_name = ?3, media_type = ?4, plaintext = ?5, dim = ?6,
                  thumbhash = ?7, duration_seconds = ?8, waveform_samples_json = ?9
@@ -437,7 +438,7 @@ fn load_message_draft_attachments(
     group_id_hex: &str,
 ) -> StorageResult<Vec<StoredMessageDraftAttachment>> {
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT attachment_id, file_name, media_type, plaintext, dim, thumbhash,
                     duration_seconds, waveform_samples_json
              FROM message_draft_attachments
@@ -485,7 +486,7 @@ fn load_message_draft(
     group_id_hex: &str,
 ) -> StorageResult<Option<StoredMessageDraft>> {
     let draft = conn
-        .query_row(
+        .query_row_cached(
             "SELECT content, reply_to_message_id_hex, created_at_ms, updated_at_ms
                  FROM message_drafts
                  WHERE group_id_hex = ?1",
