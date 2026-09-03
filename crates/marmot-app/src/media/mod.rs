@@ -20,7 +20,8 @@ mod group_image;
 mod host_safety;
 
 use blossom::{
-    blossom_content_hash_from_url, upload_blossom_blob, upload_blossom_blob_with_content_type,
+    blossom_content_hash_from_url, fetch_blossom_blob_with_transport, upload_blossom_blob,
+    upload_blossom_blob_with_content_type,
 };
 use crypto::{
     canonical_media_type_v1, canonical_media_type_v2, derive_media_file_key, media_aad,
@@ -29,10 +30,13 @@ use crypto::{
 use host_safety::validate_locator;
 
 pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
-pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
+#[cfg(test)]
+pub(crate) use blossom::fetch_blossom_blob;
+pub(crate) use blossom::{BlossomHttpTransport, blossom_blob_url};
 pub use group_image::{MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS};
 pub(crate) use group_image::{
-    fetch_group_image, prepare_group_image_upload, upload_group_image, upload_prepared_group_image,
+    fetch_group_image_with_transport, prepare_group_image_upload, upload_group_image,
+    upload_prepared_group_image,
 };
 pub(crate) use host_safety::is_loopback_http_endpoint;
 
@@ -686,6 +690,7 @@ fn upload_error_summary(err: &AppError) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn download_encrypted_media(
     reference: MediaAttachmentReference,
     media_secret: &[u8],
@@ -693,23 +698,36 @@ pub(crate) async fn download_encrypted_media(
     allowed_locator_kinds: &[String],
     allow_loopback_blob_endpoints: bool,
 ) -> Result<MediaDownloadResult, AppError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_blob_endpoints);
+    download_encrypted_media_with_transport(
+        reference,
+        media_secret,
+        fallback_endpoints,
+        allowed_locator_kinds,
+        &transport,
+    )
+    .await
+}
+
+pub(crate) async fn download_encrypted_media_with_transport(
+    reference: MediaAttachmentReference,
+    media_secret: &[u8],
+    fallback_endpoints: &[crate::AppBlobEndpoint],
+    allowed_locator_kinds: &[String],
+    transport: &BlossomHttpTransport,
+) -> Result<MediaDownloadResult, AppError> {
     // Structural validation only: an out-of-policy or client-unsupported locator
     // is judged at fetch time below, where it degrades to an unfetchable outcome
     // rather than a hard "corrupt reference" error.
-    reference.validate(allow_loopback_blob_endpoints)?;
+    reference.validate(transport.allow_loopback_http)?;
     let version = EncryptedMediaVersion::parse(&reference.version)?;
-    let encrypted = fetch_encrypted_media_blob(
+    let encrypted = fetch_encrypted_media_blob_with_transport(
         &reference,
         fallback_endpoints,
         allowed_locator_kinds,
-        allow_loopback_blob_endpoints,
+        transport,
     )
     .await?;
-    if !encrypted_media_hash_matches(&encrypted, &reference.ciphertext_sha256) {
-        return Err(AppError::InvalidEncryptedMedia(
-            "encrypted blob hash does not match media reference".into(),
-        ));
-    }
     let plaintext_hash = media_hash_from_reference(&reference)?;
     let media_type = match version {
         EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)?,
@@ -748,11 +766,28 @@ fn encrypted_media_hash_matches(encrypted: &[u8], expected_hash: &str) -> bool {
     hex::encode(Sha256::digest(encrypted)).eq_ignore_ascii_case(expected_hash)
 }
 
+#[cfg(test)]
 async fn fetch_encrypted_media_blob(
     reference: &MediaAttachmentReference,
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     allow_loopback_blob_endpoints: bool,
+) -> Result<Vec<u8>, AppError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_blob_endpoints);
+    fetch_encrypted_media_blob_with_transport(
+        reference,
+        fallback_endpoints,
+        allowed_locator_kinds,
+        &transport,
+    )
+    .await
+}
+
+async fn fetch_encrypted_media_blob_with_transport(
+    reference: &MediaAttachmentReference,
+    fallback_endpoints: &[crate::AppBlobEndpoint],
+    allowed_locator_kinds: &[String],
+    transport: &BlossomHttpTransport,
 ) -> Result<Vec<u8>, AppError> {
     // Fetchability is judged against CURRENT policy + current client support.
     // This client only fetches `blossom-v1`, so if the group's current policy
@@ -765,7 +800,7 @@ async fn fetch_encrypted_media_blob(
         ));
     }
     let mut candidates = encrypted_media_fetch_candidates(reference, fallback_endpoints);
-    if !allow_loopback_blob_endpoints {
+    if !transport.allow_loopback_http {
         // A loopback-HTTP candidate is valid component state but unusable in a
         // production build: skip it rather than GETting the local host. The
         // candidate may come from a remote-admin policy endpoint or a
@@ -795,8 +830,13 @@ async fn fetch_encrypted_media_blob(
                 continue;
             }
         }
-        match fetch_blossom_blob(&candidate, allow_loopback_blob_endpoints).await {
-            Ok(bytes) => return Ok(bytes),
+        match fetch_blossom_blob_with_transport(&candidate, transport).await {
+            Ok(bytes) if encrypted_media_hash_matches(&bytes, &expected_hash) => return Ok(bytes),
+            Ok(_) => {
+                last_error = Some(AppError::InvalidEncryptedMedia(
+                    "encrypted blob hash does not match media reference".into(),
+                ));
+            }
             Err(err) => last_error = Some(err),
         }
     }

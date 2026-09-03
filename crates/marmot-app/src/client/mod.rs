@@ -39,10 +39,10 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
-    download_encrypted_media, fetch_group_image, is_loopback_http_endpoint,
-    prepare_group_image_upload, upload_encrypted_media, upload_group_image,
-    upload_prepared_group_image,
+    BlossomHttpTransport, DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
+    download_encrypted_media_with_transport, fetch_group_image_with_transport,
+    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
+    upload_group_image, upload_prepared_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event};
 use crate::notifications;
@@ -165,17 +165,17 @@ pub(crate) struct EncryptedMediaDownloadHttp {
     media_secret: SecretBytes,
     default_blob_endpoints: Vec<AppBlobEndpoint>,
     allowed_locator_kinds: Vec<String>,
-    allow_loopback: bool,
+    transport: BlossomHttpTransport,
 }
 
 impl EncryptedMediaDownloadHttp {
     pub(crate) async fn run(self) -> Result<MediaDownloadResult, AppError> {
-        download_encrypted_media(
+        download_encrypted_media_with_transport(
             self.reference,
             self.media_secret.as_ref(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
-            self.allow_loopback,
+            &self.transport,
         )
         .await
     }
@@ -186,6 +186,7 @@ pub(crate) struct GroupImageDownloadHttp {
     image_key_hex: String,
     image_nonce_hex: String,
     media_type: String,
+    transport: BlossomHttpTransport,
 }
 
 pub(crate) struct PreparedGroupImageUploadHttp {
@@ -224,12 +225,13 @@ pub(crate) enum InitialGroupImageSource {
 
 impl GroupImageDownloadHttp {
     pub(crate) async fn run(self) -> Result<Vec<u8>, AppError> {
-        fetch_group_image(
+        fetch_group_image_with_transport(
             &self.image_hash_hex,
             &self.image_key_hex,
             &self.image_nonce_hex,
             &self.media_type,
             None,
+            &self.transport,
         )
         .await
     }
@@ -294,6 +296,7 @@ pub struct AppClient {
     pub(crate) routing: AppTransportRouting,
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) transport_signer: Arc<dyn nostr::NostrSigner>,
+    pub(crate) blossom_http_transport: BlossomHttpTransport,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
     /// `remember_seen_event` (which removes pruned ring entries from it).
@@ -3615,7 +3618,7 @@ impl AppClient {
             media_secret,
             default_blob_endpoints: policy.default_blob_endpoints,
             allowed_locator_kinds: policy.allowed_locator_kinds,
-            allow_loopback: self.app.allow_loopback_blob_endpoints(),
+            transport: self.blossom_http_transport.clone(),
         })
     }
 
@@ -3695,6 +3698,7 @@ impl AppClient {
             image_key_hex: input.image_key_hex,
             image_nonce_hex: input.image_nonce_hex,
             media_type: input.media_type.unwrap_or_default(),
+            transport: self.blossom_http_transport.clone(),
         })
     }
 

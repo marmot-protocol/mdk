@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTimestamp};
@@ -25,6 +28,15 @@ const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// A candidate that cannot resolve, connect, return headers, and yield its first
+/// body bytes within this bound gives the next ordered locator a chance. The
+/// longer transfer deadline and read-idle timeout still govern an active body,
+/// so a peer that continuously trickles bytes can occupy the transfer deadline.
+const BLOSSOM_CANDIDATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Reusing a pinned client inside this lease amortizes DNS and TLS setup without
+/// turning one resolution result into a process-lifetime routing decision.
+const BLOSSOM_ADDRESS_LEASE: Duration = Duration::from_secs(60);
+const BLOSSOM_ORIGIN_CACHE_LIMIT: usize = 32;
 const BLOSSOM_REDIRECT_LIMIT: usize = 5;
 /// Largest encrypted media blob this implementation will upload or download.
 ///
@@ -32,6 +44,189 @@ const BLOSSOM_REDIRECT_LIMIT: usize = 5;
 /// implementation bound finite for resource safety while allowing release APKs
 /// and other substantial application artifacts.
 pub const MAX_ENCRYPTED_MEDIA_BLOB_BYTES: u64 = 512 * 1024 * 1024;
+
+pub(super) type DnsResolver =
+    Arc<dyn Fn(String, u16) -> BoxFuture<'static, Result<Vec<SocketAddr>, AppError>> + Send + Sync>;
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct MediaOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl MediaOrigin {
+    fn from_url(url: &Url) -> Result<Self, AppError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a host".into()))?
+            .to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a fetch port".into()))?;
+        Ok(Self {
+            scheme: url.scheme().to_owned(),
+            host,
+            port,
+        })
+    }
+}
+
+struct CachedMediaClient {
+    client: reqwest::Client,
+    expires_at: Instant,
+}
+
+struct MediaOriginSlot {
+    generation: Arc<tokio::sync::Mutex<Option<CachedMediaClient>>>,
+    last_used: Instant,
+}
+
+struct BlossomHttpTransportInner {
+    origins: StdMutex<HashMap<MediaOrigin, MediaOriginSlot>>,
+    resolver: DnsResolver,
+}
+
+/// Per-account HTTP setup shared by compatible Blossom downloads.
+///
+/// Every cached client is bound to one exact origin and one vetted address set.
+/// Expiry creates a fresh client generation, forcing DNS resolution, vetting,
+/// and pinning again before any later request can use the origin. A rehomed
+/// origin can therefore retain a failing stale pin only until the lease ends.
+#[derive(Clone)]
+pub(crate) struct BlossomHttpTransport {
+    inner: Arc<BlossomHttpTransportInner>,
+    pub(super) allow_loopback_http: bool,
+    address_lease: Duration,
+    candidate_startup_timeout: Duration,
+}
+
+impl BlossomHttpTransport {
+    pub(crate) fn new(allow_loopback_http: bool) -> Self {
+        Self::with_policy(
+            allow_loopback_http,
+            BLOSSOM_ADDRESS_LEASE,
+            BLOSSOM_CANDIDATE_STARTUP_TIMEOUT,
+            system_dns_resolver(),
+        )
+    }
+
+    fn with_policy(
+        allow_loopback_http: bool,
+        address_lease: Duration,
+        candidate_startup_timeout: Duration,
+        resolver: DnsResolver,
+    ) -> Self {
+        Self {
+            inner: Arc::new(BlossomHttpTransportInner {
+                origins: StdMutex::new(HashMap::new()),
+                resolver,
+            }),
+            allow_loopback_http,
+            address_lease,
+            candidate_startup_timeout,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(
+        allow_loopback_http: bool,
+        address_lease: Duration,
+        candidate_startup_timeout: Duration,
+    ) -> Self {
+        Self::with_policy(
+            allow_loopback_http,
+            address_lease,
+            candidate_startup_timeout,
+            system_dns_resolver(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_resolver(
+        allow_loopback_http: bool,
+        address_lease: Duration,
+        candidate_startup_timeout: Duration,
+        resolver: DnsResolver,
+    ) -> Self {
+        Self::with_policy(
+            allow_loopback_http,
+            address_lease,
+            candidate_startup_timeout,
+            resolver,
+        )
+    }
+
+    pub(super) async fn client_for_url(&self, url: &Url) -> Result<reqwest::Client, AppError> {
+        validate_blossom_fetch_url(url, self.allow_loopback_http)
+            .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+        let origin = MediaOrigin::from_url(url)?;
+        let generation = {
+            let now = Instant::now();
+            let mut origins = self
+                .inner
+                .origins
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !origins.contains_key(&origin)
+                && origins.len() >= BLOSSOM_ORIGIN_CACHE_LIMIT
+                && let Some(oldest) = origins
+                    .iter()
+                    .min_by_key(|(_, slot)| slot.last_used)
+                    .map(|(origin, _)| origin.clone())
+            {
+                origins.remove(&oldest);
+            }
+            let slot = origins.entry(origin).or_insert_with(|| MediaOriginSlot {
+                generation: Arc::new(tokio::sync::Mutex::new(None)),
+                last_used: now,
+            });
+            slot.last_used = now;
+            slot.generation.clone()
+        };
+
+        let mut generation = generation.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = generation.as_ref()
+            && cached.expires_at > now
+        {
+            return Ok(cached.client.clone());
+        }
+
+        let allow_loopback = url.scheme() == "http"
+            && self.allow_loopback_http
+            && url.host().map(is_loopback_host).unwrap_or(false);
+        let pin = resolve_media_host_with(url, allow_loopback, &self.inner.resolver).await?;
+        let client = build_pinned_media_http_client(pin)?;
+        *generation = Some(CachedMediaClient {
+            client: client.clone(),
+            expires_at: now + self.address_lease,
+        });
+        Ok(client)
+    }
+
+    pub(super) fn with_loopback_disabled(&self) -> Self {
+        // The stricter view may share the pool because client_for_url validates
+        // its own loopback policy before consulting a cached generation.
+        Self {
+            inner: self.inner.clone(),
+            allow_loopback_http: false,
+            address_lease: self.address_lease,
+            candidate_startup_timeout: self.candidate_startup_timeout,
+        }
+    }
+}
+
+fn system_dns_resolver() -> DnsResolver {
+    Arc::new(|domain, port| {
+        Box::pin(async move {
+            tokio::net::lookup_host((domain.as_str(), port))
+                .await
+                .map_err(|_| AppError::BlobStore("media host DNS lookup failed".into()))
+                .map(|addrs| addrs.collect())
+        })
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct BlossomBlobDescriptor {
@@ -178,27 +373,37 @@ fn privacy_safe_server_reason(reason: &str) -> Option<String> {
     Some(reason)
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_blossom_blob(
     url: &str,
     allow_loopback_http: bool,
 ) -> Result<Vec<u8>, AppError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_http);
+    fetch_blossom_blob_with_transport(url, &transport).await
+}
+
+pub(crate) async fn fetch_blossom_blob_with_transport(
+    url: &str,
+    transport: &BlossomHttpTransport,
+) -> Result<Vec<u8>, AppError> {
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
-    validate_blossom_fetch_url(&current, allow_loopback_http)
+    validate_blossom_fetch_url(&current, transport.allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
     fetch_http_with_bounded_redirects(
         current,
         MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
         MEDIA_BLOB_TRANSFER_TIMEOUT,
+        Some(transport.candidate_startup_timeout),
         move |url| {
-            let allow_loopback_http = allow_loopback_http;
-            async move { media_http_client_for_url(&url, allow_loopback_http).await }
+            let transport = transport.clone();
+            async move { transport.client_for_url(&url).await }
         },
         move |current, location| {
             let next = current.join(location).map_err(|_| {
                 AppError::BlobStore("redirect Location header is not a valid URL".into())
             })?;
-            validate_blossom_redirect_target(current, &next, allow_loopback_http)?;
+            validate_blossom_redirect_target(current, &next, transport.allow_loopback_http)?;
             Ok(next)
         },
     )
@@ -228,6 +433,7 @@ pub(crate) async fn fetch_profile_image_with_loopback(
         current,
         max_bytes,
         MEDIA_HTTP_TOTAL_TIMEOUT,
+        None,
         move |url| async move { media_http_client_for_url(&url, true).await },
         move |current, location| {
             let raw_location = location.trim();
@@ -262,6 +468,7 @@ async fn fetch_profile_image_impl(url: &str, max_bytes: u64) -> Result<Vec<u8>, 
         current,
         max_bytes,
         MEDIA_HTTP_TOTAL_TIMEOUT,
+        None,
         move |url| async move { media_http_client_for_profile(&url).await },
         move |current, location| {
             parse_profile_image_redirect_url(current, location).map_err(AppError::UnsafeMediaFetch)
@@ -286,6 +493,7 @@ async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     mut current: Url,
     max_body_bytes: u64,
     request_timeout: Duration,
+    startup_timeout: Option<Duration>,
     mut client_for_url: C,
     mut redirect_target: R,
 ) -> Result<Vec<u8>, AppError>
@@ -296,28 +504,45 @@ where
 {
     let mut redirects = 0_usize;
     let deadline = tokio::time::Instant::now() + request_timeout;
+    let startup_deadline = startup_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()));
         }
-        let client = tokio::time::timeout(remaining, client_for_url(current.clone()))
+        let startup_remaining = startup_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(remaining);
+        let operation_remaining = remaining.min(startup_remaining);
+        if operation_remaining.is_zero() {
+            return Err(AppError::BlobStore("request timed out".into()));
+        }
+        let client = tokio::time::timeout(operation_remaining, client_for_url(current.clone()))
             .await
             .map_err(|_| AppError::BlobStore("request timed out".into()))??;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()));
         }
-        let response = client
-            .get(current.clone())
-            .timeout(remaining)
-            .send()
-            .await
-            .map_err(reqwest_blob_error)?;
+        let startup_remaining = startup_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(remaining);
+        let operation_remaining = remaining.min(startup_remaining);
+        if operation_remaining.is_zero() {
+            return Err(AppError::BlobStore("request timed out".into()));
+        }
+        let response = tokio::time::timeout(
+            operation_remaining,
+            client.get(current.clone()).timeout(remaining).send(),
+        )
+        .await
+        .map_err(|_| AppError::BlobStore("request timed out".into()))?
+        .map_err(reqwest_blob_error)?;
         let status = response.status();
         if status.is_success() {
-            return read_limited_blossom_body(response, max_body_bytes).await;
+            return read_limited_blossom_body_until(response, max_body_bytes, startup_deadline)
+                .await;
         }
         if !status.is_redirection() {
             return Err(AppError::BlobStore(format!(
@@ -508,6 +733,14 @@ async fn resolve_media_host(
     url: &Url,
     allow_loopback: bool,
 ) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
+    resolve_media_host_with(url, allow_loopback, &system_dns_resolver()).await
+}
+
+async fn resolve_media_host_with(
+    url: &Url,
+    allow_loopback: bool,
+    resolver: &DnsResolver,
+) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
     match url
         .host()
         .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a host".into()))?
@@ -516,10 +749,7 @@ async fn resolve_media_host(
             let port = url
                 .port_or_known_default()
                 .ok_or_else(|| AppError::BlobStore("Blossom URL is missing a fetch port".into()))?;
-            let addrs = tokio::net::lookup_host((domain, port))
-                .await
-                .map_err(|_| AppError::BlobStore("media host DNS lookup failed".into()))?
-                .collect::<Vec<_>>();
+            let addrs = resolver(domain.to_owned(), port).await?;
             validated_media_domain_pin(domain, &addrs, allow_loopback).map(Some)
         }
         Host::Ipv4(addr) => {
@@ -539,6 +769,14 @@ pub(crate) async fn read_limited_blossom_body(
     response: reqwest::Response,
     max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
+    read_limited_blossom_body_until(response, max_bytes, None).await
+}
+
+async fn read_limited_blossom_body_until(
+    response: reqwest::Response,
+    max_bytes: u64,
+    first_byte_deadline: Option<tokio::time::Instant>,
+) -> Result<Vec<u8>, AppError> {
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
     {
@@ -548,7 +786,24 @@ pub(crate) async fn read_limited_blossom_body(
     }
     let mut body = Vec::new();
     let mut response = response;
-    while let Some(chunk) = response.chunk().await.map_err(reqwest_blob_error)? {
+    loop {
+        let next = if body.is_empty()
+            && let Some(deadline) = first_byte_deadline
+        {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(AppError::BlobStore("request timed out".into()));
+            }
+            tokio::time::timeout(remaining, response.chunk())
+                .await
+                .map_err(|_| AppError::BlobStore("request timed out".into()))?
+        } else {
+            response.chunk().await
+        }
+        .map_err(reqwest_blob_error)?;
+        let Some(chunk) = next else {
+            break;
+        };
         let next_len = body
             .len()
             .checked_add(chunk.len())
