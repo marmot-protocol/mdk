@@ -261,6 +261,20 @@ late-join/re-add and roster-tail representatives. The ordinary lane executes 10-
 incremental-join canaries. The suite compiles all 54 catalog shapes but does not execute large/xlarge cases in the
 normal PR path.
 
+### `generate_offline_catchup_pressure_family(seed, cases)`
+
+Generates a replay-stable retained-relay catalog for large terminal catch-up. Bob is a founding member, goes offline
+before workload generation, and reconnects only after every application and state commit has been retained. Four
+cost-ordered volume blocks contain 24/96/384/1,024 application messages and 4/8/12/16 commit rounds. Six arms cover
+natural and reverse history, duplicate replay, incremental plus full repair, restart after sync but before processing,
+and competing commit waves.
+
+`tests/offline_catchup_family.rs` pins same-seed determinism, different-seed variation, prefix stability, registration,
+profile provenance, every volume/recovery arm, terminal-only reconnect, the pre-catch-up zero-delivery boundary, the
+post-catch-up exact-one boundary, full Bob payload multiplicity, exact canonical equivalence, no pending work, active
+decryptability, and encrypted file-backed natural/duplicate canaries. The ordinary test lane executes only two
+24-message cases; larger blocks belong in isolated manual or scheduled campaigns.
+
 ### `cross-route-restart-permutations/v1`
 
 This bounded current-build catalog adds one reviewed durable reopen to the shared four-party cross-route scenario.

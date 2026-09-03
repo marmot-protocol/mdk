@@ -469,12 +469,28 @@ Terminal expectations pin the modeled epoch, roster size, profile, admin set, pe
 active decryptability. Membership cases scope `NoPendingWork` to founding members; retained-history cases require it
 for every surviving member and also require global quiescence.
 
+`generate_offline_catchup_pressure_family(seed, cases)` specializes the production symptom where a founding member is
+offline for nearly the complete scenario and then processes a large retained-relay history at the end. Cost-ordered
+blocks contain 24, 96, 384, and 1,024 application messages interleaved with epoch commits. Six arms vary natural versus
+reverse history, duplicate replay, incremental plus full repair, restart before backlog processing, and competing
+commit waves. Terminal expectations require Bob's exact payload multiset, exact canonical equality, no pending work,
+and an active decryptability probe after recovery.
+
 Run the family directly:
 
 ```sh
 cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report -- \
-  --family chat-journey/v1 --seed 42 --cases 10 \
-  --out target/chat-journey-reports --storage file --strict-oracle
+  --family offline-catchup-pressure/v1 --seed 42 --cases 18 \
+  --out target/offline-catchup-reports --storage file --strict-oracle
+```
+
+For isolated high-volume catch-up discovery:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked -- \
+  --family offline-catchup-pressure/v1 --seed 42 --cases 18 \
+  --case-timeout-secs 300 --storage file \
+  --out target/offline-catchup-seed-42
 ```
 
 Send/leave and convergence-chaos reliability cases finish with a global transport/mailbox drain, an exact observation,

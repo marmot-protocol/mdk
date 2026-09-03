@@ -884,6 +884,20 @@ The app-witness “multi-parent” sentinel means one MLS commit consuming multi
 atomically. MLS still has exactly one prior group-state parent; the campaign does not claim that incompatible MLS state
 branches can be merged.
 
+### Offline Catch-up Pressure Catalog
+
+`offline-catchup-pressure/v1` (generator version `1`, workload-profile version `1`) keeps Bob, a founding group member,
+offline until the terminal phase while Alice, Carol, and David publish a retained application/commit backlog. Four
+cost-ordered six-arm blocks contain 24/96/384/1,024 application messages interleaved with 4/8/12/16 commit rounds.
+The competing-wave arm publishes two same-epoch group-state commits per round.
+
+Each block covers natural full-history recovery, reverse full history, reverse history with three returned copies,
+incremental followed by full repair, restart after history sync but before processing, and reverse/duplicated competing
+commit waves. A pre-reconnect assertion proves Bob has not received the first backlog payload; the terminal phase
+requires the last payload exactly once, the complete backlog payload multiset exactly once, exact canonical equality,
+no pending work, and active bidirectional decryptability involving Bob. The family always selects the retained-relay
+subject so reconnect means a durable history query rather than healing an in-memory packet partition.
+
 These tests keep the simulator machinery honest.
 
 - `canonical_vector_fixtures_match_generated_traces` checks that every top-level JSON scenario vector still matches its

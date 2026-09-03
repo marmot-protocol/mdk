@@ -172,6 +172,9 @@ pub fn generate_family_case(
         crate::LARGE_GROUP_PRESSURE_FAMILY => {
             crate::generate_large_group_pressure_case(seed, case_index)
         }
+        crate::OFFLINE_CATCHUP_PRESSURE_FAMILY => {
+            crate::generate_offline_catchup_pressure_case(seed, case_index)
+        }
         "cross-route-restart-permutations/v1" => {
             generate_cross_route_restart_permutation_case(seed, case_index)
         }
@@ -3578,7 +3581,7 @@ fn confirmed(step_index: usize, client: &str, pending: &str) -> TraceExpectation
 /// functions of the case, so these expectations are delivery-schedule
 /// invariant, and they give the strict oracle its `CreateGroup` /
 /// `PublishConfirm` stimulus coverage without hand-maintained step indices.
-fn push_labelled_confirmation_expectations(
+pub(crate) fn push_labelled_confirmation_expectations(
     scenario: &ScenarioSpec,
     expected: &mut Vec<TraceExpectation>,
 ) {
@@ -4017,7 +4020,7 @@ fn send_leave_case(rng: &mut StdRng, case_index: u64) -> (ScenarioSpec, Vec<Trac
 /// strict black-box assertion. The extra drain is deliberate: exact state and
 /// quiescence are sampled only after every attached client has had a final
 /// chance to consume retained transport.
-fn add_strict_reliability_oracle(
+pub(crate) fn add_strict_reliability_oracle(
     scenario: &mut ScenarioSpec,
     expected: &mut Vec<TraceExpectation>,
 ) {
