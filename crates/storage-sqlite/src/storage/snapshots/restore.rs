@@ -9,6 +9,7 @@ use crate::connection::CachedSql;
 #[cfg(feature = "test-conformance-replay")]
 use crate::deserialize;
 use crate::openmls_storage::mls_group_key;
+use crate::storage::groups::encode_group;
 use crate::storage::messages::put_message_on_connection;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
@@ -201,7 +202,7 @@ fn group(conn: &rusqlite::Connection, group_id: &GroupId, group: &Group) -> Stor
         params![
             group_id.as_slice(),
             epoch_to_i64(group.epoch)?,
-            serialize(group)?
+            encode_group(group)?
         ],
     )
     .storage()?;

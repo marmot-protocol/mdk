@@ -1,10 +1,40 @@
 use crate::connection::CachedSql;
 use crate::openmls_storage::mls_group_key;
-use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, serialize};
+use crate::{SqliteAccountStorage, SqliteResultExt, epoch_to_i64};
 use cgka_traits::group::Group;
 use cgka_traits::storage::{GroupStorage, StorageError, StorageResult, TransportGroupRoute};
 use cgka_traits::types::{EpochId, GroupId};
 use rusqlite::{OptionalExtension, params};
+use serde::Serialize;
+
+/// Leading bytes of a MessagePack-encoded `cgka_groups.record`. Rows written
+/// before this encoding are serde_json documents, which never begin with NUL,
+/// so a read tells the two apart by this prefix and older rows keep decoding
+/// until their next `put_group` replaces them.
+///
+/// serde_json spelled each member's id and credential as an array of decimal
+/// integers, and the engine reads the record several times per send and per
+/// inbound message. Structs are written as maps rather than positional arrays
+/// so `#[serde(default)]` fields added later stay readable either way.
+const RECORD_ENCODING_V2_PREFIX: [u8; 2] = [0x00, 0x02];
+
+pub(crate) fn encode_group(group: &Group) -> StorageResult<Vec<u8>> {
+    let mut out = RECORD_ENCODING_V2_PREFIX.to_vec();
+    let mut serializer = rmp_serde::Serializer::new(&mut out).with_struct_map();
+    group
+        .serialize(&mut serializer)
+        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+    Ok(out)
+}
+
+pub(crate) fn decode_group(bytes: &[u8]) -> StorageResult<Group> {
+    match bytes.strip_prefix(&RECORD_ENCODING_V2_PREFIX) {
+        Some(body) => {
+            rmp_serde::from_slice(body).map_err(|e| StorageError::Serialization(e.to_string()))
+        }
+        None => crate::deserialize(bytes),
+    }
+}
 
 impl GroupStorage for SqliteAccountStorage {
     fn put_group(&self, group: &Group) -> StorageResult<()> {
@@ -18,7 +48,7 @@ impl GroupStorage for SqliteAccountStorage {
                 params![
                     group.id.as_slice(),
                     epoch_to_i64(group.epoch)?,
-                    serialize(group)?
+                    encode_group(group)?
                 ],
             )
             .storage()?;
@@ -36,7 +66,7 @@ impl GroupStorage for SqliteAccountStorage {
             .optional()
             .storage()?
             .ok_or(StorageError::NotFound)?;
-        deserialize(&record)
+        decode_group(&record)
     }
 
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
@@ -118,7 +148,7 @@ impl GroupStorage for SqliteAccountStorage {
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
-        records.iter().map(|record| deserialize(record)).collect()
+        records.iter().map(|record| decode_group(record)).collect()
     }
 
     fn put_transport_group_route(
@@ -166,6 +196,49 @@ mod tests {
     };
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+    #[test]
+    fn group_record_roundtrips_through_messagepack() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut group = sample_group(gid(1), 7, 3);
+        group.disbanded = Some(cgka_traits::group::DisbandTombstone {
+            epoch: EpochId(7),
+            actor: MemberId::new(vec![1; 32]),
+            origin_commit_id: None,
+            commit_digest: [9; 32],
+            local_was_committer_leaf: true,
+            former_members: group.members.clone(),
+            announced: false,
+        });
+        store.put_group(&group).unwrap();
+        let record: Vec<u8> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT record FROM cgka_groups WHERE id = ?1",
+                [group.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(&record[..2], &[0x00, 0x02]);
+        assert_eq!(store.get_group(&group.id).unwrap(), group);
+    }
+
+    #[test]
+    fn group_record_written_as_json_still_decodes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 7, 3);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 7, ?2)",
+                rusqlite::params![group.id.as_slice(), crate::serialize(&group).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(store.get_group(&group.id).unwrap(), group);
+        assert_eq!(store.list_group_records().unwrap(), vec![group]);
+    }
 
     #[test]
     fn list_group_records_returns_every_stored_record() {

@@ -112,6 +112,8 @@ mod migration_0055_epoch_stall_evidence;
 mod migration_0056_chat_list_accepted_activity_high_water;
 #[path = "migrations/0057_openmls_values_msgpack.rs"]
 mod migration_0057_openmls_values_msgpack;
+#[path = "migrations/0058_group_record_msgpack.rs"]
+mod migration_0058_group_record_msgpack;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -411,6 +413,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 57,
         name: "0057_openmls_values_msgpack",
         apply: migration_0057_openmls_values_msgpack::apply,
+    },
+    Migration {
+        version: 58,
+        name: "0058_group_record_msgpack",
+        apply: migration_0058_group_record_msgpack::apply,
     },
 ];
 
@@ -939,7 +946,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 57,
+                found: 58,
                 latest_supported: 46,
             }
         ));
@@ -995,7 +1002,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 57,
+                found: 58,
                 latest_supported: 46,
             }
         ));
@@ -1299,7 +1306,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 57,
+                found: 58,
                 latest_supported: 46,
             }
         ));

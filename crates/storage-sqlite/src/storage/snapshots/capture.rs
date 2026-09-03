@@ -9,6 +9,7 @@ use crate::connection::CachedSql;
 use crate::openmls_storage::mls_group_key;
 #[cfg(feature = "test-conformance-replay")]
 use crate::serialize;
+use crate::storage::groups::decode_group;
 use crate::storage::messages::ordered_messages_on_connection;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
@@ -84,7 +85,7 @@ fn capture_snapshot(
         .optional()
         .storage()?
         .ok_or(StorageError::NotFound)?;
-    let group = deserialize(&group_blob)?;
+    let group = decode_group(&group_blob)?;
     let (messages, queued_outbound) = match scope {
         SnapshotScope::Full => (
             Some(messages(conn, group_id)?),
@@ -124,7 +125,7 @@ pub(super) fn capture_group_state(
         .ok_or(StorageError::NotFound)?;
 
     Ok(GroupStateCheckpoint {
-        group: deserialize(&group_blob)?,
+        group: decode_group(&group_blob)?,
         member_caps: member_capabilities(conn, group_id)?,
         validated_tree_marker: validated_tree_marker(conn, group_id)?,
         openmls_values: openmls_values(conn, &mls_group_key)?,
