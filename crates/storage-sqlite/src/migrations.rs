@@ -110,6 +110,8 @@ mod migration_0054_transport_reconciliation_items;
 mod migration_0055_epoch_stall_evidence;
 #[path = "migrations/0056_chat_list_accepted_activity_high_water.rs"]
 mod migration_0056_chat_list_accepted_activity_high_water;
+#[path = "migrations/0057_openmls_values_msgpack.rs"]
+mod migration_0057_openmls_values_msgpack;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -404,6 +406,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 56,
         name: "0056_chat_list_accepted_activity_high_water",
         apply: migration_0056_chat_list_accepted_activity_high_water::apply,
+    },
+    Migration {
+        version: 57,
+        name: "0057_openmls_values_msgpack",
+        apply: migration_0057_openmls_values_msgpack::apply,
     },
 ];
 
@@ -932,7 +939,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 56,
+                found: 57,
                 latest_supported: 46,
             }
         ));
@@ -988,7 +995,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 56,
+                found: 57,
                 latest_supported: 46,
             }
         ));
@@ -1292,7 +1299,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 56,
+                found: 57,
                 latest_supported: 46,
             }
         ));
