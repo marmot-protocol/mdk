@@ -676,6 +676,8 @@ async fn upload_blossom_blob_with_fallback(
         }
     }
     if timed_out {
+        // Any pre-publication timeout keeps the aggregate safely retryable,
+        // even when another fallback also returned a terminal rejection.
         return Err(AppError::MediaUploadTimedOut);
     }
     Err(AppError::BlobStore(format!(

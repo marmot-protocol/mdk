@@ -690,12 +690,7 @@ async fn media_http_client_for_url(
     url: &Url,
     allow_loopback_http: bool,
 ) -> Result<reqwest::Client, AppError> {
-    validate_blossom_fetch_url(url, allow_loopback_http)
-        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
-    let allow_loopback = url.scheme() == "http"
-        && allow_loopback_http
-        && url.host().map(is_loopback_host).unwrap_or(false);
-    let pin = resolve_media_host(url, allow_loopback).await?;
+    let pin = resolve_pinned_media_host_for_url(url, allow_loopback_http).await?;
     build_pinned_media_http_client(pin)
 }
 
@@ -703,13 +698,20 @@ async fn media_http_upload_client_for_url(
     url: &Url,
     allow_loopback_http: bool,
 ) -> Result<reqwest::Client, AppError> {
+    let pin = resolve_pinned_media_host_for_url(url, allow_loopback_http).await?;
+    build_pinned_media_upload_client(pin)
+}
+
+async fn resolve_pinned_media_host_for_url(
+    url: &Url,
+    allow_loopback_http: bool,
+) -> Result<Option<(String, Vec<SocketAddr>)>, AppError> {
     validate_blossom_fetch_url(url, allow_loopback_http)
         .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
     let allow_loopback = url.scheme() == "http"
         && allow_loopback_http
         && url.host().map(is_loopback_host).unwrap_or(false);
-    let pin = resolve_media_host(url, allow_loopback).await?;
-    build_pinned_media_upload_client(pin)
+    resolve_media_host(url, allow_loopback).await
 }
 
 fn build_pinned_media_http_client(

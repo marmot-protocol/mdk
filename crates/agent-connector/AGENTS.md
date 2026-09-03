@@ -44,7 +44,7 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/reconcile_telemetry.rs` — privacy-safe aggregate counters for the background reconciliation loops
   (`ReconcileTelemetry` on the connector: passes, outcomes, accounts/candidate rows considered) plus the
   `ReconcileSource` label used on per-pass tracing events (mdk#1380).
-- `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`privacy_safe_code` projections.
+- `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`retryable`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.
 - `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the persisted

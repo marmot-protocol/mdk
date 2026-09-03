@@ -200,6 +200,48 @@ fn inbound_subscription_quota_preserves_one_shot_capacity() {
     );
 }
 
+#[tokio::test]
+async fn subscription_capacity_error_echoes_request_id_and_is_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.subscription_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-subscription-busy".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: None,
+            group_id_hex: None,
+        },
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-subscription-busy"));
+    assert!(matches!(
+        response.payload,
+        AgentControlResponse::Error {
+            ref code,
+            retryable: true,
+            ..
+        } if code == "server_busy"
+    ));
+    server.await.unwrap().unwrap();
+}
+
 #[test]
 fn poisoned_connector_store_mutex_recovers_inner_state() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
@@ -1345,9 +1387,14 @@ async fn connector_socket_caps_concurrent_connections() {
             .expect("busy response should not time out")
             .expect("busy response should be a valid frame")
             .expect("busy response should not be empty");
+    assert_eq!(refused_response.id, None);
     assert!(matches!(
         refused_response.payload,
-        AgentControlResponse::Error { ref code, .. } if code == "server_busy"
+        AgentControlResponse::Error {
+            ref code,
+            retryable: false,
+            ..
+        } if code == "server_busy"
     ));
 
     // Dropping the held connection frees the permit for a new connection.

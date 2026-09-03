@@ -427,6 +427,8 @@ pub enum AgentControlResponse {
     Error {
         code: String,
         message: String,
+        /// Whether retrying the same operation is safe. Missing legacy fields
+        /// default to false so compatibility never widens retry behavior.
         #[serde(default)]
         retryable: bool,
     },
