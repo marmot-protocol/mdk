@@ -264,6 +264,13 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failure_classifications: Vec::new(),
             duration_ms: hist(3),
         },
+        media_download_body_transfer: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 1,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(8),
+        },
         host_splash_ready: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 1,
@@ -425,6 +432,11 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES
             && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS
+            && point.relay.is_none()
+            && point.value == ExportMetricValue::Counter(2)
     }));
 
     let duration = batch

@@ -2979,6 +2979,16 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot group_accept_invite;
   struct MarmotAppPerformanceOperationSnapshot media_upload;
   struct MarmotAppPerformanceOperationSnapshot media_download;
+  struct MarmotAppPerformanceOperationSnapshot media_download_queue_wait;
+  struct MarmotAppPerformanceOperationSnapshot media_download_preparation;
+  struct MarmotAppPerformanceOperationSnapshot media_download_host_setup;
+  struct MarmotAppPerformanceOperationSnapshot media_download_response_headers;
+  struct MarmotAppPerformanceOperationSnapshot media_download_first_byte;
+  struct MarmotAppPerformanceOperationSnapshot media_download_body_transfer;
+  struct MarmotAppPerformanceOperationSnapshot media_download_locator_failover;
+  struct MarmotAppPerformanceOperationSnapshot media_download_ciphertext_verify;
+  struct MarmotAppPerformanceOperationSnapshot media_download_decrypt;
+  struct MarmotAppPerformanceOperationSnapshot media_download_plaintext_verify;
   struct MarmotAppPerformanceOperationSnapshot host_splash_ready;
   struct MarmotAppPerformanceOperationSnapshot host_foreground_local_ready;
 } MarmotAppPerformanceSnapshot;

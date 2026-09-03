@@ -15,6 +15,7 @@ use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
     reject_non_public_ip, validate_blossom_fetch_url,
 };
+use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, unix_now_seconds};
 
 #[cfg(test)]
@@ -99,6 +100,7 @@ pub(crate) struct BlossomHttpTransport {
     pub(super) allow_loopback_http: bool,
     address_lease: Duration,
     candidate_startup_timeout: Duration,
+    transfer_timeout: Duration,
 }
 
 impl BlossomHttpTransport {
@@ -107,6 +109,7 @@ impl BlossomHttpTransport {
             allow_loopback_http,
             BLOSSOM_ADDRESS_LEASE,
             BLOSSOM_CANDIDATE_STARTUP_TIMEOUT,
+            MEDIA_BLOB_TRANSFER_TIMEOUT,
             system_dns_resolver(),
         )
     }
@@ -115,6 +118,7 @@ impl BlossomHttpTransport {
         allow_loopback_http: bool,
         address_lease: Duration,
         candidate_startup_timeout: Duration,
+        transfer_timeout: Duration,
         resolver: DnsResolver,
     ) -> Self {
         Self {
@@ -125,6 +129,7 @@ impl BlossomHttpTransport {
             allow_loopback_http,
             address_lease,
             candidate_startup_timeout,
+            transfer_timeout,
         }
     }
 
@@ -138,6 +143,23 @@ impl BlossomHttpTransport {
             allow_loopback_http,
             address_lease,
             candidate_startup_timeout,
+            MEDIA_BLOB_TRANSFER_TIMEOUT,
+            system_dns_resolver(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_transfer_timeout(
+        allow_loopback_http: bool,
+        address_lease: Duration,
+        candidate_startup_timeout: Duration,
+        transfer_timeout: Duration,
+    ) -> Self {
+        Self::with_policy(
+            allow_loopback_http,
+            address_lease,
+            candidate_startup_timeout,
+            transfer_timeout,
             system_dns_resolver(),
         )
     }
@@ -153,6 +175,7 @@ impl BlossomHttpTransport {
             allow_loopback_http,
             address_lease,
             candidate_startup_timeout,
+            MEDIA_BLOB_TRANSFER_TIMEOUT,
             resolver,
         )
     }
@@ -213,7 +236,13 @@ impl BlossomHttpTransport {
             allow_loopback_http: false,
             address_lease: self.address_lease,
             candidate_startup_timeout: self.candidate_startup_timeout,
+            transfer_timeout: self.transfer_timeout,
         }
+    }
+
+    /// Return the single deadline shared by every locator in one download.
+    pub(super) fn transfer_timeout(&self) -> Duration {
+        self.transfer_timeout
     }
 }
 
@@ -393,6 +422,15 @@ pub(crate) async fn fetch_blossom_blob_with_transport(
     url: &str,
     transport: &BlossomHttpTransport,
 ) -> Result<Vec<u8>, AppError> {
+    fetch_blossom_blob_with_observer(url, transport, None).await
+}
+
+/// Fetch a bounded blob while recording privacy-safe transport phase totals.
+pub(super) async fn fetch_blossom_blob_with_observer(
+    url: &str,
+    transport: &BlossomHttpTransport,
+    telemetry: Option<&AppPerformanceTelemetry>,
+) -> Result<Vec<u8>, AppError> {
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, transport.allow_loopback_http)
@@ -400,8 +438,9 @@ pub(crate) async fn fetch_blossom_blob_with_transport(
     fetch_http_with_bounded_redirects(
         current,
         MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
-        MEDIA_BLOB_TRANSFER_TIMEOUT,
+        transport.transfer_timeout,
         Some(transport.candidate_startup_timeout),
+        telemetry,
         move |url| {
             let transport = transport.clone();
             async move { transport.client_for_url(&url).await }
@@ -441,6 +480,7 @@ pub(crate) async fn fetch_profile_image_with_loopback(
         max_bytes,
         MEDIA_HTTP_TOTAL_TIMEOUT,
         None,
+        None,
         move |url| async move { media_http_client_for_url(&url, true).await },
         move |current, location| {
             let raw_location = location.trim();
@@ -476,6 +516,7 @@ async fn fetch_profile_image_impl(url: &str, max_bytes: u64) -> Result<Vec<u8>, 
         max_bytes,
         MEDIA_HTTP_TOTAL_TIMEOUT,
         None,
+        None,
         move |url| async move { media_http_client_for_profile(&url).await },
         move |current, location| {
             parse_profile_image_redirect_url(current, location).map_err(AppError::UnsafeMediaFetch)
@@ -501,6 +542,7 @@ async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     max_body_bytes: u64,
     request_timeout: Duration,
     startup_timeout: Option<Duration>,
+    telemetry: Option<&AppPerformanceTelemetry>,
     mut client_for_url: C,
     mut redirect_target: R,
 ) -> Result<Vec<u8>, AppError>
@@ -525,9 +567,41 @@ where
         if operation_remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()));
         }
-        let client = tokio::time::timeout(operation_remaining, client_for_url(current.clone()))
-            .await
-            .map_err(|_| AppError::BlobStore("request timed out".into()))??;
+        let host_setup_started = Instant::now();
+        let client = match tokio::time::timeout(
+            operation_remaining,
+            client_for_url(current.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadHostSetup,
+                    host_setup_started,
+                    true,
+                );
+                client
+            }
+            Ok(Err(error)) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadHostSetup,
+                    host_setup_started,
+                    false,
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadHostSetup,
+                    host_setup_started,
+                    false,
+                );
+                return Err(AppError::BlobStore("request timed out".into()));
+            }
+        };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()));
@@ -539,17 +613,50 @@ where
         if operation_remaining.is_zero() {
             return Err(AppError::BlobStore("request timed out".into()));
         }
-        let response = tokio::time::timeout(
+        let response_headers_started = Instant::now();
+        let response = match tokio::time::timeout(
             operation_remaining,
             client.get(current.clone()).timeout(remaining).send(),
         )
         .await
-        .map_err(|_| AppError::BlobStore("request timed out".into()))?
-        .map_err(reqwest_blob_error)?;
+        {
+            Ok(Ok(response)) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadResponseHeaders,
+                    response_headers_started,
+                    true,
+                );
+                response
+            }
+            Ok(Err(error)) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadResponseHeaders,
+                    response_headers_started,
+                    false,
+                );
+                return Err(reqwest_blob_error(error));
+            }
+            Err(_) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadResponseHeaders,
+                    response_headers_started,
+                    false,
+                );
+                return Err(AppError::BlobStore("request timed out".into()));
+            }
+        };
         let status = response.status();
         if status.is_success() {
-            return read_limited_blossom_body_until(response, max_body_bytes, startup_deadline)
-                .await;
+            return read_limited_blossom_body_until(
+                response,
+                max_body_bytes,
+                startup_deadline,
+                telemetry,
+            )
+            .await;
         }
         if !status.is_redirection() {
             return Err(AppError::BlobStore(format!(
@@ -801,7 +908,7 @@ pub(crate) async fn read_limited_blossom_body(
     response: reqwest::Response,
     max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
-    read_limited_blossom_body_until(response, max_bytes, None).await
+    read_limited_blossom_body_until(response, max_bytes, None, None).await
 }
 
 async fn read_limited_blossom_upload_body(
@@ -820,39 +927,112 @@ async fn read_limited_blossom_body_until(
     response: reqwest::Response,
     max_bytes: u64,
     first_byte_deadline: Option<tokio::time::Instant>,
+    telemetry: Option<&AppPerformanceTelemetry>,
 ) -> Result<Vec<u8>, AppError> {
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
     {
+        record_download_phase(
+            telemetry,
+            AppPerformanceOperation::MediaDownloadBodyTransfer,
+            Instant::now(),
+            false,
+        );
         return Err(AppError::BlobStore(format!(
             "download exceeds {max_bytes} bytes"
         )));
     }
     let mut body = Vec::new();
     let mut response = response;
+    let first_byte_started = Instant::now();
+    let mut body_started = None;
     loop {
-        let next = if body.is_empty()
+        let next_result = if body.is_empty()
             && let Some(deadline) = first_byte_deadline
         {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadFirstByte,
+                    first_byte_started,
+                    false,
+                );
                 return Err(AppError::BlobStore("request timed out".into()));
             }
             tokio::time::timeout(remaining, response.chunk())
                 .await
-                .map_err(|_| AppError::BlobStore("request timed out".into()))?
+                .map_err(|_| AppError::BlobStore("request timed out".into()))
+                .and_then(|result| result.map_err(reqwest_blob_error))
         } else {
-            response.chunk().await
-        }
-        .map_err(reqwest_blob_error)?;
+            response.chunk().await.map_err(reqwest_blob_error)
+        };
+        let next = match next_result {
+            Ok(next) => next,
+            Err(error) => {
+                let (operation, started_at) = match body_started {
+                    Some(started_at) => (
+                        AppPerformanceOperation::MediaDownloadBodyTransfer,
+                        started_at,
+                    ),
+                    None => (
+                        AppPerformanceOperation::MediaDownloadFirstByte,
+                        first_byte_started,
+                    ),
+                };
+                record_download_phase(telemetry, operation, started_at, false);
+                return Err(error);
+            }
+        };
         let Some(chunk) = next else {
+            if body_started.is_none() {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadFirstByte,
+                    first_byte_started,
+                    true,
+                );
+            }
+            record_download_phase(
+                telemetry,
+                AppPerformanceOperation::MediaDownloadBodyTransfer,
+                body_started.unwrap_or_else(Instant::now),
+                true,
+            );
             break;
         };
+        if body_started.is_none() {
+            record_download_phase(
+                telemetry,
+                AppPerformanceOperation::MediaDownloadFirstByte,
+                first_byte_started,
+                true,
+            );
+            body_started = Some(Instant::now());
+        }
         let next_len = body
             .len()
             .checked_add(chunk.len())
-            .ok_or_else(|| AppError::BlobStore(format!("download exceeds {max_bytes} bytes")))?;
+            .ok_or_else(|| AppError::BlobStore(format!("download exceeds {max_bytes} bytes")));
+        let next_len = match next_len {
+            Ok(next_len) => next_len,
+            Err(error) => {
+                record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadBodyTransfer,
+                    body_started.unwrap_or_else(Instant::now),
+                    false,
+                );
+                return Err(error);
+            }
+        };
         if next_len as u64 > max_bytes {
+            record_download_phase(
+                telemetry,
+                AppPerformanceOperation::MediaDownloadBodyTransfer,
+                body_started.unwrap_or_else(Instant::now),
+                false,
+            );
             return Err(AppError::BlobStore(format!(
                 "download exceeds {max_bytes} bytes"
             )));
@@ -860,6 +1040,18 @@ async fn read_limited_blossom_body_until(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Record one fixed phase without accepting caller-controlled labels.
+fn record_download_phase(
+    telemetry: Option<&AppPerformanceTelemetry>,
+    operation: AppPerformanceOperation,
+    started_at: Instant,
+    success: bool,
+) {
+    if let Some(telemetry) = telemetry {
+        telemetry.record(operation, started_at.elapsed(), success);
+    }
 }
 
 fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {

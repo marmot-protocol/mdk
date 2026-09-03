@@ -299,6 +299,7 @@ pub(crate) enum AccountWorkerCommand {
     DownloadMedia {
         group_id: GroupId,
         reference: MediaAttachmentReference,
+        enqueued_at: Instant,
         respond: oneshot::Sender<Result<MediaDownloadResult, AppError>>,
     },
     SecureDeleteExpiredPlaintext {
@@ -3529,36 +3530,58 @@ async fn handle_account_worker_command(
         AccountWorkerCommand::DownloadMedia {
             group_id,
             reference,
+            enqueued_at,
             respond,
         } => {
-            let started_at = Instant::now();
+            let telemetry = shared.app_performance_telemetry();
+            telemetry.record(
+                AppPerformanceOperation::MediaDownloadQueueWait,
+                enqueued_at.elapsed(),
+                true,
+            );
             let permit = match reserve_media_http(media_http) {
                 Ok(permit) => permit,
                 Err(err) => {
-                    shared.app_performance_telemetry().record(
+                    telemetry.record(
                         AppPerformanceOperation::MediaDownload,
-                        started_at.elapsed(),
+                        enqueued_at.elapsed(),
                         false,
                     );
                     let _ = respond.send(Err(err));
                     return;
                 }
             };
+            let preparation_started = Instant::now();
             match client
                 .prepare_encrypted_media_download(&group_id, reference)
                 .await
             {
-                Ok(http) => spawn_media_http(media_http, permit, http.run(), move |result| {
-                    MediaHttpCompletion::Download {
-                        result,
-                        respond,
-                        started_at,
-                    }
-                }),
+                Ok(http) => {
+                    telemetry.record(
+                        AppPerformanceOperation::MediaDownloadPreparation,
+                        preparation_started.elapsed(),
+                        true,
+                    );
+                    spawn_media_http(
+                        media_http,
+                        permit,
+                        http.run(Some(telemetry)),
+                        move |result| MediaHttpCompletion::Download {
+                            result,
+                            respond,
+                            started_at: enqueued_at,
+                        },
+                    )
+                }
                 Err(err) => {
-                    shared.app_performance_telemetry().record(
+                    telemetry.record(
+                        AppPerformanceOperation::MediaDownloadPreparation,
+                        preparation_started.elapsed(),
+                        false,
+                    );
+                    telemetry.record(
                         AppPerformanceOperation::MediaDownload,
-                        started_at.elapsed(),
+                        enqueued_at.elapsed(),
                         false,
                     );
                     let _ = respond.send(Err(err));

@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -807,6 +807,53 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
     assert_eq!(attachment.encrypted_size_bytes, received_len);
     assert_eq!(attachment.reference.ciphertext_sha256, received_hash);
     assert_eq!(downloaded.plaintext, vec![0x5a; plaintext_len]);
+}
+
+#[tokio::test]
+async fn encrypted_media_download_records_network_integrity_and_crypto_phases() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+
+    download_encrypted_media_with_transport(
+        upload.attachments[0].reference.clone(),
+        &secret,
+        &endpoints,
+        &allowed,
+        &transport,
+        Some(&telemetry),
+    )
+    .await
+    .expect("fixture download should succeed");
+
+    let snapshot = telemetry.snapshot();
+    for phase in [
+        snapshot.media_download_host_setup,
+        snapshot.media_download_response_headers,
+        snapshot.media_download_first_byte,
+        snapshot.media_download_body_transfer,
+        snapshot.media_download_ciphertext_verify,
+        snapshot.media_download_decrypt,
+        snapshot.media_download_plaintext_verify,
+    ] {
+        assert_eq!(phase.attempts, 1);
+        assert_eq!(phase.successes, 1);
+        assert_eq!(phase.failures, 0);
+    }
+    assert_eq!(snapshot.media_download_locator_failover.attempts, 0);
 }
 
 #[tokio::test]
@@ -1775,6 +1822,35 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
     stalled_server.abort();
 
     assert_eq!(downloaded, body);
+}
+
+#[tokio::test]
+async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
+    let body = b"healthy ciphertext";
+    let (first_url, first_server) = spawn_stalled_http_server().await;
+    let (second_url, second_server) = spawn_stalled_http_server().await;
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[first_url, second_url, healthy_url]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        Duration::from_millis(130),
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let started = Instant::now();
+
+    let error = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("candidate failover must not renew the transfer deadline");
+    first_server.abort();
+    second_server.abort();
+
+    assert!(error.to_string().contains("timed out"));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "two stalled candidates must share the configured end-to-end deadline"
+    );
 }
 
 #[tokio::test]

@@ -16,6 +16,8 @@ test-policy-overrides = [
 # privacy-critical mapping and opt-in gate stay in the default build; this
 # feature only adds the OTLP protobuf dependencies and the push transport.
 otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
+# Internal-only surface used by the repeatable media transport benchmark.
+media-benchmarks = []
 
 [dependencies]
 async-trait.workspace = true
@@ -56,8 +58,14 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "media_download_backlog"
+harness = false
+required-features = ["media-benchmarks"]
