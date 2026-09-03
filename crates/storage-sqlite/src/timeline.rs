@@ -747,7 +747,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if conn
-                .query_row(
+                .query_row_cached(
                     &format!(
                         "SELECT 1 FROM app_events
                          WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
@@ -776,7 +776,7 @@ impl SqliteAccountStorage {
             let before =
                 timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
             let cleared = conn
-                .execute(
+                .execute_cached(
                     &format!(
                         "UPDATE app_events
                          SET invalidated = 0, invalidation_reason = NULL
@@ -1484,7 +1484,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
          LIMIT 1",
     );
     let latest = tx
-        .query_row(&sql, params![group_id_hex], |row| {
+        .query_row_cached(&sql, params![group_id_hex], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,

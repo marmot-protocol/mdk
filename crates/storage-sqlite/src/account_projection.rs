@@ -1428,7 +1428,7 @@ impl SqliteAccountStorage {
                     "account_groups",
                 ] {
                     deleted = deleted.saturating_add(
-                        tx.execute(
+                        tx.execute_cached(
                             &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
                             params![group_id_hex],
                         )

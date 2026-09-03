@@ -1763,7 +1763,7 @@ fn latest_chat_list_activity_tx(
          ORDER BY {preview_order}
          LIMIT 1"
     );
-    tx.query_row(&sql, params![group_id_hex], |row| {
+    tx.query_row_cached(&sql, params![group_id_hex], |row| {
         Ok(LatestChatListMessage {
             preview: chat_list_message_from_row(row)?,
             canonical_order_prefix: (
@@ -2048,7 +2048,7 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
         "{CHAT_LIST_ROW_SELECT_AND_JOINS}
          WHERE row.group_id_hex = ?1"
     );
-    tx.query_row(&sql, params![group_id_hex], |row| {
+    tx.query_row_cached(&sql, params![group_id_hex], |row| {
         chat_list_row_from_row(row, now_ms)
     })
     .optional()
