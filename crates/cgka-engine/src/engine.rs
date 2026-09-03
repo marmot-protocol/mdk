@@ -1015,17 +1015,22 @@ impl<S: StorageProvider> Engine<S> {
                     context: Some(context.clone()),
                     kind: crate::audit_helpers::send_outcome_event(intent_kind, send_result),
                 });
-                for (msg_id, expectation) in
-                    self.recipient_expectation_records(&recipient_group_id, send_result)
-                {
-                    self.recorder.record(AuditRecord {
-                        group_ref: group_ref.clone(),
-                        context: Some(context.clone()),
-                        kind: AuditEventKind::RecipientExpectation {
-                            msg_id,
-                            expectation,
-                        },
-                    });
+                // Recipient expectations read the group record and admin
+                // policy just to describe the send; skip that work when no
+                // recorder consumes it.
+                if self.recorder.is_enabled() {
+                    for (msg_id, expectation) in
+                        self.recipient_expectation_records(&recipient_group_id, send_result)
+                    {
+                        self.recorder.record(AuditRecord {
+                            group_ref: group_ref.clone(),
+                            context: Some(context.clone()),
+                            kind: AuditEventKind::RecipientExpectation {
+                                msg_id,
+                                expectation,
+                            },
+                        });
+                    }
                 }
             }
             Err(err) => {
@@ -2261,6 +2266,44 @@ impl<S: StorageProvider> Engine<S> {
         self.epoch_manager
             .restore_unrecoverable(group_id.clone(), group.epoch);
         Ok(true)
+    }
+
+    /// The removed and unrecoverable gates every send passes at acceptance and
+    /// again before preparation, answered from one group-record read instead
+    /// of one per gate. Order matches the split checks: a removed copy reports
+    /// `Removed` even when it is also halted.
+    pub(crate) fn refuse_removed_or_halted(
+        &mut self,
+        group_id: &GroupId,
+        intent: &SendIntent,
+    ) -> Result<(), EngineError> {
+        let group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(StorageError::NotFound) => return Ok(()),
+            Err(err) => return Err(EngineError::Storage(err)),
+        };
+        if group.removed {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Removed",
+                    to: crate::audit_helpers::send_intent_kind_str(intent),
+                    reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
+        if self.epoch_manager.is_unrecoverable(group_id) {
+            return Err(EngineError::GroupUnrecoverableRepairRequired {
+                group_id: group_id.clone(),
+            });
+        }
+        if !group.unrecoverable {
+            return Ok(());
+        }
+        self.epoch_manager
+            .restore_unrecoverable(group_id.clone(), group.epoch);
+        Err(EngineError::GroupUnrecoverableRepairRequired {
+            group_id: group_id.clone(),
+        })
     }
 
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every

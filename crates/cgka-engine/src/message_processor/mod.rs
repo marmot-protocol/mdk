@@ -624,29 +624,15 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        // Terminal gate before queueing: a local copy marked removed (realized
-        // self-eviction) must never accept or queue outbound work. Checked
-        // again in `do_send_ready` so queued-intent drains for a copy removed
-        // after queueing hit the same deterministic error.
-        if self.group_record_is_removed(&group_id)? {
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: "Removed",
-                    to: crate::audit_helpers::send_intent_kind_str(intent),
-                    reason: "local group copy is marked removed (self-evicted)",
-                },
-            ));
-        }
-        // mdk#971: durable Unrecoverable halt — sync into memory and refuse
-        // outbound work until a verified repair path clears the marker.
-        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
-            // mdk#1177: typed, not `InvalidTransition`. A halted group is a
-            // durable condition whose only exit is another member's repair
-            // Welcome, so the host has something to tell the user and act on —
-            // that is not an engine bug, which is what `InvalidTransition`
-            // denotes.
-            return Err(EngineError::GroupUnrecoverableRepairRequired { group_id });
-        }
+        // Terminal gates before queueing: a local copy marked removed (realized
+        // self-eviction) must never accept or queue outbound work, and a
+        // durable Unrecoverable halt (mdk#971) is synced into memory and
+        // refused until a verified repair path clears the marker. The halt is
+        // typed rather than `InvalidTransition` (mdk#1177): its only exit is
+        // another member's repair Welcome, so the host has something to tell
+        // the user. Checked again in `do_send_ready` so queued-intent drains
+        // for a copy removed after queueing hit the same deterministic error.
+        self.refuse_removed_or_halted(&group_id, intent)?;
         if self.disbanding_in_progress(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {

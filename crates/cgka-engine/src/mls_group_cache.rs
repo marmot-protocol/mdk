@@ -112,7 +112,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
-    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent};
+    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageProvider;
 
@@ -121,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn cached_group_is_reused_until_storage_is_written_behind_it() {
         let mut engine = test_engine();
-        let (group_id, _) = engine
+        let (group_id, created) = engine
             .create_group(CreateGroupRequest {
                 name: "cache".into(),
                 description: String::new(),
@@ -132,6 +132,12 @@ mod tests {
             })
             .await
             .unwrap();
+        // Until the founding publish is confirmed the group is not Stable and
+        // every app message queues without touching the MlsGroup.
+        let SendResult::GroupCreated { pending, .. } = created else {
+            panic!("legacy-profile creation returns GroupCreated");
+        };
+        engine.confirm_published(pending).await.unwrap();
         let payload = MarmotAppEvent::new(
             hex::encode(engine.self_id().as_slice()),
             1_700_000_000,
@@ -152,7 +158,12 @@ mod tests {
                     payload: payload.to_vec(),
                 })
                 .await
-                .map(|_| ())
+                .map(|result| {
+                    assert!(
+                        matches!(result, SendResult::ApplicationMessage { .. }),
+                        "a queued send would not touch the MlsGroup"
+                    );
+                })
         }
         let hits = |engine: &crate::Engine<storage_sqlite::SqliteAccountStorage>| {
             engine.mls_group_cache.hits.load(Ordering::Relaxed)
