@@ -185,7 +185,7 @@ impl MessageStorage for SqliteAccountStorage {
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
         let columns = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 &format!("SELECT {MESSAGE_COLUMNS} FROM cgka_messages WHERE id = ?1"),
                 params![id.as_slice()],
                 message_columns,
@@ -265,7 +265,7 @@ impl MessageStorage for SqliteAccountStorage {
             state_placeholders(states)
         );
         let conn = self.lock()?;
-        conn.query_row(
+        conn.query_row_cached(
             &sql,
             rusqlite::params_from_iter(state_query_params(group_id, at_or_after_epoch, states)?),
             |row| row.get(0),
@@ -699,7 +699,7 @@ fn update_message_state_on_connection(
         .storage()?
     } else if storage_format == 1 {
         let columns = conn
-            .query_row(
+            .query_row_cached(
                 &format!("SELECT {MESSAGE_COLUMNS} FROM cgka_messages WHERE id = ?1"),
                 params![id.as_slice()],
                 message_columns,

@@ -1031,7 +1031,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let row: Option<(String, String, u64, Vec<Vec<String>>)> = conn
-                .query_row(select_sql, lookup_params, |row| {
+                .query_row_cached(select_sql, lookup_params, |row| {
                     let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
                     let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -1059,7 +1059,7 @@ impl SqliteAccountStorage {
             // The UPDATE shares the lookup predicate and appends `reason` last.
             let mut update_params: Vec<&dyn rusqlite::ToSql> = lookup_params.to_vec();
             update_params.push(&reason);
-            conn.execute(update_sql, update_params.as_slice())
+            conn.execute_cached(update_sql, update_params.as_slice())
                 .storage()?;
             rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
             let messages =
@@ -2121,7 +2121,7 @@ fn scrub_app_event_rows_by_ids_tx(
             .collect::<Vec<_>>()
             .join(", ");
         let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute(
+        tx.execute_cached(
             &format!(
                 "UPDATE app_events
                  SET source_message_id_hex = NULL,
@@ -2157,7 +2157,7 @@ fn delete_app_event_rows_by_ids_tx(
             .join(", ");
         let values = group_and_message_id_values(group_id_hex, chunk);
         deleted = deleted.saturating_add(
-            tx.execute(
+            tx.execute_cached(
                 &format!(
                     "DELETE FROM app_events
                      WHERE group_id_hex = ?
@@ -2185,7 +2185,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
             .collect::<Vec<_>>()
             .join(", ");
         let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute(
+        tx.execute_cached(
             &format!(
                 "UPDATE message_timeline
                  SET source_message_id_hex = NULL,
@@ -2213,7 +2213,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
         )
         .storage()?;
         let values = group_and_message_id_values(group_id_hex, chunk);
-        tx.execute(
+        tx.execute_cached(
             &format!(
                 "UPDATE agent_stream_starts
                  SET source_message_id_hex = NULL,
@@ -2287,7 +2287,7 @@ fn delete_timeline_projection_rows_by_ids_tx(
                 .collect::<Vec<_>>()
                 .join(", ");
             let values = group_and_message_id_values(group_id_hex, chunk);
-            tx.execute(
+            tx.execute_cached(
                 &format!(
                     "DELETE FROM {table}
                      WHERE group_id_hex = ?

@@ -1359,7 +1359,9 @@ fn chat_list_stored_unread_summaries_tx(
 }
 
 fn projection_has_rows_tx<P: Params>(tx: &Connection, sql: &str, params: P) -> StorageResult<bool> {
-    let exists: i64 = tx.query_row(sql, params, |row| row.get(0)).storage()?;
+    let exists: i64 = tx
+        .query_row_cached(sql, params, |row| row.get(0))
+        .storage()?;
     Ok(exists != 0)
 }
 
@@ -1783,7 +1785,7 @@ fn latest_accepted_activity_insert_order_tx(
     group_id_hex: &str,
 ) -> StorageResult<Option<i64>> {
     let activity_filter = chat_list_activity_filter_sql("accepted.");
-    tx.query_row(
+    tx.query_row_cached(
         &format!(
             "SELECT MAX(accepted_source.insert_order)
              FROM message_timeline AS accepted
@@ -1810,7 +1812,7 @@ fn timeline_message_for_read_marker_tx(
     message_id_hex: &str,
 ) -> StorageResult<Option<TimelineReadMarker>> {
     let activity_filter = chat_list_activity_filter_sql("");
-    tx.query_row(
+    tx.query_row_cached(
         &format!(
             "SELECT message_id_hex, source_message_id_hex, source_epoch,
                 invalidation_status, kind, timeline_at

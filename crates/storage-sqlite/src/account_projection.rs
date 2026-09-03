@@ -1945,7 +1945,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<StoredAppMessageRecord>> {
         let cols = APP_EVENT_REPLAY_COLUMNS;
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 &format!(
                     "SELECT {cols} FROM app_events
                      WHERE group_id_hex = ?1 AND message_id_hex = ?2
@@ -3514,7 +3514,7 @@ fn delete_stale_text_keys(
         values.extend_from_slice(delete_prefix_params);
         values.extend(chunk.iter().cloned().map(Value::Text));
         deleted += conn
-            .execute(&sql, params_from_iter(values.iter()))
+            .execute_cached(&sql, params_from_iter(values.iter()))
             .storage()?;
     }
     Ok(deleted)
@@ -3546,7 +3546,7 @@ fn delete_stale_group_components(
     for component in components {
         values.push(Value::Integer(i64::from(component.component_id)));
     }
-    tx.execute(&sql, params_from_iter(values.iter()))
+    tx.execute_cached(&sql, params_from_iter(values.iter()))
         .storage()?;
     Ok(())
 }

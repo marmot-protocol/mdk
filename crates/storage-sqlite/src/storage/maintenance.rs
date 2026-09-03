@@ -176,7 +176,7 @@ fn read_singleton<T: serde::de::DeserializeOwned>(
     let sql = format!("SELECT record FROM {table} WHERE singleton = 1");
     store
         .lock()?
-        .query_row(&sql, [], |row| row.get::<_, Vec<u8>>(0))
+        .query_row_cached(&sql, [], |row| row.get::<_, Vec<u8>>(0))
         .optional()
         .storage()?
         .map(|bytes| deserialize(&bytes))
@@ -194,7 +194,10 @@ fn write_singleton<T: serde::Serialize>(
          ON CONFLICT(singleton) DO UPDATE SET record = excluded.record"
     );
     write(store, || {
-        store.lock()?.execute(&sql, params![serialized]).storage()?;
+        store
+            .lock()?
+            .execute_cached(&sql, params![serialized])
+            .storage()?;
         Ok(())
     })
 }
@@ -207,7 +210,7 @@ fn read_group_record<T: serde::de::DeserializeOwned>(
     let sql = format!("SELECT record FROM {table} WHERE group_id = ?1");
     store
         .lock()?
-        .query_row(&sql, params![group_id.as_slice()], |row| {
+        .query_row_cached(&sql, params![group_id.as_slice()], |row| {
             row.get::<_, Vec<u8>>(0)
         })
         .optional()
@@ -230,7 +233,7 @@ fn write_group_record<T: serde::Serialize>(
     write(store, || {
         store
             .lock()?
-            .execute(&sql, params![group_id.as_slice(), serialized])
+            .execute_cached(&sql, params![group_id.as_slice(), serialized])
             .storage()?;
         Ok(())
     })
@@ -259,7 +262,7 @@ fn write_ordered_record<T: serde::Serialize>(
     write(store, || {
         store
             .lock()?
-            .execute(
+            .execute_cached(
                 &sql,
                 params![id.as_slice(), group_id.map(GroupId::as_slice), serialized],
             )
@@ -276,7 +279,7 @@ fn read_id_record<T: serde::de::DeserializeOwned>(
     let sql = format!("SELECT record FROM {table} WHERE id = ?1");
     store
         .lock()?
-        .query_row(&sql, params![id.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+        .query_row_cached(&sql, params![id.as_slice()], |row| row.get::<_, Vec<u8>>(0))
         .optional()
         .storage()?
         .map(|bytes| deserialize(&bytes))
@@ -322,7 +325,7 @@ fn delete_by_id(
 ) -> StorageResult<()> {
     let sql = format!("DELETE FROM {table} WHERE {column} = ?1");
     write(store, || {
-        store.lock()?.execute(&sql, params![id]).storage()?;
+        store.lock()?.execute_cached(&sql, params![id]).storage()?;
         Ok(())
     })
 }

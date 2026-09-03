@@ -32,7 +32,7 @@ impl SqliteAccountStorage {
             ));
         }
         self.lock()?
-            .execute(
+            .execute_cached(
                 r#"
 INSERT INTO encrypted_media_epoch_secrets (
     group_id_hex,
@@ -95,7 +95,7 @@ WHERE excluded.retention_managed = 1
         source_epoch: u64,
     ) -> StorageResult<Option<Vec<u8>>> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 r#"
 SELECT secret
 FROM encrypted_media_epoch_secrets
