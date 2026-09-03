@@ -427,6 +427,8 @@ pub enum AgentControlResponse {
     Error {
         code: String,
         message: String,
+        #[serde(default)]
+        retryable: bool,
     },
     AccountList {
         accounts: Vec<AgentControlAccount>,
@@ -1762,6 +1764,32 @@ mod tests {
             let round_tripped: AgentControlResponse = serde_json::from_value(value).unwrap();
             assert_eq!(round_tripped, response);
         }
+    }
+
+    #[test]
+    fn control_error_preserves_server_retryability() {
+        let value = serde_json::json!({
+            "type": "error",
+            "code": "media_upload_timeout",
+            "message": "media upload timed out before publication",
+            "retryable": true,
+        });
+
+        let response: AgentControlResponse = serde_json::from_value(value).unwrap();
+        let round_tripped = serde_json::to_value(response).unwrap();
+
+        assert_eq!(round_tripped["retryable"], true);
+
+        let legacy_value = serde_json::json!({
+            "type": "error",
+            "code": "app_error",
+            "message": "connector request failed",
+        });
+        let legacy: AgentControlResponse = serde_json::from_value(legacy_value).unwrap();
+        let AgentControlResponse::Error { retryable, .. } = legacy else {
+            panic!("expected error response");
+        };
+        assert!(!retryable);
     }
 
     fn account() -> String {

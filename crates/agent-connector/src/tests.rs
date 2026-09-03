@@ -104,6 +104,18 @@ fn send_in_progress_has_a_distinct_retry_contract() {
         error.client_message(),
         "matching send is still in progress; retry with the same idempotency key"
     );
+    assert!(error.retryable());
+}
+
+#[test]
+fn send_media_timeout_is_retryable_before_publication() {
+    let error = crate::ConnectorError::App(marmot_app::AppError::MediaUploadTimedOut);
+    assert_eq!(error.code(), "media_upload_timeout");
+    assert_eq!(
+        error.client_message(),
+        "media upload timed out before publication"
+    );
+    assert!(error.retryable());
 }
 
 #[test]

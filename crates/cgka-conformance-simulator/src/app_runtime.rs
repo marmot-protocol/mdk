@@ -1451,6 +1451,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RelayDirectory(_)
         | AppError::Publish(_)
         | AppError::BlobStore(_)
+        | AppError::MediaUploadTimedOut
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
         | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,

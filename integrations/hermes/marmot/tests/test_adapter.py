@@ -400,6 +400,20 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "send_in_progress")
         self.assertTrue(raised.exception.retryable)
 
+    def test_error_envelope_preserves_server_retryability(self):
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            self.adapter.MarmotAgentControlClient._raise_if_error(
+                {
+                    "type": "error",
+                    "code": "media_upload_timeout",
+                    "message": "media upload timed out before publication",
+                    "retryable": True,
+                }
+            )
+
+        self.assertEqual(raised.exception.code, "media_upload_timeout")
+        self.assertTrue(raised.exception.retryable)
+
     async def test_timeline_reads_write_exact_message_and_cursor_requests(self):
         requests = []
 
@@ -5083,7 +5097,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.error, "Marmot outbound media staging failed")
             self.assertNotIn(str(staged_path), "\n".join(logs.output))
 
-    async def test_multiple_images_retry_reuses_staged_paths_and_idempotency_key(self):
+    async def test_send_media_timeout_is_retryable_before_publication(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             first = root / "first.png"
@@ -5094,20 +5108,25 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             class FakeClient:
                 def __init__(self):
                     self.calls = []
+                    self.publications = 0
 
                 async def send_media(self, account, group, attachments, **kwargs):
                     self.calls.append(
                         ([item["path"] for item in attachments], kwargs["idempotency_key"])
                     )
                     if len(self.calls) == 1:
-                        raise self_error(
-                            "timed out",
-                            code="request_timed_out",
-                            retryable=True,
+                        self_client._raise_if_error(
+                            {
+                                "type": "error",
+                                "code": "media_upload_timeout",
+                                "message": "media upload timed out before publication",
+                                "retryable": True,
+                            }
                         )
+                    self.publications += 1
                     return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
 
-            self_error = self.adapter_module.AgentControlError
+            self_client = self.adapter_module.MarmotAgentControlClient
             fake_client = FakeClient()
             adapter = self.adapter_module.MarmotPlatformAdapter(
                 self.config_cls(
@@ -5130,6 +5149,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(fake_client.calls), 2)
             self.assertEqual(fake_client.calls[0], fake_client.calls[1])
+            self.assertEqual(fake_client.publications, 1)
             self.assertEqual(list(adapter._outbound_media_dir.iterdir()), [])
 
     async def test_multiple_images_waits_past_retry_budget_for_in_progress_send(self):

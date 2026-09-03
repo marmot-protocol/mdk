@@ -473,7 +473,7 @@ fn ensure_response_type(
     expected: &'static str,
 ) -> Result<(), BootstrapError> {
     if matches!(envelope.payload, AgentControlResponse::Error { .. }) {
-        let AgentControlResponse::Error { code, message } = &envelope.payload else {
+        let AgentControlResponse::Error { code, message, .. } = &envelope.payload else {
             unreachable!()
         };
         return Err(BootstrapError::ControlRejected {

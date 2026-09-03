@@ -420,6 +420,7 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
                 agent_control::AgentControlResponse::Error {
                     code: "server_busy".to_owned(),
                     message: "agent connector connection capacity is busy".to_owned(),
+                    retryable: true,
                 },
             );
             let _ = crate::connection::write_control_frame_with_timeout(

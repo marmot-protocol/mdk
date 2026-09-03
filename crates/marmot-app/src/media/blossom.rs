@@ -264,7 +264,7 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
     let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
-    let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
+    let client = media_http_upload_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
         .put(upload_url.clone())
         .timeout(MEDIA_BLOB_TRANSFER_TIMEOUT)
@@ -274,13 +274,20 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
         .body(blob)
         .send()
         .await
-        .map_err(reqwest_blob_error)?;
+        .map_err(reqwest_upload_error)?;
     if !response.status().is_success() {
         return Err(blossom_upload_status_error(response).await);
     }
-    let descriptor_body = read_limited_blossom_body(response, MAX_BLOSSOM_DESCRIPTOR_BYTES)
-        .await
-        .map_err(|_| AppError::BlobStore("upload descriptor exceeds size limit".into()))?;
+    let descriptor_body =
+        match read_limited_blossom_upload_body(response, MAX_BLOSSOM_DESCRIPTOR_BYTES).await {
+            Ok(body) => body,
+            Err(AppError::MediaUploadTimedOut) => return Err(AppError::MediaUploadTimedOut),
+            Err(_) => {
+                return Err(AppError::BlobStore(
+                    "upload descriptor exceeds size limit".into(),
+                ));
+            }
+        };
     let descriptor = serde_json::from_slice::<BlossomBlobDescriptor>(&descriptor_body)
         .map_err(|_| AppError::BlobStore("upload returned an invalid descriptor".into()))?;
     if let Some(sha256) = descriptor.sha256.as_deref()
@@ -318,7 +325,7 @@ async fn blossom_upload_status_error(response: reqwest::Response) -> AppError {
         .get("X-Reason")
         .and_then(|value| value.to_str().ok())
         .and_then(privacy_safe_server_reason);
-    let body = read_limited_blossom_body(response, MAX_BLOSSOM_ERROR_BODY_BYTES)
+    let body = read_limited_blossom_upload_body(response, MAX_BLOSSOM_ERROR_BODY_BYTES)
         .await
         .ok();
     let body_reason = body
@@ -678,6 +685,7 @@ fn same_registrable_domain(left: &str, right: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 async fn media_http_client_for_url(
     url: &Url,
     allow_loopback_http: bool,
@@ -691,26 +699,48 @@ async fn media_http_client_for_url(
     build_pinned_media_http_client(pin)
 }
 
+async fn media_http_upload_client_for_url(
+    url: &Url,
+    allow_loopback_http: bool,
+) -> Result<reqwest::Client, AppError> {
+    validate_blossom_fetch_url(url, allow_loopback_http)
+        .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
+    let allow_loopback = url.scheme() == "http"
+        && allow_loopback_http
+        && url.host().map(is_loopback_host).unwrap_or(false);
+    let pin = resolve_media_host(url, allow_loopback).await?;
+    build_pinned_media_upload_client(pin)
+}
+
 fn build_pinned_media_http_client(
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
-    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin)
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, true)
+}
+
+fn build_pinned_media_upload_client(
+    pin: Option<(String, Vec<SocketAddr>)>,
+) -> Result<reqwest::Client, AppError> {
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, false)
 }
 
 fn build_pinned_media_http_client_from_builder(
     builder: reqwest::ClientBuilder,
     pin: Option<(String, Vec<SocketAddr>)>,
+    apply_read_timeout: bool,
 ) -> Result<reqwest::Client, AppError> {
     let mut builder = builder
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(MEDIA_HTTP_CONNECT_TIMEOUT)
-        .read_timeout(MEDIA_HTTP_READ_TIMEOUT)
         .timeout(MEDIA_HTTP_TOTAL_TIMEOUT)
         .no_proxy()
         .no_gzip()
         .no_brotli()
         .no_zstd()
         .no_deflate();
+    if apply_read_timeout {
+        builder = builder.read_timeout(MEDIA_HTTP_READ_TIMEOUT);
+    }
     if let Some((domain, addrs)) = pin {
         builder = builder.resolve_to_addrs(&domain, &addrs);
     }
@@ -726,7 +756,7 @@ pub(super) fn build_pinned_media_http_client_with_proxy_for_test(
 ) -> Result<reqwest::Client, AppError> {
     let proxy = reqwest::Proxy::all(proxy_url)
         .map_err(|_| AppError::BlobStore("failed to configure test HTTP proxy".into()))?;
-    build_pinned_media_http_client_from_builder(reqwest::Client::builder().proxy(proxy), pin)
+    build_pinned_media_http_client_from_builder(reqwest::Client::builder().proxy(proxy), pin, true)
 }
 
 async fn resolve_media_host(
@@ -770,6 +800,18 @@ pub(crate) async fn read_limited_blossom_body(
     max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
     read_limited_blossom_body_until(response, max_bytes, None).await
+}
+
+async fn read_limited_blossom_upload_body(
+    response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    tokio::time::timeout(
+        MEDIA_HTTP_READ_TIMEOUT,
+        read_limited_blossom_body(response, max_bytes),
+    )
+    .await
+    .map_err(|_| AppError::MediaUploadTimedOut)?
 }
 
 async fn read_limited_blossom_body_until(
@@ -916,5 +958,13 @@ fn reqwest_blob_error(err: reqwest::Error) -> AppError {
         AppError::BlobStore("invalid response body".into())
     } else {
         AppError::BlobStore("request failed".into())
+    }
+}
+
+fn reqwest_upload_error(err: reqwest::Error) -> AppError {
+    if err.is_timeout() {
+        AppError::MediaUploadTimedOut
+    } else {
+        reqwest_blob_error(err)
     }
 }
