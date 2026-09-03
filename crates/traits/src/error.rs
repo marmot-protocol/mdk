@@ -202,6 +202,17 @@ impl EngineError {
     /// so the engine's forensic audit rows, the app runtime's tracing fields,
     /// and the daemon's status JSON all say the same word for the same failure
     /// and an operator can join them.
+    ///
+    /// That join is byte-identical for every variant except [`Self::Storage`].
+    /// This method reports the coarse `"storage"` bucket, and engine audit rows
+    /// say `"storage"`; the app runtime deliberately unwraps one layer further
+    /// and reports the nine [`crate::storage::StorageError`] kinds instead
+    /// (`storage_busy`, `storage_not_found`, ...). The trade is intentional:
+    /// [`Self::is_transient`] is true for exactly `StorageError::Busy`, so
+    /// collapsing storage to one word app-side would hide the retryable failure
+    /// among eight durable ones. A consumer joining engine rows to app fields
+    /// must therefore treat `"storage"` as the prefix of the nine, not as a
+    /// tenth peer.
     #[must_use]
     pub fn privacy_safe_kind(&self) -> &'static str {
         match self {

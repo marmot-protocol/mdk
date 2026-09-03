@@ -1034,9 +1034,15 @@ pub enum AuditEventKind {
         /// `group_advanced` is that placeholder's arithmetic, not an
         /// observation: this replay's effect on the group is *unknown*, not
         /// absent. Only a failed row can carry it — a run that succeeds has
-        /// read every armed group's epoch by definition. Optional only so rows
-        /// written before this field existed stay readable; absent means the
-        /// reading was taken.
+        /// read every armed group's epoch by definition.
+        ///
+        /// Absent means the row predates this field *or* the reading was taken,
+        /// and an analyzer cannot tell which. The field is additive, so no
+        /// schema version separates old rows from new ones, and a pre-change
+        /// failed row whose after-read failed looks exactly like an observed
+        /// one — that indistinguishability is the very defect this field exists
+        /// to end going forward. Read absence as "unknown provenance", never as
+        /// proof the reading was taken.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_advanced_observed: Option<bool>,
     },
