@@ -234,7 +234,7 @@ impl AppError {
         match self {
             Self::Account(error) => account_error_kind(error),
             Self::AccountHome(error) => account_home_error_kind(error),
-            Self::Session(_) => "session",
+            Self::Session(error) => session_error_kind(error),
             Self::Storage(error) => storage_error_kind(error),
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
@@ -392,8 +392,14 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
 
 fn account_error_kind(error: &AccountError) -> &'static str {
     match error {
-        AccountError::Session(_) => "account_session",
-        AccountError::Engine(_) => "account_engine",
+        // The wrapping depth is not the diagnosis. `as_engine_error` already
+        // treats these three shapes as one engine failure; the kind follows,
+        // so an operator greps one name instead of three.
+        AccountError::Session(error) => session_error_kind(error),
+        AccountError::Engine(cgka_traits::error::EngineError::Storage(error)) => {
+            storage_error_kind(error)
+        }
+        AccountError::Engine(error) => error.privacy_safe_kind(),
         AccountError::Transport(_) => "account_transport",
         AccountError::TransportRouting(_) => "account_transport_routing",
         AccountError::KeyPackage(_) => "account_key_package",
@@ -430,6 +436,29 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
     }
 }
 
+/// Privacy-safe kind for a session failure.
+///
+/// `SessionError` is a two-variant passthrough, so the diagnostically useful
+/// name always lives one layer down. Collapsing it to a single `"session"`
+/// kind is what made the D5 field investigations blind.
+fn session_error_kind(error: &cgka_session::SessionError) -> &'static str {
+    match error {
+        // A storage failure is the same failure whichever layer wrapped it, so
+        // reuse the nine storage kinds at both depths. That keeps the one
+        // transient kind (`storage_busy`, the sole case
+        // `SessionError::is_transient` reports) distinguishable from the eight
+        // durable ones without a second transient/permanent axis to keep in
+        // sync.
+        cgka_session::SessionError::Storage(error)
+        | cgka_session::SessionError::Engine(cgka_traits::error::EngineError::Storage(error)) => {
+            storage_error_kind(error)
+        }
+        // Engine names come from the engine so an app tracing field and an
+        // engine forensic audit row say the same word for the same failure.
+        cgka_session::SessionError::Engine(error) => error.privacy_safe_kind(),
+    }
+}
+
 fn storage_error_kind(error: &StorageError) -> &'static str {
     match error {
         StorageError::NotFound => "storage_not_found",
@@ -446,8 +475,10 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountCatchUpFailure, AppError};
+    use super::{AccountCatchUpFailure, AccountError, AppError, StorageError};
     use crate::SyncFailureClassification;
+    use cgka_traits::error::EngineError;
+    use cgka_traits::types::{EpochId, GroupId};
 
     // Kind strings leave the runtime: `account_error_message` interpolates
     // them into messages the CLI daemon persists and host apps log. Pin the
@@ -464,5 +495,83 @@ mod tests {
             err.to_string(),
             "account catch-up failed: runtime catch-up failed: account_session"
         );
+    }
+
+    // A session failure that is really a transient lock blip must not read the
+    // same as a durable one. `SessionError::is_transient` is true for exactly
+    // this case, so the kind has to carry the same split.
+    #[test]
+    fn transient_session_storage_failure_reports_the_busy_storage_kind() {
+        let err = AppError::Session(cgka_session::SessionError::Storage(StorageError::Busy(
+            "locked".into(),
+        )));
+        assert_eq!(err.privacy_safe_kind(), "storage_busy");
+    }
+
+    // A fork is the single most consequential engine failure a session can
+    // wrap, and `forked_epoch` is the name the engine's own audit rows already
+    // use for it. Reusing that vocabulary is what lets an operator join an app
+    // tracing field to an engine audit row.
+    #[test]
+    fn session_engine_failure_reports_the_engine_kind() {
+        let err = AppError::Session(cgka_session::SessionError::Engine(
+            EngineError::ForkedEpoch {
+                group_id: GroupId::new(vec![1u8; 16]),
+                last_stable: EpochId(7),
+                conflicting_epoch: EpochId(8),
+            },
+        ));
+        assert_eq!(err.privacy_safe_kind(), "forked_epoch");
+    }
+
+    // The engine wraps storage too, so a lock blip can arrive one layer deeper.
+    // It is the same blip and must get the same name — otherwise the transient
+    // case hides behind the engine's coarse `storage` bucket at one depth and
+    // is visible at the other.
+    #[test]
+    fn transient_storage_failure_wrapped_by_the_engine_reports_the_same_kind() {
+        let err = AppError::Session(cgka_session::SessionError::Engine(EngineError::Storage(
+            StorageError::Busy("locked".into()),
+        )));
+        assert_eq!(err.privacy_safe_kind(), "storage_busy");
+    }
+
+    // Most session failures reach the app wrapped in `AccountError`, and
+    // `as_engine_error` already treats all three wrappings as the same engine
+    // failure. The kind has to agree: one engine failure must not get three
+    // names depending on how deep it was wrapped.
+    #[test]
+    fn account_wrapped_session_failures_report_the_same_kind_as_unwrapped_ones() {
+        let direct = AppError::Session(cgka_session::SessionError::Engine(
+            EngineError::InvalidWelcome,
+        ));
+        let via_account_session = AppError::Account(AccountError::Session(
+            cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
+        ));
+        let via_account_engine =
+            AppError::Account(AccountError::Engine(EngineError::InvalidWelcome));
+
+        assert_eq!(direct.privacy_safe_kind(), "invalid_welcome");
+        assert_eq!(via_account_session.privacy_safe_kind(), "invalid_welcome");
+        assert_eq!(via_account_engine.privacy_safe_kind(), "invalid_welcome");
+    }
+
+    // `is_transient` and the kind are two views of one fact. Pin them together
+    // so a future kind edit cannot silently make a retryable failure read as
+    // durable (or the reverse).
+    #[test]
+    fn session_kind_agrees_with_is_transient() {
+        for error in [
+            cgka_session::SessionError::Storage(StorageError::Busy("locked".into())),
+            cgka_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
+                "locked".into(),
+            ))),
+            cgka_session::SessionError::Storage(StorageError::Closed("shut".into())),
+            cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
+        ] {
+            let transient = error.is_transient();
+            let kind = AppError::Session(error).privacy_safe_kind();
+            assert_eq!(transient, kind == "storage_busy", "kind {kind}");
+        }
     }
 }

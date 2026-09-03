@@ -195,6 +195,49 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Stable, privacy-safe name for this failure.
+    ///
+    /// Names only the variant: no group ids, member ids, epochs, paths, or
+    /// `Display` text. It lives beside the enum rather than in any one consumer
+    /// so the engine's forensic audit rows, the app runtime's tracing fields,
+    /// and the daemon's status JSON all say the same word for the same failure
+    /// and an operator can join them.
+    #[must_use]
+    pub fn privacy_safe_kind(&self) -> &'static str {
+        match self {
+            EngineError::UnknownGroup(_) => "unknown_group",
+            EngineError::GroupNotHydrated(_) => "group_not_hydrated",
+            EngineError::UnknownPending => "unknown_pending",
+            EngineError::NotAMember { .. } => "not_a_member",
+            EngineError::NotGroupAdmin { .. } => "not_group_admin",
+            EngineError::UnknownMember { .. } => "unknown_member",
+            EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
+            EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
+            EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
+            EngineError::AdminDepletion { .. } => "admin_depletion",
+            EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+            EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
+            EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+            EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
+            EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
+            EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
+            EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
+            EngineError::ForkedEpoch { .. } => "forked_epoch",
+            EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
+            EngineError::GroupUnrecoverableRepairRequired { .. } => {
+                "group_unrecoverable_repair_required"
+            }
+            EngineError::InvalidTransition(_) => "invalid_transition",
+            EngineError::Storage(_) => "storage",
+            EngineError::Peeler(_) => "peeler",
+            EngineError::Serialize(_) => "serialize",
+            EngineError::InvalidWelcome => "invalid_welcome",
+            EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+            EngineError::Backend(_) => "backend",
+            EngineError::Other(_) => "other",
+        }
+    }
+
     /// Whether this error reflects transient backend contention (a
     /// [`crate::storage::StorageError::Busy`] that survived the backend's own
     /// retries) rather than a durable failure. Callers driving the
