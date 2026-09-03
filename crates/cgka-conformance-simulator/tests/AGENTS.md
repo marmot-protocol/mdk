@@ -37,6 +37,11 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     oracles, exact retained-join pending-work classification, sampled delivery/decryptability coverage, and the normal
     mid-size application and incremental-join executable canaries.
 
+- **File:** `offline_catchup_family.rs`
+  - **Owns:** Deterministic offline-backlog volume/recovery profiles, retained-relay enforcement, terminal-only
+    reconnect, exact backlog multiplicity, strict pending-work/equivalence/decryptability oracles, and file-backed
+    executable canaries.
+
 - **File:** `mutation_adequacy.rs`
   - **Owns:** Exact executable mutation catalog coverage, kill assertions, and drift-checking the human-readable
     verification-layer matrix.

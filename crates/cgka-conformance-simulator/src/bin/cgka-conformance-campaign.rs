@@ -619,6 +619,9 @@ mod tests {
             "convergence-chaos/v1",
             "admin-churn/v1",
             "adversarial-reliability/v1",
+            "bounded-convergence-pressure/v1",
+            "large-group-pressure/v1",
+            "offline-catchup-pressure/v1",
             "cross-route-exact-restart-permutations/v1",
             "cross-route-restart-permutations/v1",
             "chat-journey/v1",
@@ -637,6 +640,15 @@ mod tests {
                 "admin-churn/v1" => cgka_conformance_simulator::generate_admin_churn_family(42, 4),
                 "adversarial-reliability/v1" => {
                     cgka_conformance_simulator::generate_adversarial_reliability_family(42, 4)
+                }
+                "bounded-convergence-pressure/v1" => {
+                    cgka_conformance_simulator::generate_bounded_convergence_pressure_family(42, 4)
+                }
+                "large-group-pressure/v1" => {
+                    cgka_conformance_simulator::generate_large_group_pressure_family(42, 4)
+                }
+                "offline-catchup-pressure/v1" => {
+                    cgka_conformance_simulator::generate_offline_catchup_pressure_family(42, 4)
                 }
                 "cross-route-exact-restart-permutations/v1" => {
                     cgka_conformance_simulator::generate_cross_route_exact_restart_permutation_family(

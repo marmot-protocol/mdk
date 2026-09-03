@@ -33,6 +33,7 @@ mod large_group_family;
 pub mod lifecycle_model;
 pub mod mutation_adequacy;
 pub mod node_protocol;
+mod offline_catchup_family;
 pub mod oracle;
 mod pending_work;
 pub mod policy_cases;
@@ -121,6 +122,11 @@ pub use large_group_family::{
     LARGE_GROUP_PRESSURE_FAMILY, LARGE_GROUP_PRESSURE_GENERATOR_VERSION,
     LARGE_GROUP_PRESSURE_PROFILE_VERSION, generate_large_group_pressure_case,
     generate_large_group_pressure_family,
+};
+pub use offline_catchup_family::{
+    OFFLINE_CATCHUP_PRESSURE_FAMILY, OFFLINE_CATCHUP_PRESSURE_GENERATOR_VERSION,
+    OFFLINE_CATCHUP_PRESSURE_PROFILE_VERSION, generate_offline_catchup_pressure_case,
+    generate_offline_catchup_pressure_family,
 };
 pub use oracle::{
     BehaviorEvidenceSummary, CoverageMatrixEntry, OracleBehavior, OracleCoverageWarning,

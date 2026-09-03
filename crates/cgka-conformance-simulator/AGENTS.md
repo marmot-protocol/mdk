@@ -108,6 +108,11 @@ Git commit; require a clean build and retain the exact source revision plus comm
     are ordered by execution cost because campaign selection is prefix-only; race arms must retain at least two active
     committers, and bounded decryptability probes must preserve late-join/re-add and roster-tail representatives.
 
+- **Module:** `src/offline_catchup_family.rs`
+  - **Role:** Replay-stable retained-relay backlog catalog. Keeps a founding member offline until the terminal phase,
+    scales application and commit volume independently, varies relay order/duplication and recovery shape, and requires
+    exact payload multiplicity, canonical equality, input closure, and post-recovery decryptability.
+
 - **Module:** `src/stateful_generator.rs`
   - **Role:** Legality-aware product journey generation into canonical Scenario IR v3. Tracks membership, admins,
     connectivity, profile, epoch, and application delivery; alternates late-membership engine cases with founding-member

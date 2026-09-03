@@ -128,6 +128,7 @@ one case cannot erase the remaining cases, and the summary contains real child-p
 | `adversarial-reliability/v1` | Named real-world and resource-pressure workload catalog |
 | `bounded-convergence-pressure/v1` | Finite self-update/profile/admin pressure under a bounded quiescence contract |
 | `large-group-pressure/v1` | Explicit 10–200 member, admin-population, committer-width, traffic, growth, and churn profiles |
+| `offline-catchup-pressure/v1` | Founding member returns only after a retained 24–1,024-message backlog plus commit pressure |
 | `cross-route-restart-permutations/v1` | Twelve public app-runtime restart boundaries in the four-party route scenario |
 | `cross-route-exact-restart-permutations/v1` | Exact/private engine companion to the public restart catalog |
 | `chat-journey/v1` | Legality-aware product journeys: membership, profile, app traffic, offline/catch-up, and restart |
@@ -143,6 +144,21 @@ anchor, `--cases 36` through the 64-member anchor, and `--cases 54` only as a de
 Run `cargo test -p cgka-conformance-simulator --test large_group_family --locked` for the ordinary 10-member
 application and retained-join canaries. Prefer the isolated file-backed campaign runner for broader execution;
 generator tests already compile all 54 shapes without running the expensive large/xlarge blocks.
+
+For `offline-catchup-pressure/v1`, six consecutive cases form one volume block: 24, 96, 384, then 1,024 application
+messages, interleaved with 4, 8, 12, then 16 commit rounds. Each block covers natural full history, reverse history,
+reverse history with three copies, natural two-copy incremental followed by full repair, reverse two-copy restart after
+sync but before processing, and reverse three-copy history containing competing commit waves. Cases `0..5` are the
+smoke block, `0..11` run through 96 messages, `0..17` through 384, and `0..23` complete the 1,024-message catalog. Every
+case uses the retained-relay subject and keeps Bob offline until the final catch-up phase. Use the isolated file-backed
+runner for volume campaigns:
+
+```sh
+cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked -- \
+  --family offline-catchup-pressure/v1 --seed 42 --cases 18 \
+  --case-timeout-secs 300 --storage file \
+  --out target/convergence-manual/offline-catchup-seed-42
+```
 
 ## Running vectors and adapter comparisons
 
