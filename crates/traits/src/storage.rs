@@ -803,6 +803,18 @@ pub trait StorageProvider:
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
 
+    /// Count of writes to the OpenMLS state store, when the backend tracks
+    /// them. The engine keeps loaded `MlsGroup`s across calls and reuses one
+    /// only while this value equals the value observed when it was stored;
+    /// `None` disables that reuse. A tracking backend must change the count on
+    /// every write to the OpenMLS store, including transaction rollbacks,
+    /// snapshot restores that bypass the OpenMLS provider, and commits made
+    /// by other connections or processes, so a cached object can never
+    /// outlive the state it was loaded from.
+    fn mls_write_generation(&self) -> Option<u64> {
+        None
+    }
+
     /// Optional account-device maintenance store.
     ///
     /// This is accessor composition for the same reason as `mls_storage()`:

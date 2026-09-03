@@ -850,15 +850,6 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         payload: Vec<u8>,
     ) -> Result<SendResult, EngineError> {
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-
         // Direct sending still requires Stable after convergence gating.
         if let Some(state) = self.epoch_manager.state(&group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -871,6 +862,11 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mut mls_group = self
+            .take_mls_group(&group_id)?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
@@ -921,6 +917,7 @@ impl<S: StorageProvider> Engine<S> {
             source_epoch,
             own_application_stamp,
         )?;
+        self.return_mls_group(&group_id, mls_group);
 
         Ok(SendResult::ApplicationMessage {
             msg: wrapped,

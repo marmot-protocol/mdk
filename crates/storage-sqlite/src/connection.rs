@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 #[cfg(any(target_os = "android", test))]
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -316,6 +316,9 @@ struct SharedConnectionInner {
     transaction_owner: Mutex<Option<ThreadId>>,
     transaction_unusable: Mutex<Option<String>>,
     transaction_released: Condvar,
+    /// Bumped before every write to `openmls_values` and on every rollback;
+    /// see `StorageProvider::mls_write_generation`.
+    openmls_writes: AtomicU64,
 }
 
 impl fmt::Debug for SharedConnection {
@@ -333,6 +336,7 @@ impl SharedConnection {
                 transaction_owner: Mutex::new(None),
                 transaction_unusable: Mutex::new(None),
                 transaction_released: Condvar::new(),
+                openmls_writes: AtomicU64::new(0),
             }),
         }
     }
@@ -408,6 +412,16 @@ impl SharedConnection {
         self.inner.transaction_released.notify_all();
     }
 
+    /// Record a write to the OpenMLS store. Called before the write so a
+    /// partial failure invalidates cached objects too.
+    pub(crate) fn note_openmls_write(&self) {
+        self.inner.openmls_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn openmls_write_generation(&self) -> u64 {
+        self.inner.openmls_writes.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn is_current_thread_transaction_owner(&self) -> bool {
         let current = std::thread::current().id();
         let owner = self
@@ -465,7 +479,7 @@ impl SharedConnection {
                     self.clear_transaction_owner();
                     Ok(value)
                 }
-                Err(commit_err) => match self.execute_transaction_boundary_with_retry("ROLLBACK") {
+                Err(commit_err) => match self.rollback_boundary_with_retry() {
                     Ok(()) => {
                         self.clear_transaction_owner();
                         Err(E::from(commit_err))
@@ -475,7 +489,7 @@ impl SharedConnection {
                     )))),
                 },
             },
-            Ok(Err(err)) => match self.execute_transaction_boundary_with_retry("ROLLBACK") {
+            Ok(Err(err)) => match self.rollback_boundary_with_retry() {
                 Ok(()) => {
                     self.clear_transaction_owner();
                     Err(err)
@@ -484,7 +498,7 @@ impl SharedConnection {
                     "sqlite transaction ROLLBACK failed after callback error ({rollback_err}); connection marked unusable",
                 )))),
             },
-            Err(payload) => match self.execute_transaction_boundary_with_retry("ROLLBACK") {
+            Err(payload) => match self.rollback_boundary_with_retry() {
                 Ok(()) => {
                     self.clear_transaction_owner();
                     std::panic::resume_unwind(payload);
@@ -536,6 +550,13 @@ impl SharedConnection {
     /// [`StorageError::Closed`], because that work was discarded. Reporting the
     /// rollback as a failure instead would latch the connection "unusable" and
     /// turn an orderly host suspension into a corruption-shaped error.
+    /// `ROLLBACK` discards OpenMLS writes the transaction made, so it counts
+    /// as a write for cache-validation purposes.
+    fn rollback_boundary_with_retry(&self) -> StorageResult<()> {
+        self.note_openmls_write();
+        self.execute_transaction_boundary_with_retry("ROLLBACK")
+    }
+
     fn execute_transaction_boundary_with_retry(&self, sql: &str) -> StorageResult<()> {
         retry_transaction_boundary(sql, || {
             let Ok(conn) = self.inner.connection.lock() else {
@@ -1043,6 +1064,25 @@ impl StorageProvider for SqliteAccountStorage {
 
     fn mls_storage(&self) -> &Self::Mls {
         &self.openmls
+    }
+
+    fn mls_write_generation(&self) -> Option<u64> {
+        if self.connection.is_closed() {
+            return None;
+        }
+        // `PRAGMA data_version` changes whenever another connection or process
+        // commits to this database, which the in-process write counter cannot
+        // see. Pack both so either kind of write invalidates a cached group.
+        // Each half wraps at 2^32; a wrap between two reads of the same cache
+        // entry is not a realistic event.
+        let data_version: i64 = self
+            .connection
+            .lock()
+            .ok()?
+            .query_row_cached("PRAGMA data_version", [], |row| row.get(0))
+            .ok()?;
+        let own = self.connection.openmls_write_generation() & 0xffff_ffff;
+        Some(((data_version as u64) << 32) | own)
     }
 
     fn maintenance_storage(&self) -> Option<&dyn cgka_traits::storage::MaintenanceStorage> {

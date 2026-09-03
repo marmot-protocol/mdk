@@ -30,6 +30,7 @@ pub(super) fn rollback(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     rollback_with_scope(store, group_id, name, RestoreScope::Full)
 }
 
@@ -38,6 +39,7 @@ pub(super) fn rollback_group_state(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     rollback_with_scope(store, group_id, name, RestoreScope::GroupState)
 }
 
@@ -102,6 +104,7 @@ pub(super) fn import(
     group_id: &GroupId,
     snapshot_blob: &[u8],
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     let snapshot: ReplaySnapshot = deserialize(snapshot_blob)?;
     if snapshot.version != REPLAY_SNAPSHOT_VERSION {
         return Err(StorageError::Serialization(format!(

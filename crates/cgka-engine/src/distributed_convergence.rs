@@ -2427,7 +2427,7 @@ fn decode_convergence_policy(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -2541,7 +2541,7 @@ mod tests {
         }
     }
 
-    fn test_engine() -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
+    pub(crate) fn test_engine() -> crate::Engine<storage_sqlite::SqliteAccountStorage> {
         let key = signing_key();
         let identity = key.verifying_key().to_bytes().to_vec();
         crate::EngineBuilder::new(storage_sqlite::SqliteAccountStorage::in_memory().unwrap())
