@@ -848,11 +848,12 @@ impl<S: StorageProvider> Engine<S> {
             MlsMessageBodyIn::PrivateMessage(p) => p.into(),
             MlsMessageBodyIn::PublicMessage(p) => p.into(),
             _ => {
-                self.persist_transport_message(
+                self.persist_openmls_wire_message_with_processed_transport_id(
                     &openmls_msg,
                     &group_id,
                     current_epoch,
                     MessageState::Failed,
+                    &raw_msg_id,
                 )?;
                 // Peeled successfully but the MLS body is neither a
                 // public nor private message: terminal. Retire the raw
