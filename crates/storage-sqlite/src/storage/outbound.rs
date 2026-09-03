@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
 use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
 use cgka_traits::OutboundFanout;
@@ -17,7 +18,7 @@ impl OutboundIntentStorage for SqliteAccountStorage {
         let created_at = created_at_to_i64(record.created_at_ms)?;
         let write = || {
             let conn = self.lock()?;
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
@@ -47,7 +48,7 @@ impl OutboundIntentStorage for SqliteAccountStorage {
     ) -> StorageResult<Vec<QueuedOutboundIntent>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT record FROM cgka_queued_outbound
                  WHERE group_id = ?1
                  ORDER BY insert_order",
@@ -67,7 +68,7 @@ impl OutboundIntentStorage for SqliteAccountStorage {
         // whole statement is safe to retry on transient lock contention.
         let delete = || {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "DELETE FROM cgka_queued_outbound WHERE id = ?1",
                     params![id.as_slice()],
                 )
@@ -91,7 +92,7 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
         let write = || {
             let conn = self.lock()?;
             let previous = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT record FROM cgka_outbound_fanout WHERE message_id = ?1",
                     params![fanout.message_id().as_slice()],
                     |row| row.get::<_, Vec<u8>>(0),
@@ -107,7 +108,7 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
                     )
                 })?;
             }
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO cgka_outbound_fanout (message_id, group_id, record)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(message_id) DO UPDATE SET
@@ -132,7 +133,7 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
     fn outbound_fanout(&self, message_id: &MessageId) -> StorageResult<Option<OutboundFanout>> {
         let conn = self.lock()?;
         let record = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_outbound_fanout WHERE message_id = ?1",
                 params![message_id.as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
@@ -145,7 +146,7 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
     fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT record FROM cgka_outbound_fanout
                  ORDER BY insert_order",
             )
@@ -164,7 +165,7 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
     ) -> StorageResult<Vec<OutboundFanout>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT record FROM cgka_outbound_fanout
                  WHERE group_id = ?1
                  ORDER BY insert_order",
@@ -181,7 +182,7 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
     fn delete_outbound_fanout(&self, message_id: &MessageId) -> StorageResult<()> {
         let delete = || {
             self.lock()?
-                .execute(
+                .execute_cached(
                     "DELETE FROM cgka_outbound_fanout WHERE message_id = ?1",
                     params![message_id.as_slice()],
                 )

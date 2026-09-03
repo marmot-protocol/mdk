@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
 use cgka_traits::storage::{DeferredPeelGeneration, DeferredPeelGenerationStorage, StorageResult};
 use cgka_traits::types::GroupId;
@@ -10,7 +11,7 @@ impl DeferredPeelGenerationStorage for SqliteAccountStorage {
     ) -> StorageResult<Option<DeferredPeelGeneration>> {
         let encoded: Option<Vec<u8>> = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT record FROM cgka_deferred_peel_generations WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get(0),
@@ -26,7 +27,7 @@ impl DeferredPeelGenerationStorage for SqliteAccountStorage {
     ) -> StorageResult<()> {
         let record = serialize(generation)?;
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT INTO cgka_deferred_peel_generations (group_id, record)
                  VALUES (?1, ?2)
                  ON CONFLICT(group_id) DO UPDATE SET record = excluded.record",
@@ -38,7 +39,7 @@ impl DeferredPeelGenerationStorage for SqliteAccountStorage {
 
     fn delete_deferred_peel_generation(&self, group_id: &GroupId) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_deferred_peel_generations WHERE group_id = ?1",
                 params![group_id.as_slice()],
             )

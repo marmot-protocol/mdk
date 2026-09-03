@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, deserialize, serialize,
 };
@@ -9,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 impl WelcomeStorage for SqliteAccountStorage {
     fn put_welcome(&self, welcome: &PendingWelcome) -> StorageResult<()> {
         self.lock()?
-            .execute(
+            .execute_cached(
                 "INSERT OR REPLACE INTO cgka_welcomes (message_id, group_id, record)
                  VALUES (?1, ?2, ?3)",
                 params![
@@ -41,7 +42,7 @@ impl WelcomeStorage for SqliteAccountStorage {
     fn list_welcomes(&self) -> StorageResult<Vec<PendingWelcome>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT record FROM cgka_welcomes ORDER BY rowid")
+            .prepare_cached("SELECT record FROM cgka_welcomes ORDER BY rowid")
             .storage()?;
         let records = stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
@@ -68,7 +69,7 @@ impl WelcomeStorage for SqliteAccountStorage {
 
 fn take_welcome_on_connection(conn: &Connection, id: &MessageId) -> StorageResult<PendingWelcome> {
     let record: Vec<u8> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT record FROM cgka_welcomes WHERE message_id = ?1",
             params![id.as_slice()],
             |row| row.get(0),
@@ -77,7 +78,7 @@ fn take_welcome_on_connection(conn: &Connection, id: &MessageId) -> StorageResul
         .storage()?
         .ok_or(StorageError::NotFound)?;
     let welcome = deserialize(&record)?;
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_welcomes WHERE message_id = ?1",
         params![id.as_slice()],
     )

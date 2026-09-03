@@ -1,4 +1,5 @@
 use super::{capture, format as snapshot_format, restore};
+use crate::connection::CachedSql;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
     epoch_to_i64,
@@ -34,7 +35,7 @@ fn create_on_connection(
     let state = capture::capture_group_state(conn, group_id)?;
     let blob = snapshot_format::encode_checkpoint(&state)?;
     let existing = conn
-        .query_row(
+        .query_row_cached(
             "SELECT resulting_epoch, checkpoint
              FROM cgka_group_state_checkpoints
              WHERE group_id = ?1 AND checkpoint_id = ?2",
@@ -56,7 +57,7 @@ fn create_on_connection(
         }
         return Err(StorageError::AlreadyExists);
     }
-    conn.execute(
+    conn.execute_cached(
         "INSERT INTO cgka_group_state_checkpoints
             (group_id, checkpoint_id, resulting_epoch, checkpoint)
          VALUES (?1, ?2, ?3, ?4)",
@@ -96,7 +97,7 @@ fn restore_on_connection(
     checkpoint_id: &str,
 ) -> StorageResult<()> {
     let blob = SensitiveBytes::new(
-        conn.query_row(
+        conn.query_row_cached(
             "SELECT checkpoint FROM cgka_group_state_checkpoints
              WHERE group_id = ?1 AND checkpoint_id = ?2",
             params![group_id.as_slice(), checkpoint_id],
@@ -116,7 +117,7 @@ pub(super) fn list_group_state_checkpoints(
 ) -> StorageResult<Vec<GroupStateCheckpointRef>> {
     let conn = store.lock()?;
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT checkpoint_id, resulting_epoch
              FROM cgka_group_state_checkpoints
              WHERE group_id = ?1
@@ -149,7 +150,7 @@ pub(super) fn release_group_state_checkpoint(
     let delete = || {
         let deleted = store
             .lock()?
-            .execute(
+            .execute_cached(
                 "DELETE FROM cgka_group_state_checkpoints
                  WHERE group_id = ?1 AND checkpoint_id = ?2",
                 params![group_id.as_slice(), checkpoint_id],

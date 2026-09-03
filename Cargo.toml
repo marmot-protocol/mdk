@@ -108,7 +108,7 @@ nostr-relay-builder = "0.44"
 # reqwest/rustls stack, so the SDK's record-time histogram API is not needed.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "metrics"] }
 prost = "0.14"
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "cache", "trace"] }
 tempfile = "3"
 
 # test

@@ -1,5 +1,6 @@
 //! Durable, account-private NIP-77 set-reconciliation inventory.
 
+use crate::connection::CachedSql;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy};
@@ -57,7 +58,7 @@ fn route_state_floor_tx(
     route_id: &[u8],
     configured_floor: i64,
 ) -> StorageResult<i64> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO transport_reconciliation_route_state (
              route_kind, route_id, inventory_since
          ) VALUES (?1, ?2, ?3)
@@ -66,13 +67,13 @@ fn route_state_floor_tx(
         params![route_kind, route_id, configured_floor],
     )
     .storage()?;
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM transport_reconciliation_items
          WHERE route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
         params![route_kind, route_id, configured_floor],
     )
     .storage()?;
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT inventory_since
          FROM transport_reconciliation_route_state
          WHERE route_kind = ?1 AND route_id = ?2",
@@ -84,7 +85,7 @@ fn route_state_floor_tx(
 
 fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> StorageResult<()> {
     let overflow_cutoff = tx
-        .query_row(
+        .query_row_cached(
             "SELECT created_at
              FROM transport_reconciliation_items
              WHERE route_kind = ?1 AND route_id = ?2
@@ -107,13 +108,13 @@ fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> S
         return Ok(());
     };
     let compacted_floor = overflow_cutoff.saturating_add(1);
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM transport_reconciliation_items
          WHERE route_kind = ?1 AND route_id = ?2 AND created_at < ?3",
         params![route_kind, route_id, compacted_floor],
     )
     .storage()?;
-    tx.execute(
+    tx.execute_cached(
         "UPDATE transport_reconciliation_route_state
          SET inventory_since = MAX(inventory_since, ?3)
          WHERE route_kind = ?1 AND route_id = ?2",
@@ -154,7 +155,7 @@ impl SqliteAccountStorage {
             let inventory_since =
                 route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
             if created_at >= inventory_since {
-                tx.execute(
+                tx.execute_cached(
                     "INSERT OR IGNORE INTO transport_reconciliation_items (
                          route_kind, route_id, event_id, created_at
                      ) VALUES (?1, ?2, ?3, ?4)",
@@ -190,7 +191,7 @@ impl SqliteAccountStorage {
                 route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
             compact_route_tx(&tx, route_kind, route_id)?;
             let inventory_since = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT inventory_since
                      FROM transport_reconciliation_route_state
                      WHERE route_kind = ?1 AND route_id = ?2",
@@ -200,7 +201,7 @@ impl SqliteAccountStorage {
                 .storage()?
                 .max(inventory_since);
             let mut statement = tx
-                .prepare(
+                .prepare_cached(
                     "SELECT event_id, created_at
                      FROM transport_reconciliation_items
                      WHERE route_kind = ?1 AND route_id = ?2 AND created_at >= ?3
@@ -250,7 +251,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TransportReconciliationRoute>> {
         let conn = self.connection.lock()?;
         let row = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT route_kind, route_id
                  FROM transport_reconciliation_scheduler
                  WHERE singleton = 1",
@@ -284,7 +285,7 @@ impl SqliteAccountStorage {
         retry_on_busy(|| {
             self.connection
                 .lock()?
-                .execute(
+                .execute_cached(
                     "INSERT INTO transport_reconciliation_scheduler (
                          singleton, route_kind, route_id
                      ) VALUES (1, ?1, ?2)

@@ -1,3 +1,4 @@
+use crate::connection::CachedSql;
 use std::fmt;
 
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
@@ -105,14 +106,14 @@ impl SqliteAccountStorage {
         let consumed_cutoff = record
             .updated_at
             .saturating_sub(CONSUMED_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS);
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM app_prepared_group_image_upload
              WHERE (state != 'consumed' AND updated_at < ?1)
                 OR (state = 'consumed' AND updated_at < ?2)",
             params![u64_to_i64(active_cutoff)?, u64_to_i64(consumed_cutoff)?],
         )
         .storage()?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM app_prepared_group_image_upload
              WHERE upload_id IN (
                  SELECT upload_id FROM app_prepared_group_image_upload
@@ -128,7 +129,7 @@ impl SqliteAccountStorage {
         )
         .storage()?;
         let active_count: i64 = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT COUNT(*) FROM app_prepared_group_image_upload WHERE state != 'consumed'",
                 [],
                 |row| row.get(0),
@@ -141,7 +142,7 @@ impl SqliteAccountStorage {
                 "prepared group image upload capacity reached ({MAX_ACTIVE_PREPARED_GROUP_IMAGE_UPLOADS})"
             )));
         }
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO app_prepared_group_image_upload (
                     upload_id, state, component_data, encrypted_blob, upload_secret,
                     group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
@@ -166,7 +167,7 @@ impl SqliteAccountStorage {
         upload_id: &str,
     ) -> StorageResult<Option<PreparedGroupImageUploadRecord>> {
         let conn = self.lock()?;
-        conn.query_row(
+        conn.query_row_cached(
             "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
                     group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
              FROM app_prepared_group_image_upload
@@ -185,7 +186,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Vec<PreparedGroupImageUploadRecord>> {
         let conn = self.lock()?;
         let mut statement = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
                         group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
                  FROM app_prepared_group_image_upload
@@ -207,7 +208,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         let changed = self
             .lock()?
-            .execute(
+            .execute_cached(
                 "UPDATE app_prepared_group_image_upload
                  SET state = 'uploaded', attempt_count = attempt_count + 1,
                      last_error_kind = NULL, updated_at = ?2
@@ -229,7 +230,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         let changed = self
             .lock()?
-            .execute(
+            .execute_cached(
                 "UPDATE app_prepared_group_image_upload
                  SET state = 'failed', attempt_count = attempt_count + 1,
                      last_error_kind = ?2, updated_at = ?3
@@ -252,7 +253,7 @@ impl SqliteAccountStorage {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
         let changed = tx
-            .execute(
+            .execute_cached(
                 "UPDATE app_prepared_group_image_upload
                  SET state = 'consumed', group_id_hex = ?2,
                      component_data = X'', encrypted_blob = NULL,
@@ -263,7 +264,7 @@ impl SqliteAccountStorage {
             .storage()?;
         if changed == 0 {
             let raw = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT upload_id, state, component_data, encrypted_blob, upload_secret,
                             group_id_hex, attempt_count, last_error_kind, recorded_at, updated_at
                      FROM app_prepared_group_image_upload WHERE upload_id = ?1",
@@ -282,7 +283,7 @@ impl SqliteAccountStorage {
                 ));
             }
         }
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM app_prepared_group_image_upload
              WHERE upload_id IN (
                  SELECT upload_id FROM app_prepared_group_image_upload

@@ -5,6 +5,7 @@ use super::rows::{
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
+use crate::connection::CachedSql;
 use crate::openmls_storage::mls_group_key;
 #[cfg(feature = "test-conformance-replay")]
 use crate::serialize;
@@ -59,7 +60,7 @@ fn create_on_connection(
 ) -> StorageResult<()> {
     let snapshot = capture_snapshot(conn, group_id, scope)?;
     let snapshot_blob = snapshot_format::encode(&snapshot)?;
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
              VALUES (?1, ?2, ?3)",
         params![group_id.as_slice(), name, snapshot_blob.as_slice()],
@@ -75,7 +76,7 @@ fn capture_snapshot(
 ) -> StorageResult<Snapshot> {
     let mls_group_key = mls_group_key(group_id)?;
     let group_blob: Vec<u8> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT record FROM cgka_groups WHERE id = ?1",
             params![group_id.as_slice()],
             |row| row.get(0),
@@ -113,7 +114,7 @@ pub(super) fn capture_group_state(
 ) -> StorageResult<GroupStateCheckpoint> {
     let mls_group_key = mls_group_key(group_id)?;
     let group_blob: Vec<u8> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT record FROM cgka_groups WHERE id = ?1",
             params![group_id.as_slice()],
             |row| row.get(0),
@@ -134,7 +135,7 @@ pub(super) fn capture_group_state(
 pub(super) fn export(store: &SqliteAccountStorage, group_id: &GroupId) -> StorageResult<Vec<u8>> {
     let conn = store.lock()?;
     let convergence_pass = conn
-        .query_row(
+        .query_row_cached(
             "SELECT record FROM cgka_convergence_passes WHERE group_id = ?1",
             params![group_id.as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
@@ -167,7 +168,7 @@ fn queued_outbound(
     group_id: &GroupId,
 ) -> StorageResult<Vec<OrderedQueuedOutbound>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT insert_order, record FROM cgka_queued_outbound
              WHERE group_id = ?1
              ORDER BY insert_order",
@@ -195,7 +196,7 @@ fn member_capabilities(
     group_id: &GroupId,
 ) -> StorageResult<Vec<MemberCapabilitiesSnapshot>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT member_id, capabilities FROM cgka_member_capabilities
              WHERE group_id = ?1
              ORDER BY member_id",
@@ -222,7 +223,7 @@ fn convergence_policy(
     tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Option<Vec<u8>>> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT policy FROM cgka_convergence_policies WHERE group_id = ?1",
         params![group_id.as_slice()],
         |row| row.get(0),
@@ -235,7 +236,7 @@ fn validated_tree_marker(
     tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Option<Vec<u8>>> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT marker FROM cgka_member_validation_cache WHERE group_id = ?1",
         params![group_id.as_slice()],
         |row| row.get(0),
@@ -249,7 +250,7 @@ fn openmls_values(
     mls_group_key: &[u8],
 ) -> StorageResult<Vec<OpenMlsValueSnapshot>> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT label, storage_key, group_key, value FROM openmls_values
              WHERE provider_version = ?1 AND group_key = ?2
              ORDER BY storage_key",

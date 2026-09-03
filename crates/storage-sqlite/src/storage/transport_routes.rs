@@ -6,6 +6,7 @@
 //! lets the engine retire prior routes once the retained-history window moves
 //! past them. The `GroupStorage` impl in `groups.rs` delegates here.
 
+use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, epoch_to_i64, i64_to_u64};
 use cgka_traits::storage::{StorageResult, TransportGroupRoute};
 use cgka_traits::types::{EpochId, GroupId};
@@ -19,7 +20,7 @@ pub(super) fn put(
 ) -> StorageResult<()> {
     store
         .lock()?
-        .execute(
+        .execute_cached(
             "INSERT INTO cgka_transport_group_routes (transport_group_id, group_id, source_epoch)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(transport_group_id) DO UPDATE SET
@@ -38,7 +39,7 @@ pub(super) fn put(
 pub(super) fn list(store: &SqliteAccountStorage) -> StorageResult<Vec<TransportGroupRoute>> {
     let conn = store.lock()?;
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT transport_group_id, group_id, source_epoch
              FROM cgka_transport_group_routes",
         )
@@ -71,25 +72,25 @@ pub(super) fn delete_route(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_items
          WHERE route_kind = 1 AND route_id = ?1",
             params![transport_group_id],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
          WHERE route_kind = 1 AND route_id = ?1",
             params![transport_group_id],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_scheduler
          WHERE singleton = 1 AND route_kind = 1 AND route_id = ?1",
             params![transport_group_id],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM cgka_transport_group_routes WHERE transport_group_id = ?1",
             params![transport_group_id],
         )
@@ -105,7 +106,7 @@ pub(super) fn delete_below_epoch(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_items
          WHERE route_kind = 1 AND route_id IN (
              SELECT transport_group_id
@@ -115,7 +116,7 @@ pub(super) fn delete_below_epoch(
             params![group_id.as_slice(), epoch_to_i64(cutoff)?],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
          WHERE route_kind = 1 AND route_id IN (
              SELECT transport_group_id
@@ -125,7 +126,7 @@ pub(super) fn delete_below_epoch(
             params![group_id.as_slice(), epoch_to_i64(cutoff)?],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_scheduler
          WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
              SELECT transport_group_id
@@ -135,7 +136,7 @@ pub(super) fn delete_below_epoch(
             params![group_id.as_slice(), epoch_to_i64(cutoff)?],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM cgka_transport_group_routes
              WHERE group_id = ?1 AND source_epoch < ?2",
             params![group_id.as_slice(), epoch_to_i64(cutoff)?],
@@ -151,7 +152,7 @@ pub(super) fn delete_for_group(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_items
          WHERE route_kind = 1 AND route_id IN (
              SELECT transport_group_id
@@ -161,7 +162,7 @@ pub(super) fn delete_for_group(
             params![group_id.as_slice()],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_route_state
          WHERE route_kind = 1 AND route_id IN (
              SELECT transport_group_id
@@ -171,7 +172,7 @@ pub(super) fn delete_for_group(
             params![group_id.as_slice()],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM transport_reconciliation_scheduler
          WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
              SELECT transport_group_id
@@ -181,7 +182,7 @@ pub(super) fn delete_for_group(
             params![group_id.as_slice()],
         )
         .storage()?;
-        conn.execute(
+        conn.execute_cached(
             "DELETE FROM cgka_transport_group_routes WHERE group_id = ?1",
             params![group_id.as_slice()],
         )

@@ -1,4 +1,5 @@
 use super::snapshots;
+use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, i64_to_u64,
@@ -55,7 +56,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<StorageFormatBenchSizes> {
         let conn = self.lock()?;
         let message_value_bytes = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT length(id) + length(group_id) + coalesce(length(payload), 0) +
                         coalesce(length(record), 0) + coalesce(length(deferred_peel), 0)
                  FROM cgka_messages WHERE id = ?1",
@@ -66,7 +67,7 @@ impl SqliteAccountStorage {
             .storage()?
             .ok_or(StorageError::NotFound)?;
         let largest_snapshot_bytes = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT max(length(snapshot)) FROM cgka_group_snapshots WHERE group_id = ?1",
                 params![group_id.as_slice()],
                 |row| row.get::<_, Option<i64>>(0),
@@ -105,7 +106,7 @@ impl SqliteAccountStorage {
                 .storage()?;
             let rows = {
                 let mut statement = tx
-                    .prepare(&format!(
+                    .prepare_cached(&format!(
                         "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
                          WHERE storage_format = 1
                          ORDER BY insert_order
@@ -134,7 +135,7 @@ impl SqliteAccountStorage {
                 }
             }
             let has_more = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT EXISTS(
                         SELECT 1 FROM cgka_messages WHERE storage_format = 1
                      )",
@@ -184,7 +185,7 @@ impl MessageStorage for SqliteAccountStorage {
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
         let columns = self
             .lock()?
-            .query_row(
+            .query_row_cached(
                 &format!("SELECT {MESSAGE_COLUMNS} FROM cgka_messages WHERE id = ?1"),
                 params![id.as_slice()],
                 message_columns,
@@ -264,7 +265,7 @@ impl MessageStorage for SqliteAccountStorage {
             state_placeholders(states)
         );
         let conn = self.lock()?;
-        conn.query_row(
+        conn.query_row_cached(
             &sql,
             rusqlite::params_from_iter(state_query_params(group_id, at_or_after_epoch, states)?),
             |row| row.get(0),
@@ -288,7 +289,7 @@ impl MessageStorage for SqliteAccountStorage {
             state_placeholders(states)
         );
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(&sql).storage()?;
+        let mut stmt = conn.prepare_cached(&sql).storage()?;
         let records = stmt
             .query_map(
                 rusqlite::params_from_iter(state_query_params(
@@ -327,7 +328,7 @@ impl MessageStorage for SqliteAccountStorage {
         let write = || {
             let conn = self.lock()?;
             let inserted = conn
-                .execute(
+                .execute_cached(
                     "INSERT INTO pending_application_events (
                         message_id, group_id, message_insert_order, record
                      )
@@ -340,7 +341,7 @@ impl MessageStorage for SqliteAccountStorage {
                 .storage()?;
             if inserted == 0 {
                 let existing = conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT record FROM pending_application_events WHERE message_id = ?1",
                         params![message_id.as_slice()],
                         |row| row.get::<_, Vec<u8>>(0),
@@ -367,7 +368,7 @@ impl MessageStorage for SqliteAccountStorage {
     fn list_pending_application_events(&self) -> StorageResult<Vec<GroupEvent>> {
         let conn = self.lock()?;
         let mut statement = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT record
                  FROM pending_application_events
                  ORDER BY message_insert_order, message_id",
@@ -385,7 +386,7 @@ impl MessageStorage for SqliteAccountStorage {
         let delete = || {
             let conn = self.lock()?;
             for id in ids {
-                conn.execute(
+                conn.execute_cached(
                     "DELETE FROM pending_application_events WHERE message_id = ?1",
                     params![id.as_slice()],
                 )
@@ -435,12 +436,12 @@ impl MessageStorage for SqliteAccountStorage {
         retry_on_busy(|| {
             self.connection.with_transaction(|| {
                 let conn = self.lock()?;
-                conn.execute(
+                conn.execute_cached(
                     "INSERT OR IGNORE INTO cgka_ingress_dedup (id) VALUES (?1)",
                     params![id.as_slice()],
                 )
                 .storage()?;
-                conn.execute(
+                conn.execute_cached(
                     "DELETE FROM cgka_ingress_dedup
                      WHERE insert_order NOT IN (
                         SELECT insert_order FROM cgka_ingress_dedup
@@ -456,7 +457,7 @@ impl MessageStorage for SqliteAccountStorage {
 
     fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
         self.lock()?
-            .query_row(
+            .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM cgka_ingress_dedup WHERE id = ?1)",
                 params![id.as_slice()],
                 |row| row.get(0),
@@ -540,7 +541,7 @@ fn list_messages_on_connection(
     include_insert_order: Option<&mut Vec<i64>>,
 ) -> StorageResult<Vec<MessageRecord>> {
     let mut statement = conn
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT insert_order, {MESSAGE_COLUMNS} FROM cgka_messages
              WHERE group_id = ?1 AND epoch >= ?2
              ORDER BY insert_order"
@@ -594,7 +595,7 @@ pub(super) fn put_message_on_connection(
 ) -> StorageResult<()> {
     let deferred_peel = record.deferred_peel.as_ref().map(serialize).transpose()?;
     match insert_order {
-        None => conn.execute(
+        None => conn.execute_cached(
             "INSERT INTO cgka_messages (
                  id, group_id, epoch, state, storage_format, record, payload, deferred_peel
              ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
@@ -616,7 +617,7 @@ pub(super) fn put_message_on_connection(
                 deferred_peel,
             ],
         ),
-        Some(insert_order) => conn.execute(
+        Some(insert_order) => conn.execute_cached(
             "INSERT INTO cgka_messages (
                  insert_order, id, group_id, epoch, state, storage_format,
                  record, payload, deferred_peel
@@ -675,7 +676,7 @@ fn update_message_state_on_connection(
     new_state: MessageState,
 ) -> StorageResult<()> {
     let storage_format: i64 = conn
-        .query_row(
+        .query_row_cached(
             "SELECT storage_format FROM cgka_messages WHERE id = ?1",
             params![id.as_slice()],
             |row| row.get(0),
@@ -684,7 +685,7 @@ fn update_message_state_on_connection(
         .storage()?
         .ok_or(StorageError::NotFound)?;
     let changed = if storage_format == NORMALIZED_MESSAGE_STORAGE_FORMAT {
-        conn.execute(
+        conn.execute_cached(
             "UPDATE cgka_messages
              SET state = ?1,
                  deferred_peel = CASE WHEN ?1 = ?2 THEN deferred_peel ELSE NULL END
@@ -698,7 +699,7 @@ fn update_message_state_on_connection(
         .storage()?
     } else if storage_format == 1 {
         let columns = conn
-            .query_row(
+            .query_row_cached(
                 &format!("SELECT {MESSAGE_COLUMNS} FROM cgka_messages WHERE id = ?1"),
                 params![id.as_slice()],
                 message_columns,
@@ -725,12 +726,12 @@ fn update_message_state_on_connection(
 /// Delete a protocol message and its not-yet-acknowledged application event on
 /// the same connection/transaction so neither row can outlive the other.
 fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM pending_application_events WHERE message_id = ?1",
         params![id.as_slice()],
     )
     .storage()?;
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_messages WHERE id = ?1",
         params![id.as_slice()],
     )

@@ -5,6 +5,7 @@ use super::rows::{
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
+use crate::connection::CachedSql;
 #[cfg(feature = "test-conformance-replay")]
 use crate::deserialize;
 use crate::openmls_storage::mls_group_key;
@@ -81,7 +82,7 @@ fn rollback_snapshot(
     scope: RestoreScope,
 ) -> StorageResult<()> {
     let snapshot_blob = SensitiveBytes::new(
-        conn.query_row(
+        conn.query_row_cached(
             "SELECT snapshot FROM cgka_group_snapshots
                  WHERE group_id = ?1 AND name = ?2",
             params![group_id.as_slice(), name],
@@ -138,13 +139,13 @@ fn convergence_pass(
     group_id: &GroupId,
     pass: Option<&cgka_traits::convergence_pass::DurableConvergencePass>,
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_convergence_passes WHERE group_id = ?1",
         params![group_id.as_slice()],
     )
     .storage()?;
     if let Some(pass) = pass {
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO cgka_convergence_passes (group_id, record) VALUES (?1, ?2)",
             params![group_id.as_slice(), serialize(pass)?],
         )
@@ -191,7 +192,7 @@ pub(super) fn restore_group_state(
 }
 
 fn group(conn: &rusqlite::Connection, group_id: &GroupId, group: &Group) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "INSERT INTO cgka_groups (id, epoch, record)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
@@ -212,7 +213,7 @@ fn messages(
     group_id: &GroupId,
     messages: &[OrderedMessage],
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_messages WHERE group_id = ?1",
         params![group_id.as_slice()],
     )
@@ -223,7 +224,7 @@ fn messages(
     // A full snapshot replaces this group's protocol messages. Preserve
     // pending application deliveries whose source messages were restored, but
     // remove outbox rows for messages that the rollback discarded.
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM pending_application_events
          WHERE group_id = ?1
            AND NOT EXISTS (
@@ -243,13 +244,13 @@ fn queued_outbound(
     group_id: &GroupId,
     queued_outbound: &[OrderedQueuedOutbound],
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_queued_outbound WHERE group_id = ?1",
         params![group_id.as_slice()],
     )
     .storage()?;
     for queued in queued_outbound {
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO cgka_queued_outbound
                 (insert_order, id, group_id, created_at_ms, record)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -271,13 +272,13 @@ fn member_capabilities(
     group_id: &GroupId,
     member_caps: &[MemberCapabilitiesSnapshot],
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_member_capabilities WHERE group_id = ?1",
         params![group_id.as_slice()],
     )
     .storage()?;
     for caps in member_caps {
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO cgka_member_capabilities (group_id, member_id, capabilities)
              VALUES (?1, ?2, ?3)",
             params![
@@ -296,13 +297,13 @@ fn convergence_policy(
     group_id: &GroupId,
     policy: Option<&[u8]>,
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_convergence_policies WHERE group_id = ?1",
         params![group_id.as_slice()],
     )
     .storage()?;
     if let Some(policy) = policy {
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO cgka_convergence_policies (group_id, policy)
              VALUES (?1, ?2)",
             params![group_id.as_slice(), policy],
@@ -317,13 +318,13 @@ fn validated_tree_marker(
     group_id: &GroupId,
     marker: Option<&[u8]>,
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM cgka_member_validation_cache WHERE group_id = ?1",
         params![group_id.as_slice()],
     )
     .storage()?;
     if let Some(marker) = marker {
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO cgka_member_validation_cache (group_id, marker)
              VALUES (?1, ?2)",
             params![group_id.as_slice(), marker],
@@ -338,14 +339,14 @@ fn openmls_values(
     mls_group_key: &[u8],
     values: &[OpenMlsValueSnapshot],
 ) -> StorageResult<()> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM openmls_values
          WHERE provider_version = ?1 AND group_key = ?2",
         params![openmls_traits::storage::CURRENT_VERSION, mls_group_key],
     )
     .storage()?;
     for value in values {
-        conn.execute(
+        conn.execute_cached(
             "INSERT INTO openmls_values
                 (provider_version, label, storage_key, group_key, value)
              VALUES (?1, ?2, ?3, ?4, ?5)",
