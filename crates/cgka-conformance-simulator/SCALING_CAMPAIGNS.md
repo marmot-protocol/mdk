@@ -217,6 +217,10 @@ Each isolated shard writes `process-campaign.v1.json`; treat the shard summaries
 one evidence set. An aggregate summary must derive totals and slowest/resource extrema from every included shard, not
 only a subset. Keep the exact source revision and command matrix beside the artifacts.
 
+Aggregate scenario timeouts separately from minimization/post-processing outcomes. A case whose report records
+`budget_exhausted` completed its original scenario and exhausted only the bounded reducer; a worker deadline with a
+durable `pending` minimization record is likewise distinct from a scenario-execution timeout with no report.
+
 Campaign artifacts can grow quickly. Retain:
 
 - all failed/timed-out/signaled cases and their exact inputs;

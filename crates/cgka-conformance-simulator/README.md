@@ -629,9 +629,18 @@ IR before launching the external driver.
 - `invariant_failures` — compatibility field mirroring expectation failures by kind and message.
 
 `run_generated_case_report(case, expected_trace)` adds generated-family metadata: family name, generator version, seed,
-case index, and an optional `minimized_case` field. Failing generated cases run a conservative greedy minimizer that
-removes removable delivery/app steps only when the semantic failure identity (classification, action type, and failure
-kind) still reproduces. The complete fingerprint, including the state digest, remains in the capsule for diagnosis.
+case index, minimization status, and an optional `minimized_case` field. Failing generated cases run a conservative
+greedy minimizer that removes removable delivery/app steps only when the semantic failure identity (classification,
+action type, and failure kind) still reproduces. The complete fingerprint, including the state digest, remains in the
+capsule for diagnosis. Report artifacts, fixture candidates, and failure capsules are written before reduction starts;
+completed minimization metadata replaces them atomically, so interruption leaves a complete original artifact rather
+than a truncated or missing one. Status is `complete`, `budget_exhausted`, `not_reproducible`, or `skipped`; a durable
+`pending` status identifies a worker interrupted during reduction.
+
+Reduction defaults to a 30-second wall-clock budget, 256 total reproduction trials, and five seconds per trial. The
+report and isolated campaign CLIs accept `--minimization-wall-time-secs`, `--minimization-max-trials`, and
+`--minimization-trial-timeout-secs` when a different diagnostic budget is intentional. Budget exhaustion never changes
+the original scenario failure classification.
 Generated report runs on the generator-recorded subject also write a sibling `*-fixture.v1.json` candidate. Adapter
 override runs deliberately do not, because their observed trace is an A/B result rather than an adapter-neutral source
 of truth. Cases with semantic expectations keep those expectations; cases without them use the observed trace as an

@@ -116,6 +116,14 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked
 The parent saves each input before spawning its worker, kills and reaps deadline failures, verifies artifact
 provenance, and writes `process-campaign.v1.json`. This is the preferred local discovery boundary: a panic or hang in
 one case cannot erase the remaining cases, and the summary contains real child-process resource measurements.
+The worker also saves the original report, fixture candidate, and failure capsule before optional semantic reduction.
+The campaign summary records each case's minimization status and classifies a process deadline as scenario execution,
+minimization, or later post-processing when enough durable evidence exists to tell them apart.
+
+Semantic reduction defaults to 30 seconds overall, 256 reproduction trials, and five seconds per trial. Override these
+with `--minimization-wall-time-secs`, `--minimization-max-trials`, and
+`--minimization-trial-timeout-secs`. A `budget_exhausted` status is a bounded post-processing result, not a scenario
+timeout, and the original failure artifacts remain authoritative.
 
 ## Choosing a generated family
 

@@ -2406,23 +2406,36 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
         .expect("failing generated case still reports");
 
     assert_eq!(report.expectation_failures.len(), 1);
-    let minimized = report
+    let generated = report
         .metadata
         .generated
         .as_ref()
-        .and_then(|generated| generated.minimized_case.as_ref())
+        .expect("failing generated case should record generated metadata");
+    assert!(matches!(
+        generated.minimization.status,
+        cgka_conformance_simulator::GeneratedScenarioMinimizationStatus::Complete
+            | cgka_conformance_simulator::GeneratedScenarioMinimizationStatus::BudgetExhausted
+    ));
+    assert!(generated.minimization.trials > 1);
+    let minimized = generated
+        .minimized_case
+        .as_ref()
         .expect("failing generated case should record a minimized case");
     assert!(
         minimized.steps.len() < case.scenario.steps.len(),
         "minimized case should remove irrelevant delivery noise"
     );
-    assert!(
-        minimized
-            .steps
-            .iter()
-            .all(|step| !matches!(step, ScenarioStep::SendAppMessage { .. })),
-        "semantic failure identity should let the reducer remove the entire application-message storm"
-    );
+    if generated.minimization.status
+        == cgka_conformance_simulator::GeneratedScenarioMinimizationStatus::Complete
+    {
+        assert!(
+            minimized
+                .steps
+                .iter()
+                .all(|step| !matches!(step, ScenarioStep::SendAppMessage { .. })),
+            "a completed semantic reduction should remove the entire application-message storm"
+        );
+    }
     let minimized_report =
         run_scenario_report_with_outcomes(minimized, None, case.expected_outcomes.clone())
             .await

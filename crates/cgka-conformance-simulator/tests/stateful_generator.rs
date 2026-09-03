@@ -85,6 +85,7 @@ async fn report_runner_executes_and_preserves_both_journey_profiles() {
         strict_oracle: true,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("representative journeys execute");
@@ -143,6 +144,7 @@ async fn report_runner_executes_and_preserves_both_journey_profiles() {
         strict_oracle: true,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("saved retained-relay input replays");

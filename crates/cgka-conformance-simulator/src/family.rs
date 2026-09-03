@@ -19,8 +19,52 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 pub const GENERATED_SCENARIO_INPUT_SCHEMA_VERSION: &str = "1";
+
+/// Bounds optional semantic reduction after the original generated report has
+/// been produced. The defaults keep expensive failures from consuming the
+/// enclosing process deadline while still allowing small deterministic cases
+/// to reduce completely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratedScenarioMinimizationBudget {
+    pub wall_clock: Duration,
+    pub max_trials: usize,
+    pub per_trial_timeout: Duration,
+}
+
+impl Default for GeneratedScenarioMinimizationBudget {
+    fn default() -> Self {
+        Self {
+            wall_clock: Duration::from_secs(30),
+            max_trials: 256,
+            per_trial_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl GeneratedScenarioMinimizationBudget {
+    pub fn validate(self) -> Result<Self, &'static str> {
+        if self.wall_clock.is_zero() {
+            return Err("minimization wall-clock budget must be greater than zero");
+        }
+        if self.max_trials == 0 {
+            return Err("minimization trial budget must be greater than zero");
+        }
+        if self.per_trial_timeout.is_zero() {
+            return Err("minimization per-trial timeout must be greater than zero");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GeneratedScenarioMinimizationOutcome {
+    status: crate::GeneratedScenarioMinimizationStatus,
+    trials: usize,
+    minimized_case: Option<ScenarioSpec>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedScenarioCase {
@@ -635,12 +679,15 @@ pub async fn run_generated_case_report_with_storage_mode(
         storage_mode,
     )
     .await?;
-    add_generated_metadata(
+    let budget = GeneratedScenarioMinimizationBudget::default();
+    prepare_generated_metadata(case, &mut report, budget);
+    complete_generated_minimization(
         case,
         case.subject,
         expected_trace.as_ref(),
         &mut report,
         storage_mode,
+        budget,
     )
     .await;
     Ok(report)
@@ -670,6 +717,37 @@ pub async fn run_generated_case_report_with_capture_on_subject(
     expected_trace: Option<ScenarioTrace>,
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
+) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
+    let budget = GeneratedScenarioMinimizationBudget::default();
+    let (mut report, failure_capture) =
+        run_generated_case_report_with_capture_on_subject_before_minimization(
+            case,
+            execution_subject,
+            expected_trace.clone(),
+            storage_mode,
+            capture_sensitive_replay,
+            budget,
+        )
+        .await?;
+    complete_generated_minimization(
+        case,
+        execution_subject,
+        expected_trace.as_ref(),
+        &mut report,
+        storage_mode,
+        budget,
+    )
+    .await;
+    Ok((report, failure_capture))
+}
+
+pub(crate) async fn run_generated_case_report_with_capture_on_subject_before_minimization(
+    case: &GeneratedScenarioCase,
+    execution_subject: GeneratedSubjectKind,
+    expected_trace: Option<ScenarioTrace>,
+    storage_mode: HarnessStorageMode,
+    capture_sensitive_replay: bool,
+    budget: GeneratedScenarioMinimizationBudget,
 ) -> Result<(ScenarioReport, crate::ScenarioFailureCaptureV1), ScenarioRunError> {
     let (mut report, failure_capture) = match execution_subject {
         GeneratedSubjectKind::Engine => {
@@ -744,35 +822,19 @@ pub async fn run_generated_case_report_with_capture_on_subject(
             )
         }
     };
-    add_generated_metadata(
-        case,
-        execution_subject,
-        expected_trace.as_ref(),
-        &mut report,
-        storage_mode,
-    )
-    .await;
+    prepare_generated_metadata(case, &mut report, budget);
     Ok((report, failure_capture))
 }
 
-async fn add_generated_metadata(
+fn prepare_generated_metadata(
     case: &GeneratedScenarioCase,
-    execution_subject: GeneratedSubjectKind,
-    expected_trace: Option<&ScenarioTrace>,
     report: &mut ScenarioReport,
-    storage_mode: HarnessStorageMode,
+    budget: GeneratedScenarioMinimizationBudget,
 ) {
-    let minimized_case = if fingerprint_report_failure(report).is_ok() {
-        minimize_failing_case(
-            case,
-            execution_subject,
-            expected_trace,
-            report,
-            storage_mode,
-        )
-        .await
+    let status = if fingerprint_report_failure(report).is_ok() {
+        crate::GeneratedScenarioMinimizationStatus::Pending
     } else {
-        None
+        crate::GeneratedScenarioMinimizationStatus::Skipped
     };
     report.metadata.generated = Some(GeneratedScenarioMetadata {
         family_name: case.family_name.clone(),
@@ -780,8 +842,45 @@ async fn add_generated_metadata(
         seed: case.seed,
         case_index: case.case_index,
         workload_profile: case.workload_profile.clone(),
-        minimized_case,
+        minimization: crate::GeneratedScenarioMinimizationV1 {
+            status,
+            trials: 0,
+            wall_clock_budget_ms: duration_ms(budget.wall_clock),
+            max_trials: budget.max_trials,
+            per_trial_timeout_ms: duration_ms(budget.per_trial_timeout),
+        },
+        minimized_case: None,
     });
+}
+
+pub(crate) async fn complete_generated_minimization(
+    case: &GeneratedScenarioCase,
+    execution_subject: GeneratedSubjectKind,
+    expected_trace: Option<&ScenarioTrace>,
+    report: &mut ScenarioReport,
+    storage_mode: HarnessStorageMode,
+    budget: GeneratedScenarioMinimizationBudget,
+) {
+    let is_pending = report.metadata.generated.as_ref().is_some_and(|metadata| {
+        metadata.minimization.status == crate::GeneratedScenarioMinimizationStatus::Pending
+    });
+    if !is_pending {
+        return;
+    }
+    let outcome = minimize_failing_case(
+        case,
+        execution_subject,
+        expected_trace,
+        report,
+        storage_mode,
+        budget,
+    )
+    .await;
+    if let Some(metadata) = report.metadata.generated.as_mut() {
+        metadata.minimization.status = outcome.status;
+        metadata.minimization.trials = outcome.trials;
+        metadata.minimized_case = outcome.minimized_case;
+    }
 }
 
 async fn minimize_failing_case(
@@ -790,11 +889,17 @@ async fn minimize_failing_case(
     expected_trace: Option<&ScenarioTrace>,
     failing_report: &ScenarioReport,
     storage_mode: HarnessStorageMode,
-) -> Option<ScenarioSpec> {
-    let target_identity = fingerprint_report_failure(failing_report)
-        .ok()?
-        .semantic_identity();
-    minimize_scenario_with(case.scenario.clone(), |trial| {
+    budget: GeneratedScenarioMinimizationBudget,
+) -> GeneratedScenarioMinimizationOutcome {
+    let Ok(fingerprint) = fingerprint_report_failure(failing_report) else {
+        return GeneratedScenarioMinimizationOutcome {
+            status: crate::GeneratedScenarioMinimizationStatus::Skipped,
+            trials: 0,
+            minimized_case: None,
+        };
+    };
+    let target_identity = fingerprint.semantic_identity();
+    minimize_scenario_with(case.scenario.clone(), budget, |trial| {
         let expected_trace = expected_trace.cloned();
         let expected_outcomes = case.expected_outcomes.clone();
         let target_identity = target_identity.clone();
@@ -815,30 +920,119 @@ async fn minimize_failing_case(
 
 async fn minimize_scenario_with<F, Fut>(
     mut candidate: ScenarioSpec,
+    budget: GeneratedScenarioMinimizationBudget,
     mut reproduces: F,
-) -> Option<ScenarioSpec>
+) -> GeneratedScenarioMinimizationOutcome
 where
     F: FnMut(ScenarioSpec) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    let started = Instant::now();
+    let mut trials = 0;
     let mut changed = false;
+    match run_minimization_trial(
+        &mut reproduces,
+        candidate.clone(),
+        budget,
+        started,
+        &mut trials,
+    )
+    .await
+    {
+        MinimizationTrial::Reproduced => {}
+        MinimizationTrial::DidNotReproduce => {
+            return GeneratedScenarioMinimizationOutcome {
+                status: crate::GeneratedScenarioMinimizationStatus::NotReproducible,
+                trials,
+                minimized_case: None,
+            };
+        }
+        MinimizationTrial::BudgetExhausted => {
+            return GeneratedScenarioMinimizationOutcome {
+                status: crate::GeneratedScenarioMinimizationStatus::BudgetExhausted,
+                trials,
+                minimized_case: None,
+            };
+        }
+    }
     loop {
         let mut reduced = false;
         for unit in semantic_minimization_units(&candidate.steps) {
             let mut trial = candidate.clone();
             remove_step_indices(&mut trial.steps, &unit);
-            if reproduces(trial.clone()).await {
-                candidate = trial;
-                changed = true;
-                reduced = true;
-                break;
+            match run_minimization_trial(
+                &mut reproduces,
+                trial.clone(),
+                budget,
+                started,
+                &mut trials,
+            )
+            .await
+            {
+                MinimizationTrial::Reproduced => {
+                    candidate = trial;
+                    changed = true;
+                    reduced = true;
+                    break;
+                }
+                MinimizationTrial::DidNotReproduce => {}
+                MinimizationTrial::BudgetExhausted => {
+                    return GeneratedScenarioMinimizationOutcome {
+                        status: crate::GeneratedScenarioMinimizationStatus::BudgetExhausted,
+                        trials,
+                        minimized_case: changed.then_some(candidate),
+                    };
+                }
             }
         }
         if !reduced {
             break;
         }
     }
-    changed.then_some(candidate)
+    GeneratedScenarioMinimizationOutcome {
+        status: crate::GeneratedScenarioMinimizationStatus::Complete,
+        trials,
+        minimized_case: changed.then_some(candidate),
+    }
+}
+
+enum MinimizationTrial {
+    Reproduced,
+    DidNotReproduce,
+    BudgetExhausted,
+}
+
+async fn run_minimization_trial<F, Fut>(
+    reproduces: &mut F,
+    trial: ScenarioSpec,
+    budget: GeneratedScenarioMinimizationBudget,
+    started: Instant,
+    trials: &mut usize,
+) -> MinimizationTrial
+where
+    F: FnMut(ScenarioSpec) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if *trials >= budget.max_trials {
+        return MinimizationTrial::BudgetExhausted;
+    }
+    let Some(remaining) = budget.wall_clock.checked_sub(started.elapsed()) else {
+        return MinimizationTrial::BudgetExhausted;
+    };
+    let trial_timeout = remaining.min(budget.per_trial_timeout);
+    if trial_timeout.is_zero() {
+        return MinimizationTrial::BudgetExhausted;
+    }
+    *trials += 1;
+    match tokio::time::timeout(trial_timeout, reproduces(trial)).await {
+        Ok(true) => MinimizationTrial::Reproduced,
+        Ok(false) => MinimizationTrial::DidNotReproduce,
+        Err(_) => MinimizationTrial::BudgetExhausted,
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Dependency-aware reduction units. Removing a fault arm without its release
@@ -4231,19 +4425,29 @@ mod tests {
             ],
         };
 
-        let minimized = minimize_scenario_with(scenario, |trial| async move {
-            let has_partition = trial
-                .steps
-                .iter()
-                .any(|step| matches!(step, ScenarioStep::SetPartition { .. }));
-            let has_clear = trial
-                .steps
-                .iter()
-                .any(|step| matches!(step, ScenarioStep::ClearPartition));
-            has_partition || has_clear
-        })
-        .await
-        .expect("independent noise should be removable");
+        let outcome = minimize_scenario_with(
+            scenario,
+            GeneratedScenarioMinimizationBudget::default(),
+            |trial| async move {
+                let has_partition = trial
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, ScenarioStep::SetPartition { .. }));
+                let has_clear = trial
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, ScenarioStep::ClearPartition));
+                has_partition || has_clear
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome.status,
+            crate::GeneratedScenarioMinimizationStatus::Complete
+        );
+        let minimized = outcome
+            .minimized_case
+            .expect("independent noise should be removable");
 
         assert_eq!(minimized.steps.len(), 2);
         assert!(matches!(
@@ -4251,6 +4455,86 @@ mod tests {
             ScenarioStep::SetPartition { .. }
         ));
         assert!(matches!(minimized.steps[1], ScenarioStep::ClearPartition));
+    }
+
+    #[tokio::test]
+    async fn expensive_reproducer_exhausts_the_minimization_budget_after_the_original_run() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let scenario = ScenarioSpec {
+            name: "budgeted-reduction".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into()],
+            steps: vec![ScenarioStep::ClearEvents {
+                clients: vec!["alice".into()],
+            }],
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_reproducer = Arc::clone(&attempts);
+        let started = Instant::now();
+
+        let outcome = minimize_scenario_with(
+            scenario,
+            GeneratedScenarioMinimizationBudget {
+                wall_clock: Duration::from_millis(50),
+                max_trials: 8,
+                per_trial_timeout: Duration::from_millis(10),
+            },
+            move |_trial| {
+                let attempt = attempts_for_reproducer.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        true
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        true
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.status,
+            crate::GeneratedScenarioMinimizationStatus::BudgetExhausted
+        );
+        assert_eq!(outcome.trials, 2, "one complete run plus one timed trial");
+        assert!(outcome.minimized_case.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the per-trial timeout must bound an expensive reproduction"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_reproducing_original_case_is_reported() {
+        let scenario = ScenarioSpec {
+            name: "non-reproducing-reduction".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into()],
+            steps: vec![ScenarioStep::ClearEvents {
+                clients: vec!["alice".into()],
+            }],
+        };
+
+        let outcome = minimize_scenario_with(
+            scenario,
+            GeneratedScenarioMinimizationBudget::default(),
+            |_trial| async { false },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.status,
+            crate::GeneratedScenarioMinimizationStatus::NotReproducible
+        );
+        assert_eq!(outcome.trials, 1);
+        assert!(outcome.minimized_case.is_none());
     }
 
     #[test]

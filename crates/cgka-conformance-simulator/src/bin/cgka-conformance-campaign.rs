@@ -1,5 +1,6 @@
 use cgka_conformance_simulator::{
-    GeneratedScenarioCase, GeneratedScenarioInputV1, HarnessStorageMode, ReportArgs, ReportInput,
+    GeneratedScenarioCase, GeneratedScenarioInputV1, GeneratedScenarioMinimizationBudget,
+    GeneratedScenarioMinimizationStatus, HarnessStorageMode, ReportArgs, ReportInput,
     ScenarioReport, generate_family_case, resolve_scenario_input_bytes, run_report,
 };
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ struct Args {
     out: PathBuf,
     storage: HarnessStorageMode,
     case_timeout: Duration,
+    minimization_budget: GeneratedScenarioMinimizationBudget,
     input: Option<PathBuf>,
     capture_sensitive_replay: bool,
     worker: bool,
@@ -29,6 +31,9 @@ struct ProcessCampaignReportV1 {
     storage: String,
     case_timeout_ms: u64,
     capture_sensitive_replay: bool,
+    minimization_wall_time_ms: u64,
+    minimization_max_trials: usize,
+    minimization_trial_timeout_ms: u64,
     cases: Vec<ProcessCaseMeasurementV1>,
 }
 
@@ -46,6 +51,10 @@ struct ProcessCaseMeasurementV1 {
     exit_code: Option<i32>,
     signal: Option<i32>,
     timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_phase: Option<ProcessCaseTimeoutPhaseV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimization_status: Option<GeneratedScenarioMinimizationStatus>,
     wall_us: u64,
     user_cpu_us: Option<u64>,
     system_cpu_us: Option<u64>,
@@ -75,6 +84,16 @@ struct PlannedCase {
 struct CaseArtifactInspection {
     integrity_errors: Vec<String>,
     database_bytes: Option<u64>,
+    timeout_phase: Option<ProcessCaseTimeoutPhaseV1>,
+    minimization_status: Option<GeneratedScenarioMinimizationStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProcessCaseTimeoutPhaseV1 {
+    ScenarioExecution,
+    Minimization,
+    PostProcessing,
 }
 
 #[tokio::main]
@@ -119,7 +138,18 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
             .arg("--out")
             .arg(&args.out)
             .arg("--storage")
-            .arg(storage_label(args.storage));
+            .arg(storage_label(args.storage))
+            .arg("--minimization-wall-time-secs")
+            .arg(args.minimization_budget.wall_clock.as_secs().to_string())
+            .arg("--minimization-max-trials")
+            .arg(args.minimization_budget.max_trials.to_string())
+            .arg("--minimization-trial-timeout-secs")
+            .arg(
+                args.minimization_budget
+                    .per_trial_timeout
+                    .as_secs()
+                    .to_string(),
+            );
         if args.capture_sensitive_replay {
             command.arg("--capture-sensitive-replay");
         }
@@ -146,6 +176,8 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
             exit_code: usage.exit_code,
             signal: usage.signal,
             timed_out: usage.timed_out,
+            timeout_phase: inspection.timeout_phase,
+            minimization_status: inspection.minimization_status,
             wall_us: elapsed_us(started.elapsed()),
             user_cpu_us: usage.user_cpu_us,
             system_cpu_us: usage.system_cpu_us,
@@ -170,6 +202,9 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
         storage: storage_label(args.storage).into(),
         case_timeout_ms: elapsed_ms(args.case_timeout),
         capture_sensitive_replay: args.capture_sensitive_replay,
+        minimization_wall_time_ms: elapsed_ms(args.minimization_budget.wall_clock),
+        minimization_max_trials: args.minimization_budget.max_trials,
+        minimization_trial_timeout_ms: elapsed_ms(args.minimization_budget.per_trial_timeout),
         cases: observations,
     };
     fs_private::write_private(&summary_path, &serde_json::to_vec_pretty(&summary)?)?;
@@ -192,6 +227,7 @@ async fn run_worker(args: &Args) -> Result<ExitCode, Box<dyn Error>> {
         strict_oracle: true,
         storage_mode: args.storage,
         capture_sensitive_replay: args.capture_sensitive_replay,
+        minimization_budget: args.minimization_budget,
     })
     .await?;
     println!("{}", summary.to_human_text());
@@ -254,6 +290,11 @@ fn inspect_case_artifacts(
     let database_bytes = report
         .as_ref()
         .and_then(|report| report.campaign_measurements.database_bytes);
+    let minimization_status = report
+        .as_ref()
+        .and_then(|report| report.metadata.generated.as_ref())
+        .map(|generated| generated.minimization.status);
+    let timeout_phase = classify_timeout_phase(usage.timed_out, minimization_status);
 
     // A timeout or signal may interrupt the worker before it can publish a
     // report. A normally exiting worker, including a strict-oracle failure,
@@ -297,7 +338,22 @@ fn inspect_case_artifacts(
     CaseArtifactInspection {
         integrity_errors: errors,
         database_bytes,
+        timeout_phase,
+        minimization_status,
     }
+}
+
+fn classify_timeout_phase(
+    timed_out: bool,
+    minimization_status: Option<GeneratedScenarioMinimizationStatus>,
+) -> Option<ProcessCaseTimeoutPhaseV1> {
+    timed_out.then_some(match minimization_status {
+        Some(GeneratedScenarioMinimizationStatus::Pending) => {
+            ProcessCaseTimeoutPhaseV1::Minimization
+        }
+        Some(_) => ProcessCaseTimeoutPhaseV1::PostProcessing,
+        None => ProcessCaseTimeoutPhaseV1::ScenarioExecution,
+    })
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>> {
@@ -307,6 +363,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     let mut out = PathBuf::from("target/cgka-adversarial-reliability-process-campaign");
     let mut storage = HarnessStorageMode::TempFileBackedSqlite;
     let mut case_timeout = Duration::from_secs(300);
+    let mut minimization_budget = GeneratedScenarioMinimizationBudget::default();
     let mut input = None;
     let mut capture_sensitive_replay = false;
     let mut worker = false;
@@ -334,6 +391,26 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
                         .parse()?,
                 )
             }
+            "--minimization-wall-time-secs" => {
+                minimization_budget.wall_clock = Duration::from_secs(
+                    args.next()
+                        .ok_or("missing --minimization-wall-time-secs value")?
+                        .parse()?,
+                )
+            }
+            "--minimization-max-trials" => {
+                minimization_budget.max_trials = args
+                    .next()
+                    .ok_or("missing --minimization-max-trials value")?
+                    .parse()?
+            }
+            "--minimization-trial-timeout-secs" => {
+                minimization_budget.per_trial_timeout = Duration::from_secs(
+                    args.next()
+                        .ok_or("missing --minimization-trial-timeout-secs value")?
+                        .parse()?,
+                )
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -349,6 +426,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
     if !worker && case_timeout.is_zero() {
         return Err("--case-timeout-secs must be greater than zero".into());
     }
+    minimization_budget = minimization_budget.validate()?;
     Ok(Args {
         family,
         seed,
@@ -356,6 +434,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, Box<dyn Error>
         out,
         storage,
         case_timeout,
+        minimization_budget,
         input,
         capture_sensitive_replay,
         worker,
@@ -600,6 +679,57 @@ mod tests {
     }
 
     #[test]
+    fn parses_minimization_budgets() {
+        let args = parse_args(
+            [
+                "--minimization-wall-time-secs",
+                "19",
+                "--minimization-max-trials",
+                "31",
+                "--minimization-trial-timeout-secs",
+                "4",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("arguments parse");
+        assert_eq!(
+            args.minimization_budget,
+            GeneratedScenarioMinimizationBudget {
+                wall_clock: Duration::from_secs(19),
+                max_trials: 31,
+                per_trial_timeout: Duration::from_secs(4),
+            }
+        );
+    }
+
+    #[test]
+    fn timeout_phase_distinguishes_scenario_execution_from_minimization() {
+        assert_eq!(
+            classify_timeout_phase(true, None),
+            Some(ProcessCaseTimeoutPhaseV1::ScenarioExecution)
+        );
+        assert_eq!(
+            classify_timeout_phase(true, Some(GeneratedScenarioMinimizationStatus::Pending)),
+            Some(ProcessCaseTimeoutPhaseV1::Minimization)
+        );
+        assert_eq!(
+            classify_timeout_phase(
+                true,
+                Some(GeneratedScenarioMinimizationStatus::BudgetExhausted)
+            ),
+            Some(ProcessCaseTimeoutPhaseV1::PostProcessing)
+        );
+        assert_eq!(
+            classify_timeout_phase(
+                false,
+                Some(GeneratedScenarioMinimizationStatus::BudgetExhausted)
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn parses_family_and_sensitive_capture() {
         let args = parse_args(
             ["--family", "chat-journey/v1", "--capture-sensitive-replay"]
@@ -676,6 +806,9 @@ mod tests {
         for args in [
             vec!["--cases", "0"],
             vec!["--case-timeout-secs", "0"],
+            vec!["--minimization-wall-time-secs", "0"],
+            vec!["--minimization-max-trials", "0"],
+            vec!["--minimization-trial-timeout-secs", "0"],
             vec!["--input", "case.json"],
             vec!["--worker"],
         ] {

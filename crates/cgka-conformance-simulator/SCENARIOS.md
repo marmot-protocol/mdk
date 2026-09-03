@@ -964,6 +964,10 @@ These tests keep the simulator machinery honest.
   generated case remove an entire irrelevant application-message storm even though action indices and the full state
   digest change. The minimized case remains diagnostic metadata; fixture candidates retain the original executed
   scenario so they cannot silently reproduce a different terminal state under the same broad failure kind.
+- `expensive_reproducer_exhausts_the_minimization_budget_after_the_original_run` checks that one completed synthetic
+  reproduction followed by an expensive trial stops at the per-trial budget with `budget_exhausted`.
+- `minimization_budget_exhaustion_preserves_the_original_failure_artifacts` checks that bounded reduction retains the
+  original failure kind in the report and portable capsule and keeps the original fixture candidate durable.
 - `failed_campaign_capsule_contains_a_replayable_tick_witness` checks that a real report campaign exports a sensitive
   recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across

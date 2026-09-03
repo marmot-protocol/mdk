@@ -1,12 +1,15 @@
 use std::error::Error;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::scenario_input::generated_scenario_input_provenance;
 use crate::{
     CoverageMatrixEntry, FailureCapsuleSensitivity, FailureCapsuleV1, GeneratedScenarioCase,
-    GeneratedScenarioInputV1, HarnessStorageMode, ScenarioInputProvenanceV1, ScenarioReport,
-    VectorFixture, coverage_matrix_entry, generate_family_case, resolve_scenario_input_bytes,
-    run_vector_fixture_report_with_capture, write_failure_capsule,
+    GeneratedScenarioInputV1, GeneratedScenarioMinimizationBudget, HarnessStorageMode,
+    ScenarioInputProvenanceV1, ScenarioReport, VectorFixture, coverage_matrix_entry,
+    generate_family_case, resolve_scenario_input_bytes, run_vector_fixture_report_with_capture,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +20,7 @@ pub struct ReportArgs {
     pub storage_mode: HarnessStorageMode,
     /// Explicit opt-in because replay checkpoints contain MLS key material.
     pub capture_sensitive_replay: bool,
+    pub minimization_budget: GeneratedScenarioMinimizationBudget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +184,7 @@ fn scenario_report_failures(
 }
 
 pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn Error>> {
+    args.minimization_budget.validate()?;
     #[cfg(unix)]
     let _output_dir_guard = fs_private::prepare_directory_path(
         &args.out,
@@ -194,18 +199,7 @@ pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn E
             family,
             seed,
             cases,
-        } => {
-            run_generated_family_reports(
-                family,
-                *seed,
-                *cases,
-                &args.out,
-                args.strict_oracle,
-                args.storage_mode,
-                args.capture_sensitive_replay,
-            )
-            .await?
-        }
+        } => run_generated_family_reports(family, *seed, *cases, args).await?,
         ReportInput::VectorFixtures { paths } => {
             run_vector_fixture_reports(
                 paths,
@@ -217,15 +211,7 @@ pub async fn run_report(args: &ReportArgs) -> Result<ReportRunSummary, Box<dyn E
             .await?
         }
         ReportInput::GeneratedInputs { paths, adapter } => {
-            run_generated_input_reports(
-                paths,
-                *adapter,
-                &args.out,
-                args.strict_oracle,
-                args.storage_mode,
-                args.capture_sensitive_replay,
-            )
-            .await?
+            run_generated_input_reports(paths, *adapter, args).await?
         }
     };
 
@@ -245,15 +231,12 @@ async fn run_generated_family_reports(
     family: &str,
     seed: u64,
     cases: usize,
-    out: &Path,
-    strict_oracle: bool,
-    storage_mode: HarnessStorageMode,
-    capture_sensitive_replay: bool,
+    args: &ReportArgs,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
     let mut summaries = Vec::with_capacity(cases);
     for case_index in 0..cases {
         let case = generate_family_case(family, seed, u64::try_from(case_index)?)?;
-        let input_output = out.join(format!(
+        let input_output = args.out.join(format!(
             "{}-seed-{}-case-{}-generated-input.json",
             case.family_name.replace('/', "-"),
             case.seed,
@@ -272,10 +255,11 @@ async fn run_generated_family_reports(
                     provenance,
                     label: source,
                 },
-                out,
-                strict_oracle,
-                storage_mode,
-                capture_sensitive_replay,
+                &args.out,
+                args.strict_oracle,
+                args.storage_mode,
+                args.capture_sensitive_replay,
+                args.minimization_budget,
             )
             .await?,
         );
@@ -287,10 +271,7 @@ async fn run_generated_family_reports(
 async fn run_generated_input_reports(
     paths: &[PathBuf],
     adapter: Option<crate::GeneratedSubjectKind>,
-    out: &Path,
-    strict_oracle: bool,
-    storage_mode: HarnessStorageMode,
-    capture_sensitive_replay: bool,
+    args: &ReportArgs,
 ) -> Result<Vec<ScenarioReportSummary>, Box<dyn Error>> {
     if paths.is_empty() {
         return Err("no generated input paths supplied".into());
@@ -310,10 +291,11 @@ async fn run_generated_input_reports(
                     provenance: resolved.provenance,
                     label: path.display().to_string(),
                 },
-                out,
-                strict_oracle,
-                storage_mode,
-                capture_sensitive_replay,
+                &args.out,
+                args.strict_oracle,
+                args.storage_mode,
+                args.capture_sensitive_replay,
+                args.minimization_budget,
             )
             .await?,
         );
@@ -334,17 +316,20 @@ async fn run_generated_case_artifacts(
     strict_oracle: bool,
     storage_mode: HarnessStorageMode,
     capture_sensitive_replay: bool,
+    minimization_budget: GeneratedScenarioMinimizationBudget,
 ) -> Result<ScenarioReportSummary, Box<dyn Error>> {
     let execution_subject = source.adapter.unwrap_or(case.subject);
     let adapter_overridden = execution_subject != case.subject;
-    let (mut report, failure_capture) = crate::run_generated_case_report_with_capture_on_subject(
-        case,
-        execution_subject,
-        None,
-        storage_mode,
-        capture_sensitive_replay,
-    )
-    .await?;
+    let (mut report, failure_capture) =
+        crate::family::run_generated_case_report_with_capture_on_subject_before_minimization(
+            case,
+            execution_subject,
+            None,
+            storage_mode,
+            capture_sensitive_replay,
+            minimization_budget,
+        )
+        .await?;
     report.metadata.input_provenance = Some(source.provenance);
     let artifact_stem = generated_artifact_stem(case, execution_subject);
     let output = out.join(format!("{artifact_stem}.json"));
@@ -357,6 +342,7 @@ async fn run_generated_case_artifacts(
     let coverage = coverage_matrix_entry(source.label.clone(), &report);
     let failures = scenario_report_failures(&report, strict_oracle);
     let failure_count = failures.len();
+    let capsule_capture = failure_capture_for(&failures, failure_capture);
     let failure_capsules = if failures.is_empty() {
         WrittenFailureCapsules::default()
     } else {
@@ -364,11 +350,38 @@ async fn run_generated_case_artifacts(
         let replay_path = out.join(format!("{artifact_stem}-sensitive-replay-capsule.v1.json"));
         write_report_failure_capsules(
             &report,
-            failure_capture_for(&failures, failure_capture),
+            capsule_capture.clone(),
             portable_path,
             replay_path,
+            ArtifactWriteMode::Create,
         )?
     };
+
+    // The original report, fixture candidate, and failure capsules are now
+    // durable. Optional semantic reduction may consume its own bounded budget
+    // without being able to erase the primary failure evidence.
+    crate::family::complete_generated_minimization(
+        case,
+        execution_subject,
+        None,
+        &mut report,
+        storage_mode,
+        minimization_budget,
+    )
+    .await;
+    replace_private_json(&output, &report)?;
+    if !failures.is_empty() {
+        write_report_failure_capsules(
+            &report,
+            capsule_capture,
+            failure_capsules
+                .portable
+                .clone()
+                .expect("failing generated reports always write a portable capsule"),
+            out.join(format!("{artifact_stem}-sensitive-replay-capsule.v1.json")),
+            ArtifactWriteMode::Replace,
+        )?;
+    }
     Ok(ScenarioReportSummary {
         scenario_name: report.metadata.scenario_name.clone(),
         source: source.label,
@@ -458,6 +471,7 @@ async fn run_vector_fixture_reports(
                 failure_capture_for(&failures, failure_capture),
                 portable_path,
                 replay_path,
+                ArtifactWriteMode::Create,
             )?
         };
         summaries.push(ScenarioReportSummary {
@@ -496,11 +510,18 @@ struct WrittenFailureCapsules {
     replay: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum ArtifactWriteMode {
+    Create,
+    Replace,
+}
+
 fn write_report_failure_capsules(
     report: &ScenarioReport,
     capture: crate::ScenarioFailureCaptureV1,
     portable_path: PathBuf,
     replay_path: PathBuf,
+    mode: ArtifactWriteMode,
 ) -> Result<WrittenFailureCapsules, Box<dyn Error>> {
     let portable_capsule = FailureCapsuleV1::from_report_capture(
         report.clone(),
@@ -508,7 +529,7 @@ fn write_report_failure_capsules(
         capture.transport,
         None,
     )?;
-    write_failure_capsule(&portable_path, &portable_capsule)?;
+    write_private_json(&portable_path, &portable_capsule, mode)?;
 
     let replay = if let Some(byte_replay) = capture.byte_replay {
         let replay_capsule = FailureCapsuleV1::from_report(
@@ -517,7 +538,7 @@ fn write_report_failure_capsules(
             Vec::new(),
             Some(byte_replay),
         )?;
-        write_failure_capsule(&replay_path, &replay_capsule)?;
+        write_private_json(&replay_path, &replay_capsule, mode)?;
         Some(replay_path)
     } else {
         None
@@ -527,6 +548,66 @@ fn write_report_failure_capsules(
         portable: Some(portable_path),
         replay,
     })
+}
+
+fn write_private_json<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    mode: ArtifactWriteMode,
+) -> Result<(), Box<dyn Error>> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    match mode {
+        ArtifactWriteMode::Create => fs_private::write_private(path, &bytes)?,
+        ArtifactWriteMode::Replace => replace_private(path, &bytes)?,
+    }
+    Ok(())
+}
+
+fn replace_private_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>> {
+    write_private_json(path, value, ArtifactWriteMode::Replace)
+}
+
+/// Durably replace a private artifact without exposing a truncated live path.
+/// A process killed during the write leaves either the original file or the
+/// complete replacement.
+fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private replacement path must name a file",
+        )
+    })?;
+    let (mut file, temporary) = loop {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = file_name.to_os_string();
+        temporary_name.push(format!(".tmp-{}-{id}", std::process::id()));
+        let temporary = parent.join(temporary_name);
+        match fs_private::create_new_private(&temporary) {
+            Ok(file) => break (file, temporary),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn collect_vector_fixture_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
@@ -601,6 +682,7 @@ pub fn parse_report_command(
     let mut storage_mode = None;
     let mut replay_capsule = None;
     let mut capture_sensitive_replay = false;
+    let mut minimization_budget = GeneratedScenarioMinimizationBudget::default();
     let mut scenario_input_selected = false;
     let mut generated_family_selected = false;
 
@@ -641,6 +723,23 @@ pub fn parse_report_command(
                 replay_capsule = Some(PathBuf::from(next_value(&mut args, "--replay-capsule")?));
             }
             "--capture-sensitive-replay" => capture_sensitive_replay = true,
+            "--minimization-wall-time-secs" => {
+                scenario_input_selected = true;
+                minimization_budget.wall_clock = Duration::from_secs(
+                    next_value(&mut args, "--minimization-wall-time-secs")?.parse()?,
+                );
+            }
+            "--minimization-max-trials" => {
+                scenario_input_selected = true;
+                minimization_budget.max_trials =
+                    next_value(&mut args, "--minimization-max-trials")?.parse()?;
+            }
+            "--minimization-trial-timeout-secs" => {
+                scenario_input_selected = true;
+                minimization_budget.per_trial_timeout = Duration::from_secs(
+                    next_value(&mut args, "--minimization-trial-timeout-secs")?.parse()?,
+                );
+            }
             "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
             "--storage" => {
                 storage_mode = Some(HarnessStorageMode::parse(&next_value(
@@ -673,6 +772,7 @@ pub fn parse_report_command(
     if generated_input_adapter.is_some() && generated_inputs.is_empty() {
         return Err("--adapter requires at least one --generated-input".into());
     }
+    minimization_budget = minimization_budget.validate()?;
 
     let input = if !generated_inputs.is_empty() {
         ReportInput::GeneratedInputs {
@@ -695,6 +795,7 @@ pub fn parse_report_command(
         strict_oracle,
         storage_mode: storage_mode.unwrap_or_else(HarnessStorageMode::from_env),
         capture_sensitive_replay,
+        minimization_budget,
     }))
 }
 
@@ -707,7 +808,7 @@ fn next_value(
 }
 
 pub fn report_usage() -> &'static str {
-    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... [--adapter engine|retained-relay|app-runtime] | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|admin-churn/v1|adversarial-reliability/v1|bounded-convergence-pressure/v1|large-group-pressure/v1|offline-catchup-pressure/v1|cross-route-restart-permutations/v1|cross-route-exact-restart-permutations/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay]"
+    "Usage: cgka-conformance-simulator-report [--replay-capsule FILE | --generated-input FILE ... [--adapter engine|retained-relay|app-runtime] | --vectors FILE_OR_DIR ... | --family send-leave/v1|convergence-e2e-delivery/v1|convergence-chaos/v1|admin-churn/v1|adversarial-reliability/v1|bounded-convergence-pressure/v1|large-group-pressure/v1|offline-catchup-pressure/v1|cross-route-restart-permutations/v1|cross-route-exact-restart-permutations/v1|chat-journey/v1 --seed N --cases N] [--out DIR] [--storage memory|file] [--strict-oracle|--allow-weak-oracle] [--capture-sensitive-replay] [--minimization-wall-time-secs N] [--minimization-max-trials N] [--minimization-trial-timeout-secs N]"
 }
 
 #[cfg(test)]
@@ -882,6 +983,7 @@ mod tests {
             seed: case.seed,
             case_index: case.case_index,
             workload_profile: case.workload_profile.clone(),
+            minimization: Default::default(),
             minimized_case: Some(minimized.clone()),
         });
 
@@ -889,5 +991,32 @@ mod tests {
 
         assert_eq!(fixture.scenario, original);
         assert_ne!(fixture.scenario, minimized);
+    }
+
+    #[test]
+    fn private_artifact_replacement_is_complete_and_owner_only() {
+        let root = tempfile::tempdir().expect("temporary artifact root");
+        let path = root.path().join("report.json");
+        fs_private::write_private(&path, br#"{"status":"original"}"#)
+            .expect("original artifact writes");
+
+        replace_private(&path, br#"{"status":"complete"}"#).expect("replacement artifact writes");
+
+        assert_eq!(
+            std::fs::read(&path).expect("replacement reads"),
+            br#"{"status":"complete"}"#
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("replacement metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                fs_private::PRIVATE_FILE_MODE
+            );
+        }
     }
 }
