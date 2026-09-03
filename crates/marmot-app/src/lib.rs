@@ -4916,11 +4916,15 @@ impl MarmotApp {
     }
 
     fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
+        // Snapshot the obligation; it is cleared only after the refresh
+        // succeeded, so an error leaves every unrefreshed id dirty for the
+        // next read, and ids marked while the refresh ran stay dirty too.
         let stale = self
             .chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&account.label);
+            .get(&account.label)
+            .cloned();
         let warmed = self
             .chat_list_projection_warmed
             .lock()
@@ -4928,18 +4932,30 @@ impl MarmotApp {
             .contains(&account.label);
         let storage = self.account_storage(&account.label)?;
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
-        match stale {
+        match &stale {
             None if warmed => return Ok(()),
             Some(group_ids) if warmed => {
                 for group_id_hex in group_ids {
                     storage.refresh_chat_list_row(
                         &account.account_id_hex,
-                        &group_id_hex,
+                        group_id_hex,
                         &classifier,
                     )?;
                 }
             }
             _ => storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?,
+        }
+        if let Some(refreshed) = stale {
+            let mut dirty = self
+                .chat_list_projection_stale
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(remaining) = dirty.get_mut(&account.label) {
+                remaining.retain(|group_id_hex| !refreshed.contains(group_id_hex));
+                if remaining.is_empty() {
+                    dirty.remove(&account.label);
+                }
+            }
         }
         self.chat_list_projection_warmed
             .lock()

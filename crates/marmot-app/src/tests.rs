@@ -17215,3 +17215,42 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
     );
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn failed_chat_list_refresh_keeps_dirty_groups_for_the_next_read() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        app.chat_list_projection_warmed
+            .lock()
+            .unwrap()
+            .contains("alice")
+    );
+
+    app.chat_list_projection_stale.lock().unwrap().insert(
+        "alice".to_owned(),
+        HashSet::from(["stale-group".to_owned()]),
+    );
+    app.close_storage().unwrap();
+
+    // The refresh cannot run against closed storage. The obligation must
+    // survive the error, or a warm account would serve stale rows forever.
+    assert!(app.chat_list("alice", true).is_err());
+    assert!(
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .get("alice")
+            .is_some_and(|dirty| dirty.contains("stale-group")),
+        "a failed refresh must leave the dirty group for the next read"
+    );
+    runtime.shutdown().await;
+}
