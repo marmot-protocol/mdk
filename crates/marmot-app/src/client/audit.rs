@@ -28,8 +28,10 @@ pub(crate) struct EpochBackfillTerminalAudit {
     pub skipped: u64,
     pub refused: u64,
     pub local_epoch_before: u64,
-    pub local_epoch_after: u64,
-    pub group_advanced: bool,
+    /// The group's post-replay local epoch, or `None` when the read failed.
+    /// `None` means "we could not look", which is a different finding from
+    /// "we looked and nothing moved".
+    pub local_epoch_after: Option<u64>,
 }
 
 impl AppClient {
@@ -274,7 +276,18 @@ impl AppClient {
         terminal: EpochBackfillTerminalAudit,
         context: &AuditEventContext,
     ) {
+        let observed = terminal.local_epoch_after.is_some();
+        // An unread after-epoch has no number to report, so the row repeats the
+        // before-epoch to keep the field's shape. `group_advanced_observed`
+        // beside it is what tells a reader the pair is a placeholder rather than
+        // a measurement.
+        let local_epoch_after = terminal
+            .local_epoch_after
+            .unwrap_or(terminal.local_epoch_before);
+        let group_advanced = local_epoch_after > terminal.local_epoch_before;
         let kind = if succeeded {
+            // A run only succeeds once every armed group's after-epoch was read,
+            // so the completed row is always an observation and needs no flag.
             AuditEventKind::EpochStallBackfillCompleted {
                 retry_ordinal: terminal.retry_ordinal,
                 duration_ms: terminal.duration_ms,
@@ -284,8 +297,8 @@ impl AppClient {
                 skipped: Some(terminal.skipped),
                 refused: Some(terminal.refused),
                 local_epoch_before: terminal.local_epoch_before,
-                local_epoch_after: terminal.local_epoch_after,
-                group_advanced: terminal.group_advanced,
+                local_epoch_after,
+                group_advanced,
             }
         } else {
             AuditEventKind::EpochStallBackfillFailed {
@@ -297,8 +310,9 @@ impl AppClient {
                 skipped: Some(terminal.skipped),
                 refused: Some(terminal.refused),
                 local_epoch_before: terminal.local_epoch_before,
-                local_epoch_after: terminal.local_epoch_after,
-                group_advanced: terminal.group_advanced,
+                local_epoch_after,
+                group_advanced,
+                group_advanced_observed: Some(observed),
             }
         };
         self.runtime

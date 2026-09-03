@@ -892,6 +892,11 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             local_epoch_before: 19,
             local_epoch_after: 19,
             group_advanced: false,
+            // The unobserved case is the interesting one: the failure kind and
+            // the observation state have to coexist on one row, or a reader
+            // cannot tell a replay that recovered nothing from one whose effect
+            // was never read.
+            group_advanced_observed: Some(false),
         },
         AuditEventKind::EpochStallBackfillDeferred {
             reason: EpochBackfillDeferredReason::GroupEpochUnavailable,

@@ -285,6 +285,54 @@ fn incomplete_full_history_repair(
     )
 }
 
+/// Build the per-group terminal audit rows for one backfill execution.
+///
+/// `epochs_after` is a *reading*, not a fact about the group: a group whose
+/// record could not be read is simply absent from the map, exactly like a group
+/// that was never armed. Carrying the after-epoch as an `Option` all the way to
+/// the row is what keeps the two apart — the alternative, defaulting it to the
+/// before-epoch, makes a failed read indistinguishable from a replay that
+/// recovered nothing and lets the row assert an observation nobody took.
+///
+/// Free-standing so the row content is testable without a live client; the
+/// caller owns the recorder.
+fn epoch_backfill_terminal_rows(
+    pending: &PendingEpochBackfill,
+    retry_ordinal: u64,
+    epochs_before: &HashMap<cgka_traits::GroupId, u64>,
+    epochs_after: &HashMap<cgka_traits::GroupId, u64>,
+    outcome: &EpochBackfillReplayOutcome,
+) -> Vec<(cgka_traits::GroupId, EpochBackfillTerminalAudit)> {
+    pending
+        .groups
+        .iter()
+        .map(|(group_id, group)| {
+            // The before-read has its own bail-out in
+            // `begin_epoch_backfill_execution`, so an absent entry here can only
+            // be the armed stalled epoch this intent was created from.
+            let local_epoch_before = epochs_before
+                .get(group_id)
+                .copied()
+                .unwrap_or(group.stalled_epoch);
+            (
+                group_id.clone(),
+                EpochBackfillTerminalAudit {
+                    retry_ordinal,
+                    duration_ms: outcome.duration_ms,
+                    activation_outcome: outcome.activation_outcome,
+                    error_kind: outcome.error_kind.clone(),
+                    completion_kind: outcome.completion_kind,
+                    deliveries: outcome.counts.deliveries,
+                    skipped: outcome.counts.skipped,
+                    refused: outcome.counts.refused,
+                    local_epoch_before,
+                    local_epoch_after: epochs_after.get(group_id).copied(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// What one delivery's ingest settled, for the two seams that decide whether the
 /// delivery may be dropped from the fetch path.
 struct DeliveryIngest {
@@ -2924,11 +2972,27 @@ impl AppClient {
         );
     }
 
+    /// Read a group's current local epoch, or `None` when it cannot be read.
+    ///
+    /// `None` is deliberately not a claim about the group: it covers a group
+    /// that is gone as well as a storage backend that was busy or closed.
+    /// Callers must treat it as "unobserved", never as "unchanged". The read
+    /// error itself has no audit field to land in, so name its privacy-safe
+    /// kind here — that is the difference between chasing a deleted group and
+    /// chasing lock contention.
     fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
-        self.runtime
-            .group_record(group_id)
-            .ok()
-            .map(|record| record.epoch.0)
+        match self.runtime.group_record(group_id) {
+            Ok(record) => Some(record.epoch.0),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::epoch_stall",
+                    method = "local_epoch_for_group",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "local group epoch could not be read; treating it as unobserved"
+                );
+                None
+            }
+        }
     }
 
     fn capture_pending_group_epochs(
@@ -3006,6 +3070,11 @@ impl AppClient {
         let epochs_after = self.capture_pending_group_epochs(&execution.pending);
         let observed_all_groups = epochs_after.len() == execution.pending.groups.len();
         let succeeded = succeeded && observed_all_groups;
+        // The marker only fills in for a run that failed *because* an epoch was
+        // unreadable and had no other failure to report; a real failure kind
+        // keeps priority. That no longer costs anything, because the per-group
+        // row now carries `group_advanced_observed` — the failure kind and the
+        // observation state live in separate fields and coexist.
         let error_kind = if !observed_all_groups && error_kind.is_none() {
             Some("group_epoch_unavailable".to_string())
         } else {
@@ -3146,32 +3215,17 @@ impl AppClient {
         outcome: EpochBackfillReplayOutcome,
     ) {
         let context = Self::epoch_backfill_audit_context(pending);
-        for group_id in pending.groups.keys() {
-            let local_epoch_before = epochs_before
-                .get(group_id)
-                .copied()
-                .unwrap_or(pending.groups[group_id].stalled_epoch);
-            let local_epoch_after = epochs_after
-                .get(group_id)
-                .copied()
-                .unwrap_or(local_epoch_before);
-            let group_advanced = local_epoch_after > local_epoch_before;
+        for (group_id, terminal) in epoch_backfill_terminal_rows(
+            pending,
+            retry_ordinal,
+            epochs_before,
+            epochs_after,
+            &outcome,
+        ) {
             self.record_epoch_stall_backfill_terminal(
-                group_id,
+                &group_id,
                 outcome.succeeded,
-                EpochBackfillTerminalAudit {
-                    retry_ordinal,
-                    duration_ms: outcome.duration_ms,
-                    activation_outcome: outcome.activation_outcome,
-                    error_kind: outcome.error_kind.clone(),
-                    completion_kind: outcome.completion_kind,
-                    deliveries: outcome.counts.deliveries,
-                    skipped: outcome.counts.skipped,
-                    refused: outcome.counts.refused,
-                    local_epoch_before,
-                    local_epoch_after,
-                    group_advanced,
-                },
+                terminal,
                 &context,
             );
         }
@@ -4690,11 +4744,14 @@ pub(crate) fn epoch_stall_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::DrainCounts;
     use super::{
-        DrainVerdict, backfill_drain_verdict, incomplete_full_history_repair,
+        DrainVerdict, EpochBackfillReplayOutcome, backfill_drain_verdict,
+        epoch_backfill_terminal_rows, incomplete_full_history_repair,
         reconciliation_start_after_cursor, retry_backoff_for_ordinal,
         transport_reconciliation_record,
     };
+    use crate::client::epoch_stall::PendingEpochBackfill;
     use crate::tests::{
         ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
     };
@@ -4703,9 +4760,75 @@ mod tests {
         SyncFailureStage, SyncSummary,
     };
     use marmot_account::AccountHome;
+    use marmot_forensics::EpochBackfillActivationOutcome;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+
+    fn armed_backfill(group_id: &cgka_traits::GroupId, stalled_epoch: u64) -> PendingEpochBackfill {
+        let mut pending = PendingEpochBackfill::new();
+        pending.groups.insert(
+            group_id.clone(),
+            crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch },
+        );
+        pending
+    }
+
+    fn failed_replay_outcome() -> EpochBackfillReplayOutcome {
+        EpochBackfillReplayOutcome {
+            duration_ms: 1,
+            activation_outcome: EpochBackfillActivationOutcome::Succeeded,
+            error_kind: Some("backfill_drain_eose_timeout".to_string()),
+            completion_kind: None,
+            counts: DrainCounts::default(),
+            succeeded: false,
+        }
+    }
+
+    // "We looked and the group did not move" and "we could not look" are
+    // different facts and lead to different investigations. The after-read can
+    // fail on its own, so a row that reports `group_advanced: false` for an
+    // unread epoch asserts knowledge nobody has — which is what made the
+    // failed backfill rows untrustworthy in the field.
+    #[test]
+    fn an_unread_post_replay_epoch_is_reported_as_unobserved_not_as_no_advance() {
+        let group_id = cgka_traits::GroupId::new(vec![7u8; 16]);
+        let pending = armed_backfill(&group_id, 4);
+        let epochs_before = HashMap::from([(group_id.clone(), 4u64)]);
+        let epochs_after = HashMap::new();
+
+        let rows = epoch_backfill_terminal_rows(
+            &pending,
+            0,
+            &epochs_before,
+            &epochs_after,
+            &failed_replay_outcome(),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.local_epoch_before, 4);
+        assert_eq!(rows[0].1.local_epoch_after, None);
+    }
+
+    // The observed case must keep saying exactly what it always said.
+    #[test]
+    fn an_observed_post_replay_epoch_still_reports_the_reading_it_took() {
+        let group_id = cgka_traits::GroupId::new(vec![7u8; 16]);
+        let pending = armed_backfill(&group_id, 4);
+        let epochs_before = HashMap::from([(group_id.clone(), 4u64)]);
+        let epochs_after = HashMap::from([(group_id.clone(), 4u64)]);
+
+        let rows = epoch_backfill_terminal_rows(
+            &pending,
+            0,
+            &epochs_before,
+            &epochs_after,
+            &failed_replay_outcome(),
+        );
+
+        assert_eq!(rows[0].1.local_epoch_after, Some(4));
+    }
 
     #[test]
     fn reconciliation_cursor_rotates_past_a_slow_route_and_wraps() {
