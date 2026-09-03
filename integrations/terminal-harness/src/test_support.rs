@@ -331,7 +331,7 @@ async fn send_control_request(
         return Err("control response id mismatch".into());
     }
     match response.payload {
-        AgentControlResponse::Error { code, message } => {
+        AgentControlResponse::Error { code, message, .. } => {
             Err(format!("control request rejected: {code}: {message}").into())
         }
         payload => Ok(payload),

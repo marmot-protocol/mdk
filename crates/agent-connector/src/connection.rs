@@ -91,6 +91,7 @@ impl AgentConnector {
                         AgentControlResponse::Error {
                             code: "server_busy".to_owned(),
                             message: "agent connector subscription capacity is busy".to_owned(),
+                            retryable: true,
                         },
                     );
                     write_control_frame(&mut write_half, &response).await?;
@@ -141,6 +142,7 @@ impl AgentConnector {
         AgentControlResponse::Error {
             code: err.code().to_owned(),
             message: err.client_message().to_owned(),
+            retryable: err.retryable(),
         }
     }
 
@@ -528,6 +530,7 @@ impl AgentConnector {
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),
                 message: unsupported_request_message(&other).to_owned(),
+                retryable: false,
             }),
         }
     }

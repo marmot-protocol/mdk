@@ -512,6 +512,64 @@ fn spawn_hashing_upload_response(response: Vec<u8>) -> (String, mpsc::Receiver<(
     (format!("http://{addr}"), rx)
 }
 
+#[derive(Clone, Copy)]
+enum SlowUploadIngest {
+    PauseAfterFirstChunk(Duration),
+    Continuous { delay_per_chunk: Duration },
+}
+
+fn spawn_slow_upload_response(ingest: SlowUploadIngest) -> (String, mpsc::Receiver<u64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow upload test server");
+    let addr = listener.local_addr().expect("slow upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept slow upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut received = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        while received < content_length {
+            let take = (content_length - received).min(buffer.len() as u64) as usize;
+            let Ok(count) = stream.read(&mut buffer[..take]) else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            received += count as u64;
+            match ingest {
+                SlowUploadIngest::PauseAfterFirstChunk(delay) if received == count as u64 => {
+                    thread::sleep(delay);
+                }
+                SlowUploadIngest::Continuous { delay_per_chunk } => {
+                    thread::sleep(delay_per_chunk);
+                }
+                SlowUploadIngest::PauseAfterFirstChunk(_) => {}
+            }
+        }
+        stream
+            .get_mut()
+            .write_all(&http_json_response("{}"))
+            .expect("write slow upload descriptor");
+        tx.send(received).expect("report slow upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
 pub(super) fn http_redirect_response(location: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -659,6 +717,48 @@ async fn blossom_fallback_reuses_the_identical_encrypted_body() {
     .expect("second Blossom endpoint should accept the retry body");
 
     assert_eq!(first_body.recv().unwrap(), second_body.recv().unwrap());
+}
+
+#[tokio::test]
+async fn blossom_upload_allows_response_gap_longer_than_read_timeout() {
+    let (server, received) = spawn_slow_upload_response(SlowUploadIngest::PauseAfterFirstChunk(
+        Duration::from_secs(16),
+    ));
+    let encrypted = bytes::Bytes::from(vec![0x5a; 40_405_416]);
+    let encrypted_hash = hex::encode(Sha256::digest(&encrypted));
+
+    upload_blossom_blob(
+        &server,
+        encrypted.clone(),
+        &encrypted_hash,
+        &signing_keys(),
+        true,
+    )
+    .await
+    .expect("a bounded upload may wait more than the response read timeout while sending");
+
+    assert_eq!(received.recv().unwrap(), encrypted.len() as u64);
+}
+
+#[tokio::test]
+async fn blossom_upload_allows_continuous_slow_body_ingest() {
+    let (server, received) = spawn_slow_upload_response(SlowUploadIngest::Continuous {
+        delay_per_chunk: Duration::from_millis(30),
+    });
+    let encrypted = bytes::Bytes::from(vec![0x5a; 40_405_416]);
+    let encrypted_hash = hex::encode(Sha256::digest(&encrypted));
+
+    upload_blossom_blob(
+        &server,
+        encrypted.clone(),
+        &encrypted_hash,
+        &signing_keys(),
+        true,
+    )
+    .await
+    .expect("continuous request-body progress may exceed the response read timeout");
+
+    assert_eq!(received.recv().unwrap(), encrypted.len() as u64);
 }
 
 #[tokio::test]
