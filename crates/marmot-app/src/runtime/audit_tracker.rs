@@ -6,8 +6,16 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::{RuntimeLifecycle, runtime_shutdown_requested, wait_for_runtime_shutdown};
-use crate::{AppError, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp};
+use crate::audit_log::{AUDIT_LOG_UPLOAD_MAX_BYTES, AuditUploadOutcome};
+use crate::{
+    AppError, AuditLogFile, AuditLogTrackerConfig, AuditLogTrackerUpdateResult, MarmotApp,
+};
 
+/// Trigger queue depth. One slot is the coalescing contract (mdk#1181): a
+/// burst of send/receive/convergence triggers arriving while an update is
+/// scheduled or running collapses into exactly one follow-up run — `schedule`
+/// drops triggers that find the slot full, and the worker never starts a second
+/// update concurrently because it drains the slot only between runs.
 const APP_RUNTIME_AUDIT_TRACKER_QUEUE: usize = 1;
 
 #[derive(Clone)]
@@ -213,30 +221,125 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
 
     let mut uploaded = Vec::new();
     let mut failed = 0_usize;
-    for (file_index, file) in files.into_iter().enumerate() {
-        match app
-            .post_audit_log_file_with_tracker_config(&file.path, &config)
-            .await
-        {
-            Ok(result) => uploaded.push(result),
-            Err(_err) => {
-                failed += 1;
+    let mut acknowledged = 0_usize;
+    let mut too_large_recorded = 0_usize;
+    let mut too_large_known = 0_usize;
+    // `audit_log_files` sorts by account first, so each account's files arrive
+    // as one contiguous run and its checkpoint is loaded and stored once.
+    for account_files in group_by_account(files) {
+        let account_ref = account_files[0].account_ref.clone();
+        let mut checkpoint = app.audit_upload_checkpoint(&account_ref);
+        let mut checkpoint_changed =
+            checkpoint.retain_present(account_files.iter().map(|file| file.file_name.as_str()));
+        for (file_index, file) in account_files.iter().enumerate() {
+            // An acknowledged file is never re-read or re-posted. Sealed
+            // segments are immutable, so a single 200 is a durable
+            // acknowledgment of their whole content; the active file changes on
+            // every append and therefore re-transfers in full each trigger.
+            // That residual is accepted by design and is bounded by the
+            // recorder's segment threshold — a byte-offset acknowledgment
+            // protocol was considered and rejected as overkill (mdk#1181).
+            // Both outcomes skip the file, but they are not the same fact: one
+            // means the endpoint has the content, the other means it never
+            // will. Keep them apart in the aggregates so an operator reading
+            // the counts is not told a permanently untransferable file was
+            // delivered.
+            match checkpoint.acknowledged(file) {
+                Some(AuditUploadOutcome::Uploaded) => {
+                    acknowledged += 1;
+                    continue;
+                }
+                Some(AuditUploadOutcome::TooLargeToUpload) => {
+                    too_large_known += 1;
+                    continue;
+                }
+                None => {}
+            }
+            if file.size_bytes > AUDIT_LOG_UPLOAD_MAX_BYTES {
+                // Upgrade path: a file grown past the per-request ceiling by a
+                // build without segment rotation. Rotation keeps new files well
+                // under the ceiling, so this can only be a legacy artifact.
+                // Splitting it is out of scope; record the verdict so it
+                // surfaces once instead of failing silently on every trigger,
+                // and keep going so it never wedges the other files.
+                //
+                // There is no app-level escape hatch: `post_audit_log_file`
+                // enforces the same ceiling before it opens a body
+                // (`audit_log.rs`, pinned by
+                // `post_audit_log_file_rejects_oversized_files_before_upload`),
+                // so a file this size is not transferable through any app API.
+                // It stays on disk for manual handling, and deleting it belongs
+                // to mdk#1014.
+                too_large_recorded += 1;
+                checkpoint.acknowledge(file, file.size_bytes, AuditUploadOutcome::TooLargeToUpload);
+                checkpoint_changed = true;
                 tracing::warn!(
                     target: "marmot_app::audit_log",
                     method = "post_audit_log_tracker_update",
                     file_index,
-                    "failed to post forensic audit log file to tracker"
+                    size_bytes = file.size_bytes,
+                    limit_bytes = AUDIT_LOG_UPLOAD_MAX_BYTES,
+                    "skipped forensic audit log file larger than the tracker request limit"
                 );
+                continue;
+            }
+            match app
+                .post_audit_log_file_with_tracker_config(&file.path, &config)
+                .await
+            {
+                Ok(result) => {
+                    checkpoint.acknowledge(file, result.bytes_sent, AuditUploadOutcome::Uploaded);
+                    checkpoint_changed = true;
+                    uploaded.push(result);
+                }
+                Err(_err) => {
+                    // Unacknowledged: left out of the checkpoint so the next
+                    // trigger retries it.
+                    failed += 1;
+                    tracing::warn!(
+                        target: "marmot_app::audit_log",
+                        method = "post_audit_log_tracker_update",
+                        file_index,
+                        "failed to post forensic audit log file to tracker"
+                    );
+                }
             }
         }
+        // Recorded after the effects it mirrors, so a crash before this point
+        // costs one repeat transfer rather than dropping forensic data.
+        if checkpoint_changed
+            && let Err(err) = app.store_audit_upload_checkpoint(&account_ref, &checkpoint)
+        {
+            tracing::warn!(
+                target: "marmot_app::audit_log",
+                method = "post_audit_log_tracker_update",
+                error_kind = err.privacy_safe_kind(),
+                "failed to persist forensic audit log upload checkpoint"
+            );
+        }
     }
-    if failed > 0 {
+    // Only a newly recorded over-ceiling file warrants a warning: one already
+    // in the checkpoint has been reported, and re-warning every trigger is the
+    // noise this contract removes. Counts only — no file names or paths.
+    if failed > 0 || too_large_recorded > 0 {
         tracing::warn!(
             target: "marmot_app::audit_log",
             method = "post_audit_log_tracker_update",
             uploaded = uploaded.len(),
+            acknowledged,
+            too_large_recorded,
+            too_large_known,
             failed,
             "completed forensic audit log tracker update with file upload failures"
+        );
+    } else {
+        tracing::debug!(
+            target: "marmot_app::audit_log",
+            method = "post_audit_log_tracker_update",
+            uploaded = uploaded.len(),
+            acknowledged,
+            too_large_known,
+            "completed forensic audit log tracker update"
         );
     }
     Ok(AuditLogTrackerUpdateResult {
@@ -244,4 +347,16 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         uploaded,
         skipped_reason: None,
     })
+}
+
+/// Split the account-sorted enumeration into one non-empty run per account.
+fn group_by_account(files: Vec<AuditLogFile>) -> Vec<Vec<AuditLogFile>> {
+    let mut grouped: Vec<Vec<AuditLogFile>> = Vec::new();
+    for file in files {
+        match grouped.last_mut() {
+            Some(run) if run[0].account_ref == file.account_ref => run.push(file),
+            _ => grouped.push(vec![file]),
+        }
+    }
+    grouped
 }

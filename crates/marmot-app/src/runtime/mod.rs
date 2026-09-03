@@ -2260,6 +2260,14 @@ impl MarmotAppRuntime {
         post_audit_log_tracker_update_for_app(&self.accounts.app, config).await
     }
 
+    /// Test seam: fire one tracker trigger through the same scheduling path
+    /// ordinary send/receive/convergence activity uses, so a burst can be
+    /// observed coalescing instead of queueing N runs (mdk#1181).
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub fn schedule_audit_log_tracker_update_for_test(&self, trigger: &'static str) {
+        self.shared.schedule_audit_log_tracker_update(trigger);
+    }
+
     /// Delete one local JSONL audit log file. When a session for the file's
     /// account is live and audit logging is on, the recorder rotates to a fresh
     /// file and keeps recording; otherwise the file is simply removed.

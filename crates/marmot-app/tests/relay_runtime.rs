@@ -9708,15 +9708,26 @@ async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
     // Force a completed sync so the rebuild + drain rows are flushed to disk.
     runtime.catch_up_accounts().await.unwrap();
 
-    let files = app.audit_log_files().unwrap();
-    let alice_file = files
+    // Read every file for the account, not the first: the recorder seals the
+    // active file into `-seg<NNNNNN>` siblings (mdk#1181), and those sort ahead
+    // of it, so picking one file silently reads a prefix once audit volume
+    // crosses the segment threshold. Path order is session order.
+    let mut files = app.audit_log_files().unwrap();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let alice_files = files
         .iter()
-        .find(|file| file.account_ref == alice.account.label)
-        .expect("alice has a live audit file");
-    let events = std::fs::read_to_string(&alice_file.path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|file| file.account_ref == alice.account.label)
+        .collect::<Vec<_>>();
+    assert!(!alice_files.is_empty(), "alice has a live audit file");
+    let events = alice_files
+        .iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(&file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
 
     // subscription_rebuild: exact wire tag, the lookback recorded, and the mock

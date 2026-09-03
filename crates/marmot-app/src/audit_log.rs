@@ -32,8 +32,14 @@ const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// The name matches the `audit-*.jsonl` glob so it is enumerable via
 /// [`MarmotApp::audit_log_files`].
 const KEY_REVEAL_AUDIT_FILE: &str = "audit-key-reveal.jsonl";
+/// Per-account record of which audit files the tracker has already handed to
+/// the upload endpoint (mdk#1181).
+///
+/// Deliberately *not* an `audit-*.jsonl` name: it must never be enumerated by
+/// [`MarmotApp::audit_log_files`] and uploaded as if it were forensic data.
+const AUDIT_UPLOAD_CHECKPOINT_FILE: &str = "audit-upload-checkpoint.json";
 pub(crate) const AUDIT_ID_BYTES: usize = 16;
-const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 static AUDIT_LOG_UPLOAD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -65,6 +71,103 @@ pub struct AuditLogTrackerUpdateResult {
     pub enabled: bool,
     pub uploaded: Vec<AuditLogUploadResult>,
     pub skipped_reason: Option<String>,
+}
+
+/// What the tracker already did with one audit file.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuditUploadOutcome {
+    /// The endpoint accepted the file's whole content.
+    Uploaded,
+    /// The file is larger than the endpoint's per-request ceiling, so no
+    /// automatic upload can ever accept it. Recorded so the tracker reports it
+    /// once instead of re-attempting on every trigger.
+    TooLargeToUpload,
+}
+
+/// One acknowledged audit file, identified by the size and mtime it had when
+/// the tracker was done with it.
+///
+/// Identity is metadata, not a content hash, precisely because the point of the
+/// checkpoint is to *avoid reading* the file again. Audit files only ever grow
+/// (segments never change at all), so a later enumeration reporting the exact
+/// same pair means the acknowledged content is still the whole file. Every
+/// mismatch — including the racy ones, where the file grew between enumeration
+/// and upload — falls back to re-uploading, which the endpoint's `file_sha256`
+/// short-circuit absorbs without parsing.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AuditUploadCheckpointEntry {
+    size_bytes: u64,
+    #[serde(default)]
+    modified_at_ms: Option<u64>,
+    outcome: AuditUploadOutcome,
+}
+
+/// Per-account upload checkpoint (mdk#1181).
+///
+/// Losing or corrupting this file is safe by design: the worst case is that
+/// each still-present file transfers once more, and the upload endpoint
+/// short-circuits a byte-identical re-upload on `file_sha256` without parsing
+/// a line. That is why it is a plain sidecar rather than a migration in the
+/// account database.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct AuditUploadCheckpoint {
+    #[serde(default)]
+    files: std::collections::BTreeMap<String, AuditUploadCheckpointEntry>,
+}
+
+impl AuditUploadCheckpoint {
+    /// What the tracker already did with `file`, if its content is unchanged
+    /// since then.
+    pub(crate) fn acknowledged(&self, file: &AuditLogFile) -> Option<AuditUploadOutcome> {
+        self.files
+            .get(&file.file_name)
+            .filter(|entry| {
+                entry.size_bytes == file.size_bytes && entry.modified_at_ms == file.modified_at_ms
+            })
+            .map(|entry| entry.outcome)
+    }
+
+    /// Record `outcome` for `file`. `acknowledged_bytes` is the length actually
+    /// handed to the endpoint, re-stat'd inside the upload and therefore taken
+    /// *after* `file` was enumerated — so for an append-only audit file it is
+    /// greater than or equal to `file.size_bytes`, never less.
+    ///
+    /// Pairing it with the enumerated `modified_at_ms` is what makes that safe.
+    /// Size only grows and mtime only moves forward, so if the recorder
+    /// appended between enumeration and upload, the stored pair describes no
+    /// state the file will ever be in again and every later run re-uploads.
+    /// The identity can therefore cost a redundant transfer, which the
+    /// endpoint's `file_sha256` short-circuit absorbs, but it cannot claim
+    /// unsent bytes were acknowledged.
+    pub(crate) fn acknowledge(
+        &mut self,
+        file: &AuditLogFile,
+        acknowledged_bytes: u64,
+        outcome: AuditUploadOutcome,
+    ) {
+        self.files.insert(
+            file.file_name.clone(),
+            AuditUploadCheckpointEntry {
+                size_bytes: acknowledged_bytes,
+                modified_at_ms: file.modified_at_ms,
+                outcome,
+            },
+        );
+    }
+
+    /// Drop entries for files that are no longer on disk, so the sidecar stays
+    /// bounded by the account's live audit files. Returns whether anything
+    /// changed.
+    pub(crate) fn retain_present<'a>(
+        &mut self,
+        present: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let present: std::collections::BTreeSet<&str> = present.into_iter().collect();
+        let before = self.files.len();
+        self.files.retain(|name, _| present.contains(name.as_str()));
+        before != self.files.len()
+    }
 }
 
 /// Outcome of deleting a single audit log file.
@@ -308,6 +411,46 @@ impl MarmotApp {
                 .then_with(|| left.file_name.cmp(&right.file_name))
         });
         Ok(files)
+    }
+
+    /// Load the tracker's upload checkpoint for `account_ref`.
+    ///
+    /// Never fails: a missing, unreadable, or malformed sidecar reads as empty,
+    /// which costs one re-upload per still-present file and nothing else.
+    pub(crate) fn audit_upload_checkpoint(&self, account_ref: &str) -> AuditUploadCheckpoint {
+        let path = self
+            .account_dir(account_ref)
+            .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the tracker's upload checkpoint for `account_ref`.
+    ///
+    /// Written to an owner-only staging sibling and renamed into place, so a
+    /// crash mid-write leaves the previous checkpoint intact rather than a torn
+    /// one that would strand every entry.
+    pub(crate) fn store_audit_upload_checkpoint(
+        &self,
+        account_ref: &str,
+        checkpoint: &AuditUploadCheckpoint,
+    ) -> Result<(), AppError> {
+        let path = self
+            .account_dir(account_ref)
+            .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
+        let mut staged = path.clone().into_os_string();
+        staged.push(".tmp");
+        let staged = PathBuf::from(staged);
+        fs_private::write_private(&staged, &serde_json::to_vec(checkpoint)?)?;
+        // `rename` preserves the staged 0600 mode, so the checkpoint is never
+        // reachable at umask-default permissions.
+        if let Err(err) = fs::rename(&staged, &path) {
+            let _ = fs::remove_file(&staged);
+            return Err(err.into());
+        }
+        Ok(())
     }
 
     pub async fn post_audit_log_file(
@@ -844,6 +987,78 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[test]
+    fn audit_upload_checkpoint_round_trips_and_is_never_enumerated_as_forensic_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        std::fs::write(
+            home.account_dir("alice").join("audit-engine-v3.jsonl"),
+            b"{\"seq\":1}\n",
+        )
+        .unwrap();
+        let file = app.audit_log_files().unwrap().remove(0);
+
+        assert!(
+            app.audit_upload_checkpoint("alice")
+                .acknowledged(&file)
+                .is_none()
+        );
+        let mut checkpoint = AuditUploadCheckpoint::default();
+        checkpoint.acknowledge(&file, file.size_bytes, AuditUploadOutcome::Uploaded);
+        app.store_audit_upload_checkpoint("alice", &checkpoint)
+            .unwrap();
+
+        assert_eq!(
+            app.audit_upload_checkpoint("alice").acknowledged(&file),
+            Some(AuditUploadOutcome::Uploaded)
+        );
+        // The sidecar must never be uploaded as if it were forensic data.
+        let enumerated = app.audit_log_files().unwrap();
+        assert_eq!(enumerated.len(), 1);
+        assert_eq!(enumerated[0].file_name, "audit-engine-v3.jsonl");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = home.account_dir("alice").join(AUDIT_UPLOAD_CHECKPOINT_FILE);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn audit_upload_checkpoint_acknowledgement_is_scoped_to_unchanged_content() {
+        let file = AuditLogFile {
+            account_ref: "alice".to_owned(),
+            path: "/tmp/audit-engine-v3.jsonl".to_owned(),
+            file_name: "audit-engine-v3.jsonl".to_owned(),
+            size_bytes: 10,
+            modified_at_ms: Some(1_000),
+        };
+        let mut checkpoint = AuditUploadCheckpoint::default();
+        checkpoint.acknowledge(&file, file.size_bytes, AuditUploadOutcome::Uploaded);
+
+        let grown = AuditLogFile {
+            size_bytes: 20,
+            modified_at_ms: Some(1_100),
+            ..file.clone()
+        };
+        assert!(checkpoint.acknowledged(&grown).is_none());
+        // Same length, rewritten content: the mtime change still forces a
+        // re-upload rather than silently skipping unsent forensic data.
+        let replaced = AuditLogFile {
+            modified_at_ms: Some(2_000),
+            ..file.clone()
+        };
+        assert!(checkpoint.acknowledged(&replaced).is_none());
+
+        assert!(checkpoint.retain_present(["audit-other.jsonl"]));
+        assert!(checkpoint.acknowledged(&file).is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-08-29
+updated: 2026-09-03
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -23,7 +23,7 @@ member identities, or arbitrary convergence-rule input/result JSON. There is no 
 | Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed into each `AccountDeviceSession` only when app-level `AuditLogSettings.enabled` is true before that account session opens. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
 | File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v3`; the line-level JSON Schema is [`audit-log-event.v3.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v3.schema.json). |
-| Local file location | `<account_dir>/audit-<engine_id>-v3.jsonl` for app-opened account sessions. Existing v1/v2 files are not rewritten or appended to. |
+| Local file location | `<account_dir>/audit-<engine_id>-v3.jsonl` for app-opened account sessions, sealed into `-seg<NNNNNN>` siblings at 1 MiB. Existing v1/v2 files are not rewritten or appended to. |
 | Upload/listing | App and UniFFI expose listing and explicit upload of all local `audit-*.jsonl` files. Runtime tracker uploads continue to include existing v1/v2 files. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
 
@@ -1034,6 +1034,25 @@ The app can list and upload audit logs, but upload is separate from local record
 
 Files are sorted by app account label, then file name.
 
+### Segment rotation
+
+The recorder seals the active file into an immutable segment once it reaches `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
+continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v3-seg<NNNNNN>.jsonl`, so they are
+still enumerated by `audit_log_files()` and sort ahead of the active file.
+
+- Rotation is a rename, so nothing is deleted or truncated, and the concatenation of a session's segments plus its
+  active file is byte-identical to the single file the recorder would otherwise have written.
+- `seq`, the recorder session id, and the health counters carry across a segment boundary, and no `recorder_started`
+  row is written: a roll is not a new recorder session, and the upload endpoint's content-keyed line dedupe never
+  re-mints a line just because it moved to a new file name.
+- A file already over the threshold at open — the upgrade path from builds without rotation, including one already past
+  the 64 MiB request ceiling — is rolled aside on the first open, so a session always starts on an uploadable file.
+- A failed roll is compensated and retried later, not absorbed: the rename is the only step that moves data, so a failed
+  reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
+  attempting rolls until something proves the directory writable again — a fresh open, or a `rotate()` — so a transient
+  `ENOSPC`/`EMFILE` costs a delayed roll, not a session with rotation disabled.
+- Retention, deletion, and disk bounding of sealed segments are out of scope here; they belong to mdk#1014.
+
 ### Explicit upload
 
 `MarmotApp::post_audit_log_file(path, endpoint)` / `post_audit_log_file_with_tracker_config(...)` upload one selected
@@ -1124,7 +1143,35 @@ Structured skip reasons:
 | `uploaded` | Per-file upload results. |
 | `skipped_reason` | Optional reason the update did not upload. |
 
-The runtime has a coalescing uploader queue of size `1`. It schedules tracker updates after these triggers:
+### Upload checkpoint
+
+Each account directory holds `audit-upload-checkpoint.json` (owner-only, staged-and-renamed, deliberately not an
+`audit-*.jsonl` name). It records, per audit file, the size and mtime the file had when the tracker last finished with
+it, plus whether that was an accepted upload or a file above the request ceiling.
+
+- A file whose current size and mtime match its entry is never re-read or re-posted. Sealed segments never change, so
+  one `2xx` is a durable acknowledgment of their whole content.
+- The active file changes on every append and therefore re-transfers in full on each trigger. That residual is accepted
+  by design and is bounded by the segment threshold; a byte-offset acknowledgment protocol was considered and rejected.
+- Identity is metadata, not a content hash, because the point of the checkpoint is to avoid reading the file. Audit
+  files only grow, so every mismatch — including the racy ones where the file grew between enumeration and upload —
+  falls back to re-uploading, which the endpoint short-circuits on `file_sha256` without parsing a line.
+- Losing or corrupting the sidecar costs one repeat transfer per still-present file and nothing else.
+- A file above the 64 MiB ceiling is recorded as such, logged once with aggregate counts, and skipped on later runs
+  instead of failing on every trigger. It never blocks the files behind it.
+- There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
+  it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
+  for manual handling (copy it off the device and hand it to the endpoint out of band, or split it). Deleting it is
+  mdk#1014's contract. Segment rotation is what keeps any newly produced file well under the ceiling, so this is an
+  upgrade-path condition only.
+- The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
+  are pruned each run. Because sealed segments are never deleted (mdk#1014), that bound still grows with cumulative
+  audit volume — each tracker run stats every enumerated file and rewrites the whole sidecar. Both costs are linear in
+  file count and small next to the HTTP request each run already makes.
+
+The runtime has a coalescing uploader queue of size `1`: triggers arriving while an update is scheduled or running
+collapse into exactly one follow-up run, and two updates never upload concurrently. It schedules tracker updates after
+these triggers:
 
 - `create_group`
 - `invite_members`
@@ -1150,8 +1197,12 @@ The runtime has a coalescing uploader queue of size `1`. It schedules tracker up
 - `catch_up`
 - `receive`
 
-Tracker scheduling itself logs only the trigger, skip reason, uploaded count, failed count, and file index for failed
-uploads. It does not log audit file contents.
+Tracker scheduling itself logs only the trigger, skip reason, file sizes, the file index for failed and skipped
+uploads, and aggregate counts: `uploaded`, `acknowledged` (already accepted by the endpoint), `too_large_recorded`
+(newly found above the ceiling this run, which is what warrants the warning), `too_large_known` (already recorded as
+above the ceiling, so skipped without a repeat warning), and `failed`. Acknowledged-and-uploaded is kept distinct from
+skipped-as-too-large so the counts never report a permanently untransferable file as delivered. It does not log audit
+file names, paths, or contents.
 
 ## Coverage audit
 
