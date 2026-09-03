@@ -845,7 +845,12 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
 #[tokio::test]
 async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
     let mut alice = build_client(b"alice");
-    let mut bob = build_client_with_peeler(b"bob", Box::new(MalformedShortPayloadPeeler));
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage_and_peeler(
+        storage.clone(),
+        b"bob",
+        Box::new(MalformedShortPayloadPeeler),
+    );
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
     let (group_id, result) = alice
@@ -883,6 +888,7 @@ async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
             transport_group_id: group_id.as_slice().to_vec(),
         },
     };
+    let garbage_id = garbage.id.clone();
     let outcome = bob
         .ingest(garbage)
         .await
@@ -895,6 +901,14 @@ async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
             }
         ),
         "expected invalid encoding for malformed content, got {outcome:?}"
+    );
+    assert!(
+        !storage.has_processed_transport_id(&garbage_id).unwrap(),
+        "a wrapper that never peeled must not enter the durable processed-id table"
+    );
+    assert!(
+        !storage.has_ingress_dedup_marker(&garbage_id).unwrap(),
+        "attacker-controlled group wrappers must not churn the bounded exceptional marker pool"
     );
 
     let msg = match alice
@@ -1173,7 +1187,7 @@ async fn wrong_transport_recipient_after_stale_epoch_fallback_is_terminal() {
 }
 
 #[tokio::test]
-async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest() {
+async fn post_peel_invalid_mls_inputs_are_terminal_and_restart_deduplicated() {
     let mut alice = build_client(b"alice-post-peel");
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut bob = build_client_with_storage(storage.clone(), b"bob-post-peel");
@@ -1213,6 +1227,7 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
             transport_group_id: group_id.as_slice().to_vec(),
         },
     };
+    let garbage_transport_id = garbage.id.clone();
     let garbage_content_id = content_id(&garbage);
     let outcome = bob
         .ingest(garbage)
@@ -1228,6 +1243,49 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
         storage.get_message(&garbage_content_id).unwrap().state,
         MessageState::Failed,
         "the content-derived poison row must be durable and terminal"
+    );
+    assert!(
+        storage
+            .has_processed_transport_id(&garbage_transport_id)
+            .unwrap(),
+        "a successfully peeled wrapper must be associated with its durable content row"
+    );
+
+    // A syntactically valid MLS object with a non-message body follows a
+    // separate terminal branch. Its exact wrapper needs the same durable alias
+    // because replay cannot rely on historical peel context after restart.
+    let key_package = bob.fresh_key_package().await.unwrap();
+    let unsupported = TransportMessage {
+        id: hash_id(b"authenticated wrapper with unsupported MLS body"),
+        payload: key_package.bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let unsupported_transport_id = unsupported.id.clone();
+    let unsupported_content_id = content_id(&unsupported);
+    let unsupported_outcome = bob
+        .ingest(unsupported.clone())
+        .await
+        .expect("unsupported post-peel MLS body must not abort ingest");
+    assert!(matches!(
+        unsupported_outcome,
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::InvalidEncoding
+        }
+    ));
+    assert_eq!(
+        storage.get_message(&unsupported_content_id).unwrap().state,
+        MessageState::Failed
+    );
+    assert!(
+        storage
+            .has_processed_transport_id(&unsupported_transport_id)
+            .unwrap(),
+        "a successfully peeled unsupported body must retain its exact wrapper id"
     );
 
     let msg = match alice
@@ -1253,6 +1311,18 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
     assert!(bob.drain_events().iter().any(
         |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after post-peel garbage")
     ));
+
+    drop(bob);
+    let mut reopened = build_client_with_storage(storage, b"bob-post-peel");
+    assert_eq!(
+        reopened
+            .ingest(unsupported)
+            .await
+            .expect("unsupported wrapper replay must short-circuit after restart"),
+        IngestOutcome::Ignored {
+            category: InputRejectionCategory::Duplicate
+        }
+    );
 }
 
 #[tokio::test]

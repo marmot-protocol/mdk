@@ -484,6 +484,17 @@ impl MessageStorage for FlakyGroupRecordStorage {
     fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
         self.inner.has_ingress_dedup_marker(id)
     }
+    fn put_processed_transport_id(
+        &self,
+        group_id: &GroupId,
+        transport_id: &MessageId,
+    ) -> StorageResult<()> {
+        self.inner
+            .put_processed_transport_id(group_id, transport_id)
+    }
+    fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool> {
+        self.inner.has_processed_transport_id(transport_id)
+    }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
     }

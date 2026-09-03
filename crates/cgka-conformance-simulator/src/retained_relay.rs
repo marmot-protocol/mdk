@@ -800,7 +800,8 @@ mod tests {
     use super::*;
     use crate::{
         EngineHarnessSubject, ReferenceModelSubject, ScenarioAccountV2, ScenarioDeviceV2,
-        ScenarioProcessV2, ScenarioSpec, ScenarioStep, run_scenario_report_with_subject,
+        ScenarioProcessV2, ScenarioSpec, ScenarioStep, TraceExpectation,
+        run_scenario_report_with_subject,
     };
 
     fn split_relay_topology() -> ScenarioTopologyV2 {
@@ -939,6 +940,177 @@ mod tests {
                 && observation.completeness == RelayHistoryCompletenessClaimV2::FullHistoryQueried
                 && observation.injected_objects > 0
         }));
+    }
+
+    /// Regression for mdk#1650: after an offline member has consumed retained
+    /// history, exact replay of the same transport wrappers must deduplicate
+    /// before old peel contexts fall outside the rewind horizon. The restart
+    /// between the incremental and full-history queries proves the outer-id
+    /// decision is durable rather than only held by the hot-process cache.
+    #[tokio::test]
+    async fn exact_full_history_replay_after_restart_deduplicates_processed_wrappers() {
+        let clients = vec!["alice".into(), "bob".into(), "carol".into(), "dave".into()];
+        let mut steps = vec![
+            ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "round-0".into(),
+                invitees: vec!["bob".into(), "carol".into(), "dave".into()],
+                required_features: vec![],
+                initial_admins: Some(vec!["alice".into()]),
+                pending: "create".into(),
+            },
+            ScenarioStep::AcknowledgeOutbound {
+                client: "alice".into(),
+                publication: None,
+                selection: Default::default(),
+                outcome: SubjectOutboundOutcome::Accepted,
+            },
+            ScenarioStep::DeliverAll,
+            ScenarioStep::Tick {
+                clients: vec!["bob".into(), "carol".into(), "dave".into()],
+            },
+            ScenarioStep::SetClientOffline {
+                client: "bob".into(),
+            },
+        ];
+        let expected_payloads = (1..=6)
+            .map(|round| format!("offline-payload-{round}"))
+            .collect::<Vec<_>>();
+        for (round, payload) in expected_payloads.iter().enumerate() {
+            let round = round + 1;
+            let pending = format!("update-{round}");
+            steps.extend([
+                ScenarioStep::UpdateGroupData {
+                    client: "alice".into(),
+                    name: format!("round-{round}"),
+                    pending: pending.clone(),
+                },
+                ScenarioStep::accept_publication("alice", &pending),
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["carol".into(), "dave".into()],
+                },
+                ScenarioStep::SendAppMessage {
+                    sender: "alice".into(),
+                    payload: payload.clone(),
+                },
+                ScenarioStep::AcknowledgeOutbound {
+                    client: "alice".into(),
+                    publication: None,
+                    selection: Default::default(),
+                    outcome: SubjectOutboundOutcome::Accepted,
+                },
+                ScenarioStep::DeliverAll,
+                ScenarioStep::Tick {
+                    clients: vec!["carol".into(), "dave".into()],
+                },
+            ]);
+        }
+        steps.extend([
+            ScenarioStep::ReconnectClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::SyncRelayHistory {
+                clients: vec!["bob".into()],
+                sync: ScenarioRelaySyncModeV2::Incremental,
+            },
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::Observe {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::RestartClient {
+                client: "bob".into(),
+            },
+            ScenarioStep::SyncRelayHistory {
+                clients: vec!["bob".into()],
+                sync: ScenarioRelaySyncModeV2::FullHistory,
+            },
+            ScenarioStep::Tick {
+                clients: vec!["bob".into()],
+            },
+            ScenarioStep::ObserveExact {
+                clients: vec!["bob".into()],
+            },
+        ]);
+        let scenario = ScenarioSpec {
+            name: "retained-relay/exact-full-history-replay-after-restart".into(),
+            spec_version: "2".into(),
+            clients,
+            topology: ScenarioTopologyV2::default(),
+            steps,
+        };
+        let mut subject = RetainedRelaySubject::new(
+            &scenario.clients,
+            &scenario.topology,
+            ProtocolProfile::Current,
+            HarnessStorageMode::TempFileBackedSqlite,
+        )
+        .unwrap();
+
+        let report = run_scenario_report_with_subject(
+            &scenario,
+            None,
+            vec![
+                TraceExpectation::ClientState {
+                    client: "bob".into(),
+                    epoch: 7,
+                    member_count: 4,
+                    received_payloads: Some(expected_payloads),
+                    added_members: None,
+                    removed_members: None,
+                },
+                TraceExpectation::GroupProfile {
+                    client: "bob".into(),
+                    name: "round-6".into(),
+                    description: "".into(),
+                },
+                TraceExpectation::NoPendingWork {
+                    clients: vec!["bob".into()],
+                },
+            ],
+            &mut subject,
+        )
+        .await
+        .expect("run exact full-history wrapper replay regression");
+
+        let bob = report
+            .observed_trace
+            .as_ref()
+            .and_then(|trace| {
+                trace
+                    .observations
+                    .iter()
+                    .rev()
+                    .find(|observation| observation.client == "bob")
+            })
+            .expect("Bob has a final exact observation");
+        let first_commit = bob
+            .scenario_input_ledger
+            .iter()
+            .find(|entry| entry.scenario_id == "step-5:update_group_data")
+            .expect("the first offline commit remains in Bob's input ledger");
+        assert_eq!(
+            first_commit.deduplicated, 1,
+            "exact replay of the first processed wrapper must deduplicate"
+        );
+        assert_eq!(
+            first_commit.transport_deferred, 0,
+            "exact replay must not re-enter the deferred-peel lifecycle"
+        );
+        assert!(!first_commit.pending);
+
+        assert!(
+            report.expectation_failures.is_empty(),
+            "unexpected failures: {:#?}",
+            report.expectation_failures
+        );
+        assert!(
+            report.invariant_failures.is_empty(),
+            "unexpected invariant failures: {:#?}",
+            report.invariant_failures
+        );
     }
 
     #[tokio::test]

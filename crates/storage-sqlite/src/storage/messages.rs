@@ -465,6 +465,34 @@ impl MessageStorage for SqliteAccountStorage {
             .storage()
     }
 
+    fn put_processed_transport_id(
+        &self,
+        group_id: &GroupId,
+        transport_id: &MessageId,
+    ) -> StorageResult<()> {
+        let write = || {
+            let conn = self.lock()?;
+            put_processed_transport_id_on_connection(&conn, group_id, transport_id)
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            retry_on_busy(write)
+        }
+    }
+
+    fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT EXISTS(
+                    SELECT 1 FROM cgka_processed_transport_ids WHERE id = ?1
+                 )",
+                params![transport_id.as_slice()],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::create(self, group_id, name)
     }
@@ -739,13 +767,42 @@ fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> 
     Ok(())
 }
 
+fn put_processed_transport_id_on_connection(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    transport_id: &MessageId,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "INSERT OR IGNORE INTO cgka_processed_transport_ids (id, group_id)
+         VALUES (?1, ?2)",
+        params![transport_id.as_slice(), group_id.as_slice()],
+    )
+    .storage()?;
+    let stored_group_id = conn
+        .query_row_cached(
+            "SELECT group_id FROM cgka_processed_transport_ids WHERE id = ?1",
+            params![transport_id.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .storage()?;
+    if stored_group_id != group_id.as_slice() {
+        return Err(StorageError::Backend(
+            "processed transport id is already assigned to another group".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::INGRESS_DEDUP_MARKER_CAPACITY;
     use crate::storage::test_support::{gid, mid, sample_group, sample_message};
     use crate::{SqliteAccountStorage, serialize};
     use cgka_traits::engine::GroupEvent;
     use cgka_traits::message::{DeferredPeelLifecycle, MessageState};
-    use cgka_traits::storage::{GroupStorage, MessageStorage, StorageError};
+    use cgka_traits::storage::{
+        GroupStorage, MessageStorage, StorageError, StorageProvider, StorageResult,
+    };
     use cgka_traits::types::{EpochId, MemberId};
 
     fn application_event(message_id: cgka_traits::MessageId) -> GroupEvent {
@@ -1025,6 +1082,79 @@ mod tests {
         store.put_ingress_dedup_marker(&id).unwrap();
         store.put_ingress_dedup_marker(&id).unwrap();
         assert!(store.has_ingress_dedup_marker(&id).unwrap());
+    }
+
+    #[test]
+    fn processed_transport_ids_survive_marker_capacity_churn_and_cascade() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 0);
+        store.put_group(&group).unwrap();
+
+        let processed_ids = (0..=INGRESS_DEDUP_MARKER_CAPACITY)
+            .map(|index| indexed_id(0xa1, index))
+            .collect::<Vec<_>>();
+        for id in &processed_ids {
+            store.put_processed_transport_id(&group.id, id).unwrap();
+        }
+
+        let bounded_ids = (0..=INGRESS_DEDUP_MARKER_CAPACITY)
+            .map(|index| indexed_id(0xb2, index))
+            .collect::<Vec<_>>();
+        for id in &bounded_ids {
+            store.put_ingress_dedup_marker(id).unwrap();
+        }
+
+        assert!(
+            store.has_processed_transport_id(&processed_ids[0]).unwrap(),
+            "processed wrapper evidence must survive beyond the bounded marker capacity"
+        );
+        assert!(
+            !store.has_ingress_dedup_marker(&bounded_ids[0]).unwrap(),
+            "the hostile/unassociated marker pool must remain bounded"
+        );
+        assert!(
+            store
+                .has_ingress_dedup_marker(bounded_ids.last().unwrap())
+                .unwrap()
+        );
+
+        store.delete_group(&group.id).unwrap();
+        assert!(
+            !store.has_processed_transport_id(&processed_ids[0]).unwrap(),
+            "processed wrapper evidence must cascade with its owning group"
+        );
+    }
+
+    #[test]
+    fn processed_transport_id_conflict_rolls_back_canonical_message_admission() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let first_group = sample_group(gid(1), 0, 0);
+        let second_group = sample_group(gid(2), 0, 0);
+        store.put_group(&first_group).unwrap();
+        store.put_group(&second_group).unwrap();
+        let transport_id = indexed_id(0xc3, 0);
+        store
+            .put_processed_transport_id(&first_group.id, &transport_id)
+            .unwrap();
+        let message = sample_message(indexed_id(0xd4, 0), second_group.id.clone(), 0);
+
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            storage.put_message(&message)?;
+            storage.put_processed_transport_id(&second_group.id, &transport_id)
+        });
+
+        assert!(result.is_err());
+        assert!(matches!(
+            store.get_message(&message.id),
+            Err(StorageError::NotFound)
+        ));
+        assert!(store.has_processed_transport_id(&transport_id).unwrap());
+    }
+
+    fn indexed_id(prefix: u8, index: i64) -> cgka_traits::MessageId {
+        let mut bytes = vec![prefix; 32];
+        bytes[24..].copy_from_slice(&index.to_be_bytes());
+        cgka_traits::MessageId::new(bytes)
     }
 
     #[test]

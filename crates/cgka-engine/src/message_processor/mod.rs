@@ -471,9 +471,9 @@ impl<S: StorageProvider> Engine<S> {
         // the current call may suppress its own seen-cache insertion.
         self.retryable_unpersisted_ingest_id = None;
         self.last_ingest_left_object_unpersisted = false;
-        // Durable dedup / own-echo check. Storage is authoritative so a
-        // restarted engine can classify replayed transport messages the same
-        // way as a hot process.
+        // Durable dedup / own-echo check. Storage is consulted before the hot
+        // cache so a restarted engine can classify replayed transport messages
+        // the same way as a running process.
         if let Some(outcome) = self.recorded_message_outcome(&msg.id)? {
             return Ok(outcome);
         }
@@ -516,10 +516,12 @@ impl<S: StorageProvider> Engine<S> {
         // seen-cache insertion is also what it reports to callers holding a
         // dedup index of their own.
         self.last_ingest_left_object_unpersisted = retryable_unpersisted;
-        if !retryable_unpersisted
-            && !matches!(outcome, IngestOutcome::Buffered { .. })
-            && self.should_remember_ingested_message(&msg.id)?
-        {
+        if !retryable_unpersisted && self.should_remember_ingested_message(&msg.id)? {
+            // Successful group-message peel seams persist exact wrapper ids
+            // with their canonical content admission before reaching this
+            // epilogue. Keep only the bounded hot-process fallback here: doing
+            // a broad durable write would let attacker-controlled malformed
+            // wrappers churn the exceptional ingress-marker pool.
             self.seen_message_ids.insert(msg.id.clone());
         }
         Ok(outcome)

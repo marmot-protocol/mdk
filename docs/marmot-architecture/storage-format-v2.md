@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-08-14
+updated: 2026-09-03
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -80,6 +80,22 @@ account readiness. Removing format-1 reads requires a later migration and
 release decision.
 Reclaiming freed SQLCipher pages is an explicit maintenance operation; opening
 an account never runs `VACUUM` implicitly.
+
+## Processed transport identities
+
+Migration `0058_processed_transport_ids` separates exact-wrapper replay
+evidence from the bounded `cgka_ingress_dedup` exceptional-input cache. An id
+enters `cgka_processed_transport_ids` only after a group wrapper peels and its
+content is durably admitted. The content row and processed transport id are one
+transaction when first admitted, so ingest cannot report a marker-write error
+after committing only the canonical row.
+
+Processed transport ids are retained for the lifetime of their owning protocol
+group and cascade when that group is deleted. They are not subject to the
+4,096-row account-device FIFO used for malformed or otherwise unassociated
+terminal ingress. This keeps exact retained-history replay restart-safe without
+letting attacker-controlled, unpeelable wrapper ids create unbounded durable
+state.
 
 ## `StoredMessagePayload` v2
 

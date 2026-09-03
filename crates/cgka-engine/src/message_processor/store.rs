@@ -128,6 +128,11 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: &MessageId,
     ) -> Result<Option<IngestOutcome>, EngineError> {
+        if self.storage.has_processed_transport_id(id)? {
+            return Ok(Some(IngestOutcome::Ignored {
+                category: InputRejectionCategory::Duplicate,
+            }));
+        }
         if self.storage.has_ingress_dedup_marker(id)? {
             return Ok(Some(IngestOutcome::Ignored {
                 category: InputRejectionCategory::Duplicate,
@@ -237,6 +242,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             MessageState::Sent,
             StoredMessagePayload::staged_invite_welcome(msg.clone(), origin_commit_id.clone()),
+            None,
         )
     }
 
@@ -302,6 +308,7 @@ impl<S: StorageProvider> Engine<S> {
                 epoch,
                 MessageState::Sent,
                 payload,
+                None,
             )?;
             self.persist_sent_openmls_content_marker(
                 &openmls_msg,
@@ -409,6 +416,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             StoredMessagePayload::raw_transport(msg.clone()),
+            None,
         )
     }
 
@@ -443,6 +451,7 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_openmls_wire_message(
         &self,
         msg: &TransportMessage,
@@ -456,6 +465,28 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
+            None,
+        )
+    }
+
+    /// Persist canonical peeled content and the exact transport wrapper that
+    /// admitted it in one storage transaction. Once this succeeds, replay of
+    /// the wrapper never needs the historical peel context again.
+    pub(crate) fn persist_openmls_wire_message_with_processed_transport_id(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+        transport_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        self.persist_stored_message_payload(
+            msg.id.clone(),
+            group_id,
+            epoch,
+            state,
+            StoredMessagePayload::openmls_wire(msg.clone()),
+            Some(transport_id),
         )
     }
 
@@ -466,6 +497,7 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
         state: MessageState,
         payload: StoredMessagePayload,
+        processed_transport_id: Option<&MessageId>,
     ) -> Result<(), EngineError> {
         let id_hex = hex::encode(id.as_slice());
         let previous = match self.storage.get_message(&id) {
@@ -503,16 +535,29 @@ impl<S: StorageProvider> Engine<S> {
                 && record.payload == payload
                 && record.deferred_peel == deferred_peel
         }) {
+            if let Some(transport_id) = processed_transport_id {
+                self.storage
+                    .put_processed_transport_id(group_id, transport_id)?;
+            }
             return Ok(());
         }
-        self.storage.put_message(&MessageRecord {
+        let record = MessageRecord {
             id,
             group_id: group_id.clone(),
             epoch,
             state,
             payload,
             deferred_peel,
-        })?;
+        };
+        if let Some(transport_id) = processed_transport_id {
+            self.storage.with_transaction(|storage| {
+                storage.put_message(&record)?;
+                storage.put_processed_transport_id(group_id, transport_id)?;
+                Ok::<(), EngineError>(())
+            })?;
+        } else {
+            self.storage.put_message(&record)?;
+        }
         self.audit_group(
             group_id,
             crate::audit_helpers::message_state_transition_event(
@@ -911,6 +956,7 @@ mod tests {
                     staged_welcome.clone(),
                     origin_commit_id.clone(),
                 ),
+                None,
             )
             .unwrap();
         engine
@@ -928,6 +974,35 @@ mod tests {
             Some(&origin_commit_id),
             "own echo must preserve staged Welcome ownership"
         );
+    }
+
+    #[test]
+    fn canonical_content_and_processed_transport_id_admit_atomically() {
+        let (storage, engine, first_group_id) = engine_with_stored_group();
+        let mut second_group = storage.get_group(&first_group_id).unwrap();
+        second_group.id = GroupId::new(vec![8u8; 16]);
+        storage.put_group(&second_group).unwrap();
+        let transport_id = MessageId::new(vec![0x91; 32]);
+        storage
+            .put_processed_transport_id(&first_group_id, &transport_id)
+            .unwrap();
+        let content = transport_message(b"new-canonical-content", b"wire-bytes");
+
+        engine
+            .persist_openmls_wire_message_with_processed_transport_id(
+                &content,
+                &second_group.id,
+                EpochId(3),
+                MessageState::Failed,
+                &transport_id,
+            )
+            .expect_err("a transport id cannot be reassigned across groups");
+
+        assert!(matches!(
+            storage.get_message(&content.id),
+            Err(cgka_traits::storage::StorageError::NotFound)
+        ));
+        assert!(storage.has_processed_transport_id(&transport_id).unwrap());
     }
 
     /// The commit-digest memo behind `deferred_peel_context_fingerprint`
