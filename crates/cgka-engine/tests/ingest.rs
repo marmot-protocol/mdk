@@ -845,7 +845,12 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
 #[tokio::test]
 async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
     let mut alice = build_client(b"alice");
-    let mut bob = build_client_with_peeler(b"bob", Box::new(MalformedShortPayloadPeeler));
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage_and_peeler(
+        storage.clone(),
+        b"bob",
+        Box::new(MalformedShortPayloadPeeler),
+    );
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
     let (group_id, result) = alice
@@ -883,6 +888,7 @@ async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
             transport_group_id: group_id.as_slice().to_vec(),
         },
     };
+    let garbage_id = garbage.id.clone();
     let outcome = bob
         .ingest(garbage)
         .await
@@ -895,6 +901,14 @@ async fn malformed_group_message_is_rejected_and_does_not_wedge_ingest() {
             }
         ),
         "expected invalid encoding for malformed content, got {outcome:?}"
+    );
+    assert!(
+        !storage.has_processed_transport_id(&garbage_id).unwrap(),
+        "a wrapper that never peeled must not enter the durable processed-id table"
+    );
+    assert!(
+        !storage.has_ingress_dedup_marker(&garbage_id).unwrap(),
+        "attacker-controlled group wrappers must not churn the bounded exceptional marker pool"
     );
 
     let msg = match alice
@@ -1213,6 +1227,7 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
             transport_group_id: group_id.as_slice().to_vec(),
         },
     };
+    let garbage_transport_id = garbage.id.clone();
     let garbage_content_id = content_id(&garbage);
     let outcome = bob
         .ingest(garbage)
@@ -1228,6 +1243,12 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
         storage.get_message(&garbage_content_id).unwrap().state,
         MessageState::Failed,
         "the content-derived poison row must be durable and terminal"
+    );
+    assert!(
+        storage
+            .has_processed_transport_id(&garbage_transport_id)
+            .unwrap(),
+        "a successfully peeled wrapper must be associated with its durable content row"
     );
 
     let msg = match alice

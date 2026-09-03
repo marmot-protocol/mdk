@@ -110,6 +110,8 @@ mod migration_0054_transport_reconciliation_items;
 mod migration_0055_epoch_stall_evidence;
 #[path = "migrations/0056_chat_list_accepted_activity_high_water.rs"]
 mod migration_0056_chat_list_accepted_activity_high_water;
+#[path = "migrations/0057_processed_transport_ids.rs"]
+mod migration_0057_processed_transport_ids;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -404,6 +406,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 56,
         name: "0056_chat_list_accepted_activity_high_water",
         apply: migration_0056_chat_list_accepted_activity_high_water::apply,
+    },
+    Migration {
+        version: 57,
+        name: "0057_processed_transport_ids",
+        apply: migration_0057_processed_transport_ids::apply,
     },
 ];
 
@@ -932,7 +939,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 56,
+                found: 57,
                 latest_supported: 46,
             }
         ));
@@ -988,7 +995,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 56,
+                found: 57,
                 latest_supported: 46,
             }
         ));
@@ -1292,7 +1299,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 56,
+                found: 57,
                 latest_supported: 46,
             }
         ));
@@ -2316,6 +2323,7 @@ mod tests {
             ("cgka_member_validation_cache", "group_id"),
             ("cgka_group_snapshots", "group_id"),
             ("cgka_group_state_checkpoints", "group_id"),
+            ("cgka_processed_transport_ids", "group_id"),
         ] {
             assert_eq!(
                 foreign_key(&conn, table, column),
@@ -2464,6 +2472,11 @@ mod tests {
             "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
              VALUES (?1, ?2, 0, 0, ?3)",
             params![vec![0x01_u8; 4], orphan_group, vec![0xAA_u8]],
+        ));
+        assert_foreign_key_error(conn.execute(
+            "INSERT INTO cgka_processed_transport_ids (id, group_id)
+             VALUES (?1, ?2)",
+            params![vec![0x09_u8; 4], orphan_group],
         ));
         assert_foreign_key_error(conn.execute(
             "INSERT INTO pending_push_registration_shares (

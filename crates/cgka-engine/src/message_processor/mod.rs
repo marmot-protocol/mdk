@@ -471,9 +471,9 @@ impl<S: StorageProvider> Engine<S> {
         // the current call may suppress its own seen-cache insertion.
         self.retryable_unpersisted_ingest_id = None;
         self.last_ingest_left_object_unpersisted = false;
-        // Durable dedup / own-echo check. Storage is authoritative so a
-        // restarted engine can classify replayed transport messages the same
-        // way as a hot process.
+        // Durable dedup / own-echo check. Storage is consulted before the hot
+        // cache so a restarted engine can classify replayed transport messages
+        // the same way as a running process.
         if let Some(outcome) = self.recorded_message_outcome(&msg.id)? {
             return Ok(outcome);
         }
@@ -517,19 +517,11 @@ impl<S: StorageProvider> Engine<S> {
         // dedup index of their own.
         self.last_ingest_left_object_unpersisted = retryable_unpersisted;
         if !retryable_unpersisted && self.should_remember_ingested_message(&msg.id)? {
-            // Keep the cheap outer transport-id prefilter restart-safe. The
-            // content-derived row remains canonical for MLS dedup (so a fresh
-            // wrapper still collapses after peeling), but an exact wrapper
-            // replay may no longer be peelable once its source context falls
-            // outside the retained-history horizon (mdk#1650). Persist this
-            // only at the same terminal boundary used by the hot-process
-            // cache. Raw Retryable/PeelDeferred rows remain eligible because
-            // `should_remember_ingested_message` rejects them; a Buffered
-            // outcome whose durable row is instead keyed by peeled content
-            // has finished using this exact wrapper and is safe to remember.
-            if matches!(&msg.envelope, TransportEnvelope::GroupMessage { .. }) {
-                self.storage.put_ingress_dedup_marker(&msg.id)?;
-            }
+            // Successful group-message peel seams persist exact wrapper ids
+            // with their canonical content admission before reaching this
+            // epilogue. Keep only the bounded hot-process fallback here: doing
+            // a broad durable write would let attacker-controlled malformed
+            // wrappers churn the exceptional ingress-marker pool.
             self.seen_message_ids.insert(msg.id.clone());
         }
         Ok(outcome)

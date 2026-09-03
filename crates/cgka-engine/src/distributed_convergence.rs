@@ -388,6 +388,7 @@ impl<S: StorageProvider> Engine<S> {
                 monotonic_ms,
                 wall_ms: self.convergence_now().wall_ms,
             },
+            None,
         )
     }
 
@@ -401,7 +402,12 @@ impl<S: StorageProvider> Engine<S> {
         // input against it (mdk#1161): the group's interrupted probe/apply
         // recovery must run before any of its stored state is extended.
         self.ensure_hydrated_for_convergence(group_id)?;
-        self.buffer_openmls_convergence_message_with_time(group_id, message, self.convergence_now())
+        self.buffer_openmls_convergence_message_with_time(
+            group_id,
+            message,
+            self.convergence_now(),
+            None,
+        )
     }
 
     /// Fail-closed hydration promotion for the public convergence-buffering
@@ -428,6 +434,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         message: TransportMessage,
         now: ConvergenceTime,
+        processed_transport_id: Option<&MessageId>,
     ) -> Result<(), OpenMlsProjectionError> {
         // Key the convergence store on the content-derived dedup id (SHA-256 of
         // the recovered MLS bytes), not the outer transport id (#238). This
@@ -438,7 +445,14 @@ impl<S: StorageProvider> Engine<S> {
         let content_id = crate::message_processor::content_dedup_id(&message.payload);
         match self.storage.get_message(&content_id) {
             Ok(record) if record.state == MessageState::PeelDeferred => {}
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if let Some(transport_id) = processed_transport_id {
+                    self.storage
+                        .put_processed_transport_id(group_id, transport_id)
+                        .map_err(storage_projection_error)?;
+                }
+                return Ok(());
+            }
             Err(StorageError::NotFound) => {}
             Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
         }
@@ -479,6 +493,9 @@ impl<S: StorageProvider> Engine<S> {
         // intentionally blocked by an unstable local mutation owner.
         let (admission, opened) = self.storage.with_transaction(|storage| {
             storage.put_message(&record)?;
+            if let Some(transport_id) = processed_transport_id {
+                storage.put_processed_transport_id(group_id, transport_id)?;
+            }
             let (admission, opened) =
                 self.admit_stored_message_to_convergence_pass(group_id, &content_id, now)?;
             if admission == ConvergenceAdmissionOutcome::FrozenIntegrityFailure {

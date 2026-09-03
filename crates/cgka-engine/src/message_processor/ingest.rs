@@ -786,6 +786,11 @@ impl<S: StorageProvider> Engine<S> {
         // and the in-memory dedup sets to this content-derived id.
         let content_id = content_dedup_id(&mls_bytes);
         if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
+            // Peeling proved which durable content record this wrapper carries.
+            // Remember the exact wrapper outside the bounded hostile-input
+            // marker pool so a later restart can short-circuit before peel.
+            self.storage
+                .put_processed_transport_id(&group_id, &raw_msg_id)?;
             return Ok(outcome);
         }
         if self.seen_message_ids.contains(&content_id) {
@@ -822,11 +827,12 @@ impl<S: StorageProvider> Engine<S> {
                 // structurally invalid MLS message as terminal hostile
                 // input: returning `Err` here aborts the transport drain
                 // and lets the same poison event redeliver forever.
-                self.persist_openmls_wire_message(
+                self.persist_openmls_wire_message_with_processed_transport_id(
                     &openmls_msg,
                     &group_id,
                     current_epoch,
                     MessageState::Failed,
+                    &raw_msg_id,
                 )?;
                 self.mark_raw_transport_message_failed_if_awaiting_retry(
                     &raw_msg_id,
@@ -874,11 +880,12 @@ impl<S: StorageProvider> Engine<S> {
             && self.msg_is_pre_membership(&group_id, msg_epoch)
         {
             let tag = crate::message_disposition::MessageDisposition::PreMembershipEvent.tag();
-            self.persist_openmls_wire_message(
+            self.persist_openmls_wire_message_with_processed_transport_id(
                 &openmls_msg,
                 &group_id,
                 current_epoch,
                 MessageState::Failed,
+                &raw_msg_id,
             )?;
             self.audit_group(
                 &group_id,
@@ -1004,11 +1011,12 @@ impl<S: StorageProvider> Engine<S> {
             );
         }
 
-        self.persist_openmls_wire_message(
+        self.persist_openmls_wire_message_with_processed_transport_id(
             &openmls_msg,
             &group_id,
             current_epoch,
             MessageState::Created,
+            &raw_msg_id,
         )?;
 
         // Process via MLS. Commits may contain AppDataUpdate proposals,
@@ -2425,8 +2433,13 @@ impl<S: StorageProvider> Engine<S> {
             drain,
         } = handoff;
         let now = self.convergence_now();
-        self.buffer_openmls_convergence_message_with_time(&group_id, openmls_msg.clone(), now)
-            .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
+        self.buffer_openmls_convergence_message_with_time(
+            &group_id,
+            openmls_msg.clone(),
+            now,
+            Some(raw_msg_id),
+        )
+        .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
         if raw_msg_id != &msg.id {
             self.mark_raw_transport_message_processed_if_awaiting_retry(
                 raw_msg_id,

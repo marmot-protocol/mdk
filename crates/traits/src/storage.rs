@@ -268,14 +268,28 @@ pub trait MessageStorage {
     /// committed. Unknown ids are harmless so replay remains idempotent.
     fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()>;
 
-    /// Persist a terminal duplicate-detection marker for inbound protocol
-    /// material. This includes outer transport ids whose canonical group row
-    /// is keyed by a content-derived id, plus material that cannot be
-    /// associated with a group (notably malformed or rejected welcomes).
-    /// Markers are account-device scoped and may be keyed by either the
-    /// transport id or a content-derived id.
+    /// Persist a bounded terminal duplicate-detection marker for inbound
+    /// protocol material that cannot be associated with a durable group
+    /// message (notably malformed or rejected welcomes). Implementations may
+    /// evict these markers; correctness-critical processed group wrappers use
+    /// [`Self::put_processed_transport_id`] instead.
     fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()>;
     fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool>;
+
+    /// Persist the exact outer transport id of a group message whose peeled
+    /// content has been durably admitted. This evidence must remain until its
+    /// owning group is deleted and must not share a count-based eviction pool
+    /// with unassociated ingress markers.
+    ///
+    /// When the canonical content row is first admitted by the same ingest,
+    /// callers must invoke this inside the same [`StorageProvider::with_transaction`]
+    /// unit as [`Self::put_message`].
+    fn put_processed_transport_id(
+        &self,
+        group_id: &GroupId,
+        transport_id: &MessageId,
+    ) -> StorageResult<()>;
+    fn has_processed_transport_id(&self, transport_id: &MessageId) -> StorageResult<bool>;
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
 
