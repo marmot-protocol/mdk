@@ -787,21 +787,38 @@ impl<S: StorageProvider> Engine<S> {
                 ),
             );
         }
-        let projected = self
+        // The caller discards the members unless a trigger opens a pass, and a
+        // trigger needs either a row in a pass-opening state or a disband
+        // candidate. Answer the common "nothing to open" case with two indexed
+        // reads before projecting the window.
+        let candidate_ids: HashSet<MessageId> = self
             .storage
-            .list_messages(group_id, EpochId(floor))
+            .list_disband_candidates(group_id)
             .map_err(storage_projection_error)?
             .into_iter()
-            .filter(|record| {
-                matches!(
-                    record.state,
-                    MessageState::Sent
-                        | MessageState::Created
-                        | MessageState::Retryable
-                        | MessageState::ConvergenceDeferred
-                        | MessageState::Processed
+            .flat_map(|candidate| [candidate.commit_id, candidate.content_commit_id])
+            .collect();
+        if candidate_ids.is_empty()
+            && !self
+                .storage
+                .has_messages_in_states(
+                    group_id,
+                    &crate::convergence_input::PASS_OPENING_STATES,
+                    EpochId(floor),
                 )
-            })
+                .map_err(storage_projection_error)?
+        {
+            return Ok((Vec::new(), false));
+        }
+        let projected = self
+            .storage
+            .list_messages_in_states(
+                group_id,
+                &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
+                EpochId(floor),
+            )
+            .map_err(storage_projection_error)?
+            .into_iter()
             .filter_map(|record| {
                 let payload = match StoredMessagePayload::decode(&record.payload) {
                     Ok(payload) => payload,
@@ -837,20 +854,9 @@ impl<S: StorageProvider> Engine<S> {
             .collect::<Result<Vec<_>, _>>()?;
         let context =
             ConvergenceInputContext::from_inputs(projected.iter().map(|(_, input)| *input));
-        let has_terminal_trigger = if projected.is_empty() {
-            false
-        } else {
-            let candidate_ids: HashSet<MessageId> = self
-                .storage
-                .list_disband_candidates(group_id)
-                .map_err(storage_projection_error)?
-                .into_iter()
-                .flat_map(|candidate| [candidate.commit_id, candidate.content_commit_id])
-                .collect();
-            projected
-                .iter()
-                .any(|(member, _)| candidate_ids.contains(&member.message_id))
-        };
+        let has_terminal_trigger = projected
+            .iter()
+            .any(|(member, _)| candidate_ids.contains(&member.message_id));
         let has_trigger = has_terminal_trigger
             || projected
                 .iter()

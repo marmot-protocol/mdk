@@ -36,9 +36,7 @@ use marmot_forensics::{
     AuditEngineContext, AuditEventContext, AuditEventKind, AuditGroupContext, AuditRecord,
     ForensicRecorder, NoopRecorder,
 };
-use openmls::prelude::{
-    MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolMessage,
-};
+use openmls::prelude::{ProcessedMessageContent, Proposal};
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
 use rand::RngCore;
@@ -46,7 +44,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tls_codec::{Deserialize as _, Serialize as _};
+use tls_codec::Serialize as _;
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -2327,22 +2325,14 @@ impl<S: StorageProvider> Engine<S> {
             let Some(message) = stored_payload.as_openmls_wire() else {
                 continue;
             };
-            let Ok(projection) = crate::openmls_projection::project_mls_message(&message.payload)
+            let Ok((projection, Some(protocol))) =
+                crate::openmls_projection::project_protocol_message(&message.payload)
             else {
                 continue;
             };
             if projection.kind != crate::openmls_projection::OpenMlsContentKind::Proposal {
                 continue;
             }
-
-            let Ok(msg_in) = MlsMessageIn::tls_deserialize_exact(message.payload.as_slice()) else {
-                continue;
-            };
-            let protocol: ProtocolMessage = match msg_in.extract() {
-                MlsMessageBodyIn::PrivateMessage(private) => private.into(),
-                MlsMessageBodyIn::PublicMessage(public) => public.into(),
-                _ => continue,
-            };
             let mut hasher = Sha256::new();
             hasher.update(b"cgka-engine-hydrate-selfremove-probe/v1");
             hasher.update(group_id.as_slice());

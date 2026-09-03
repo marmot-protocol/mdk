@@ -174,17 +174,20 @@ pub(crate) struct DeferredPeelGroupState {
     /// logged, or copied into durable generation state, and process restart
     /// drops it naturally.
     candidate_cache: Option<DeferredPeelCandidateCacheEntry>,
-    /// Per-row verdicts backing `stored_convergence_commit_digests`: the
-    /// stored payload's hash, plus the commit digest or `None` for a row that
-    /// is not an MLS-wire commit. A row id CAN map to different payload bytes
+    /// Per-row verdicts backing `stored_convergence_commit_edges`: the
+    /// stored payload's hash, plus the commit's `(source_epoch, digest)` or
+    /// `None` for a row that is not an MLS-wire commit. A row id CAN map to different payload bytes
     /// over its lifetime — `persist_stored_message_payload` overwrites a
     /// same-id row stored under a different payload variant (e.g. RawTransport
     /// re-persisted as OpenMlsWire, #369) — so each reuse revalidates the
     /// cheap payload hash and only then skips the decode + TLS parse. Rebuilt
     /// to the currently listed rows on every use, so it cannot outgrow the
     /// group's stored history.
-    commit_digest_memo: HashMap<MessageId, ([u8; 32], Option<[u8; 32]>)>,
+    commit_digest_memo: HashMap<MessageId, ([u8; 32], Option<CommitEdge>)>,
 }
+
+/// `(source_epoch, digest)` of one stored commit in the convergence graph.
+type CommitEdge = (u64, [u8; 32]);
 
 struct DeferredPeelCandidateCacheEntry {
     context_fingerprint: [u8; 32],
@@ -2026,15 +2029,15 @@ impl<S: StorageProvider> Engine<S> {
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
             .map_err(|error| EngineError::Backend(format!("load convergence policy: {error}")))?;
-        let contested = crate::openmls_projection::stored_graph_is_contested(
-            &self.storage,
-            group_id,
-            group
-                .epoch
-                .0
-                .saturating_sub(policy.convergence.max_rewind_commits),
-        )
-        .map_err(|error| EngineError::Backend(format!("stored graph contested probe: {error}")))?;
+        let floor = group
+            .epoch
+            .0
+            .saturating_sub(policy.convergence.max_rewind_commits);
+        let contested = crate::openmls_projection::commit_edges_are_contested(
+            self.stored_convergence_commit_edges(group_id)?
+                .into_iter()
+                .filter(|(source_epoch, _)| *source_epoch >= floor),
+        );
         Ok(if contested {
             DeferralLineage::ContestedFork
         } else {
@@ -2259,7 +2262,12 @@ impl<S: StorageProvider> Engine<S> {
         // anchor set are both unchanged. Without this term the gate would stay
         // armed exactly where it must not — on a device holding its own branch
         // while a rival branch's traffic sits unreadable.
-        for digest in self.stored_convergence_commit_digests(group_id)? {
+        let digests: BTreeSet<[u8; 32]> = self
+            .stored_convergence_commit_edges(group_id)?
+            .into_iter()
+            .map(|(_source_epoch, digest)| digest)
+            .collect();
+        for digest in digests {
             hasher.update(digest);
         }
         let mut out = [0u8; 32];
@@ -2267,20 +2275,25 @@ impl<S: StorageProvider> Engine<S> {
         Ok(out)
     }
 
-    /// Content digests of the stored commits that can contribute to this
-    /// group's convergence graph, in a stable order.
+    /// `(source_epoch, digest)` of the stored commits that can contribute to
+    /// this group's convergence graph, in listing order.
     ///
-    /// The fingerprint gate computes this set at least twice per sweep, so a
-    /// row's decode + TLS parse + digest is remembered in
+    /// The fingerprint gate computes this set at least twice per sweep and
+    /// the deferral-lineage probe once per deferred message, so a row's
+    /// decode + TLS parse + digest is remembered in
     /// `DeferredPeelGroupState::commit_digest_memo` and paid once per stored
     /// payload version instead of once per computation. State membership is
     /// re-read from the fresh listing every call, and each reuse revalidates
     /// the payload hash; only the payload verdict is memoized.
-    fn stored_convergence_commit_digests(
+    fn stored_convergence_commit_edges(
         &mut self,
         group_id: &GroupId,
-    ) -> Result<BTreeSet<[u8; 32]>, EngineError> {
-        let records = self.storage.list_messages(group_id, EpochId(0))?;
+    ) -> Result<Vec<CommitEdge>, EngineError> {
+        let records = self.storage.list_messages_in_states(
+            group_id,
+            &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
+            EpochId(0),
+        )?;
         let mut memo = std::mem::take(
             &mut self
                 .deferred_peel
@@ -2289,17 +2302,8 @@ impl<S: StorageProvider> Engine<S> {
                 .commit_digest_memo,
         );
         let mut next_memo = HashMap::with_capacity(records.len());
-        let mut digests = BTreeSet::new();
+        let mut edges = Vec::new();
         for record in records {
-            // Share the graph's own membership predicate rather than restating
-            // it: this set must describe exactly the commits a pass would build
-            // candidate branches from, and a private copy of that match drifts
-            // without any test noticing.
-            if !crate::openmls_projection::record_state_can_contribute_to_openmls_graph(
-                record.state,
-            ) {
-                continue;
-            }
             // The memo entry is valid only for the payload bytes it was
             // computed from: a same-id row can be overwritten under a
             // different payload variant (RawTransport re-persisted as
@@ -2311,10 +2315,12 @@ impl<S: StorageProvider> Engine<S> {
                     .filter(|(_message, projection)| {
                         projection.kind == crate::openmls_projection::OpenMlsContentKind::Commit
                     })
-                    .map(|(_message, projection)| projection.message_digest),
+                    .and_then(|(_message, projection)| {
+                        Some((projection.source_epoch?, projection.message_digest))
+                    }),
             };
-            if let Some(digest) = verdict {
-                digests.insert(digest);
+            if let Some(edge) = verdict {
+                edges.push(edge);
             }
             next_memo.insert(record.id, (payload_hash, verdict));
         }
@@ -2322,7 +2328,7 @@ impl<S: StorageProvider> Engine<S> {
             .entry(group_id.clone())
             .or_default()
             .commit_digest_memo = next_memo;
-        Ok(digests)
+        Ok(edges)
     }
 
     /// Check capacity for one new `PeelDeferred` row, lazily counting the
