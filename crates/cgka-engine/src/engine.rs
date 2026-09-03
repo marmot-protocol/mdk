@@ -169,9 +169,9 @@ pub struct Engine<S: StorageProvider> {
 
     /// MessageIds the engine has ingested. Backs the typed duplicate exclusion.
     ///
-    /// Bounded hot-process cache in front of the authoritative durable
-    /// `MessageRecord` store (checked first in `do_ingest`), so an id that ages
-    /// out of the cap is still classified by storage.
+    /// Bounded hot-process cache in front of the authoritative durable ingress
+    /// markers and `MessageRecord` store (checked first in `do_ingest`), so an
+    /// id that ages out of the cap is still classified by storage.
     pub(crate) seen_message_ids: BoundedIdSet<MessageId>,
 
     /// One-shot marker for a cap-dropped, unpersisted ingest. The outer

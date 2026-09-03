@@ -269,9 +269,11 @@ pub trait MessageStorage {
     fn delete_pending_application_events(&self, ids: &[MessageId]) -> StorageResult<()>;
 
     /// Persist a terminal duplicate-detection marker for inbound protocol
-    /// material that cannot yet be associated with a group (notably malformed
-    /// or rejected welcomes). Markers are account-device scoped and may be
-    /// keyed by either the transport id or a content-derived id.
+    /// material. This includes outer transport ids whose canonical group row
+    /// is keyed by a content-derived id, plus material that cannot be
+    /// associated with a group (notably malformed or rejected welcomes).
+    /// Markers are account-device scoped and may be keyed by either the
+    /// transport id or a content-derived id.
     fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()>;
     fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool>;
 

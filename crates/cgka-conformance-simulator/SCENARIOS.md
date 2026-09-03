@@ -138,6 +138,18 @@ These are the scenarios another implementation should be able to load from JSON 
   regression owns the retained-injection observations, the stable commit-disposition subset, and Alpha's own-commit
   withdrawal event pair.
 
+### `retained-relay/exact-full-history-replay-after-restart`
+
+- File: focused Rust regression in `src/retained_relay.rs`.
+- Setup: Alice creates a four-member current-profile group, Bob goes offline, and Alice publishes six sequential
+  profile commits plus one application payload after each commit. Bob catches up from an incremental retained-relay
+  query and then restarts over encrypted file-backed SQLite.
+- Pressure: after the restart, Bob performs an exact full-history query that returns the same retained transport
+  wrappers, including the first commit whose peel context is now beyond the five-commit rewind horizon.
+- Expected: Bob remains at epoch 7 with the four-member roster, the round-6 profile, and all six payloads from the
+  incremental catch-up. The first commit wrapper is durably deduplicated without entering `PeelDeferred`, and the
+  exact pending-work projection is empty.
+
 ### `cross-route-app-runtime-recovery/v1`
 
 - File: constructed once by `cross_route_app_runtime_recovery_public_scenario` (with an engine-exact companion) and

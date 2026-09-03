@@ -516,10 +516,20 @@ impl<S: StorageProvider> Engine<S> {
         // seen-cache insertion is also what it reports to callers holding a
         // dedup index of their own.
         self.last_ingest_left_object_unpersisted = retryable_unpersisted;
-        if !retryable_unpersisted
-            && !matches!(outcome, IngestOutcome::Buffered { .. })
-            && self.should_remember_ingested_message(&msg.id)?
-        {
+        if !retryable_unpersisted && self.should_remember_ingested_message(&msg.id)? {
+            // Keep the cheap outer transport-id prefilter restart-safe. The
+            // content-derived row remains canonical for MLS dedup (so a fresh
+            // wrapper still collapses after peeling), but an exact wrapper
+            // replay may no longer be peelable once its source context falls
+            // outside the retained-history horizon (mdk#1650). Persist this
+            // only at the same terminal boundary used by the hot-process
+            // cache. Raw Retryable/PeelDeferred rows remain eligible because
+            // `should_remember_ingested_message` rejects them; a Buffered
+            // outcome whose durable row is instead keyed by peeled content
+            // has finished using this exact wrapper and is safe to remember.
+            if matches!(&msg.envelope, TransportEnvelope::GroupMessage { .. }) {
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+            }
             self.seen_message_ids.insert(msg.id.clone());
         }
         Ok(outcome)
