@@ -664,10 +664,16 @@ impl CaptureSink {
                             .unwrap()
                             .pop_front()
                             .unwrap_or_else(|| default_status.load(Ordering::Relaxed));
+                        // Record the body before answering, after the hold: once the
+                        // response is written the client may fire its next request,
+                        // and the order-asserting tests need bodies pushed in serve
+                        // order. Pushing before the hold would instead expose a body
+                        // while its request is still deliberately in flight, which
+                        // the coalescing test's contract cannot tolerate.
+                        requests.lock().unwrap().push(request);
                         write_http_response(&mut stream, status).await;
                         let _ = stream.shutdown().await;
                         in_flight.lock().unwrap().0 -= 1;
-                        requests.lock().unwrap().push(request);
                     });
                 }
             }

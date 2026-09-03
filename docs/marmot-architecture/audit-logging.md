@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-08-29
+updated: 2026-09-03
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---

@@ -1472,7 +1472,11 @@ fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
+    // A dedicated subdir takes the chmod fault so a failing assertion can
+    // never leave the TempDir root unwritable and block its cleanup.
+    let logs = dir.path().join("logs");
+    fs::create_dir(&logs).unwrap();
+    let path = default_jsonl_path(&logs, "engine-abc");
     fs::write(
         &path,
         "x".repeat(usize::try_from(AUDIT_LOG_SEGMENT_MAX_BYTES).unwrap() + 1),
@@ -1481,17 +1485,26 @@ fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
 
     // The episode: the directory is momentarily unwritable, so the roll-on-open
     // cannot rename and latches.
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
+    if fs::write(logs.join("probe.tmp"), b"").is_ok() {
+        // Root ignores permission bits, so the roll cannot be made to fail
+        // and the episode this test needs cannot exist. Same guard as
+        // `rotate_failure_keeps_recording_to_original_file`.
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
     let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    let rolled_during_episode = segment_paths(&path);
+
+    // The episode ends. Restore the mode before asserting the premise so a
+    // failure here cannot strand an unwritable directory. `rotate` below is
+    // the proof the episode ended: it cannot succeed unless it created a
+    // sibling in this directory and renamed it over the live path.
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(
-        segment_paths(&path).is_empty(),
+        rolled_during_episode.is_empty(),
         "the roll must have failed for this test to mean anything"
     );
-
-    // The episode ends. `rotate` is the proof it ended: it cannot succeed
-    // unless it created a sibling in this directory and renamed it over the
-    // live path.
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     recorder.rotate().unwrap();
 
     record_until_segment_rolls(&recorder, &path, 0);
