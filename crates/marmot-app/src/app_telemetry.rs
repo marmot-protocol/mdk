@@ -548,6 +548,8 @@ impl AppPerformanceOperationTelemetry {
 }
 
 impl AppPerformanceTelemetry {
+    /// Record one closed, reviewed operation as a process-wide count and
+    /// fixed-bucket duration sample without accepting dynamic attributes.
     pub(crate) fn record(
         &self,
         operation: AppPerformanceOperation,
@@ -863,6 +865,8 @@ impl AppPerformanceTelemetry {
         );
     }
 
+    /// Return cumulative process-wide aggregates suitable for the opt-in
+    /// telemetry and host-FFI boundaries.
     pub fn snapshot(&self) -> AppPerformanceSnapshot {
         let inner = self
             .inner
@@ -1381,6 +1385,8 @@ mod tests {
         assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
     }
 
+    /// Every media phase is retained as an aggregate operation with no dynamic
+    /// classification surface.
     #[test]
     fn records_each_media_download_phase_without_dynamic_labels() {
         let telemetry = AppPerformanceTelemetry::default();

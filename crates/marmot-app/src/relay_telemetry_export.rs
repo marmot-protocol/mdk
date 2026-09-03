@@ -979,6 +979,7 @@ pub fn build_export_batch_with_app_performance(
     batch
 }
 
+/// Append the fixed app-performance schema as unlabeled aggregate points.
 fn append_app_performance_points(
     points: &mut Vec<ExportMetricPoint>,
     app_performance: &AppPerformanceSnapshot,
@@ -1573,6 +1574,8 @@ fn append_app_performance_points(
     }
 }
 
+/// Encode one aggregate operation without allowing the caller to supply any
+/// label name or value.
 fn append_app_operation_points(
     points: &mut Vec<ExportMetricPoint>,
     operation: &AppPerformanceOperationSnapshot,

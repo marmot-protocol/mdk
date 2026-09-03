@@ -104,6 +104,8 @@ pub(crate) struct BlossomHttpTransport {
 }
 
 impl BlossomHttpTransport {
+    /// Create the production transport policy with bounded startup, transfer,
+    /// cache lifetime, and origin count.
     pub(crate) fn new(allow_loopback_http: bool) -> Self {
         Self::with_policy(
             allow_loopback_http,
@@ -114,6 +116,8 @@ impl BlossomHttpTransport {
         )
     }
 
+    /// Build one transport from an explicit policy while preserving the same
+    /// origin-isolation and address-vetting path used in production.
     fn with_policy(
         allow_loopback_http: bool,
         address_lease: Duration,
@@ -134,6 +138,8 @@ impl BlossomHttpTransport {
     }
 
     #[cfg(test)]
+    /// Override cache and startup bounds while retaining the production
+    /// transfer deadline and resolver.
     pub(super) fn for_test(
         allow_loopback_http: bool,
         address_lease: Duration,
@@ -149,6 +155,7 @@ impl BlossomHttpTransport {
     }
 
     #[cfg(test)]
+    /// Override all timing bounds for deterministic deadline regression tests.
     pub(super) fn for_test_with_transfer_timeout(
         allow_loopback_http: bool,
         address_lease: Duration,
@@ -165,6 +172,8 @@ impl BlossomHttpTransport {
     }
 
     #[cfg(test)]
+    /// Inject a resolver so tests can prove that expired origin leases are
+    /// resolved and vetted again.
     pub(super) fn for_test_with_resolver(
         allow_loopback_http: bool,
         address_lease: Duration,
@@ -180,6 +189,8 @@ impl BlossomHttpTransport {
         )
     }
 
+    /// Return a client pinned to a currently vetted address set for the URL's
+    /// exact origin, refreshing it when the bounded lease expires.
     pub(super) async fn client_for_url(&self, url: &Url) -> Result<reqwest::Client, AppError> {
         validate_blossom_fetch_url(url, self.allow_loopback_http)
             .map_err(|err| AppError::BlobStore(format!("unsafe Blossom URL: {err}")))?;
@@ -228,6 +239,8 @@ impl BlossomHttpTransport {
         Ok(client)
     }
 
+    /// Reuse the same safe origin cache through a view that rejects loopback
+    /// HTTP before consulting any cached generation.
     pub(super) fn with_loopback_disabled(&self) -> Self {
         // The stricter view may share the pool because client_for_url validates
         // its own loopback policy before consulting a cached generation.
@@ -246,6 +259,8 @@ impl BlossomHttpTransport {
     }
 }
 
+/// Resolve the full address set so every answer can be vetted before a client
+/// is pinned to that generation.
 fn system_dns_resolver() -> DnsResolver {
     Arc::new(|domain, port| {
         Box::pin(async move {
@@ -418,6 +433,8 @@ pub(crate) async fn fetch_blossom_blob(
     fetch_blossom_blob_with_transport(url, &transport).await
 }
 
+/// Fetch a bounded blob through a caller-owned transport without collecting
+/// telemetry, primarily for internal callers and deterministic tests.
 pub(crate) async fn fetch_blossom_blob_with_transport(
     url: &str,
     transport: &BlossomHttpTransport,
@@ -923,6 +940,8 @@ async fn read_limited_blossom_upload_body(
     .map_err(|_| AppError::MediaUploadTimedOut)?
 }
 
+/// Stream a response under size and first-byte bounds while recording only
+/// aggregate first-byte and body-transfer outcomes.
 async fn read_limited_blossom_body_until(
     response: reqwest::Response,
     max_bytes: u64,

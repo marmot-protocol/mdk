@@ -433,9 +433,83 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
         point.name == metric_names::APP_GROUP_ACCEPT_INVITE_FAILURES
             && point.value == ExportMetricValue::Counter(1)
     }));
+    // Every media phase uses the same population-only export path. Assert all
+    // four points per phase remain free of relay and failure attributes so a
+    // later field addition cannot silently turn media activity into a dynamic
+    // per-host, per-account, or per-message series.
+    for metric_names in [
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES,
+        ],
+        [
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION,
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS,
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES,
+            metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES,
+        ],
+    ] {
+        for name in metric_names {
+            assert!(
+                batch.points.iter().any(|point| point.name == name
+                    && point.relay.is_none()
+                    && point.failure.is_none()),
+                "missing unlabeled media telemetry export {name}",
+            );
+        }
+    }
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS
-            && point.relay.is_none()
             && point.value == ExportMetricValue::Counter(2)
     }));
 

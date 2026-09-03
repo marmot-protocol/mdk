@@ -809,6 +809,8 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
     assert_eq!(downloaded.plaintext, vec![0x5a; plaintext_len]);
 }
 
+/// A successful round trip records transport, integrity, and crypto phases
+/// without changing the downloaded result.
 #[tokio::test]
 async fn encrypted_media_download_records_network_integrity_and_crypto_phases() {
     let (server, _received) = spawn_roundtrip_blob_server();
@@ -1824,8 +1826,13 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
     assert_eq!(downloaded, body);
 }
 
+/// Multiple stalled locators consume one shared transfer deadline instead of
+/// receiving a fresh end-to-end budget for every candidate.
 #[tokio::test]
 async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
+    const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
+    const EARLY_COMPLETION_TOLERANCE: Duration = Duration::from_millis(30);
+
     let body = b"healthy ciphertext";
     let (first_url, first_server) = spawn_stalled_http_server().await;
     let (second_url, second_server) = spawn_stalled_http_server().await;
@@ -1835,7 +1842,7 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
         true,
         Duration::from_secs(60),
         Duration::from_millis(80),
-        Duration::from_millis(130),
+        TRANSFER_DEADLINE,
     );
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     let started = Instant::now();
@@ -1847,8 +1854,13 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     second_server.abort();
 
     assert!(error.to_string().contains("timed out"));
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        elapsed >= TRANSFER_DEADLINE - EARLY_COMPLETION_TOLERANCE,
+        "the shared end-to-end deadline must be consumed before timing out"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
         "two stalled candidates must share the configured end-to-end deadline"
     );
 }

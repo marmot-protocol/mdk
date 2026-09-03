@@ -749,6 +749,8 @@ pub(crate) async fn download_encrypted_media(
     .await
 }
 
+/// Download, authenticate, decrypt, and verify one attachment while optionally
+/// recording only reviewed aggregate phase outcomes.
 pub(crate) async fn download_encrypted_media_with_transport(
     reference: MediaAttachmentReference,
     media_secret: &[u8],
@@ -842,6 +844,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
     })
 }
 
+/// Compare downloaded ciphertext with the reference hash before decryption.
 fn encrypted_media_hash_matches(encrypted: &[u8], expected_hash: &str) -> bool {
     hex::encode(Sha256::digest(encrypted)).eq_ignore_ascii_case(expected_hash)
 }

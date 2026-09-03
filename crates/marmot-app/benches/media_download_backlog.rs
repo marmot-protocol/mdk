@@ -14,6 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const BACKLOG_SIZE: usize = 16;
 const BODY_SIZE: usize = 64 * 1024;
 
+/// Start a loopback HTTP/1.1 server that keeps each accepted connection alive
+/// so the benchmark can distinguish connection reuse from per-request setup.
 async fn spawn_keep_alive_server(
     requests_expected: usize,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -66,21 +68,22 @@ async fn spawn_keep_alive_server(
     (format!("http://localhost:{port}/blob.bin"), server)
 }
 
+/// Download one fixed backlog either through one shared transport or through a
+/// fresh transport per item while keeping payload and server behavior equal.
 async fn run_backlog(reuse_transport: bool) {
     let (url, server) = spawn_keep_alive_server(BACKLOG_SIZE).await;
     let shared = MediaDownloadBenchmarkTransport::new();
     for _ in 0..BACKLOG_SIZE {
-        let transport = if reuse_transport {
-            &shared
-        } else {
-            &MediaDownloadBenchmarkTransport::new()
-        };
+        let fresh = (!reuse_transport).then(MediaDownloadBenchmarkTransport::new);
+        let transport = fresh.as_ref().unwrap_or(&shared);
         let body = transport.fetch(&url).await.unwrap();
         assert_eq!(body.len(), BODY_SIZE);
     }
     server.await.unwrap();
 }
 
+/// Measure a stable wall-clock p95 for the complete backlog outside Criterion's
+/// statistical report so before/after evidence uses the same definition.
 async fn backlog_p95(reuse_transport: bool, samples: usize) -> Duration {
     let mut durations = Vec::with_capacity(samples);
     for _ in 0..samples {
@@ -92,6 +95,7 @@ async fn backlog_p95(reuse_transport: bool, samples: usize) -> Duration {
     durations[(samples * 95).div_ceil(100).saturating_sub(1)]
 }
 
+/// Register both transport policies and print their directly comparable p95s.
 fn media_download_backlog(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let shared_p95 = runtime.block_on(backlog_p95(true, 20));
