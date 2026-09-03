@@ -80,8 +80,108 @@ pub struct HarnessClient {
     /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
     audit_capture: AuditCapture,
     convergence_checkpoints: HashMap<String, (GroupId, DurableConvergencePass)>,
+    #[cfg(test)]
+    scripted_convergence_drain: Option<ScriptedConvergenceDrain>,
 }
 
+#[cfg(test)]
+struct ScriptedConvergenceDrain {
+    group_id: GroupId,
+    remaining_retained_messages: usize,
+    remaining_passes: usize,
+    attempted_passes: usize,
+    generation: u64,
+    scheduled: bool,
+    advance_generation: bool,
+    fail_on_attempt: Option<usize>,
+}
+
+#[cfg(test)]
+impl ScriptedConvergenceDrain {
+    /// Builds bounded retained-history work for harness-level tick tests.
+    fn retained_history(retained_messages: usize, passes: usize) -> Self {
+        Self {
+            group_id: GroupId::new(b"scripted-convergence-drain".to_vec()),
+            remaining_retained_messages: retained_messages,
+            remaining_passes: passes,
+            attempted_passes: 0,
+            generation: 1,
+            scheduled: passes > 0,
+            advance_generation: true,
+            fail_on_attempt: None,
+        }
+    }
+
+    /// Builds a scheduler that re-arms forever without changing durable state.
+    fn stalled() -> Self {
+        Self {
+            advance_generation: false,
+            ..Self::retained_history(0, usize::MAX)
+        }
+    }
+
+    /// Builds a drain whose underlying convergence operation fails verbatim.
+    fn failing(attempt: usize) -> Self {
+        Self {
+            fail_on_attempt: Some(attempt),
+            ..Self::retained_history(attempt, attempt)
+        }
+    }
+
+    /// Drains the scripted one-shot schedule edge.
+    fn drain_pending_groups(&mut self) -> Vec<GroupId> {
+        if !self.scheduled {
+            return Vec::new();
+        }
+        self.scheduled = false;
+        vec![self.group_id.clone()]
+    }
+
+    /// Captures the same privacy-safe fields used by the real engine seam.
+    fn progress(&self) -> ConformanceStructuralProgressSnapshot {
+        let pending_work = cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot {
+            scheduled_convergence_groups: usize::from(self.scheduled),
+            ..Default::default()
+        };
+        ConformanceStructuralProgressSnapshot {
+            current_epoch: self.generation,
+            current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
+            lifecycle: cgka_traits::engine_state::GroupLifecycleState::Stable,
+            pending_work,
+            pass_generation: Some(self.generation),
+            pass_phase: Some(ConvergencePassPhase::Resolving),
+            earliest_next_wake_monotonic_ms: None,
+            runnable_work: 1,
+            terminal_unrecoverable: false,
+        }
+    }
+
+    /// Executes one scripted convergence round and re-arms when work remains.
+    fn converge(&mut self) -> Result<Vec<SendResult>, EngineError> {
+        self.attempted_passes = self.attempted_passes.saturating_add(1);
+        if self.fail_on_attempt == Some(self.attempted_passes) {
+            return Err(EngineError::Backend(
+                "scripted underlying convergence failure".into(),
+            ));
+        }
+        if self.advance_generation {
+            let messages_this_pass = self
+                .remaining_retained_messages
+                .div_ceil(self.remaining_passes);
+            self.remaining_retained_messages = self
+                .remaining_retained_messages
+                .saturating_sub(messages_this_pass);
+            self.remaining_passes = self.remaining_passes.saturating_sub(1);
+            self.generation = self.generation.saturating_add(1);
+            self.scheduled = self.remaining_passes > 0;
+        } else {
+            self.scheduled = true;
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Saturating-merge one engine metrics snapshot into the harness aggregate.
 pub(crate) fn merge_engine_metrics(
     target: &mut EngineMetricsSnapshot,
     source: &EngineMetricsSnapshot,
@@ -185,6 +285,7 @@ pub(crate) fn merge_engine_metrics(
     );
 }
 
+/// Saturating-merge histogram buckets while retaining upper-bound order.
 fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
     for source_bucket in &source.buckets {
         if let Some(target_bucket) = target
@@ -201,6 +302,12 @@ fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
     target.overflow_count = target.overflow_count.saturating_add(source.overflow_count);
 }
 
+/// Rejects only an exact full-slice repeat of scheduled structural state.
+///
+/// A durable pass-generation change counts as progress. More complex cycles
+/// remain the scenario fixed-point driver's responsibility; this local guard
+/// exists to catch a scheduler that repeatedly re-arms the same state without
+/// turning the per-tick work bound into a convergence deadline.
 fn ensure_convergence_drain_progress(
     attempts: usize,
     continuation_scheduled: bool,
@@ -217,12 +324,13 @@ fn ensure_convergence_drain_progress(
 }
 
 #[cfg(test)]
-mod metric_tests {
+mod tests {
     use super::*;
     use cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot;
     use cgka_engine::engine_metrics::HistogramBucket;
     use cgka_traits::engine_state::GroupLifecycleState;
 
+    /// Builds a single-bucket histogram fixture.
     fn histogram(upper_bound: u64, count: u64, overflow_count: u64) -> HistogramSnapshot {
         HistogramSnapshot {
             buckets: vec![HistogramBucket { upper_bound, count }],
@@ -230,6 +338,7 @@ mod metric_tests {
         }
     }
 
+    /// Every engine metric participates in the aggregate merge.
     #[test]
     fn merge_engine_metrics_covers_every_snapshot_field() {
         let source = EngineMetricsSnapshot {
@@ -273,6 +382,7 @@ mod metric_tests {
         assert_eq!(target, source);
     }
 
+    /// An unchanged, re-armed eighth attempt is a local scheduler spin.
     #[test]
     fn eight_repeated_convergence_drain_states_are_a_typed_failure() {
         let progress = structural_progress(7);
@@ -290,6 +400,7 @@ mod metric_tests {
         );
     }
 
+    /// Seven unchanged attempts remain below the deterministic slice bound.
     #[test]
     fn seven_repeated_convergence_drain_states_can_continue() {
         let progress = structural_progress(7);
@@ -303,6 +414,7 @@ mod metric_tests {
         .expect("the deterministic slice still has one attempt left");
     }
 
+    /// Advancing the durable pass generation permits cross-tick continuation.
     #[test]
     fn changed_convergence_drain_state_can_continue_after_eight_attempts() {
         let previous = structural_progress(7);
@@ -317,6 +429,7 @@ mod metric_tests {
         .expect("a later pass generation is structural progress");
     }
 
+    /// Twelve retained-history rounds can span an eight- plus four-pass slice.
     #[test]
     fn large_retained_history_can_continue_in_a_later_bounded_slice() {
         // The 384-message natural-history case advances through twelve commit
@@ -338,6 +451,96 @@ mod metric_tests {
         .expect("the following tick can settle the retained history");
     }
 
+    /// Seven and eight scheduled passes both complete in one harness tick.
+    #[tokio::test]
+    async fn harness_tick_covers_seven_and_eight_pass_boundaries() {
+        for passes in [
+            HARNESS_CONVERGENCE_DRAIN_PASSES - 1,
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+        ] {
+            let mut client =
+                scripted_client(ScriptedConvergenceDrain::retained_history(passes, passes));
+
+            let outcomes = client.tick().await;
+
+            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+            let script = client.scripted_convergence_drain.as_ref().unwrap();
+            assert_eq!(script.attempted_passes, passes);
+            assert_eq!(script.remaining_passes, 0);
+            assert_eq!(script.remaining_retained_messages, 0);
+            assert!(!script.scheduled);
+        }
+    }
+
+    /// A 384-message, twelve-round drain continues on a second harness tick.
+    #[tokio::test]
+    async fn harness_tick_continues_large_retained_history_after_eight_passes() {
+        let mut client = scripted_client(ScriptedConvergenceDrain::retained_history(384, 12));
+
+        let first = client.tick().await;
+
+        assert!(first.iter().all(Result::is_ok), "{first:?}");
+        let script = client.scripted_convergence_drain.as_ref().unwrap();
+        assert_eq!(script.attempted_passes, HARNESS_CONVERGENCE_DRAIN_PASSES);
+        assert_eq!(script.remaining_passes, 4);
+        assert_eq!(script.remaining_retained_messages, 128);
+        assert!(script.scheduled);
+
+        let second = client.tick().await;
+
+        assert!(second.iter().all(Result::is_ok), "{second:?}");
+        let script = client.scripted_convergence_drain.as_ref().unwrap();
+        assert_eq!(script.attempted_passes, 12);
+        assert_eq!(script.remaining_passes, 0);
+        assert_eq!(script.remaining_retained_messages, 0);
+        assert!(!script.scheduled);
+    }
+
+    /// The same tick path retains a typed failure for an unchanged re-arm loop.
+    #[tokio::test]
+    async fn harness_tick_rejects_a_true_scheduler_spin() {
+        let mut client = scripted_client(ScriptedConvergenceDrain::stalled());
+
+        let outcomes = client.tick().await;
+
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Err(EngineError::Backend(message))]
+                if message.contains("without structural progress")
+        ));
+        assert_eq!(
+            client
+                .scripted_convergence_drain
+                .as_ref()
+                .unwrap()
+                .attempted_passes,
+            HARNESS_CONVERGENCE_DRAIN_PASSES
+        );
+    }
+
+    /// A real convergence error is not replaced by the slice guard.
+    #[tokio::test]
+    async fn harness_tick_preserves_underlying_convergence_error() {
+        let mut client = scripted_client(ScriptedConvergenceDrain::failing(8));
+
+        let outcomes = client.tick().await;
+
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Err(EngineError::Backend(message))]
+                if message == "scripted underlying convergence failure"
+        ));
+    }
+
+    /// Wraps a scripted drain in a real `HarnessClient` tick surface.
+    fn scripted_client(script: ScriptedConvergenceDrain) -> HarnessClient {
+        let bus = TransportBus::ordered();
+        let mut client = ClientBuilder::new(b"scripted-drain-client".to_vec()).attach(&bus);
+        client.scripted_convergence_drain = Some(script);
+        client
+    }
+
+    /// Builds a privacy-safe structural state for drain-boundary tests.
     fn structural_progress(pass_generation: u64) -> ConformanceStructuralProgressSnapshot {
         ConformanceStructuralProgressSnapshot {
             current_epoch: pass_generation,
@@ -611,6 +814,8 @@ impl ClientBuilder {
             regenerated_queued_intents: HashMap::new(),
             audit_capture,
             convergence_checkpoints: HashMap::new(),
+            #[cfg(test)]
+            scripted_convergence_drain: None,
         }
     }
 }
@@ -1788,6 +1993,46 @@ impl HarnessClient {
             .collect()
     }
 
+    /// Drains the next one-shot convergence schedule batch.
+    fn drain_harness_convergence_groups(&mut self) -> Vec<GroupId> {
+        #[cfg(test)]
+        if let Some(script) = self.scripted_convergence_drain.as_mut() {
+            return script.drain_pending_groups();
+        }
+        self.engine_mut().drain_pending_convergence_groups()
+    }
+
+    /// Captures structural progress through the production or scripted seam.
+    fn harness_convergence_progress(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<ConformanceStructuralProgressSnapshot, EngineError> {
+        #[cfg(test)]
+        if let Some(script) = self.scripted_convergence_drain.as_ref() {
+            assert_eq!(&script.group_id, group_id, "scripted convergence group");
+            return Ok(script.progress());
+        }
+        self.engine()
+            .conformance_structural_progress_snapshot(group_id)
+    }
+
+    /// Runs one convergence attempt through the production or scripted seam.
+    async fn harness_converge_and_drain(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+    ) -> Result<Vec<SendResult>, EngineError> {
+        #[cfg(test)]
+        if let Some(script) = self.scripted_convergence_drain.as_mut() {
+            assert_eq!(&script.group_id, group_id, "scripted convergence group");
+            return script.converge();
+        }
+        self.engine_mut()
+            .converge_and_drain_queued_outbound_intents(group_id, now_ms)
+            .await
+    }
+
+    /// Executes one deterministic convergence-work slice for this harness tick.
     async fn drive_due_convergence(
         &mut self,
         outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
@@ -1797,27 +2042,25 @@ impl HarnessClient {
             HashMap::<GroupId, (usize, ConformanceStructuralProgressSnapshot)>::new();
         let mut encountered_error = false;
         for _ in 0..HARNESS_CONVERGENCE_DRAIN_PASSES {
-            let groups = self.engine_mut().drain_pending_convergence_groups();
+            let mut groups = self.drain_harness_convergence_groups();
             if groups.is_empty() {
                 return;
             }
+            groups.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
             for group_id in groups {
-                let progress = match self
-                    .engine()
-                    .conformance_structural_progress_snapshot(&group_id)
-                {
-                    Ok(progress) => progress,
-                    Err(error) => {
-                        outcomes.push(Err(error));
-                        encountered_error = true;
-                        continue;
+                let initial_progress = if successful_attempts.contains_key(&group_id) {
+                    None
+                } else {
+                    match self.harness_convergence_progress(&group_id) {
+                        Ok(progress) => Some(progress),
+                        Err(error) => {
+                            outcomes.push(Err(error));
+                            encountered_error = true;
+                            continue;
+                        }
                     }
                 };
-                let results = match self
-                    .engine_mut()
-                    .converge_and_drain_queued_outbound_intents(&group_id, now_ms)
-                    .await
-                {
+                let results = match self.harness_converge_and_drain(&group_id, now_ms).await {
                     Ok(results) => results,
                     Err(e) => {
                         outcomes.push(Err(e));
@@ -1825,34 +2068,34 @@ impl HarnessClient {
                         continue;
                     }
                 };
-                let mut attempt_succeeded = true;
                 self.capture_engine_events();
                 for result in results {
                     if let Err(e) = self.publish_send_result(result).await {
                         outcomes.push(Err(e));
-                        attempt_succeeded = false;
                         encountered_error = true;
                     }
                 }
                 self.drain_auto_publish().await;
-                if attempt_succeeded {
-                    successful_attempts
-                        .entry(group_id)
-                        .and_modify(|(attempts, _)| {
-                            *attempts = attempts.saturating_add(1);
-                        })
-                        .or_insert((1, progress));
-                }
+                successful_attempts
+                    .entry(group_id)
+                    .and_modify(|(attempts, _)| {
+                        *attempts = attempts.saturating_add(1);
+                    })
+                    .or_insert_with(|| {
+                        (
+                            1,
+                            initial_progress.expect("untracked group captured initial progress"),
+                        )
+                    });
             }
         }
         if encountered_error {
             return;
         }
+        let mut successful_attempts = successful_attempts.into_iter().collect::<Vec<_>>();
+        successful_attempts.sort_by(|(left, _), (right, _)| left.as_slice().cmp(right.as_slice()));
         for (group_id, (attempts, initial)) in successful_attempts {
-            let mut current = match self
-                .engine()
-                .conformance_structural_progress_snapshot(&group_id)
-            {
+            let mut current = match self.harness_convergence_progress(&group_id) {
                 Ok(progress) => progress,
                 Err(error) => {
                     outcomes.push(Err(error));
