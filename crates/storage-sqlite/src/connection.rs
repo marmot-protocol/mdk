@@ -1067,7 +1067,22 @@ impl StorageProvider for SqliteAccountStorage {
     }
 
     fn mls_write_generation(&self) -> Option<u64> {
-        Some(self.connection.openmls_write_generation())
+        if self.connection.is_closed() {
+            return None;
+        }
+        // `PRAGMA data_version` changes whenever another connection or process
+        // commits to this database, which the in-process write counter cannot
+        // see. Pack both so either kind of write invalidates a cached group.
+        // Each half wraps at 2^32; a wrap between two reads of the same cache
+        // entry is not a realistic event.
+        let data_version: i64 = self
+            .connection
+            .lock()
+            .ok()?
+            .query_row_cached("PRAGMA data_version", [], |row| row.get(0))
+            .ok()?;
+        let own = self.connection.openmls_write_generation() & 0xffff_ffff;
+        Some(((data_version as u64) << 32) | own)
     }
 
     fn maintenance_storage(&self) -> Option<&dyn cgka_traits::storage::MaintenanceStorage> {

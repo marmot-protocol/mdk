@@ -77,6 +77,7 @@ pub(super) fn restore_group_state_checkpoint(
     group_id: &GroupId,
     checkpoint_id: &str,
 ) -> StorageResult<()> {
+    store.connection.note_openmls_write();
     if store.connection.is_current_thread_transaction_owner() {
         let conn = store.lock()?;
         return restore_on_connection(&conn, group_id, checkpoint_id);

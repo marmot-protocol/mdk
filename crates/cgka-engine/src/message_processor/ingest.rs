@@ -423,12 +423,14 @@ impl<S: StorageProvider> Engine<S> {
             // active.
             self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Failed)?;
             self.realize_self_eviction(&group_id, current_epoch)?;
+            self.return_unmodified_mls_group(&group_id, mls_group);
             return Ok(IngestOutcome::LocalState {
                 state: LocalIngestState::Removed,
             });
         }
         if !self.epoch_manager.can_ingest(&group_id) {
             self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Retryable)?;
+            self.return_unmodified_mls_group(&group_id, mls_group);
             return Ok(IngestOutcome::Buffered {
                 group_id,
                 epoch: current_epoch,
@@ -516,6 +518,7 @@ impl<S: StorageProvider> Engine<S> {
                         } else {
                             InputRejectionCategory::InvalidEncoding
                         };
+                        self.return_unmodified_mls_group(&group_id, mls_group);
                         return self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
@@ -524,6 +527,7 @@ impl<S: StorageProvider> Engine<S> {
                         );
                     }
                     Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
+                        self.return_unmodified_mls_group(&group_id, mls_group);
                         return self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
@@ -580,6 +584,7 @@ impl<S: StorageProvider> Engine<S> {
                             method = "ingest_group_message",
                             "peel-deferred row cap reached; dropping undecryptable input unpersisted"
                         );
+                        self.return_unmodified_mls_group(&group_id, mls_group);
                         return Ok(IngestOutcome::ResourceRefused {
                             group_id,
                             resource: InboundResourceLimit::TransportDeferredCapacity,
@@ -608,6 +613,7 @@ impl<S: StorageProvider> Engine<S> {
                         ),
                     );
                     let lineage = self.deferral_lineage(&group_id)?;
+                    self.return_unmodified_mls_group(&group_id, mls_group);
                     return Ok(IngestOutcome::TransportDeferred { group_id, lineage });
                 }
             }
@@ -642,6 +648,7 @@ impl<S: StorageProvider> Engine<S> {
                         } else {
                             InputRejectionCategory::InvalidEncoding
                         };
+                        self.return_unmodified_mls_group(&group_id, mls_group);
                         return self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
@@ -650,6 +657,7 @@ impl<S: StorageProvider> Engine<S> {
                         );
                     }
                     Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
+                        self.return_unmodified_mls_group(&group_id, mls_group);
                         return self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
@@ -701,6 +709,7 @@ impl<S: StorageProvider> Engine<S> {
                             "stale_epoch_no_snapshot",
                         ),
                     );
+                    self.return_unmodified_mls_group(&group_id, mls_group);
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::AlreadyAtEpoch {
                             current: context_epoch,
@@ -732,6 +741,7 @@ impl<S: StorageProvider> Engine<S> {
                 } else {
                     InputRejectionCategory::InvalidEncoding
                 };
+                self.return_unmodified_mls_group(&group_id, mls_group);
                 return self.terminal_peel_rejection_ignored(
                     &raw_msg_id,
                     &msg.id,
@@ -740,6 +750,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
             Err(PeelerError::WrongRecipient) => {
+                self.return_unmodified_mls_group(&group_id, mls_group);
                 return self.terminal_peel_rejection_ignored(
                     &raw_msg_id,
                     &msg.id,
@@ -765,6 +776,7 @@ impl<S: StorageProvider> Engine<S> {
                     current_epoch,
                     MessageState::Failed,
                 )?;
+                self.return_unmodified_mls_group(&group_id, mls_group);
                 return Ok(IngestOutcome::Ignored {
                     category: InputRejectionCategory::InvalidEncoding,
                 });
@@ -785,11 +797,13 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(outcome);
         }
         if self.seen_message_ids.contains(&content_id) {
+            self.return_unmodified_mls_group(&group_id, mls_group);
             return Ok(IngestOutcome::Ignored {
                 category: InputRejectionCategory::Duplicate,
             });
         }
         if self.sent_message_ids.contains(&content_id) {
+            self.return_unmodified_mls_group(&group_id, mls_group);
             return Ok(IngestOutcome::Ignored {
                 category: InputRejectionCategory::OwnEcho,
             });
@@ -828,6 +842,7 @@ impl<S: StorageProvider> Engine<S> {
                     &raw_msg_id,
                     "malformed_mls_message",
                 )?;
+                self.return_unmodified_mls_group(&group_id, mls_group);
                 return Ok(IngestOutcome::Ignored {
                     category: InputRejectionCategory::InvalidEncoding,
                 });
@@ -851,6 +866,7 @@ impl<S: StorageProvider> Engine<S> {
                     &raw_msg_id,
                     "non_mls_message_body",
                 )?;
+                self.return_unmodified_mls_group(&group_id, mls_group);
                 return Ok(IngestOutcome::Ignored {
                     category: InputRejectionCategory::InvalidEncoding,
                 });
@@ -885,6 +901,7 @@ impl<S: StorageProvider> Engine<S> {
                 ),
             );
             self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
+            self.return_unmodified_mls_group(&group_id, mls_group);
             return Ok(IngestOutcome::Stale {
                 reason: StaleReason::PreMembership,
             });

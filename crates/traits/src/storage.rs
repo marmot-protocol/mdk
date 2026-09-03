@@ -791,9 +791,10 @@ pub trait StorageProvider:
     /// them. The engine keeps loaded `MlsGroup`s across calls and reuses one
     /// only while this value equals the value observed when it was stored;
     /// `None` disables that reuse. A tracking backend must change the count on
-    /// every write to the OpenMLS store, including transaction rollbacks and
-    /// snapshot restores that bypass the OpenMLS provider, so a cached object
-    /// can never outlive the state it was loaded from.
+    /// every write to the OpenMLS store, including transaction rollbacks,
+    /// snapshot restores that bypass the OpenMLS provider, and commits made
+    /// by other connections or processes, so a cached object can never
+    /// outlive the state it was loaded from.
     fn mls_write_generation(&self) -> Option<u64> {
         None
     }
