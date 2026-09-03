@@ -110,8 +110,8 @@ mod migration_0054_transport_reconciliation_items;
 mod migration_0055_epoch_stall_evidence;
 #[path = "migrations/0056_chat_list_accepted_activity_high_water.rs"]
 mod migration_0056_chat_list_accepted_activity_high_water;
-#[path = "migrations/0057_openmls_values_cbor_encoding.rs"]
-mod migration_0057_openmls_values_cbor_encoding;
+#[path = "migrations/0057_openmls_values_msgpack.rs"]
+mod migration_0057_openmls_values_msgpack;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -409,8 +409,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 57,
-        name: "0057_openmls_values_cbor_encoding",
-        apply: migration_0057_openmls_values_cbor_encoding::apply,
+        name: "0057_openmls_values_msgpack",
+        apply: migration_0057_openmls_values_msgpack::apply,
     },
 ];
 
