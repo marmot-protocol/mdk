@@ -267,6 +267,48 @@ impl DirectoryRelayPlane {
         (to_add, to_remove)
     }
 
+    /// Record the validation filter immediately after its SDK subscription is
+    /// created, so a later batch failure cannot leave that live subscription
+    /// unknown to [`Self::accepts_live_event`].
+    pub(crate) async fn record_subscription_filter(
+        &self,
+        subscription_id: String,
+        filter: DirectorySubscriptionFilter,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        let created = state
+            .active_subscriptions
+            .insert(subscription_id, filter)
+            .is_none();
+        if created {
+            state.subscriptions_created += 1;
+        }
+        created
+    }
+
+    /// Complete a subscription sync whose newly created filters were already
+    /// recorded as their SDK subscriptions succeeded.
+    pub(crate) async fn complete_subscription_sync(
+        &self,
+        desired: HashMap<String, DirectorySubscriptionFilter>,
+        subscriptions_created: usize,
+    ) -> Result<DirectorySubscriptionSyncSummary, String> {
+        let mut state = self.state.lock().await;
+        let removed = state
+            .active_subscriptions
+            .keys()
+            .filter(|id| !desired.contains_key(*id))
+            .count();
+        state.completed_subscription_syncs += 1;
+        state.subscriptions_removed += removed;
+        state.active_subscriptions = desired;
+        Ok(DirectorySubscriptionSyncSummary {
+            active_subscriptions: state.active_subscriptions.len(),
+            subscriptions_created,
+            subscriptions_removed: removed,
+        })
+    }
+
     /// Replace the active directory subscriptions with the supplied
     /// `(subscription_id, filter)` plan, returning the lifecycle summary.
     ///
