@@ -24,7 +24,7 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
+use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -37,7 +37,7 @@ use cgka_traits::storage::{
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::component::ComponentType;
 use openmls::extensions::{
     AppDataDictionary, AppDataDictionaryExtension, Extension, LastResortExtension,
@@ -3031,4 +3031,38 @@ async fn audit_log_records_welcome_recipient_expectation() {
     ));
     assert_eq!(app_message.expected_count, Some(1));
     assert_eq!(app_message.expected_member_refs.len(), 1);
+}
+
+/// The strict-cutover Invite gate reads the durable group record to check its
+/// profile. With no record (`get_group` -> `NotFound`) the gate must fail
+/// with that storage error rather than fall through to later stages.
+#[tokio::test]
+async fn current_invite_to_unknown_group_fails_on_missing_record() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut current = build_profile_client_on_storage(
+        b"missing-record-invite",
+        storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let unknown = GroupId::new(vec![0xAB; 16]);
+    assert!(matches!(
+        storage.get_group(&unknown),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+
+    let error = current
+        .send(SendIntent::Invite {
+            group_id: unknown,
+            key_packages: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("invite to an unknown group must fail");
+    assert!(
+        matches!(
+            error,
+            EngineError::Storage(cgka_traits::storage::StorageError::NotFound)
+        ),
+        "expected missing-record error, got {error:?}"
+    );
 }

@@ -2249,48 +2249,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// Whether the local copy of `group_id` is marked removed (realized
-    /// self-eviction; member-departure.md "Realizing removal"). A removed copy
-    /// is terminal for outbound work: nothing may be prepared or published for
-    /// it. Unknown groups report `false` — callers fail them with their own
-    /// unknown-group handling. The marker clears through an authenticated
-    /// re-join (`do_join_welcome` rebuilds the record) or when branch
-    /// selection supersedes the removal that set it — the convergence reorg
-    /// path re-derives membership from the selected canonical branch
-    /// (`emit_convergence_events`).
-    pub(crate) fn group_record_is_removed(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        match self.storage.get_group(group_id) {
-            Ok(group) => Ok(group.removed),
-            Err(StorageError::NotFound) => Ok(false),
-            Err(err) => Err(EngineError::Storage(err)),
-        }
-    }
-
-    /// Ensure a durable `Unrecoverable` halt is reflected in the in-memory
-    /// epoch map (mdk#971). Returns `true` when the group is halted. Used as
-    /// defense-in-depth on paths that may run before or without session-open
-    /// hydration so a persisted marker cannot be skipped by a bare
-    /// `set_stable` overwrite.
-    pub(crate) fn sync_unrecoverable_halt_from_storage(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<bool, EngineError> {
-        if self.epoch_manager.is_unrecoverable(group_id) {
-            return Ok(true);
-        }
-        let group = match self.storage.get_group(group_id) {
-            Ok(group) => group,
-            Err(StorageError::NotFound) => return Ok(false),
-            Err(err) => return Err(EngineError::Storage(err)),
-        };
-        if !group.unrecoverable {
-            return Ok(false);
-        }
-        self.epoch_manager
-            .restore_unrecoverable(group_id.clone(), group.epoch);
-        Ok(true)
-    }
-
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
     /// retained artifact in place.
     ///
