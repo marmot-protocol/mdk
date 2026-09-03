@@ -11,6 +11,7 @@ use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE, NostrPeelerError};
 
 use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
+use crate::directory::DirectorySyncBatch;
 
 use super::*;
 
@@ -1585,6 +1586,63 @@ async fn directory_plane_with_active_subscription(
         .await
         .expect("active subscription is recorded");
     directory
+}
+
+#[tokio::test]
+async fn directory_sync_keeps_filter_for_subscription_created_before_later_error() {
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let author = "11".repeat(32);
+    let subscription_id = "directory_users_0_first".to_owned();
+    let plan = DirectorySyncPlan {
+        endpoints: vec![TransportEndpoint(relay_url)],
+        watched_user_count: 2,
+        batches: vec![
+            DirectorySyncBatch {
+                subscription_id: subscription_id.clone(),
+                authors: vec![author.clone()],
+                kinds: vec![0],
+                since: None,
+            },
+            DirectorySyncBatch {
+                subscription_id: "directory_users_1_invalid".to_owned(),
+                authors: vec!["not-a-public-key".to_owned()],
+                kinds: vec![0],
+                since: None,
+            },
+        ],
+    };
+
+    let err = relay_plane
+        .sync_directory_user_subscriptions(plan, false)
+        .await
+        .expect_err("the invalid later batch must fail the sync");
+    assert_eq!(err, "invalid directory author");
+
+    let sdk_subscriptions = relay_plane
+        .inner
+        .transport
+        .sdk_relay_client
+        .as_ref()
+        .unwrap()
+        .client()
+        .subscriptions()
+        .await;
+    assert!(
+        sdk_subscriptions.contains_key(&SubscriptionId::new(subscription_id.clone())),
+        "the first SDK subscription must be live before the later batch fails"
+    );
+    assert!(
+        relay_plane
+            .inner
+            .directory
+            .accepts_live_event(&subscription_id, &author, 0)
+            .await,
+        "the validation filter must be committed for every live SDK subscription"
+    );
+
+    relay_plane.shutdown().await;
 }
 
 #[tokio::test]

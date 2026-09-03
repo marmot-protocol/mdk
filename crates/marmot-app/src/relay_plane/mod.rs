@@ -1010,6 +1010,7 @@ impl MarmotRelayPlane {
         // into the directory cache when it matches an active subscription's
         // requested authors and kinds (mdk#709).
         let mut desired = HashMap::with_capacity(plan.batches.len());
+        let mut subscriptions_created = 0;
         for batch in &plan.batches {
             let authors = batch
                 .authors
@@ -1028,10 +1029,9 @@ impl MarmotRelayPlane {
             // Canonical lowercase hex matches the `event.pubkey` form a forwarded
             // SDK event carries, so the membership check is exact.
             let filter_authors = authors.iter().map(PublicKey::to_hex).collect::<Vec<_>>();
-            desired.insert(
-                batch.subscription_id.clone(),
-                DirectorySubscriptionFilter::new(filter_authors, batch.kinds.clone()),
-            );
+            let validation_filter =
+                DirectorySubscriptionFilter::new(filter_authors, batch.kinds.clone());
+            desired.insert(batch.subscription_id.clone(), validation_filter.clone());
             if !to_add.contains(&batch.subscription_id) {
                 continue;
             }
@@ -1052,9 +1052,18 @@ impl MarmotRelayPlane {
                 )
                 .await
                 .map_err(|err| format!("directory subscription subscribe: {err}"))?;
+            subscriptions_created += usize::from(
+                self.inner
+                    .directory
+                    .record_subscription_filter(batch.subscription_id.clone(), validation_filter)
+                    .await,
+            );
         }
 
-        self.inner.directory.replace_subscriptions(desired).await
+        self.inner
+            .directory
+            .complete_subscription_sync(desired, subscriptions_created)
+            .await
     }
 
     pub async fn shutdown(&self) {
