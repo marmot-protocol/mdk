@@ -224,6 +224,18 @@ mod tests {
         assert_eq!(store.get_group(&group.id).unwrap(), group);
     }
 
+    /// MessagePack rows written before the ids carried `serde_bytes` spell
+    /// each byte vector as an array of integers; the byte-string visitor
+    /// must still accept that form.
+    #[test]
+    fn group_record_with_integer_array_bytes_still_decodes() {
+        let group = sample_group(gid(1), 7, 3);
+        let as_arrays = serde_json::to_value(&group).unwrap();
+        let mut record = vec![0x00, 0x02];
+        record.extend(rmp_serde::to_vec_named(&as_arrays).unwrap());
+        assert_eq!(super::decode_group(&record).unwrap(), group);
+    }
+
     #[test]
     fn group_record_written_as_json_still_decodes() {
         let store = SqliteAccountStorage::in_memory().unwrap();

@@ -11,6 +11,7 @@ description = "Shared traits and cross-boundary value types for the CGKA engine,
 async-trait.workspace = true
 thiserror.workspace = true
 serde = { workspace = true }
+serde_bytes.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 url.workspace = true

@@ -130,5 +130,6 @@ pub struct DisbandTombstone {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub id: MemberId,
+    #[serde(with = "serde_bytes")]
     pub credential: Vec<u8>,
 }

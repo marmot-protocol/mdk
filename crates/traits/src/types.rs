@@ -11,8 +11,11 @@ use std::fmt;
 macro_rules! byte_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
+        // `serde_bytes` lets binary formats carry the id as one byte string
+        // instead of an element-per-byte sequence; serde_json still writes
+        // and reads the same integer array either way.
         #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        pub struct $name(Vec<u8>);
+        pub struct $name(#[serde(with = "serde_bytes")] Vec<u8>);
 
         impl $name {
             pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
@@ -91,4 +94,19 @@ impl fmt::Display for EpochId {
 pub enum Backend {
     /// SQLCipher-backed SQLite persistence. See `storage-sqlite`.
     Sqlite,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemberId;
+
+    /// JSON rows written before the ids carried `serde_bytes` are integer
+    /// arrays; the attribute must keep reading and writing that form.
+    #[test]
+    fn byte_id_json_form_is_an_integer_array() {
+        let id = MemberId::new(vec![0, 7, 255]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "[0,7,255]");
+        assert_eq!(serde_json::from_str::<MemberId>(&json).unwrap(), id);
+    }
 }
