@@ -2029,6 +2029,20 @@ impl<S: StorageProvider> Engine<S> {
             {
                 continue;
             }
+            // Deliberately NOT gated on the commit having been applied locally.
+            // `pre_apply` reads `Created` for a rival this device buffered, the
+            // pass materialized, and branch selection put on the losing side —
+            // and that announces too. Narrowing to `Processed` would be the
+            // wrong trade in both directions. The wide signal is inert where it
+            // has nothing to retract: `origin_commit_id` is stamped only on rows
+            // synthesized from an applied commit's `GroupStateChanged`, so every
+            // consumer keyed on that id (the timeline withdrawal, the
+            // last-verdict filter in the app's `project_group_system_rows`,
+            // `mark_evolution_superseded`) matches nothing for a commit that was
+            // never applied. And the pair is the only portable statement that a
+            // NAMED commit lost selection, which is what a peer holding no branch
+            // of its own records as its share of the fleet's agreement about a
+            // fork's outcome.
             let invalidated_commit_id = message_id_from_hex(&deferred.message_id)?;
             // The stored record's epoch is the commit's source epoch (the fork
             // it lost). A missing record falls back to the selected branch's

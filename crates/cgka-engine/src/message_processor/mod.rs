@@ -2106,6 +2106,16 @@ impl<S: StorageProvider> Engine<S> {
             .ingest_group_message_from_sweep(&msg, group_id.as_slice().to_vec(), sweep)
             .await
         {
+            // Still unreadable: the row keeps its place in the retry lifecycle
+            // and the caller charges its budget. The verdict's `lineage` is
+            // dropped on purpose. There is exactly one lineage site
+            // (`Self::deferral_lineage`, reached from the single deferral return
+            // in `ingest_group_message_from_sweep`), and it answers about the
+            // GROUP's stored commit graph rather than about this row — so a
+            // sweep can only ever restate what live ingest already reported for
+            // this group, over rows the app's stall detector counted when they
+            // first arrived. Routing it out would re-count that evidence, not
+            // sharpen it.
             Ok(IngestOutcome::TransportDeferred { .. }) => Ok(false),
             Ok(IngestOutcome::ResourceRefused {
                 resource: InboundResourceLimit::TransportDeferredCapacity,
