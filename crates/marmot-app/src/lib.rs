@@ -607,9 +607,12 @@ pub struct MarmotApp {
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     /// Per account label, the group ids whose chat-list row must be refreshed
-    /// before the next `chat_list()` answers. A single received message used
-    /// to mark the whole projection stale and rebuild every row.
-    chat_list_projection_stale: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// before the next `chat_list()` answers, each with a generation that
+    /// bumps on every mark. A refresh snapshots the map, refreshes the rows,
+    /// and drops only ids whose generation is unchanged, so a mark that raced
+    /// the refresh stays dirty. A single received message used to mark the
+    /// whole projection stale and rebuild every row.
+    chat_list_projection_stale: Arc<Mutex<HashMap<String, HashMap<String, u64>>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
@@ -3192,6 +3195,9 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
             .set_group_self_membership(group_id_hex, membership)?;
+        // This write bypasses the projection save, so the row's dirty mark
+        // must come from here or a warm chat list keeps the old membership.
+        self.mark_chat_list_stale(&account.label, HashSet::from([group_id_hex.to_owned()]));
         Ok(())
     }
 
@@ -4770,12 +4776,34 @@ impl MarmotApp {
     }
 
     fn mark_chat_list_stale(&self, label: &str, group_ids_hex: HashSet<String>) {
-        self.chat_list_projection_stale
+        if group_ids_hex.is_empty() {
+            return;
+        }
+        let mut stale = self
+            .chat_list_projection_stale
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(label.to_owned())
-            .or_default()
-            .extend(group_ids_hex);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dirty = stale.entry(label.to_owned()).or_default();
+        for group_id_hex in group_ids_hex {
+            *dirty.entry(group_id_hex).or_insert(0) += 1;
+        }
+    }
+
+    /// Forget the dirty marks a refresh satisfied. An id whose generation
+    /// moved since the snapshot was re-marked during the refresh and stays.
+    fn clear_refreshed_chat_list_groups(&self, label: &str, refreshed: &HashMap<String, u64>) {
+        let mut stale = self
+            .chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(remaining) = stale.get_mut(label) else {
+            return;
+        };
+        remaining
+            .retain(|group_id_hex, generation| refreshed.get(group_id_hex) != Some(generation));
+        if remaining.is_empty() {
+            stale.remove(label);
+        }
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
@@ -4918,7 +4946,8 @@ impl MarmotApp {
     fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
         // Snapshot the obligation; it is cleared only after the refresh
         // succeeded, so an error leaves every unrefreshed id dirty for the
-        // next read, and ids marked while the refresh ran stay dirty too.
+        // next read, and ids marked while the refresh ran stay dirty too
+        // (their generation no longer matches the snapshot).
         let stale = self
             .chat_list_projection_stale
             .lock()
@@ -4935,7 +4964,7 @@ impl MarmotApp {
         match &stale {
             None if warmed => return Ok(()),
             Some(group_ids) if warmed => {
-                for group_id_hex in group_ids {
+                for group_id_hex in group_ids.keys() {
                     storage.refresh_chat_list_row(
                         &account.account_id_hex,
                         group_id_hex,
@@ -4946,16 +4975,7 @@ impl MarmotApp {
             _ => storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?,
         }
         if let Some(refreshed) = stale {
-            let mut dirty = self
-                .chat_list_projection_stale
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(remaining) = dirty.get_mut(&account.label) {
-                remaining.retain(|group_id_hex| !refreshed.contains(group_id_hex));
-                if remaining.is_empty() {
-                    dirty.remove(&account.label);
-                }
-            }
+            self.clear_refreshed_chat_list_groups(&account.label, &refreshed);
         }
         self.chat_list_projection_warmed
             .lock()

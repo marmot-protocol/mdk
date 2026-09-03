@@ -4705,7 +4705,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
             .remove("alice");
         app.chat_list_projection_stale.lock().unwrap().insert(
             "alice".to_owned(),
-            HashSet::from(["stale-group".to_owned()]),
+            HashMap::from([("stale-group".to_owned(), 1)]),
         );
 
         relay.block_next_publish();
@@ -17237,7 +17237,7 @@ async fn failed_chat_list_refresh_keeps_dirty_groups_for_the_next_read() {
 
     app.chat_list_projection_stale.lock().unwrap().insert(
         "alice".to_owned(),
-        HashSet::from(["stale-group".to_owned()]),
+        HashMap::from([("stale-group".to_owned(), 1)]),
     );
     app.close_storage().unwrap();
 
@@ -17249,8 +17249,51 @@ async fn failed_chat_list_refresh_keeps_dirty_groups_for_the_next_read() {
             .lock()
             .unwrap()
             .get("alice")
-            .is_some_and(|dirty| dirty.contains("stale-group")),
+            .is_some_and(|dirty| dirty.contains_key("stale-group")),
         "a failed refresh must leave the dirty group for the next read"
     );
     runtime.shutdown().await;
+}
+
+#[test]
+fn same_group_re_marked_during_refresh_stays_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.mark_chat_list_stale("alice", HashSet::from(["g".to_owned()]));
+
+    // A refresh snapshots the obligation, then storage re-marks the same
+    // group before the snapshot is cleared. The newer mark must survive.
+    let snapshot = app
+        .chat_list_projection_stale
+        .lock()
+        .unwrap()
+        .get("alice")
+        .cloned()
+        .unwrap();
+    app.mark_chat_list_stale("alice", HashSet::from(["g".to_owned()]));
+    app.clear_refreshed_chat_list_groups("alice", &snapshot);
+    assert!(
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .get("alice")
+            .is_some_and(|dirty| dirty.contains_key("g")),
+        "a mark that raced the refresh must stay dirty"
+    );
+
+    // Without an intervening mark the snapshot clears the obligation.
+    let snapshot = app
+        .chat_list_projection_stale
+        .lock()
+        .unwrap()
+        .get("alice")
+        .cloned()
+        .unwrap();
+    app.clear_refreshed_chat_list_groups("alice", &snapshot);
+    assert!(
+        !app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains_key("alice")
+    );
 }
