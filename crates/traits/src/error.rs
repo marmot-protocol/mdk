@@ -195,6 +195,60 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Stable, privacy-safe name for this failure.
+    ///
+    /// Names only the variant: no group ids, member ids, epochs, paths, or
+    /// `Display` text. It lives beside the enum rather than in any one consumer
+    /// so the engine's forensic audit rows, the app runtime's tracing fields,
+    /// and the daemon's status JSON all say the same word for the same failure
+    /// and an operator can join them.
+    ///
+    /// That join is byte-identical for every variant except [`Self::Storage`].
+    /// This method reports the coarse `"storage"` bucket, and engine audit rows
+    /// say `"storage"`; the app runtime deliberately unwraps one layer further
+    /// and reports the nine [`crate::storage::StorageError`] kinds instead
+    /// (`storage_busy`, `storage_not_found`, ...). The trade is intentional:
+    /// [`Self::is_transient`] is true for exactly `StorageError::Busy`, so
+    /// collapsing storage to one word app-side would hide the retryable failure
+    /// among eight durable ones. A consumer joining engine rows to app fields
+    /// must therefore treat `"storage"` as the prefix of the nine, not as a
+    /// tenth peer.
+    #[must_use]
+    pub fn privacy_safe_kind(&self) -> &'static str {
+        match self {
+            EngineError::UnknownGroup(_) => "unknown_group",
+            EngineError::GroupNotHydrated(_) => "group_not_hydrated",
+            EngineError::UnknownPending => "unknown_pending",
+            EngineError::NotAMember { .. } => "not_a_member",
+            EngineError::NotGroupAdmin { .. } => "not_group_admin",
+            EngineError::UnknownMember { .. } => "unknown_member",
+            EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
+            EngineError::AdminCannotSelfRemove { .. } => "admin_cannot_self_remove",
+            EngineError::LeaveAlreadyRequested { .. } => "leave_already_requested",
+            EngineError::AdminDepletion { .. } => "admin_depletion",
+            EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
+            EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
+            EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+            EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
+            EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
+            EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
+            EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
+            EngineError::ForkedEpoch { .. } => "forked_epoch",
+            EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
+            EngineError::GroupUnrecoverableRepairRequired { .. } => {
+                "group_unrecoverable_repair_required"
+            }
+            EngineError::InvalidTransition(_) => "invalid_transition",
+            EngineError::Storage(_) => "storage",
+            EngineError::Peeler(_) => "peeler",
+            EngineError::Serialize(_) => "serialize",
+            EngineError::InvalidWelcome => "invalid_welcome",
+            EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
+            EngineError::Backend(_) => "backend",
+            EngineError::Other(_) => "other",
+        }
+    }
+
     /// Whether this error reflects transient backend contention (a
     /// [`crate::storage::StorageError::Busy`] that survived the backend's own
     /// retries) rather than a durable failure. Callers driving the

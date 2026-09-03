@@ -1213,6 +1213,11 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
         );
         assert_eq!(failed[0]["kind"]["deliveries"], 0);
         assert_eq!(failed[0]["kind"]["group_advanced"], false);
+        // This run did read the group's post-replay epoch, so `group_advanced:
+        // false` here is a measurement and the row says so. Without the
+        // companion flag a reader cannot separate this row from one whose
+        // after-read failed and defaulted to the before-epoch.
+        assert_eq!(failed[0]["kind"]["group_advanced_observed"], true);
     });
 }
 

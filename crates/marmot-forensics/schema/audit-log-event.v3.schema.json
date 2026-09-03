@@ -1541,6 +1541,9 @@
             },
             "group_advanced": {
               "type": "boolean"
+            },
+            "group_advanced_observed": {
+              "type": "boolean"
             }
           }
         },

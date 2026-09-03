@@ -3656,6 +3656,17 @@ async fn convergence_pass_that_keeps_the_own_commit_emits_no_own_withdrawal() {
         local.drain_events().is_empty(),
         "buffering the rival must not be application-visible"
     );
+    // The withdrawal below names a commit this device never applied. Pinning the
+    // pre-pass state makes that deliberate: `emit_rolled_back_commits` reads the
+    // pre-apply state only to suppress a repeat announcement, never to require
+    // prior local application, so narrowing it to `Processed` would silence the
+    // pair a non-adopting peer records as its share of the fleet's agreement
+    // about which commit lost.
+    assert_eq!(
+        f.local_storage.get_message(&competing_id).unwrap().state,
+        MessageState::Created,
+        "the rival must reach the settling pass never having been applied"
+    );
 
     drive_convergence(&mut local, &f, &competing_id).await;
     assert_eq!(settled_branch(&local, &f), Branch::Own);

@@ -28,8 +28,61 @@ pub(crate) struct EpochBackfillTerminalAudit {
     pub skipped: u64,
     pub refused: u64,
     pub local_epoch_before: u64,
-    pub local_epoch_after: u64,
-    pub group_advanced: bool,
+    /// The group's post-replay local epoch, or `None` when the read failed.
+    /// `None` means "we could not look", which is a different finding from
+    /// "we looked and nothing moved".
+    pub local_epoch_after: Option<u64>,
+}
+
+/// The audit row one terminal backfill outcome serializes to.
+///
+/// Free-standing so the `Option<u64>` -> row derivation is testable without a
+/// live client. Carrying the after-epoch as an `Option` only buys anything
+/// because of what this function does with `None`, and a derivation reachable
+/// only through a recorder is a derivation nothing pins.
+fn epoch_backfill_terminal_event_kind(
+    succeeded: bool,
+    terminal: EpochBackfillTerminalAudit,
+) -> AuditEventKind {
+    let observed = terminal.local_epoch_after.is_some();
+    // An unread after-epoch has no number to report, so the row repeats the
+    // before-epoch to keep the field's shape. `group_advanced_observed` beside
+    // it is what tells a reader the pair is a placeholder rather than a
+    // measurement.
+    let local_epoch_after = terminal
+        .local_epoch_after
+        .unwrap_or(terminal.local_epoch_before);
+    let group_advanced = local_epoch_after > terminal.local_epoch_before;
+    if succeeded {
+        // A run only succeeds once every armed group's after-epoch was read,
+        // so the completed row is always an observation and needs no flag.
+        AuditEventKind::EpochStallBackfillCompleted {
+            retry_ordinal: terminal.retry_ordinal,
+            duration_ms: terminal.duration_ms,
+            activation_outcome: terminal.activation_outcome,
+            completion_kind: terminal.completion_kind,
+            deliveries: terminal.deliveries,
+            skipped: Some(terminal.skipped),
+            refused: Some(terminal.refused),
+            local_epoch_before: terminal.local_epoch_before,
+            local_epoch_after,
+            group_advanced,
+        }
+    } else {
+        AuditEventKind::EpochStallBackfillFailed {
+            retry_ordinal: terminal.retry_ordinal,
+            duration_ms: terminal.duration_ms,
+            activation_outcome: terminal.activation_outcome,
+            error_kind: terminal.error_kind,
+            deliveries: terminal.deliveries,
+            skipped: Some(terminal.skipped),
+            refused: Some(terminal.refused),
+            local_epoch_before: terminal.local_epoch_before,
+            local_epoch_after,
+            group_advanced,
+            group_advanced_observed: Some(observed),
+        }
+    }
 }
 
 impl AppClient {
@@ -274,33 +327,7 @@ impl AppClient {
         terminal: EpochBackfillTerminalAudit,
         context: &AuditEventContext,
     ) {
-        let kind = if succeeded {
-            AuditEventKind::EpochStallBackfillCompleted {
-                retry_ordinal: terminal.retry_ordinal,
-                duration_ms: terminal.duration_ms,
-                activation_outcome: terminal.activation_outcome,
-                completion_kind: terminal.completion_kind,
-                deliveries: terminal.deliveries,
-                skipped: Some(terminal.skipped),
-                refused: Some(terminal.refused),
-                local_epoch_before: terminal.local_epoch_before,
-                local_epoch_after: terminal.local_epoch_after,
-                group_advanced: terminal.group_advanced,
-            }
-        } else {
-            AuditEventKind::EpochStallBackfillFailed {
-                retry_ordinal: terminal.retry_ordinal,
-                duration_ms: terminal.duration_ms,
-                activation_outcome: terminal.activation_outcome,
-                error_kind: terminal.error_kind,
-                deliveries: terminal.deliveries,
-                skipped: Some(terminal.skipped),
-                refused: Some(terminal.refused),
-                local_epoch_before: terminal.local_epoch_before,
-                local_epoch_after: terminal.local_epoch_after,
-                group_advanced: terminal.group_advanced,
-            }
-        };
+        let kind = epoch_backfill_terminal_event_kind(succeeded, terminal);
         self.runtime
             .session()
             .record_audit_event(Some(group_id), Some(context.clone()), kind);
@@ -634,9 +661,82 @@ fn schema_valid_message_ids(message_ids: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::schema_valid_message_ids;
+    use super::{
+        EpochBackfillTerminalAudit, epoch_backfill_terminal_event_kind, schema_valid_message_ids,
+    };
+    use marmot_forensics::EpochBackfillActivationOutcome;
 
     const VALID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn terminal_at(local_epoch_after: Option<u64>) -> EpochBackfillTerminalAudit {
+        EpochBackfillTerminalAudit {
+            retry_ordinal: 0,
+            duration_ms: 1,
+            activation_outcome: EpochBackfillActivationOutcome::Failed,
+            completion_kind: None,
+            error_kind: Some("backfill_drain_eose_timeout".to_string()),
+            deliveries: 0,
+            skipped: 0,
+            refused: 0,
+            local_epoch_before: 4,
+            local_epoch_after,
+        }
+    }
+
+    /// The row as an external reader sees it: what `JsonlRecorder` writes under
+    /// `kind`. Asserting the serialized object rather than the enum is what
+    /// makes these tests speak the analyzer's language.
+    fn row(succeeded: bool, local_epoch_after: Option<u64>) -> serde_json::Value {
+        serde_json::to_value(epoch_backfill_terminal_event_kind(
+            succeeded,
+            terminal_at(local_epoch_after),
+        ))
+        .expect("terminal audit kind serializes")
+    }
+
+    // The whole point of carrying the after-epoch as an `Option`. A failed
+    // after-read leaves the row's epoch pair a placeholder — `local_epoch_after`
+    // repeats `local_epoch_before` and `group_advanced` is that placeholder's
+    // arithmetic — so the row must say so in the one field that can, or it
+    // reads as "we looked and nothing moved" for a run that never looked.
+    #[test]
+    fn a_failed_after_read_marks_the_failed_row_unobserved() {
+        let row = row(false, None);
+        assert_eq!(row["type"], "epoch_stall_backfill_failed");
+        assert_eq!(row["group_advanced_observed"], false);
+        assert_eq!(row["local_epoch_after"], 4);
+        assert_eq!(row["group_advanced"], false);
+        // The observation state must not cost the row its real failure kind:
+        // separate fields exist so the two coexist.
+        assert_eq!(row["error_kind"], "backfill_drain_eose_timeout");
+    }
+
+    // The other branch of the same derivation. A failed run whose after-read
+    // did land reports a measurement, and `group_advanced: false` on it means
+    // what it says.
+    #[test]
+    fn an_observed_after_read_marks_the_failed_row_observed() {
+        let unmoved = row(false, Some(4));
+        assert_eq!(unmoved["group_advanced_observed"], true);
+        assert_eq!(unmoved["local_epoch_after"], 4);
+        assert_eq!(unmoved["group_advanced"], false);
+
+        let advanced = row(false, Some(9));
+        assert_eq!(advanced["group_advanced_observed"], true);
+        assert_eq!(advanced["local_epoch_after"], 9);
+        assert_eq!(advanced["group_advanced"], true);
+    }
+
+    // A completed run has read every armed group's epoch by definition, so the
+    // flag is failed-row-only. Pin its absence: a completed row that grew one
+    // would be a field no schema branch allows.
+    #[test]
+    fn a_completed_row_carries_no_observation_flag() {
+        let row = row(true, Some(9));
+        assert_eq!(row["type"], "epoch_stall_backfill_completed");
+        assert!(row.get("group_advanced_observed").is_none());
+        assert_eq!(row["group_advanced"], true);
+    }
 
     #[test]
     fn drops_empty_synthetic_source_id() {

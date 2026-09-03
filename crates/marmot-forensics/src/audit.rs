@@ -1027,6 +1027,24 @@ pub enum AuditEventKind {
         local_epoch_before: u64,
         local_epoch_after: u64,
         group_advanced: bool,
+        /// Whether `local_epoch_after` is a reading at all.
+        ///
+        /// `false` means the post-replay epoch read failed, so
+        /// `local_epoch_after` repeats `local_epoch_before` and
+        /// `group_advanced` is that placeholder's arithmetic, not an
+        /// observation: this replay's effect on the group is *unknown*, not
+        /// absent. Only a failed row can carry it — a run that succeeds has
+        /// read every armed group's epoch by definition.
+        ///
+        /// Absent means the row predates this field *or* the reading was taken,
+        /// and an analyzer cannot tell which. The field is additive, so no
+        /// schema version separates old rows from new ones, and a pre-change
+        /// failed row whose after-read failed looks exactly like an observed
+        /// one — that indistinguishability is the very defect this field exists
+        /// to end going forward. Read absence as "unknown provenance", never as
+        /// proof the reading was taken.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_advanced_observed: Option<bool>,
     },
     /// A pending epoch-gap backfill replay was not executed on this pass.
     /// Account-scoped; does not clear pending recovery.
