@@ -475,6 +475,9 @@ blocks contain 24, 96, 384, and 1,024 application messages interleaved with epoc
 reverse history, reverse three-copy replay, natural two-copy incremental plus full repair, reverse two-copy restart
 before backlog processing, and reverse three-copy competing commit waves. Terminal expectations require Bob's exact
 payload multiset, exact canonical equality, no pending work, and an active decryptability probe after recovery.
+Capacity-refused retained objects remain a subject-owned redelivery obligation: later assertion ticks re-query complete
+history after engine progress frees capacity, while a truly full/no-progress loop terminates with a typed resource
+failure.
 
 Run a stateful chat journey directly:
 

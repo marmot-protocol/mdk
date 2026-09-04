@@ -909,7 +909,9 @@ processing, and reverse three-copy competing commit waves. A pre-reconnect asser
 first backlog payload; the terminal phase requires the last payload exactly once, the complete backlog payload multiset
 exactly once, exact canonical equality, no pending work, and active bidirectional decryptability involving Bob. The
 family always selects the retained-relay subject so reconnect means a durable history query rather than healing an
-in-memory packet partition.
+in-memory packet partition. Capacity-refused retained inputs schedule bounded complete-history redelivery on later
+ticks; strict pending-work closure includes that obligation, and unchanged full-refusal retries fail with a typed
+resource error instead of spinning.
 
 ### General Simulator Integrity Checks
 

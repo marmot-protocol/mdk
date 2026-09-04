@@ -90,6 +90,10 @@ message wall-clock timestamps in whole seconds; virtual time does not rewrite th
 not consume the independent incremental cursor. Each query records queried relays, EOSE relays,
 returned/unique/injected counts, whether the result was quiet, and one of these deliberately distinct claims:
 `relay_eose_only`, `full_history_queried`, `relevant_set_mismatch`, or `relevant_set_equality_verified`.
+If engine ingest refuses retained objects because the deferred-peel capacity is full, the subject keeps a transport
+redelivery obligation and performs another complete-history query on a later tick. The obligation remains visible as
+pending transport work until a retry is admitted, and repeated full refusals without engine progress fail with the
+typed `retained_history_redelivery_no_progress` resource error.
 
 Relay-control actions configure deterministic natural/reverse order and duplicate copies, change per-client event
 visibility through semantic selectors, and equalize selected relay event sets. Reconciliation copies missing events
