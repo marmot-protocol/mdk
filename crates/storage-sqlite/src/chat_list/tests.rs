@@ -3028,6 +3028,102 @@ fn unread_mention_of_other_account_does_not_count() {
 }
 
 #[test]
+fn targeted_refresh_classifies_only_changed_unread_messages() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("first", REMOTE, 10, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&chat("second", REMOTE, 20, "hello again"))
+        .unwrap();
+
+    let classifier_calls = std::cell::Cell::new(0usize);
+    let classifier = |plaintext: &str, _tags: &[Vec<String>]| {
+        classifier_calls.set(classifier_calls.get() + 1);
+        plaintext.contains("@local")
+    };
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &classifier)
+        .unwrap();
+    assert_eq!(classifier_calls.get(), 2);
+
+    classifier_calls.set(0);
+    store
+        .record_app_event(&chat("third", REMOTE, 30, "hello @local"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &classifier)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(classifier_calls.get(), 1);
+    assert_eq!(row.unread_count, 3);
+    assert_eq!(row.unread_mention_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("first"));
+
+    classifier_calls.set(0);
+    store
+        .invalidate_app_event_by_message_id(GROUP, "third", "LosingBranch")
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &classifier)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(classifier_calls.get(), 0);
+    assert_eq!(row.unread_count, 2);
+    assert_eq!(row.unread_mention_count, 0);
+}
+
+#[test]
+fn ensure_repairs_timeline_change_left_dirty_before_chat_list_refresh() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("first", REMOTE, 10, "first"))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    // Model a process stop between the timeline commit and the app's targeted
+    // chat-list refresh. The trigger-owned marker must make startup repair it.
+    store
+        .record_app_event(&chat("second", REMOTE, 20, "second"))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        let dirty: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM chat_list_unread_dirty_groups
+                    WHERE group_id_hex = ?1
+                 )",
+                params![GROUP],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 1);
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(row.unread_count, 2);
+    let conn = store.lock().unwrap();
+    let dirty: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chat_list_unread_dirty_groups",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dirty, 0);
+}
+
+#[test]
 fn already_read_mention_does_not_count_as_unread_mention() {
     let store = setup_store();
     // A mention arrives, then the client reads it: it is before the read marker
@@ -3115,6 +3211,11 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
         conn.execute(
             "UPDATE chat_list_rows SET unread_mention_count = 0 WHERE group_id_hex = ?1",
             params![GROUP],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version = 0 WHERE id = 1",
+            [],
         )
         .unwrap();
     }
