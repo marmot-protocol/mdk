@@ -114,6 +114,8 @@ impl MemberKeyPackagePrewarmCache {
         }
     }
 
+    /// Keep relay readiness discovered after the KeyPackage was cached in sync
+    /// with the process-local prewarm entry.
     fn update_relay_lists(&mut self, account_id_hex: &str, relay_lists: &AccountRelayListStatus) {
         if let Some(entry) = self.entries.get_mut(account_id_hex) {
             entry.fetched.relay_lists = relay_lists.clone();
@@ -175,6 +177,13 @@ struct MemberTarget {
     relay_lists: AccountRelayListStatus,
 }
 
+/// Merge relay-list observations without allowing stale discovery to clobber
+/// newer cached state.
+///
+/// Each list is replaced only by a strictly newer `created_at`; ties retain the
+/// current value. Timestamp-less (`created_at == 0`) state may fill an empty
+/// timestamp-less slot, which supports setup-derived and fixture-built state
+/// without overriding a timestamped directory event.
 fn merge_member_relay_lists(
     mut current: AccountRelayListStatus,
     candidate: AccountRelayListStatus,
@@ -233,9 +242,13 @@ impl MarmotApp {
     }
 
     /// Prewarm group composition without reserving or consuming any package.
-    /// A later create call re-reads and validates the cached bytes, and the MLS
-    /// mutation boundary still performs its ordinary lifetime/single-use
-    /// validation.
+    ///
+    /// The roster must also resolve a safe Marmot inbox route for every member;
+    /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
+    /// fetched packages and relay metadata remain cached even when another
+    /// member fails readiness. A later create call re-reads and validates the
+    /// cached bytes, and the MLS mutation boundary still performs its ordinary
+    /// lifetime/single-use validation.
     pub async fn prewarm_group_member_key_packages(
         &self,
         member_refs: &[&str],

@@ -758,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    /// The CLI JSON contract keeps recipient identity out of text while exposing repair data.
     fn missing_member_inbox_errors_identify_the_recipient_and_repair() {
         let account = "22".repeat(32);
         let error = wn_error_json(&WnError::App(AppError::MissingMemberInboxRoute(

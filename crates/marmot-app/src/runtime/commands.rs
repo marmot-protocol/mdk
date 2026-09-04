@@ -182,7 +182,9 @@ impl AccountManager {
     /// Prewarm the current group-composition roster outside the account-worker
     /// mutation queue. Dropping the returned future cancels the caller's wait;
     /// relay-plane coalescing may still safely satisfy a later identical create
-    /// request, and no KeyPackage is reserved or consumed here.
+    /// request, and no KeyPackage is reserved or consumed here. Every member
+    /// must also resolve a safe Marmot inbox route; missing routes return a
+    /// typed readiness error while successfully fetched material stays cached.
     pub async fn prewarm_group_member_key_packages(
         &self,
         account_ref: &str,

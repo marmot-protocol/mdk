@@ -771,6 +771,7 @@ mod tests {
     }
 
     #[test]
+    /// The typed FFI error preserves the recipient needed for client recovery UI.
     fn missing_member_inbox_route_crosses_ffi_with_recipient() {
         let account = "11".repeat(32);
         let ffi: MarmotKitError = AppError::MissingMemberInboxRoute(account.clone()).into();
