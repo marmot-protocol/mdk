@@ -1002,43 +1002,56 @@ impl<S: StorageProvider> Engine<S> {
                 }
 
                 let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
-                let (local_state_is_stale, repaired_unrecoverable) =
-                    match storage.get_group(&group_id) {
-                        Ok(group) => {
-                            let self_is_recorded_member = group
-                                .members
-                                .iter()
-                                .any(|member| &member.id == self.identity.self_id());
-                            if self_is_recorded_member
-                                && !group.unrecoverable
-                                && incoming_epoch <= group.epoch
-                            {
+                let (local_state_is_stale, repaired_unrecoverable) = match storage
+                    .get_group(&group_id)
+                {
+                    Ok(group) => {
+                        let self_is_recorded_member = group
+                            .members
+                            .iter()
+                            .any(|member| &member.id == self.identity.self_id());
+                        if self_is_recorded_member && !group.unrecoverable {
+                            if incoming_epoch <= group.epoch {
                                 // A distinct transport/content id does not make a
                                 // same- or older-epoch Welcome for an already-active
                                 // group a rejoin. Reject before OpenMLS staging and
                                 // let the surrounding transaction restore KeyPackage
                                 // consumption and every tentative write.
-                                //
-                                // A strictly newer Welcome is different: local state
-                                // can still list this device because a delayed older
-                                // Welcome was accepted after the device had already
-                                // been removed elsewhere. A later legitimate re-add
-                                // must be allowed through the fully authenticated
-                                // replacement path below rather than being mistaken
-                                // for a duplicate solely from that stale local view.
                                 return Err(EngineError::WelcomeAlreadyProcessed);
                             }
-                            // Unrecoverable is the explicit exception: a fully
-                            // authenticated replacement Welcome is a protocol-defined
-                            // repair even though the frozen record still lists us as
-                            // a member. The surrounding transaction restores the old
-                            // OpenMLS state and KeyPackage on any later validation
-                            // failure, so clearing the live rows remains tentative.
-                            (true, group.unrecoverable)
+
+                            // Epoch freshness is not branch continuity. A member can
+                            // fork the same group id, advance that fork, rewrite its
+                            // admin component, and issue a cryptographically valid
+                            // newer Welcome. Replacing healthy active state here would
+                            // let that uncorroborated fork destroy the trusted branch.
+                            //
+                            // A legitimate re-entry remains possible after this engine
+                            // processes the current branch's removal, at which point the
+                            // durable record no longer lists this identity. This error is
+                            // deliberately non-terminal so that exact Welcome can be
+                            // retried after the trusted removal arrives. Consulting the
+                            // durable record also closes the cold-start window before the
+                            // epoch manager has been hydrated.
+                            return Err(EngineError::InvalidTransition(
+                                cgka_traits::engine_state::InvalidTransition {
+                                    from: "ActiveMember",
+                                    to: "JoinWelcome",
+                                    reason: "replacement Welcome requires trusted removal evidence",
+                                },
+                            ));
                         }
-                        Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
-                        Err(error) => return Err(EngineError::Storage(error)),
-                    };
+                        // Unrecoverable is the explicit exception: a fully
+                        // authenticated replacement Welcome is a protocol-defined
+                        // repair even though the frozen record still lists us as
+                        // a member. The surrounding transaction restores the old
+                        // OpenMLS state and KeyPackage on any later validation
+                        // failure, so clearing the live rows remains tentative.
+                        (true, group.unrecoverable)
+                    }
+                    Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
+                    Err(error) => return Err(EngineError::Storage(error)),
+                };
                 if local_state_is_stale
                     && let Some(state) = self.epoch_manager.state(&group_id)
                     && state.is_resolving_local_publish()

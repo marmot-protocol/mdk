@@ -633,21 +633,21 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `membership-reentry/v1`
 
-- Generator: `generate_membership_reentry_family` (generator version `3`).
+- Generator: `generate_membership_reentry_family` (generator version `1`).
 - Setup: the first eight arms use four clients; the final two use eight. A non-admin identity departs and rejoins
   through fresh KeyPackages. Seeded cases vary the victim, delivery order, and partial-impact committer count without
   changing the ten-arm catalog.
 - Pressure: the catalog guarantees one clean cycle, two cycles, three cycles with victim restarts, self-updates between
   cycles, a same-epoch self-update/removal race, self-leave followed by re-entry, self-leave racing administrative
-  removal, delivery of a withheld original Welcome only after that leaf has been removed and before a fresh
-  re-invitation, a wider self-leave for which every incumbent stages a sibling commit before any commit delivery, and
+  removal, delivery of a withheld original Welcome followed by the trusted removal commit and a fresh re-invitation,
+  a wider self-leave for which every incumbent stages a sibling commit before any commit delivery, and
   the corresponding partial-impact timing in which only two to four incumbents commit before the winning branch
   reaches the rest.
 - Expected: every successful re-entry immediately sends an application probe. The terminal oracle requires exact
   canonical equivalence, the final complete roster at the exact epoch, no pending work for survivors, exactly the
   documented retained join-commit exception for the re-added member, and active decryptability in every direction.
 - Status: all ten arms are ordinary executable regressions. The stale-original-Welcome arm at case `7` guards that
-  a fully validated, strictly newer re-invitation replaces a stale active local view and restores exact convergence.
+  a fresh re-invitation waits until the stale active view processes its trusted removal, then restores exact convergence.
   Cases `8` and `9` require convergence and re-entry after all-incumbent and partial-impact multi-auto-committer
   self-leave forks, respectively.
 

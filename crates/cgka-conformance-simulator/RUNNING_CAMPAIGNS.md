@@ -173,14 +173,15 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked
 
 For `membership-reentry/v1`, ten consecutive cases cover the complete catalog: one clean cycle, two
 cycles, three cycles with victim restarts, self-updates between cycles, a self-update/removal race, self-leave then
-re-entry, self-leave racing administrative removal, and a stale original Welcome followed by a fresh re-invitation.
-The final two arms widen the group to eight members: case `8` lets all seven incumbents stage competing commits for the
-same self-leave before any commit delivery, while case `9` lets only two to four seeded early committers do so before
+re-entry, self-leave racing administrative removal, and a stale original Welcome followed by the trusted removal
+commit and a fresh re-invitation. The final two arms widen the group to eight members: case `8` lets all seven
+incumbents stage competing commits for the same self-leave before any commit delivery, while case `9` lets only two
+to four seeded early committers do so before
 the winner reaches the remaining incumbents. All cases are ordinary strict regressions. Case `7` pins the
-replacement-Welcome freshness rule: a delayed older
-Welcome may install a stale active local view, but a fully validated strictly newer re-invitation must replace it and
-restore convergence. Cases `8` and `9` require the all-committer and production-shaped partial-impact fork to converge
-before re-entry.
+trusted-removal continuity rule: a delayed older Welcome may install a stale active local view, but a newer
+re-invitation remains retryable until the victim processes the removal from its trusted branch. The same Welcome then
+restores convergence. Cases `8` and `9` require the all-committer and production-shaped partial-impact fork to
+converge before re-entry.
 
 ## Running vectors and adapter comparisons
 

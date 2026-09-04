@@ -293,6 +293,14 @@ pub fn generate_membership_reentry_case(seed: u64, case_index: u64) -> Generated
                 pending: "remove-before-welcome".into(),
             });
             confirm(&mut steps, &mut expected, "alice", "remove-before-welcome");
+            steps.push(ScenarioStep::WithholdMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    publication: Some("remove-before-welcome".into()),
+                    class: Some(ScenarioTransportClass::GroupMessage),
+                    ..Default::default()
+                },
+                label: "trusted-removal-after-stale-welcome".into(),
+            });
             settle(&mut steps, &delivery_order_without(&delivery_order, victim));
             epoch += 1;
             assert_client_state(&mut steps, "alice", epoch, clients.len() - 1);
@@ -308,6 +316,14 @@ pub fn generate_membership_reentry_case(seed: u64, case_index: u64) -> Generated
                     client: victim.into(),
                 });
             }
+            // A newer Welcome cannot authenticate its own lineage. Release the
+            // commit from the victim's currently trusted branch first; only
+            // after that removal is applied is the fresh Welcome a re-entry.
+            steps.push(ScenarioStep::ReleaseWithheld {
+                label: "trusted-removal-after-stale-welcome".into(),
+            });
+            settle(&mut steps, &delivery_order);
+            assert_client_state(&mut steps, "alice", epoch, clients.len() - 1);
             epoch = readd_and_probe(
                 &mut steps,
                 &mut expected,

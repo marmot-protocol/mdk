@@ -1920,11 +1920,12 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
 }
 
 /// A delayed Welcome can install an apparently active local view after the
-/// rest of the group has already removed that identity. A later, strictly
-/// newer re-add Welcome must replace that stale view, while an older Welcome
-/// must never downgrade an already-current client.
+/// rest of the group has already removed that identity. A fresh re-add Welcome
+/// must wait for the trusted removal commit instead of replacing active state
+/// based on its uncorroborated epoch, and an older Welcome must never downgrade
+/// an already-current client.
 #[tokio::test]
-async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgrade() {
+async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart() {
     let mut alice = build_client(b"alice-stale-welcome");
     let mut bob = build_client(b"bob-stale-welcome");
     let (mut carol, carol_storage) = build_with_storage(b"carol-stale-welcome");
@@ -1988,8 +1989,8 @@ async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgra
         })
         .await
         .unwrap();
-    let remove_pending = match remove {
-        SendResult::GroupEvolution { pending, .. } => pending,
+    let (remove_commit, remove_pending) = match remove {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
     alice.confirm_published(remove_pending).await.unwrap();
@@ -1999,17 +2000,8 @@ async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgra
     // she is active even though the canonical group removed her at epoch 3.
     carol.join_welcome(stale_carol_welcome).await.unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
-    drop(carol);
-    let mut carol = build_client_on_storage(b"carol-stale-welcome", carol_storage.clone());
-    carol.hydrate_all_stored_groups().unwrap();
-    assert_eq!(
-        carol.epoch(&group_id).unwrap().0,
-        2,
-        "restart must preserve the stale active view"
-    );
-
-    // A legitimate re-add advances the canonical group to epoch 4. Carol's
-    // strictly newer Welcome must repair her stale active view.
+    // A legitimate re-add advances the canonical group to epoch 4. Its epoch
+    // alone cannot prove that it descends from Carol's trusted local branch.
     let readd = alice
         .send(SendIntent::Invite {
             group_id: group_id.clone(),
@@ -2031,45 +2023,95 @@ async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgra
     let fresh_carol_welcome = take_welcome_for(&mut fresh_welcomes, &carol_id);
     let fresh_david_welcome = take_welcome_for(&mut fresh_welcomes, &david_id);
 
-    // Carol can still stage work against her stale active view. A replacement
-    // must wait for that publication's explicit outcome rather than discard
-    // its MLS state and leave the epoch manager pointing at the old copy.
+    // Carol can still stage work against her stale active view. Drop the engine
+    // with that publication unresolved, then rebuild without hydration to pin
+    // the cold-start path: the durable active record must close the replacement
+    // window even while the epoch manager is empty.
     let held_update = carol
         .send(SendIntent::SelfUpdate {
             group_id: group_id.clone(),
         })
         .await
         .unwrap();
-    let held_pending = match held_update {
+    let _held_pending = match held_update {
         SendResult::GroupEvolution { pending, .. } => pending,
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
     let stale_record = carol_storage.get_group(&group_id).unwrap();
-    let held_epoch = carol.epoch(&group_id).unwrap();
-    let held_error = carol
+    drop(carol);
+    let mut carol = build_client_on_storage(b"carol-stale-welcome", carol_storage.clone());
+    assert!(
+        load_group_and_signer(&carol_storage, &carol.self_id(), &group_id)
+            .0
+            .pending_commit()
+            .is_some(),
+        "the staged self-update must survive restart before hydration"
+    );
+
+    let cold_start_error = carol
         .join_welcome(fresh_carol_welcome.clone())
         .await
-        .expect_err("replacement must wait for the held publication outcome");
+        .expect_err("an unhydrated restart must not replace active state");
     assert!(matches!(
-        held_error,
+        cold_start_error,
         EngineError::InvalidTransition(ref error)
-            if error.from == "PendingPublish" && error.to == "JoinWelcome"
+            if error.from == "ActiveMember" && error.to == "JoinWelcome"
     ));
     assert_eq!(
         carol_storage.get_group(&group_id).unwrap(),
         stale_record,
-        "refused replacement must leave the durable stale view intact"
+        "cold-start refusal must leave the durable active view intact"
     );
-    assert_eq!(
-        carol.epoch(&group_id).unwrap(),
-        held_epoch,
-        "refused replacement must preserve the held epoch-manager state"
+    assert!(
+        load_group_and_signer(&carol_storage, &carol.self_id(), &group_id)
+            .0
+            .pending_commit()
+            .is_some(),
+        "cold-start refusal must not orphan or discard the pending commit"
     );
-    carol.publish_failed(held_pending).await.unwrap();
-    assert_eq!(carol.epoch(&group_id).unwrap(), stale_record.epoch);
 
-    // The refusal is retryable: rolling back the stale publication restores
-    // Stable, and the identical Welcome can now atomically replace that view.
+    // Hydration restores the publication obligation. Resolve it, then prove
+    // that even Stable active state cannot be replaced without continuity.
+    carol.hydrate_all_stored_groups().unwrap();
+    let restored = carol.drain_auto_publish();
+    assert_eq!(
+        restored.len(),
+        1,
+        "hydrate must restore the staged publication"
+    );
+    carol.publish_failed(restored[0].pending).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), stale_record.epoch);
+    let active_error = carol
+        .join_welcome(fresh_carol_welcome.clone())
+        .await
+        .expect_err("a newer epoch is not trusted branch continuity");
+    assert!(matches!(
+        active_error,
+        EngineError::InvalidTransition(ref error)
+            if error.from == "ActiveMember" && error.to == "JoinWelcome"
+    ));
+
+    // Once Carol processes the removal from her trusted epoch-2 branch, the
+    // exact same Welcome is a legitimate retry and installs the epoch-4 rejoin.
+    let routed_remove = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..remove_commit
+    };
+    assert!(matches!(
+        carol.ingest(routed_remove).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    converge_buffered_commit(&mut carol, &group_id);
+    assert!(
+        !carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == carol_id),
+        "trusted removal must clear Carol's active membership before re-entry"
+    );
     carol.join_welcome(fresh_carol_welcome).await.unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
@@ -2308,7 +2350,7 @@ async fn join_rejects_welcome_authored_by_existing_non_admin() {
 }
 
 #[tokio::test]
-async fn rejected_newer_welcome_rolls_back_active_group_replacement() {
+async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
     let mut alice = build_client(b"alice-active-replacement");
     let (mut bob, bob_storage) = build_with_storage(b"bob-active-replacement");
     let (mut carol, carol_storage) = build_with_storage(b"carol-active-replacement");
@@ -2343,8 +2385,9 @@ async fn rejected_newer_welcome_rolls_back_active_group_replacement() {
     carol.join_welcome(carol_welcome).await.unwrap();
 
     // Alice removes Carol and Bob applies that commit, while Carol deliberately
-    // retains her epoch-1 active view. Bob can now construct an MLS-valid Add
-    // for Carol at a newer epoch, but remains unauthorized by Marmot policy.
+    // retains her epoch-1 active view. Bob can now fork from that newer state,
+    // add Carol, and self-promote in the same commit. The sibling bootstrap test
+    // proves this Welcome passes the incoming branch's admin check.
     let remove = alice
         .send(SendIntent::RemoveMembers {
             group_id: group_id.clone(),
@@ -2373,20 +2416,29 @@ async fn rejected_newer_welcome_rolls_back_active_group_replacement() {
 
     let before = carol_storage.get_group(&group_id).unwrap();
     let carol_replacement_kp = carol.fresh_key_package().await.unwrap();
-    let unauthorized_newer_welcome = welcome_from_existing_non_admin(
+    let forged_admins = encode_admin_policy_for_test(&[
+        alice.self_id().as_slice().to_vec(),
+        bob.self_id().as_slice().to_vec(),
+    ]);
+    let unauthorized_newer_welcome = welcome_from_fork_with_self_promoted_admin(
         &bob_storage,
         &bob.self_id(),
         &group_id,
         &carol_replacement_kp,
+        forged_admins,
     );
 
     let error = carol
         .join_welcome(unauthorized_newer_welcome)
         .await
-        .expect_err("a newer Welcome from a non-admin must be rejected");
+        .expect_err("a newer self-promoted fork must not replace active state");
     assert!(
-        matches!(error, EngineError::NotGroupAdmin { .. }),
-        "expected NotGroupAdmin after authenticated staging, got {error:?}"
+        matches!(
+            error,
+            EngineError::InvalidTransition(ref error)
+                if error.from == "ActiveMember" && error.to == "JoinWelcome"
+        ),
+        "expected active-state continuity refusal, got {error:?}"
     );
     assert_eq!(
         carol_storage.get_group(&group_id).unwrap(),
