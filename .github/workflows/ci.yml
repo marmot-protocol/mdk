@@ -620,3 +620,32 @@ jobs:
           # test_installer_env.sh against its real GatewayRunner, then runs the
           # adapter E2E. A missing Hermes venv is a hard failure, not a skip.
           ./scripts/hermes_marmot_deterministic_e2e.sh --root "$RUNNER_TEMP/hermes-installer-auth"
+
+  required-ci:
+    name: Required CI
+    if: always()
+    needs:
+      - rust-format
+      - rust-audit
+      - terminal-harness-installers
+      - rust-check
+      - rust-clippy
+      - c-smoke
+      - ios-account-clippy
+      - convergence-policy-pin
+      - rust-test
+      - cli-e2e
+      - relay-runtime
+      - relay-e2e
+      - conformance
+      - formal
+      - hermes-installer-auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every core CI job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
