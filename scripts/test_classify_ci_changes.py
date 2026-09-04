@@ -52,6 +52,12 @@ class ClassifyCiChangesTests(unittest.TestCase):
         self.assertTrue(result["run_full"])
         self.assertTrue(result["run_conformance"])
 
+    def test_markdown_golden_fixture_runs_compiled_consumers(self) -> None:
+        result = classify(["crates/marmot-markdown/tests/golden/kitchen_sink.md"])
+        self.assertTrue(result["run_full"])
+        self.assertTrue(result["run_c"])
+        self.assertTrue(result["run_conformance"])
+
     def test_non_markdown_assurance_inventory_is_not_treated_as_docs(self) -> None:
         result = classify(
             ["docs/marmot-architecture/convergence-constant-inventory.txt"]
@@ -63,7 +69,14 @@ class ClassifyCiChangesTests(unittest.TestCase):
         result = classify(["formal/tamarin/convergence.spthy"])
         self.assertTrue(result["run_full"])
         self.assertTrue(result["run_formal"])
+        self.assertTrue(result["run_conformance"])
         self.assertFalse(result["run_c"])
+
+    def test_shared_tamarin_policy_input_runs_formal_and_conformance(self) -> None:
+        result = classify(["formal/tamarin/policy_cases.json"])
+        self.assertTrue(result["run_full"])
+        self.assertTrue(result["run_formal"])
+        self.assertTrue(result["run_conformance"])
 
     def test_ci_workflow_change_runs_every_lane(self) -> None:
         result = classify([".github/workflows/ci.yml"])

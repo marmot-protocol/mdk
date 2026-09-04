@@ -38,6 +38,7 @@ on:
       - crates/transport-quic-stream/**
       - '!*.md'
       - '!**/*.md'
+      - integrations/openclaw/marmot/README.md
   push:
     branches:
       - master

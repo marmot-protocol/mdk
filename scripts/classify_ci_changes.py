@@ -26,6 +26,10 @@ EXECUTABLE_MARKDOWN = {
     "crates/cgka-conformance-simulator/PROTOCOL_DECISIONS.md",
 }
 
+EXECUTABLE_MARKDOWN_PREFIXES = (
+    "crates/marmot-markdown/tests/golden/",
+)
+
 C_WORKSPACE_CRATES = {
     "cgka-engine",
     "cgka-session",
@@ -104,8 +108,11 @@ SPECIALIST_EXACT_PATHS = {
 
 
 def _is_documentation(path: str) -> bool:
+    executable_markdown = path in EXECUTABLE_MARKDOWN or path.startswith(
+        EXECUTABLE_MARKDOWN_PREFIXES
+    )
     return (
-        (path.endswith(".md") and path not in EXECUTABLE_MARKDOWN)
+        (path.endswith(".md") and not executable_markdown)
         or path.startswith(".github/ISSUE_TEMPLATE/")
         or path.startswith(".github/PULL_REQUEST_TEMPLATE/")
     )
@@ -177,6 +184,7 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
             "scripts/tests/test_campaign_toolchain.sh",
             "docs/marmot-architecture/convergence-constant-inventory.txt",
         }
+        or path.startswith("formal/tamarin/")
         or path.startswith("formal/tla/")
         for path in normalized
     )
