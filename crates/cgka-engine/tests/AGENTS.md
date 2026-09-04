@@ -116,7 +116,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 cargo test -p cgka-engine
 ```
 
-Note: the default build pins the v1 convergence policy; suites that install custom policies need
+Note: the default build pins the v1 convergence policy, so the bare command above FAILS the suites that install
+custom policies (~18 tests, `distributed_convergence.rs` and `deferred_peel_lifecycle.rs`) — they need
 `cargo test -p cgka-engine --features test-policy-overrides` (CI runs the workspace with
 `wn-cli/test-policy-overrides,cgka-engine/test-crash-hooks`, see `justfile`).
 

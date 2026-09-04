@@ -333,8 +333,11 @@ restarted committer alike. The durable retained anchor (`openmls-retained-anchor
 into the pass. Anchors mark the epochs a device *stopped* at, not every epoch it passed through — a multi-commit
 convergence apply retains one at its start epoch and one at its final tip, because snapshots cannot nest inside the
 apply transaction — so the rewind base is `retained_anchor_rewind_base`: the **greatest** anchor at or below the fork
-epoch, within the horizon, with the already-applied commits between it and the fork replayed instead of skipped. Own
-commits materialize from their commit-addressed checkpoints (#1285); no anchor at or below an in-horizon fork fails
+epoch, within the horizon, with the already-applied commits between it and the fork replayed instead of skipped. That
+replay bounds the descent (`lowest_replayable_epoch`, read identically by the pass seeder and the apply so the pass
+never selects what the apply cannot realize): it stops above an own commit, above a commit whose by-reference proposal
+has been consumed, and above any gap in the stored chain. Own commits otherwise materialize from their
+commit-addressed checkpoints (#1285); no usable anchor at or below an in-horizon fork fails
 closed loudly, with ingest retaining and scheduling the
 unadjudicable rival and the convergence coordinator issuing the durable `Unrecoverable` +
 `GroupEvent::GroupUnrecoverable` from the authenticated pass. The former pairwise fast-path (`ForkRecoveryManager`, `committed_from` routing,

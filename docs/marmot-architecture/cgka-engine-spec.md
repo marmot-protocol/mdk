@@ -273,7 +273,9 @@ Commit rules:
 - A commit creates a candidate edge only if it validates against exactly one parent state.
 - A child commit whose parent is unavailable is explicitly deferred until the parent appears or the child expires.
 - A commit at or after the retained anchor MAY be replayed from the greatest retained snapshot at or below its source
-  epoch; anchors exist only where a device stopped, so a traversed source epoch has none of its own.
+  epoch; anchors exist only where a device stopped, so a traversed source epoch has none of its own. Replay from that
+  snapshot re-applies the already-applied commits in between, so the snapshot MUST NOT sit below an own commit, a
+  commit that consumed a proposal by reference, or a gap in the stored chain.
 - A commit older than the retained anchor MUST be dropped with `BeyondAnchor`.
 - A commit that needs a retained snapshot inside the rewind window, when no snapshot at or below its source epoch
   survives there, MUST return `MissingRetainedAnchor` without mutating group state or message state.

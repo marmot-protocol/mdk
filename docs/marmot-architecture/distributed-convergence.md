@@ -73,7 +73,10 @@ retained anchors as soon as stable canonicalization advances the current tip pas
 An anchor is not retained at *every* in-window epoch: a snapshot is taken where a device stops, so a device that
 crossed several epochs in one apply holds anchors at that apply's start and tip and none for the epochs it traversed.
 The rewind base is therefore the **greatest retained anchor at or below the fork epoch**, inside the window; the
-already-applied commits between that anchor and the fork are replayed rather than skipped.
+already-applied commits between that anchor and the fork are re-applied by replaying them, not skipped. That replay is
+what bounds how low the base may go: it may not descend past a commit this device authored (MLS refuses to re-process
+an own commit) or one that consumed a proposal by reference (the proposal is no longer an input), nor past a gap in
+the stored chain.
 
 Late commits are handled by their source epoch:
 

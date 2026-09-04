@@ -1202,6 +1202,11 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     let mut already_delivered_app_ids = BTreeSet::new();
     let mut stale_commit_drops = Vec::new();
     let mut own_commits = PrevalidatedOwnCommits::default();
+    // Epochs a rewind below the fork may descend past: an already-applied
+    // (`Processed`) commit is there to replay, and this device did not author
+    // it. See `lowest_replayable_epoch`; the apply applies the same rule to the
+    // branch it realizes, so a pass must not select what the apply cannot.
+    let mut replayable_epochs = BTreeSet::new();
 
     for record in records {
         if admitted_message_ids.is_some_and(|admitted| !admitted.contains(&record.id)) {
@@ -1240,6 +1245,9 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                 }
                 if record.state == MessageState::Processed {
                     own_commits.insert_canonical(projection.message_digest);
+                    if own_commit_stamp.is_none() {
+                        replayable_epochs.insert(source_epoch);
+                    }
                 }
                 // Confirmed own commits remain prevalidated while canonical or
                 // parked for convergence. Terminal states must not regain
@@ -1292,7 +1300,14 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     let historical_start_epoch = historical_replay_start_epoch(&commit_messages, current_epoch);
     let replay_start_epoch = match historical_start_epoch {
         Some(fork_epoch) => {
-            retained_anchor_rewind_base(storage, group_id, fork_epoch, retained_anchor_epoch)?
+            for epoch in
+                epochs_with_unreplayable_proposals(storage, group_id, retained_anchor_epoch)?
+            {
+                replayable_epochs.remove(&epoch);
+            }
+            let floor =
+                lowest_replayable_epoch(fork_epoch, &replayable_epochs).max(retained_anchor_epoch);
+            retained_anchor_rewind_base(storage, group_id, fork_epoch, floor)?
         }
         None => current_epoch,
     };
@@ -1568,8 +1583,9 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
 /// the anchor below the fork and replaying the already-applied commits back up
 /// to it adjudicates the rival instead.
 ///
-/// `floor_epoch` keeps the base inside the window whose commits are still
-/// available to replay. With no anchor in range this returns `fork_epoch`
+/// `floor_epoch` is the lowest base the replay from it can actually start at —
+/// see [`lowest_replayable_epoch`]; being inside the retention window is
+/// necessary but not sufficient. With no anchor in range this returns `fork_epoch`
 /// unchanged, so the caller's rollback still fails closed on
 /// `MissingRetainedAnchor` — the residual case of genuinely lost recovery
 /// material.
@@ -1587,6 +1603,73 @@ fn retained_anchor_rewind_base<S: StorageProvider>(
         .filter(|epoch| (floor_epoch..=fork_epoch).contains(epoch))
         .max()
         .unwrap_or(fork_epoch))
+}
+
+/// Epochs whose commit cannot be replayed because a proposal it may have
+/// referenced is no longer an input.
+///
+/// MLS proposals are epoch-scoped: a proposal from epoch `E` is only
+/// committable by a commit whose source epoch is `E`, so a proposal's own epoch
+/// IS the source epoch of the commit that could have consumed it. Accepting
+/// that proposal marks it `Processed`, which
+/// [`record_state_is_canonicalization_input`] excludes, and a retained anchor
+/// predates the proposal's arrival — so neither the seeded pass inputs nor a
+/// rolled-back proposal store can offer it to a replay again.
+///
+/// A safe over-approximation: every `Processed` proposal's epoch is reported,
+/// including one no commit on the selected branch actually referenced. That
+/// only floors the rewind higher, which fails closed; missing an epoch here
+/// would let the descent pass a commit it cannot replay.
+///
+/// Read through one shared query so the pass and the apply floor the rewind
+/// identically; a disagreement there selects branches the apply cannot realize.
+fn epochs_with_unreplayable_proposals<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    at_or_after_epoch: u64,
+) -> Result<BTreeSet<u64>, OpenMlsProjectionError> {
+    let mut epochs = BTreeSet::new();
+    for record in storage
+        .list_messages_in_states(
+            group_id,
+            &[MessageState::Processed],
+            EpochId(at_or_after_epoch),
+        )
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+    {
+        let Some(message) = openmls_wire_message_from_record(&record)? else {
+            continue;
+        };
+        // Authenticated wire epoch, never the mutable row metadata: a lagging
+        // row would silently drop an epoch from the exclusion set.
+        let projection = project_mls_message(&message.payload)?;
+        if projection.kind == OpenMlsContentKind::Proposal
+            && let Some(source_epoch) = projection.source_epoch
+        {
+            epochs.insert(source_epoch);
+        }
+    }
+    Ok(epochs)
+}
+
+/// The lowest epoch a rewind base may descend to: rewinding below the fork
+/// re-replays the already-applied commits in between, so the base may only pass
+/// epochs whose commit this device can replay again.
+///
+/// `replayable_epochs` holds those epochs — epoch `e` is present when the commit
+/// that took this device from `e` to `e + 1` is still a usable replay input:
+/// it is stored and already applied, this device did not author it (OpenMLS
+/// refuses to re-process own commits), and it referenced no proposal that has
+/// since been consumed ([`epochs_with_unreplayable_proposals`]). Walking down from
+/// `fork_epoch` and stopping at the first epoch missing from the set keeps the
+/// replay contiguous; below that the rewind fails closed on
+/// `MissingRetainedAnchor` rather than stalling on a branch it cannot rebuild.
+fn lowest_replayable_epoch(fork_epoch: u64, replayable_epochs: &BTreeSet<u64>) -> u64 {
+    let mut floor = fork_epoch;
+    while floor > 0 && replayable_epochs.contains(&(floor - 1)) {
+        floor -= 1;
+    }
+    floor
 }
 
 fn historical_replay_start_epoch(
@@ -2399,7 +2482,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     // for the run's final own commit — the exact post-merge state it produced.
     let own_checkpoint_prefix =
         checkpoint_realizable_own_commit_prefix(storage, result, &applied_prefix)?;
-    let mut skipped_prefix = applied_prefix;
+    let mut skipped_prefix: BTreeSet<String> = applied_prefix.keys().cloned().collect();
     skipped_prefix.extend(own_checkpoint_prefix.commit_ids.iter().cloned());
     let mut apply_start_epoch = match own_checkpoint_prefix.realized.as_ref() {
         Some(realized) => realized.resulting_epoch,
@@ -2412,6 +2495,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
         (apply_start_epoch, skipped_prefix) = rebase_apply_onto_retained_anchor(
             storage,
             group_id,
+            &applied_prefix,
             skipped_prefix,
             apply_start_epoch,
         )?;
@@ -2634,18 +2718,29 @@ pub(crate) fn openmls_canonicalization_dispositions(
         .collect()
 }
 
+/// A commit of the already-applied prefix, with what
+/// [`rebase_apply_onto_retained_anchor`] needs to decide whether the rewind may
+/// descend past it.
+struct AppliedPrefixCommit {
+    /// Epoch this commit consumed; it produced `source_epoch + 1`.
+    source_epoch: u64,
+    /// Authored and confirmed by this device.
+    is_own: bool,
+}
+
 /// The longest leading run of accepted commits already applied on the live
 /// canonical state: `Processed` records whose source epoch sits below the live
 /// tip. `Processed` means "applied on this device's canonical chain" (there is
-/// at most one per epoch), so the prefix needs no re-replay — and an OWN
-/// confirmed commit in it CANNOT be re-replayed (`process_message` refuses own
-/// commits).
+/// at most one per epoch), so the prefix needs no re-replay — it is skipped, and
+/// only a rewind to an anchor *below* the fork puts any of it back into the
+/// replay (see [`rebase_apply_onto_retained_anchor`], which is what keeps an OWN
+/// confirmed commit out: `process_message` refuses own commits).
 fn already_applied_commit_prefix<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
     current_epoch: u64,
-) -> Result<BTreeSet<String>, OpenMlsProjectionError> {
-    let mut prefix = BTreeSet::new();
+) -> Result<BTreeMap<String, AppliedPrefixCommit>, OpenMlsProjectionError> {
+    let mut prefix = BTreeMap::new();
     for commit_id in &result.accepted_commits {
         let message_id = message_id_from_hex(commit_id)?;
         let record = match storage.get_message(&message_id) {
@@ -2656,7 +2751,15 @@ fn already_applied_commit_prefix<S: StorageProvider>(
         if record.state != MessageState::Processed || record.epoch.0 >= current_epoch {
             break;
         }
-        prefix.insert(commit_id.clone());
+        let is_own = StoredMessagePayload::decode(&record.payload)
+            .is_ok_and(|payload| payload.own_commit_stamp().is_some());
+        prefix.insert(
+            commit_id.clone(),
+            AppliedPrefixCommit {
+                source_epoch: record.epoch.0,
+                is_own,
+            },
+        );
     }
     Ok(prefix)
 }
@@ -2666,32 +2769,45 @@ fn already_applied_commit_prefix<S: StorageProvider>(
 /// The apply skips the selected branch's already-applied prefix and rewinds to
 /// the first new commit's source epoch, but that epoch may have been merely
 /// traversed by an earlier multi-commit apply and so carry no anchor (see
-/// [`retained_anchor_rewind_base`]). Un-skipping the prefix commits at or above
-/// the anchor below it restores a contiguous replay from a base that exists.
+/// [`retained_anchor_rewind_base`]). Descending to the anchor below it un-skips
+/// the prefix commits at or above that anchor so they are replayed instead.
 ///
-/// The prefix's own source epochs are the only eligible bases: rewinding below
-/// the branch root would leave the replay with no commit to apply against the
-/// restored state. With no anchor among them the fork epoch is returned
-/// unchanged and the rollback fails closed.
+/// [`lowest_replayable_epoch`] bounds the descent — an own commit or a commit
+/// whose by-reference proposal is gone ends it — and the bound is read the same
+/// way the pass reads it, so the apply never faces a branch the pass selected
+/// from lower down. Where the bound leaves no anchor, the rollback fails closed
+/// instead of erroring the pass.
+///
+/// The two sets are not identical, benignly: the pass seeds through its frozen
+/// batch (`admitted_message_ids`) while this reads the accepted branch, so on a
+/// frozen-batch pass the apply may descend deeper than the pass validated. The
+/// extra commits satisfy the same predicate, so they replay cleanly.
 fn rebase_apply_onto_retained_anchor<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
+    applied_prefix: &BTreeMap<String, AppliedPrefixCommit>,
     mut skipped_prefix: BTreeSet<String>,
     fork_epoch: u64,
 ) -> Result<(u64, BTreeSet<String>), OpenMlsProjectionError> {
-    let mut source_epochs = BTreeMap::new();
-    for commit_id in &skipped_prefix {
-        let record = storage
-            .get_message(&message_id_from_hex(commit_id)?)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        source_epochs.insert(commit_id.clone(), record.epoch.0);
-    }
-    let Some(&branch_root_epoch) = source_epochs.values().min() else {
+    let mut replayable_epochs: BTreeSet<u64> = applied_prefix
+        .values()
+        .filter(|commit| !commit.is_own)
+        .map(|commit| commit.source_epoch)
+        .collect();
+    let Some(&branch_root_epoch) = replayable_epochs.first() else {
         return Ok((fork_epoch, skipped_prefix));
     };
-    let base = retained_anchor_rewind_base(storage, group_id, fork_epoch, branch_root_epoch)?;
+    for epoch in epochs_with_unreplayable_proposals(storage, group_id, branch_root_epoch)? {
+        replayable_epochs.remove(&epoch);
+    }
+    let floor = lowest_replayable_epoch(fork_epoch, &replayable_epochs);
+    let base = retained_anchor_rewind_base(storage, group_id, fork_epoch, floor)?;
     if base < fork_epoch {
-        skipped_prefix.retain(|commit_id| source_epochs[commit_id] < base);
+        skipped_prefix.retain(|commit_id| {
+            applied_prefix
+                .get(commit_id)
+                .is_none_or(|commit| commit.source_epoch < base)
+        });
     }
     Ok((base, skipped_prefix))
 }
@@ -2744,13 +2860,13 @@ struct RealizedCheckpoint {
 fn checkpoint_realizable_own_commit_prefix<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
-    applied_prefix: &BTreeSet<String>,
+    applied_prefix: &BTreeMap<String, AppliedPrefixCommit>,
 ) -> Result<CheckpointRealizableOwnPrefix, OpenMlsProjectionError> {
     let mut prefix = CheckpointRealizableOwnPrefix::default();
     for commit_id in result
         .accepted_commits
         .iter()
-        .filter(|commit_id| !applied_prefix.contains(*commit_id))
+        .filter(|commit_id| !applied_prefix.contains_key(*commit_id))
     {
         let message_id = message_id_from_hex(commit_id)?;
         let record = match storage.get_message(&message_id) {
@@ -2967,7 +3083,9 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
         // No pre-validated own messages here. Snapshot rollforward cannot nest
         // inside this transaction, and every own commit on the accepted
         // branch was excluded from `replay_messages` before this call —
-        // either as part of the already-applied prefix or as a
+        // either as part of the already-applied prefix (which a rewind to a
+        // lower anchor un-skips only down to the newest own commit, never
+        // past it: `rebase_apply_onto_retained_anchor`) or as a
         // checkpoint-realizable own-commit run whose exact restore the
         // caller performs itself (`checkpoint_realizable_own_commit_prefix`).
         // Leaving own-application stamps out is also load-bearing: those apps
@@ -4275,6 +4393,28 @@ mod reuse_scope_tests {
 }
 
 #[cfg(test)]
+mod rewind_descent_tests {
+    use super::lowest_replayable_epoch;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn rewind_descent_stops_at_the_first_epoch_it_cannot_replay() {
+        // A contiguous run of replayable epochs is walked in full.
+        assert_eq!(
+            lowest_replayable_epoch(27, &BTreeSet::from([24, 25, 26])),
+            24
+        );
+        // A gap — a retired commit, an own commit, a consumed proposal — ends
+        // the descent above it, so the replay never starts where it cannot
+        // reach the fork.
+        assert_eq!(lowest_replayable_epoch(27, &BTreeSet::from([24, 26])), 26);
+        // Nothing to descend over: the fork epoch is its own floor.
+        assert_eq!(lowest_replayable_epoch(27, &BTreeSet::new()), 27);
+        assert_eq!(lowest_replayable_epoch(0, &BTreeSet::from([0])), 0);
+    }
+}
+
+#[cfg(test)]
 mod unresolved_commit_state_tests {
     use super::unresolved_commit_state;
     use cgka_traits::message::MessageState;
@@ -4336,7 +4476,7 @@ mod checkpoint_prefix_tests {
     use cgka_traits::storage::{GroupStateCheckpointRef, GroupStorage, MessageStorage};
     use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
     use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use storage_sqlite::SqliteAccountStorage;
 
     fn group_id() -> GroupId {
@@ -4455,7 +4595,7 @@ mod checkpoint_prefix_tests {
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &result_accepting(&[b"commit-a"]),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         let realized = prefix.realized.expect("checkpoint should be realizable");
@@ -4478,7 +4618,7 @@ mod checkpoint_prefix_tests {
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &result_accepting(&[b"commit-a"]),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(
@@ -4516,7 +4656,7 @@ mod checkpoint_prefix_tests {
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &result_accepting(&[b"commit-a", b"commit-a-next"]),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(prefix.commit_ids.len(), 2);
@@ -4540,7 +4680,7 @@ mod checkpoint_prefix_tests {
         let prefix = checkpoint_realizable_own_commit_prefix(
             &storage,
             &result_accepting(&[b"commit-a2"]),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(

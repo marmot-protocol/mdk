@@ -4537,6 +4537,17 @@ async fn convergence_rewinds_to_greatest_anchor_at_or_below_traversed_fork_epoch
         &alice_chain[2],
         MessageState::ConvergenceDeferred,
     );
+    let anchors = carol_storage.list_group_snapshots(&group_id).unwrap();
+    assert!(
+        anchors
+            .iter()
+            .all(|name| name.starts_with("openmls-retained-anchor-")),
+        "the rewind must leave no probe or apply snapshot behind, got {anchors:?}"
+    );
+    assert!(
+        anchors.contains(&"openmls-retained-anchor-4".to_string()),
+        "the new tip must be anchored for the next pass, got {anchors:?}"
+    );
     let members = carol.members(&group_id).unwrap();
     assert!(
         members.iter().any(|member| member.id == gina.self_id()),
@@ -10105,6 +10116,7 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
     );
 
     // So the rival forking from the join epoch is adjudicated, not halted.
+    let bob_rival_id = bob_rival.clone();
     carol
         .buffer_openmls_convergence_message_at(&group_id, bob_rival, 3_000)
         .unwrap();
@@ -10114,4 +10126,284 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
     assert_eq!(result.errors, Vec::new());
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // Adjudicated, not merely error-free: Bob wins the epoch-2 tiebreak, so
+    // Carol rolls Alice's commit back and adopts the rival's branch.
+    assert!(committer_wins(&bob.self_id(), &alice.self_id()));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_message_state(&carol_storage, &bob_rival_id, MessageState::Processed);
+    let members = carol.members(&group_id).unwrap();
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+    assert!(!members.iter().any(|member| member.id == david.self_id()));
+}
+
+/// The rewind base must not descend past this device's OWN applied commit.
+///
+/// Descending un-skips the already-applied prefix so it can be replayed, but
+/// OpenMLS refuses to re-process a commit this device authored. Confirming an
+/// own commit anchors both the epoch it started from and the epoch it produced,
+/// so the floor costs nothing in practice; it matters when the upper anchor is
+/// lost, which must fail closed rather than error the whole pass.
+#[tokio::test]
+async fn rewind_base_never_descends_past_an_own_applied_commit() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+    let (mut frank, _frank_storage) = build_client(b"frank");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "own-commit-floor".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id(), carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    assert!(committer_wins(&bob.self_id(), &alice.self_id()));
+
+    // Carol's OWN commit carries epoch 1 -> 2 and lands `Processed`.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let (carol_commit, carol_pending) = evolution(
+        carol
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![david_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    carol.confirm_published(carol_pending).await.unwrap();
+    let carol_commit = route(carol_commit, &group_id);
+    for follower in [&mut alice, &mut bob] {
+        follower
+            .buffer_openmls_convergence_message_at(&group_id, carol_commit.clone(), 1_000)
+            .unwrap();
+        follower
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+    }
+
+    // Alice and Bob then fork at epoch 2.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let (alice_commit, alice_pending) = evolution(
+        alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![eve_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    let alice_commit = route(alice_commit, &group_id);
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let (bob_rival, _bob_pending) = evolution(
+        bob.send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap(),
+    );
+    let bob_rival = route(bob_rival, &group_id);
+
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, alice_commit, 2_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 2_000_000)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+
+    // Storage loss takes the anchor at the fork epoch but leaves the one below
+    // it, which sits under Carol's own commit.
+    carol_storage
+        .release_group_snapshot(&group_id, "openmls-retained-anchor-2")
+        .expect("release the fork-epoch anchor");
+    assert!(
+        carol_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-1".to_string()),
+        "the anchor below the own commit must survive for this shape"
+    );
+
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, bob_rival, 3_000)
+        .unwrap();
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .expect("an unreplayable own commit must not error the pass");
+
+    assert_eq!(
+        result.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor],
+        "with no anchor above the own commit the pass must fail closed"
+    );
+    assert_eq!(result.convergence_status, ConvergenceStatus::Blocked);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
+/// The rewind base must not descend past a commit that consumed a proposal
+/// BY REFERENCE (the SelfRemove auto-commit shape).
+///
+/// Accepting a proposal marks it `Processed`, which is not a canonicalization
+/// input, and the anchor below it predates its arrival — so neither the seeded
+/// pass inputs nor the rolled-back proposal store can offer it again. Replaying
+/// the commit from there is impossible, so the descent must stop above it and
+/// the pass must fail closed instead of silently selecting nothing.
+#[tokio::test]
+async fn rewind_base_never_descends_past_a_commit_consuming_a_proposal_by_reference() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut dave, _dave_storage) = build_client(b"dave");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+    let (mut frank, _frank_storage) = build_client(b"frank");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "by-ref-proposal-floor".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp, dave_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![dave.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    for (member, name) in [
+        (&mut bob, &b"bob"[..]),
+        (&mut carol, &b"carol"[..]),
+        (&mut dave, &b"dave"[..]),
+    ] {
+        member
+            .join_welcome(welcome_for(&welcomes, name))
+            .await
+            .unwrap();
+    }
+
+    // Bob leaves: a SelfRemove proposal, auto-committed by reference.
+    let leave_proposal = route(
+        proposal(
+            bob.send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        ),
+        &group_id,
+    );
+    alice.ingest(leave_proposal.clone()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    alice.advance_convergence(&group_id).await.unwrap();
+    let auto = alice
+        .drain_auto_publish()
+        .into_iter()
+        .next()
+        .expect("alice auto-commits bob's self-remove");
+    let selfremove_commit = route(auto.msg, &group_id);
+    alice.confirm_published(auto.pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+
+    // Alice carries the chain on to epoch 3; Dave forks at epoch 2.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let (alice_commit, alice_pending) = evolution(
+        alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![eve_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    let alice_commit = route(alice_commit, &group_id);
+
+    for message in [leave_proposal.clone(), selfremove_commit.clone()] {
+        dave.buffer_openmls_convergence_message_at(&group_id, message, 500)
+            .unwrap();
+    }
+    dave.converge_stored_openmls_messages_at(&group_id, 500_000)
+        .unwrap();
+    assert_eq!(dave.epoch(&group_id).unwrap(), EpochId(2));
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let (dave_rival, _dave_pending) = evolution(
+        dave.send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap(),
+    );
+    let dave_rival = route(dave_rival, &group_id);
+
+    // Carol traverses epoch 2 in one pass, so she anchors 1 and 3 only, and the
+    // proposal the epoch-1 commit consumed lands `Processed`.
+    for (message, at) in [
+        (leave_proposal.clone(), 1_000),
+        (selfremove_commit.clone(), 1_000),
+        (alice_commit, 1_000),
+    ] {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, message, at)
+            .unwrap();
+    }
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("carol catches up in one pass");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_message_state(&carol_storage, &leave_proposal, MessageState::Processed);
+    let anchors = carol_storage.list_group_snapshots(&group_id).unwrap();
+    assert!(
+        !anchors.contains(&"openmls-retained-anchor-2".to_string()),
+        "epoch 2 must be traversed, got {anchors:?}"
+    );
+
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, dave_rival, 2_000)
+        .unwrap();
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 2_000_000)
+        .expect("a consumed by-reference proposal must not error the pass");
+
+    assert_eq!(
+        result.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor],
+        "with no anchor above the proposal-consuming commit the pass fails closed"
+    );
+    assert_eq!(result.convergence_status, ConvergenceStatus::Blocked);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
 }
