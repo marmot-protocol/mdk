@@ -7440,7 +7440,6 @@ name = "wn-cli"
 version = "0.9.17"
 dependencies = [
  "agent-stream-compose",
- "cgka-session",
  "cgka-traits",
  "chrono",
  "clap",
