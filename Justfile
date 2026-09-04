@@ -237,6 +237,9 @@ cargo-audit-policy-gate:
     python3 scripts/check_cargo_audit_ci.py
     python3 scripts/test_check_cargo_audit_ci.py
 
+ci-path-classifier-gate:
+    python3 scripts/test_classify_ci_changes.py
+
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -311,12 +314,12 @@ conformance-slow:
     cargo nextest run -p cgka-conformance-simulator --features conformance-slow
 
 # Fast PR feedback: ordinary simulator coverage without dedicated verification
-# binaries or the generated multi-minute reliability batches. Run the
-# subprocess-heavy process suite separately so relay tasks do not compete with
-# the parallel simulator tests.
+# binaries or the generated multi-minute reliability batches. Keep two
+# production-shaped process canaries in PR CI; the complete serialized process
+# suite runs in the nightly lane below.
 simulator-smoke:
     cargo nextest run -p cgka-conformance-simulator --locked --profile ci -E '{{simulator-smoke-filter}}'
-    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci
+    cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked --profile ci -E 'test(=engine_app_runtime_and_process_adapters_reach_equivalent_public_state) | test(=process_kill_disconnect_reconnect_and_restart_agree_with_uninterrupted_execution)'
 
 # Complete generic simulator coverage for the nightly lane. Dedicated
 # adversarial and independent-verification binaries run in later recipes.
@@ -583,6 +586,6 @@ test-convergence-policy-pin:
 
 # Fast local pre-push gate: mechanical/static checks plus the release pin proof.
 # GitHub CI invokes the static gates directly and runs the full test matrix.
-fast-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin
+fast-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate check clippy test-convergence-policy-pin
 
-ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate check clippy test-convergence-policy-pin test
+ci: fmt-check naming-gate c-parity-gate convergence-ledger-gate campaign-toolchain-gate agent-install-docs-gate install-example-sha256-gate cargo-audit-policy-gate ci-path-classifier-gate check clippy test-convergence-policy-pin test

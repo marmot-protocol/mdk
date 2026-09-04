@@ -66,7 +66,7 @@ while IFS='|' read -r ledger_id source_path symbol; do
         report "convergence inventory source does not exist: ${source_path}"
         continue
     fi
-    if ! rg -q "^(pub(\\([^)]*\\))? )?const ${symbol}:" "$source_path"; then
+    if ! grep -Eq -- "^(pub(\\([^)]*\\))? )?const ${symbol}:" "$source_path"; then
         report "convergence inventory declaration is missing: ${source_path}:${symbol}"
     fi
 done < "$inventory_path"
@@ -82,7 +82,7 @@ for expected_id in "${expected_ids[@]}"; do
     if [[ "$found" -eq 0 ]]; then
         report "convergence inventory is missing ledger id ${expected_id}"
     fi
-    if ! rg -q "^\\| ${expected_id} \\|" "$plan_path"; then
+    if ! grep -Eq -- "^\\| ${expected_id} \\|" "$plan_path"; then
         report "convergence plan is missing ledger row ${expected_id}"
     fi
 done
@@ -102,7 +102,7 @@ discover_constants() {
             report "unreviewed convergence constant ${source_path}:${symbol}"
         fi
     done < <(
-        rg --no-filename -o \
+        grep -Eo -- \
             "^(pub(\\([^)]*\\))? )?const (${name_pattern}):" \
             "$source_path" || true
     )

@@ -36,6 +36,9 @@ on:
       - crates/transport-nostr-peeler/**
       - crates/transport-quic-broker/**
       - crates/transport-quic-stream/**
+      - '!*.md'
+      - '!**/*.md'
+      - integrations/openclaw/marmot/README.md
   push:
     branches:
       - master

@@ -14,6 +14,8 @@ on:
       - crates/transport-quic-stream/**
       - crates/transport-quic-broker/**
       - .github/workflows/quic-broker-image.yml
+      - '!*.md'
+      - '!**/*.md'
   push:
     branches:
       - master

@@ -802,10 +802,14 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
         fs::remove_dir_all(&out_dir).expect("remove stale output dir");
     }
 
-    let vectors_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vectors");
+    // The canonical-scenarios gate executes every committed vector. This test
+    // only needs one semantic fixture to prove the report writer and summary
+    // path, rather than executing the complete vector directory a second time.
+    let vector =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vectors/group-data-fork-recovery.v1.json");
     let summary = run_report(&ReportArgs {
         input: ReportInput::VectorFixtures {
-            paths: vec![vectors_dir],
+            paths: vec![vector],
         },
         out: out_dir.clone(),
         strict_oracle: false,
@@ -817,7 +821,7 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
     .expect("runner writes vector reports");
 
     assert_eq!(summary.failed(), 0);
-    assert!(summary.total() >= 3);
+    assert_eq!(summary.total(), 1);
     let text = summary.to_human_text();
     assert!(text.contains("PASS"));
     assert!(text.contains("group-data-fork-recovery/v1"));
