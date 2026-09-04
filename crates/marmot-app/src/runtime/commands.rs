@@ -1550,6 +1550,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::DownloadMedia {
                 group_id: group_id.clone(),
                 reference,
+                enqueued_at: Instant::now(),
                 respond,
             })
             .await

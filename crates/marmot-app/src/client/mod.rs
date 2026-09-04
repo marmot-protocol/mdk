@@ -169,13 +169,19 @@ pub(crate) struct EncryptedMediaDownloadHttp {
 }
 
 impl EncryptedMediaDownloadHttp {
-    pub(crate) async fn run(self) -> Result<MediaDownloadResult, AppError> {
+    /// Run the prepared fetch and crypto work, optionally recording only the
+    /// reviewed aggregate phase histograms.
+    pub(crate) async fn run(
+        self,
+        telemetry: Option<AppPerformanceTelemetry>,
+    ) -> Result<MediaDownloadResult, AppError> {
         download_encrypted_media_with_transport(
             self.reference,
             self.media_secret.as_ref(),
             &self.default_blob_endpoints,
             &self.allowed_locator_kinds,
             &self.transport,
+            telemetry.as_ref(),
         )
         .await
     }
@@ -3591,7 +3597,7 @@ impl AppClient {
     ) -> Result<MediaDownloadResult, AppError> {
         self.prepare_encrypted_media_download(group_id, reference)
             .await?
-            .run()
+            .run(None)
             .await
     }
 

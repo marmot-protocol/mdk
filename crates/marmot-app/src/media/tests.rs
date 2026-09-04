@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -12,7 +12,8 @@ use url::Url;
 
 use super::blossom::{
     BlossomHttpTransport, DnsResolver, MAX_BLOSSOM_DESCRIPTOR_BYTES,
-    MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_transport, read_limited_blossom_body,
+    MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_observer,
+    fetch_blossom_blob_with_transport, read_limited_blossom_body,
 };
 use super::host_safety::validate_blossom_fetch_url;
 
@@ -807,6 +808,55 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
     assert_eq!(attachment.encrypted_size_bytes, received_len);
     assert_eq!(attachment.reference.ciphertext_sha256, received_hash);
     assert_eq!(downloaded.plaintext, vec![0x5a; plaintext_len]);
+}
+
+/// A successful round trip records transport, integrity, and crypto phases
+/// without changing the downloaded result.
+#[tokio::test]
+async fn encrypted_media_download_records_network_integrity_and_crypto_phases() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+
+    download_encrypted_media_with_transport(
+        upload.attachments[0].reference.clone(),
+        &secret,
+        &endpoints,
+        &allowed,
+        &transport,
+        Some(&telemetry),
+    )
+    .await
+    .expect("fixture download should succeed");
+
+    let snapshot = telemetry.snapshot();
+    for phase in [
+        snapshot.media_download_host_setup,
+        snapshot.media_download_response_headers,
+        snapshot.media_download_first_byte,
+        snapshot.media_download_body_transfer,
+        snapshot.media_download_ciphertext_verify,
+        snapshot.media_download_decrypt,
+        snapshot.media_download_plaintext_verify,
+    ] {
+        assert_eq!(phase.attempts, 1);
+        assert_eq!(phase.successes, 1);
+        assert_eq!(phase.failures, 0);
+    }
+    assert_eq!(snapshot.media_download_locator_failover.attempts, 0);
 }
 
 #[tokio::test]
@@ -1777,6 +1827,81 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
     assert_eq!(downloaded, body);
 }
 
+/// Multiple stalled locators consume one shared transfer deadline instead of
+/// receiving a fresh end-to-end budget for every candidate.
+#[tokio::test]
+async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
+    const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
+    const EARLY_COMPLETION_TOLERANCE: Duration = Duration::from_millis(30);
+
+    let body = b"healthy ciphertext";
+    let (first_url, first_server) = spawn_stalled_http_server().await;
+    let (second_url, second_server) = spawn_stalled_http_server().await;
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[first_url, second_url, healthy_url]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        TRANSFER_DEADLINE,
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let started = Instant::now();
+
+    let error = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("candidate failover must not renew the transfer deadline");
+    first_server.abort();
+    second_server.abort();
+
+    assert!(error.to_string().contains("timed out"));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= TRANSFER_DEADLINE - EARLY_COMPLETION_TOLERANCE,
+        "the shared end-to-end deadline must be consumed before timing out"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "two stalled candidates must share the configured end-to-end deadline"
+    );
+}
+
+/// Expiring the shared deadline while a later locator is active must leave a
+/// failed sample for the transport phase that consumed the remaining budget.
+#[tokio::test]
+async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
+    let body = b"healthy ciphertext";
+    let (first_url, first_server) = spawn_stalled_http_server().await;
+    let (second_url, second_server) = spawn_stalled_http_server().await;
+    let reference = blob_reference_for_servers(body, &[first_url, second_url]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        Duration::from_millis(130),
+    );
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let error = fetch_encrypted_media_blob_with_observer(
+        &reference,
+        &[],
+        &allowed,
+        &transport,
+        Some(&telemetry),
+    )
+    .await
+    .expect_err("the shared transfer deadline must still expire");
+    first_server.abort();
+    second_server.abort();
+
+    assert!(error.to_string().contains("timed out"));
+    let response_headers = telemetry.snapshot().media_download_response_headers;
+    assert_eq!(response_headers.attempts, 2);
+    assert_eq!(response_headers.successes, 0);
+    assert_eq!(response_headers.failures, 2);
+}
+
 #[tokio::test]
 async fn corrupt_first_locator_does_not_prevent_integrity_valid_fallback() {
     let body = b"integrity-valid ciphertext";
@@ -1875,6 +2000,53 @@ async fn fetch_blossom_blob_rejects_oversized_content_length() {
     let err = fetch_blossom_blob(&url, true).await.unwrap_err();
 
     assert!(err.to_string().contains("download exceeds"));
+}
+
+/// Rejecting a declared oversized body happens before transfer and must not
+/// contribute an artificial zero-duration sample to the transfer histogram.
+#[tokio::test]
+async fn oversized_content_length_does_not_record_body_transfer_timing() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let url = format!("{server}/{}.bin", valid_hash());
+    let transport = BlossomHttpTransport::new(true);
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+
+    let err = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
+        .await
+        .expect_err("oversized declared bodies must be rejected");
+
+    assert!(err.to_string().contains("download exceeds"));
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.media_download_response_headers.attempts, 1);
+    assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
+}
+
+/// EOF before any body bytes is a failed first-byte phase, not a successful
+/// zero-duration transfer.
+#[tokio::test]
+async fn empty_response_records_first_byte_failure_without_body_transfer_timing() {
+    let server = spawn_http_response(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
+    let url = format!("{server}/{}.bin", valid_hash());
+    let transport = BlossomHttpTransport::new(true);
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+
+    let body = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
+        .await
+        .expect("an empty response remains available for integrity validation");
+
+    assert!(body.is_empty());
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.media_download_response_headers.successes, 1);
+    assert_eq!(snapshot.media_download_first_byte.attempts, 1);
+    assert_eq!(snapshot.media_download_first_byte.successes, 0);
+    assert_eq!(snapshot.media_download_first_byte.failures, 1);
+    assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
 }
 
 #[tokio::test]

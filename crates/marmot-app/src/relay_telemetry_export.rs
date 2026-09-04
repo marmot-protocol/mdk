@@ -618,6 +618,82 @@ pub mod metric_names {
     pub const APP_MEDIA_DOWNLOAD_SUCCESSES: &str = "app_media_download_successes";
     /// Failed media downloads.
     pub const APP_MEDIA_DOWNLOAD_FAILURES: &str = "app_media_download_failures";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION: &str =
+        "app_media_download_queue_wait_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS: &str =
+        "app_media_download_queue_wait_attempts";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES: &str =
+        "app_media_download_queue_wait_successes";
+    pub const APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES: &str =
+        "app_media_download_queue_wait_failures";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_DURATION: &str =
+        "app_media_download_preparation_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS: &str =
+        "app_media_download_preparation_attempts";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES: &str =
+        "app_media_download_preparation_successes";
+    pub const APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES: &str =
+        "app_media_download_preparation_failures";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION: &str =
+        "app_media_download_host_setup_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS: &str =
+        "app_media_download_host_setup_attempts";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES: &str =
+        "app_media_download_host_setup_successes";
+    pub const APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES: &str =
+        "app_media_download_host_setup_failures";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION: &str =
+        "app_media_download_response_headers_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS: &str =
+        "app_media_download_response_headers_attempts";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES: &str =
+        "app_media_download_response_headers_successes";
+    pub const APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES: &str =
+        "app_media_download_response_headers_failures";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION: &str =
+        "app_media_download_first_byte_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS: &str =
+        "app_media_download_first_byte_attempts";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES: &str =
+        "app_media_download_first_byte_successes";
+    pub const APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES: &str =
+        "app_media_download_first_byte_failures";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION: &str =
+        "app_media_download_body_transfer_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS: &str =
+        "app_media_download_body_transfer_attempts";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES: &str =
+        "app_media_download_body_transfer_successes";
+    pub const APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES: &str =
+        "app_media_download_body_transfer_failures";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION: &str =
+        "app_media_download_locator_failover_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS: &str =
+        "app_media_download_locator_failover_attempts";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES: &str =
+        "app_media_download_locator_failover_successes";
+    pub const APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES: &str =
+        "app_media_download_locator_failover_failures";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION: &str =
+        "app_media_download_ciphertext_verify_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS: &str =
+        "app_media_download_ciphertext_verify_attempts";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES: &str =
+        "app_media_download_ciphertext_verify_successes";
+    pub const APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES: &str =
+        "app_media_download_ciphertext_verify_failures";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_DURATION: &str = "app_media_download_decrypt_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS: &str = "app_media_download_decrypt_attempts";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES: &str = "app_media_download_decrypt_successes";
+    pub const APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES: &str = "app_media_download_decrypt_failures";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION: &str =
+        "app_media_download_plaintext_verify_duration_ms";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS: &str =
+        "app_media_download_plaintext_verify_attempts";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES: &str =
+        "app_media_download_plaintext_verify_successes";
+    pub const APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES: &str =
+        "app_media_download_plaintext_verify_failures";
     pub const APP_HOST_SPLASH_READY_DURATION: &str = "app_host_splash_ready_duration_ms";
     pub const APP_HOST_SPLASH_READY_ATTEMPTS: &str = "app_host_splash_ready_attempts";
     pub const APP_HOST_SPLASH_READY_SUCCESSES: &str = "app_host_splash_ready_successes";
@@ -903,6 +979,7 @@ pub fn build_export_batch_with_app_performance(
     batch
 }
 
+/// Append the fixed app-performance schema as unlabeled aggregate points.
 fn append_app_performance_points(
     points: &mut Vec<ExportMetricPoint>,
     app_performance: &AppPerformanceSnapshot,
@@ -1381,6 +1458,86 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.media_download_queue_wait,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_preparation,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_PREPARATION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_host_setup,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_HOST_SETUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_response_headers,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_RESPONSE_HEADERS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_first_byte,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_FIRST_BYTE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_body_transfer,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_BODY_TRANSFER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_locator_failover,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_LOCATOR_FAILOVER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_ciphertext_verify,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_CIPHERTEXT_VERIFY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_decrypt,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_DECRYPT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.media_download_plaintext_verify,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_DURATION,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_ATTEMPTS,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_SUCCESSES,
+        metric_names::APP_MEDIA_DOWNLOAD_PLAINTEXT_VERIFY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.host_splash_ready,
         metric_names::APP_HOST_SPLASH_READY_DURATION,
         metric_names::APP_HOST_SPLASH_READY_ATTEMPTS,
@@ -1417,6 +1574,8 @@ fn append_app_performance_points(
     }
 }
 
+/// Encode one aggregate operation without allowing the caller to supply any
+/// label name or value.
 fn append_app_operation_points(
     points: &mut Vec<ExportMetricPoint>,
     operation: &AppPerformanceOperationSnapshot,

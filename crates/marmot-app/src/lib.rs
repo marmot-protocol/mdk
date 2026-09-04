@@ -88,6 +88,9 @@ mod key_package_records;
 #[cfg(test)]
 mod local_open_test_gate;
 mod media;
+#[cfg(feature = "media-benchmarks")]
+#[doc(hidden)]
+pub use media::MediaDownloadBenchmarkTransport;
 mod messages;
 mod nostr_secret;
 mod notifications;

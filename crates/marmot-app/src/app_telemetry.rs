@@ -82,6 +82,16 @@ pub(crate) enum AppPerformanceOperation {
     GroupAcceptInvite,
     MediaUpload,
     MediaDownload,
+    MediaDownloadQueueWait,
+    MediaDownloadPreparation,
+    MediaDownloadHostSetup,
+    MediaDownloadResponseHeaders,
+    MediaDownloadFirstByte,
+    MediaDownloadBodyTransfer,
+    MediaDownloadLocatorFailover,
+    MediaDownloadCiphertextVerify,
+    MediaDownloadDecrypt,
+    MediaDownloadPlaintextVerify,
     HostSplashReady,
     HostForegroundLocalReady,
 }
@@ -332,6 +342,26 @@ pub struct AppPerformanceSnapshot {
     pub media_upload: AppPerformanceOperationSnapshot,
     pub media_download: AppPerformanceOperationSnapshot,
     #[serde(default)]
+    pub media_download_queue_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_preparation: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_host_setup: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_response_headers: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_first_byte: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_body_transfer: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_locator_failover: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_ciphertext_verify: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_decrypt: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub media_download_plaintext_verify: AppPerformanceOperationSnapshot,
+    #[serde(default)]
     pub host_splash_ready: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub host_foreground_local_ready: AppPerformanceOperationSnapshot,
@@ -403,6 +433,16 @@ struct AppPerformanceTelemetryInner {
     group_accept_invite: AppPerformanceOperationTelemetry,
     media_upload: AppPerformanceOperationTelemetry,
     media_download: AppPerformanceOperationTelemetry,
+    media_download_queue_wait: AppPerformanceOperationTelemetry,
+    media_download_preparation: AppPerformanceOperationTelemetry,
+    media_download_host_setup: AppPerformanceOperationTelemetry,
+    media_download_response_headers: AppPerformanceOperationTelemetry,
+    media_download_first_byte: AppPerformanceOperationTelemetry,
+    media_download_body_transfer: AppPerformanceOperationTelemetry,
+    media_download_locator_failover: AppPerformanceOperationTelemetry,
+    media_download_ciphertext_verify: AppPerformanceOperationTelemetry,
+    media_download_decrypt: AppPerformanceOperationTelemetry,
+    media_download_plaintext_verify: AppPerformanceOperationTelemetry,
     host_splash_ready: AppPerformanceOperationTelemetry,
     host_foreground_local_ready: AppPerformanceOperationTelemetry,
 }
@@ -508,6 +548,8 @@ impl AppPerformanceOperationTelemetry {
 }
 
 impl AppPerformanceTelemetry {
+    /// Record one closed, reviewed operation as a process-wide count and
+    /// fixed-bucket duration sample without accepting dynamic attributes.
     pub(crate) fn record(
         &self,
         operation: AppPerformanceOperation,
@@ -731,6 +773,44 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::MediaDownload => {
                 inner.media_download.record(duration, success);
             }
+            AppPerformanceOperation::MediaDownloadQueueWait => {
+                inner.media_download_queue_wait.record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadPreparation => {
+                inner.media_download_preparation.record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadHostSetup => {
+                inner.media_download_host_setup.record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadResponseHeaders => {
+                inner
+                    .media_download_response_headers
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadFirstByte => {
+                inner.media_download_first_byte.record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadBodyTransfer => {
+                inner.media_download_body_transfer.record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadLocatorFailover => {
+                inner
+                    .media_download_locator_failover
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadCiphertextVerify => {
+                inner
+                    .media_download_ciphertext_verify
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadDecrypt => {
+                inner.media_download_decrypt.record(duration, success);
+            }
+            AppPerformanceOperation::MediaDownloadPlaintextVerify => {
+                inner
+                    .media_download_plaintext_verify
+                    .record(duration, success);
+            }
             AppPerformanceOperation::HostSplashReady => {
                 inner.host_splash_ready.record(duration, success);
             }
@@ -785,6 +865,8 @@ impl AppPerformanceTelemetry {
         );
     }
 
+    /// Return cumulative process-wide aggregates suitable for the opt-in
+    /// telemetry and host-FFI boundaries.
     pub fn snapshot(&self) -> AppPerformanceSnapshot {
         let inner = self
             .inner
@@ -866,6 +948,16 @@ impl AppPerformanceTelemetry {
             group_accept_invite: inner.group_accept_invite.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
+            media_download_queue_wait: inner.media_download_queue_wait.snapshot(),
+            media_download_preparation: inner.media_download_preparation.snapshot(),
+            media_download_host_setup: inner.media_download_host_setup.snapshot(),
+            media_download_response_headers: inner.media_download_response_headers.snapshot(),
+            media_download_first_byte: inner.media_download_first_byte.snapshot(),
+            media_download_body_transfer: inner.media_download_body_transfer.snapshot(),
+            media_download_locator_failover: inner.media_download_locator_failover.snapshot(),
+            media_download_ciphertext_verify: inner.media_download_ciphertext_verify.snapshot(),
+            media_download_decrypt: inner.media_download_decrypt.snapshot(),
+            media_download_plaintext_verify: inner.media_download_plaintext_verify.snapshot(),
             host_splash_ready: inner.host_splash_ready.snapshot(),
             host_foreground_local_ready: inner.host_foreground_local_ready.snapshot(),
         }
@@ -1291,6 +1383,46 @@ mod tests {
         );
         assert_eq!(snapshot.group_accept_invite.duration_ms.sample_count(), 2);
         assert_eq!(snapshot.group_accept_invite.duration_ms.sum_ms, 100);
+    }
+
+    /// Every media phase is retained as an aggregate operation with no dynamic
+    /// classification surface.
+    #[test]
+    fn records_each_media_download_phase_without_dynamic_labels() {
+        let telemetry = AppPerformanceTelemetry::default();
+        for (operation, duration_ms) in [
+            (AppPerformanceOperation::MediaDownloadQueueWait, 1),
+            (AppPerformanceOperation::MediaDownloadPreparation, 2),
+            (AppPerformanceOperation::MediaDownloadHostSetup, 3),
+            (AppPerformanceOperation::MediaDownloadResponseHeaders, 4),
+            (AppPerformanceOperation::MediaDownloadFirstByte, 5),
+            (AppPerformanceOperation::MediaDownloadBodyTransfer, 6),
+            (AppPerformanceOperation::MediaDownloadLocatorFailover, 7),
+            (AppPerformanceOperation::MediaDownloadCiphertextVerify, 8),
+            (AppPerformanceOperation::MediaDownloadDecrypt, 9),
+            (AppPerformanceOperation::MediaDownloadPlaintextVerify, 10),
+        ] {
+            telemetry.record(operation, Duration::from_millis(duration_ms), true);
+        }
+
+        let snapshot = telemetry.snapshot();
+        for phase in [
+            snapshot.media_download_queue_wait,
+            snapshot.media_download_preparation,
+            snapshot.media_download_host_setup,
+            snapshot.media_download_response_headers,
+            snapshot.media_download_first_byte,
+            snapshot.media_download_body_transfer,
+            snapshot.media_download_locator_failover,
+            snapshot.media_download_ciphertext_verify,
+            snapshot.media_download_decrypt,
+            snapshot.media_download_plaintext_verify,
+        ] {
+            assert_eq!(phase.attempts, 1);
+            assert_eq!(phase.successes, 1);
+            assert_eq!(phase.failures, 0);
+            assert_eq!(phase.duration_ms.sample_count(), 1);
+        }
     }
 
     #[test]
