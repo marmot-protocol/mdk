@@ -860,6 +860,91 @@ fn direct_peer_profile_saturates_oversized_timestamps_and_batch_reads_current_sn
 }
 
 #[test]
+fn direct_peer_batch_hydration_skips_unchanged_write_transactions() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("direct-peer-batch.sqlite3");
+    let key = SqlCipherKey::new("direct peer batch hydration key").unwrap();
+    let options = crate::SqliteStorageOptions {
+        busy_timeout_ms: 0,
+        ..crate::SqliteStorageOptions::default()
+    };
+    let store =
+        SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone()).unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let profile = DirectPeerProfile {
+        peer_account_id_hex: REMOTE.to_owned(),
+        display_name: Some("Remote Otter".to_owned()),
+        avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+        profile_created_at: 42,
+    };
+    store
+        .hydrate_direct_peer_profiles(LOCAL, std::slice::from_ref(&profile), &[])
+        .unwrap();
+
+    let competing =
+        SqliteAccountStorage::open_encrypted_with_options(&path, &key, options).unwrap();
+    let competing_conn = competing.lock().unwrap();
+    competing_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store
+        .hydrate_direct_peer_profiles(LOCAL, std::slice::from_ref(&profile), &[])
+        .expect("unchanged profiles must not compete for the write lock");
+    competing_conn.execute_batch("ROLLBACK").unwrap();
+
+    let unavailable = vec![REMOTE.to_owned()];
+    store
+        .hydrate_direct_peer_profiles(LOCAL, &[], &unavailable)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("direct row")
+            .direct_peer_presentation
+            .expect("direct peer presentation")
+            .state,
+        DirectPeerPresentationState::LastKnown
+    );
+
+    competing_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store
+        .hydrate_direct_peer_profiles(LOCAL, &[], &unavailable)
+        .expect("an unchanged unavailable profile must not compete for the write lock");
+    competing_conn.execute_batch("ROLLBACK").unwrap();
+
+    store
+        .hydrate_direct_peer_profiles(LOCAL, std::slice::from_ref(&profile), &unavailable)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("direct row")
+            .direct_peer_presentation
+            .expect("direct peer presentation")
+            .state,
+        DirectPeerPresentationState::Current,
+        "an available profile must win conflicting hydration evidence"
+    );
+}
+
+#[test]
 fn direct_peer_profile_projection_is_driven_by_member_index() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let conn = store.lock().unwrap();
@@ -883,6 +968,27 @@ fn direct_peer_profile_projection_is_driven_by_member_index() {
     assert!(
         !plan.contains("scan account_groups"),
         "profile projection must not scan every account group: {plan}"
+    );
+
+    let batch_sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        direct_peer_profile_hydration_needed_sql(1)
+    );
+    let mut batch_statement = conn.prepare(&batch_sql).unwrap();
+    let batch_plan = batch_statement
+        .query_map(params![REMOTE, LOCAL], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n")
+        .to_ascii_lowercase();
+    assert!(
+        batch_plan.contains("idx_direct_conversation_members_member"),
+        "batch hydration must be driven by the member index: {batch_plan}"
+    );
+    assert!(
+        !batch_plan.contains("scan account_groups"),
+        "batch hydration must not scan every account group: {batch_plan}"
     );
 }
 
@@ -2804,7 +2910,7 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn).unwrap(),
+            chat_list_projection_complete_tx(&conn, LOCAL).unwrap(),
             "failed-send preview priority must match the completeness query"
         );
     }
@@ -4616,7 +4722,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn).unwrap(),
+            chat_list_projection_complete_tx(&conn, LOCAL).unwrap(),
             "a pending leave request must not make the projection look stale"
         );
     }

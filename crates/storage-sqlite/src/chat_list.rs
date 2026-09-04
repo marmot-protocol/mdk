@@ -639,6 +639,56 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Hydrate a batch of cached direct-peer profiles with at most one write
+    /// transaction.
+    ///
+    /// A read-only preflight skips the transaction entirely when every
+    /// presentation is already current. Available profiles take precedence if
+    /// a peer is also listed in `unavailable_peer_ids_hex`.
+    pub fn hydrate_direct_peer_profiles(
+        &self,
+        local_account_id_hex: &str,
+        profiles: &[DirectPeerProfile],
+        unavailable_peer_ids_hex: &[String],
+    ) -> StorageResult<()> {
+        let available_peer_ids = profiles
+            .iter()
+            .map(|profile| profile.peer_account_id_hex.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let unavailable_peer_ids = unavailable_peer_ids_hex
+            .iter()
+            .map(|peer| peer.trim().to_ascii_lowercase())
+            .filter(|peer| !available_peer_ids.contains(peer))
+            .collect::<HashSet<_>>();
+        let needs_write = {
+            let conn = self.lock()?;
+            direct_peer_profile_hydration_needed_tx(
+                &conn,
+                local_account_id_hex,
+                profiles,
+                &unavailable_peer_ids,
+            )?
+        };
+        if !needs_write {
+            return Ok(());
+        }
+
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for profile in profiles {
+                project_direct_peer_profile_tx(&conn, local_account_id_hex, profile)?;
+            }
+            for peer_account_id_hex in &unavailable_peer_ids {
+                mark_direct_peer_profile_unavailable_tx(
+                    &conn,
+                    local_account_id_hex,
+                    peer_account_id_hex,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
     ///
     /// Returns only rows whose durable projection is currently classified as
@@ -875,7 +925,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if !chat_list_projection_complete_tx(&conn)? {
+            if !chat_list_projection_complete_tx(&conn, local_account_id_hex)? {
                 rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)?;
             }
             Ok(())
@@ -1238,7 +1288,7 @@ fn refresh_chat_list_row_for_messages_tx(
             message_ids_hex,
             mention_classifier,
         )?;
-        write_chat_list_row_for_group_tx(tx, &group, unread)?;
+        write_chat_list_row_for_group_tx(tx, local_account_id_hex, &group, unread)?;
     }
     chat_list_row_tx(tx, group_id_hex)
 }
@@ -1444,7 +1494,10 @@ fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> Storage
 /// `ChatListRow::leave_requested_at_ms` is derived at read time rather than
 /// materialized, so there is no stored value that can drift out of date — and
 /// comparing a read-time-only field here would mark every row stale forever.
-fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
+fn chat_list_projection_complete_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+) -> StorageResult<bool> {
     if chat_list_projection_version_tx(tx)? < CHAT_LIST_PROJECTION_VERSION {
         return Ok(false);
     }
@@ -1706,7 +1759,7 @@ fn rebuild_chat_list_row_for_group_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
-    write_chat_list_row_for_group_tx(tx, &group, unread)?;
+    write_chat_list_row_for_group_tx(tx, local_account_id_hex, &group, unread)?;
     tx.execute_cached(
         "DELETE FROM chat_list_unread_dirty_messages WHERE group_id_hex = ?1",
         params![group.group_id_hex],
@@ -1723,6 +1776,7 @@ fn rebuild_chat_list_row_for_group_tx(
 
 fn write_chat_list_row_for_group_tx(
     tx: &Connection,
+    local_account_id_hex: &str,
     group: &AccountGroupRow,
     unread: UnreadSummary,
 ) -> StorageResult<()> {
@@ -1741,7 +1795,7 @@ fn write_chat_list_row_for_group_tx(
         )
         .fold(group.conversation_created_at, u64::max);
     let direct_peer_presentation =
-        direct_peer_presentation_for_rebuild_tx(tx, local_account_id_hex, &group)?;
+        direct_peer_presentation_for_rebuild_tx(tx, local_account_id_hex, group)?;
     let now = unix_now_seconds();
     tx.execute_cached(
         "INSERT INTO chat_list_rows (
@@ -2054,16 +2108,12 @@ fn project_direct_peer_profile_tx(
     let mut rows = Vec::with_capacity(group_ids.len());
     for group_id_hex in group_ids {
         let existing = stored_direct_peer_presentation_tx(tx, &group_id_hex)?;
-        if let Some(existing) = existing.as_ref()
-            && existing.peer_account_id_hex.as_deref() == Some(peer.as_str())
-            && (existing
-                .profile_created_at
-                .is_some_and(|created_at| created_at > profile_created_at)
-                || (existing.profile_created_at == Some(profile_created_at)
-                    && existing.display_name == profile.display_name
-                    && existing.avatar_url == profile.avatar_url
-                    && existing.state == DirectPeerPresentationState::Current))
-        {
+        if !direct_peer_profile_projection_needed(
+            existing.as_ref(),
+            &peer,
+            profile,
+            profile_created_at,
+        ) {
             continue;
         }
         let changed = tx
@@ -2096,6 +2146,124 @@ fn project_direct_peer_profile_tx(
         }
     }
     Ok(rows)
+}
+
+/// Determine whether a bounded hydration batch would change any exact Direct
+/// chat. One indexed set query replaces the prior query-per-peer hot path.
+fn direct_peer_profile_hydration_needed_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    profiles: &[DirectPeerProfile],
+    unavailable_peer_ids: &HashSet<String>,
+) -> StorageResult<bool> {
+    let local = local_account_id_hex.trim().to_ascii_lowercase();
+    if local.is_empty() {
+        return Ok(false);
+    }
+
+    let mut profiles_by_peer = HashMap::<String, Vec<&DirectPeerProfile>>::new();
+    for profile in profiles {
+        let peer = profile.peer_account_id_hex.trim().to_ascii_lowercase();
+        if !peer.is_empty() && peer != local {
+            profiles_by_peer.entry(peer).or_default().push(profile);
+        }
+    }
+    let mut peer_ids = profiles_by_peer.keys().cloned().collect::<HashSet<_>>();
+    peer_ids.extend(
+        unavailable_peer_ids
+            .iter()
+            .filter(|peer| !peer.is_empty() && *peer != &local)
+            .cloned(),
+    );
+    let peer_ids = peer_ids.into_iter().collect::<Vec<_>>();
+    for peer_ids in peer_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK.saturating_sub(1)) {
+        let sql = direct_peer_profile_hydration_needed_sql(peer_ids.len());
+        let mut parameters = peer_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        parameters.push(local.as_str());
+        let mut statement = tx.prepare(&sql).storage()?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    direct_peer_presentation_from_columns(row, 1)?,
+                ))
+            })
+            .storage()?;
+        for row in rows {
+            let (peer, existing) = row.storage()?;
+            if let Some(peer_profiles) = profiles_by_peer.get(&peer) {
+                if peer_profiles.iter().any(|profile| {
+                    direct_peer_profile_projection_needed(
+                        existing.as_ref(),
+                        &peer,
+                        profile,
+                        profile.profile_created_at.min(i64::MAX as u64),
+                    )
+                }) {
+                    return Ok(true);
+                }
+            } else if unavailable_peer_ids.contains(&peer)
+                && existing.is_some_and(|presentation| {
+                    presentation.peer_account_id_hex.as_deref() == Some(peer.as_str())
+                        && presentation.state == DirectPeerPresentationState::Current
+                })
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// SQL for the batch hydration preflight, parameterized by a non-empty peer
+/// page. Peer parameters precede the final local-account parameter.
+fn direct_peer_profile_hydration_needed_sql(peer_count: usize) -> String {
+    debug_assert!(peer_count > 0);
+    let placeholders = vec!["?"; peer_count].join(", ");
+    format!(
+        "SELECT peer_member.member_id_hex,
+                    row.direct_peer_presentation_version,
+                    row.direct_peer_account_id_hex,
+                    row.direct_peer_display_name,
+                    row.direct_peer_avatar_url,
+                    row.direct_peer_profile_created_at,
+                    row.direct_peer_presentation_state
+             FROM direct_conversation_members AS peer_member
+             JOIN account_groups AS ag
+               ON ag.group_id_hex = peer_member.group_id_hex
+             JOIN chat_list_rows AS row
+               ON row.group_id_hex = peer_member.group_id_hex
+             WHERE peer_member.member_id_hex IN ({placeholders})
+               AND trim(ag.profile_name) = ''
+               AND ag.member_count = 2
+               AND EXISTS (
+                    SELECT 1 FROM direct_conversation_members AS local_member
+                    WHERE local_member.group_id_hex = peer_member.group_id_hex
+                      AND local_member.member_id_hex = ?
+               )
+               AND (
+                    SELECT COUNT(*) FROM direct_conversation_members AS member_count
+                    WHERE member_count.group_id_hex = peer_member.group_id_hex
+               ) = 2"
+    )
+}
+
+fn direct_peer_profile_projection_needed(
+    existing: Option<&DirectPeerPresentation>,
+    peer_account_id_hex: &str,
+    profile: &DirectPeerProfile,
+    profile_created_at: u64,
+) -> bool {
+    !existing.is_some_and(|existing| {
+        existing.peer_account_id_hex.as_deref() == Some(peer_account_id_hex)
+            && (existing
+                .profile_created_at
+                .is_some_and(|created_at| created_at > profile_created_at)
+                || (existing.profile_created_at == Some(profile_created_at)
+                    && existing.display_name == profile.display_name
+                    && existing.avatar_url == profile.avatar_url
+                    && existing.state == DirectPeerPresentationState::Current))
+    })
 }
 
 fn mark_direct_peer_profile_unavailable_tx(

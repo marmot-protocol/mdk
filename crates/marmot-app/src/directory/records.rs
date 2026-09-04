@@ -371,9 +371,15 @@ fn is_known_profile_field(field: &str) -> bool {
 /// result valid UTF-8.
 const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 
+/// Normalize one untrusted profile field without retaining control characters,
+/// edge whitespace, empty values, or more than the defensive character cap.
 pub(crate) fn sanitize_profile_field(value: &str) -> Option<String> {
     let value = value
-        .trim()
+        // Removing control characters first must not let one at either edge
+        // shield adjacent whitespace from trimming. Matching both classes at
+        // the boundary is equivalent without allocating an unbounded
+        // intermediate attacker-controlled string.
+        .trim_matches(|character: char| character.is_control() || character.is_whitespace())
         .chars()
         .filter(|character| !character.is_control())
         .take(MAX_PROFILE_FIELD_CHARS)
@@ -692,13 +698,18 @@ mod tests {
     #[test]
     fn profile_string_fields_strip_control_characters() {
         let content = serde_json::json!({
-            "name": "  alice\u{1b}[2J\nadmin\u{7}  ",
+            "name": "\u{0}  alice\u{1b}[2J\nadmin\u{7}  ",
+            "picture": "\u{7} https://cdn.example/avatar.png\u{0} ",
             "about": "\u{0}\u{1b}",
         });
 
         assert_eq!(
             string_field(&content, "name").as_deref(),
             Some("alice[2Jadmin")
+        );
+        assert_eq!(
+            string_field(&content, "picture").as_deref(),
+            Some("https://cdn.example/avatar.png")
         );
         assert_eq!(string_field(&content, "about"), None);
     }

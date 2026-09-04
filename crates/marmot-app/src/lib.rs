@@ -2696,7 +2696,7 @@ impl MarmotApp {
                 message_ids_hex,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(&account, row.as_mut())?;
         Ok(row)
     }
 
@@ -4791,30 +4791,31 @@ impl MarmotApp {
         let storage = self.account_storage(&account.label)?;
         let requested = peer_ids.into_iter().collect::<Vec<_>>();
         for page in requested.chunks(MAX_CACHED_IDENTITY_PAGE_SIZE) {
+            let mut profiles = Vec::new();
+            let mut unavailable_peer_ids = Vec::new();
             for projection in self.cached_identity_projections_for_account_ids(page)? {
                 let Some(peer_account_id_hex) = projection.account_id_hex else {
                     continue;
                 };
                 if let Some(profile) = projection.profile {
-                    storage.project_direct_peer_profile(
-                        &account.account_id_hex,
-                        &storage_sqlite::DirectPeerProfile {
-                            peer_account_id_hex,
-                            display_name: projection.resolved_name,
-                            avatar_url: profile
-                                .picture
-                                .as_deref()
-                                .and_then(directory::records::sanitize_profile_field),
-                            profile_created_at: profile.created_at,
-                        },
-                    )?;
+                    profiles.push(storage_sqlite::DirectPeerProfile {
+                        peer_account_id_hex,
+                        display_name: projection.resolved_name,
+                        avatar_url: profile
+                            .picture
+                            .as_deref()
+                            .and_then(directory::records::sanitize_profile_field),
+                        profile_created_at: profile.created_at,
+                    });
                 } else {
-                    storage.mark_direct_peer_profile_unavailable(
-                        &account.account_id_hex,
-                        &peer_account_id_hex,
-                    )?;
+                    unavailable_peer_ids.push(peer_account_id_hex);
                 }
             }
+            storage.hydrate_direct_peer_profiles(
+                &account.account_id_hex,
+                &profiles,
+                &unavailable_peer_ids,
+            )?;
         }
 
         // The caller's rows were read before directory hydration. Re-read only
