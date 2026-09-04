@@ -60,6 +60,16 @@ impl MediaDownloadBenchmarkTransport {
     pub async fn fetch(&self, url: &str) -> Result<Vec<u8>, AppError> {
         blossom::fetch_blossom_blob_with_transport(url, &self.0).await
     }
+
+    /// Fetch one bounded blob while recording only the production transport's
+    /// fixed, aggregate phase metrics for the repository benchmark.
+    pub async fn fetch_with_telemetry(
+        &self,
+        url: &str,
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<Vec<u8>, AppError> {
+        blossom::fetch_blossom_blob_with_observer(url, &self.0, Some(telemetry)).await
+    }
 }
 
 #[cfg(feature = "media-benchmarks")]
