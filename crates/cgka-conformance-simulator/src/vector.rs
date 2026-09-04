@@ -1089,6 +1089,9 @@ pub struct ConvergenceDecisionObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_app_witness_score: Option<u64>,
     pub candidate_count: usize,
+    /// Stable canonicalization error tags emitted for this evaluation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_kinds: Vec<String>,
 }
 
 fn observe_convergence_decision(kind: &AuditEventKind) -> Option<ConvergenceDecisionObservation> {
@@ -1098,6 +1101,7 @@ fn observe_convergence_decision(kind: &AuditEventKind) -> Option<ConvergenceDeci
         decisive_rule,
         selected_branch_id,
         selected_tip_epoch,
+        error_kinds,
         ..
     } = kind
     else {
@@ -1121,6 +1125,7 @@ fn observe_convergence_decision(kind: &AuditEventKind) -> Option<ConvergenceDeci
             .unwrap_or(false),
         selected_app_witness_score: selected_score.and_then(|score| score.app_witness_score),
         candidate_count: candidates.len(),
+        error_kinds: error_kinds.clone(),
     })
 }
 
@@ -1357,6 +1362,7 @@ mod tests {
             witness_quorum_met,
             selected_app_witness_score: Some(selected_app_witness_score),
             candidate_count: 2,
+            error_kinds: Vec::new(),
         }
     }
 
@@ -1987,7 +1993,7 @@ mod tests {
             selected_fork_epoch: Some(1),
             selected_tip_epoch: Some(2),
             losing_branch_ids: vec!["loser".into()],
-            error_kinds: Vec::new(),
+            error_kinds: vec!["missing_retained_anchor".into()],
         };
 
         let projected = observe_convergence_decision(&kind).expect("projects a decision");
@@ -2003,6 +2009,7 @@ mod tests {
         );
         assert_eq!(projected.selected_app_witness_score, Some(2));
         assert_eq!(projected.candidate_count, 2);
+        assert_eq!(projected.error_kinds, vec!["missing_retained_anchor"]);
     }
 
     #[test]
@@ -2143,6 +2150,7 @@ mod tests {
             witness_quorum_met: false,
             selected_app_witness_score: Some(0),
             candidate_count: 1,
+            error_kinds: Vec::new(),
         };
         let settled = convergence_decision("settled", 2, "tip_committer", false, 0);
         let mut carol = observation("carol", 2, 4);
@@ -2199,6 +2207,7 @@ mod tests {
             witness_quorum_met: false,
             selected_app_witness_score: None,
             candidate_count: 0,
+            error_kinds: Vec::new(),
         };
         let mut carol = observation("carol", 2, 4);
         carol.convergence_decisions = vec![settled, trailing_empty];

@@ -414,3 +414,35 @@ fn retained_relay_topology(clients: &[String]) -> ScenarioTopologyV2 {
 fn labels<const N: usize>(items: [&str; N]) -> Vec<String> {
     items.into_iter().map(String::from).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HarnessStorageMode, run_generated_case_report_with_storage_mode};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn four_and_eight_competing_wave_cases_converge_with_file_backed_storage() {
+        for case_index in [5, 11] {
+            let case = generate_offline_catchup_pressure_case(9_101, case_index);
+            let report = run_generated_case_report_with_storage_mode(
+                &case,
+                None,
+                HarnessStorageMode::TempFileBackedSqlite,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+            assert!(
+                report.expectation_failures.is_empty(),
+                "{} expectation failures: {:#?}",
+                case.scenario.name,
+                report.expectation_failures
+            );
+            assert!(
+                report.invariant_failures.is_empty(),
+                "{} invariant failures: {:#?}",
+                case.scenario.name,
+                report.invariant_failures
+            );
+        }
+    }
+}

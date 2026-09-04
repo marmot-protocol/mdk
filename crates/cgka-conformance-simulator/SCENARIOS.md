@@ -911,6 +911,10 @@ exactly once, exact canonical equality, no pending work, and active bidirectiona
 family always selects the retained-relay subject so reconnect means a durable history query rather than healing an
 in-memory packet partition.
 
+`four_and_eight_competing_wave_cases_converge_with_file_backed_storage` pins the lower four-round control and the
+eight-round `seed=9101`, `case_index=11` regression from mdk#1671. The latter requires a selected path that spans
+several epochs to leave every intermediate retained anchor available to the next frozen convergence generation.
+
 ### General Simulator Integrity Checks
 
 These tests keep the simulator machinery honest.

@@ -852,8 +852,14 @@ fn replay_openmls_messages_prevalidated_output<S: StorageProvider>(
     let guard = SnapshotRollbackGuard::create_group_state(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let result =
-        process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy);
+    let result = process_openmls_messages_inner(
+        storage,
+        group_id,
+        messages,
+        own_commits,
+        profile_policy,
+        None,
+    );
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
@@ -2040,8 +2046,15 @@ fn capture_candidate_tip_context<S: StorageProvider>(
 ) -> Result<Option<CandidateTipState>, OpenMlsProjectionError> {
     // A path that fails to replay is simply not a reachable branch state; the
     // BFS already reported that outcome for adjudication.
-    if process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy)
-        .is_err()
+    if process_openmls_messages_inner(
+        storage,
+        group_id,
+        messages,
+        own_commits,
+        profile_policy,
+        None,
+    )
+    .is_err()
     {
         return Ok(None);
     }
@@ -2450,6 +2463,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
             group_id,
             result,
             &replay_messages,
+            max_retained_anchor_rewind,
             profile_policy,
         )?;
         if apply_start_epoch < current_epoch || restore_own_checkpoint {
@@ -2866,6 +2880,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     group_id: &GroupId,
     result: &CanonicalizationResult,
     replay_messages: &[TransportMessage],
+    max_retained_anchor_rewind: u64,
     profile_policy: ReplayProfilePolicy,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     // #157/#424: the convergence-apply multi-write durable sequence
@@ -2896,6 +2911,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
             replay_messages,
             &PrevalidatedOwnCommits::default(),
             profile_policy,
+            Some(max_retained_anchor_rewind),
         )?;
         update_group_record_from_replay(storage, group_id, &output)?;
         persist_openmls_canonicalization_dispositions(storage, result)?;
@@ -3451,6 +3467,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
     profile_policy: ReplayProfilePolicy,
+    retain_replayed_anchors: Option<u64>,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     let reject_legacy_group_additions = profile_policy.reject_legacy_group_additions
         && storage
@@ -3805,6 +3822,24 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         reason: format!("current-profile merged state: {error}"),
                         rejection_category: None,
                     })?;
+                if let Some(max_retained_anchor_rewind) = retain_replayed_anchors {
+                    // One frozen pass may adopt several consecutive commits.
+                    // Persist every resulting epoch, not only the final tip:
+                    // input held for the next generation can still fork from
+                    // any intermediate epoch inside the rewind horizon.
+                    let intermediate = OpenMlsReplayOutput {
+                        observations: Vec::new(),
+                        final_epoch: mls_group.epoch().as_u64(),
+                        final_members: marmot_members(&mls_group),
+                        epoch_authenticators: BTreeMap::new(),
+                    };
+                    update_group_record_from_replay(storage, group_id, &intermediate)?;
+                    retain_current_group_epoch_snapshot(
+                        storage,
+                        group_id,
+                        max_retained_anchor_rewind,
+                    )?;
+                }
                 prefix_canonical =
                     prefix_canonical && own_commits.is_canonical(&projection.message_digest);
             }
