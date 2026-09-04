@@ -72,10 +72,13 @@ async fn spawn_keep_alive_server(
 /// fresh transport per item while keeping payload and server behavior equal.
 async fn run_backlog(reuse_transport: bool) {
     let (url, server) = spawn_keep_alive_server(BACKLOG_SIZE).await;
-    let shared = MediaDownloadBenchmarkTransport::new();
+    let shared = reuse_transport.then(MediaDownloadBenchmarkTransport::new);
     for _ in 0..BACKLOG_SIZE {
         let fresh = (!reuse_transport).then(MediaDownloadBenchmarkTransport::new);
-        let transport = fresh.as_ref().unwrap_or(&shared);
+        let transport = fresh
+            .as_ref()
+            .or(shared.as_ref())
+            .expect("one transport policy must be selected");
         let body = transport.fetch(&url).await.unwrap();
         assert_eq!(body.len(), BODY_SIZE);
     }
