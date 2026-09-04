@@ -219,6 +219,9 @@ pub fn generate_family_case(
         crate::OFFLINE_CATCHUP_PRESSURE_FAMILY => {
             crate::generate_offline_catchup_pressure_case(seed, case_index)
         }
+        crate::MEMBERSHIP_REENTRY_FAMILY => {
+            crate::generate_membership_reentry_case(seed, case_index)
+        }
         "cross-route-restart-permutations/v1" => {
             generate_cross_route_restart_permutation_case(seed, case_index)
         }

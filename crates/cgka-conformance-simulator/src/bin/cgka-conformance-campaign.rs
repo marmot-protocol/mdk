@@ -824,6 +824,7 @@ mod tests {
             "bounded-convergence-pressure/v1",
             "large-group-pressure/v1",
             "offline-catchup-pressure/v1",
+            "membership-reentry/v1",
             "cross-route-exact-restart-permutations/v1",
             "cross-route-restart-permutations/v1",
             "chat-journey/v1",
@@ -851,6 +852,9 @@ mod tests {
                 }
                 "offline-catchup-pressure/v1" => {
                     cgka_conformance_simulator::generate_offline_catchup_pressure_family(42, 4)
+                }
+                "membership-reentry/v1" => {
+                    cgka_conformance_simulator::generate_membership_reentry_family(42, 4)
                 }
                 "cross-route-exact-restart-permutations/v1" => {
                     cgka_conformance_simulator::generate_cross_route_exact_restart_permutation_family(

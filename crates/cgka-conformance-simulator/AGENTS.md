@@ -108,6 +108,11 @@ Git commit; require a clean build and retain the exact source revision plus comm
     are ordered by execution cost because campaign selection is prefix-only; race arms must retain at least two active
     committers, and bounded decryptability probes must preserve late-join/re-add and roster-tail representatives.
 
+- **Module:** `src/membership_reentry_family.rs`
+  - **Role:** Replay-stable small-group departure/re-entry catalog. Guarantees single and repeated administrative
+    remove/re-add cycles, restart boundaries, self-update and self-leave interactions, fresh post-rejoin traffic,
+    exact terminal equivalence, and the stale-original-Welcome incident archetype.
+
 - **Module:** `src/offline_catchup_family.rs`
   - **Role:** Replay-stable retained-relay backlog catalog. Keeps a founding member offline until the terminal phase,
     scales application and commit volume independently, varies relay order/duplication and recovery shape, and requires
@@ -383,7 +388,9 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   relies on saved-input semantic reduction; upgrade lifecycle remains separate.
 - **Partition policy is scripted, not strategy-driven.** The bus supports partitions; proptest currently drives FIFO /
   Reverse / SeededRandom.
-- **Generated family coverage is broad but not exhaustive.** `chat-journey/v1` covers legal product-shaped membership,
+- **Generated family coverage is broad but not exhaustive.** `membership-reentry/v1` owns bounded single/repeated
+  departure and fresh-Welcome re-entry interactions, including a wider multi-auto-committer self-leave fork.
+  `chat-journey/v1` covers legal product-shaped membership,
   admin, profile, application, offline, reconnect, self-update, and restart histories. `send-leave/v1` records lifecycle
   metadata, `convergence-e2e-delivery/v1` mutates the convergence E2E bridge with duplicate/delay/reorder delivery, and
   `convergence-chaos/v1` covers invite races, group-data races, publish rollback, partitions, leaves, delayed past-epoch

@@ -243,8 +243,9 @@ misclassified as a no-pending failure.
 The generator is deterministic by family name, independent generator version, seed, and case index, plus a separately
 versioned workload profile when applicable. Existing semantic reduction minimizes a saved failing scenario after
 execution. `tests/stateful_generator.rs` independently replays the legal-action preconditions, checks the complete
-action vocabulary across adjacent cases, runs both profiles through the report path, and verifies that the input
-fixture was saved privately before execution.
+action vocabulary and a remove/re-invite interaction across adjacent cases, runs both profiles through the report path,
+and verifies that the input fixture was saved privately before execution. Removed identities return to the legal invite
+set; a re-added identity can self-update again during its new membership tenure.
 
 ### `generate_large_group_pressure_family(seed, cases)`
 
@@ -260,6 +261,24 @@ provenance, exact retained-join versus strict pending-work coverage, and bounded
 late-join/re-add and roster-tail representatives. The ordinary lane executes 10-member application-heavy and
 incremental-join canaries. The suite compiles all 54 catalog shapes but does not execute large/xlarge cases in the
 normal PR path.
+
+### `generate_membership_reentry_family(seed, cases)`
+
+Generates a ten-arm, replay-stable catalog dedicated to membership departure and re-entry. Eight arms use four
+clients and cover one, two, and three remove/re-add cycles; victim restarts; self-updates between cycles;
+self-update/removal and self-leave/removal races; self-leave followed by re-entry; and a stale original Welcome
+followed by a fresh Welcome. The final two arms use eight clients: one lets every incumbent stage a sibling commit for
+the same self-leave before any commit is delivered; the other lets only two to four seeded early committers do so while
+the remaining incumbents receive the winning branch first. Both then re-add the departed member. Every successful re-entry
+sends a uniquely labelled application probe, and terminal oracles require exact canonical equivalence, survivor input
+closure, the precisely named retained join-commit exception for the re-added member, and active bidirectional
+decryptability.
+
+`tests/membership_reentry_family.rs` pins deterministic replay, seed variation, prefix stability, family registration,
+cycle counts, and every named interaction. All ten cases execute in the ordinary test lane. Case `7` specifically
+guards that a fully validated, strictly newer re-invitation advances a victim whose delayed older Welcome installed a
+stale active local view. Cases `8` and `9` pin convergence and re-entry after wider all-incumbent and partial-impact
+multi-auto-committer self-leave forks.
 
 ### `generate_offline_catchup_pressure_family(seed, cases)`
 

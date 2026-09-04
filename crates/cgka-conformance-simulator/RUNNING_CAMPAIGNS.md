@@ -139,6 +139,7 @@ timeout, and the original failure artifacts remain authoritative.
 | `bounded-convergence-pressure/v1` | Finite self-update/profile/admin pressure under a bounded quiescence contract |
 | `large-group-pressure/v1` | Explicit 10–200 member, admin-population, committer-width, traffic, growth, and churn profiles |
 | `offline-catchup-pressure/v1` | Founding member returns only after a retained 24–1,024-message backlog plus commit pressure |
+| `membership-reentry/v1` | Single/repeated removal and fresh-Welcome re-entry with restart, self-update, self-leave, and stale-Welcome interactions |
 | `cross-route-restart-permutations/v1` | Twelve public app-runtime restart boundaries in the four-party route scenario |
 | `cross-route-exact-restart-permutations/v1` | Exact/private engine companion to the public restart catalog |
 | `chat-journey/v1` | Legality-aware product journeys: membership, profile, app traffic, offline/catch-up, and restart |
@@ -169,6 +170,17 @@ cargo run -p cgka-conformance-simulator --bin cgka-conformance-campaign --locked
   --case-timeout-secs 300 --storage file \
   --out target/convergence-manual/offline-catchup-seed-42
 ```
+
+For `membership-reentry/v1`, ten consecutive cases cover the complete catalog: one clean cycle, two
+cycles, three cycles with victim restarts, self-updates between cycles, a self-update/removal race, self-leave then
+re-entry, self-leave racing administrative removal, and a stale original Welcome followed by a fresh re-invitation.
+The final two arms widen the group to eight members: case `8` lets all seven incumbents stage competing commits for the
+same self-leave before any commit delivery, while case `9` lets only two to four seeded early committers do so before
+the winner reaches the remaining incumbents. All cases are ordinary strict regressions. Case `7` pins the
+replacement-Welcome freshness rule: a delayed older
+Welcome may install a stale active local view, but a fully validated strictly newer re-invitation must replace it and
+restore convergence. Cases `8` and `9` require the all-committer and production-shaped partial-impact fork to converge
+before re-entry.
 
 ## Running vectors and adapter comparisons
 
