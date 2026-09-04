@@ -4870,7 +4870,7 @@ impl MarmotApp {
                     target: "marmot_app::storage",
                     method = "hydrate_direct_peer_presentations",
                     error_kind = AppError::from(error).privacy_safe_kind(),
-                    group_count = group_ids_hex.len(),
+                    conversation_count = rows.len(),
                     "cleared direct-peer presentation after its roster-safe hydration re-read failed"
                 );
                 for row in rows {
