@@ -22,8 +22,8 @@ const FIXTURES: [BacklogFixture; 2] = [
         body_size: 64 * 1024,
     },
     BacklogFixture {
-        name: "large_1_mib",
-        body_size: 1024 * 1024,
+        name: "large_16_mib",
+        body_size: 16 * 1024 * 1024,
     },
 ];
 
