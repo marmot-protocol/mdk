@@ -12802,10 +12802,9 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
 /// behind no delivery at all, and that replay is the only reconciler left when
 /// the live projection never ran.
 ///
-/// The arm also sets `routes_dirty`, which is deliberately not asserted here: a
-/// disband leaves the group's transport route in place, so the forced
-/// `sync_runtime_groups` reconciles an unchanged subscription set and reaches
-/// the relay as nothing observable.
+/// The arm also sets `routes_dirty`, which this test does not assert: the
+/// teardown it forces belongs to `refresh_group_routes`, which clears a
+/// disbanded group's subscriptions outright. This test pins the push sweep.
 #[tokio::test]
 async fn a_drained_disband_performs_the_terminal_push_sweep() {
     let dir = tempfile::tempdir().unwrap();
