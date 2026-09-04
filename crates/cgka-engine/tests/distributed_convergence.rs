@@ -9835,18 +9835,19 @@ async fn a_deferral_with_only_one_retained_branch_reports_uncontested_lineage() 
     );
 }
 
-/// A joiner anchors its join epoch on its first advance, so a rival forking
-/// from that epoch is adjudicated rather than halting the group.
+/// The join epoch always carries a retained anchor, so a rival forking from it
+/// is adjudicated rather than halting the group.
 ///
-/// `do_join_welcome` retains no anchor of its own — the join epoch is anchored
-/// by whatever first carries the device past it, because every advance path
-/// (direct ingest, confirm-published, and the convergence apply that starts at
-/// the live tip) snapshots the pre-advance epoch. That is what keeps a late
-/// joiner out of the `MissingRetainedAnchor` residual, and it is the invariant
+/// Two independent paths anchor it. `do_join_welcome` retains the joined epoch
+/// inside the join transaction (mdk#1680), and the first advance past that
+/// epoch snapshots it regardless, because every advance path — direct ingest,
+/// confirm-published, and the convergence apply that starts at the live tip —
+/// snapshots the pre-advance epoch. Either one alone keeps a late joiner out of
+/// the `MissingRetainedAnchor` residual, which is the invariant
 /// [`convergence_rewinds_to_greatest_anchor_at_or_below_traversed_fork_epoch`]
 /// leans on: a rewind base exists at every epoch a device stopped at.
 #[tokio::test]
-async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicates() {
+async fn join_epoch_is_anchored_so_a_rival_forking_there_adjudicates() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -9899,10 +9900,12 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
         .await
         .unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
-    assert_eq!(
-        carol_storage.list_group_snapshots(&group_id).unwrap(),
-        Vec::<String>::new(),
-        "the join itself retains no anchor"
+    assert!(
+        carol_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-2".to_string()),
+        "the join must anchor the epoch it joined at"
     );
 
     // Bob follows to epoch 2 and forks there.
@@ -9922,7 +9925,9 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
     );
     let bob_rival = route(bob_rival, &group_id);
 
-    // Carol's first advance past the join epoch anchors it.
+    // Carol's first advance past the join epoch keeps it anchored: the advance
+    // snapshots the pre-advance epoch, so the anchor holds even independently
+    // of the join-time retain above.
     let david_kp = david.fresh_key_package().await.unwrap();
     let (alice_commit, alice_pending) = evolution(
         alice
@@ -9947,7 +9952,7 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
             .list_group_snapshots(&group_id)
             .unwrap()
             .contains(&"openmls-retained-anchor-2".to_string()),
-        "the first advance must anchor the join epoch"
+        "the join epoch must still be anchored after the first advance"
     );
 
     // So the rival forking from the join epoch is adjudicated, not halted.
