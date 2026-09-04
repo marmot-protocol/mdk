@@ -2892,14 +2892,12 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     //
     // The surrounding durable group snapshot (create/rollback/release in
     // `apply_openmls_canonicalization_result`) intentionally stays OUTSIDE this
-    // boundary: those ops drive their own SQLite transactions and cannot nest
-    // inside an open one. The snapshot guards in-process error returns; this
-    // transaction guards hard crashes mid-merge.
+    // boundary: the snapshot guards in-process error returns; this transaction
+    // guards hard crashes mid-merge.
     storage.with_transaction(|storage| {
-        // No pre-validated own messages here. Snapshot rollforward cannot nest
-        // inside this transaction, and every own commit on the accepted
-        // branch was excluded from `replay_messages` before this call —
-        // either as part of the already-applied prefix or as a
+        // No pre-validated own messages here: every own commit on the
+        // accepted branch was excluded from `replay_messages` before this
+        // call — either as part of the already-applied prefix or as a
         // checkpoint-realizable own-commit run whose exact restore the
         // caller performs itself (`checkpoint_realizable_own_commit_prefix`).
         // Leaving own-application stamps out is also load-bearing: those apps
