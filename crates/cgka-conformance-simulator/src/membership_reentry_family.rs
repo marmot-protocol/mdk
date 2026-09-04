@@ -19,7 +19,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 pub const MEMBERSHIP_REENTRY_FAMILY: &str = "membership-reentry/v1";
-pub const MEMBERSHIP_REENTRY_GENERATOR_VERSION: &str = "3";
+pub const MEMBERSHIP_REENTRY_GENERATOR_VERSION: &str = "1";
 
 const ARM_COUNT: u64 = 10;
 

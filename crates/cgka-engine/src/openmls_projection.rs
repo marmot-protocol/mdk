@@ -1268,8 +1268,7 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
             // witnesses; canonical apply skips one already consumed by an
             // accepted prefix using its authenticated source epoch.
             OpenMlsContentKind::Proposal
-                if record_state_can_contribute_to_openmls_graph(record.state)
-                    && source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
+                if source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
             {
                 pending_messages.push(message)
             }
@@ -3100,7 +3099,7 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 ///   tip convergence settled on — the commit that advances the group to its
 ///   epoch has not been selected yet (ordinary out-of-order relay delivery,
 ///   mdk#144). Persisting it as the terminal `EpochInvalidated` would
-///   permanently drop it: `record_state_is_canonicalization_input` never
+///   permanently drop it: `record_state_can_contribute_to_openmls_graph` never
 ///   re-admits `EpochInvalidated`, so the buffered message could never re-enter
 ///   convergence once that commit arrives. Keep it `Retryable` so a later
 ///   canonicalize pass re-feeds and applies it; ordinary current results do not
