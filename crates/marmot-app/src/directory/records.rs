@@ -384,7 +384,8 @@ pub(crate) fn sanitize_profile_field(value: &str) -> Option<String> {
         .filter(|character| !character.is_control())
         .take(MAX_PROFILE_FIELD_CHARS)
         .collect::<String>();
-    (!value.is_empty()).then_some(value)
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
@@ -712,6 +713,21 @@ mod tests {
             Some("https://cdn.example/avatar.png")
         );
         assert_eq!(string_field(&content, "about"), None);
+    }
+
+    #[test]
+    fn profile_string_fields_trim_whitespace_exposed_by_the_character_cap() {
+        let oversized = format!("{} trailing", "a".repeat(MAX_PROFILE_FIELD_CHARS - 1));
+
+        let sanitized = sanitize_profile_field(&oversized).expect("non-empty sanitized field");
+
+        assert_eq!(sanitized, "a".repeat(MAX_PROFILE_FIELD_CHARS - 1));
+        assert!(
+            sanitized
+                .chars()
+                .last()
+                .is_some_and(|character| !character.is_whitespace())
+        );
     }
 
     #[test]

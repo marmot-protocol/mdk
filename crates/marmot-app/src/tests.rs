@@ -9071,6 +9071,86 @@ fn direct_peer_presentation_is_local_on_the_first_frame_after_restart() {
 }
 
 #[test]
+fn direct_peer_hydration_is_best_effort_and_does_not_use_local_label_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let group_id_hex = "11".repeat(32);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    app.account_storage(&alice.label)
+        .unwrap()
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: alice.label.clone(),
+                groups: vec![storage_sqlite::StoredAccountGroup {
+                    group_id_hex: group_id_hex.clone(),
+                    endpoint: "wss://relay.example".to_owned(),
+                    profile_name: String::new(),
+                    profile_description: String::new(),
+                    image_hash_hex: String::new(),
+                    image_key_hex: String::new(),
+                    image_nonce_hex: String::new(),
+                    image_upload_key_hex: String::new(),
+                    image_media_type: None,
+                    admin_keys_hex: String::new(),
+                    archived: false,
+                    pending_confirmation: false,
+                    member_count: Some(2),
+                    direct_member_ids_hex: Some(vec![
+                        alice.account_id_hex.clone(),
+                        bob.account_id_hex.clone(),
+                    ]),
+                    welcomer_account_id_hex: None,
+                    via_welcome_message_id_hex: None,
+                    nostr_routing_last_epoch: 0,
+                    prior_nostr_routes: Vec::new(),
+                    self_membership: storage_sqlite::SelfMembership::Member,
+                    components: Vec::new(),
+                }],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    app.remember_directory_profile(
+        &bob.account_id_hex,
+        &UserProfileMetadata {
+            picture: Some("https://cdn.example.com/bob.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+
+    let first = app.chat_list(&alice.label, false).unwrap().remove(0);
+    assert_eq!(
+        first
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.display_name.as_deref()),
+        None,
+        "a local account label must not become remotely sourced peer presentation"
+    );
+
+    let alice_cache = app.directory_cache_for_account(&alice).unwrap();
+    let bob_cache = app.directory_cache_for_account(&bob).unwrap();
+    alice_cache.close().unwrap();
+    bob_cache.close().unwrap();
+
+    let after_directory_failure = app
+        .chat_list(&alice.label, false)
+        .expect("derived directory hydration failure must not hide a readable chat row")
+        .remove(0);
+    assert_eq!(
+        after_directory_failure.direct_peer_presentation,
+        first.direct_peer_presentation
+    );
+}
+
+#[test]
 fn direct_peer_hydration_rechecks_presentation_after_a_roster_race() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -9124,6 +9204,7 @@ fn direct_peer_hydration_rechecks_presentation_after_a_roster_race() {
     )
     .unwrap();
     let mut stale_row = app.chat_list("alice", false).unwrap().remove(0);
+    let mut stale_row_when_storage_is_unavailable = stale_row.clone();
     assert_eq!(
         stale_row
             .direct_peer_presentation
@@ -9158,6 +9239,21 @@ fn direct_peer_hydration_rechecks_presentation_after_a_roster_race() {
             profile_created_at: None,
             state: storage_sqlite::DirectPeerPresentationState::Invalidated,
         })
+    );
+
+    // If storage closes in the same window, hydration cannot perform its
+    // roster-safe re-read. The chat row remains usable, but the presentation
+    // must fail closed instead of returning the former peer's values.
+    app.close_storage().unwrap();
+    app.hydrate_direct_peer_presentations(
+        &alice,
+        std::slice::from_mut(&mut stale_row_when_storage_is_unavailable),
+    )
+    .unwrap();
+    assert!(
+        stale_row_when_storage_is_unavailable
+            .direct_peer_presentation
+            .is_none()
     );
 }
 

@@ -4788,19 +4788,50 @@ impl MarmotApp {
                     .and_then(|presentation| presentation.peer_account_id_hex.clone())
             })
             .collect::<HashSet<_>>();
-        let storage = self.account_storage(&account.label)?;
+        let storage = match self.account_storage(&account.label) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "hydrate_direct_peer_presentations",
+                    error_kind = error.privacy_safe_kind(),
+                    "cleared direct-peer presentation because the account store was unavailable"
+                );
+                // The rows were read before this second storage acquisition.
+                // If a concurrent roster change then closed the app storage,
+                // retaining those values could expose the former peer because
+                // the roster-safe re-read below is no longer possible.
+                for row in rows {
+                    row.direct_peer_presentation = None;
+                }
+                return Ok(());
+            }
+        };
         let requested = peer_ids.into_iter().collect::<Vec<_>>();
         for page in requested.chunks(MAX_CACHED_IDENTITY_PAGE_SIZE) {
             let mut profiles = Vec::new();
             let mut unavailable_peer_ids = Vec::new();
-            for projection in self.cached_identity_projections_for_account_ids(page)? {
+            let projections = match self.cached_identity_projections_for_account_ids(page) {
+                Ok(projections) => projections,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::storage",
+                        method = "hydrate_direct_peer_presentations",
+                        error_kind = error.privacy_safe_kind(),
+                        peer_count = page.len(),
+                        "skipped a direct-peer presentation hydration page because cached identities were unavailable"
+                    );
+                    continue;
+                }
+            };
+            for projection in projections {
                 let Some(peer_account_id_hex) = projection.account_id_hex else {
                     continue;
                 };
                 if let Some(profile) = projection.profile {
                     profiles.push(storage_sqlite::DirectPeerProfile {
                         peer_account_id_hex,
-                        display_name: projection.resolved_name,
+                        display_name: directory::records::display_name_for_profile(Some(&profile)),
                         avatar_url: profile
                             .picture
                             .as_deref()
@@ -4811,19 +4842,43 @@ impl MarmotApp {
                     unavailable_peer_ids.push(peer_account_id_hex);
                 }
             }
-            storage.hydrate_direct_peer_profiles(
+            if let Err(error) = storage.hydrate_direct_peer_profiles(
                 &account.account_id_hex,
                 &profiles,
                 &unavailable_peer_ids,
-            )?;
+            ) {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "hydrate_direct_peer_presentations",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    peer_count = page.len(),
+                    "skipped a direct-peer presentation hydration page after a storage failure"
+                );
+            }
         }
 
         // The caller's rows were read before directory hydration. Re-read only
         // the presentation columns after the writes so a concurrent roster
         // replacement cannot return the former peer's name/avatar from that
         // earlier snapshot. One set query preserves the no-per-row-call path.
-        let mut current_presentations =
-            storage.direct_peer_presentations_for_group_ids(&group_ids_hex)?;
+        let mut current_presentations = match storage
+            .direct_peer_presentations_for_group_ids(&group_ids_hex)
+        {
+            Ok(current_presentations) => current_presentations,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "hydrate_direct_peer_presentations",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    group_count = group_ids_hex.len(),
+                    "cleared direct-peer presentation after its roster-safe hydration re-read failed"
+                );
+                for row in rows {
+                    row.direct_peer_presentation = None;
+                }
+                return Ok(());
+            }
+        };
         for row in rows {
             row.direct_peer_presentation =
                 current_presentations.remove(&row.group_id_hex).flatten();

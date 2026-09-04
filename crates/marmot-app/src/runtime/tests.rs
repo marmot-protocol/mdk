@@ -1939,6 +1939,9 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         .unwrap()
         .close()
         .unwrap();
+    let ordinary_lookup_failures_before =
+        super::subscriptions::ORDINARY_PRESENTATION_LOOKUP_FAILURES_FOR_TEST
+            .load(std::sync::atomic::Ordering::Relaxed);
     runtime.publish_chat_list_projection_update(
         account.account_id_hex.clone(),
         account.label.clone(),
@@ -1946,6 +1949,23 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         Some(lookup_failure_update),
         ChatListUpdateTrigger::UnreadChanged,
     );
+    tokio::time::timeout(UPDATE_TIMEOUT, async {
+        loop {
+            if super::subscriptions::ORDINARY_PRESENTATION_LOOKUP_FAILURES_FOR_TEST
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > ordinary_lookup_failures_before
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the ordinary event's presentation lookup should fail");
+    app.account_storages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&account.label);
     let lookup_failure = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("the ordinary projection change must survive a presentation lookup failure")
@@ -1961,13 +1981,9 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         "a presentation lookup failure dropped or leaked presentation into the ordinary update: {lookup_failure:?}"
     );
 
-    // Let the bounded retry reopen the same durable database. This simulates
+    // The bounded retry now reopens the same durable database. This simulates
     // recovery from a transient cached-handle failure without changing the
     // semantic unread update that the first emission carried.
-    app.account_storages
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&account.label);
     let recovered = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("the bounded presentation retry should recover")

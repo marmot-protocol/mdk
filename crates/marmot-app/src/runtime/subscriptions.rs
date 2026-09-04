@@ -83,6 +83,12 @@ const CHAT_LIST_PRESENTATION_LOOKUP_RETRY_DELAY: Duration = Duration::from_milli
 pub(super) static DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Counts failed ordinary-event presentation lookups so the runtime regression
+/// test can repair the cached storage handle before the bounded retry runs.
+#[cfg(test)]
+pub(super) static ORDINARY_PRESENTATION_LOOKUP_FAILURES_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Re-materializes the timeline for a fixed account/group from the store.
 /// Captures the owning [`MarmotApp`] and account label so the subscription can
 /// run cursor queries off the caller thread without threading them through
@@ -1543,6 +1549,9 @@ impl MarmotAppRuntime {
                                     error_kind = error.privacy_safe_kind(),
                                     "emitting a chat-list projection update without direct-peer presentation after its current projection lookup failed"
                                 );
+                                #[cfg(test)]
+                                ORDINARY_PRESENTATION_LOOKUP_FAILURES_FOR_TEST
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 row.direct_peer_presentation = None;
                                 retry_direct_peer_presentation = true;
                                 Some(row)
