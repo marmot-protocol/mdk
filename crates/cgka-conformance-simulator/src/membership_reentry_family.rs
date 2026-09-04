@@ -316,24 +316,62 @@ pub fn generate_membership_reentry_case(seed: u64, case_index: u64) -> Generated
                     client: victim.into(),
                 });
             }
-            // A newer Welcome cannot authenticate its own lineage. Release the
-            // commit from the victim's currently trusted branch first; only
-            // after that removal is applied is the fresh Welcome a re-entry.
+            // Create the fresh re-invitation while the victim still trusts the
+            // stale active view. Keep one byte-identical duplicate aside so the
+            // first delivery can pin the retryable refusal and the second can
+            // prove the same Welcome succeeds after trusted removal.
+            let pending = "readd-0";
+            steps.push(ScenarioStep::InviteMembers {
+                inviter: "alice".into(),
+                invitees: vec![victim.into()],
+                pending: pending.into(),
+            });
+            confirm(&mut steps, &mut expected, "alice", pending);
+            steps.push(ScenarioStep::DuplicateMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    publication: Some(pending.into()),
+                    class: Some(ScenarioTransportClass::Welcome),
+                    ..Default::default()
+                },
+            });
+            steps.push(ScenarioStep::WithholdMessage {
+                selector: ScenarioMessageSelectorV2 {
+                    publication: Some(pending.into()),
+                    class: Some(ScenarioTransportClass::Welcome),
+                    occurrence: 1,
+                    ..Default::default()
+                },
+                label: "fresh-reentry-welcome-retry".into(),
+            });
+            settle(&mut steps, &delivery_order_without(&delivery_order, victim));
+            epoch += 1;
+            assert_client_state(&mut steps, "alice", epoch, clients.len());
+
+            let refusal_step = steps.len();
+            steps.push(ScenarioStep::ExpectTickError {
+                client: victim.into(),
+                error: "invalid_transition".into(),
+            });
+            expected.push(TraceExpectation::ExpectedError {
+                step_index: refusal_step,
+                client: victim.into(),
+                operation: "tick".into(),
+                error: "invalid_transition".into(),
+            });
+
+            // A newer Welcome cannot authenticate its own lineage. Only after
+            // the victim applies the commit from its currently trusted branch
+            // does the held byte-identical Welcome become a valid re-entry.
             steps.push(ScenarioStep::ReleaseWithheld {
                 label: "trusted-removal-after-stale-welcome".into(),
             });
+            settle_twice(&mut steps, &delivery_order);
+            steps.push(ScenarioStep::ReleaseWithheld {
+                label: "fresh-reentry-welcome-retry".into(),
+            });
             settle(&mut steps, &delivery_order);
-            assert_client_state(&mut steps, "alice", epoch, clients.len() - 1);
-            epoch = readd_and_probe(
-                &mut steps,
-                &mut expected,
-                &clients,
-                &delivery_order,
-                victim,
-                case_index,
-                0,
-                epoch,
-            );
+            assert_client_state(&mut steps, victim, epoch, clients.len());
+            probe_after_readd(&mut steps, &delivery_order, victim, case_index, 0);
         }
         ReentryArm::SelfLeaveMultiCommitterReentry => {
             steps.push(ScenarioStep::Leave {
@@ -421,16 +459,22 @@ pub fn generate_membership_reentry_case(seed: u64, case_index: u64) -> Generated
     expected.push(TraceExpectation::ClientsExactlyEquivalent {
         clients: clients.clone(),
     });
-    expected.push(TraceExpectation::NoPendingWork {
-        clients: clients
-            .iter()
-            .filter(|client| client.as_str() != victim)
-            .cloned()
-            .collect(),
-    });
-    expected.push(TraceExpectation::NoPendingWorkExceptRetainedJoinCommit {
-        client: victim.into(),
-    });
+    if arm == ReentryArm::StaleWelcomeThenFreshReentry {
+        expected.push(TraceExpectation::NoPendingWork {
+            clients: clients.clone(),
+        });
+    } else {
+        expected.push(TraceExpectation::NoPendingWork {
+            clients: clients
+                .iter()
+                .filter(|client| client.as_str() != victim)
+                .cloned()
+                .collect(),
+        });
+        expected.push(TraceExpectation::NoPendingWorkExceptRetainedJoinCommit {
+            client: victim.into(),
+        });
+    }
     expected.push(TraceExpectation::ClientsBidirectionallyDecryptable {
         clients: clients.clone(),
     });
@@ -568,6 +612,17 @@ fn readd_and_probe(
     assert_client_state(steps, "alice", epoch, clients.len());
     assert_client_state(steps, victim, epoch, clients.len());
 
+    probe_after_readd(steps, delivery_order, victim, case_index, cycle);
+    epoch
+}
+
+fn probe_after_readd(
+    steps: &mut Vec<ScenarioStep>,
+    delivery_order: &[String],
+    victim: &str,
+    case_index: u64,
+    cycle: usize,
+) {
     let payload = format!("membership-reentry:{case_index}:{cycle}:{victim}");
     steps.push(ScenarioStep::SendAppMessage {
         sender: victim.into(),
@@ -584,7 +639,6 @@ fn readd_and_probe(
             },
         },
     });
-    epoch
 }
 
 fn self_update(

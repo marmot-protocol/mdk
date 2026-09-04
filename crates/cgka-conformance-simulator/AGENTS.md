@@ -149,6 +149,8 @@ Git commit; require a clean build and retain the exact source revision plus comm
     into the canonical snapshot and scenario-input ledger while legacy `Observe` remains stable for existing fixtures.
     `ProbeBidirectionalDecryptability` actively exercises send, transport peel, MLS decrypt, and application delivery.
     Membership operations include invite, admin removal, leave, and leaf self-update through the same subject contract.
+    V3's `expect_tick_error` records a normalized, expected transport refusal and continues so the same input can be
+    replayed after a later prerequisite state transition.
 
 - **Module:** `src/scenario_ir.rs`
   - **Role:** Canonical ScenarioSpec v2/v3 compiler. It validates input, assigns stable action ids, records the deterministic

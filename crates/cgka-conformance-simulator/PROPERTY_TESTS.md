@@ -276,8 +276,9 @@ the re-added member, and active bidirectional decryptability.
 
 `tests/membership_reentry_family.rs` pins deterministic replay, seed variation, prefix stability, family registration,
 cycle counts, and every named interaction. All ten cases execute in the ordinary test lane. Case `7` specifically
-guards that a fresh re-invitation stays retryable while a delayed older Welcome leaves the victim apparently active,
-then succeeds after the victim processes the removal from its trusted branch. Cases `8` and `9` pin convergence and
+guards that a fresh re-invitation is refused non-terminally while a delayed older Welcome leaves the victim apparently
+active, then replays the byte-identical Welcome successfully after the victim processes the removal from its trusted
+branch. That arm requires complete pending-work closure; cases `8` and `9` pin convergence and
 re-entry after wider all-incumbent and partial-impact multi-auto-committer self-leave forks.
 
 ### `generate_offline_catchup_pressure_family(seed, cases)`

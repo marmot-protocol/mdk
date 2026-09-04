@@ -646,8 +646,9 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 - Expected: every successful re-entry immediately sends an application probe. The terminal oracle requires exact
   canonical equivalence, the final complete roster at the exact epoch, no pending work for survivors, exactly the
   documented retained join-commit exception for the re-added member, and active decryptability in every direction.
-- Status: all ten arms are ordinary executable regressions. The stale-original-Welcome arm at case `7` guards that
-  a fresh re-invitation waits until the stale active view processes its trusted removal, then restores exact convergence.
+- Status: all ten arms are ordinary executable regressions. The stale-original-Welcome arm at case `7` explicitly
+  observes the fresh re-invitation's non-terminal refusal while the stale view is active, then replays a byte-identical
+  Welcome after trusted removal and requires exact convergence with no pending work.
   Cases `8` and `9` require convergence and re-entry after all-incumbent and partial-impact multi-auto-committer
   self-leave forks, respectively.
 

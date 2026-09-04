@@ -63,10 +63,17 @@ fn complete_catalog_guarantees_reentry_and_high_risk_interactions() {
             expectation,
             TraceExpectation::ClientsBidirectionallyDecryptable { .. }
         )));
-        assert!(case.expected_outcomes.iter().any(|expectation| matches!(
-            expectation,
-            TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { .. }
-        )));
+        if case.case_index == 7 {
+            assert!(case.expected_outcomes.iter().any(|expectation| matches!(
+                expectation,
+                TraceExpectation::NoPendingWork { clients } if clients == &case.scenario.clients
+            )));
+        } else {
+            assert!(case.expected_outcomes.iter().any(|expectation| matches!(
+                expectation,
+                TraceExpectation::NoPendingWorkExceptRetainedJoinCommit { .. }
+            )));
+        }
     }
 
     assert!(
@@ -92,6 +99,52 @@ fn complete_catalog_guarantees_reentry_and_high_risk_interactions() {
         step,
         ScenarioStep::WithholdMessage { label, .. } if label == "stale-original-welcome"
     )));
+    let case_7_steps = &cases[7].scenario.steps;
+    let step_index = |predicate: &dyn Fn(&ScenarioStep) -> bool| {
+        case_7_steps
+            .iter()
+            .position(predicate)
+            .expect("case 7 must contain the expected retry step")
+    };
+    let fresh_invite = step_index(
+        &|step| matches!(step, ScenarioStep::InviteMembers { pending, .. } if pending == "readd-0"),
+    );
+    let refused_fresh_welcome = step_index(&|step| {
+        matches!(
+            step,
+            ScenarioStep::ExpectTickError { error, .. } if error == "invalid_transition"
+        )
+    });
+    let trusted_removal = step_index(&|step| {
+        matches!(
+            step,
+            ScenarioStep::ReleaseWithheld { label }
+                if label == "trusted-removal-after-stale-welcome"
+        )
+    });
+    let welcome_retry = step_index(&|step| {
+        matches!(
+            step,
+            ScenarioStep::ReleaseWithheld { label }
+                if label == "fresh-reentry-welcome-retry"
+        )
+    });
+    assert!(fresh_invite < refused_fresh_welcome);
+    assert!(refused_fresh_welcome < trusted_removal);
+    assert!(trusted_removal < welcome_retry);
+    assert!(
+        cases[7]
+            .expected_outcomes
+            .iter()
+            .any(|expectation| matches!(
+                expectation,
+                TraceExpectation::ExpectedError {
+                    operation,
+                    error,
+                    ..
+                } if operation == "tick" && error == "invalid_transition"
+            ))
+    );
     assert_eq!(cases[8].scenario.clients.len(), 8);
     assert!(cases[8].scenario.steps.iter().any(|step| matches!(
         step,

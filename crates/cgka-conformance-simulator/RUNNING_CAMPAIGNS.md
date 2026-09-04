@@ -179,8 +179,9 @@ incumbents stage competing commits for the same self-leave before any commit del
 to four seeded early committers do so before
 the winner reaches the remaining incumbents. All cases are ordinary strict regressions. Case `7` pins the
 trusted-removal continuity rule: a delayed older Welcome may install a stale active local view, but a newer
-re-invitation remains retryable until the victim processes the removal from its trusted branch. The same Welcome then
-restores convergence. Cases `8` and `9` require the all-committer and production-shaped partial-impact fork to
+re-invitation is explicitly refused without terminal deduplication. After the victim processes the removal from its
+trusted branch, a byte-identical duplicate of the same Welcome restores convergence with no pending work. Cases `8`
+and `9` require the all-committer and production-shaped partial-impact fork to
 converge before re-entry.
 
 ## Running vectors and adapter comparisons

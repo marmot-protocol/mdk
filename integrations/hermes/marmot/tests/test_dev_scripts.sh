@@ -74,6 +74,7 @@ env \
         --root "$local_ref_root" \
         --hermes-ref "$(printf 'ab%.0s' {1..20})" \
         --no-enable-plugin
+[ "$(grep -c '^count=' "$local_ref_capture")" -eq 1 ]
 [ "$(grep -Fxc 'count=1' "$local_ref_capture")" -eq 1 ]
 [ "$(grep -Fxc 'key=http.https://github.com/.extraheader' "$local_ref_capture")" -eq 1 ]
 [ "$(grep -Fxc "value=AUTHORIZATION: basic $expected_basic" "$local_ref_capture")" -eq 1 ]
