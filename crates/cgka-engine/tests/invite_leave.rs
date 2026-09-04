@@ -2000,7 +2000,7 @@ async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgra
     carol.join_welcome(stale_carol_welcome).await.unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
     drop(carol);
-    let mut carol = build_client_on_storage(b"carol-stale-welcome", carol_storage);
+    let mut carol = build_client_on_storage(b"carol-stale-welcome", carol_storage.clone());
     carol.hydrate_all_stored_groups().unwrap();
     assert_eq!(
         carol.epoch(&group_id).unwrap().0,
@@ -2031,6 +2031,45 @@ async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgra
     let fresh_carol_welcome = take_welcome_for(&mut fresh_welcomes, &carol_id);
     let fresh_david_welcome = take_welcome_for(&mut fresh_welcomes, &david_id);
 
+    // Carol can still stage work against her stale active view. A replacement
+    // must wait for that publication's explicit outcome rather than discard
+    // its MLS state and leave the epoch manager pointing at the old copy.
+    let held_update = carol
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let held_pending = match held_update {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let stale_record = carol_storage.get_group(&group_id).unwrap();
+    let held_epoch = carol.epoch(&group_id).unwrap();
+    let held_error = carol
+        .join_welcome(fresh_carol_welcome.clone())
+        .await
+        .expect_err("replacement must wait for the held publication outcome");
+    assert!(matches!(
+        held_error,
+        EngineError::InvalidTransition(ref error)
+            if error.from == "PendingPublish" && error.to == "JoinWelcome"
+    ));
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap(),
+        stale_record,
+        "refused replacement must leave the durable stale view intact"
+    );
+    assert_eq!(
+        carol.epoch(&group_id).unwrap(),
+        held_epoch,
+        "refused replacement must preserve the held epoch-manager state"
+    );
+    carol.publish_failed(held_pending).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), stale_record.epoch);
+
+    // The refusal is retryable: rolling back the stale publication restores
+    // Stable, and the identical Welcome can now atomically replace that view.
     carol.join_welcome(fresh_carol_welcome).await.unwrap();
     assert_eq!(carol.epoch(&group_id).unwrap().0, 4);
     assert_eq!(

@@ -1039,6 +1039,26 @@ impl<S: StorageProvider> Engine<S> {
                         Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
                         Err(error) => return Err(EngineError::Storage(error)),
                     };
+                if local_state_is_stale
+                    && let Some(state) = self.epoch_manager.state(&group_id)
+                    && state.is_resolving_local_publish()
+                {
+                    // The held publication belongs to the local group copy
+                    // this replacement would discard. Let its explicit
+                    // confirm/rollback transition finish first; otherwise the
+                    // durable replacement can commit while `set_stable` below
+                    // correctly refuses to overwrite PendingPublish/Merging,
+                    // splitting the epoch manager from the installed group.
+                    // This error is deliberately non-terminal for Welcome
+                    // deduplication, so the identical Welcome can be retried.
+                    return Err(EngineError::InvalidTransition(
+                        cgka_traits::engine_state::InvalidTransition {
+                            from: state.name(),
+                            to: "JoinWelcome",
+                            reason: "replacement Welcome requires the local publication to resolve",
+                        },
+                    ));
+                }
                 if local_state_is_stale {
                     self.clear_live_openmls_group_on_storage(storage, &group_id)?;
                 }
