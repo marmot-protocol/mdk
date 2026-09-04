@@ -28,42 +28,47 @@ CREATE INDEX idx_chat_list_unread_messages_first
         message_id_hex
     );
 
-CREATE TABLE chat_list_unread_dirty_groups (
+CREATE TABLE chat_list_unread_ready_groups (
     group_id_hex TEXT PRIMARY KEY
                  REFERENCES account_groups(group_id_hex) ON DELETE CASCADE
 );
-INSERT INTO chat_list_unread_dirty_groups (group_id_hex)
-SELECT group_id_hex FROM account_groups;
+
+CREATE TABLE chat_list_unread_dirty_messages (
+    group_id_hex   TEXT NOT NULL
+                   REFERENCES account_groups(group_id_hex) ON DELETE CASCADE,
+    message_id_hex TEXT NOT NULL,
+    PRIMARY KEY (group_id_hex, message_id_hex)
+);
 
 CREATE TRIGGER chat_list_unread_dirty_after_timeline_insert
 AFTER INSERT ON message_timeline
 BEGIN
-    INSERT INTO chat_list_unread_dirty_groups (group_id_hex)
-    SELECT NEW.group_id_hex
+    INSERT INTO chat_list_unread_dirty_messages (group_id_hex, message_id_hex)
+    SELECT NEW.group_id_hex, NEW.message_id_hex
     WHERE EXISTS (
         SELECT 1 FROM account_groups WHERE group_id_hex = NEW.group_id_hex
     )
-    ON CONFLICT(group_id_hex) DO NOTHING;
+    ON CONFLICT(group_id_hex, message_id_hex) DO NOTHING;
 END;
 CREATE TRIGGER chat_list_unread_dirty_after_timeline_update
 AFTER UPDATE ON message_timeline
 BEGIN
-    INSERT INTO chat_list_unread_dirty_groups (group_id_hex)
-    SELECT NEW.group_id_hex
+    INSERT INTO chat_list_unread_dirty_messages (group_id_hex, message_id_hex)
+    SELECT NEW.group_id_hex, NEW.message_id_hex
     WHERE EXISTS (
         SELECT 1 FROM account_groups WHERE group_id_hex = NEW.group_id_hex
     )
-    ON CONFLICT(group_id_hex) DO NOTHING;
+    ON CONFLICT(group_id_hex, message_id_hex) DO NOTHING;
 END;
 CREATE TRIGGER chat_list_unread_dirty_after_timeline_delete
 AFTER DELETE ON message_timeline
 BEGIN
-    INSERT INTO chat_list_unread_dirty_groups (group_id_hex)
-    SELECT OLD.group_id_hex
+    INSERT INTO chat_list_unread_dirty_messages (group_id_hex, message_id_hex)
+    SELECT OLD.group_id_hex, OLD.message_id_hex
     WHERE EXISTS (
         SELECT 1 FROM account_groups WHERE group_id_hex = OLD.group_id_hex
     )
-    ON CONFLICT(group_id_hex) DO NOTHING;
+    ON CONFLICT(group_id_hex, message_id_hex) DO NOTHING;
 END;
 
 -- Force one authoritative rebuild to seed the new derived projection.

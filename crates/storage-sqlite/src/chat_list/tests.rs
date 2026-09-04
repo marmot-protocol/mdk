@@ -3077,7 +3077,7 @@ fn targeted_refresh_classifies_only_changed_unread_messages() {
 }
 
 #[test]
-fn ensure_repairs_timeline_change_left_dirty_before_chat_list_refresh() {
+fn later_targeted_refresh_preserves_earlier_dirty_message_for_repair() {
     let store = setup_store();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
@@ -3089,38 +3089,119 @@ fn ensure_repairs_timeline_change_left_dirty_before_chat_list_refresh() {
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
 
-    // Model a process stop between the timeline commit and the app's targeted
-    // chat-list refresh. The trigger-owned marker must make startup repair it.
+    // Model a process stop between this timeline commit and its targeted
+    // chat-list refresh.
     store
         .record_app_event(&chat("second", REMOTE, 20, "second"))
         .unwrap();
+    store
+        .record_app_event(&chat("third", REMOTE, 30, "third"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 2);
     {
         let conn = store.lock().unwrap();
-        let dirty: i64 = conn
+        let dirty_message: String = conn
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM chat_list_unread_dirty_groups
-                    WHERE group_id_hex = ?1
-                 )",
+                "SELECT message_id_hex FROM chat_list_unread_dirty_messages
+                 WHERE group_id_hex = ?1",
                 params![GROUP],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(dirty, 1);
+        assert_eq!(dirty_message, "second");
     }
 
     store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
-    assert_eq!(row.unread_count, 2);
+    assert_eq!(row.unread_count, 3);
     let conn = store.lock().unwrap();
     let dirty: i64 = conn
         .query_row(
-            "SELECT count(*) FROM chat_list_unread_dirty_groups",
+            "SELECT count(*) FROM chat_list_unread_dirty_messages",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(dirty, 0);
+}
+
+#[test]
+fn targeted_refresh_requires_per_group_membership_readiness_after_upgrade() {
+    const SECOND_GROUP: &str = "22";
+    let mut other_group = group();
+    other_group.group_id_hex = SECOND_GROUP.to_owned();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, SECOND_GROUP, &mentions_local)
+        .unwrap();
+    let mut historical = chat_with_tags(
+        "h-old",
+        REMOTE,
+        10,
+        "historical mention",
+        vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+    );
+    historical.group_id_hex = SECOND_GROUP.to_owned();
+    store.record_app_event(&historical).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, SECOND_GROUP, &mentions_local)
+        .unwrap();
+
+    // Reproduce the post-migration state: old chat-list rows exist, but no
+    // group has had its membership projection seeded yet.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute("DELETE FROM chat_list_unread_messages", [])
+            .unwrap();
+        conn.execute("DELETE FROM chat_list_unread_ready_groups", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    store
+        .record_app_event(&chat("g-new", REMOTE, 20, "new in first group"))
+        .unwrap();
+    store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["g-new".to_owned()], &mentions_local)
+        .unwrap();
+
+    let mut new_in_second = chat("h-new", REMOTE, 20, "new in second group");
+    new_in_second.group_id_hex = SECOND_GROUP.to_owned();
+    store.record_app_event(&new_in_second).unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(
+            LOCAL,
+            SECOND_GROUP,
+            &["h-new".to_owned()],
+            &mentions_local,
+        )
+        .unwrap()
+        .expect("second chat row");
+    assert_eq!(row.unread_count, 2);
+    assert_eq!(row.unread_mention_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("h-old"));
 }
 
 #[test]
@@ -3216,6 +3297,11 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
         conn.execute(
             "UPDATE chat_list_projection_meta SET mention_counts_version = 0 WHERE id = 1",
             [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM chat_list_unread_ready_groups WHERE group_id_hex = ?1",
+            params![GROUP],
         )
         .unwrap();
     }

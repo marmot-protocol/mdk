@@ -1005,7 +1005,13 @@ fn refresh_chat_list_row_for_messages_tx(
         return Ok(None);
     };
     if message_ids_hex.is_empty()
-        || chat_list_projection_version_tx(tx)? < CHAT_LIST_PROJECTION_VERSION
+        || !projection_has_rows_tx(
+            tx,
+            "SELECT EXISTS(
+                SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex = ?1
+             )",
+            params![group_id_hex],
+        )?
         || !projection_has_rows_tx(
             tx,
             "SELECT EXISTS(SELECT 1 FROM chat_list_rows WHERE group_id_hex = ?1)",
@@ -1023,12 +1029,6 @@ fn refresh_chat_list_row_for_messages_tx(
         )?;
         write_chat_list_row_for_group_tx(tx, &group, unread)?;
     }
-    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)?;
-    tx.execute_cached(
-        "DELETE FROM chat_list_unread_dirty_groups WHERE group_id_hex = ?1",
-        params![group_id_hex],
-    )
-    .storage()?;
     chat_list_row_tx(tx, group_id_hex)
 }
 
@@ -1205,8 +1205,8 @@ fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> Storage
 /// comparing a read-time-only field here would mark every row stale forever.
 fn chat_list_projection_complete_tx(
     tx: &Connection,
-    local_account_id_hex: &str,
-    mention_classifier: &MentionClassifier<'_>,
+    _local_account_id_hex: &str,
+    _mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<bool> {
     let activity_filter = chat_list_activity_filter_sql("mt.");
     let preview_order = chat_list_preview_order_desc("mt.");
@@ -1227,7 +1227,19 @@ fn chat_list_projection_complete_tx(
     }
     if projection_has_rows_tx(
         tx,
-        "SELECT EXISTS(SELECT 1 FROM chat_list_unread_dirty_groups)",
+        "SELECT EXISTS(SELECT 1 FROM chat_list_unread_dirty_messages)",
+        [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+            SELECT 1 FROM account_groups AS ag
+            LEFT JOIN chat_list_unread_ready_groups AS ready
+                ON ready.group_id_hex = ag.group_id_hex
+            WHERE ready.group_id_hex IS NULL
+         )",
         [],
     )? {
         return Ok(false);
@@ -1374,10 +1386,10 @@ fn chat_list_projection_complete_tx(
     if chat_list_projection_version_tx(tx)? >= CHAT_LIST_PROJECTION_VERSION {
         return Ok(true);
     }
-    // Older projection versions have no durable unread membership to compare;
-    // seed it with one authoritative rebuild.
-    let _ = (local_account_id_hex, mention_classifier);
-    Ok(false)
+    // Every group has durable membership now, so an account-wide marker left
+    // behind by targeted post-migration rebuilds can be advanced safely.
+    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)?;
+    Ok(true)
 }
 
 fn projection_has_rows_tx<P: Params>(tx: &Connection, sql: &str, params: P) -> StorageResult<bool> {
@@ -1407,11 +1419,17 @@ fn rebuild_chat_list_row_for_group_tx(
     )?;
     write_chat_list_row_for_group_tx(tx, &group, unread)?;
     tx.execute_cached(
-        "DELETE FROM chat_list_unread_dirty_groups WHERE group_id_hex = ?1",
+        "DELETE FROM chat_list_unread_dirty_messages WHERE group_id_hex = ?1",
         params![group.group_id_hex],
     )
     .storage()?;
-    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)
+    tx.execute_cached(
+        "INSERT INTO chat_list_unread_ready_groups (group_id_hex) VALUES (?1)
+         ON CONFLICT(group_id_hex) DO NOTHING",
+        params![group.group_id_hex],
+    )
+    .storage()?;
+    Ok(())
 }
 
 fn write_chat_list_row_for_group_tx(
@@ -1660,6 +1678,12 @@ fn reconcile_unread_messages_tx(
                 }
             }
         }
+        tx.execute_cached(
+            "DELETE FROM chat_list_unread_dirty_messages
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+        )
+        .storage()?;
     }
     let first_message_id = tx
         .query_row_cached(
@@ -1924,7 +1948,16 @@ pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
     )
     .storage()?;
     tx.execute_cached(
-        "DELETE FROM chat_list_unread_dirty_groups WHERE group_id_hex = ?1",
+        "DELETE FROM chat_list_unread_dirty_messages WHERE group_id_hex = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "INSERT INTO chat_list_unread_ready_groups (group_id_hex)
+         SELECT ?1 WHERE EXISTS (
+            SELECT 1 FROM account_groups WHERE group_id_hex = ?1
+         )
+         ON CONFLICT(group_id_hex) DO NOTHING",
         params![group_id_hex],
     )
     .storage()?;
