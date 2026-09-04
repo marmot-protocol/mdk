@@ -4017,12 +4017,22 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
-        let terminal = self
-            .runtime
-            .group_record(group_id)
-            .map(|group| group.disbanded.is_some())
-            .unwrap_or(false);
-        if terminal || self.runtime.disbanding_in_progress(group_id)? {
+        // One `is_terminal` gate, two errors. Both terminal reasons block the
+        // send, but they are not the same news for the user: disbanded means
+        // the group is gone for everyone, removed means it goes on without
+        // this device. Reporting "disbanding" for a removal claims a group no
+        // longer exists when it does.
+        if let Ok(group) = self.runtime.group_record(group_id)
+            && group.is_terminal()
+        {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            return Err(if group.removed {
+                AppError::GroupRemoved(group_id_hex)
+            } else {
+                AppError::GroupDisbanding(group_id_hex)
+            });
+        }
+        if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
         }
         Ok(())

@@ -14325,6 +14325,114 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     );
 }
 
+/// A device an admin removed must fail a composer send before it projects a row.
+///
+/// The engine rejects the send at its own terminal gate, but the app records
+/// the optimistic local row *before* the engine call, so a removed device
+/// rendered the message and then retracted it as `local_publish_failed` — a
+/// permanent "failed" row in a group it can never send to again. The send
+/// preflight only knew about disband tombstones, so `Group::removed` walked
+/// straight past it.
+#[tokio::test]
+async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+
+    let group_id = alice
+        .create_group("removal target", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "bob must join the group before the removal commit"
+    );
+
+    alice
+        .remove_members(&group_id, &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+        .await
+        .expect("the removal commit must fan out to bob's group route")
+        .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        panic!("the test did not overflow its account delivery queue");
+    };
+    bob_client
+        .ingest_received_delivery(*delivery)
+        .await
+        .unwrap();
+    // The removal lands in the epoch bob still holds, so convergence adopts it
+    // rather than the inline commit-apply path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bob_client.runtime.group_record(&group_id).unwrap().removed {
+        bob_client
+            .advance_convergence_after_runtime_sync(&group_id)
+            .await
+            .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "convergence did not adopt the removal commit within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut optimistic_projection_count = 0usize;
+    let error = bob_client
+        .send_with_local_projection(&group_id, b"must not appear", |_| {
+            optimistic_projection_count += 1;
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::GroupRemoved(_)),
+        "a removed group is not a disbanding one; got {error:?}"
+    );
+    assert_eq!(
+        optimistic_projection_count, 0,
+        "a removed device must fail before optimistic timeline projection"
+    );
+    let projected = app
+        .timeline_messages_with_query(
+            "bob",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    assert!(
+        !projected
+            .iter()
+            .any(|row| row.plaintext == "must not appear"),
+        "a send that can never publish must leave no timeline row, failed or otherwise"
+    );
+}
+
 #[tokio::test]
 async fn local_delete_compensation_preserves_primary_error_and_attempts_route_restore() {
     let dir = tempfile::tempdir().unwrap();

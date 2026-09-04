@@ -95,6 +95,7 @@ pub enum MarmotStatus {
     AccountWorkerResponseTimedOut = 60,
     GroupInviteNotPending = 61,
     MissingMemberInboxRoute = 62,
+    GroupRemoved = 63,
 }
 
 thread_local! {
@@ -168,6 +169,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         }
         MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
+        MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {

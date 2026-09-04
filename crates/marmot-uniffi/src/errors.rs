@@ -119,6 +119,11 @@ pub enum MarmotKitError {
     DisbandingNotEnabled { group_id_hex: String },
     #[error("group {group_id_hex} is disbanding or disbanded")]
     GroupDisbanding { group_id_hex: String },
+    /// This device was removed from the group; it goes on without us. Kept
+    /// distinct from `GroupDisbanding` so a host does not tell the user a live
+    /// group was disbanded.
+    #[error("this device was removed from group {group_id_hex}")]
+    GroupRemoved { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -290,6 +295,7 @@ impl From<AppError> for MarmotKitError {
             },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
             AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
+            AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
             // Encrypted-media validation failures are always media-boundary
             // errors; map them to the typed variant so send/upload/download
