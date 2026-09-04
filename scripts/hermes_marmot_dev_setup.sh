@@ -247,14 +247,42 @@ clone_hermes_repo() {
     return 1
 }
 
+fetch_hermes_ref() {
+    local attempt=1
+    local max_attempts=5
+    local delay=8
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if git_with_github_auth -C "$hermes_repo" fetch origin "$hermes_ref"; then
+            return 0
+        fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            echo "warning: hermes ref fetch failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+        attempt=$((attempt + 1))
+    done
+    echo "error: failed to fetch Hermes ref after ${max_attempts} attempts" >&2
+    return 1
+}
+
 install_hermes() {
     if [ ! -d "$hermes_repo/.git" ]; then
         clone_hermes_repo "$hermes_repo"
     fi
 
     if [ -n "$hermes_ref" ]; then
-        git_with_github_auth -C "$hermes_repo" fetch origin "$hermes_ref"
-        git -C "$hermes_repo" checkout --detach FETCH_HEAD
+        if [[ "$hermes_ref" =~ ^[0-9a-fA-F]{40}$ ]] \
+            && git -C "$hermes_repo" cat-file -e "${hermes_ref}^{commit}" 2>/dev/null; then
+            # A normal full clone already contains the pinned commit when it is
+            # reachable from the default branch. Avoid a second GitHub request:
+            # under shared-runner pressure that redundant fetch can be 429'd
+            # immediately after the clone itself finally succeeds.
+            git -C "$hermes_repo" checkout --detach "$hermes_ref"
+        else
+            fetch_hermes_ref
+            git -C "$hermes_repo" checkout --detach FETCH_HEAD
+        fi
     fi
 
     if ensure_uv; then
