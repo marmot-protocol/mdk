@@ -1144,15 +1144,6 @@ impl MarmotAppRuntime {
             }
         })
         .await?;
-        let mut group_fingerprints = snapshot
-            .iter()
-            .map(|group| {
-                (
-                    group.group_id_hex.clone(),
-                    app_group_record_fingerprint(group),
-                )
-            })
-            .collect::<HashMap<_, _>>();
         let mut group_records = snapshot
             .iter()
             .map(|group| (group.group_id_hex.clone(), group.clone()))
@@ -1198,7 +1189,6 @@ impl MarmotAppRuntime {
                             };
                             if !reconcile_chats_snapshot(
                                 &updates_tx,
-                                &mut group_fingerprints,
                                 &mut group_records,
                                 recovered.0,
                                 recovered.1,
@@ -1233,7 +1223,6 @@ impl MarmotAppRuntime {
                 {
                     Ok(Some(group)) => group,
                     Ok(None) => {
-                        group_fingerprints.remove(&group_id_hex);
                         if let Some(prior_group) = group_records.remove(&group_id_hex) {
                             let tombstone = removed_chat_record(prior_group, None);
                             if updates_tx.send(tombstone).await.is_err() {
@@ -1247,18 +1236,15 @@ impl MarmotAppRuntime {
                     }
                 };
                 if !include_archived && group.archived {
-                    group_fingerprints.remove(&group_id_hex);
                     group_records.remove(&group_id_hex);
                     if updates_tx.send(group).await.is_err() {
                         return;
                     }
                     continue;
                 }
-                let fingerprint = app_group_record_fingerprint(&group);
-                if group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint) {
+                if group_records.get(&group.group_id_hex) == Some(&group) {
                     continue;
                 }
-                group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
                 group_records.insert(group.group_id_hex.clone(), group.clone());
                 if updates_tx.send(group).await.is_err() {
                     return;
@@ -1566,7 +1552,6 @@ impl MarmotAppRuntime {
         })
         .await?;
         let mut last_group = snapshot.clone();
-        let mut last_fingerprint = app_group_record_fingerprint(&snapshot);
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -1589,7 +1574,6 @@ impl MarmotAppRuntime {
                                     if !emit_missing_group_state(
                                         &updates_tx,
                                         &mut last_group,
-                                        &mut last_fingerprint,
                                     )
                                     .await
                                     {
@@ -1599,11 +1583,9 @@ impl MarmotAppRuntime {
                                 }
                                 Err(_) => continue,
                             };
-                            let fingerprint = app_group_record_fingerprint(&group);
-                            if fingerprint == last_fingerprint {
+                            if group == last_group {
                                 continue;
                             }
-                            last_fingerprint = fingerprint;
                             last_group = group.clone();
                             if updates_tx.send(group).await.is_err() {
                                 return;
@@ -1634,24 +1616,16 @@ impl MarmotAppRuntime {
                 {
                     Ok(Some(group)) => group,
                     Ok(None) => {
-                        if !emit_missing_group_state(
-                            &updates_tx,
-                            &mut last_group,
-                            &mut last_fingerprint,
-                        )
-                        .await
-                        {
+                        if !emit_missing_group_state(&updates_tx, &mut last_group).await {
                             return;
                         }
                         continue;
                     }
                     Err(_) => continue,
                 };
-                let fingerprint = app_group_record_fingerprint(&group);
-                if fingerprint == last_fingerprint {
+                if group == last_group {
                     continue;
                 }
-                last_fingerprint = fingerprint;
                 last_group = group.clone();
                 if updates_tx.send(group).await.is_err() {
                     return;
@@ -1882,10 +1856,6 @@ pub(crate) fn received_message_update_from_record(
     }
 }
 
-fn app_group_record_fingerprint(group: &AppGroupRecord) -> String {
-    serde_json::to_string(group).unwrap_or_else(|_| group.group_id_hex.clone())
-}
-
 fn removed_chat_record(
     mut prior_group: AppGroupRecord,
     current: Option<AppGroupRecord>,
@@ -1899,19 +1869,16 @@ fn removed_chat_record(
 async fn emit_missing_group_state(
     updates_tx: &mpsc::Sender<AppGroupRecord>,
     last_group: &mut AppGroupRecord,
-    last_fingerprint: &mut String,
 ) -> bool {
     if last_group.archived {
         return true;
     }
     last_group.archived = true;
-    *last_fingerprint = app_group_record_fingerprint(last_group);
     updates_tx.send(last_group.clone()).await.is_ok()
 }
 
 async fn reconcile_chats_snapshot(
     updates_tx: &mpsc::Sender<AppGroupRecord>,
-    group_fingerprints: &mut HashMap<String, String>,
     group_records: &mut HashMap<String, AppGroupRecord>,
     groups: Vec<AppGroupRecord>,
     removed_records: Vec<AppGroupRecord>,
@@ -1920,23 +1887,19 @@ async fn reconcile_chats_snapshot(
         .iter()
         .map(|group| group.group_id_hex.clone())
         .collect::<HashSet<_>>();
-    group_fingerprints.retain(|group_id_hex, _| visible_group_ids.contains(group_id_hex));
     group_records.retain(|group_id_hex, _| visible_group_ids.contains(group_id_hex));
     for record in removed_records {
-        group_fingerprints.remove(&record.group_id_hex);
         group_records.remove(&record.group_id_hex);
         if updates_tx.send(record).await.is_err() {
             return false;
         }
     }
     for group in groups {
-        let fingerprint = app_group_record_fingerprint(&group);
-        let unchanged = group_fingerprints.get(&group.group_id_hex) == Some(&fingerprint);
+        let unchanged = group_records.get(&group.group_id_hex) == Some(&group);
         group_records.insert(group.group_id_hex.clone(), group.clone());
         if unchanged {
             continue;
         }
-        group_fingerprints.insert(group.group_id_hex.clone(), fingerprint);
         if updates_tx.send(group).await.is_err() {
             return false;
         }
@@ -1944,10 +1907,20 @@ async fn reconcile_chats_snapshot(
     true
 }
 
-pub(crate) fn chat_list_row_fingerprint(row: &ChatListRow) -> String {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChatListRowFingerprint(ChatListRow);
+
+/// Builds the structural subscription key without serializing the row.
+///
+/// Keep this normalization aligned with fields intentionally excluded from
+/// the previous serialized key so internal maintenance cannot wake subscribers.
+pub(crate) fn chat_list_row_fingerprint(row: &ChatListRow) -> ChatListRowFingerprint {
     let mut stable = row.clone();
     stable.updated_at = 0;
-    serde_json::to_string(&stable).unwrap_or_else(|_| row.group_id_hex.clone())
+    if let Some(last_message) = stable.last_message.as_mut() {
+        last_message.media_json = None;
+    }
+    ChatListRowFingerprint(stable)
 }
 
 pub(crate) fn chat_list_mute_expiries(rows: &[ChatListRow]) -> HashMap<String, i64> {
@@ -1974,7 +1947,7 @@ pub(crate) fn remember_chat_list_mute_expiry(
 
 async fn send_chat_list_row_update(
     updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
-    row_fingerprints: &mut HashMap<String, String>,
+    row_fingerprints: &mut HashMap<String, ChatListRowFingerprint>,
     trigger: ChatListUpdateTrigger,
     row: ChatListRow,
 ) -> bool {
@@ -1994,7 +1967,7 @@ async fn send_chat_list_row_update(
 
 pub(crate) async fn send_chat_list_remove_update(
     updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
-    row_fingerprints: &mut HashMap<String, String>,
+    row_fingerprints: &mut HashMap<String, ChatListRowFingerprint>,
     trigger: ChatListUpdateTrigger,
     group_id_hex: &str,
 ) -> bool {
@@ -2012,7 +1985,7 @@ pub(crate) async fn send_chat_list_remove_update(
 
 pub(crate) async fn reconcile_chat_list_snapshot(
     updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
-    row_fingerprints: &mut HashMap<String, String>,
+    row_fingerprints: &mut HashMap<String, ChatListRowFingerprint>,
     trigger: ChatListUpdateTrigger,
     rows: Vec<ChatListRow>,
 ) -> bool {
@@ -2041,7 +2014,7 @@ pub(crate) async fn reconcile_chat_list_snapshot(
 
 pub(crate) async fn send_atomic_chat_list_snapshot(
     updates_tx: &mpsc::Sender<RuntimeChatListUpdate>,
-    row_fingerprints: &mut HashMap<String, String>,
+    row_fingerprints: &mut HashMap<String, ChatListRowFingerprint>,
     trigger: ChatListUpdateTrigger,
     rows: Vec<ChatListRow>,
 ) -> bool {

@@ -1429,7 +1429,11 @@ fn refresh_query_for_anchored_window_targets_head() {
 #[tokio::test]
 async fn chat_list_remove_update_is_sent_once_for_visible_rows() {
     let (updates_tx, mut updates_rx) = mpsc::channel(1);
-    let mut row_fingerprints = HashMap::from([("group".to_owned(), "fingerprint".to_owned())]);
+    let visible_row = chat_list_test_row("group", "visible");
+    let mut row_fingerprints = HashMap::from([(
+        visible_row.group_id_hex.clone(),
+        chat_list_row_fingerprint(&visible_row),
+    )]);
 
     assert!(
         send_chat_list_remove_update(
@@ -1505,7 +1509,11 @@ async fn chat_list_snapshot_reconciliation_updates_changed_rows_and_removes_miss
 #[tokio::test]
 async fn pin_order_changes_are_sent_as_one_atomic_snapshot() {
     let (updates_tx, mut updates_rx) = mpsc::channel(1);
-    let mut row_fingerprints = HashMap::from([("stale".to_owned(), "old".to_owned())]);
+    let stale = chat_list_test_row("stale", "old");
+    let mut row_fingerprints = HashMap::from([(
+        stale.group_id_hex.clone(),
+        chat_list_row_fingerprint(&stale),
+    )]);
     let mut first = chat_list_test_row("first", "First");
     first.pinned = true;
     first.pinned_position = Some(0);
@@ -1541,8 +1549,42 @@ async fn pin_order_changes_are_sent_as_one_atomic_snapshot() {
 }
 
 #[test]
-fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
+fn chat_list_fingerprint_preserves_serialized_deduplication_semantics() {
     let base = chat_list_test_row("group", "title");
+    let mut refreshed = base.clone();
+    refreshed.updated_at = base.updated_at.saturating_add(1);
+    assert_eq!(
+        chat_list_row_fingerprint(&base),
+        chat_list_row_fingerprint(&refreshed),
+        "projection maintenance timestamps must not wake chat-list subscribers"
+    );
+
+    let mut internal_media_changed = base.clone();
+    internal_media_changed.last_message = Some(crate::ChatListMessagePreview {
+        message_id_hex: "message".to_owned(),
+        sender: "sender".to_owned(),
+        sender_display_name: None,
+        plaintext: "hello".to_owned(),
+        kind: 9,
+        timeline_at: 1,
+        deleted: false,
+        attachment_kind: None,
+        attachment_count: 0,
+        delivery_state: crate::ChatListMessageDeliveryState::NotApplicable,
+        media_json: None,
+    });
+    let internal_media_baseline = internal_media_changed.clone();
+    internal_media_changed
+        .last_message
+        .as_mut()
+        .expect("test row has a last message")
+        .media_json = Some("internal".to_owned());
+    assert_eq!(
+        chat_list_row_fingerprint(&internal_media_baseline),
+        chat_list_row_fingerprint(&internal_media_changed),
+        "internal non-serialized media must not wake chat-list subscribers"
+    );
+
     let mut manual = base.clone();
     manual.manually_marked_unread = true;
     manual.has_unread = true;
@@ -1564,6 +1606,11 @@ fn chat_list_fingerprint_and_expiry_tracking_include_new_interaction_state() {
         chat_list_row_fingerprint(&disbanding),
         "pending disband must wake chat-list subscribers so hosts can hide the composer"
     );
+}
+
+#[test]
+fn chat_list_expiry_tracking_includes_new_interaction_state() {
+    let base = chat_list_test_row("group", "title");
 
     let mut timed = base.clone();
     timed.muted = true;
