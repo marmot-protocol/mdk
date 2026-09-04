@@ -1975,6 +1975,52 @@ fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview()
 }
 
 #[test]
+fn legacy_read_state_uses_canonical_first_unread_order_across_refresh_paths() {
+    let store = setup_store();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversation_read_state (
+                group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                initialized_at, updated_at
+             ) VALUES (?1, 'marker', 5, 0, 1)",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    let mut higher_epoch = chat("higher-epoch", REMOTE, 10, "earlier wall clock");
+    higher_epoch.source_epoch = Some(8);
+    store.record_app_event(&higher_epoch).unwrap();
+    let mut lower_epoch = chat("lower-epoch", REMOTE, 20, "later wall clock");
+    lower_epoch.source_epoch = Some(7);
+    store.record_app_event(&lower_epoch).unwrap();
+
+    let rebuilt = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        rebuilt.first_unread_message_id_hex.as_deref(),
+        Some("lower-epoch")
+    );
+
+    let targeted = store
+        .refresh_chat_list_row_for_messages(
+            LOCAL,
+            GROUP,
+            &["higher-epoch".to_owned()],
+            &no_mentions,
+        )
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        targeted.first_unread_message_id_hex,
+        rebuilt.first_unread_message_id_hex
+    );
+}
+
+#[test]
 fn ensure_repairs_a_stale_pending_preview_after_newer_authenticated_activity() {
     let store = setup_store();
     let mut pending = chat("pending", LOCAL, 100, "older pending send");
@@ -3067,13 +3113,17 @@ fn targeted_refresh_classifies_only_changed_unread_messages() {
         .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &classifier)
         .unwrap()
         .expect("chat row");
-    assert_eq!(classifier_calls.get(), 0);
+    assert_eq!(
+        classifier_calls.get(),
+        2,
+        "timeline invalidation dirties rewritten siblings, so uncovered work must force a rebuild"
+    );
     assert_eq!(row.unread_count, 2);
     assert_eq!(row.unread_mention_count, 0);
 }
 
 #[test]
-fn later_targeted_refresh_preserves_earlier_dirty_message_for_repair() {
+fn later_targeted_refresh_rebuilds_when_an_earlier_message_is_still_dirty() {
     let store = setup_store();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
@@ -3097,18 +3147,18 @@ fn later_targeted_refresh_preserves_earlier_dirty_message_for_repair() {
         .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &no_mentions)
         .unwrap()
         .expect("chat row");
-    assert_eq!(row.unread_count, 2);
+    assert_eq!(row.unread_count, 3);
     {
         let conn = store.lock().unwrap();
-        let dirty_message: String = conn
+        let dirty_messages: i64 = conn
             .query_row(
-                "SELECT message_id_hex FROM chat_list_unread_dirty_messages
+                "SELECT count(*) FROM chat_list_unread_dirty_messages
                  WHERE group_id_hex = ?1",
                 params![GROUP],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(dirty_message, "second");
+        assert_eq!(dirty_messages, 0);
     }
 
     store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
@@ -3123,6 +3173,56 @@ fn later_targeted_refresh_preserves_earlier_dirty_message_for_repair() {
         )
         .unwrap();
     assert_eq!(dirty, 0);
+}
+
+#[test]
+fn targeted_refresh_leaves_other_groups_dirty_work_untouched() {
+    const OTHER_GROUP: &str = "22";
+    let mut other_group = group();
+    other_group.group_id_hex = OTHER_GROUP.to_owned();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, OTHER_GROUP, &no_mentions)
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let mut missed = chat("missed", REMOTE, 10, "other group");
+    missed.group_id_hex = OTHER_GROUP.to_owned();
+    store.record_app_event(&missed).unwrap();
+    store
+        .record_app_event(&chat("current", REMOTE, 20, "current group"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["current".to_owned()], &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+
+    let other_group_dirty: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM chat_list_unread_dirty_messages
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![OTHER_GROUP, "missed"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(other_group_dirty, 1);
 }
 
 #[test]

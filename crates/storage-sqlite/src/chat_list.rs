@@ -1005,6 +1005,7 @@ fn refresh_chat_list_row_for_messages_tx(
         return Ok(None);
     };
     if message_ids_hex.is_empty()
+        || !dirty_unread_messages_are_covered_tx(tx, group_id_hex, message_ids_hex)?
         || !projection_has_rows_tx(
             tx,
             "SELECT EXISTS(
@@ -1030,6 +1031,33 @@ fn refresh_chat_list_row_for_messages_tx(
         write_chat_list_row_for_group_tx(tx, &group, unread)?;
     }
     chat_list_row_tx(tx, group_id_hex)
+}
+
+fn dirty_unread_messages_are_covered_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids_hex: &[String],
+) -> StorageResult<bool> {
+    let supplied_message_ids = message_ids_hex
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT message_id_hex FROM chat_list_unread_dirty_messages
+             WHERE group_id_hex = ?1",
+        )
+        .storage()?;
+    let dirty_message_ids = statement
+        .query_map(params![group_id_hex], |row| row.get::<_, String>(0))
+        .storage()?;
+    for dirty_message_id in dirty_message_ids {
+        let dirty_message_id = dirty_message_id.storage()?;
+        if !supplied_message_ids.contains(dirty_message_id.as_str()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Current chat-list projection reconciliation version.
@@ -1826,7 +1854,11 @@ fn rebuild_unread_membership_tx(
                     rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
                     rusqlite::types::Value::Text(marker_id.to_owned()),
                 ],
-                "timeline_at ASC, message_id_hex ASC",
+                "timeline_order_class ASC,
+              timeline_order_primary ASC,
+              timeline_order_phase ASC,
+              timeline_order_at ASC,
+              message_id_hex ASC",
             )
         } else {
             (
@@ -1835,13 +1867,19 @@ fn rebuild_unread_membership_tx(
                     rusqlite::types::Value::Integer(u64_to_i64(read_state.initialized_at)?),
                     rusqlite::types::Value::Text(String::new()),
                 ],
-                "timeline_at ASC, message_id_hex ASC",
+                "timeline_order_class ASC,
+              timeline_order_primary ASC,
+              timeline_order_phase ASC,
+              timeline_order_at ASC,
+              message_id_hex ASC",
             )
         };
     // Derive count + first-unread id + mention_count from one ordered scan over
     // the unread window. Persisted canonical anchors use the same accepted-history
     // key as timeline pagination even after retention prunes the marker row.
-    // Legacy states without a canonical anchor use wall-clock predicate + order.
+    // Legacy states without a canonical anchor retain their wall-clock unread
+    // predicate, then use the canonical tuple to order that unread set just as
+    // incremental reconciliation does.
     let activity_filter = chat_list_activity_filter_sql("");
     let scan_sql = format!(
         "SELECT message_id_hex, plaintext, tags_json, kind,
