@@ -28,9 +28,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
-use cgka_traits::message::{
-    MessageRecord, MessageState, StoredMessagePayload, StoredMessagePayloadCodecError,
-};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{
     DeferredPeelGeneration, QueuedOutboundIntent, StorageError, StorageProvider,
 };
@@ -213,6 +211,21 @@ pub(crate) struct DeferredPeelGroupState {
 pub(crate) struct PreparedDeferredPeelPayload {
     pub(crate) previous_payload_bytes: Option<usize>,
     pub(crate) encoded_payload: Vec<u8>,
+}
+
+pub(crate) enum DeferredPeelPayloadPreparationError {
+    Storage(StorageError),
+    CodecLimit,
+}
+
+fn previous_deferred_payload_bytes(
+    stored: Result<MessageRecord, StorageError>,
+) -> Result<Option<usize>, StorageError> {
+    match stored {
+        Ok(record) if record.state == MessageState::PeelDeferred => Ok(Some(record.payload.len())),
+        Ok(_) | Err(StorageError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// `(source_epoch, digest)` of one stored commit in the convergence graph.
@@ -2532,14 +2545,13 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) fn prepare_deferred_peel_payload(
         &self,
         msg: &TransportMessage,
-    ) -> Result<PreparedDeferredPeelPayload, StoredMessagePayloadCodecError> {
-        let previous_payload_bytes = self
-            .storage
-            .get_message(&msg.id)
-            .ok()
-            .filter(|record| record.state == MessageState::PeelDeferred)
-            .map(|record| record.payload.len());
-        let encoded_payload = StoredMessagePayload::raw_transport(msg.clone()).encode()?;
+    ) -> Result<PreparedDeferredPeelPayload, DeferredPeelPayloadPreparationError> {
+        let previous_payload_bytes =
+            previous_deferred_payload_bytes(self.storage.get_message(&msg.id))
+                .map_err(DeferredPeelPayloadPreparationError::Storage)?;
+        let encoded_payload = StoredMessagePayload::raw_transport(msg.clone())
+            .encode()
+            .map_err(|_| DeferredPeelPayloadPreparationError::CodecLimit)?;
         Ok(PreparedDeferredPeelPayload {
             previous_payload_bytes,
             encoded_payload,
@@ -3047,5 +3059,13 @@ mod deferred_peel_accounting_tests {
         // replacement, not another addition.
         account.reconcile_group_bytes(group_b_bytes, group_b_bytes);
         assert_eq!(account.bytes, group_a_bytes + group_b_bytes);
+    }
+
+    #[test]
+    fn deferred_payload_lookup_propagates_storage_failure() {
+        let result = previous_deferred_payload_bytes(Err(StorageError::Busy(
+            "injected get_message failure".into(),
+        )));
+        assert!(matches!(result, Err(StorageError::Busy(_))));
     }
 }

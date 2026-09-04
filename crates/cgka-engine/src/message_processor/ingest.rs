@@ -6,7 +6,7 @@
 //! typed outcomes. `Err` is reserved for storage, peeler, serialization, and
 //! unclassified OpenMLS failures.
 
-use super::{content_dedup_id, route_wrapped_group_message};
+use super::{DeferredPeelPayloadPreparationError, content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
 use crate::identity::member_id_of_sender;
@@ -327,7 +327,12 @@ impl<S: StorageProvider> Engine<S> {
         if self.quarantined_reason(&group_id).is_some() {
             let prepared = match self.prepare_deferred_peel_payload(msg) {
                 Ok(prepared) => prepared,
-                Err(_) => return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id)),
+                Err(DeferredPeelPayloadPreparationError::Storage(error)) => {
+                    return Err(EngineError::Storage(error));
+                }
+                Err(DeferredPeelPayloadPreparationError::CodecLimit) => {
+                    return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
+                }
             };
             let deferred_payload_bytes = prepared.encoded_payload.len();
             if self.has_peel_deferred_capacity(
@@ -549,7 +554,11 @@ impl<S: StorageProvider> Engine<S> {
                     // recovery path once the backlog drains.
                     let prepared = match self.prepare_deferred_peel_payload(msg) {
                         Ok(prepared) => prepared,
-                        Err(_) => {
+                        Err(DeferredPeelPayloadPreparationError::Storage(error)) => {
+                            self.return_unmodified_mls_group(&group_id, mls_group);
+                            return Err(EngineError::Storage(error));
+                        }
+                        Err(DeferredPeelPayloadPreparationError::CodecLimit) => {
                             self.return_unmodified_mls_group(&group_id, mls_group);
                             return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
                         }
