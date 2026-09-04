@@ -355,6 +355,7 @@ adversarial-reliability-ci:
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked
     cargo test -p cgka-conformance-simulator --features test-policy-overrides --test adversarial_reliability_campaigns --locked -- --ignored
     cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test policy_sweeps --locked
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --test offline_catchup_family --locked -E 'test(=test_override_reproduces_256_row_capacity_refetch)'
     rm -rf -- target/cgka-adversarial-reliability-ci
     cargo run -p cgka-conformance-simulator --features test-policy-overrides --bin cgka-conformance-campaign --locked -- --cases 1 --case-timeout-secs 300 --out target/cgka-adversarial-reliability-ci --storage file
 

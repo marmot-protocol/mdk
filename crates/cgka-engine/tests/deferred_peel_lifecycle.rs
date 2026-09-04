@@ -16,7 +16,9 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
+};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -602,6 +604,54 @@ async fn carol_behind_two_epochs_with<P>(
         commit_to_epoch2,
         commit_to_epoch3,
     )
+}
+
+async fn add_group_two_epochs_ahead(
+    alice: &mut Engine<SqliteAccountStorage>,
+    carol: &mut Engine<SqliteAccountStorage>,
+) -> GroupId {
+    let (mut david, _david_storage) = build_client(b"david-second-group");
+    let (mut eve, _eve_storage) = build_client(b"eve-second-group");
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "second-deferred-peel-group".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    for key_package in [
+        david.fresh_key_package().await.unwrap(),
+        eve.fresh_key_package().await.unwrap(),
+    ] {
+        let invite = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![key_package],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let (_withheld_commit, pending) = evolution(invite);
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    group_id
 }
 
 /// Build a deterministic two-branch graph and retain `backlog` wrappers of one
@@ -1656,6 +1706,12 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
             ..
         }
     ));
+    let capacity_metrics = carol.engine_metrics();
+    assert_eq!(capacity_metrics.deferred_peel_row_capacity_refusals, 1);
+    assert_eq!(
+        capacity_metrics.deferred_peel_peak_rows_per_group,
+        MAX_PEEL_DEFERRED_ROWS_PER_GROUP as u64
+    );
 
     let retained = carol_storage
         .list_messages(&group_id, EpochId(0))
@@ -1702,6 +1758,191 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         carol.ingest(overflow).await.unwrap(),
         IngestOutcome::Processed
     ));
+}
+
+/// If account accounting was initialized by group A, a later deferral in
+/// group B is charged incrementally. Group B's first sweep must reconcile that
+/// contribution rather than adding the same durable bytes again.
+#[tokio::test]
+async fn later_deferring_group_first_sweep_keeps_exact_account_byte_total() {
+    let (mut alice, mut carol, storage, _peeler, group_a, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+
+    let deferred_a = send_app(&mut alice, &group_a, "group A deferred bytes").await;
+    assert!(matches!(
+        carol.ingest(deferred_a.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_a = storage.get_message(&deferred_a.id).unwrap().payload.len();
+
+    // Account reconstruction has now run without group B in storage. Creating
+    // B after that boundary is what exercises the original double-count path.
+    let group_b = add_group_two_epochs_ahead(&mut alice, &mut carol).await;
+    let deferred_b = send_app(&mut alice, &group_b, "group B deferred bytes").await;
+    assert!(matches!(
+        carol.ingest(deferred_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_b = storage.get_message(&deferred_b.id).unwrap().payload.len();
+
+    carol.retry_deferred_peels(&group_b).await.unwrap();
+    assert_eq!(
+        carol.engine_metrics().deferred_peel_peak_bytes_per_account,
+        (bytes_a + bytes_b) as u64
+    );
+}
+
+/// A transport object outside the bounded stored-message representation is a
+/// typed, same-id-retryable resource refusal. It must not abort a relay drain
+/// as an internal serialization error.
+#[tokio::test]
+async fn unencodable_deferred_transport_is_resource_refused() {
+    let (mut alice, mut carol, storage, carol_peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let template = send_app(&mut alice, &group_id, "unencodable deferred payload").await;
+    let oversized = TransportMessage {
+        id: MessageId::new(b"unencodable-deferred".to_vec()),
+        // StoredMessagePayload bounds causal dependency lists at 2^20 items.
+        // The codec rejects this before encoding individual entries.
+        causal_deps: vec![MessageId::new(Vec::new()); (1 << 20) + 1],
+        ..template
+    };
+
+    assert!(matches!(
+        carol.ingest(oversized.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert!(matches!(
+        storage.get_message(&oversized.id),
+        Err(StorageError::NotFound)
+    ));
+
+    let attempts = carol_peeler.attempts_for(&oversized.id);
+    assert!(matches!(
+        carol.ingest(oversized.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert_eq!(carol_peeler.attempts_for(&oversized.id), attempts + 1);
+}
+
+/// The test-only override can isolate the per-group byte budget independently
+/// of the row and account bounds.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn peel_deferred_group_byte_budget_refuses_growth_without_persisting_it() {
+    let (mut alice, mut carol, storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    carol.set_deferred_peel_limits_for_tests(512, usize::MAX, usize::MAX);
+
+    let template = send_app(&mut alice, &group_id, "group byte budget").await;
+    let first = TransportMessage {
+        id: MessageId::new(b"group-byte-0001".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(first.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let first_bytes = storage.get_message(&first.id).unwrap().payload.len();
+    carol.set_deferred_peel_limits_for_tests(512, first_bytes.saturating_mul(2), usize::MAX);
+
+    let second = TransportMessage {
+        id: MessageId::new(b"group-byte-0002".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(second).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+
+    let overflow = TransportMessage {
+        id: MessageId::new(b"group-byte-0003".to_vec()),
+        ..template
+    };
+    assert!(matches!(
+        carol.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert!(matches!(
+        storage.get_message(&overflow.id),
+        Err(StorageError::NotFound)
+    ));
+    let metrics = carol.engine_metrics();
+    assert_eq!(metrics.deferred_peel_row_capacity_refusals, 0);
+    assert_eq!(metrics.deferred_peel_group_byte_capacity_refusals, 1);
+    assert_eq!(metrics.deferred_peel_account_byte_capacity_refusals, 0);
+    assert_eq!(
+        metrics.deferred_peel_peak_bytes_per_group,
+        first_bytes.saturating_mul(2) as u64
+    );
+}
+
+/// Account-wide byte accounting is reconstructed from durable deferred rows
+/// after restart before a new row can be admitted.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn peel_deferred_account_byte_budget_is_restart_safe() {
+    let (mut alice, mut carol, storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let template = send_app(&mut alice, &group_id, "account byte budget").await;
+    let first = TransportMessage {
+        id: MessageId::new(b"account-byte-0001".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(first.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let first_bytes = storage.get_message(&first.id).unwrap().payload.len();
+    drop(carol);
+
+    let clock = ManualConvergenceClock::new(2_000, 20_000);
+    let (mut restarted, _, _) =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock);
+    restarted.hydrate_all_stored_groups().unwrap();
+    restarted.set_deferred_peel_limits_for_tests(512, usize::MAX, first_bytes.saturating_mul(2));
+
+    let second = TransportMessage {
+        id: MessageId::new(b"account-byte-0002".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        restarted.ingest(second).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+
+    let overflow = TransportMessage {
+        id: MessageId::new(b"account-byte-0003".to_vec()),
+        ..template
+    };
+    assert!(matches!(
+        restarted.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert!(matches!(
+        storage.get_message(&overflow.id),
+        Err(StorageError::NotFound)
+    ));
+    let metrics = restarted.engine_metrics();
+    assert_eq!(metrics.deferred_peel_row_capacity_refusals, 0);
+    assert_eq!(metrics.deferred_peel_group_byte_capacity_refusals, 0);
+    assert_eq!(metrics.deferred_peel_account_byte_capacity_refusals, 1);
+    assert_eq!(
+        metrics.deferred_peel_peak_bytes_per_account,
+        first_bytes.saturating_mul(2) as u64
+    );
 }
 
 /// An application message from before this device joined is terminal on

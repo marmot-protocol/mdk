@@ -325,6 +325,13 @@ pub struct Engine<S: StorageProvider> {
     /// cached row-count/cap bookkeeping. Correctness-critical completion and
     /// residence bookkeeping lives durably on each MessageRecord.
     pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
+    /// Account-wide half of the deferred-peel byte budget. Reconstructed from
+    /// durable rows on the first capacity-sensitive ingest and maintained with
+    /// the per-group cache afterwards.
+    pub(crate) deferred_peel_account: crate::message_processor::DeferredPeelAccountState,
+    pub(crate) deferred_peel_row_limit: usize,
+    pub(crate) deferred_peel_group_byte_limit: usize,
+    pub(crate) deferred_peel_account_byte_limit: usize,
 
     /// Retry budget before a `PeelDeferred` row is resource-refused and
     /// released without terminal deduplication. Field (not a const) so tests
@@ -362,6 +369,8 @@ pub struct EngineBuilder<S: StorageProvider> {
     admit_app_witnesses: bool,
     #[cfg(feature = "test-policy-overrides")]
     replay_probe_budget_override: Option<u64>,
+    #[cfg(feature = "test-policy-overrides")]
+    deferred_peel_limits_override: Option<(usize, usize, usize)>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
@@ -385,6 +394,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             admit_app_witnesses: true,
             #[cfg(feature = "test-policy-overrides")]
             replay_probe_budget_override: None,
+            #[cfg(feature = "test-policy-overrides")]
+            deferred_peel_limits_override: None,
             recorder: None,
         }
     }
@@ -488,6 +499,20 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    /// Override deferred-peel row and byte budgets for explicit resource
+    /// policy campaigns. Production construction cannot call this method.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn deferred_peel_limits_for_tests(
+        mut self,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) -> Self {
+        self.deferred_peel_limits_override =
+            Some((rows_per_group, bytes_per_group, bytes_per_account));
+        self
+    }
+
     /// Install a forensic audit-log recorder. Without this call the engine
     /// uses [`NoopRecorder`] and emits no audit events.
     pub fn recorder(mut self, recorder: Box<dyn ForensicRecorder>) -> Self {
@@ -541,6 +566,27 @@ impl<S: StorageProvider> EngineBuilder<S> {
         .map_err(EngineError::Other)?;
 
         let pending_application_events = self.storage.list_pending_application_events()?;
+
+        #[cfg(feature = "test-policy-overrides")]
+        let (
+            deferred_peel_row_limit,
+            deferred_peel_group_byte_limit,
+            deferred_peel_account_byte_limit,
+        ) = self.deferred_peel_limits_override.unwrap_or((
+            crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP,
+            crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_GROUP,
+            crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT,
+        ));
+        #[cfg(not(feature = "test-policy-overrides"))]
+        let (
+            deferred_peel_row_limit,
+            deferred_peel_group_byte_limit,
+            deferred_peel_account_byte_limit,
+        ) = (
+            crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP,
+            crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_GROUP,
+            crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT,
+        );
 
         Ok(Engine {
             storage: self.storage,
@@ -597,6 +643,10 @@ impl<S: StorageProvider> EngineBuilder<S> {
             transport_group_id_index: HashMap::new(),
             seen_message_ids_hex_cache: None,
             deferred_peel: HashMap::new(),
+            deferred_peel_account: crate::message_processor::DeferredPeelAccountState::default(),
+            deferred_peel_row_limit,
+            deferred_peel_group_byte_limit,
+            deferred_peel_account_byte_limit,
             deferred_peel_retry_budget: crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS,
             deferred_peel_residence_ms: crate::message_processor::MAX_DEFERRED_PEEL_RESIDENCE_MS,
             foreground_deferred_peel_budget_ms:
@@ -612,6 +662,22 @@ impl<S: StorageProvider> Engine<S> {
     #[cfg(feature = "test-policy-overrides")]
     pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
         self.replay_probe_budget_override = limit;
+    }
+
+    /// Change deferred-peel resource budgets for a running policy campaign
+    /// without altering durable state. Existing retained usage remains charged
+    /// and can therefore begin above a newly lowered limit; exact-id retries
+    /// stay eligible while new rows are refused until usage drains.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_deferred_peel_limits_for_tests(
+        &mut self,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) {
+        self.deferred_peel_row_limit = rows_per_group;
+        self.deferred_peel_group_byte_limit = bytes_per_group;
+        self.deferred_peel_account_byte_limit = bytes_per_account;
     }
 
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {

@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-08-19
+updated: 2026-09-04
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -176,6 +176,9 @@ exporter passes `None`, so no engine metrics are sent by the runtime exporter to
 | `foreground_deferred_backlog` | Histogram of deferred backlog observed by foreground opportunities. |
 | `foreground_deferred_completed`, `foreground_deferred_budget_exhausted`, `foreground_deferred_normalization_pending`, `foreground_deferred_unchanged`, `foreground_deferred_errors` | Aggregate foreground outcomes. |
 | `foreground_deferred_budget_overrun_ms` | Histogram of elapsed foreground time beyond its configured monotonic budget; zero is recorded when work completes within budget. |
+| `deferred_peel_sweeps` | Aggregate deferred-peel retry sweeps. |
+| `deferred_peel_*_capacity_refusals` | Separate row-per-group, byte-per-group, and byte-per-account refusal counters. |
+| `deferred_peel_peak_rows_per_group`, `deferred_peel_peak_bytes_per_group`, `deferred_peel_peak_bytes_per_account` | Aggregate high-water marks used to compare capacity policies without exposing identifiers or payloads. |
 | `queued_outbound_wait_ms` | Histogram from durable intent acceptance to later regeneration attempt. |
 
 `reorg_lateness_ms` uses the same millisecond bucket bounds as relay timing. `reorg_rewind_depth` uses commit-count

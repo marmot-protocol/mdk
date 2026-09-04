@@ -245,6 +245,12 @@ pub struct EngineMetrics {
     deferred_peel_candidate_cache_misses: u64,
     deferred_peel_candidate_cache_invalidations: u64,
     deferred_peel_candidate_enumeration_ms: BucketHistogram,
+    deferred_peel_row_capacity_refusals: u64,
+    deferred_peel_group_byte_capacity_refusals: u64,
+    deferred_peel_account_byte_capacity_refusals: u64,
+    deferred_peel_peak_rows_per_group: u64,
+    deferred_peel_peak_bytes_per_group: u64,
+    deferred_peel_peak_bytes_per_account: u64,
     queued_outbound_wait_ms: BucketHistogram,
     /// Per-group completion time of the last applied pass, in-memory only
     /// (never snapshotted); feeds `generation_gap_ms`.
@@ -288,6 +294,12 @@ impl Default for EngineMetrics {
             deferred_peel_candidate_enumeration_ms: BucketHistogram::new(
                 &LATENESS_BUCKET_BOUNDS_MS,
             ),
+            deferred_peel_row_capacity_refusals: 0,
+            deferred_peel_group_byte_capacity_refusals: 0,
+            deferred_peel_account_byte_capacity_refusals: 0,
+            deferred_peel_peak_rows_per_group: 0,
+            deferred_peel_peak_bytes_per_group: 0,
+            deferred_peel_peak_bytes_per_account: 0,
             queued_outbound_wait_ms: BucketHistogram::new(&LATENESS_BUCKET_BOUNDS_MS),
             last_pass_completed_at_ms: HashMap::new(),
         }
@@ -468,6 +480,45 @@ impl EngineMetrics {
             .saturating_add(1);
     }
 
+    pub(crate) fn note_deferred_peel_capacity_refusal(
+        &mut self,
+        resource: DeferredPeelCapacityResource,
+    ) {
+        match resource {
+            DeferredPeelCapacityResource::RowsPerGroup => {
+                self.deferred_peel_row_capacity_refusals =
+                    self.deferred_peel_row_capacity_refusals.saturating_add(1);
+            }
+            DeferredPeelCapacityResource::BytesPerGroup => {
+                self.deferred_peel_group_byte_capacity_refusals = self
+                    .deferred_peel_group_byte_capacity_refusals
+                    .saturating_add(1);
+            }
+            DeferredPeelCapacityResource::BytesPerAccount => {
+                self.deferred_peel_account_byte_capacity_refusals = self
+                    .deferred_peel_account_byte_capacity_refusals
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn note_deferred_peel_usage(
+        &mut self,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) {
+        self.deferred_peel_peak_rows_per_group = self
+            .deferred_peel_peak_rows_per_group
+            .max(rows_per_group as u64);
+        self.deferred_peel_peak_bytes_per_group = self
+            .deferred_peel_peak_bytes_per_group
+            .max(bytes_per_group as u64);
+        self.deferred_peel_peak_bytes_per_account = self
+            .deferred_peel_peak_bytes_per_account
+            .max(bytes_per_account as u64);
+    }
+
     pub(crate) fn note_outbound_wire_prepare_ms(&mut self, duration_ms: u64) {
         self.outbound_wire_prepare_ms.record(duration_ms);
     }
@@ -527,6 +578,14 @@ impl EngineMetrics {
             deferred_peel_candidate_enumeration_ms: self
                 .deferred_peel_candidate_enumeration_ms
                 .snapshot(),
+            deferred_peel_row_capacity_refusals: self.deferred_peel_row_capacity_refusals,
+            deferred_peel_group_byte_capacity_refusals: self
+                .deferred_peel_group_byte_capacity_refusals,
+            deferred_peel_account_byte_capacity_refusals: self
+                .deferred_peel_account_byte_capacity_refusals,
+            deferred_peel_peak_rows_per_group: self.deferred_peel_peak_rows_per_group,
+            deferred_peel_peak_bytes_per_group: self.deferred_peel_peak_bytes_per_group,
+            deferred_peel_peak_bytes_per_account: self.deferred_peel_peak_bytes_per_account,
             queued_outbound_wait_ms: self.queued_outbound_wait_ms.snapshot(),
         }
     }
@@ -539,6 +598,13 @@ pub(crate) enum DeferredPeelMetricOutcome {
     NormalizationPending,
     Unchanged,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredPeelCapacityResource {
+    RowsPerGroup,
+    BytesPerGroup,
+    BytesPerAccount,
 }
 
 /// Aggregate engine telemetry snapshot.
@@ -612,6 +678,19 @@ pub struct EngineMetricsSnapshot {
     pub deferred_peel_candidate_cache_invalidations: u64,
     /// Candidate enumeration elapsed time in local monotonic milliseconds.
     pub deferred_peel_candidate_enumeration_ms: HistogramSnapshot,
+    /// New rows refused because one group reached its row limit.
+    pub deferred_peel_row_capacity_refusals: u64,
+    /// New rows refused because one group reached its encoded-byte limit.
+    pub deferred_peel_group_byte_capacity_refusals: u64,
+    /// New rows refused because the account-device database reached its
+    /// aggregate encoded-byte limit.
+    pub deferred_peel_account_byte_capacity_refusals: u64,
+    /// Greatest deferred row count observed for any one group.
+    pub deferred_peel_peak_rows_per_group: u64,
+    /// Greatest encoded deferred payload bytes observed for any one group.
+    pub deferred_peel_peak_bytes_per_group: u64,
+    /// Greatest encoded deferred payload bytes observed across the account.
+    pub deferred_peel_peak_bytes_per_account: u64,
     /// Time from durable queue acceptance to a regeneration attempt.
     pub queued_outbound_wait_ms: HistogramSnapshot,
 }

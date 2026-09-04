@@ -22,6 +22,20 @@ pub struct CampaignMeasurementsV1 {
     pub logical_expirations: usize,
     pub logical_invalidations: usize,
     pub replay_probe_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_sweeps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_row_capacity_refusals: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_group_byte_capacity_refusals: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_account_byte_capacity_refusals: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_peak_rows_per_group: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_peak_bytes_per_group: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_peel_peak_bytes_per_account: Option<u64>,
     pub database_bytes: Option<u64>,
     pub first_failing_action: Option<usize>,
     pub limiting_resource: Option<String>,
@@ -163,6 +177,19 @@ impl CampaignMeasurementsV1 {
             logical_expirations,
             logical_invalidations,
             replay_probe_count,
+            deferred_peel_sweeps: engine_metrics.map(|metrics| metrics.deferred_peel_sweeps),
+            deferred_peel_row_capacity_refusals: engine_metrics
+                .map(|metrics| metrics.deferred_peel_row_capacity_refusals),
+            deferred_peel_group_byte_capacity_refusals: engine_metrics
+                .map(|metrics| metrics.deferred_peel_group_byte_capacity_refusals),
+            deferred_peel_account_byte_capacity_refusals: engine_metrics
+                .map(|metrics| metrics.deferred_peel_account_byte_capacity_refusals),
+            deferred_peel_peak_rows_per_group: engine_metrics
+                .map(|metrics| metrics.deferred_peel_peak_rows_per_group),
+            deferred_peel_peak_bytes_per_group: engine_metrics
+                .map(|metrics| metrics.deferred_peel_peak_bytes_per_group),
+            deferred_peel_peak_bytes_per_account: engine_metrics
+                .map(|metrics| metrics.deferred_peel_peak_bytes_per_account),
             database_bytes,
             first_failing_action,
             limiting_resource,

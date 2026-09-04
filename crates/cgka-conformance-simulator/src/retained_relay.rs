@@ -119,6 +119,35 @@ impl RetainedRelaySubject {
         protocol_profile: ProtocolProfile,
         storage_mode: HarnessStorageMode,
     ) -> Result<Self, SubjectError> {
+        Self::new_with_deferred_peel_limits(clients, topology, protocol_profile, storage_mode, None)
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn new_with_deferred_peel_limits_for_tests(
+        clients: &[String],
+        topology: &ScenarioTopologyV2,
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_deferred_peel_limits(
+            clients,
+            topology,
+            protocol_profile,
+            storage_mode,
+            Some((rows_per_group, bytes_per_group, bytes_per_account)),
+        )
+    }
+
+    fn new_with_deferred_peel_limits(
+        clients: &[String],
+        topology: &ScenarioTopologyV2,
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+        deferred_peel_limits: Option<(usize, usize, usize)>,
+    ) -> Result<Self, SubjectError> {
         let mut resolved = topology
             .resolve_for_clients(clients)
             .map_err(|error| SubjectError::new("scenario_topology_error", error.message))?;
@@ -156,12 +185,35 @@ impl RetainedRelaySubject {
             .iter()
             .map(|relay| (relay.id.clone(), RetainedRelay::default()))
             .collect::<BTreeMap<_, _>>();
-        let engine = EngineHarnessSubject::new_with_topology(
-            clients,
-            topology,
-            protocol_profile,
-            storage_mode,
-        )?;
+        #[cfg(feature = "test-policy-overrides")]
+        let engine = if let Some((rows, group_bytes, account_bytes)) = deferred_peel_limits {
+            EngineHarnessSubject::new_with_deferred_peel_limits_for_tests(
+                clients,
+                topology,
+                protocol_profile,
+                storage_mode,
+                rows,
+                group_bytes,
+                account_bytes,
+            )?
+        } else {
+            EngineHarnessSubject::new_with_topology(
+                clients,
+                topology,
+                protocol_profile,
+                storage_mode,
+            )?
+        };
+        #[cfg(not(feature = "test-policy-overrides"))]
+        let engine = {
+            let _ = deferred_peel_limits;
+            EngineHarnessSubject::new_with_topology(
+                clients,
+                topology,
+                protocol_profile,
+                storage_mode,
+            )?
+        };
         let mut capabilities = engine.descriptor().capabilities;
         capabilities.retain(|capability| {
             !matches!(

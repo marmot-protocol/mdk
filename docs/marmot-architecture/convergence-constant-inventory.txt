@@ -17,6 +17,8 @@ P10|crates/cgka-engine/src/wire_format.rs|DEFAULT_MAXIMUM_FORWARD_DISTANCE
 E1|crates/cgka-engine/src/message_processor/mod.rs|MAX_CONVERGENCE_REPROCESSING_PASSES
 E2|crates/cgka-engine/src/message_processor/mod.rs|MAX_DEFERRED_PEEL_ATTEMPTS
 E3|crates/cgka-engine/src/message_processor/mod.rs|MAX_PEEL_DEFERRED_ROWS_PER_GROUP
+E3|crates/cgka-engine/src/message_processor/mod.rs|MAX_PEEL_DEFERRED_BYTES_PER_GROUP
+E3|crates/cgka-engine/src/message_processor/mod.rs|MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT
 E4|crates/cgka-engine/src/message_processor/mod.rs|MAX_DEFERRED_ROWS_PER_SWEEP
 E5|crates/cgka-engine/src/openmls_projection.rs|CANDIDATE_REPLAY_BUDGET_SLACK
 E6|crates/cgka-engine/src/openmls_projection.rs|CANDIDATE_REPLAY_BUDGET_FLOOR

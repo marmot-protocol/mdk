@@ -9,6 +9,10 @@ use cgka_conformance_simulator::{
     generate_offline_catchup_pressure_family, resolve_scenario_input_bytes,
     run_generated_case_report_with_storage_mode,
 };
+#[cfg(feature = "test-policy-overrides")]
+use cgka_conformance_simulator::{RetainedRelaySubject, run_scenario_report_with_subject};
+#[cfg(feature = "test-policy-overrides")]
+use cgka_traits::group::ProtocolProfile;
 
 const COMPLETE_PROFILE_CASES: usize = 24;
 
@@ -332,7 +336,7 @@ async fn smoke_natural_and_duplicate_history_cases_pass_file_backed_strict_oracl
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn large_natural_history_retries_capacity_refused_relay_objects() {
+async fn large_natural_history_fits_raised_deferred_capacity() {
     let case = generate_offline_catchup_pressure_case(9101, 12);
     let report = run_generated_case_report_with_storage_mode(
         &case,
@@ -354,16 +358,110 @@ async fn large_natural_history_retries_capacity_refused_relay_objects() {
         case.scenario.name,
         report.invariant_failures
     );
+    assert_eq!(
+        full_history_sync_count(&report),
+        1,
+        "the 384-message natural history should fit without a capacity refetch"
+    );
+    assert_eq!(
+        report
+            .campaign_measurements
+            .deferred_peel_row_capacity_refusals,
+        Some(0)
+    );
     assert!(
         report
-            .relay_sync_observations
-            .iter()
-            .filter(|observation| {
-                observation.client == "bob"
-                    && matches!(observation.mode, ScenarioRelaySyncModeV2::FullHistory)
+            .campaign_measurements
+            .deferred_peel_peak_rows_per_group
+            .is_some_and(|rows| {
+                rows > 0
+                    && rows
+                        <= cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP as u64
             })
-            .count()
-            >= 2,
-        "the capacity refusal must cause a bounded complete-history refetch"
     );
+}
+
+fn full_history_sync_count(report: &cgka_conformance_simulator::ScenarioReport) -> usize {
+    report
+        .relay_sync_observations
+        .iter()
+        .filter(|observation| {
+            observation.client == "bob"
+                && matches!(observation.mode, ScenarioRelaySyncModeV2::FullHistory)
+        })
+        .count()
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn run_large_natural_history_with_row_limit(
+    rows_per_group: usize,
+) -> cgka_conformance_simulator::ScenarioReport {
+    let case = generate_offline_catchup_pressure_case(9101, 12);
+    let mut subject = RetainedRelaySubject::new_with_deferred_peel_limits_for_tests(
+        &case.scenario.clients,
+        &case.scenario.topology,
+        ProtocolProfile::Legacy,
+        HarnessStorageMode::TempFileBackedSqlite,
+        rows_per_group,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("retained-relay subject");
+    run_scenario_report_with_subject(
+        &case.scenario,
+        None,
+        case.expected_outcomes.clone(),
+        &mut subject,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "{} at row limit {rows_per_group}: {error}",
+            case.scenario.name
+        )
+    })
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_override_reproduces_256_row_capacity_refetch() {
+    let report = run_large_natural_history_with_row_limit(256).await;
+    assert!(report.expectation_failures.is_empty());
+    assert!(report.invariant_failures.is_empty());
+    assert!(full_history_sync_count(&report) >= 2);
+    assert!(
+        report
+            .campaign_measurements
+            .deferred_peel_row_capacity_refusals
+            .is_some_and(|refusals| refusals > 0)
+    );
+}
+
+/// Manual policy sweep retained for release decisions without making every CI
+/// run execute the same large scenario three extra times.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual deferred-peel 256/512/1024 policy sweep"]
+async fn deferred_peel_row_capacity_policy_sweep() {
+    for rows_per_group in [256, 512, 1_024] {
+        let report = run_large_natural_history_with_row_limit(rows_per_group).await;
+        assert!(report.expectation_failures.is_empty());
+        assert!(report.invariant_failures.is_empty());
+        eprintln!(
+            "rows={rows_per_group} full_history_syncs={} refusals={:?} peak_rows={:?} peak_group_bytes={:?} peak_account_bytes={:?}",
+            full_history_sync_count(&report),
+            report
+                .campaign_measurements
+                .deferred_peel_row_capacity_refusals,
+            report
+                .campaign_measurements
+                .deferred_peel_peak_rows_per_group,
+            report
+                .campaign_measurements
+                .deferred_peel_peak_bytes_per_group,
+            report
+                .campaign_measurements
+                .deferred_peel_peak_bytes_per_account,
+        );
+    }
 }
