@@ -22,7 +22,7 @@ use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::{AutoPublish, GroupEvent, GroupStateChange};
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{
-    InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent,
+    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent,
     ProposalRejectionCategory, StaleReason,
 };
 use cgka_traits::message::{MessageState, StoredMessagePayload};
@@ -325,26 +325,22 @@ impl<S: StorageProvider> Engine<S> {
         // excluded from settlement math and replay through
         // retry_deferred_peels once repair clears the quarantine.
         if self.quarantined_reason(&group_id).is_some() {
-            let previous_deferred_payload_bytes = self
-                .storage
-                .get_message(&msg.id)
-                .ok()
-                .filter(|record| record.state == MessageState::PeelDeferred)
-                .map(|record| record.payload.len());
-            let deferred_payload_bytes = StoredMessagePayload::raw_transport(msg.clone())
-                .encode()
-                .map_err(|error| EngineError::Serialize(format!("{error:?}")))?
-                .len();
+            let prepared = match self.prepare_deferred_peel_payload(msg) {
+                Ok(prepared) => prepared,
+                Err(_) => return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id)),
+            };
+            let deferred_payload_bytes = prepared.encoded_payload.len();
             if self.has_peel_deferred_capacity(
                 &group_id,
-                previous_deferred_payload_bytes,
+                prepared.previous_payload_bytes,
                 deferred_payload_bytes,
             )? {
-                self.persist_transport_message_for_existing_group(
+                self.persist_encoded_transport_message_for_existing_group(
                     msg,
                     &group_id,
                     EpochId(0),
                     MessageState::PeelDeferred,
+                    prepared.encoded_payload,
                 )?;
                 self.note_peel_deferred_row_persisted(&group_id, &msg.id, deferred_payload_bytes);
                 self.audit_group(
@@ -356,26 +352,7 @@ impl<S: StorageProvider> Engine<S> {
                     ),
                 );
             } else {
-                self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
-                if self.should_audit_peel_deferred_cap_rejection(&group_id) {
-                    // Same flood cap as the deferral seam (mdk#339): a
-                    // quarantined group's replay buffer must not grow
-                    // unboundedly either. Audited once per cap-full episode so
-                    // a flood does not emit one write per rejected message.
-                    self.audit_group(
-                        &group_id,
-                        marmot_forensics::AuditEventKind::Rejection {
-                            msg_id: hex::encode(msg.id.as_slice()),
-                            reason: crate::message_disposition::MessageDisposition::DeferredCapacityRefused
-                                .tag()
-                                .to_string(),
-                        },
-                    );
-                }
-                return Ok(IngestOutcome::ResourceRefused {
-                    group_id,
-                    resource: InboundResourceLimit::TransportDeferredCapacity,
-                });
+                return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
             }
             return Ok(IngestOutcome::LocalState {
                 state: LocalIngestState::Quarantined,
@@ -570,49 +547,33 @@ impl<S: StorageProvider> Engine<S> {
                     // per group; at the cap, new undecryptable input is
                     // dropped unpersisted and transport redelivery is the
                     // recovery path once the backlog drains.
-                    let previous_deferred_payload_bytes = self
-                        .storage
-                        .get_message(&msg.id)
-                        .ok()
-                        .filter(|record| record.state == MessageState::PeelDeferred)
-                        .map(|record| record.payload.len());
-                    let deferred_payload_bytes = StoredMessagePayload::raw_transport(msg.clone())
-                        .encode()
-                        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?
-                        .len();
+                    let prepared = match self.prepare_deferred_peel_payload(msg) {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            self.return_unmodified_mls_group(&group_id, mls_group);
+                            return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
+                        }
+                    };
+                    let deferred_payload_bytes = prepared.encoded_payload.len();
                     if !self.has_peel_deferred_capacity(
                         &group_id,
-                        previous_deferred_payload_bytes,
+                        prepared.previous_payload_bytes,
                         deferred_payload_bytes,
                     )? {
-                        self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
-                        if self.should_audit_peel_deferred_cap_rejection(&group_id) {
-                            self.audit_group(
-                                &group_id,
-                                marmot_forensics::AuditEventKind::Rejection {
-                                    msg_id: msg_id_hex.clone(),
-                                    reason: crate::message_disposition::MessageDisposition::DeferredCapacityRefused
-                                        .tag()
-                                        .to_string(),
-                                },
-                            );
-                        }
                         tracing::debug!(
                             target: "cgka_engine::message_processor",
                             method = "ingest_group_message",
                             "peel-deferred row cap reached; dropping undecryptable input unpersisted"
                         );
                         self.return_unmodified_mls_group(&group_id, mls_group);
-                        return Ok(IngestOutcome::ResourceRefused {
-                            group_id,
-                            resource: InboundResourceLimit::TransportDeferredCapacity,
-                        });
+                        return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
                     }
-                    self.persist_transport_message(
+                    self.persist_encoded_transport_message_for_existing_group(
                         msg,
                         &group_id,
                         current_epoch,
                         MessageState::PeelDeferred,
+                        prepared.encoded_payload,
                     )?;
                     self.note_peel_deferred_row_persisted(
                         &group_id,

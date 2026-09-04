@@ -16,7 +16,9 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::ingest::{
+    InboundResourceLimit, IngestOutcome, PeeledContent, PeeledMessage, StaleReason,
+};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -602,6 +604,54 @@ async fn carol_behind_two_epochs_with<P>(
         commit_to_epoch2,
         commit_to_epoch3,
     )
+}
+
+async fn add_group_two_epochs_ahead(
+    alice: &mut Engine<SqliteAccountStorage>,
+    carol: &mut Engine<SqliteAccountStorage>,
+) -> GroupId {
+    let (mut david, _david_storage) = build_client(b"david-second-group");
+    let (mut eve, _eve_storage) = build_client(b"eve-second-group");
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "second-deferred-peel-group".into(),
+            description: String::new(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    for key_package in [
+        david.fresh_key_package().await.unwrap(),
+        eve.fresh_key_package().await.unwrap(),
+    ] {
+        let invite = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![key_package],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let (_withheld_commit, pending) = evolution(invite);
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    group_id
 }
 
 /// Build a deterministic two-branch graph and retain `backlog` wrappers of one
@@ -1708,6 +1758,75 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         carol.ingest(overflow).await.unwrap(),
         IngestOutcome::Processed
     ));
+}
+
+/// If account accounting was initialized by group A, a later deferral in
+/// group B is charged incrementally. Group B's first sweep must reconcile that
+/// contribution rather than adding the same durable bytes again.
+#[tokio::test]
+async fn later_deferring_group_first_sweep_keeps_exact_account_byte_total() {
+    let (mut alice, mut carol, storage, _peeler, group_a, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let group_b = add_group_two_epochs_ahead(&mut alice, &mut carol).await;
+
+    let deferred_a = send_app(&mut alice, &group_a, "group A deferred bytes").await;
+    assert!(matches!(
+        carol.ingest(deferred_a.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_a = storage.get_message(&deferred_a.id).unwrap().payload.len();
+
+    let deferred_b = send_app(&mut alice, &group_b, "group B deferred bytes").await;
+    assert!(matches!(
+        carol.ingest(deferred_b.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let bytes_b = storage.get_message(&deferred_b.id).unwrap().payload.len();
+
+    carol.retry_deferred_peels(&group_b).await.unwrap();
+    assert_eq!(
+        carol.engine_metrics().deferred_peel_peak_bytes_per_account,
+        (bytes_a + bytes_b) as u64
+    );
+}
+
+/// A transport object outside the bounded stored-message representation is a
+/// typed, same-id-retryable resource refusal. It must not abort a relay drain
+/// as an internal serialization error.
+#[tokio::test]
+async fn unencodable_deferred_transport_is_resource_refused() {
+    let (mut alice, mut carol, storage, carol_peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let template = send_app(&mut alice, &group_id, "unencodable deferred payload").await;
+    let oversized = TransportMessage {
+        id: MessageId::new(b"unencodable-deferred".to_vec()),
+        // StoredMessagePayload bounds causal dependency lists at 2^20 items.
+        // The codec rejects this before encoding individual entries.
+        causal_deps: vec![MessageId::new(Vec::new()); (1 << 20) + 1],
+        ..template
+    };
+
+    assert!(matches!(
+        carol.ingest(oversized.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert!(matches!(
+        storage.get_message(&oversized.id),
+        Err(StorageError::NotFound)
+    ));
+
+    let attempts = carol_peeler.attempts_for(&oversized.id);
+    assert!(matches!(
+        carol.ingest(oversized.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert_eq!(carol_peeler.attempts_for(&oversized.id), attempts + 1);
 }
 
 /// The test-only override can isolate the per-group byte budget independently

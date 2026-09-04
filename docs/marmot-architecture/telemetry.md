@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-08-19
+updated: 2026-09-04
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---

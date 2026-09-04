@@ -274,9 +274,10 @@ profile provenance (including exact distinct-committer and retained-copy counts)
 terminal-only reconnect, the pre-catch-up zero-delivery boundary, the post-catch-up exact-one boundary, full Bob payload
 multiplicity, exact canonical equivalence, no pending work, active decryptability, and encrypted file-backed
 natural/duplicate canaries. A focused file-backed 384-message natural-history regression verifies that the production
-512-row limit avoids a redundant retained-history refetch. A feature-gated test override reproduces the old 256-row
-refetch, and an ignored 256/512/1,024 sweep records row refusals plus row and byte high-water marks for future policy
-decisions. Larger catalog blocks otherwise belong in isolated manual or scheduled campaigns.
+512-row limit avoids a redundant retained-history refetch. The adversarial reliability CI lane runs a feature-gated
+test override that reproduces the old 256-row refetch, and an ignored 256/512/1,024 sweep records row refusals plus row
+and byte high-water marks for future policy decisions. Larger catalog blocks otherwise belong in isolated manual or
+scheduled campaigns.
 
 ### `cross-route-restart-permutations/v1`
 

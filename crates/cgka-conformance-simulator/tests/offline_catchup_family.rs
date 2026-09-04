@@ -373,7 +373,11 @@ async fn large_natural_history_fits_raised_deferred_capacity() {
         report
             .campaign_measurements
             .deferred_peel_peak_rows_per_group
-            .is_some_and(|rows| rows > 0 && rows <= 512)
+            .is_some_and(|rows| {
+                rows > 0
+                    && rows
+                        <= cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP as u64
+            })
     );
 }
 

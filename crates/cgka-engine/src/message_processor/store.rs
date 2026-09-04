@@ -427,6 +427,38 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
         state: MessageState,
     ) -> Result<(), EngineError> {
+        if !self.should_persist_transport_message_for_existing_group(msg, group_id)? {
+            return Ok(());
+        }
+        self.persist_transport_message(msg, group_id, epoch, state)
+    }
+
+    pub(crate) fn persist_encoded_transport_message_for_existing_group(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+        encoded_payload: Vec<u8>,
+    ) -> Result<(), EngineError> {
+        if !self.should_persist_transport_message_for_existing_group(msg, group_id)? {
+            return Ok(());
+        }
+        self.persist_encoded_stored_message_payload(
+            msg.id.clone(),
+            group_id,
+            epoch,
+            state,
+            encoded_payload,
+            None,
+        )
+    }
+
+    fn should_persist_transport_message_for_existing_group(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
         match self.storage.get_group(group_id) {
             Ok(_) => {
                 // An own transport echo must not erase the lifecycle-aware
@@ -442,11 +474,11 @@ impl<S: StorageProvider> Engine<S> {
                             || payload.as_staged_invite_welcome().is_some()
                     })
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
-                self.persist_transport_message(msg, group_id, epoch, state)
+                Ok(true)
             }
-            Err(StorageError::NotFound) => Ok(()),
+            Err(StorageError::NotFound) => Ok(false),
             Err(e) => Err(EngineError::Storage(e)),
         }
     }
@@ -499,6 +531,28 @@ impl<S: StorageProvider> Engine<S> {
         payload: StoredMessagePayload,
         processed_transport_id: Option<&MessageId>,
     ) -> Result<(), EngineError> {
+        let payload = payload
+            .encode()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        self.persist_encoded_stored_message_payload(
+            id,
+            group_id,
+            epoch,
+            state,
+            payload,
+            processed_transport_id,
+        )
+    }
+
+    fn persist_encoded_stored_message_payload(
+        &self,
+        id: MessageId,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+        payload: Vec<u8>,
+        processed_transport_id: Option<&MessageId>,
+    ) -> Result<(), EngineError> {
         let id_hex = hex::encode(id.as_slice());
         let previous = match self.storage.get_message(&id) {
             Ok(record) => Some(record),
@@ -520,9 +574,6 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             None
         };
-        let payload = payload
-            .encode()
-            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         // Short-circuit only when the stored record is fully identical,
         // including the encoded payload bytes. A same (group, epoch, state)
         // row persisted under a different payload variant (e.g. RawTransport

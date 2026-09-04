@@ -28,7 +28,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    MessageRecord, MessageState, StoredMessagePayload, StoredMessagePayloadCodecError,
+};
 use cgka_traits::storage::{
     DeferredPeelGeneration, QueuedOutboundIntent, StorageError, StorageProvider,
 };
@@ -183,9 +185,6 @@ pub(crate) struct DeferredPeelGroupState {
     /// Exact retained ids and encoded lengths make replacement and retirement
     /// accounting idempotent across nested ingest/replay paths.
     deferred_payload_bytes_by_id: HashMap<MessageId, usize>,
-    /// Whether `deferred_rows` has been initialized from storage this
-    /// session.
-    counted: bool,
     /// Whether a cap-exceeded `Rejection` has already been audited for the
     /// current cap-full episode. Raw transport ids are attacker-controlled,
     /// so a sustained flood past the cap would otherwise emit one audit write
@@ -209,6 +208,11 @@ pub(crate) struct DeferredPeelGroupState {
     /// to the currently listed rows on every use, so it cannot outgrow the
     /// group's stored history.
     commit_digest_memo: HashMap<MessageId, ([u8; 32], Option<CommitEdge>)>,
+}
+
+pub(crate) struct PreparedDeferredPeelPayload {
+    pub(crate) previous_payload_bytes: Option<usize>,
+    pub(crate) encoded_payload: Vec<u8>,
 }
 
 /// `(source_epoch, digest)` of one stored commit in the convergence graph.
@@ -267,6 +271,17 @@ impl DeferredPeelGroupState {
 pub(crate) struct DeferredPeelAccountState {
     bytes: usize,
     counted: bool,
+}
+
+impl DeferredPeelAccountState {
+    fn reconcile_group_bytes(&mut self, previous_bytes: usize, current_bytes: usize) {
+        if self.counted {
+            self.bytes = self
+                .bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(current_bytes);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2423,7 +2438,6 @@ impl<S: StorageProvider> Engine<S> {
                     (record.id, payload_bytes)
                 })
                 .collect();
-            state.counted = true;
             account_bytes = account_bytes.saturating_add(bytes);
             peak_group_rows = peak_group_rows.max(rows);
             peak_group_bytes = peak_group_bytes.max(bytes);
@@ -2447,26 +2461,18 @@ impl<S: StorageProvider> Engine<S> {
         });
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
         let previous_bytes = state.deferred_bytes;
-        let was_counted = state.counted;
         state.deferred_rows = rows;
         state.deferred_bytes = bytes;
         state.deferred_payload_bytes_by_id = records
             .iter()
             .map(|record| (record.id.clone(), record.payload.len()))
             .collect();
-        state.counted = true;
-        if self.deferred_peel_account.counted {
-            if was_counted {
-                self.deferred_peel_account.bytes = self
-                    .deferred_peel_account
-                    .bytes
-                    .saturating_sub(previous_bytes)
-                    .saturating_add(bytes);
-            } else {
-                self.deferred_peel_account.bytes =
-                    self.deferred_peel_account.bytes.saturating_add(bytes);
-            }
-        }
+        // Incremental deferral already charges a group that started retaining
+        // rows after the account-wide reconstruction. Always reconcile the
+        // cached contribution as a delta; treating that group as previously
+        // uncounted would add its bytes a second time on its first sweep.
+        self.deferred_peel_account
+            .reconcile_group_bytes(previous_bytes, bytes);
         self.engine_metrics
             .note_deferred_peel_usage(rows, bytes, self.deferred_peel_account.bytes);
     }
@@ -2517,6 +2523,50 @@ impl<S: StorageProvider> Engine<S> {
                 .note_deferred_peel_capacity_refusal(resource);
         }
         Ok(group_has_capacity && account_has_capacity)
+    }
+
+    /// Prepare the exact bytes that admission measures and persistence writes.
+    /// Encoding bounds are a local retention limit, not an internal drain
+    /// failure, so callers translate codec failure to the typed capacity
+    /// refusal path.
+    pub(crate) fn prepare_deferred_peel_payload(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<PreparedDeferredPeelPayload, StoredMessagePayloadCodecError> {
+        let previous_payload_bytes = self
+            .storage
+            .get_message(&msg.id)
+            .ok()
+            .filter(|record| record.state == MessageState::PeelDeferred)
+            .map(|record| record.payload.len());
+        let encoded_payload = StoredMessagePayload::raw_transport(msg.clone()).encode()?;
+        Ok(PreparedDeferredPeelPayload {
+            previous_payload_bytes,
+            encoded_payload,
+        })
+    }
+
+    pub(crate) fn peel_deferred_capacity_refused(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+    ) -> IngestOutcome {
+        self.retryable_unpersisted_ingest_id = Some(message_id.clone());
+        if self.should_audit_peel_deferred_cap_rejection(group_id) {
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::Rejection {
+                    msg_id: hex::encode(message_id.as_slice()),
+                    reason: crate::message_disposition::MessageDisposition::DeferredCapacityRefused
+                        .tag()
+                        .to_string(),
+                },
+            );
+        }
+        IngestOutcome::ResourceRefused {
+            group_id: group_id.clone(),
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+        }
     }
 
     pub(crate) fn note_peel_deferred_row_persisted(
@@ -2962,10 +3012,7 @@ mod deferred_peel_accounting_tests {
 
     #[test]
     fn capacity_check_does_not_consume_slot_before_persist() {
-        let mut state = DeferredPeelGroupState {
-            counted: true,
-            ..Default::default()
-        };
+        let mut state = DeferredPeelGroupState::default();
 
         assert!(state.has_capacity(1, 10, 2, 20));
         assert_eq!(
@@ -2981,5 +3028,24 @@ mod deferred_peel_accounting_tests {
             "same-size exact-id retries stay eligible after a limit is lowered"
         );
         assert!(!state.has_capacity(0, 1, 0, 0));
+    }
+
+    #[test]
+    fn first_sweep_of_later_deferring_group_does_not_double_count_account_bytes() {
+        let group_a_bytes = 100;
+        let group_b_bytes = 25;
+        let mut account = DeferredPeelAccountState {
+            bytes: group_a_bytes,
+            counted: true,
+        };
+
+        // Account reconstruction happened while only group A was deferring.
+        // Group B starts deferring later and is charged incrementally.
+        account.bytes = account.bytes.saturating_add(group_b_bytes);
+
+        // Its first sweep observes the same durable bytes. Reconciliation is
+        // replacement, not another addition.
+        account.reconcile_group_bytes(group_b_bytes, group_b_bytes);
+        assert_eq!(account.bytes, group_a_bytes + group_b_bytes);
     }
 }
