@@ -9834,3 +9834,130 @@ async fn a_deferral_with_only_one_retained_branch_reports_uncontested_lineage() 
         "one retained commit cannot fork with itself; an absent rival looks exactly like missing history, which is what a backfill is for"
     );
 }
+
+/// A joiner anchors its join epoch on its first advance, so a rival forking
+/// from that epoch is adjudicated rather than halting the group.
+///
+/// `do_join_welcome` retains no anchor of its own — the join epoch is anchored
+/// by whatever first carries the device past it, because every advance path
+/// (direct ingest, confirm-published, and the convergence apply that starts at
+/// the live tip) snapshots the pre-advance epoch. That is what keeps a late
+/// joiner out of the `MissingRetainedAnchor` residual, and it is the invariant
+/// [`convergence_rewinds_to_greatest_anchor_at_or_below_traversed_fork_epoch`]
+/// leans on: a rewind base exists at every epoch a device stopped at.
+#[tokio::test]
+async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicates() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "late-joiner-rival".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    // Carol joins late, at epoch 2.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (carol_invite, carol_welcomes, carol_pending) = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => (msg, welcomes, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(carol_pending).await.unwrap();
+    let carol_invite = route(carol_invite, &group_id);
+    carol
+        .join_welcome(welcome_for(&carol_welcomes, b"carol"))
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        carol_storage.list_group_snapshots(&group_id).unwrap(),
+        Vec::<String>::new(),
+        "the join itself retains no anchor"
+    );
+
+    // Bob follows to epoch 2 and forks there.
+    bob.buffer_openmls_convergence_message_at(&group_id, carol_invite, 1_000)
+        .unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let (bob_rival, _bob_pending) = evolution(
+        bob.send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap(),
+    );
+    let bob_rival = route(bob_rival, &group_id);
+
+    // Carol's first advance past the join epoch anchors it.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let (alice_commit, alice_pending) = evolution(
+        alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![david_kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, route(alice_commit, &group_id), 2_000)
+        .unwrap();
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 2_000_000)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert!(
+        carol_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-2".to_string()),
+        "the first advance must anchor the join epoch"
+    );
+
+    // So the rival forking from the join epoch is adjudicated, not halted.
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, bob_rival, 3_000)
+        .unwrap();
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .expect("the join-epoch rival is adjudicated");
+    assert_eq!(result.errors, Vec::new());
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+}
