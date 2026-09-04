@@ -574,6 +574,14 @@ fn app_error_json(err: &AppError) -> Value {
                 "remote": "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
             },
         }),
+        AppError::MissingMemberInboxRoute(account) => json!({
+            "code": "missing_member_inbox_route",
+            "message": err.to_string(),
+            "account_id": account,
+            "repair": {
+                "action": "ask the recipient to publish a valid Marmot inbox relay list",
+            },
+        }),
         AppError::UnknownGroup(group_id) => json!({
             "code": "unknown_group",
             "message": err.to_string(),
@@ -746,6 +754,21 @@ mod tests {
         assert_eq!(
             error["repair"]["remote"],
             "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+        );
+    }
+
+    #[test]
+    fn missing_member_inbox_errors_identify_the_recipient_and_repair() {
+        let account = "22".repeat(32);
+        let error = wn_error_json(&WnError::App(AppError::MissingMemberInboxRoute(
+            account.clone(),
+        )));
+
+        assert_eq!(error["code"], "missing_member_inbox_route");
+        assert_eq!(error["account_id"], account);
+        assert_eq!(
+            error["repair"]["action"],
+            "ask the recipient to publish a valid Marmot inbox relay list"
         );
     }
 

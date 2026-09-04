@@ -1081,6 +1081,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Sqlite(_) => "read_marker_failed:sqlite",
         AppError::Hex(_) => "read_marker_failed:hex",
         AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
+        AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {

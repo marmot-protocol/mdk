@@ -10769,6 +10769,104 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     runtime.shutdown().await;
 }
 
+/// mdk#1673: directory resolution persists the recipient's explicit inbox
+/// route, and a later process can use that route to deliver one Welcome.
+#[tokio::test]
+async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "persisted invite route",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    app.resolve_member_key_packages(&[carol_id.as_str()])
+        .await
+        .expect("route and KeyPackage should resolve before restart");
+    assert!(
+        app.directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&url))
+    );
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    assert!(
+        app.directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&url)),
+        "the resolved inbox route must survive process restart"
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let mut restarted_events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut restarted_events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &carol_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+    assert_eq!(members.len(), 3);
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == carol_id)
+            .count(),
+        1,
+        "the persisted route must deliver one Welcome without staging a duplicate Add"
+    );
+    runtime.shutdown().await;
+}
+
 /// mdk#352 review follow-up: the welcome re-delivery surface is reachable end
 /// to end through the runtime worker. A create whose welcome delivered leaves
 /// nothing pending, and re-delivering an unknown welcome id is a clean error

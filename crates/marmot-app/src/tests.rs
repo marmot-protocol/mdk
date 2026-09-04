@@ -4605,6 +4605,7 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let runtime = MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -4696,6 +4697,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
         runtime.catch_up_accounts().await.unwrap();
@@ -4769,6 +4771,7 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
         runtime.catch_up_accounts().await.unwrap();
@@ -4882,6 +4885,8 @@ async fn concurrent_invites_keep_projections_readable_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &alice.account_id_hex, "wss://relay.example");
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let runtime = MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -7245,6 +7250,15 @@ async fn fresh_key_package_for_account(
     session.fresh_key_package().await.unwrap()
 }
 
+fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, relay: &str) {
+    let mut relay_lists = AccountRelayListStatus::empty();
+    relay_lists.inbox.created_at = 1;
+    relay_lists.inbox.relays = vec![relay.to_owned()];
+    relay_lists.refresh();
+    app.remember_directory_relay_lists(account_id_hex, &relay_lists)
+        .unwrap();
+}
+
 #[tokio::test]
 async fn member_key_package_skips_local_legacy_cache() {
     let directory = tempfile::tempdir().unwrap();
@@ -7343,6 +7357,10 @@ async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() 
     for account in [&bob, &carol] {
         let current = fresh_key_package_for_account(&app, account, false).await;
         let metadata = cgka_engine::key_package::key_package_metadata(&current).unwrap();
+        let mut relay_lists = AccountRelayListStatus::empty();
+        relay_lists.inbox.created_at = 1;
+        relay_lists.inbox.relays = vec!["wss://inbox.example".into()];
+        relay_lists.refresh();
         app.save_directory_entry(&UserDirectoryRecord {
             account_id_hex: account.account_id_hex.clone(),
             npub: npub_for_account_id_lossy(&account.account_id_hex),
@@ -7353,7 +7371,7 @@ async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() 
             profile: None,
             follows: Vec::new(),
             follow_source_relays: Vec::new(),
-            relay_lists: AccountRelayListStatus::empty(),
+            relay_lists,
             key_package: Some(DirectoryKeyPackage {
                 key_package_id: format!("{}-slot", account.label),
                 key_package_ref_hex: metadata.key_package_ref_hex,
@@ -7463,9 +7481,280 @@ async fn member_resolution_fixture(
                 vec![vec!["r".into(), relay.into()]],
                 String::new(),
             ));
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .push(NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_MARMOT_INBOX_RELAY_LIST,
+                vec![vec!["relay".into(), relay.into()]],
+                String::new(),
+            ));
     }
     app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(relay, fetcher.clone());
     (directory, app, accounts, fetcher)
+}
+
+#[tokio::test]
+async fn missing_inbox_is_discovered_when_nip65_is_cached() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
+
+    let prewarm_error = app
+        .prewarm_group_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("KeyPackage-only prewarm must not report invite readiness");
+    assert!(matches!(
+        prewarm_error,
+        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+    ));
+    fetcher.requests.lock().unwrap().clear();
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("commit-purpose resolution must require a safe inbox route");
+
+    assert!(
+        matches!(
+            &error,
+            AppError::MissingMemberInboxRoute(recipient) if recipient == &account_id
+        ),
+        "the typed error must identify the unready canonical recipient"
+    );
+    assert_eq!(error.privacy_safe_kind(), "missing_member_inbox_route");
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(
+        requests.iter().any(|request| request
+            .queries
+            .iter()
+            .any(|query| query.kind == KIND_MARMOT_INBOX_RELAY_LIST)),
+        "a cached NIP-65 list must not suppress independent inbox discovery"
+    );
+    assert!(
+        requests.iter().all(|request| request
+            .queries
+            .iter()
+            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)),
+        "the KeyPackage fetched during failed prewarm must remain reusable"
+    );
+}
+
+#[tokio::test]
+async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    let unsafe_inbox = "ws://127.0.0.1:29170";
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != account_id);
+    let unsafe_event = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        vec![vec!["relay".into(), unsafe_inbox.into()]],
+        String::new(),
+    );
+    let unsafe_created_at = unsafe_event.created_at;
+    fetcher.events.lock().unwrap().push(unsafe_event);
+
+    let error = app
+        .prewarm_group_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a loopback inbox route must not satisfy invite readiness");
+    assert!(matches!(
+        error,
+        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+    ));
+
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != account_id);
+    let mut safe_event = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        vec![vec!["relay".into(), "wss://safe-inbox.example".into()]],
+        String::new(),
+    );
+    safe_event.created_at = unsafe_created_at.saturating_add(1);
+    fetcher.events.lock().unwrap().push(safe_event);
+    fetcher.requests.lock().unwrap().clear();
+
+    app.resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect("a safe replacement inbox route should make the member ready");
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .queries
+            .iter()
+            .any(|query| query.kind == KIND_MARMOT_INBOX_RELAY_LIST)
+    }));
+}
+
+#[tokio::test]
+async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
+    let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
+
+    let inviter = AccountHome::open(directory.path())
+        .create_account("single-route-readiness-inviter")
+        .unwrap();
+    let mut client = app.client(&inviter.label).await.unwrap();
+    let group_id = client
+        .create_group("single route readiness", &[])
+        .await
+        .unwrap();
+
+    let error = client
+        .invite_members(&group_id, &[account_id.as_str()])
+        .await
+        .expect_err("a KeyPackage alone must not allow an Add commit");
+    assert!(matches!(
+        error,
+        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+    ));
+    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 1);
+
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .push(NostrTransportEvent::new_unsigned(
+            account_id.clone(),
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            vec![vec!["relay".into(), "wss://shared.example".into()]],
+            String::new(),
+        ));
+    fetcher.requests.lock().unwrap().clear();
+    client
+        .invite_members(&group_id, &[account_id.as_str()])
+        .await
+        .expect("the explicit retry should reuse the unconsumed KeyPackage");
+    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
+    assert!(fetcher.requests.lock().unwrap().iter().all(|request| {
+        request
+            .queries
+            .iter()
+            .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)
+    }));
+}
+
+#[tokio::test]
+async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_membership() {
+    let (directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    let missing_inbox_account = accounts[1].account_id_hex.clone();
+    fetcher.events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing_inbox_account
+    });
+
+    let inviter = AccountHome::open(directory.path())
+        .create_account("route-readiness-inviter")
+        .unwrap();
+    let mut client = app.client(&inviter.label).await.unwrap();
+    let group_id = client
+        .create_group("atomic route readiness", &[])
+        .await
+        .unwrap();
+    let member_refs = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+
+    let error = client
+        .invite_members(&group_id, &member_refs)
+        .await
+        .expect_err("one unrouteable member must reject the whole invite");
+    assert!(matches!(
+        error,
+        AppError::MissingMemberInboxRoute(ref recipient)
+            if recipient == &missing_inbox_account
+    ));
+    assert_eq!(
+        client.group_mls_state(&group_id).unwrap().member_count,
+        1,
+        "route readiness must fail before the MLS roster changes"
+    );
+
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .push(NostrTransportEvent::new_unsigned(
+            missing_inbox_account,
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            vec![vec!["relay".into(), "wss://shared.example".into()]],
+            String::new(),
+        ));
+    fetcher.requests.lock().unwrap().clear();
+
+    client
+        .invite_members(&group_id, &member_refs)
+        .await
+        .expect("the explicit retry should reuse both fetched KeyPackages");
+    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 3);
+    assert!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request
+                .queries
+                .iter()
+                .all(|query| query.kind != KIND_MARMOT_KEY_PACKAGE)),
+        "the failed preflight must not consume or discard valid fetched KeyPackages"
+    );
+}
+
+#[tokio::test]
+async fn thirty_incremental_invites_with_large_directory_cache_converge_without_false_success() {
+    let (directory, app, accounts, _fetcher) = member_resolution_fixture(30, false).await;
+    for _ in 0..256 {
+        let account_id = Keys::generate().public_key().to_hex();
+        app.save_directory_entry(&app.empty_directory_record(&account_id))
+            .unwrap();
+    }
+
+    let inviter = AccountHome::open(directory.path())
+        .create_account("incremental-inviter")
+        .unwrap();
+    let mut client = app.client(&inviter.label).await.unwrap();
+    let group_id = client
+        .create_group("incremental route readiness", &[])
+        .await
+        .unwrap();
+
+    for (batch_index, batch) in accounts.chunks(5).enumerate() {
+        let member_refs = batch
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        client
+            .invite_members(&group_id, &member_refs)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("incremental invite batch {batch_index} failed: {error:?}")
+            });
+        assert_eq!(
+            client.group_mls_state(&group_id).unwrap().member_count,
+            1 + ((batch_index + 1) * batch.len()),
+            "each successful incremental batch must be reflected in the canonical roster"
+        );
+    }
 }
 
 #[tokio::test]
@@ -11451,6 +11740,7 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
     let errors = [
         AppError::UnknownGroup(group_id.clone()).to_string(),
         AppError::MissingKeyPackage(account_id.clone()).to_string(),
+        AppError::MissingMemberInboxRoute(account_id.clone()).to_string(),
         AppError::MissingDirectoryEntry(account_id.clone()).to_string(),
         AppError::AccountHome(AccountHomeError::SecretNotFound(account_id.clone())).to_string(),
     ];
@@ -16675,6 +16965,11 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://invite-recovery.example")
         .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(
+        &app,
+        &invited.account_id_hex,
+        "wss://invite-recovery.example",
+    );
     let runtime = MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();

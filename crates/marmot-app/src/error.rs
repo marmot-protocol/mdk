@@ -54,6 +54,11 @@ pub enum AppError {
     Hex(#[from] hex::FromHexError),
     #[error("no published key package for account")]
     MissingKeyPackage(String),
+    /// The canonical invite target has no Marmot inbox endpoint that survives
+    /// this device's relay-safety policy. Kept per-recipient for typed host
+    /// presentation, while Display remains identity-free for safe diagnostics.
+    #[error("member has no valid Marmot inbox relay")]
+    MissingMemberInboxRoute(String),
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -242,6 +247,7 @@ impl AppError {
             Self::Sqlite(_) => "sqlite",
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
+            Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",
