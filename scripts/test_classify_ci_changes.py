@@ -21,13 +21,21 @@ class ClassifyCiChangesTests(unittest.TestCase):
             },
         )
 
-    def test_unknown_non_documentation_change_keeps_general_ci(self) -> None:
+    def test_unknown_non_documentation_change_fails_open_to_every_lane(self) -> None:
         result = classify(["integrations/codex/marmot/src/main.rs"])
+        self.assertTrue(all(result.values()))
+
+    def test_known_independent_crate_keeps_specialist_jobs_filtered(self) -> None:
+        result = classify(["crates/cli/src/main.rs"])
         self.assertTrue(result["run_full"])
         self.assertFalse(result["run_c"])
         self.assertFalse(result["run_conformance"])
         self.assertFalse(result["run_ios"])
         self.assertFalse(result["run_formal"])
+
+    def test_new_workspace_crate_fails_open_until_classified(self) -> None:
+        result = classify(["crates/new-workspace-member/src/lib.rs"])
+        self.assertTrue(all(result.values()))
 
     def test_engine_change_runs_all_compiled_specialists_except_formal_model(self) -> None:
         result = classify(["crates/cgka-engine/src/lib.rs"])

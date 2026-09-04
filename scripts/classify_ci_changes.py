@@ -72,6 +72,36 @@ IOS_WORKSPACE_CRATES = {
     "traits",
 }
 
+INDEPENDENT_WORKSPACE_CRATES = {
+    "agent-connector",
+    "agent-control",
+    "agent-stream-compose",
+    "cli",
+    "incident-replay",
+}
+
+CLASSIFIED_WORKSPACE_CRATES = (
+    C_WORKSPACE_CRATES
+    | CONFORMANCE_WORKSPACE_CRATES
+    | IOS_WORKSPACE_CRATES
+    | INDEPENDENT_WORKSPACE_CRATES
+)
+
+SPECIALIST_EXACT_PATHS = {
+    ".github/workflows/bindings.yaml",
+    ".github/workflows/c-smoke-nightly.yml",
+    ".github/workflows/convergence-hardening.yml",
+    ".github/workflows/simulator-nightly.yml",
+    "Dockerfile.convergence-campaign",
+    "crates/cgka-conformance-simulator/src/policy_cases.rs",
+    "crates/cgka-conformance-simulator/tests/generated_policy_cases.rs",
+    "crates/cgka-conformance-simulator/tests/policy_case_tamarin_drift.rs",
+    "docs/marmot-architecture/convergence-constant-inventory.txt",
+    "scripts/check_c_binding_parity.py",
+    "scripts/check_campaign_toolchain.sh",
+    "scripts/tests/test_campaign_toolchain.sh",
+}
+
 
 def _is_documentation(path: str) -> bool:
     return (
@@ -90,6 +120,16 @@ def _crate_name(path: str) -> str | None:
 
 def _touches_crates(path: str, crates: set[str]) -> bool:
     return _crate_name(path) in crates
+
+
+def _is_recognized_specialist_path(path: str) -> bool:
+    return (
+        _crate_name(path) in CLASSIFIED_WORKSPACE_CRATES
+        or path in ROOT_BUILD_PATHS
+        or path in SPECIALIST_EXACT_PATHS
+        or path.startswith("formal/tamarin/")
+        or path.startswith("formal/tla/")
+    )
 
 
 def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
@@ -115,14 +155,18 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
 
     workflow_changed = ".github/workflows/ci.yml" in normalized
     root_build_changed = any(path in ROOT_BUILD_PATHS for path in normalized)
+    unclassified_path = any(
+        not _is_documentation(path) and not _is_recognized_specialist_path(path)
+        for path in normalized
+    )
 
-    run_c = workflow_changed or root_build_changed or any(
+    run_c = unclassified_path or workflow_changed or root_build_changed or any(
         _touches_crates(path, C_WORKSPACE_CRATES)
         or path == ".github/workflows/c-smoke-nightly.yml"
         or path == "scripts/check_c_binding_parity.py"
         for path in normalized
     )
-    run_conformance = workflow_changed or root_build_changed or any(
+    run_conformance = unclassified_path or workflow_changed or root_build_changed or any(
         _touches_crates(path, CONFORMANCE_WORKSPACE_CRATES)
         or path
         in {
@@ -136,12 +180,12 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
         or path.startswith("formal/tla/")
         for path in normalized
     )
-    run_ios = workflow_changed or root_build_changed or any(
+    run_ios = unclassified_path or workflow_changed or root_build_changed or any(
         _touches_crates(path, IOS_WORKSPACE_CRATES)
         or path == ".github/workflows/bindings.yaml"
         for path in normalized
     )
-    run_formal = workflow_changed or any(
+    run_formal = unclassified_path or workflow_changed or any(
         path.startswith("formal/tamarin/")
         or path
         in {
