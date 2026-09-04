@@ -665,7 +665,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if !chat_list_projection_complete_tx(&conn, local_account_id_hex, mention_classifier)? {
+            if !chat_list_projection_complete_tx(&conn)? {
                 rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)?;
             }
             Ok(())
@@ -695,6 +695,28 @@ impl SqliteAccountStorage {
                 &conn,
                 local_account_id_hex,
                 group_id_hex,
+                mention_classifier,
+            )
+        })
+    }
+
+    /// Refresh one chat-list row after a timeline projection changed only the
+    /// supplied message ids. Unread membership is reconciled incrementally;
+    /// older databases and incomplete projections fall back to a full rebuild.
+    pub fn refresh_chat_list_row_for_messages(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        message_ids_hex: &[String],
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<Option<ChatListRow>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            refresh_chat_list_row_for_messages_tx(
+                &conn,
+                local_account_id_hex,
+                group_id_hex,
+                message_ids_hex,
                 mention_classifier,
             )
         })
@@ -967,13 +989,85 @@ fn refresh_chat_list_row_tx(
     chat_list_row_tx(tx, group_id_hex)
 }
 
+fn refresh_chat_list_row_for_messages_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    message_ids_hex: &[String],
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<Option<ChatListRow>> {
+    let Some(group) = account_group_tx(tx, group_id_hex)? else {
+        tx.execute_cached(
+            "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
+            params![group_id_hex],
+        )
+        .storage()?;
+        return Ok(None);
+    };
+    if message_ids_hex.is_empty()
+        || !dirty_unread_messages_are_covered_tx(tx, group_id_hex, message_ids_hex)?
+        || !projection_has_rows_tx(
+            tx,
+            "SELECT EXISTS(
+                SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex = ?1
+             )",
+            params![group_id_hex],
+        )?
+        || !projection_has_rows_tx(
+            tx,
+            "SELECT EXISTS(SELECT 1 FROM chat_list_rows WHERE group_id_hex = ?1)",
+            params![group_id_hex],
+        )?
+    {
+        rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
+    } else {
+        let unread = reconcile_unread_messages_tx(
+            tx,
+            local_account_id_hex,
+            &group.group_id_hex,
+            message_ids_hex,
+            mention_classifier,
+        )?;
+        write_chat_list_row_for_group_tx(tx, &group, unread)?;
+    }
+    chat_list_row_tx(tx, group_id_hex)
+}
+
+fn dirty_unread_messages_are_covered_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids_hex: &[String],
+) -> StorageResult<bool> {
+    let supplied_message_ids = message_ids_hex
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT message_id_hex FROM chat_list_unread_dirty_messages
+             WHERE group_id_hex = ?1",
+        )
+        .storage()?;
+    let dirty_message_ids = statement
+        .query_map(params![group_id_hex], |row| row.get::<_, String>(0))
+        .storage()?;
+    for dirty_message_id in dirty_message_ids {
+        let dirty_message_id = dirty_message_id.storage()?;
+        if !supplied_message_ids.contains(dirty_message_id.as_str()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Current chat-list projection reconciliation version.
 ///
 /// Version 1 covered unread-mention counts (#750). Version 2 additionally
 /// projects kind-1210 group-system rows into preview, activity, and unread state
-/// (#822). The persisted column keeps its legacy `mention_counts_version` name
+/// (#822). Version 3 materializes per-message unread membership so incremental
+/// refreshes do not rescan the unread window. The persisted column keeps its legacy `mention_counts_version` name
 /// for schema compatibility, but now gates the complete derived-row contract.
-const CHAT_LIST_PROJECTION_VERSION: i64 = 2;
+const CHAT_LIST_PROJECTION_VERSION: i64 = 3;
 
 const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
     GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -1137,11 +1231,10 @@ fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> Storage
 /// `ChatListRow::leave_requested_at_ms` is derived at read time rather than
 /// materialized, so there is no stored value that can drift out of date — and
 /// comparing a read-time-only field here would mark every row stale forever.
-fn chat_list_projection_complete_tx(
-    tx: &Connection,
-    local_account_id_hex: &str,
-    mention_classifier: &MentionClassifier<'_>,
-) -> StorageResult<bool> {
+fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
+    if chat_list_projection_version_tx(tx)? < CHAT_LIST_PROJECTION_VERSION {
+        return Ok(false);
+    }
     let activity_filter = chat_list_activity_filter_sql("mt.");
     let preview_order = chat_list_preview_order_desc("mt.");
     let preview_eligibility = chat_list_preview_eligibility_sql("mt.");
@@ -1155,6 +1248,25 @@ fn chat_list_projection_complete_tx(
                     ON row.group_id_hex = ag.group_id_hex
                 WHERE row.group_id_hex IS NULL
              )",
+        [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(SELECT 1 FROM chat_list_unread_dirty_messages)",
+        [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+            SELECT 1 FROM account_groups AS ag
+            LEFT JOIN chat_list_unread_ready_groups AS ready
+                ON ready.group_id_hex = ag.group_id_hex
+            WHERE ready.group_id_hex IS NULL
+         )",
         [],
     )? {
         return Ok(false);
@@ -1298,64 +1410,7 @@ fn chat_list_projection_complete_tx(
     )? {
         return Ok(false);
     }
-    if chat_list_projection_version_tx(tx)? >= CHAT_LIST_PROJECTION_VERSION {
-        return Ok(true);
-    }
-    // The version marker can lag behind rows that a targeted refresh already
-    // brought current. Re-derive the unread summary once and rebuild only when
-    // a row is actually stale; this preserves the cheap warm path after the
-    // marker advances without turning a metadata-only open into needless SQL.
-    for (group_id_hex, stored) in chat_list_stored_unread_summaries_tx(tx)? {
-        let read_state = read_state_tx(tx, &group_id_hex)?;
-        let derived = unread_summary_tx(
-            tx,
-            local_account_id_hex,
-            &group_id_hex,
-            read_state.as_ref(),
-            mention_classifier,
-        )?;
-        if derived.count != stored.count
-            || derived.mention_count != stored.mention_count
-            || derived.first_message_id != stored.first_message_id
-        {
-            return Ok(false);
-        }
-    }
-    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)?;
     Ok(true)
-}
-
-fn chat_list_stored_unread_summaries_tx(
-    tx: &Connection,
-) -> StorageResult<Vec<(String, UnreadSummary)>> {
-    let mut stmt = tx
-        .prepare_cached(
-            "SELECT group_id_hex, unread_count, unread_mention_count,
-                    first_unread_message_id_hex
-             FROM chat_list_rows",
-        )
-        .storage()?;
-    stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    })
-    .storage()?
-    .map(|entry| {
-        let (group_id_hex, count, mention_count, first_message_id) = entry.storage()?;
-        Ok((
-            group_id_hex,
-            UnreadSummary {
-                count: i64_to_u64(count)?,
-                mention_count: i64_to_u64(mention_count)?,
-                first_message_id,
-            },
-        ))
-    })
-    .collect()
 }
 
 fn projection_has_rows_tx<P: Params>(tx: &Connection, sql: &str, params: P) -> StorageResult<bool> {
@@ -1375,18 +1430,39 @@ fn rebuild_chat_list_row_for_group_tx(
     group: AccountGroupRow,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
-    let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
-    let latest_message = latest.as_ref().map(|latest| &latest.preview);
-    let accepted_activity_insert_order =
-        latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
-    let unread = unread_summary_tx(
+    let unread = rebuild_unread_membership_tx(
         tx,
         local_account_id_hex,
         &group.group_id_hex,
         read_state.as_ref(),
         mention_classifier,
     )?;
+    write_chat_list_row_for_group_tx(tx, &group, unread)?;
+    tx.execute_cached(
+        "DELETE FROM chat_list_unread_dirty_messages WHERE group_id_hex = ?1",
+        params![group.group_id_hex],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "INSERT INTO chat_list_unread_ready_groups (group_id_hex) VALUES (?1)
+         ON CONFLICT(group_id_hex) DO NOTHING",
+        params![group.group_id_hex],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn write_chat_list_row_for_group_tx(
+    tx: &Connection,
+    group: &AccountGroupRow,
+    unread: UnreadSummary,
+) -> StorageResult<()> {
+    let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
+    let latest_message = latest.as_ref().map(|latest| &latest.preview);
+    let accepted_activity_insert_order =
+        latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
+    let read_state = read_state_tx(tx, &group.group_id_hex)?;
     let activity_sort_at = latest_message
         .map(|message| message.timeline_at)
         .into_iter()
@@ -1458,7 +1534,7 @@ fn rebuild_chat_list_row_for_group_tx(
             &group.group_id_hex,
             bool_i64(group.archived),
             bool_i64(group.pending_confirmation),
-            chat_title(&group),
+            chat_title(group),
             &group.profile_name,
             group.avatar_url.as_deref(),
             group
@@ -1531,13 +1607,217 @@ struct UnreadSummary {
     first_message_id: Option<String>,
 }
 
-fn unread_summary_tx(
+struct UnreadMembership {
+    mentions_local: bool,
+    order_class: i64,
+    order_primary: i64,
+    order_phase: i64,
+    order_at: i64,
+}
+
+fn reconcile_unread_messages_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    message_ids_hex: &[String],
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<UnreadSummary> {
+    let (stored_count, stored_mention_count): (i64, i64) = tx
+        .query_row_cached(
+            "SELECT unread_count, unread_mention_count
+             FROM chat_list_rows WHERE group_id_hex = ?1",
+            params![group_id_hex],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .storage()?;
+    let read_state = read_state_tx(tx, group_id_hex)?;
+    let mut count_delta = 0i64;
+    let mut mention_delta = 0i64;
+    let mut seen = HashSet::with_capacity(message_ids_hex.len());
+    for message_id_hex in message_ids_hex {
+        if !seen.insert(message_id_hex) {
+            continue;
+        }
+        let old_mentions = tx
+            .query_row_cached(
+                "SELECT mentions_local FROM chat_list_unread_messages
+                 WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                params![group_id_hex, message_id_hex],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .storage()?;
+        let current = unread_membership_for_message_tx(
+            tx,
+            local_account_id_hex,
+            group_id_hex,
+            message_id_hex,
+            read_state.as_ref(),
+            mention_classifier,
+        )?;
+        match (old_mentions, current) {
+            (None, None) => {}
+            (Some(old), None) => {
+                tx.execute_cached(
+                    "DELETE FROM chat_list_unread_messages
+                     WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+                    params![group_id_hex, message_id_hex],
+                )
+                .storage()?;
+                count_delta -= 1;
+                mention_delta -= old;
+            }
+            (old, Some(current)) => {
+                tx.execute_cached(
+                    "INSERT INTO chat_list_unread_messages (
+                        group_id_hex, message_id_hex, mentions_local,
+                        timeline_order_class, timeline_order_primary,
+                        timeline_order_phase, timeline_order_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
+                        mentions_local = excluded.mentions_local,
+                        timeline_order_class = excluded.timeline_order_class,
+                        timeline_order_primary = excluded.timeline_order_primary,
+                        timeline_order_phase = excluded.timeline_order_phase,
+                        timeline_order_at = excluded.timeline_order_at",
+                    params![
+                        group_id_hex,
+                        message_id_hex,
+                        bool_i64(current.mentions_local),
+                        current.order_class,
+                        current.order_primary,
+                        current.order_phase,
+                        current.order_at,
+                    ],
+                )
+                .storage()?;
+                if let Some(old) = old {
+                    mention_delta += bool_i64(current.mentions_local) - old;
+                } else {
+                    count_delta += 1;
+                    mention_delta += bool_i64(current.mentions_local);
+                }
+            }
+        }
+        tx.execute_cached(
+            "DELETE FROM chat_list_unread_dirty_messages
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![group_id_hex, message_id_hex],
+        )
+        .storage()?;
+    }
+    let first_message_id = tx
+        .query_row_cached(
+            "SELECT message_id_hex
+             FROM chat_list_unread_messages
+             WHERE group_id_hex = ?1
+             ORDER BY timeline_order_class, timeline_order_primary,
+                      timeline_order_phase, timeline_order_at, message_id_hex
+             LIMIT 1",
+            params![group_id_hex],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .storage()?;
+    Ok(UnreadSummary {
+        count: i64_to_u64(stored_count + count_delta)?,
+        mention_count: i64_to_u64(stored_mention_count + mention_delta)?,
+        first_message_id,
+    })
+}
+
+fn unread_membership_for_message_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    message_id_hex: &str,
+    read_state: Option<&ConversationReadState>,
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<Option<UnreadMembership>> {
+    let Some(read_state) = read_state else {
+        return Ok(None);
+    };
+    let (where_sql, marker_params) =
+        if let Some((class, primary, phase, at, id)) = read_state.canonical_order_key() {
+            (
+                "(timeline_order_class, timeline_order_primary,
+                  timeline_order_phase, timeline_order_at, message_id_hex)
+                    > (?4, ?5, ?6, ?7, ?8)",
+                vec![
+                    rusqlite::types::Value::Integer(i64::from(class)),
+                    rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+                    rusqlite::types::Value::Integer(i64::from(phase)),
+                    rusqlite::types::Value::Integer(u64_to_i64(at)?),
+                    rusqlite::types::Value::Text(id.to_owned()),
+                ],
+            )
+        } else if let Some(last_read_at) = read_state.last_read_timeline_at {
+            (
+                "(timeline_at > ?4 OR (timeline_at = ?4 AND message_id_hex > ?5))",
+                vec![
+                    rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
+                    rusqlite::types::Value::Text(
+                        read_state
+                            .last_read_message_id_hex
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_owned(),
+                    ),
+                ],
+            )
+        } else {
+            (
+                "timeline_at > ?4",
+                vec![rusqlite::types::Value::Integer(u64_to_i64(
+                    read_state.initialized_at,
+                )?)],
+            )
+        };
+    let activity_filter = chat_list_activity_filter_sql("");
+    let sql = format!(
+        "SELECT plaintext, tags_json, kind, timeline_order_class,
+                timeline_order_primary, timeline_order_phase, timeline_order_at
+         FROM message_timeline
+         WHERE group_id_hex = ?1 AND sender != ?2 AND message_id_hex = ?3
+           AND {activity_filter} AND deleted = 0
+           AND invalidation_status IS NULL AND {where_sql}"
+    );
+    let mut query_params = vec![
+        rusqlite::types::Value::Text(group_id_hex.to_owned()),
+        rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
+        rusqlite::types::Value::Text(message_id_hex.to_owned()),
+    ];
+    query_params.extend(marker_params);
+    tx.query_row_cached(&sql, rusqlite::params_from_iter(query_params), |row| {
+        let plaintext: String = row.get(0)?;
+        let tags_json: String = row.get(1)?;
+        let kind = row.get::<_, i64>(2)? as u64;
+        let tags = crate::tags_from_json(tags_json).unwrap_or_default();
+        Ok(UnreadMembership {
+            mentions_local: kind == MARMOT_APP_EVENT_KIND_CHAT
+                && mention_classifier(&plaintext, &tags),
+            order_class: row.get(3)?,
+            order_primary: row.get(4)?,
+            order_phase: row.get(5)?,
+            order_at: row.get(6)?,
+        })
+    })
+    .optional()
+    .storage()
+}
+
+fn rebuild_unread_membership_tx(
     tx: &Connection,
     local_account_id_hex: &str,
     group_id_hex: &str,
     read_state: Option<&ConversationReadState>,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<UnreadSummary> {
+    tx.execute_cached(
+        "DELETE FROM chat_list_unread_messages WHERE group_id_hex = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
     let Some(read_state) = read_state else {
         return Ok(UnreadSummary {
             count: 0,
@@ -1574,7 +1854,11 @@ fn unread_summary_tx(
                     rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
                     rusqlite::types::Value::Text(marker_id.to_owned()),
                 ],
-                "timeline_at ASC, message_id_hex ASC",
+                "timeline_order_class ASC,
+              timeline_order_primary ASC,
+              timeline_order_phase ASC,
+              timeline_order_at ASC,
+              message_id_hex ASC",
             )
         } else {
             (
@@ -1583,16 +1867,24 @@ fn unread_summary_tx(
                     rusqlite::types::Value::Integer(u64_to_i64(read_state.initialized_at)?),
                     rusqlite::types::Value::Text(String::new()),
                 ],
-                "timeline_at ASC, message_id_hex ASC",
+                "timeline_order_class ASC,
+              timeline_order_primary ASC,
+              timeline_order_phase ASC,
+              timeline_order_at ASC,
+              message_id_hex ASC",
             )
         };
     // Derive count + first-unread id + mention_count from one ordered scan over
     // the unread window. Persisted canonical anchors use the same accepted-history
     // key as timeline pagination even after retention prunes the marker row.
-    // Legacy states without a canonical anchor use wall-clock predicate + order.
+    // Legacy states without a canonical anchor retain their wall-clock unread
+    // predicate, then use the canonical tuple to order that unread set just as
+    // incremental reconciliation does.
     let activity_filter = chat_list_activity_filter_sql("");
     let scan_sql = format!(
-        "SELECT message_id_hex, plaintext, tags_json, kind
+        "SELECT message_id_hex, plaintext, tags_json, kind,
+                timeline_order_class, timeline_order_primary,
+                timeline_order_phase, timeline_order_at
          FROM message_timeline
          WHERE group_id_hex = ?1
            AND {activity_filter}
@@ -1619,14 +1911,37 @@ fn unread_summary_tx(
         let plaintext: String = row.get(1).storage()?;
         let tags_json: String = row.get(2).storage()?;
         let kind = i64_to_u64(row.get(3).storage()?)?;
+        let timeline_order_class: i64 = row.get(4).storage()?;
+        let timeline_order_primary: i64 = row.get(5).storage()?;
+        let timeline_order_phase: i64 = row.get(6).storage()?;
+        let timeline_order_at: i64 = row.get(7).storage()?;
         if first_message_id.is_none() {
-            first_message_id = Some(message_id_hex);
+            first_message_id = Some(message_id_hex.clone());
         }
         count += 1;
         let tags = crate::tags_from_json(tags_json).unwrap_or_default();
-        if kind == MARMOT_APP_EVENT_KIND_CHAT && mention_classifier(&plaintext, &tags) {
+        let mentions_local =
+            kind == MARMOT_APP_EVENT_KIND_CHAT && mention_classifier(&plaintext, &tags);
+        if mentions_local {
             mention_count += 1;
         }
+        tx.execute_cached(
+            "INSERT INTO chat_list_unread_messages (
+                group_id_hex, message_id_hex, mentions_local,
+                timeline_order_class, timeline_order_primary,
+                timeline_order_phase, timeline_order_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                group_id_hex,
+                &message_id_hex,
+                bool_i64(mentions_local),
+                timeline_order_class,
+                timeline_order_primary,
+                timeline_order_phase,
+                timeline_order_at,
+            ],
+        )
+        .storage()?;
     }
     Ok(UnreadSummary {
         count,
@@ -1642,7 +1957,7 @@ pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
     let read_state = read_state_tx(tx, group_id_hex)?;
-    let unread = unread_summary_tx(
+    let unread = rebuild_unread_membership_tx(
         tx,
         local_account_id_hex,
         group_id_hex,
@@ -1661,6 +1976,20 @@ pub(crate) fn refresh_chat_list_unread_after_secure_prune_tx(
             u64_to_i64(unread.mention_count)?,
             unread.first_message_id
         ],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "DELETE FROM chat_list_unread_dirty_messages WHERE group_id_hex = ?1",
+        params![group_id_hex],
+    )
+    .storage()?;
+    tx.execute_cached(
+        "INSERT INTO chat_list_unread_ready_groups (group_id_hex)
+         SELECT ?1 WHERE EXISTS (
+            SELECT 1 FROM account_groups WHERE group_id_hex = ?1
+         )
+         ON CONFLICT(group_id_hex) DO NOTHING",
+        params![group_id_hex],
     )
     .storage()?;
     Ok(())

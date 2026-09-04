@@ -1736,9 +1736,7 @@ fn ensure_chat_list_rows_treats_unknown_self_membership_as_normalized() {
     // CASE) — otherwise it sees 'member' != '<unknown>' forever and rebuilds the
     // whole projection on every open.
     let store = setup_store();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
     {
         let conn = store.lock().unwrap();
@@ -1977,6 +1975,52 @@ fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview()
 }
 
 #[test]
+fn legacy_read_state_uses_canonical_first_unread_order_across_refresh_paths() {
+    let store = setup_store();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversation_read_state (
+                group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                initialized_at, updated_at
+             ) VALUES (?1, 'marker', 5, 0, 1)",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    let mut higher_epoch = chat("higher-epoch", REMOTE, 10, "earlier wall clock");
+    higher_epoch.source_epoch = Some(8);
+    store.record_app_event(&higher_epoch).unwrap();
+    let mut lower_epoch = chat("lower-epoch", REMOTE, 20, "later wall clock");
+    lower_epoch.source_epoch = Some(7);
+    store.record_app_event(&lower_epoch).unwrap();
+
+    let rebuilt = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        rebuilt.first_unread_message_id_hex.as_deref(),
+        Some("lower-epoch")
+    );
+
+    let targeted = store
+        .refresh_chat_list_row_for_messages(
+            LOCAL,
+            GROUP,
+            &["higher-epoch".to_owned()],
+            &no_mentions,
+        )
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        targeted.first_unread_message_id_hex,
+        rebuilt.first_unread_message_id_hex
+    );
+}
+
+#[test]
 fn ensure_repairs_a_stale_pending_preview_after_newer_authenticated_activity() {
     let store = setup_store();
     let mut pending = chat("pending", LOCAL, 100, "older pending send");
@@ -2184,10 +2228,8 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     delivered.source_epoch = Some(8);
     store.record_app_event(&delivered).unwrap();
 
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(
         row.last_message
             .as_ref()
@@ -2210,7 +2252,7 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn, LOCAL, &no_mentions).unwrap(),
+            chat_list_projection_complete_tx(&conn).unwrap(),
             "failed-send preview priority must match the completeness query"
         );
     }
@@ -3028,6 +3070,237 @@ fn unread_mention_of_other_account_does_not_count() {
 }
 
 #[test]
+fn targeted_refresh_classifies_only_changed_unread_messages() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("first", REMOTE, 10, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&chat("second", REMOTE, 20, "hello again"))
+        .unwrap();
+
+    let classifier_calls = std::cell::Cell::new(0usize);
+    let classifier = |plaintext: &str, _tags: &[Vec<String>]| {
+        classifier_calls.set(classifier_calls.get() + 1);
+        plaintext.contains("@local")
+    };
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &classifier)
+        .unwrap();
+    assert_eq!(classifier_calls.get(), 2);
+
+    classifier_calls.set(0);
+    store
+        .record_app_event(&chat("third", REMOTE, 30, "hello @local"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &classifier)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(classifier_calls.get(), 1);
+    assert_eq!(row.unread_count, 3);
+    assert_eq!(row.unread_mention_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("first"));
+
+    classifier_calls.set(0);
+    store
+        .invalidate_app_event_by_message_id(GROUP, "third", "LosingBranch")
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &classifier)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(
+        classifier_calls.get(),
+        2,
+        "timeline invalidation dirties rewritten siblings, so uncovered work must force a rebuild"
+    );
+    assert_eq!(row.unread_count, 2);
+    assert_eq!(row.unread_mention_count, 0);
+}
+
+#[test]
+fn later_targeted_refresh_rebuilds_when_an_earlier_message_is_still_dirty() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("first", REMOTE, 10, "first"))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    // Model a process stop between this timeline commit and its targeted
+    // chat-list refresh.
+    store
+        .record_app_event(&chat("second", REMOTE, 20, "second"))
+        .unwrap();
+    store
+        .record_app_event(&chat("third", REMOTE, 30, "third"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 3);
+    {
+        let conn = store.lock().unwrap();
+        let dirty_messages: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_list_unread_dirty_messages
+                 WHERE group_id_hex = ?1",
+                params![GROUP],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty_messages, 0);
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    assert_eq!(row.unread_count, 3);
+    let conn = store.lock().unwrap();
+    let dirty: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chat_list_unread_dirty_messages",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dirty, 0);
+}
+
+#[test]
+fn targeted_refresh_leaves_other_groups_dirty_work_untouched() {
+    const OTHER_GROUP: &str = "22";
+    let mut other_group = group();
+    other_group.group_id_hex = OTHER_GROUP.to_owned();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, OTHER_GROUP, &no_mentions)
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let mut missed = chat("missed", REMOTE, 10, "other group");
+    missed.group_id_hex = OTHER_GROUP.to_owned();
+    store.record_app_event(&missed).unwrap();
+    store
+        .record_app_event(&chat("current", REMOTE, 20, "current group"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["current".to_owned()], &no_mentions)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+
+    let other_group_dirty: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM chat_list_unread_dirty_messages
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            params![OTHER_GROUP, "missed"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(other_group_dirty, 1);
+}
+
+#[test]
+fn targeted_refresh_requires_per_group_membership_readiness_after_upgrade() {
+    const SECOND_GROUP: &str = "22";
+    let mut other_group = group();
+    other_group.group_id_hex = SECOND_GROUP.to_owned();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, SECOND_GROUP, &mentions_local)
+        .unwrap();
+    let mut historical = chat_with_tags(
+        "h-old",
+        REMOTE,
+        10,
+        "historical mention",
+        vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+    );
+    historical.group_id_hex = SECOND_GROUP.to_owned();
+    store.record_app_event(&historical).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, SECOND_GROUP, &mentions_local)
+        .unwrap();
+
+    // Reproduce the post-migration state: old chat-list rows exist, but no
+    // group has had its membership projection seeded yet.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute("DELETE FROM chat_list_unread_messages", [])
+            .unwrap();
+        conn.execute("DELETE FROM chat_list_unread_ready_groups", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    store
+        .record_app_event(&chat("g-new", REMOTE, 20, "new in first group"))
+        .unwrap();
+    store
+        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["g-new".to_owned()], &mentions_local)
+        .unwrap();
+
+    let mut new_in_second = chat("h-new", REMOTE, 20, "new in second group");
+    new_in_second.group_id_hex = SECOND_GROUP.to_owned();
+    store.record_app_event(&new_in_second).unwrap();
+    let row = store
+        .refresh_chat_list_row_for_messages(
+            LOCAL,
+            SECOND_GROUP,
+            &["h-new".to_owned()],
+            &mentions_local,
+        )
+        .unwrap()
+        .expect("second chat row");
+    assert_eq!(row.unread_count, 2);
+    assert_eq!(row.unread_mention_count, 1);
+    assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("h-old"));
+}
+
+#[test]
 fn already_read_mention_does_not_count_as_unread_mention() {
     let store = setup_store();
     // A mention arrives, then the client reads it: it is before the read marker
@@ -3117,6 +3390,27 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
             params![GROUP],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let ready_groups: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_list_unread_ready_groups",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dirty_messages: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_list_unread_dirty_messages",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_groups, 1);
+        assert_eq!(dirty_messages, 0);
     }
 
     store.ensure_chat_list_rows(LOCAL, &mentions_local).unwrap();
@@ -3770,7 +4064,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn, LOCAL, &no_mentions).unwrap(),
+            chat_list_projection_complete_tx(&conn).unwrap(),
             "a pending leave request must not make the projection look stale"
         );
     }

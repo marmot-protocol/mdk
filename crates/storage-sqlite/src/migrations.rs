@@ -114,6 +114,8 @@ mod migration_0056_chat_list_accepted_activity_high_water;
 mod migration_0057_openmls_values_msgpack;
 #[path = "migrations/0058_processed_transport_ids.rs"]
 mod migration_0058_processed_transport_ids;
+#[path = "migrations/0059_chat_list_unread_membership.rs"]
+mod migration_0059_chat_list_unread_membership;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -418,6 +420,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 58,
         name: "0058_processed_transport_ids",
         apply: migration_0058_processed_transport_ids::apply,
+    },
+    Migration {
+        version: 59,
+        name: "0059_chat_list_unread_membership",
+        apply: migration_0059_chat_list_unread_membership::apply,
     },
 ];
 
@@ -946,7 +953,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 58,
+                found: 59,
                 latest_supported: 46,
             }
         ));
@@ -1002,7 +1009,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 58,
+                found: 59,
                 latest_supported: 46,
             }
         ));
@@ -1306,7 +1313,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 58,
+                found: 59,
                 latest_supported: 46,
             }
         ));
