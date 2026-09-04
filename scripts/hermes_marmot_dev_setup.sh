@@ -44,6 +44,10 @@ USAGE
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 hermes_ref_override="${HERMES_AGENT_REF:-}"
+hermes_ref_is_explicit=0
+if [ -n "$hermes_ref_override" ]; then
+    hermes_ref_is_explicit=1
+fi
 . "$repo_root/integrations/hermes/marmot/hermes-agent.lock"
 default_tmp="${TMPDIR:-/tmp}"
 dev_root="${HERMES_MARMOT_DEV_ROOT:-${default_tmp%/}/hermes-marmot-test}"
@@ -81,6 +85,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --hermes-ref)
             hermes_ref="$2"
+            hermes_ref_is_explicit=1
             shift 2
             ;;
         --install-pinned-wheel)
@@ -159,6 +164,11 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$install_pinned_wheel" -eq 1 ] && [ "$hermes_ref_is_explicit" -eq 1 ]; then
+    echo "error: --install-pinned-wheel cannot be combined with an explicit Hermes ref" >&2
+    exit 2
+fi
 
 dev_parent="$(dirname "$dev_root")"
 dev_base="$(basename "$dev_root")"
@@ -254,15 +264,19 @@ clone_hermes_repo() {
 }
 
 install_hermes() {
-    local install_target=".[all,dev]"
+    local install_args=(-e ".[all,dev]")
     if [ "$install_pinned_wheel" -eq 1 ]; then
         if [[ ! "$HERMES_AGENT_WHEEL_URL" =~ ^https://files\.pythonhosted\.org/ ]] \
             || [[ ! "$HERMES_AGENT_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "error: invalid pinned Hermes wheel URL or SHA-256" >&2
             exit 1
         fi
+        if [[ "$HERMES_AGENT_WHEEL_URL" != *"/hermes_agent-${HERMES_AGENT_VERSION}-"* ]]; then
+            echo "error: pinned Hermes wheel URL does not match HERMES_AGENT_VERSION" >&2
+            exit 1
+        fi
         mkdir -p "$hermes_repo"
-        install_target="hermes-agent[all,dev] @ ${HERMES_AGENT_WHEEL_URL}#sha256=${HERMES_AGENT_WHEEL_SHA256}"
+        install_args=("hermes-agent[all,dev] @ ${HERMES_AGENT_WHEEL_URL}#sha256=${HERMES_AGENT_WHEEL_SHA256}")
     else
         if [ ! -d "$hermes_repo/.git" ]; then
             clone_hermes_repo "$hermes_repo"
@@ -278,11 +292,7 @@ install_hermes() {
         (
             cd "$hermes_repo"
             uv venv .venv --python 3.11
-            if [ "$install_pinned_wheel" -eq 1 ]; then
-                uv pip install "$install_target"
-            else
-                uv pip install -e "$install_target"
-            fi
+            uv pip install "${install_args[@]}"
         )
         return 0
     fi
@@ -293,11 +303,7 @@ install_hermes() {
             python3.11 -m venv .venv
             . .venv/bin/activate
             python -m pip install --upgrade pip
-            if [ "$install_pinned_wheel" -eq 1 ]; then
-                python -m pip install "$install_target"
-            else
-                python -m pip install -e "$install_target"
-            fi
+            python -m pip install "${install_args[@]}"
         )
         return 0
     fi

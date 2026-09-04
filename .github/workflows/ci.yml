@@ -644,7 +644,7 @@ jobs:
           env -i HOME="$HOME" PATH="$PATH" USER="${USER:-runner}" \
             python3 -m unittest discover -s integrations/hermes/marmot/tests -v
 
-      - name: Prepare isolated Hermes checkout for authorization E2E
+      - name: Prepare isolated Hermes environment for authorization E2E
         run: |
           set -euo pipefail
           ./scripts/hermes_marmot_dev_setup.sh \
