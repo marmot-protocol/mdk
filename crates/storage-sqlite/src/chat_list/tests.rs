@@ -1102,6 +1102,109 @@ fn roster_change_invalidates_direct_peer_presentation_atomically() {
 }
 
 #[test]
+fn ensure_chat_list_rows_repairs_only_invalidated_direct_rows() {
+    const OTHER: &str = "cc";
+    const UNRELATED_GROUP: &str = "22";
+    const UNRELATED_SENTINEL_UPDATED_AT: i64 = 4_000_000_000;
+
+    let unrelated_group = || {
+        let mut unrelated = group();
+        unrelated.group_id_hex = UNRELATED_GROUP.to_owned();
+        unrelated.profile_name = "Unaffected group".to_owned();
+        unrelated
+    };
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct, unrelated_group()],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    store
+        .project_direct_peer_profile(
+            LOCAL,
+            &DirectPeerProfile {
+                peer_account_id_hex: REMOTE.to_owned(),
+                display_name: Some("Former Peer".to_owned()),
+                avatar_url: None,
+                profile_created_at: 42,
+            },
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET updated_at = ?2 WHERE group_id_hex = ?1",
+            params![UNRELATED_GROUP, UNRELATED_SENTINEL_UPDATED_AT],
+        )
+        .unwrap();
+    }
+
+    let mut changed_peer = group();
+    changed_peer.profile_name.clear();
+    changed_peer.member_count = Some(2);
+    changed_peer.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), OTHER.to_owned()]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![changed_peer, unrelated_group()],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("invalidated direct row")
+            .direct_peer_presentation
+            .expect("invalidated presentation")
+            .state,
+        DirectPeerPresentationState::Invalidated
+    );
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("repaired direct row")
+            .direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(OTHER.to_owned()),
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Absent,
+        })
+    );
+    assert_eq!(
+        store
+            .chat_list_row(UNRELATED_GROUP)
+            .unwrap()
+            .expect("unrelated row")
+            .updated_at,
+        u64::try_from(UNRELATED_SENTINEL_UPDATED_AT).unwrap(),
+        "repairing one invalidated Direct row must not rebuild unrelated rows"
+    );
+}
+
+#[test]
 fn ensure_chat_list_rows_backfills_direct_peer_presentation_after_upgrade() {
     let mut direct = group();
     direct.profile_name.clear();

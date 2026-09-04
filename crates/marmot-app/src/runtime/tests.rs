@@ -1895,9 +1895,9 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
     delayed_named_group.unread_count = 2;
     delayed_named_group.has_unread = true;
     runtime.publish_chat_list_projection_update(
-        account.account_id_hex,
-        account.label,
-        group_id_hex,
+        account.account_id_hex.clone(),
+        account.label.clone(),
+        group_id_hex.clone(),
         Some(delayed_named_group),
         ChatListUpdateTrigger::UnreadChanged,
     );
@@ -1922,6 +1922,41 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
                 })
         ),
         "a delayed named-group projection hid current peer presentation: {delayed:?}"
+    );
+
+    // An ordinary row can be the only carrier for an unread/preview update.
+    // If its presentation revalidation fails, deliver those semantic fields
+    // without replaying the captured (potentially cross-peer) presentation.
+    let RuntimeChatListUpdate::Row { row, .. } = delayed else {
+        panic!("expected the delayed ordinary row")
+    };
+    let mut lookup_failure_update = *row;
+    lookup_failure_update.unread_count = 3;
+    lookup_failure_update.has_unread = true;
+    app.account_storage(&account.label)
+        .unwrap()
+        .close()
+        .unwrap();
+    runtime.publish_chat_list_projection_update(
+        account.account_id_hex,
+        account.label,
+        group_id_hex,
+        Some(lookup_failure_update),
+        ChatListUpdateTrigger::UnreadChanged,
+    );
+    let lookup_failure = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+        .await
+        .expect("the ordinary projection change must survive a presentation lookup failure")
+        .expect("chat-list update");
+    assert!(
+        matches!(
+            &lookup_failure,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::UnreadChanged,
+                row,
+            } if row.unread_count == 3 && row.direct_peer_presentation.is_none()
+        ),
+        "a presentation lookup failure dropped or leaked presentation into the ordinary update: {lookup_failure:?}"
     );
 }
 

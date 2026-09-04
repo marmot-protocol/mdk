@@ -1467,7 +1467,7 @@ impl MarmotAppRuntime {
                         let app_for_lookup = app.clone();
                         let account_label_for_lookup = account_label.clone();
                         let group_id_hex_for_lookup = update.update.group_id_hex.clone();
-                        let current_presentation = match blocking_app_task(move || {
+                        match blocking_app_task(move || {
                             let storage =
                                 app_for_lookup.account_storage(&account_label_for_lookup)?;
                             let mut presentations = storage
@@ -1478,13 +1478,28 @@ impl MarmotAppRuntime {
                         })
                         .await
                         {
-                            Ok(presentation) => presentation,
-                            Err(_) => continue,
-                        };
-                        current_presentation.map(|current_presentation| {
-                            row.direct_peer_presentation = current_presentation;
-                            row
-                        })
+                            Ok(Some(current_presentation)) => {
+                                row.direct_peer_presentation = current_presentation;
+                                Some(row)
+                            }
+                            Ok(None) => None,
+                            Err(error) => {
+                                // Do not discard the ordinary projection event:
+                                // it may carry the only unread, preview, or
+                                // delivery-state update the subscriber sees.
+                                // The captured presentation can predate a roster
+                                // transition, so fail closed instead of replaying
+                                // that potentially cross-peer value.
+                                tracing::warn!(
+                                    target: "marmot_app::runtime",
+                                    method = "subscribe_chat_list",
+                                    error_kind = error.privacy_safe_kind(),
+                                    "emitting a chat-list projection update without direct-peer presentation after its current projection lookup failed"
+                                );
+                                row.direct_peer_presentation = None;
+                                Some(row)
+                            }
+                        }
                     } else {
                         None
                     };
