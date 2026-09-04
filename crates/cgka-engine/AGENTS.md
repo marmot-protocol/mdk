@@ -329,9 +329,13 @@ OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>
 ### Done — fork-resolution route unification (2026-08-06, supersedes ForkRecoveryManager 2026-05-04)
 
 Same-epoch rival commits are adjudicated by distributed convergence for every member — committer, observer, or
-restarted committer alike. The durable source-epoch anchor (`openmls-retained-anchor-{epoch}`, retained on every
-canonical advance) admits an in-horizon rival into the pass; own commits materialize from their commit-addressed
-checkpoints (#1285); a missing in-horizon anchor fails closed loudly, with ingest retaining and scheduling the
+restarted committer alike. The durable retained anchor (`openmls-retained-anchor-{epoch}`) admits an in-horizon rival
+into the pass. Anchors mark the epochs a device *stopped* at, not every epoch it passed through — a multi-commit
+convergence apply retains one at its start epoch and one at its final tip, because snapshots cannot nest inside the
+apply transaction — so the rewind base is `retained_anchor_rewind_base`: the **greatest** anchor at or below the fork
+epoch, within the horizon, with the already-applied commits between it and the fork replayed instead of skipped. Own
+commits materialize from their commit-addressed checkpoints (#1285); no anchor at or below an in-horizon fork fails
+closed loudly, with ingest retaining and scheduling the
 unadjudicable rival and the convergence coordinator issuing the durable `Unrecoverable` +
 `GroupEvent::GroupUnrecoverable` from the authenticated pass. The former pairwise fast-path (`ForkRecoveryManager`, `committed_from` routing,
 send/apply-time `fork-` snapshots, `GroupEvent::ForkRecovered`) is deleted. The deterministic ordering key

@@ -2609,11 +2609,14 @@ async fn restarted_committer_without_source_anchor_halts_through_convergence() {
     // is absent (pre-mechanism database, storage loss). The rival is then
     // unadjudicable: `has_retained_anchor_snapshot` refuses convergence
     // admission and no other resolution route exists.
-    // Within the rewind horizon that absence is abnormal by construction —
-    // every canonical advance retains a source-epoch anchor and pruning runs
-    // only beyond the horizon — so a durable, observable halt is the honest
-    // outcome: silently keeping our own (possibly losing) branch would be
-    // permanent divergence invisible to both the app and forensics.
+    // Within the rewind horizon that absence is abnormal: the device stopped
+    // at this epoch, so it anchored it, and pruning runs only beyond the
+    // horizon. A fork epoch the device merely *traversed* is a different
+    // shape, adjudicated from the anchor below it
+    // (`convergence_rewinds_to_greatest_anchor_at_or_below_traversed_fork_epoch`).
+    // With nothing at or below the fork, a durable, observable halt is the
+    // honest outcome: silently keeping our own (possibly losing) branch would
+    // be permanent divergence invisible to both the app and forensics.
     //
     // Ingest does not write that halt. It cannot honestly: it reaches this
     // decision through OpenMLS's `WrongEpoch` framing check, upstream of every

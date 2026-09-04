@@ -4387,6 +4387,167 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 }
 
+/// A rival forking from an epoch this device only *traversed* must still be
+/// adjudicated: the rewind base is the greatest retained anchor at or below the
+/// fork, not an anchor demanded at exactly the fork epoch.
+///
+/// Anchors exist only at the epochs a device *stopped* at. A multi-commit
+/// convergence apply retains one at its start epoch and one at its final tip
+/// (snapshots cannot nest inside the apply transaction), so every epoch in
+/// between is anchorless by construction on a device that caught up in one
+/// pass. Demanding an exact-epoch anchor turned that ordinary shape into a
+/// permanent `MissingRetainedAnchor` halt: the halt freezes the tip, so the
+/// drop horizon never advances past the rival and every later pass re-halts.
+#[tokio::test]
+async fn convergence_rewinds_to_greatest_anchor_at_or_below_traversed_fork_epoch() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+    let (mut frank, _frank_storage) = build_client(b"frank");
+    let (mut gina, _gina_storage) = build_client(b"gina");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "traversed-epoch-fork".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    // Bob is the deterministic tiebreak winner against Alice, so the rival
+    // forking from the traversed epoch is the branch convergence must adopt.
+    assert!(committer_wins(&bob.self_id(), &alice.self_id()));
+
+    // Alice builds the canonical chain 1 -> 2 -> 3 -> 4.
+    let mut alice_chain = Vec::new();
+    for invitee in [&mut david, &mut eve, &mut frank] {
+        let kp = invitee.fresh_key_package().await.unwrap();
+        let (commit, pending) = evolution(
+            alice
+                .send(SendIntent::Invite {
+                    group_id: group_id.clone(),
+                    key_packages: vec![kp],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap(),
+        );
+        alice.confirm_published(pending).await.unwrap();
+        alice_chain.push(route(commit, &group_id));
+    }
+
+    // Bob follows the chain to epoch 3, then forks there.
+    bob.buffer_openmls_convergence_message_at(&group_id, alice_chain[0].clone(), 1_000)
+        .unwrap();
+    bob.buffer_openmls_convergence_message_at(&group_id, alice_chain[1].clone(), 1_000)
+        .unwrap();
+    bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(3));
+    let gina_kp = gina.fresh_key_package().await.unwrap();
+    let (bob_rival, _bob_pending) = evolution(
+        bob.send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![gina_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap(),
+    );
+    let bob_rival = route(bob_rival, &group_id);
+
+    // Carol stops at epoch 2, so she anchors 1 and 2...
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, alice_chain[0].clone(), 1_000)
+        .expect("first chain commit buffered");
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("first chain commit applies");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    // ...then catches up 2 -> 3 -> 4 inside ONE convergence apply, which
+    // anchors only its start (2) and its final tip (4). Epoch 3 is traversed.
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, alice_chain[1].clone(), 2_000)
+        .expect("second chain commit buffered");
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, alice_chain[2].clone(), 2_000)
+        .expect("third chain commit buffered");
+    carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .expect("both chain commits apply in one pass");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(4));
+
+    let anchors = carol_storage.list_group_snapshots(&group_id).unwrap();
+    assert!(
+        anchors.contains(&"openmls-retained-anchor-2".to_string()),
+        "the multi-commit apply must anchor its start epoch, got {anchors:?}"
+    );
+    assert!(
+        !anchors.contains(&"openmls-retained-anchor-3".to_string()),
+        "the traversed epoch is anchorless by construction, got {anchors:?}"
+    );
+
+    // The rival forks from the traversed epoch 3, well inside the rewind
+    // horizon (tip 4, `max_rewind_commits` 5).
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, bob_rival.clone(), 4_000)
+        .expect("rival buffered");
+    let result = carol
+        .converge_stored_openmls_messages_at(&group_id, 5_000_000)
+        .expect("the rival is adjudicated from the anchor below the fork");
+
+    assert_eq!(
+        result.errors,
+        Vec::new(),
+        "an anchor at or below the fork epoch is enough to adjudicate"
+    );
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        !carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "an adjudicable fork must never halt the group"
+    );
+
+    // Carol rewound to the epoch-2 anchor, replayed the already-applied commit
+    // that carried her to the fork, and adopted the winning branch.
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(4));
+    assert_message_state(&carol_storage, &bob_rival, MessageState::Processed);
+    assert_message_state(
+        &carol_storage,
+        &alice_chain[2],
+        MessageState::ConvergenceDeferred,
+    );
+    let members = carol.members(&group_id).unwrap();
+    assert!(
+        members.iter().any(|member| member.id == gina.self_id()),
+        "the winning branch's added member must be live"
+    );
+    assert!(
+        !members.iter().any(|member| member.id == frank.self_id()),
+        "the losing branch's added member must be rolled back"
+    );
+}
+
 #[tokio::test]
 async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
     let (mut alice, storage) = build_client(b"alice");

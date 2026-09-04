@@ -1290,7 +1290,12 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
     }
 
     let historical_start_epoch = historical_replay_start_epoch(&commit_messages, current_epoch);
-    let replay_start_epoch = historical_start_epoch.unwrap_or(current_epoch);
+    let replay_start_epoch = match historical_start_epoch {
+        Some(fork_epoch) => {
+            retained_anchor_rewind_base(storage, group_id, fork_epoch, retained_anchor_epoch)?
+        }
+        None => current_epoch,
+    };
     let commit_messages: Vec<_> = if historical_start_epoch.is_some() {
         commit_messages
     } else {
@@ -1549,6 +1554,39 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
     append_missing_parent_deferred_commits(&mut result, path_result.unmaterialized_commit_ids);
     Ok(result)
+}
+
+/// The epoch a retained-anchor rewind can actually land on when replaying a fork
+/// at `fork_epoch`: the greatest retained anchor in `floor_epoch..=fork_epoch`.
+///
+/// Anchors exist only at the epochs a device *stopped* at. A convergence apply
+/// that traverses several commits retains one at its start epoch and one at its
+/// final tip — snapshots cannot nest inside the apply transaction — so every
+/// epoch it passed through is anchorless by construction. Demanding an anchor at
+/// exactly the fork epoch therefore halted an ordinary catch-up shape, and the
+/// halt froze the tip so the drop horizon never aged the rival out. Rewinding to
+/// the anchor below the fork and replaying the already-applied commits back up
+/// to it adjudicates the rival instead.
+///
+/// `floor_epoch` keeps the base inside the window whose commits are still
+/// available to replay. With no anchor in range this returns `fork_epoch`
+/// unchanged, so the caller's rollback still fails closed on
+/// `MissingRetainedAnchor` — the residual case of genuinely lost recovery
+/// material.
+fn retained_anchor_rewind_base<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    fork_epoch: u64,
+    floor_epoch: u64,
+) -> Result<u64, OpenMlsProjectionError> {
+    Ok(storage
+        .list_group_snapshots(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .iter()
+        .filter_map(|name| retained_anchor_epoch_from_snapshot_name(name))
+        .filter(|epoch| (floor_epoch..=fork_epoch).contains(epoch))
+        .max()
+        .unwrap_or(fork_epoch))
 }
 
 fn historical_replay_start_epoch(
@@ -2363,11 +2401,21 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
         checkpoint_realizable_own_commit_prefix(storage, result, &applied_prefix)?;
     let mut skipped_prefix = applied_prefix;
     skipped_prefix.extend(own_checkpoint_prefix.commit_ids.iter().cloned());
-    let apply_start_epoch = match own_checkpoint_prefix.realized.as_ref() {
+    let mut apply_start_epoch = match own_checkpoint_prefix.realized.as_ref() {
         Some(realized) => realized.resulting_epoch,
         None => apply_start_epoch_for_canonicalization_result(storage, result, &skipped_prefix)?
             .unwrap_or(current_epoch),
     };
+    // A checkpoint restore is addressed by commit, not by epoch, so only the
+    // anchor rewind needs a base that actually exists.
+    if own_checkpoint_prefix.realized.is_none() && apply_start_epoch < current_epoch {
+        (apply_start_epoch, skipped_prefix) = rebase_apply_onto_retained_anchor(
+            storage,
+            group_id,
+            skipped_prefix,
+            apply_start_epoch,
+        )?;
+    }
     // The own-checkpoint case must restore even when its epoch equals the live
     // tip: the live tip may be a different branch's state at that epoch.
     let rewind_to_retained_anchor = apply_start_epoch < current_epoch;
@@ -2611,6 +2659,41 @@ fn already_applied_commit_prefix<S: StorageProvider>(
         prefix.insert(commit_id.clone());
     }
     Ok(prefix)
+}
+
+/// Rebase a historical apply onto the retained anchor a rewind can restore.
+///
+/// The apply skips the selected branch's already-applied prefix and rewinds to
+/// the first new commit's source epoch, but that epoch may have been merely
+/// traversed by an earlier multi-commit apply and so carry no anchor (see
+/// [`retained_anchor_rewind_base`]). Un-skipping the prefix commits at or above
+/// the anchor below it restores a contiguous replay from a base that exists.
+///
+/// The prefix's own source epochs are the only eligible bases: rewinding below
+/// the branch root would leave the replay with no commit to apply against the
+/// restored state. With no anchor among them the fork epoch is returned
+/// unchanged and the rollback fails closed.
+fn rebase_apply_onto_retained_anchor<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    mut skipped_prefix: BTreeSet<String>,
+    fork_epoch: u64,
+) -> Result<(u64, BTreeSet<String>), OpenMlsProjectionError> {
+    let mut source_epochs = BTreeMap::new();
+    for commit_id in &skipped_prefix {
+        let record = storage
+            .get_message(&message_id_from_hex(commit_id)?)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        source_epochs.insert(commit_id.clone(), record.epoch.0);
+    }
+    let Some(&branch_root_epoch) = source_epochs.values().min() else {
+        return Ok((fork_epoch, skipped_prefix));
+    };
+    let base = retained_anchor_rewind_base(storage, group_id, fork_epoch, branch_root_epoch)?;
+    if base < fork_epoch {
+        skipped_prefix.retain(|commit_id| source_epochs[commit_id] < base);
+    }
+    Ok((base, skipped_prefix))
 }
 
 fn apply_start_epoch_for_canonicalization_result<S: StorageProvider>(

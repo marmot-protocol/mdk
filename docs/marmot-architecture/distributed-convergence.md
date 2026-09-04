@@ -67,15 +67,20 @@ Edges are discovered by replay. A v0.1 commit does not need an explicit parent p
 ## Retained Anchors
 
 The retained anchor is the oldest epoch from which the engine may rebuild a candidate branch. Implementations MUST
-retain epoch snapshots for the current tip and every epoch inside `max_rewind_commits`. They MUST prune older retained
-anchors as soon as stable canonicalization advances the current tip past the rewind window.
+retain an epoch snapshot for the current tip and MUST NOT prune one inside `max_rewind_commits`. They MUST prune older
+retained anchors as soon as stable canonicalization advances the current tip past the rewind window.
+
+An anchor is not retained at *every* in-window epoch: a snapshot is taken where a device stops, so a device that
+crossed several epochs in one apply holds anchors at that apply's start and tip and none for the epochs it traversed.
+The rewind base is therefore the **greatest retained anchor at or below the fork epoch**, inside the window; the
+already-applied commits between that anchor and the fork are replayed rather than skipped.
 
 Late commits are handled by their source epoch:
 
-- If the commit source epoch is at or after the retained anchor, the engine may roll back to that retained snapshot,
-  replay candidate paths, and select the canonical branch.
-- If the required retained snapshot is missing, canonicalization returns `MissingRetainedAnchor` and leaves group state
-  and message state unchanged.
+- If the commit source epoch is at or after the retained anchor, the engine may roll back to the rewind base for that
+  source epoch, replay candidate paths, and select the canonical branch.
+- If no retained snapshot at or below the source epoch survives inside the window, canonicalization returns
+  `MissingRetainedAnchor` and leaves group state and message state unchanged.
 - If the commit source epoch is older than the retained anchor, the commit is dropped with `BeyondAnchor` and persisted
   as invalidated.
 
