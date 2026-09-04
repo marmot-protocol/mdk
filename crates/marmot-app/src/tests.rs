@@ -12796,6 +12796,71 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     );
 }
 
+/// A departure that takes this device out of the group is terminal for its
+/// copy, exactly as a disband is terminal for everyone's, so both must mark
+/// transport routes dirty. The ingest seam keys the pre-refresh projection save
+/// off that flag, and the convergence and checkpoint seams key their
+/// subscription refresh off it, so a self-departure that leaves it clear defers
+/// its own route teardown to whatever runs next. A peer's departure changes no
+/// routing for this device.
+#[tokio::test]
+async fn a_self_departure_marks_transport_routes_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://routes-dirty.example")
+        .with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("routes dirty", &[]).await.unwrap();
+    let departure = |change| cgka_traits::engine::GroupEvent::GroupStateChanged {
+        group_id: group_id.clone(),
+        epoch: cgka_traits::EpochId(1),
+        actor: None,
+        change,
+        origin_commit_id: None,
+    };
+    let member = |account_id_hex: &str| MemberId::new(hex::decode(account_id_hex).unwrap());
+    let peer = nostr::Keys::generate().public_key().to_hex();
+    let local = account.account_id_hex.as_str();
+    let mut summary = SyncSummary::default();
+
+    for (label, change) in [
+        (
+            "an eviction",
+            cgka_traits::engine::GroupStateChange::MemberRemoved {
+                member: member(local),
+            },
+        ),
+        (
+            "a voluntary leave",
+            cgka_traits::engine::GroupStateChange::MemberLeft {
+                member: member(local),
+            },
+        ),
+    ] {
+        assert!(
+            client
+                .observe_event_projection_effects(&departure(change), local, &mut summary)
+                .unwrap(),
+            "{label} that removes this device must mark transport routes dirty"
+        );
+    }
+    assert!(
+        !client
+            .observe_event_projection_effects(
+                &departure(cgka_traits::engine::GroupStateChange::MemberRemoved {
+                    member: member(&peer),
+                }),
+                local,
+                &mut summary,
+            )
+            .unwrap(),
+        "a peer's departure must not disturb this device's routing"
+    );
+}
+
 /// A terminal group never advertises notification destinations again. The
 /// inbound seam queues the current registration's removal and discards every
 /// cached peer token; hydration re-emits a stored group's `GroupDisbanded`
@@ -13857,6 +13922,300 @@ fn reopening_account_restores_current_and_prior_group_routes() {
             .map(|route| route.transport_group_id.clone())
             .collect::<HashSet<_>>(),
         HashSet::from([vec![0x11; 32], vec![0x22; 32]])
+    );
+}
+
+/// Relay subscriptions taken out for one group, across every account. Growth
+/// after a device is removed is the field symptom: a departed device that keeps
+/// re-publishing the group's Nostr subscription on every route refresh.
+fn group_subscriptions(relay: &ScriptedPushRelayClient, group_id: &GroupId) -> usize {
+    relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|subscription| {
+            matches!(
+                subscription,
+                NostrSubscription::Group { group_id: subscribed, .. } if subscribed == group_id
+            )
+        })
+        .count()
+}
+
+/// Live group routes this client would (re-)subscribe on the next refresh.
+fn installed_group_routes(client: &AppClient, group_id: &GroupId) -> usize {
+    client
+        .routing
+        .snapshot()
+        .group_routes
+        .iter()
+        .filter(|route| &route.group_id == group_id)
+        .count()
+}
+
+/// A realized voluntary leave must stop routing, exactly as an eviction does.
+///
+/// A voluntary leave and an eviction may be recorded with either app
+/// membership label — attribution depends on which seam realizes the
+/// departure — but the engine sets the same terminal `Group::removed` marker
+/// for both. Routing must therefore key off that one marker, never off the
+/// app projection.
+#[tokio::test]
+async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group("leaving for good", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "bob must join before he leaves"
+    );
+
+    // Bob publishes the SelfRemove proposal; the admin auto-commits it; bob
+    // folds that commit through convergence and realizes his own departure.
+    bob_client.leave_group(&group_id).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bob_client.runtime.group_record(&group_id).unwrap().removed {
+        alice.sync().await.unwrap();
+        alice.retry_group_convergence(&group_id).await.unwrap();
+        bob_client.sync().await.unwrap();
+        bob_client
+            .advance_convergence_after_runtime_sync(&group_id)
+            .await
+            .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bob's leave was never committed and realized within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(bob_client);
+    let reopened = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        installed_group_routes(&reopened, &group_id),
+        0,
+        "account open must not reseed the route of a group this device has left"
+    );
+}
+
+/// A leave request is not a departure yet.
+///
+/// `leave_group` publishes a SelfRemove proposal and records the voluntary
+/// `Left` membership immediately, but this device stays in the MLS group until
+/// someone commits that proposal. Observing that commit — and re-proposing the
+/// leave into a newer epoch when an unrelated commit lands first — needs the
+/// group's transport route, so account open must keep seeding it while the
+/// engine's own terminal marker is still clear.
+#[tokio::test]
+async fn a_pending_leave_request_keeps_its_group_route_across_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group("leaving", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "bob must join before he asks to leave"
+    );
+
+    bob_client.leave_group(&group_id).await.unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("bob", &hex::encode(group_id.as_slice()))
+            .unwrap(),
+        Some(SelfMembership::Left),
+        "the leave request records the voluntary departure up front"
+    );
+    assert!(
+        !bob_client.runtime.group_record(&group_id).unwrap().removed,
+        "nobody has committed the leave yet, so the copy is not terminal"
+    );
+
+    drop(bob_client);
+    let reopened = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    assert!(
+        installed_group_routes(&reopened, &group_id) > 0,
+        "a device waiting for its leave to be committed must keep listening"
+    );
+}
+
+/// A device an admin removed must stop routing for the group.
+///
+/// A removed device was observed re-publishing the group's Nostr subscription
+/// on every route refresh for a day, then persisting one failed inbound row
+/// per message because its OpenMLS group was inactive. `refresh_group_routes`
+/// tore routes down for a disband tombstone only, so the removal — durable on
+/// the engine's `Group::removed` marker — never reached routing.
+///
+/// The kept group is the negative space: the same refresh must not disturb a
+/// group this device is still a member of.
+#[tokio::test]
+async fn an_admin_removal_clears_the_removed_devices_group_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    // One shared plane so alice's publishes fan out into bob's routes.
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    // Register bob's inbox route before the welcomes publish.
+    bob_client.sync().await.unwrap();
+
+    let removed_group = alice
+        .create_group("removal target", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let kept_group = alice
+        .create_group("still a member", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let joined = bob_client.sync().await.unwrap().joined_groups;
+    assert!(
+        joined.contains(&removed_group) && joined.contains(&kept_group),
+        "bob must join both groups before the removal commit"
+    );
+    assert!(
+        installed_group_routes(&bob_client, &removed_group) > 0,
+        "a joined group must be routed"
+    );
+
+    let subscriptions_before_removal = group_subscriptions(&relay, &removed_group);
+
+    alice
+        .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    // The runtime's dominant receive path. The removal commit lands in the
+    // same epoch bob still holds, so the engine buffers it for distributed
+    // convergence instead of applying it inline.
+    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+        .await
+        .expect("the removal commit must fan out to bob's group route")
+        .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        panic!("the test did not overflow its account delivery queue");
+    };
+    bob_client
+        .ingest_received_delivery(*delivery)
+        .await
+        .unwrap();
+    // The scheduled-convergence path the account worker drives. This is the
+    // field case: the removal was adopted through convergence, not inline.
+    // Adoption cannot freeze until the settlement quiescence window closes, so
+    // poll it the way the runtime's own convergence tests do.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bob_client
+        .runtime
+        .group_record(&removed_group)
+        .unwrap()
+        .removed
+    {
+        bob_client
+            .advance_convergence_after_runtime_sync(&removed_group)
+            .await
+            .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "convergence did not adopt the removal commit within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        installed_group_routes(&bob_client, &removed_group),
+        0,
+        "a removed device must not keep routing for the group it was removed from"
+    );
+    assert!(
+        installed_group_routes(&bob_client, &kept_group) > 0,
+        "the same refresh must keep routes for a group this device is still in"
+    );
+
+    drop(bob_client);
+    let reopened = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        installed_group_routes(&reopened, &removed_group),
+        0,
+        "account open must not reinstall the removed group's route"
+    );
+    assert!(
+        installed_group_routes(&reopened, &kept_group) > 0,
+        "account open must still seed routes for live groups"
+    );
+    // Only bob touches routing from the removal onwards, so any new
+    // subscription for this group is his.
+    assert_eq!(
+        group_subscriptions(&relay, &removed_group),
+        subscriptions_before_removal,
+        "a removed device must never re-publish the group's Nostr subscription"
     );
 }
 
