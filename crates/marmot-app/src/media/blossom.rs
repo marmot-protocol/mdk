@@ -951,12 +951,6 @@ async fn read_limited_blossom_body_until(
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
     {
-        record_download_phase(
-            telemetry,
-            AppPerformanceOperation::MediaDownloadBodyTransfer,
-            Instant::now(),
-            false,
-        );
         return Err(AppError::BlobStore(format!(
             "download exceeds {max_bytes} bytes"
         )));

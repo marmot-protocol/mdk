@@ -12,7 +12,8 @@ use url::Url;
 
 use super::blossom::{
     BlossomHttpTransport, DnsResolver, MAX_BLOSSOM_DESCRIPTOR_BYTES,
-    MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_transport, read_limited_blossom_body,
+    MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_observer,
+    fetch_blossom_blob_with_transport, read_limited_blossom_body,
 };
 use super::host_safety::validate_blossom_fetch_url;
 
@@ -1963,6 +1964,29 @@ async fn fetch_blossom_blob_rejects_oversized_content_length() {
     let err = fetch_blossom_blob(&url, true).await.unwrap_err();
 
     assert!(err.to_string().contains("download exceeds"));
+}
+
+/// Rejecting a declared oversized body happens before transfer and must not
+/// contribute an artificial zero-duration sample to the transfer histogram.
+#[tokio::test]
+async fn oversized_content_length_does_not_record_body_transfer_timing() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let url = format!("{server}/{}.bin", valid_hash());
+    let transport = BlossomHttpTransport::new(true);
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+
+    let err = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
+        .await
+        .expect_err("oversized declared bodies must be rejected");
+
+    assert!(err.to_string().contains("download exceeds"));
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.media_download_response_headers.attempts, 1);
+    assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
 }
 
 #[tokio::test]
