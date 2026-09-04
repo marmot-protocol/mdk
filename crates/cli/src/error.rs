@@ -98,7 +98,7 @@ pub(crate) enum WnError {
         source: std::io::Error,
     },
     #[error(
-        "QUIC candidate {candidate} resolved to a local/private endpoint {addr}; pass --insecure-local to allow local endpoints"
+        "QUIC candidate {candidate} resolved to a non-public endpoint {addr}; --insecure-local permits loopback endpoints only"
     )]
     UnsafeQuicCandidateEndpoint { candidate: String, addr: SocketAddr },
     #[error("transcript hash must be 32 bytes, got {0}")]

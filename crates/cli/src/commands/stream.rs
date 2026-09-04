@@ -1,9 +1,9 @@
 //! `stream` command namespace handlers (QUIC agent text stream previews) and stream helpers.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use cgka_traits::app_components::is_public_ip;
+use cgka_traits::app_components::{is_loopback_candidate_host, reject_non_public_socket_addr};
 use cgka_traits::app_event::{STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_TAG};
 use cgka_traits::{GroupId, MessageId};
 use marmot_account::AccountHome;
@@ -738,12 +738,11 @@ pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidat
 /// Resolve a sender-provided `quic://` candidate to a socket address.
 ///
 /// Sender-controlled candidates must not be able to steer the client into
-/// connecting to loopback, private, link-local, ULA, multicast, unspecified, or
-/// broadcast endpoints (SSRF). When `allow_local_endpoint` is false, any resolved
-/// address that is not a safe public unicast address is rejected. The local user
-/// only opts into local endpoints via explicit `--insecure-local`, which sets
-/// `allow_local_endpoint` to true; loopback enforcement for the actual trust mode
-/// still happens in `broker_trust` / `stream_trust`.
+/// connecting to private, link-local, CGNAT, ULA, multicast, unspecified, or
+/// broadcast endpoints (SSRF). Every resolved address passes through the shared
+/// host-safety gate. Explicit `--insecure-local` permits loopback only; every
+/// other non-public address remains rejected. The returned address is the same
+/// address the QUIC endpoint dials, so validation and connection cannot diverge.
 pub(crate) async fn resolve_quic_candidate_addr(
     candidate: &ParsedQuicCandidate,
     allow_local_endpoint: bool,
@@ -757,21 +756,13 @@ pub(crate) async fn resolve_quic_candidate_addr(
     let addr = addrs
         .next()
         .ok_or_else(|| WnError::InvalidQuicCandidate(candidate.original.clone()))?;
-    if !allow_local_endpoint && socket_addr_is_unsafe(addr) {
-        return Err(WnError::UnsafeQuicCandidateEndpoint {
+    reject_non_public_socket_addr(addr, allow_local_endpoint).map_err(|_| {
+        WnError::UnsafeQuicCandidateEndpoint {
             candidate: candidate.original.clone(),
             addr,
-        });
-    }
+        }
+    })?;
     Ok(addr)
-}
-
-/// Whether a resolved candidate address must never be reached from a
-/// sender-controlled `quic://` candidate without explicit local opt-in. Delegates
-/// to the canonical Marmot host-safety classifier so QUIC candidate filtering
-/// cannot drift from the shared SSRF hardening rules.
-fn socket_addr_is_unsafe(addr: SocketAddr) -> bool {
-    !is_public_ip(addr.ip())
 }
 
 pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
@@ -789,12 +780,7 @@ pub(crate) fn quic_candidate_host(candidate: &str) -> Option<String> {
 }
 
 fn quic_host_is_loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    is_loopback_candidate_host(host)
 }
 
 fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], WnError> {

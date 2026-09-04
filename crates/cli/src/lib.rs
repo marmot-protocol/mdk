@@ -1960,6 +1960,26 @@ mod tests {
         assert!(addr.ip().is_loopback());
     }
 
+    #[tokio::test]
+    async fn resolve_quic_candidate_rejects_non_loopback_endpoints_with_opt_in() {
+        // `--insecure-local` is a loopback-only development escape hatch. It
+        // must not let a sender steer QUIC at other non-public network ranges.
+        for candidate in [
+            "quic://10.0.0.1:4450",        // RFC1918 private
+            "quic://100.64.0.1:4450",      // shared address space
+            "quic://169.254.169.254:4450", // link-local cloud metadata
+            "quic://[fd00::1]:4450",       // IPv6 unique-local (ULA)
+            "quic://[fe80::1]:4450",       // IPv6 unicast link-local
+        ] {
+            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
+            let result = resolve_quic_candidate_addr(&parsed, true).await;
+            assert!(
+                matches!(result, Err(WnError::UnsafeQuicCandidateEndpoint { .. })),
+                "expected {candidate} to remain rejected with opt-in, got {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn candidate_trust_rejects_conflicting_insecure_and_certificate_flags() {
         let result = broker_trust_for_candidate(

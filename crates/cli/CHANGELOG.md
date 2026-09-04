@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Sender-provided QUIC stream candidates cannot use `--insecure-local` to dial
+  private, link-local, CGNAT, ULA, or other non-public network ranges. The
+  explicit development opt-in now permits loopback endpoints only.
+
 ## [0.9.17] - 2026-09-02
 
 ### Changed
