@@ -28,7 +28,6 @@ openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 tls_codec = { workspace = true, features = ["derive", "std"] }
 async-trait.workspace = true
-futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
@@ -44,10 +43,11 @@ sha2.workspace = true
 # enabling the `schnorr` feature here pulls in BIP-340 x-only point validation.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tokio = { workspace = true, features = ["time"] }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+futures.workspace = true
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
@@ -65,6 +65,7 @@ sha2.workspace = true
 # binding uses, so engine visibility in tests matches production.
 chacha20poly1305.workspace = true
 criterion.workspace = true
+futures.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
