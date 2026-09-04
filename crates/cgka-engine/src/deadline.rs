@@ -3,7 +3,7 @@ use std::{future::Future, time::Duration};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeadlineElapsed;
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 fn browser_timeout_milliseconds(duration: Duration) -> u32 {
     // Browser timers accept integer milliseconds. Round a fractional
     // millisecond up so conversion never expires a nonzero budget early, then
@@ -15,7 +15,7 @@ fn browser_timeout_milliseconds(duration: Duration) -> u32 {
         .min(i32::MAX as u128) as u32
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 async fn browser_timeout_with_timer<F, T>(
     operation: F,
     timer: T,
@@ -38,7 +38,7 @@ where
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, DeadlineElapsed>
 where
     F: Future,
@@ -48,7 +48,7 @@ where
         .map_err(|_| DeadlineElapsed)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, DeadlineElapsed>
 where
     F: Future,
