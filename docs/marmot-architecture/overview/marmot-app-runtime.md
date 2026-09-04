@@ -193,30 +193,13 @@ events back to clients.
 Daemon responsibilities stay narrow: process lifecycle, socket protocol, request routing, and stream fanout.
 
 MDK currently has two local Unix-socket protocols. They both use newline-terminated JSON and deliberately bounded
-inbound messages, but they serve different trust boundaries and are not wire-compatible:
+inbound messages, but they are not wire-compatible. `wnd` exposes MDK's internal CLI command shape, while `wn-agent`
+exposes the versioned, typed `marmot.agent-control.v2` integration protocol.
 
-| Property | `wnd` CLI daemon protocol | `wn-agent` agent-control protocol |
-| --- | --- | --- |
-| Consumer | MDK's own CLI and TUI | Local agent integrations |
-| Wire model | Internal `DaemonRequest` variants carrying the CLI command shape | Stable, typed request/response/event DTOs inside `marmot.agent-control.v2` envelopes |
-| Correlation and versioning | No request id or explicit protocol version | Optional correlation id, an explicit protocol label, and request-id idempotency for stream begin |
-| Authorization | Owner-only socket plus same-UID peer checks | Same-UID peer checks by default, or an explicitly configured full-control bearer token |
-| Errors | CLI output envelopes; no protocol-wide retryability field | Typed error responses with an explicit, fail-closed `retryable` field |
-| Size boundary | 1 MiB cap on each inbound daemon request; responses do not yet have a symmetric protocol cap | 1 MiB per-frame cap in the shared agent-control codec |
-| Sensitive input buffers | Request assembly and decoded request bytes use zeroizing buffers; buffered read-ahead is not guaranteed to be erased | The generic frame codec uses ordinary byte buffers |
-
-Both servers accept one request per connection. A non-streaming `wnd` client reads its response to EOF, while its
-subscription clients read newline-delimited stream records until `stream_end` or EOF. Agent control returns a typed
-response envelope or keeps an inbound-subscription connection open for typed event envelopes; the envelope id is
-echoed on those responses and events.
-
-The similar newline framing is an implementation pattern, not a shared semantic contract. A future consolidation
-should therefore be limited to a small framing primitive that can enforce a caller-selected payload cap, distinguish
-clean EOF from an incomplete frame, and optionally erase its input buffer. Protocol versioning, DTOs, request ids,
-authorization, retry semantics, connection lifetime, and response framing should remain owned by their respective
-protocols. Until such a primitive preserves the CLI daemon's zeroization requirement and adds a symmetric response
-bound, replacing its reader directly with the generic agent-control codec would be a regression rather than a useful
-deduplication.
+Their shared framing pattern is not a shared semantic contract. Any future framing reuse must preserve the CLI
+daemon's stronger request-buffer erasure while leaving versioning, authorization, correlation, retry, and connection
+semantics protocol-owned. See [Local Daemon Protocol Boundaries](../further-context/local-daemon-protocol-boundaries.md)
+for the full comparison and consolidation constraints.
 
 ## CLI And TUI Boundary
 

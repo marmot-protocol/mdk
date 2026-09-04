@@ -52,26 +52,13 @@ The current app-core concepts are:
 
 ## Local SQLite Layout
 
-For `N` active signing accounts whose stores have been opened, the current layout has up to `2N + 1` SQLite files:
+For `N` active signing accounts whose stores have been opened, the current layout has up to `2N + 1` SQLite files: an
+authoritative SQLCipher `session.sqlite` and a derived SQLCipher `app-cache.sqlite3` per account, plus the
+installation-wide `shared.sqlite3` public-directory and settings store.
 
-| Path | Encryption and scope | Authority and recovery contract |
-| --- | --- | --- |
-| `accounts/<label>/session.sqlite` | Per-account SQLCipher | Contains authoritative protocol and recovery state plus durable app projections. It is not disposable and uses the numbered `cgka_schema_migrations` history described by [Storage Format V2](../storage-format-v2.md). |
-| `accounts/<label>/app-cache.sqlite3` | Per-account SQLCipher | Derived account-private Nostr directory and bounded search state. It can be reconstructed from `AccountHome` plus the Nostr network, but ordinary upgrades should preserve and migrate it so offline directory behavior and discovery provenance are not discarded. |
-| `shared.sqlite3` | Installation-wide plaintext SQLite, created owner-only | Its sanitized public-directory rows are reconstructible cache data. Its telemetry/audit settings and telemetry installation id are durable installation state and must not be silently discarded with the cache. |
-
-Directory writes mirror the public subset into `shared.sqlite3` and the richer record into each active account cache.
-Reads reconcile independently timestamped components from both tiers. Those cross-database writes are not one atomic
-transaction, so neither directory tier is an authoritative protocol-state boundary. A read alone does not repair a
-partial mirror; a later successful save of that directory record reconciles it.
-
-The root-level `app-cache.sqlite3` is a legacy plaintext directory location that is imported and removed. Likewise,
-`accounts/<label>/app.sqlite3` is a legacy projection database imported once into `session.sqlite`; neither is a fourth
-current store.
-
-Only `session.sqlite` currently has a numbered migration ledger and future-schema refusal. The two auxiliary stores
-initialize their current tables independently and must receive their own version histories before either schema makes
-a non-additive change. A session migration version must never be treated as the version of either cache.
+Only the session database currently has a numbered migration ledger. The auxiliary stores need independent migration
+histories before non-additive schema changes. Their authority, reconciliation, durability, and legacy-import contracts
+are detailed in [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
 
 ## CLI Contract
 
