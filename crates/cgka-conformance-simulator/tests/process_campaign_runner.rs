@@ -59,6 +59,11 @@ fn isolated_campaign_preserves_input_provenance_and_refuses_overwrite() {
     assert_eq!(summary["family"], "send-leave/v1");
     assert_eq!(summary["storage"], "memory");
     assert_eq!(summary["case_timeout_ms"], 60_000);
+    assert_eq!(summary["minimization_wall_time_ms"], 30_000);
+    assert_eq!(summary["minimization_max_trials"], 256);
+    assert_eq!(summary["minimization_trial_timeout_ms"], 5_000);
+    assert_eq!(summary["cases"][0]["minimization_status"], "skipped");
+    assert!(summary["cases"][0].get("timeout_phase").is_none());
     assert_eq!(
         summary["cases"][0]["artifact_integrity_errors"],
         serde_json::json!([])

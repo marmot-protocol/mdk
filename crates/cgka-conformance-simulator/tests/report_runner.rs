@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use cgka_conformance_simulator::{
     FailureCapsuleSensitivity, GeneratedScenarioCase, GeneratedScenarioInputV1,
-    GeneratedSubjectKind, HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand,
-    ReportInput, ScenarioSpec, ScenarioStep, ScenarioStimulus, parse_report_command,
+    GeneratedScenarioMinimizationBudget, GeneratedScenarioMinimizationStatus, GeneratedSubjectKind,
+    HarnessStorageMode, OracleBehavior, ReportArgs, ReportCommand, ReportInput, ScenarioReport,
+    ScenarioSpec, ScenarioStep, ScenarioStimulus, TraceExpectation, parse_report_command,
     promote_failure_capsule_to_vector, property_test_coverage_entries, read_failure_capsule,
     replay_engine_bytes, run_report,
 };
@@ -24,6 +25,7 @@ fn parse_defaults_to_send_leave_family() {
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
             capture_sensitive_replay: false,
+            minimization_budget: Default::default(),
         })
     );
 }
@@ -54,6 +56,7 @@ fn parse_custom_report_args() {
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
             capture_sensitive_replay: false,
+            minimization_budget: Default::default(),
         })
     );
 }
@@ -66,6 +69,42 @@ fn explicit_storage_flag_overrides_environment_default() {
         panic!("expected run command");
     };
     assert_eq!(args.storage_mode, HarnessStorageMode::TempFileBackedSqlite);
+}
+
+#[test]
+fn generated_report_minimization_budgets_are_configurable() {
+    let ReportCommand::Run(args) = parse_report_command([
+        "--minimization-wall-time-secs".into(),
+        "17".into(),
+        "--minimization-max-trials".into(),
+        "23".into(),
+        "--minimization-trial-timeout-secs".into(),
+        "3".into(),
+    ])
+    .expect("minimization budgets parse") else {
+        panic!("expected run command");
+    };
+    assert_eq!(
+        args.minimization_budget,
+        GeneratedScenarioMinimizationBudget {
+            wall_clock: std::time::Duration::from_secs(17),
+            max_trials: 23,
+            per_trial_timeout: std::time::Duration::from_secs(3),
+        }
+    );
+}
+
+#[test]
+fn generated_report_rejects_zero_minimization_budgets() {
+    for flag in [
+        "--minimization-wall-time-secs",
+        "--minimization-max-trials",
+        "--minimization-trial-timeout-secs",
+    ] {
+        let error = parse_report_command([flag.into(), "0".into()])
+            .expect_err("zero minimization budgets must fail");
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
 }
 
 #[test]
@@ -98,6 +137,7 @@ fn parse_vector_fixture_report_args() {
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
             capture_sensitive_replay: false,
+            minimization_budget: Default::default(),
         })
     );
 }
@@ -130,6 +170,7 @@ fn parse_generated_input_report_args() {
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
             capture_sensitive_replay: false,
+            minimization_budget: Default::default(),
         })
     );
 }
@@ -205,6 +246,7 @@ async fn adapter_override_uses_distinct_artifacts_without_minting_a_fixture() {
             strict_oracle: false,
             storage_mode: HarnessStorageMode::InMemorySqlite,
             capture_sensitive_replay: false,
+            minimization_budget: Default::default(),
         })
         .await
         .unwrap();
@@ -241,6 +283,7 @@ fn parse_strict_oracle_report_args() {
             strict_oracle: true,
             storage_mode: HarnessStorageMode::InMemorySqlite,
             capture_sensitive_replay: false,
+            minimization_budget: Default::default(),
         })
     );
 }
@@ -358,6 +401,7 @@ async fn report_runner_writes_send_leave_json_reports() {
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("runner writes reports");
@@ -408,6 +452,134 @@ async fn report_runner_writes_send_leave_json_reports() {
 }
 
 #[tokio::test]
+async fn minimization_budget_exhaustion_preserves_the_original_failure_artifacts() {
+    let root = tempfile::tempdir().expect("temporary report root");
+    let input_path = root.path().join("generated-input.json");
+    let out = root.path().join("reports");
+    let case = GeneratedScenarioCase {
+        family_name: "minimization-budget/v1".into(),
+        generator_version: "1".into(),
+        seed: 17,
+        case_index: 0,
+        workload_profile: None,
+        subject: GeneratedSubjectKind::Engine,
+        scenario: ScenarioSpec {
+            name: "minimization-budget/v1/case-0".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into()],
+            steps: vec![
+                ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "budgeted".into(),
+                    invitees: Vec::new(),
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".into(),
+                },
+                ScenarioStep::SetPartition {
+                    allow: vec!["alice".into()],
+                },
+                ScenarioStep::ClearPartition,
+                ScenarioStep::Observe {
+                    clients: vec!["alice".into()],
+                },
+            ],
+        },
+        expected_outcomes: vec![TraceExpectation::ClientState {
+            client: "alice".into(),
+            epoch: 1,
+            member_count: 99,
+            received_payloads: None,
+            added_members: None,
+            removed_members: None,
+        }],
+    };
+    fs_private::write_private(
+        &input_path,
+        &serde_json::to_vec_pretty(&GeneratedScenarioInputV1::new(case))
+            .expect("generated input serializes"),
+    )
+    .expect("generated input writes");
+
+    let summary = run_report(&ReportArgs {
+        input: ReportInput::GeneratedInputs {
+            paths: vec![input_path],
+            adapter: None,
+        },
+        out: out.clone(),
+        strict_oracle: true,
+        storage_mode: HarnessStorageMode::InMemorySqlite,
+        capture_sensitive_replay: false,
+        minimization_budget: GeneratedScenarioMinimizationBudget {
+            wall_clock: std::time::Duration::from_secs(1),
+            max_trials: 1,
+            per_trial_timeout: std::time::Duration::from_secs(1),
+        },
+    })
+    .await
+    .expect("budget exhaustion remains a reportable failure");
+
+    assert_eq!(summary.failed(), 1);
+    let stem = "minimization-budget-v1-seed-17-case-0";
+    let report_path = out.join(format!("{stem}.json"));
+    let fixture_path = out.join(format!("{stem}-fixture.v1.json"));
+    let capsule_path = out.join(format!("{stem}-failure-capsule.v1.json"));
+    assert!(
+        fixture_path.is_file(),
+        "the original fixture remains durable"
+    );
+    let report: ScenarioReport = serde_json::from_slice(
+        &fs::read(&report_path).expect("the original report remains durable"),
+    )
+    .expect("the report remains parseable");
+    let generated = report
+        .metadata
+        .generated
+        .as_ref()
+        .expect("generated metadata exists");
+    assert_eq!(
+        generated.minimization.status,
+        GeneratedScenarioMinimizationStatus::BudgetExhausted
+    );
+    assert_eq!(generated.minimization.trials, 1);
+    assert!(generated.minimized_case.is_none());
+    assert!(
+        report
+            .expectation_failures
+            .iter()
+            .any(|failure| failure.kind == "client_state_mismatch"),
+        "unexpected original failures: {:?}; steps: {:?}",
+        report.expectation_failures,
+        report.step_log
+    );
+
+    let capsule = read_failure_capsule(&capsule_path).expect("portable capsule remains readable");
+    assert_eq!(
+        capsule.sensitivity,
+        FailureCapsuleSensitivity::SyntheticShareable
+    );
+    assert!(
+        capsule
+            .report
+            .expectation_failures
+            .iter()
+            .any(|failure| failure.kind == "client_state_mismatch")
+    );
+    assert_eq!(
+        capsule
+            .report
+            .metadata
+            .generated
+            .as_ref()
+            .expect("capsule generated metadata")
+            .minimization
+            .status,
+        GeneratedScenarioMinimizationStatus::BudgetExhausted
+    );
+}
+
+#[tokio::test]
 async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
     let out_dir = std::env::temp_dir().join(format!(
         "mdk-cgka-strict-oracle-report-test-{}",
@@ -441,6 +613,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
         strict_oracle: true,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("strict runner writes reports");
@@ -490,6 +663,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("runner writes convergence delivery reports");
@@ -544,6 +718,7 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("runner writes convergence chaos reports");
@@ -636,6 +811,7 @@ async fn report_runner_writes_vector_fixture_reports_and_summary() {
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("runner writes vector reports");
@@ -698,6 +874,7 @@ async fn failed_campaign_capsule_contains_a_replayable_tick_witness() {
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: true,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("failing campaign reports");
@@ -841,6 +1018,7 @@ async fn refused_application_send_fails_step_without_aborting_the_run() {
         strict_oracle: false,
         storage_mode: HarnessStorageMode::InMemorySqlite,
         capture_sensitive_replay: false,
+        minimization_budget: Default::default(),
     })
     .await
     .expect("runner completes despite the refused send");

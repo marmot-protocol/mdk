@@ -960,10 +960,21 @@ These tests keep the simulator machinery honest.
   after an artifact reached a recipient mailbox;
   `exposed_welcome_prevents_partial_commit_retraction_and_rollback` applies the same rule to the complete
   commit/Welcome publication so a failed rollback cannot partially mutate transport state.
-- `failing_generated_case_records_a_minimized_reproducer` checks that semantic failure identity lets a failing
-  generated case remove an entire irrelevant application-message storm even though action indices and the full state
-  digest change. The minimized case remains diagnostic metadata; fixture candidates retain the original executed
-  scenario so they cannot silently reproduce a different terminal state under the same broad failure kind.
+- `completed_minimizer_removes_irrelevant_message_storm_and_reproduces` deterministically checks that completed
+  reduction removes an entire irrelevant application-message storm and retains the synthetic failure trigger.
+- `failing_generated_case_records_bounded_minimization_outcome` checks the engine-backed semantic failure identity and
+  replays any best-so-far reduced case. The minimized case remains diagnostic metadata; fixture candidates retain the
+  original executed scenario so they cannot silently reproduce a different terminal state under the same broad
+  failure kind.
+- `expensive_reproducer_exhausts_the_minimization_budget_after_the_original_run` checks that one completed synthetic
+  reproduction followed by an expensive trial stops at the per-trial budget with `budget_exhausted`.
+- `minimization_budget_exhaustion_preserves_the_original_failure_artifacts` checks that bounded reduction retains the
+  original failure kind in the report and portable capsule and keeps the original fixture candidate durable.
+- `cleanup_removes_only_temporaries_owned_by_the_reaped_worker` checks that campaign cleanup removes report and
+  sensitive-capsule replacement files for the exact worker PID without touching another worker's files.
+- `interrupted_minimization_preserves_original_artifacts_and_summary_phase` launches the real worker path, waits for
+  durable original failure artifacts, reaps it during minimization, and records `pending` plus a `minimization` timeout
+  phase in the process summary schema.
 - `failed_campaign_capsule_contains_a_replayable_tick_witness` checks that a real report campaign exports a sensitive
   recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across

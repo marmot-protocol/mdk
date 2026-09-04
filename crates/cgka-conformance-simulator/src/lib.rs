@@ -102,9 +102,10 @@ pub use failure_capsule::{
 };
 pub use family::{
     GENERATED_SCENARIO_INPUT_SCHEMA_VERSION, GeneratedScenarioCase, GeneratedScenarioInputV1,
-    GeneratedSubjectKind, GeneratedWorkloadProfileV1, UnsupportedGeneratedFamily,
-    generate_admin_churn_case, generate_admin_churn_family, generate_adversarial_reliability_case,
-    generate_adversarial_reliability_family, generate_adversarial_reliability_offline_regression,
+    GeneratedScenarioMinimizationBudget, GeneratedSubjectKind, GeneratedWorkloadProfileV1,
+    UnsupportedGeneratedFamily, generate_admin_churn_case, generate_admin_churn_family,
+    generate_adversarial_reliability_case, generate_adversarial_reliability_family,
+    generate_adversarial_reliability_offline_regression,
     generate_adversarial_reliability_self_update_regression,
     generate_adversarial_reliability_sustained_regression,
     generate_bounded_convergence_pressure_case, generate_bounded_convergence_pressure_family,
@@ -157,9 +158,10 @@ pub use retained_relay::{
 };
 pub use scenario::{
     AppInvalidationReportObservation, EpochChangeReportObservation, GeneratedScenarioMetadata,
-    InvariantFailure, ScenarioOutboundSelection, ScenarioReport, ScenarioReportMetadata,
-    ScenarioRunError, ScenarioSpec, ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus,
-    VectorFixtureMetadata, run_scenario_report, run_scenario_report_with_outcomes,
+    GeneratedScenarioMinimizationStatus, GeneratedScenarioMinimizationV1, InvariantFailure,
+    ScenarioOutboundSelection, ScenarioReport, ScenarioReportMetadata, ScenarioRunError,
+    ScenarioSpec, ScenarioStep, ScenarioStepLogEntry, ScenarioStepStatus, VectorFixtureMetadata,
+    run_scenario_report, run_scenario_report_with_outcomes,
     run_scenario_report_with_outcomes_and_capture,
     run_scenario_report_with_outcomes_and_storage_mode, run_scenario_report_with_storage_mode,
     run_scenario_report_with_subject, run_scenario_spec, run_scenario_spec_with_subject,

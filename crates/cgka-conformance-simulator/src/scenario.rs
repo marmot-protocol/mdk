@@ -424,7 +424,34 @@ pub struct GeneratedScenarioMetadata {
     pub case_index: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_profile: Option<crate::GeneratedWorkloadProfileV1>,
+    #[serde(default)]
+    pub minimization: GeneratedScenarioMinimizationV1,
     pub minimized_case: Option<ScenarioSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedScenarioMinimizationStatus {
+    /// The report has no fingerprinted failure, so reduction is unnecessary.
+    #[default]
+    Skipped,
+    /// The original report is durable and optional reduction is in progress.
+    Pending,
+    /// Reduction exhausted every eligible candidate inside the configured budget.
+    Complete,
+    /// The wall-clock, trial-count, or per-trial budget stopped reduction.
+    BudgetExhausted,
+    /// A fresh execution of the original scenario did not reproduce the failure.
+    NotReproducible,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedScenarioMinimizationV1 {
+    pub status: GeneratedScenarioMinimizationStatus,
+    pub trials: usize,
+    pub wall_clock_budget_ms: u64,
+    pub max_trials: usize,
+    pub per_trial_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
