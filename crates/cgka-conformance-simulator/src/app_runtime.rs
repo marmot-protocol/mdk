@@ -1480,6 +1480,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidAuditLogFile(_)
         | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
         AppError::MissingKeyPackage(_)
+        | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
         | AppError::GroupDisbanding(_)

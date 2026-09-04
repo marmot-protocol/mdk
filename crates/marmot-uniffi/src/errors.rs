@@ -55,6 +55,11 @@ pub enum MarmotKitError {
     InvalidKeyPackageEvent { details: String },
     #[error("missing key package for {account}")]
     MissingKeyPackage { account: String },
+    /// The invite target has no kind-10050 inbox endpoint that this device can
+    /// safely use. The account id lets hosts identify the affected selection
+    /// without parsing display text.
+    #[error("member {account} has no valid Marmot inbox relay")]
+    MissingMemberInboxRoute { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
     /// No current kind-3 event was found on the account's known outbox/default
@@ -295,6 +300,7 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::MissingKeyPackage(account) => Self::MissingKeyPackage { account },
+            AppError::MissingMemberInboxRoute(account) => Self::MissingMemberInboxRoute { account },
             AppError::InvalidPublicKey => Self::InvalidIdentity {
                 details: "invalid nostr public key".into(),
             },
@@ -762,6 +768,18 @@ mod tests {
             ),
             "invalid KeyPackage events must not be flattened into InvalidIdentity, got {ffi:?}"
         );
+    }
+
+    #[test]
+    /// The typed FFI error preserves the recipient needed for client recovery UI.
+    fn missing_member_inbox_route_crosses_ffi_with_recipient() {
+        let account = "11".repeat(32);
+        let ffi: MarmotKitError = AppError::MissingMemberInboxRoute(account.clone()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::MissingMemberInboxRoute { account: recipient }
+                if recipient == account
+        ));
     }
 
     #[test]

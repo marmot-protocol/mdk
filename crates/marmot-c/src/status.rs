@@ -94,6 +94,7 @@ pub enum MarmotStatus {
     AccountWorkerBusy = 59,
     AccountWorkerResponseTimedOut = 60,
     GroupInviteNotPending = 61,
+    MissingMemberInboxRoute = 62,
 }
 
 thread_local! {
@@ -121,6 +122,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidHex { .. } => MarmotStatus::InvalidHex,
         MarmotKitError::InvalidIdentity { .. } => MarmotStatus::InvalidIdentity,
         MarmotKitError::MissingKeyPackage { .. } => MarmotStatus::MissingKeyPackage,
+        MarmotKitError::MissingMemberInboxRoute { .. } => MarmotStatus::MissingMemberInboxRoute,
         MarmotKitError::Publish { .. } => MarmotStatus::Publish,
         MarmotKitError::TransportClosed => MarmotStatus::TransportClosed,
         MarmotKitError::RuntimeStopping => MarmotStatus::RuntimeStopping,
@@ -210,6 +212,9 @@ mod tests {
                 details: "d".into(),
             },
             MarmotKitError::MissingKeyPackage {
+                account: "a".into(),
+            },
+            MarmotKitError::MissingMemberInboxRoute {
                 account: "a".into(),
             },
             MarmotKitError::Publish {

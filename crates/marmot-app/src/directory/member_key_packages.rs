@@ -114,6 +114,14 @@ impl MemberKeyPackagePrewarmCache {
         }
     }
 
+    /// Keep relay readiness discovered after the KeyPackage was cached in sync
+    /// with the process-local prewarm entry.
+    fn update_relay_lists(&mut self, account_id_hex: &str, relay_lists: &AccountRelayListStatus) {
+        if let Some(entry) = self.entries.get_mut(account_id_hex) {
+            entry.fetched.relay_lists = relay_lists.clone();
+        }
+    }
+
     fn remove_expired(&mut self) {
         let now = Instant::now();
         self.entries.retain(|_, entry| {
@@ -169,6 +177,38 @@ struct MemberTarget {
     relay_lists: AccountRelayListStatus,
 }
 
+/// Merge relay-list observations without allowing stale discovery to clobber
+/// newer cached state.
+///
+/// Each list is replaced only by a strictly newer `created_at`; ties retain the
+/// current value. Timestamp-less (`created_at == 0`) state may fill an empty
+/// timestamp-less slot, which supports setup-derived and fixture-built state
+/// without overriding a timestamped directory event.
+fn merge_member_relay_lists(
+    mut current: AccountRelayListStatus,
+    candidate: AccountRelayListStatus,
+) -> AccountRelayListStatus {
+    if candidate.nip65.created_at > current.nip65.created_at
+        || (candidate.nip65.created_at == 0
+            && current.nip65.created_at == 0
+            && current.nip65.relays.is_empty()
+            && !candidate.nip65.relays.is_empty())
+    {
+        current.nip65 = candidate.nip65;
+    }
+    if candidate.inbox.created_at > current.inbox.created_at
+        || (candidate.inbox.created_at == 0
+            && current.inbox.created_at == 0
+            && current.inbox.relays.is_empty()
+            && !candidate.inbox.relays.is_empty())
+    {
+        current.inbox = candidate.inbox;
+    }
+    push_unique_strings(&mut current.bootstrap_relays, candidate.bootstrap_relays);
+    current.refresh();
+    current
+}
+
 #[allow(dead_code)]
 fn member_resolution_future_is_send(app: &MarmotApp) {
     fn assert_send<T: Send>(_: T) {}
@@ -202,9 +242,13 @@ impl MarmotApp {
     }
 
     /// Prewarm group composition without reserving or consuming any package.
-    /// A later create call re-reads and validates the cached bytes, and the MLS
-    /// mutation boundary still performs its ordinary lifetime/single-use
-    /// validation.
+    ///
+    /// The roster must also resolve a safe Marmot inbox route for every member;
+    /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
+    /// fetched packages and relay metadata remain cached even when another
+    /// member fails readiness. A later create call re-reads and validates the
+    /// cached bytes, and the MLS mutation boundary still performs its ordinary
+    /// lifetime/single-use validation.
     pub async fn prewarm_group_member_key_packages(
         &self,
         member_refs: &[&str],
@@ -278,7 +322,7 @@ impl MarmotApp {
             .collect::<Vec<Option<Result<KeyPackage, AppError>>>>();
         let mut unresolved = Vec::new();
         let mut reused_members = 0usize;
-        for (index, target) in targets.iter().enumerate() {
+        for (index, target) in targets.iter_mut().enumerate() {
             if let Some(label) = &target.local_label
                 && let Some(key_package) = self.validated_current_local_key_package(label)
                 && let Ok(key_package) =
@@ -304,23 +348,50 @@ impl MarmotApp {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&target.account_id_hex);
-            if let Some(fetched) = prefetched
-                && let Ok(key_package) = self.accept_prefetched_key_package(purpose, fetched)
-            {
-                outcomes[index] = Some(Ok(key_package));
-                reused_members += 1;
-                continue;
+            if let Some(mut fetched) = prefetched {
+                target.relay_lists = merge_member_relay_lists(
+                    target.relay_lists.clone(),
+                    fetched.relay_lists.clone(),
+                );
+                fetched.relay_lists = target.relay_lists.clone();
+                if let Ok(key_package) = self.accept_prefetched_key_package(purpose, fetched) {
+                    outcomes[index] = Some(Ok(key_package));
+                    reused_members += 1;
+                    continue;
+                }
             }
             unresolved.push(index);
         }
 
-        if !unresolved.is_empty() {
+        let relay_list_unresolved = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                let safe_inbox = self.retain_safe_discovered_endpoints(
+                    target
+                        .relay_lists
+                        .inbox
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "member invite inbox discovery",
+                );
+                (safe_inbox.is_empty()
+                    || (outcomes[index].is_none() && target.relay_lists.nip65.relays.is_empty()))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !relay_list_unresolved.is_empty() {
             for (index, error) in self
-                .resolve_missing_relay_lists(&mut targets, &unresolved)
+                .resolve_missing_relay_lists(&mut targets, &relay_list_unresolved)
                 .await
             {
                 outcomes[index] = Some(Err(error));
             }
+        }
+        if !unresolved.is_empty() {
             let key_package_unresolved = unresolved
                 .iter()
                 .copied()
@@ -335,6 +406,30 @@ impl MarmotApp {
             .await;
         }
 
+        match purpose {
+            MemberResolutionPurpose::Commit => {
+                for target in &targets {
+                    if !target.relay_lists.nip65.relays.is_empty()
+                        || !target.relay_lists.inbox.relays.is_empty()
+                    {
+                        self.remember_directory_relay_lists(
+                            &target.account_id_hex,
+                            &target.relay_lists,
+                        )?;
+                    }
+                }
+            }
+            MemberResolutionPurpose::Prewarm => {
+                let mut cache = self
+                    .member_key_package_prewarm_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for target in &targets {
+                    cache.update_relay_lists(&target.account_id_hex, &target.relay_lists);
+                }
+            }
+        }
+
         let mut key_packages = Vec::with_capacity(targets.len());
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome.unwrap_or_else(|| {
@@ -342,7 +437,25 @@ impl MarmotApp {
                     targets[index].account_id_hex.clone(),
                 ))
             }) {
-                Ok(key_package) => key_packages.push(key_package),
+                Ok(key_package) => {
+                    let safe_inbox = self.retain_safe_discovered_endpoints(
+                        targets[index]
+                            .relay_lists
+                            .inbox
+                            .relays
+                            .iter()
+                            .cloned()
+                            .map(TransportEndpoint)
+                            .collect(),
+                        "member invite inbox readiness",
+                    );
+                    if safe_inbox.is_empty() {
+                        return Err(AppError::MissingMemberInboxRoute(
+                            targets[index].account_id_hex.clone(),
+                        ));
+                    }
+                    key_packages.push(key_package);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -409,33 +522,19 @@ impl MarmotApp {
         records: Vec<crate::relay_plane::DirectoryRelayEventRecord>,
         endpoints: &[TransportEndpoint],
     ) -> AccountRelayListStatus {
-        let freshness = self.directory_freshness();
-        let observed_nip65 = records
-            .iter()
-            .any(|record| record.event.kind == KIND_NIP65_RELAY_LIST && freshness.accepts(record));
-        let observed_inbox = records.iter().any(|record| {
-            record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST && freshness.accepts(record)
-        });
-        let mut status =
-            fresh_relay_list_status_from_records(&target.account_id_hex, records, freshness).value;
-        if !observed_nip65 {
-            status.nip65 = target.relay_lists.nip65.clone();
-        }
-        if !observed_inbox {
-            status.inbox = target.relay_lists.inbox.clone();
-        }
-        push_unique_strings(
-            &mut status.bootstrap_relays,
-            target.relay_lists.bootstrap_relays.clone(),
-        );
+        let mut status = fresh_relay_list_status_from_records(
+            &target.account_id_hex,
+            records,
+            self.directory_freshness(),
+        )
+        .value;
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = endpoints
                 .iter()
                 .map(|endpoint| endpoint.0.clone())
                 .collect();
         }
-        status.refresh();
-        status
+        merge_member_relay_lists(target.relay_lists.clone(), status)
     }
 
     async fn resolve_missing_relay_lists(
@@ -443,11 +542,7 @@ impl MarmotApp {
         targets: &mut [MemberTarget],
         unresolved: &[usize],
     ) -> Vec<(usize, AppError)> {
-        let needs_discovery = unresolved
-            .iter()
-            .copied()
-            .filter(|index| targets[*index].relay_lists.nip65.relays.is_empty())
-            .collect::<Vec<_>>();
+        let needs_discovery = unresolved.to_vec();
         if needs_discovery.is_empty() {
             return Vec::new();
         }
