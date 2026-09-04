@@ -1258,8 +1258,17 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                     state: record.state,
                 });
             }
+            // A proposal consumed by this device's locally confirmed commit
+            // is `Processed`, but it is still a prerequisite for replaying a
+            // sibling commit that references the same proposal. Excluding it
+            // makes every committer able to materialize only its own
+            // checkpointed branch, so each independently declares its local
+            // sibling canonical. Re-admit retained processed proposals to the
+            // candidate graph exactly like processed commits and application
+            // witnesses; canonical apply skips one already consumed by an
+            // accepted prefix using its authenticated source epoch.
             OpenMlsContentKind::Proposal
-                if record_state_is_canonicalization_input(record.state)
+                if record_state_can_contribute_to_openmls_graph(record.state)
                     && source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
             {
                 pending_messages.push(message)
@@ -3030,16 +3039,6 @@ fn required_capabilities_from_group(
         caps.app_components = components;
     }
     caps
-}
-
-fn record_state_is_canonicalization_input(state: MessageState) -> bool {
-    matches!(
-        state,
-        MessageState::Sent
-            | MessageState::Created
-            | MessageState::Retryable
-            | MessageState::ConvergenceDeferred
-    )
 }
 
 /// Whether a stored row in this state is an input to the OpenMLS graph the
