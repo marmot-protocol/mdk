@@ -135,7 +135,7 @@ def _is_recognized_specialist_path(path: str) -> bool:
         or path in ROOT_BUILD_PATHS
         or path in SPECIALIST_EXACT_PATHS
         or path.startswith("formal/tamarin/")
-        or path.startswith("formal/tla/")
+        or path.startswith("formal/liveness/")
     )
 
 
@@ -185,7 +185,7 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
             "docs/marmot-architecture/convergence-constant-inventory.txt",
         }
         or path.startswith("formal/tamarin/")
-        or path.startswith("formal/tla/")
+        or path.startswith("formal/liveness/")
         for path in normalized
     )
     run_ios = unclassified_path or workflow_changed or root_build_changed or any(
