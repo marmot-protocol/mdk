@@ -3,9 +3,18 @@
 
 from __future__ import annotations
 
+import re
+import subprocess
 import unittest
+from pathlib import Path
 
 from classify_ci_changes import classify
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+LITERAL_INCLUDE = re.compile(
+    r'\binclude_(?:str|bytes)!\s*\(\s*"([^"\r\n]+)"\s*\)', re.MULTILINE
+)
 
 
 class ClassifyCiChangesTests(unittest.TestCase):
@@ -77,6 +86,65 @@ class ClassifyCiChangesTests(unittest.TestCase):
         self.assertTrue(result["run_full"])
         self.assertTrue(result["run_formal"])
         self.assertTrue(result["run_conformance"])
+
+    def test_tla_liveness_inputs_run_only_the_conformance_specialist(self) -> None:
+        for path in [
+            "formal/liveness/ConvergenceLifecycle.tla",
+            "formal/liveness/ConvergenceLifecycle.fair.cfg",
+            "formal/liveness/counterexamples/admin-starvation.scenario.json",
+        ]:
+            with self.subTest(path=path):
+                result = classify([path])
+                self.assertTrue(result["run_full"])
+                self.assertTrue(result["run_conformance"])
+                self.assertFalse(result["run_c"])
+                self.assertFalse(result["run_ios"])
+                self.assertFalse(result["run_formal"])
+
+    def test_literal_rust_includes_preserve_their_consumers_lanes(self) -> None:
+        tracked_rust = subprocess.run(
+            ["git", "ls-files", "-z", "--", "*.rs"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout.split(b"\0")
+        failures = []
+
+        for encoded_source in tracked_rust:
+            if not encoded_source:
+                continue
+            source = REPOSITORY_ROOT / encoded_source.decode("utf-8")
+            source_path = source.relative_to(REPOSITORY_ROOT).as_posix()
+            source_lanes = {
+                lane for lane, selected in classify([source_path]).items() if selected
+            }
+            source_text = source.read_text(encoding="utf-8")
+
+            for included_path in LITERAL_INCLUDE.findall(source_text):
+                included = (source.parent / included_path).resolve()
+                if not included.is_file():
+                    continue
+                try:
+                    included_path = included.relative_to(REPOSITORY_ROOT).as_posix()
+                except ValueError:
+                    continue
+                included_lanes = {
+                    lane
+                    for lane, selected in classify([included_path]).items()
+                    if selected
+                }
+                missing_lanes = sorted(source_lanes - included_lanes)
+                if missing_lanes:
+                    failures.append(
+                        f"{included_path}, included by {source_path}, misses "
+                        f"{', '.join(missing_lanes)}"
+                    )
+
+        self.assertFalse(
+            failures,
+            "literal Rust includes must select every lane used by their consumers:\n"
+            + "\n".join(failures),
+        )
 
     def test_ci_workflow_change_runs_every_lane(self) -> None:
         result = classify([".github/workflows/ci.yml"])
