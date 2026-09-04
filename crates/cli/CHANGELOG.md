@@ -14,6 +14,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Sender-provided QUIC stream candidates cannot use `--insecure-local` to dial
   private, link-local, CGNAT, ULA, or other non-public network ranges. The
   explicit development opt-in now permits loopback endpoints only.
+- Engine failures now retain the same stable CLI JSON error code whether they
+  reach the app boundary directly or through account/session wrappers.
 
 ## [0.9.17] - 2026-09-02
 

@@ -21,7 +21,6 @@ path = "src/bin/wnd.rs"
 [dependencies]
 agent-stream-compose.workspace = true
 cgka-traits.workspace = true
-cgka-session.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true

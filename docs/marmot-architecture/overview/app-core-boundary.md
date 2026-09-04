@@ -1,7 +1,7 @@
 ---
 title: "App Core Boundary"
 created: 2026-05-15
-updated: 2026-05-17
+updated: 2026-09-04
 tags: [marmot, app-core, cli, tui, swift]
 status: overview
 ---
@@ -25,9 +25,10 @@ session effects and keeps engine storage behind a small account-device API.
 `crates/marmot-account` owns account home orchestration: account records, signing-key storage, session opening,
 transport activation, routing policy, KeyPackage publication, and publish confirmation or rollback.
 
-`crates/marmot-app` owns app-core integration: account projections, shared directory cache, relay-list setup and
-discovery, local development relay support, Nostr SDK relay access, group/message records, and the `AppClient` methods
-used by app surfaces.
+`crates/marmot-app` owns app-core integration: account projections, account-private and shared directory caches,
+relay-list setup and discovery, local development relay support, Nostr SDK relay access, group/message records, and
+the long-running `MarmotAppRuntime` used by app surfaces. `AppClient` remains a lower-level compatibility surface, not
+the preferred host-owned runtime boundary.
 
 `crates/cli` owns commands and output. Its JSON envelope is intentionally stable enough for a future TUI or harness, but
 Swift and other host apps should prefer app-core bindings over shelling out to the CLI.
@@ -36,14 +37,28 @@ Swift and other host apps should prefer app-core bindings over shelling out to t
 
 The current app-core concepts are:
 
-- **Account home:** a platform user-data directory containing account records, app projection databases, shared cache,
+- **Account home:** a platform user-data directory containing account records, per-account databases, a shared store,
   and local development relay state.
 - **Secret store:** platform keychain by default, with a file-backed development store for deterministic tests.
-- **Per-account session DB:** one SQLCipher-backed session database per Marmot account-device identity.
-- **Per-account app projection DB:** group list, app components, seen relay events, and sent/received message records.
-- **Shared app cache:** relay-list and KeyPackage directory state keyed by account id.
-- **App client:** an opened account runtime that can create groups, invite and remove members, update group profile data,
-  send messages, sync transport input, and inspect members.
+- **Per-account session DB:** one SQLCipher-backed durable database per Marmot account-device identity. It contains
+  OpenMLS/Marmot state and the operational app projections needed to preserve groups, messages, delivery state, and
+  recovery obligations.
+- **Per-account directory cache:** an encrypted account-private directory/search view containing local-account links,
+  discovery provenance, profiles, follows, relay lists, KeyPackages, and bounded web-of-trust search state.
+- **Shared store:** an installation-wide public-directory mirror stripped of account-private provenance, plus durable
+  installation-wide telemetry/audit preferences and the telemetry installation id.
+- **App runtime:** the long-running multi-account owner of account workers, relay subscriptions, projections, typed
+  event streams, and storage lifecycle.
+
+## Local SQLite Layout
+
+For `N` active signing accounts whose stores have been opened, the current layout has up to `2N + 1` SQLite files: an
+authoritative SQLCipher `session.sqlite` and a derived SQLCipher `app-cache.sqlite3` per account, plus the
+installation-wide `shared.sqlite3` public-directory and settings store.
+
+Only the session database currently has a numbered migration ledger. The auxiliary stores need independent migration
+histories before non-additive schema changes. Their authority, reconciliation, durability, and legacy-import contracts
+are detailed in [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
 
 ## CLI Contract
 
@@ -81,7 +96,7 @@ A Swift app should bind to `marmot-app`/`marmot-account` shaped APIs rather than
 - inspect and repair relay-list setup;
 - publish/fetch KeyPackages;
 - refresh directory entries;
-- open an account client;
+- start and retain an app runtime;
 - call group, message, membership, archive, and sync methods;
 - render app projection records.
 

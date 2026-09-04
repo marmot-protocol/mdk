@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-08-18
+updated: 2026-09-04
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -187,10 +187,19 @@ uploaded artifact.
 
 ## Daemon Boundary
 
-`wnd` should host one `MarmotAppRuntime`. It should accept socket requests, pass intents into the runtime, and stream
-runtime events back to clients.
+`wnd` hosts one `MarmotAppRuntime`. It accepts socket requests, passes intents into the runtime, and streams runtime
+events back to clients.
 
 Daemon responsibilities stay narrow: process lifecycle, socket protocol, request routing, and stream fanout.
+
+MDK currently has two local Unix-socket protocols. They both use newline-terminated JSON and deliberately bounded
+inbound messages, but they are not wire-compatible. `wnd` exposes MDK's internal CLI command shape, while `wn-agent`
+exposes the versioned, typed `marmot.agent-control.v2` integration protocol.
+
+Their shared framing pattern is not a shared semantic contract. Any future framing reuse must preserve the CLI
+daemon's stronger request-buffer erasure while leaving versioning, authorization, correlation, retry, and connection
+semantics protocol-owned. See [Local Daemon Protocol Boundaries](../further-context/local-daemon-protocol-boundaries.md)
+for the full comparison and consolidation constraints.
 
 ## CLI And TUI Boundary
 

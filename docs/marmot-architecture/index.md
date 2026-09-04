@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-08-23
+updated: 2026-09-04
 tags: [marmot, architecture, index]
 ---
 
@@ -159,6 +159,14 @@ These are longer working documents. Go here when you need depth, not orientation
 - **Doc:** [`storage-format-v2.md`](./storage-format-v2.md)
   - **What it covers:** MDK-local storage versioning, normalized protocol-message rows, the explicit stored-message
     binary envelope, legacy compatibility, snapshot-v2 decision gate, and upgrade/downgrade operations.
+
+- **Doc:** [`further-context/app-sqlite-storage-boundaries.md`](./further-context/app-sqlite-storage-boundaries.md)
+  - **What it covers:** Current ownership, durability, reconciliation, legacy-import, and migration contracts for the
+    session, account-directory, and shared SQLite stores.
+
+- **Doc:** [`further-context/local-daemon-protocol-boundaries.md`](./further-context/local-daemon-protocol-boundaries.md)
+  - **What it covers:** Detailed comparison of the `wnd` and `marmot.agent-control.v2` local socket protocols and the
+    narrow boundary for any future shared framing helper.
 
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.

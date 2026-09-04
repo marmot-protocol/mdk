@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use cgka_traits::error::EngineError;
-use marmot_account::{AccountError, AccountHomeError};
+use marmot_account::AccountHomeError;
 use marmot_app::{AccountRelayListStatus, AppError, MissingRelayListKind};
 use serde_json::{Value, json};
 
@@ -559,12 +559,11 @@ fn account_home_error_json(err: &AccountHomeError) -> Value {
 }
 
 fn app_error_json(err: &AppError) -> Value {
+    if let Some(engine_error) = err.as_engine_error() {
+        return engine_error_json(engine_error);
+    }
     match err {
         AppError::AccountHome(err) => account_home_error_json(err),
-        AppError::Account(AccountError::Engine(err)) => engine_error_json(err),
-        AppError::Account(AccountError::Session(cgka_session::SessionError::Engine(err))) => {
-            engine_error_json(err)
-        }
         AppError::MissingKeyPackage(account) => json!({
             "code": "missing_key_package",
             "message": err.to_string(),
@@ -738,6 +737,8 @@ fn engine_error_json(err: &EngineError) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use marmot_account::AccountError;
+
     use super::*;
 
     #[test]
@@ -826,5 +827,18 @@ mod tests {
         let timed_out = wn_error_json(&WnError::App(AppError::AccountWorkerResponseTimedOut));
         assert_eq!(timed_out["code"], "account_worker_response_timed_out");
         assert_eq!(timed_out["completion_unknown"], true);
+    }
+
+    #[test]
+    fn engine_errors_have_the_same_json_across_app_wrappers() {
+        let rendered = [
+            AppError::Session(EngineError::InvalidWelcome.into()),
+            AppError::Account(AccountError::Session(EngineError::InvalidWelcome.into())),
+            AppError::Account(AccountError::Engine(EngineError::InvalidWelcome)),
+        ]
+        .map(|error| wn_error_json(&WnError::App(error)));
+
+        assert_eq!(rendered[0]["code"], "engine_error");
+        assert!(rendered.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }
