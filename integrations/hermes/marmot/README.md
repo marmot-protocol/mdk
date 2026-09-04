@@ -209,6 +209,9 @@ Development, CI, and the phone-test image default to the repo-owned
 [`hermes-agent.lock`](hermes-agent.lock): Hermes `0.19.0`, release tag
 `v2026.7.20`, commit `3ef6bbd201263d354fd83ec55b3c306ded2eb72a`.
 Use `--hermes-ref` (or `HERMES_AGENT_REF`) only for deliberate upstream testing.
+Required CI installs the same released version with `--install-pinned-wheel`;
+the lock file pins both its Python package URL and SHA-256 so CI does not depend
+on a cross-repository GitHub clone.
 
 The setup script creates these paths under that root:
 

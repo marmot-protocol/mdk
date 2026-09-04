@@ -39,6 +39,9 @@ esac
 SCRIPT
 cat >"$auth_fake_bin/uv" <<'SCRIPT'
 #!/usr/bin/env bash
+if [ -n "${UV_CAPTURE:-}" ]; then
+    printf '%s\n' "$*" >>"$UV_CAPTURE"
+fi
 exit 0
 SCRIPT
 chmod +x "$auth_fake_bin/git" "$auth_fake_bin/uv"
@@ -60,6 +63,23 @@ if grep -F 'test-actions-token' "$auth_capture" >/dev/null; then
     echo "raw GitHub token leaked into git configuration" >&2
     exit 1
 fi
+
+# The required CI path installs the released, hash-pinned wheel and must not
+# contact GitHub for a source checkout.
+wheel_dev_root="$tmp_parent/pinned-wheel"
+wheel_capture="$tmp_parent/pinned-wheel-uv-capture"
+env \
+    PATH="$auth_fake_bin:$PATH" \
+    UV_CAPTURE="$wheel_capture" \
+    "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
+        --root "$wheel_dev_root" \
+        --install-pinned-wheel \
+        --no-enable-plugin
+[ -d "$wheel_dev_root/hermes-agent" ]
+[ ! -e "$wheel_dev_root/hermes-agent/.git" ]
+grep -F 'venv .venv --python 3.11' "$wheel_capture" >/dev/null
+grep -F 'hermes-agent[all,dev] @ https://files.pythonhosted.org/' "$wheel_capture" >/dev/null
+grep -F '#sha256=' "$wheel_capture" >/dev/null
 
 "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
     --root "$dev_root" \

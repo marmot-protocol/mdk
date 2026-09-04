@@ -645,12 +645,11 @@ jobs:
             python3 -m unittest discover -s integrations/hermes/marmot/tests -v
 
       - name: Prepare isolated Hermes checkout for authorization E2E
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ./scripts/hermes_marmot_dev_setup.sh \
-            --root "$RUNNER_TEMP/hermes-installer-auth"
+            --root "$RUNNER_TEMP/hermes-installer-auth" \
+            --install-pinned-wheel
 
       - name: Hermes installer unit and mock regressions
         run: |
