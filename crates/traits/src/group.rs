@@ -92,6 +92,20 @@ pub struct Group {
     pub join_epoch: EpochId,
 }
 
+impl Group {
+    /// Is this local copy of the group terminal — nothing may be routed, sent,
+    /// or ingested for it any more?
+    ///
+    /// Two distinct reasons, both terminal here and neither implying the
+    /// other: [`Group::removed`] means this device is out of a group that goes
+    /// on without it, and [`Group::disbanded`] means the group itself is gone
+    /// for everyone. [`Group::unrecoverable`] is deliberately excluded: that
+    /// copy is halted pending a verified repair, not finished.
+    pub fn is_terminal(&self) -> bool {
+        self.removed || self.disbanded.is_some()
+    }
+}
+
 /// Durable evidence and read-only projection material retained after a
 /// selected disband Commit deletes live MLS state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

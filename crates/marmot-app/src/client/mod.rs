@@ -4399,7 +4399,7 @@ impl AppClient {
             if self
                 .runtime
                 .group_record(&group_id)
-                .is_ok_and(|group| group.disbanded.is_some())
+                .is_ok_and(|group| group.is_terminal())
             {
                 if self.routing.replace_group_routes(&group_id, Vec::new()) {
                     refresh.routing_changed = true;
