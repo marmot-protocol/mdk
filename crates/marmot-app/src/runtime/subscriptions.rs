@@ -639,6 +639,7 @@ pub enum ChatListUpdateTrigger {
     #[default]
     SnapshotRefresh,
     Removed,
+    DirectPeerPresentationChanged,
 }
 
 impl ChatListUpdateTrigger {
@@ -1269,6 +1270,7 @@ impl MarmotAppRuntime {
         let account_label = account.label.clone();
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
+        let mut direct_peer_presentation_events = app.subscribe_direct_peer_presentation_updates();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let app_for_snapshot = app.clone();
         let account_label_for_snapshot = account_label.clone();
@@ -1305,6 +1307,24 @@ impl MarmotAppRuntime {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     event = events.recv() => Some(event),
+                    update = direct_peer_presentation_events.recv() => Some(update.map(|update| {
+                        MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+                            account_id_hex: update.account_id_hex,
+                            account_label: update.account_label,
+                            update: AppProjectionUpdate {
+                                group_id_hex: update.group_id_hex,
+                                timeline_messages: Vec::new(),
+                                timeline_changes: Vec::new(),
+                                // The broadcast is only a wake-up key. The
+                                // subscriber reads the current row below so a
+                                // roster change committed after profile
+                                // projection cannot replay a stale peer value.
+                                chat_list_row: None,
+                                chat_list_trigger:
+                                    ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                            },
+                        })
+                    })),
                     _ = expiry_wait => None,
                 };
                 let Some(event) = event else {
@@ -1417,7 +1437,58 @@ impl MarmotAppRuntime {
                         }
                         continue;
                     }
-                    let Some(row) = update.update.chat_list_row.clone() else {
+                    let row = if matches!(
+                        update.update.chat_list_trigger,
+                        ChatListUpdateTrigger::DirectPeerPresentationChanged
+                    ) {
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let group_id_hex_for_lookup = update.update.group_id_hex.clone();
+                        match blocking_app_task(move || {
+                            app_for_lookup
+                                .chat_list_row(&account_label_for_lookup, &group_id_hex_for_lookup)
+                        })
+                        .await
+                        {
+                            Ok(row) => row,
+                            Err(_) => continue,
+                        }
+                    } else if let Some(mut row) = update.update.chat_list_row.clone() {
+                        // Ordinary projection events carry a row captured when
+                        // the event was produced. Direct-peer wakes arrive on
+                        // a separate channel, so a delayed ordinary event can
+                        // otherwise restore presentation that predates a
+                        // profile or roster change. Preserve the ordinary
+                        // event's semantic fields and trigger, but bind its
+                        // presentation to the current durable snapshot.
+                        // This lookup is unconditional: the captured row can
+                        // predate a Group -> Direct transition and therefore
+                        // cannot safely identify whether presentation exists.
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let group_id_hex_for_lookup = update.update.group_id_hex.clone();
+                        let current_presentation = match blocking_app_task(move || {
+                            let storage =
+                                app_for_lookup.account_storage(&account_label_for_lookup)?;
+                            let mut presentations = storage
+                                .direct_peer_presentations_for_group_ids(std::slice::from_ref(
+                                    &group_id_hex_for_lookup,
+                                ))?;
+                            Ok::<_, AppError>(presentations.remove(&group_id_hex_for_lookup))
+                        })
+                        .await
+                        {
+                            Ok(presentation) => presentation,
+                            Err(_) => continue,
+                        };
+                        current_presentation.map(|current_presentation| {
+                            row.direct_peer_presentation = current_presentation;
+                            row
+                        })
+                    } else {
+                        None
+                    };
+                    let Some(row) = row else {
                         mute_expiries.remove(&update.update.group_id_hex);
                         if !send_chat_list_remove_update(
                             &updates_tx,

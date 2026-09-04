@@ -3,7 +3,8 @@
 use marmot_app::{
     AppDisbandRequest, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListRow, ChatNotificationSettings,
-    ChatPinState, ExistingDirectConversation, RuntimeChatListUpdate,
+    ChatPinState, DirectPeerPresentation, DirectPeerPresentationState, ExistingDirectConversation,
+    RuntimeChatListUpdate,
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
@@ -143,6 +144,66 @@ impl From<ChatConversationKind> for ChatConversationKindFfi {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DirectPeerPresentationStateFfi {
+    Absent,
+    Current,
+    LastKnown,
+    Invalidated,
+}
+
+impl From<DirectPeerPresentationState> for DirectPeerPresentationStateFfi {
+    fn from(value: DirectPeerPresentationState) -> Self {
+        match value {
+            DirectPeerPresentationState::Absent => Self::Absent,
+            DirectPeerPresentationState::Current => Self::Current,
+            DirectPeerPresentationState::LastKnown => Self::LastKnown,
+            DirectPeerPresentationState::Invalidated => Self::Invalidated,
+        }
+    }
+}
+
+/// Versioned, display-only metadata for the exact peer of one Direct chat.
+/// Membership decisions must continue to use MDK's authoritative group state.
+#[derive(Clone, uniffi::Record)]
+pub struct DirectPeerPresentationFfi {
+    pub schema_version: u16,
+    pub peer_account_id_hex: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_created_at: Option<u64>,
+    pub state: DirectPeerPresentationStateFfi,
+}
+
+impl std::fmt::Debug for DirectPeerPresentationFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectPeerPresentationFfi")
+            .field("schema_version", &self.schema_version)
+            .field(
+                "peer_account_id_hex",
+                &self.peer_account_id_hex.as_ref().map(|_| "<redacted>"),
+            )
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_avatar_url", &self.avatar_url.is_some())
+            .field("has_profile_created_at", &self.profile_created_at.is_some())
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl From<DirectPeerPresentation> for DirectPeerPresentationFfi {
+    fn from(value: DirectPeerPresentation) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            peer_account_id_hex: value.peer_account_id_hex,
+            display_name: value.display_name,
+            avatar_url: value.avatar_url,
+            profile_created_at: value.profile_created_at,
+            state: value.state.into(),
+        }
+    }
+}
+
 /// Authoritative reuse decision for one existing direct conversation.
 ///
 /// Returned by [`crate::Marmot::existing_direct_conversation`]. `reusable` is
@@ -194,6 +255,8 @@ pub struct ChatListRowFfi {
     pub group_name: String,
     pub avatar_url: Option<String>,
     pub avatar: Option<ChatListAvatarFfi>,
+    #[uniffi(default = None)]
+    pub direct_peer_presentation: Option<DirectPeerPresentationFfi>,
     pub last_message: Option<ChatListMessagePreviewFfi>,
     pub unread_count: u64,
     pub has_unread: bool,
@@ -265,6 +328,7 @@ impl From<ChatListRow> for ChatListRowFfi {
             group_name: value.group_name,
             avatar_url: value.avatar_url,
             avatar: value.avatar.map(Into::into),
+            direct_peer_presentation: value.direct_peer_presentation.map(Into::into),
             last_message: value.last_message.map(Into::into),
             unread_count: value.unread_count,
             has_unread: value.has_unread,
@@ -386,6 +450,7 @@ pub enum ChatListUpdateTriggerFfi {
     PinOrderChanged,
     SnapshotRefresh,
     Removed,
+    DirectPeerPresentationChanged,
 }
 
 impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
@@ -404,6 +469,9 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
             marmot_app::ChatListUpdateTrigger::MuteChanged => Self::MuteChanged,
             marmot_app::ChatListUpdateTrigger::ConversationKindChanged => {
                 Self::ConversationKindChanged
+            }
+            marmot_app::ChatListUpdateTrigger::DirectPeerPresentationChanged => {
+                Self::DirectPeerPresentationChanged
             }
             marmot_app::ChatListUpdateTrigger::LatestMessageDeliveryChanged => {
                 Self::LatestMessageDeliveryChanged
@@ -433,6 +501,7 @@ mod tests {
             group_name: "Marmot Lab".to_owned(),
             avatar_url: None,
             avatar: None,
+            direct_peer_presentation: None,
             last_message: None,
             unread_count: 0,
             has_unread: false,
@@ -488,6 +557,68 @@ mod tests {
         assert_eq!(ffi.conversation_created_at, 100);
         assert_eq!(ffi.activity_sort_at, 200);
         assert_eq!(ffi.updated_at, 300);
+    }
+
+    #[test]
+    fn direct_peer_presentation_round_trips_to_ffi() {
+        let cases = [
+            (
+                marmot_app::DirectPeerPresentationState::Absent,
+                DirectPeerPresentationStateFfi::Absent,
+                Some("bb".repeat(32)),
+                None,
+                None,
+                None,
+            ),
+            (
+                marmot_app::DirectPeerPresentationState::Current,
+                DirectPeerPresentationStateFfi::Current,
+                Some("bb".repeat(32)),
+                Some("Remote Otter".to_owned()),
+                Some("https://cdn.example.com/remote.png".to_owned()),
+                Some(42),
+            ),
+            (
+                marmot_app::DirectPeerPresentationState::LastKnown,
+                DirectPeerPresentationStateFfi::LastKnown,
+                Some("bb".repeat(32)),
+                Some("Remote Otter".to_owned()),
+                Some("https://cdn.example.com/remote.png".to_owned()),
+                Some(42),
+            ),
+            (
+                marmot_app::DirectPeerPresentationState::Invalidated,
+                DirectPeerPresentationStateFfi::Invalidated,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        for (state, expected_state, peer_id, display_name, avatar_url, profile_created_at) in cases
+        {
+            let ffi = ChatListRowFfi::from(ChatListRow {
+                direct_peer_presentation: Some(marmot_app::DirectPeerPresentation {
+                    schema_version: marmot_app::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+                    peer_account_id_hex: peer_id.clone(),
+                    display_name: display_name.clone(),
+                    avatar_url: avatar_url.clone(),
+                    profile_created_at,
+                    state,
+                }),
+                ..sample_row()
+            });
+            let presentation = ffi
+                .direct_peer_presentation
+                .expect("direct-peer presentation");
+            assert_eq!(presentation.schema_version, 1);
+            assert_eq!(presentation.peer_account_id_hex, peer_id);
+            assert_eq!(presentation.display_name, display_name);
+            assert_eq!(presentation.avatar_url, avatar_url);
+            assert_eq!(presentation.profile_created_at, profile_created_at);
+            assert_eq!(presentation.state, expected_state);
+        }
     }
 
     #[test]

@@ -297,7 +297,10 @@ mod tests {
         assert_eq!(left.last_read_timeline_at, right.last_read_timeline_at);
         assert_eq!(left.conversation_created_at, right.conversation_created_at);
         assert_eq!(left.activity_sort_at, right.activity_sort_at);
-        assert_eq!(left.updated_at, right.updated_at);
+        assert!(
+            right.updated_at >= left.updated_at,
+            "a later read must not regress the projection maintenance timestamp"
+        );
         assert_eq!(
             std::mem::discriminant(&left.self_membership),
             std::mem::discriminant(&right.self_membership)

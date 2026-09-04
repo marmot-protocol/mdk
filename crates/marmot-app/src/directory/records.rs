@@ -98,10 +98,8 @@ pub(crate) fn display_name_for_profile(profile: Option<&UserProfileMetadata>) ->
     profile
         .display_name
         .as_deref()
-        .or(profile.name.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .and_then(sanitize_profile_field)
+        .or_else(|| profile.name.as_deref().and_then(sanitize_profile_field))
 }
 
 pub(crate) fn cached_identity_projection(
@@ -373,17 +371,19 @@ fn is_known_profile_field(field: &str) -> bool {
 /// result valid UTF-8.
 const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 
-fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+pub(crate) fn sanitize_profile_field(value: &str) -> Option<String> {
     let value = value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)?;
-    let value = value
+        .trim()
         .chars()
         .filter(|character| !character.is_control())
         .take(MAX_PROFILE_FIELD_CHARS)
         .collect::<String>();
     (!value.is_empty()).then_some(value)
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    let value = value.get(field).and_then(serde_json::Value::as_str)?;
+    sanitize_profile_field(value)
 }
 
 pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {

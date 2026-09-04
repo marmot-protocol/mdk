@@ -206,7 +206,8 @@ pub use relay_telemetry_export::{
 };
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, ExistingDirectConversation,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+    DirectPeerPresentation, DirectPeerPresentationState, ExistingDirectConversation,
     MAX_TIMELINE_LIMIT, SelfMembership, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     select_reusable_direct_conversation,
@@ -610,12 +611,35 @@ pub struct MarmotApp {
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
+    direct_peer_presentation_events: tokio::sync::broadcast::Sender<DirectPeerPresentationUpdate>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
+}
+
+/// Wake-up key for one account-scoped chat-list row changed by an accepted
+/// peer profile.
+///
+/// The row is deliberately re-read at delivery time so this event can never
+/// carry stale peer presentation across a concurrent roster transition.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DirectPeerPresentationUpdate {
+    pub(crate) account_id_hex: String,
+    pub(crate) account_label: String,
+    pub(crate) group_id_hex: String,
+}
+
+impl std::fmt::Debug for DirectPeerPresentationUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectPeerPresentationUpdate")
+            .field("account_id_hex", &"<redacted>")
+            .field("account_label", &"<redacted>")
+            .field("group_id_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1458,6 +1482,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            direct_peer_presentation_events: tokio::sync::broadcast::channel(1024).0,
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -1532,6 +1557,7 @@ impl MarmotApp {
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            direct_peer_presentation_events: tokio::sync::broadcast::channel(1024).0,
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -2521,7 +2547,7 @@ impl MarmotApp {
         let mut rows = self
             .account_storage(&account.label)?
             .chat_list_rows(ChatListQuery { include_archived })?;
-        self.hydrate_chat_list_rows(&mut rows)?;
+        self.hydrate_chat_list_rows(&account, &mut rows)?;
         Ok(rows)
     }
 
@@ -2536,7 +2562,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .chat_list_row(group_id_hex)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(&account, row.as_mut())?;
         Ok(row)
     }
 
@@ -2650,7 +2676,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .refresh_chat_list_row(&account.account_id_hex, group_id_hex, &classifier)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(&account, row.as_mut())?;
         Ok(row)
     }
 
@@ -2685,7 +2711,7 @@ impl MarmotApp {
         let mut row = self
             .account_storage(&account.label)?
             .initialize_chat_read_state(&account.account_id_hex, group_id_hex, &classifier)?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(&account, row.as_mut())?;
         Ok(row)
     }
 
@@ -2706,7 +2732,7 @@ impl MarmotApp {
                 message_id_hex,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(&account, row.as_mut())?;
         Ok(row)
     }
 
@@ -2729,7 +2755,7 @@ impl MarmotApp {
                 manually_unread,
                 &classifier,
             )?;
-        self.hydrate_chat_list_row(row.as_mut())?;
+        self.hydrate_chat_list_row(&account, row.as_mut())?;
         Ok(row)
     }
 
@@ -4686,7 +4712,12 @@ impl MarmotApp {
         (message.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).then_some(message.sender.as_str())
     }
 
-    fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+    fn hydrate_chat_list_rows(
+        &self,
+        account: &AccountSummary,
+        rows: &mut [ChatListRow],
+    ) -> Result<(), AppError> {
+        self.hydrate_direct_peer_presentations(account, rows)?;
         let senders = rows
             .iter()
             .filter_map(|row| {
@@ -4711,10 +4742,15 @@ impl MarmotApp {
         Ok(())
     }
 
-    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) -> Result<(), AppError> {
+    fn hydrate_chat_list_row(
+        &self,
+        account: &AccountSummary,
+        row: Option<&mut ChatListRow>,
+    ) -> Result<(), AppError> {
         let Some(row) = row else {
             return Ok(());
         };
+        self.hydrate_direct_peer_presentations(account, std::slice::from_mut(row))?;
         let Some(message) = row.last_message.as_mut() else {
             return Ok(());
         };
@@ -4727,6 +4763,142 @@ impl MarmotApp {
             message.sender_display_name = Some(name);
         }
         Ok(())
+    }
+
+    /// Fill the durable direct-peer projection exclusively from local
+    /// directory state. This path never starts a relay request, so a host can
+    /// render the returned row on its first frame after process restart.
+    fn hydrate_direct_peer_presentations(
+        &self,
+        account: &AccountSummary,
+        rows: &mut [ChatListRow],
+    ) -> Result<(), AppError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let group_ids_hex = rows
+            .iter()
+            .map(|row| row.group_id_hex.clone())
+            .collect::<Vec<_>>();
+        let peer_ids = rows
+            .iter()
+            .filter_map(|row| {
+                row.direct_peer_presentation
+                    .as_ref()
+                    .and_then(|presentation| presentation.peer_account_id_hex.clone())
+            })
+            .collect::<HashSet<_>>();
+        let storage = self.account_storage(&account.label)?;
+        let requested = peer_ids.into_iter().collect::<Vec<_>>();
+        for page in requested.chunks(MAX_CACHED_IDENTITY_PAGE_SIZE) {
+            for projection in self.cached_identity_projections_for_account_ids(page)? {
+                let Some(peer_account_id_hex) = projection.account_id_hex else {
+                    continue;
+                };
+                if let Some(profile) = projection.profile {
+                    storage.project_direct_peer_profile(
+                        &account.account_id_hex,
+                        &storage_sqlite::DirectPeerProfile {
+                            peer_account_id_hex,
+                            display_name: projection.resolved_name,
+                            avatar_url: profile
+                                .picture
+                                .as_deref()
+                                .and_then(directory::records::sanitize_profile_field),
+                            profile_created_at: profile.created_at,
+                        },
+                    )?;
+                } else {
+                    storage.mark_direct_peer_profile_unavailable(
+                        &account.account_id_hex,
+                        &peer_account_id_hex,
+                    )?;
+                }
+            }
+        }
+
+        // The caller's rows were read before directory hydration. Re-read only
+        // the presentation columns after the writes so a concurrent roster
+        // replacement cannot return the former peer's name/avatar from that
+        // earlier snapshot. One set query preserves the no-per-row-call path.
+        let mut current_presentations =
+            storage.direct_peer_presentations_for_group_ids(&group_ids_hex)?;
+        for row in rows {
+            row.direct_peer_presentation =
+                current_presentations.remove(&row.group_id_hex).flatten();
+        }
+        Ok(())
+    }
+
+    fn project_direct_peer_profile_for_accounts(
+        &self,
+        peer_account_id_hex: &str,
+        profile: &UserProfileMetadata,
+    ) -> Result<Vec<DirectPeerPresentationUpdate>, AppError> {
+        let accounts = match self.account_home().accounts() {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::storage",
+                    method = "project_direct_peer_profile_for_accounts",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "skipped direct-peer profile projection because account metadata was unavailable"
+                );
+                return Ok(Vec::new());
+            }
+        };
+        let display_name = directory::records::display_name_for_profile(Some(profile));
+        let avatar_url = profile
+            .picture
+            .as_deref()
+            .and_then(directory::records::sanitize_profile_field);
+        let mut updates = Vec::new();
+        for account in accounts {
+            let storage = match self.account_storage(&account.label) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::storage",
+                        method = "project_direct_peer_profile_for_accounts",
+                        error_kind = error.privacy_safe_kind(),
+                        "skipped a direct-peer profile projection for an unavailable account store"
+                    );
+                    continue;
+                }
+            };
+            let rows = match storage.project_direct_peer_profile(
+                &account.account_id_hex,
+                &storage_sqlite::DirectPeerProfile {
+                    peer_account_id_hex: peer_account_id_hex.to_owned(),
+                    display_name: display_name.clone(),
+                    avatar_url: avatar_url.clone(),
+                    profile_created_at: profile.created_at,
+                },
+            ) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::storage",
+                        method = "project_direct_peer_profile_for_accounts",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "skipped a direct-peer profile projection after a storage failure"
+                    );
+                    continue;
+                }
+            };
+            updates.extend(rows.into_iter().map(|row| DirectPeerPresentationUpdate {
+                account_id_hex: account.account_id_hex.clone(),
+                account_label: account.label.clone(),
+                group_id_hex: row.group_id_hex,
+            }));
+        }
+        Ok(updates)
+    }
+
+    pub(crate) fn subscribe_direct_peer_presentation_updates(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<DirectPeerPresentationUpdate> {
+        self.direct_peer_presentation_events.subscribe()
     }
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
@@ -4811,7 +4983,7 @@ impl MarmotApp {
                 &classifier,
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
-        self.hydrate_chat_list_row(Some(&mut row))?;
+        self.hydrate_chat_list_row(&account, Some(&mut row))?;
 
         // Only the created row belongs on the response tail. Preserve any
         // pre-existing stale marker, and add one if this delta also persisted

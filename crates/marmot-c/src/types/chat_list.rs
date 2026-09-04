@@ -4,7 +4,8 @@ use marmot_uniffi::conversions::{
     ChatConversationKindFfi, ChatListAttachmentKindFfi, ChatListAvatarFfi,
     ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
-    ChatPinStateFfi, ExistingDirectConversationFfi,
+    ChatPinStateFfi, DirectPeerPresentationFfi, DirectPeerPresentationStateFfi,
+    ExistingDirectConversationFfi,
 };
 
 use super::group::{MarmotDisbandRequest, MarmotGroupLifecycleState, MarmotSelfMembership};
@@ -103,6 +104,28 @@ c_enum! {
     }
 }
 
+c_enum! {
+    /// Freshness/provenance of Direct peer display metadata.
+    MarmotDirectPeerPresentationState from DirectPeerPresentationStateFfi {
+        Absent,
+        Current,
+        LastKnown,
+        Invalidated,
+    }
+}
+
+c_mirror! {
+    /// Versioned, display-only metadata for the exact peer of one Direct chat.
+    MarmotDirectPeerPresentation from DirectPeerPresentationFfi {
+        copy schema_version: u16,
+        opt_str peer_account_id_hex,
+        opt_str display_name,
+        opt_str avatar_url,
+        opt_copy has_profile_created_at/profile_created_at: u64,
+        copy state: MarmotDirectPeerPresentationState,
+    }
+}
+
 c_mirror! {
     /// Preview of a chat row's last message.
     MarmotChatListMessagePreview from ChatListMessagePreviewFfi {
@@ -140,6 +163,7 @@ c_mirror! {
         str group_name,
         opt_str avatar_url,
         opt_rec avatar: MarmotChatListAvatar,
+        opt_rec direct_peer_presentation: MarmotDirectPeerPresentation,
         opt_rec last_message: MarmotChatListMessagePreview,
         copy unread_count: u64,
         copy has_unread: bool,
@@ -187,6 +211,7 @@ c_enum! {
         PinOrderChanged,
         SnapshotRefresh,
         Removed,
+        DirectPeerPresentationChanged,
     }
 }
 
@@ -309,5 +334,29 @@ mod tests {
         assert!(timed.has_muted_until_ms);
         assert_eq!(timed.muted_until_ms, 1_700_000_000_000);
         unsafe { marmot_chat_notification_settings_free(boxed(timed)) };
+    }
+
+    #[test]
+    fn direct_peer_presentation_deep_free_releases_owned_strings() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let mut mirror: MarmotDirectPeerPresentation = DirectPeerPresentationFfi {
+            schema_version: 1,
+            peer_account_id_hex: Some("bb".repeat(32)),
+            display_name: Some("Remote Otter".to_owned()),
+            avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+            profile_created_at: Some(42),
+            state: DirectPeerPresentationStateFfi::Current,
+        }
+        .into();
+        assert!(!mirror.peer_account_id_hex.is_null());
+        assert!(mirror.has_profile_created_at);
+        assert_eq!(mirror.profile_created_at, 42);
+
+        unsafe { mirror.free_in_place() };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
     }
 }
