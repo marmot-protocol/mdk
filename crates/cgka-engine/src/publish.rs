@@ -99,10 +99,9 @@ impl<S: StorageProvider> Engine<S> {
         let has_pending_commit = mls_group.pending_commit().is_some();
 
         // Snapshot the pre-commit epoch as a fork-recovery anchor. Done outside
-        // the durable transaction below because snapshot capture opens its own
-        // backend transaction (it cannot nest) — but the write is keyed by epoch
-        // and idempotent (`INSERT OR REPLACE`), so a retried confirm re-running
-        // it is harmless.
+        // the durable transaction below; the write is keyed by epoch and
+        // idempotent (`INSERT OR REPLACE`), so a retried confirm re-running it
+        // is harmless.
         if has_pending_commit {
             self.retain_current_epoch_snapshot_for_group(&group_id)?;
         }
