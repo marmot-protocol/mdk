@@ -9951,6 +9951,7 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
     );
 
     // So the rival forking from the join epoch is adjudicated, not halted.
+    let bob_rival_id = bob_rival.clone();
     carol
         .buffer_openmls_convergence_message_at(&group_id, bob_rival, 3_000)
         .unwrap();
@@ -9960,4 +9961,13 @@ async fn joiners_first_advance_anchors_the_join_epoch_so_a_rival_there_adjudicat
     assert_eq!(result.errors, Vec::new());
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert!(!carol_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // Adjudicated, not merely error-free: Bob wins the epoch-2 tiebreak, so
+    // Carol rolls Alice's commit back and adopts the rival's branch.
+    assert!(committer_wins(&bob.self_id(), &alice.self_id()));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_message_state(&carol_storage, &bob_rival_id, MessageState::Processed);
+    let members = carol.members(&group_id).unwrap();
+    assert!(members.iter().any(|member| member.id == eve.self_id()));
+    assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
