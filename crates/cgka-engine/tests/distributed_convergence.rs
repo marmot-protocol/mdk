@@ -2381,6 +2381,13 @@ async fn engine_materializes_multi_commit_path_from_stored_commits() {
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    let retained_anchors = carol_storage
+        .list_group_snapshots(&group_id)
+        .expect("retained anchors list");
+    assert!(
+        retained_anchors.contains(&"openmls-retained-anchor-2".to_string()),
+        "a multi-commit apply must retain its intermediate epoch for a later convergence generation: {retained_anchors:?}"
+    );
     assert_eq!(
         result.accepted_commits,
         vec![content_hex(&commit_david), content_hex(&commit_eve)]
