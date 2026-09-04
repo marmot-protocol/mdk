@@ -448,6 +448,23 @@ pub(super) async fn fetch_blossom_blob_with_observer(
     transport: &BlossomHttpTransport,
     telemetry: Option<&AppPerformanceTelemetry>,
 ) -> Result<Vec<u8>, AppError> {
+    fetch_blossom_blob_with_observer_until(
+        url,
+        transport,
+        telemetry,
+        tokio::time::Instant::now() + transport.transfer_timeout,
+    )
+    .await
+}
+
+/// Fetch a bounded blob while enforcing a caller-owned absolute deadline so
+/// timeout failures remain observable across locator failover.
+pub(super) async fn fetch_blossom_blob_with_observer_until(
+    url: &str,
+    transport: &BlossomHttpTransport,
+    telemetry: Option<&AppPerformanceTelemetry>,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, AppError> {
     let current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, transport.allow_loopback_http)
@@ -455,7 +472,7 @@ pub(super) async fn fetch_blossom_blob_with_observer(
     fetch_http_with_bounded_redirects(
         current,
         MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
-        transport.transfer_timeout,
+        deadline,
         Some(transport.candidate_startup_timeout),
         telemetry,
         move |url| {
@@ -495,7 +512,7 @@ pub(crate) async fn fetch_profile_image_with_loopback(
     profile_operation_timeout(fetch_http_with_bounded_redirects(
         current,
         max_bytes,
-        MEDIA_HTTP_TOTAL_TIMEOUT,
+        tokio::time::Instant::now() + MEDIA_HTTP_TOTAL_TIMEOUT,
         None,
         None,
         move |url| async move { media_http_client_for_url(&url, true).await },
@@ -531,7 +548,7 @@ async fn fetch_profile_image_impl(url: &str, max_bytes: u64) -> Result<Vec<u8>, 
     fetch_http_with_bounded_redirects(
         current,
         max_bytes,
-        MEDIA_HTTP_TOTAL_TIMEOUT,
+        tokio::time::Instant::now() + MEDIA_HTTP_TOTAL_TIMEOUT,
         None,
         None,
         move |url| async move { media_http_client_for_profile(&url).await },
@@ -557,7 +574,7 @@ pub(crate) fn vet_profile_fetch_resolved_addresses(addrs: &[SocketAddr]) -> Resu
 async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     mut current: Url,
     max_body_bytes: u64,
-    request_timeout: Duration,
+    deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
     telemetry: Option<&AppPerformanceTelemetry>,
     mut client_for_url: C,
@@ -569,7 +586,6 @@ where
     R: FnMut(&Url, &str) -> Result<Url, AppError>,
 {
     let mut redirects = 0_usize;
-    let deadline = tokio::time::Instant::now() + request_timeout;
     let startup_deadline = startup_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
 
     loop {
@@ -667,10 +683,13 @@ where
         };
         let status = response.status();
         if status.is_success() {
+            let first_byte_deadline = startup_deadline
+                .map(|startup_deadline| startup_deadline.min(deadline))
+                .unwrap_or(deadline);
             return read_limited_blossom_body_until(
                 response,
                 max_body_bytes,
-                startup_deadline,
+                Some(first_byte_deadline),
                 telemetry,
             )
             .await;
@@ -998,20 +1017,20 @@ async fn read_limited_blossom_body_until(
             }
         };
         let Some(chunk) = next else {
-            if body_started.is_none() {
-                record_download_phase(
+            match body_started {
+                Some(started_at) => record_download_phase(
+                    telemetry,
+                    AppPerformanceOperation::MediaDownloadBodyTransfer,
+                    started_at,
+                    true,
+                ),
+                None => record_download_phase(
                     telemetry,
                     AppPerformanceOperation::MediaDownloadFirstByte,
                     first_byte_started,
-                    true,
-                );
+                    false,
+                ),
             }
-            record_download_phase(
-                telemetry,
-                AppPerformanceOperation::MediaDownloadBodyTransfer,
-                body_started.unwrap_or_else(Instant::now),
-                true,
-            );
             break;
         };
         if body_started.is_none() {

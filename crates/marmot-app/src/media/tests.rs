@@ -1866,6 +1866,42 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     );
 }
 
+/// Expiring the shared deadline while a later locator is active must leave a
+/// failed sample for the transport phase that consumed the remaining budget.
+#[tokio::test]
+async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
+    let body = b"healthy ciphertext";
+    let (first_url, first_server) = spawn_stalled_http_server().await;
+    let (second_url, second_server) = spawn_stalled_http_server().await;
+    let reference = blob_reference_for_servers(body, &[first_url, second_url]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        Duration::from_millis(130),
+    );
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let error = fetch_encrypted_media_blob_with_observer(
+        &reference,
+        &[],
+        &allowed,
+        &transport,
+        Some(&telemetry),
+    )
+    .await
+    .expect_err("the shared transfer deadline must still expire");
+    first_server.abort();
+    second_server.abort();
+
+    assert!(error.to_string().contains("timed out"));
+    let response_headers = telemetry.snapshot().media_download_response_headers;
+    assert_eq!(response_headers.attempts, 2);
+    assert_eq!(response_headers.successes, 0);
+    assert_eq!(response_headers.failures, 2);
+}
+
 #[tokio::test]
 async fn corrupt_first_locator_does_not_prevent_integrity_valid_fallback() {
     let body = b"integrity-valid ciphertext";
@@ -1986,6 +2022,30 @@ async fn oversized_content_length_does_not_record_body_transfer_timing() {
     assert!(err.to_string().contains("download exceeds"));
     let snapshot = telemetry.snapshot();
     assert_eq!(snapshot.media_download_response_headers.attempts, 1);
+    assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
+}
+
+/// EOF before any body bytes is a failed first-byte phase, not a successful
+/// zero-duration transfer.
+#[tokio::test]
+async fn empty_response_records_first_byte_failure_without_body_transfer_timing() {
+    let server = spawn_http_response(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
+    let url = format!("{server}/{}.bin", valid_hash());
+    let transport = BlossomHttpTransport::new(true);
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+
+    let body = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
+        .await
+        .expect("an empty response remains available for integrity validation");
+
+    assert!(body.is_empty());
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.media_download_response_headers.successes, 1);
+    assert_eq!(snapshot.media_download_first_byte.attempts, 1);
+    assert_eq!(snapshot.media_download_first_byte.successes, 0);
+    assert_eq!(snapshot.media_download_first_byte.failures, 1);
     assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
 }
 

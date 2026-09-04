@@ -957,16 +957,19 @@ async fn fetch_encrypted_media_blob_with_observer(
                 continue;
             }
         }
-        let remaining = download_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        if download_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .is_zero()
+        {
             return Err(AppError::BlobStore("media download timed out".into()));
         }
-        let fetched = tokio::time::timeout(
-            remaining,
-            blossom::fetch_blossom_blob_with_observer(&candidate, transport, telemetry),
+        let fetched = blossom::fetch_blossom_blob_with_observer_until(
+            &candidate,
+            transport,
+            telemetry,
+            download_deadline,
         )
-        .await
-        .map_err(|_| AppError::BlobStore("media download timed out".into()))?;
+        .await;
         match fetched {
             Ok(bytes) => {
                 let verify_started = Instant::now();
