@@ -43,6 +43,16 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "client", "error"],
+          "properties": {
+            "type": { "const": "expect_tick_error" },
+            "client": { "type": "string", "minLength": 1 },
+            "error": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "group", "action"],
           "properties": {
             "type": { "const": "in_group" },

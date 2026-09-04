@@ -950,8 +950,8 @@ impl<S: StorageProvider> Engine<S> {
         // Building a group from a staged Welcome performs the same multi-row
         // OpenMLS store as group creation. Keep KeyPackage consumption, stale
         // live-state clearing, that store, every Marmot post-check, the
-        // discoverable group record, capability cache, and both durable
-        // Welcome dispositions in one transaction.
+        // discoverable group record, joined-epoch recovery anchor, capability
+        // cache, and both durable Welcome dispositions in one transaction.
         let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) =
             self.storage.with_transaction(|storage| {
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
@@ -990,37 +990,88 @@ impl<S: StorageProvider> Engine<S> {
                         .as_slice()
                         .to_vec(),
                 );
+                // The epoch is still unverified at this point. It is used only
+                // to decide whether a distinct Welcome is worth attempting as
+                // a replacement for local live state. Every replacement write
+                // remains inside this transaction and is committed only after
+                // OpenMLS verifies the GroupInfo and the Marmot membership,
+                // capability, and admin checks below all succeed.
+                let incoming_epoch = EpochId(processed.unverified_group_info().epoch().as_u64());
                 if storage.disband_tombstone(&group_id)?.is_some() {
                     return Err(EngineError::InvalidWelcome);
                 }
 
                 let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
-                let (local_state_is_stale, repaired_unrecoverable) =
-                    match storage.get_group(&group_id) {
-                        Ok(group) => {
-                            let self_is_recorded_member = group
-                                .members
-                                .iter()
-                                .any(|member| &member.id == self.identity.self_id());
-                            if self_is_recorded_member && !group.unrecoverable {
+                let (local_state_is_stale, repaired_unrecoverable) = match storage
+                    .get_group(&group_id)
+                {
+                    Ok(group) => {
+                        let self_is_recorded_member = group
+                            .members
+                            .iter()
+                            .any(|member| &member.id == self.identity.self_id());
+                        if self_is_recorded_member && !group.unrecoverable {
+                            if incoming_epoch <= group.epoch {
                                 // A distinct transport/content id does not make a
-                                // second normal Welcome for an already-active group
-                                // a rejoin. Reject before OpenMLS staging and let
-                                // the surrounding transaction restore KeyPackage
+                                // same- or older-epoch Welcome for an already-active
+                                // group a rejoin. Reject before OpenMLS staging and
+                                // let the surrounding transaction restore KeyPackage
                                 // consumption and every tentative write.
                                 return Err(EngineError::WelcomeAlreadyProcessed);
                             }
-                            // Unrecoverable is the explicit exception: a fully
-                            // authenticated replacement Welcome is a protocol-defined
-                            // repair even though the frozen record still lists us as
-                            // a member. The surrounding transaction restores the old
-                            // OpenMLS state and KeyPackage on any later validation
-                            // failure, so clearing the live rows remains tentative.
-                            (true, group.unrecoverable)
+
+                            // Epoch freshness is not branch continuity. A member can
+                            // fork the same group id, advance that fork, rewrite its
+                            // admin component, and issue a cryptographically valid
+                            // newer Welcome. Replacing healthy active state here would
+                            // let that uncorroborated fork destroy the trusted branch.
+                            //
+                            // A legitimate re-entry remains possible after this engine
+                            // processes the current branch's removal, at which point the
+                            // durable record no longer lists this identity. This error is
+                            // deliberately non-terminal so that exact Welcome can be
+                            // retried after the trusted removal arrives. Consulting the
+                            // durable record also closes the cold-start window before the
+                            // epoch manager has been hydrated.
+                            return Err(EngineError::InvalidTransition(
+                                cgka_traits::engine_state::InvalidTransition {
+                                    from: "ActiveMember",
+                                    to: "JoinWelcome",
+                                    reason: "replacement Welcome requires trusted removal evidence",
+                                },
+                            ));
                         }
-                        Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
-                        Err(error) => return Err(EngineError::Storage(error)),
-                    };
+                        // Unrecoverable is the explicit exception: a fully
+                        // authenticated replacement Welcome is a protocol-defined
+                        // repair even though the frozen record still lists us as
+                        // a member. The surrounding transaction restores the old
+                        // OpenMLS state and KeyPackage on any later validation
+                        // failure, so clearing the live rows remains tentative.
+                        (true, group.unrecoverable)
+                    }
+                    Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
+                    Err(error) => return Err(EngineError::Storage(error)),
+                };
+                if local_state_is_stale
+                    && let Some(state) = self.epoch_manager.state(&group_id)
+                    && state.is_resolving_local_publish()
+                {
+                    // The held publication belongs to the local group copy
+                    // this replacement would discard. Let its explicit
+                    // confirm/rollback transition finish first; otherwise the
+                    // durable replacement can commit while `set_stable` below
+                    // correctly refuses to overwrite PendingPublish/Merging,
+                    // splitting the epoch manager from the installed group.
+                    // This error is deliberately non-terminal for Welcome
+                    // deduplication, so the identical Welcome can be retried.
+                    return Err(EngineError::InvalidTransition(
+                        cgka_traits::engine_state::InvalidTransition {
+                            from: state.name(),
+                            to: "JoinWelcome",
+                            reason: "replacement Welcome requires the local publication to resolve",
+                        },
+                    ));
+                }
                 if local_state_is_stale {
                     self.clear_live_openmls_group_on_storage(storage, &group_id)?;
                 }
@@ -1202,6 +1253,14 @@ impl<S: StorageProvider> Engine<S> {
                     lifecycle.last_consumed_at = Some(joined_at);
                     maintenance.put_key_package_lifecycle(&lifecycle)?;
                 }
+
+                // A Welcome-installed member must retain the joined epoch
+                // before it can safely advance locally. Otherwise a sibling
+                // commit authored from this epoch but delivered after our own
+                // publish cannot be peeled and never enters convergence. Keep
+                // the anchor in this transaction so a snapshot failure also
+                // restores the consumed KeyPackage and every staged join row.
+                self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
 
                 Ok::<_, EngineError>((
                     group_id,

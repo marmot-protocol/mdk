@@ -31,6 +31,7 @@ mod failure_capsule;
 pub mod family;
 mod large_group_family;
 pub mod lifecycle_model;
+mod membership_reentry_family;
 pub mod mutation_adequacy;
 pub mod node_protocol;
 mod offline_catchup_family;
@@ -123,6 +124,10 @@ pub use large_group_family::{
     LARGE_GROUP_PRESSURE_FAMILY, LARGE_GROUP_PRESSURE_GENERATOR_VERSION,
     LARGE_GROUP_PRESSURE_PROFILE_VERSION, generate_large_group_pressure_case,
     generate_large_group_pressure_family,
+};
+pub use membership_reentry_family::{
+    MEMBERSHIP_REENTRY_FAMILY, MEMBERSHIP_REENTRY_GENERATOR_VERSION,
+    generate_membership_reentry_case, generate_membership_reentry_family,
 };
 pub use offline_catchup_family::{
     OFFLINE_CATCHUP_PRESSURE_FAMILY, OFFLINE_CATCHUP_PRESSURE_GENERATOR_VERSION,

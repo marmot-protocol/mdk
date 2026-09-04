@@ -1953,6 +1953,7 @@ fn process_relay_control_error(error: ProcessRelayControlError) -> ProcessOrches
 fn action_participant(step: &ScenarioStep) -> Option<String> {
     match step {
         ScenarioStep::ExpectUpdateAdminPolicyError { client, .. }
+        | ScenarioStep::ExpectTickError { client, .. }
         | ScenarioStep::ClearStorageFault { target: client } => Some(client.clone()),
         ScenarioStep::InjectStorageFault { fault } => Some(fault.target.clone()),
         _ => None,

@@ -16,12 +16,13 @@ use crate::{
 
 /// Stable canonical version for the original Scenario IR action set.
 pub const SCENARIO_IR_V2_VERSION: &str = "2";
-/// Canonical version that adds full group-profile updates.
+/// Canonical version that adds full group-profile updates and expected tick
+/// errors for retryable transport refusals.
 pub const SCENARIO_IR_V3_VERSION: &str = "3";
 /// Newest Scenario IR version emitted when newly authored actions require it.
 pub const SCENARIO_IR_LATEST_VERSION: &str = SCENARIO_IR_V3_VERSION;
 /// Action kinds introduced after Scenario IR v2.
-pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &["update_group_profile"];
+pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &["update_group_profile", "expect_tick_error"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioActionScheduleV2 {
@@ -336,6 +337,7 @@ fn validate_step(
         }
         ScenarioStep::SelfUpdate { client, .. }
         | ScenarioStep::UpdateGroupData { client, .. }
+        | ScenarioStep::ExpectTickError { client, .. }
         | ScenarioStep::Leave { client }
         | ScenarioStep::RestartClient { client }
         | ScenarioStep::SetClientOffline { client }

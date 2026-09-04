@@ -118,7 +118,7 @@ async fn ordinary_delivery_still_converges_when_the_transport_seals_per_epoch() 
     // The visibility model must not break the uncontested path: a member that
     // shares the sender's epoch state peels and applies exactly as before.
     let mut alice = build_client(b"sealed-alice");
-    let mut bob = build_client(b"sealed-bob");
+    let (mut bob, bob_storage) = build_client_with_storage(b"sealed-bob");
     let mut carol = build_client(b"sealed-carol");
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -144,6 +144,13 @@ async fn ordinary_delivery_still_converges_when_the_transport_seals_per_epoch() 
         other => panic!("unexpected create result: {other:?}"),
     };
     bob.join_welcome(welcome).await.unwrap();
+    assert!(
+        bob_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-1".to_string()),
+        "a Welcome join must atomically retain its joined epoch for later sibling-branch peeling"
+    );
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
     let commit = match alice

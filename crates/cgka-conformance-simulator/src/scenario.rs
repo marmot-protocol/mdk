@@ -132,6 +132,13 @@ pub enum ScenarioStep {
     Tick {
         clients: Vec<String>,
     },
+    /// Tick one participant and require the adapter to surface the named
+    /// normalized error. This keeps an expected, retryable transport refusal
+    /// in the trace without terminating the rest of the scenario.
+    ExpectTickError {
+        client: String,
+        error: String,
+    },
     /// Advance both convergence-clock domains without waking a participant.
     /// Use `Tick` to select which participant runtimes observe elapsed time.
     AdvanceTime {
@@ -248,6 +255,7 @@ impl ScenarioStep {
         "leave",
         "deliver_all",
         "tick",
+        "expect_tick_error",
         "advance_time",
         "await_quiescence",
         "observe",
@@ -311,6 +319,7 @@ impl ScenarioStep {
             ScenarioStep::Leave { .. } => "leave",
             ScenarioStep::DeliverAll => "deliver_all",
             ScenarioStep::Tick { .. } => "tick",
+            ScenarioStep::ExpectTickError { .. } => "expect_tick_error",
             ScenarioStep::AdvanceTime { .. } => "advance_time",
             ScenarioStep::AwaitQuiescence { .. } => "await_quiescence",
             ScenarioStep::Observe { .. } => "observe",
@@ -921,6 +930,31 @@ async fn execute_scenario_step(
                         step_index,
                         client: client_label,
                         operation: "update_admin_policy".into(),
+                        error: actual.code,
+                    });
+                }
+            }
+        }
+        ScenarioStep::ExpectTickError { client, error } => {
+            let client_label = client.clone();
+            match subject.tick(std::slice::from_ref(client)).await {
+                Ok(()) => {
+                    return Err(err(
+                        step_index,
+                        format!("tick unexpectedly succeeded; expected {error}"),
+                    ));
+                }
+                Err(actual) => {
+                    if &actual.code != error {
+                        return Err(err(
+                            step_index,
+                            format!("tick failed with {}; expected {error}", actual.code),
+                        ));
+                    }
+                    error_observations.push(ScenarioErrorObservation {
+                        step_index,
+                        client: client_label,
+                        operation: "tick".into(),
                         error: actual.code,
                     });
                 }

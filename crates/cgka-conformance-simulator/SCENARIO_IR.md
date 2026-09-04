@@ -4,7 +4,7 @@ The simulator has two deliberately separate inputs:
 
 - `ScenarioSpec` v2 and v3 are canonical adapter-neutral JSON IRs. Both contain only a linear sequence of executable
   atomic actions. V2 remains replayable through `schemas/scenario-ir.v2.schema.json`; v3 adds the full
-  `update_group_profile` action through `schemas/scenario-ir.v3.schema.json`.
+  `update_group_profile` action and expected tick-error observation through `schemas/scenario-ir.v3.schema.json`.
 - `ScenarioAuthoringSpec` v1 is human-oriented structure. It may be represented as JSON or YAML, but it is never passed
   to an adapter. The repository compiler deterministically lowers it to canonical JSON first, emitting v2 unless an
   expanded action requires v3. Its schema is `schemas/scenario-authoring.v1.schema.json`.
@@ -29,6 +29,10 @@ Scenario IR v2's `update_group_data` action is the stable name-only operation. S
 `update_group_profile` action carries optional `name` and `description` fields and requires at least one of them. A
 missing field means preserve the adopted canonical value; an explicitly empty string clears that field. The compiler
 rejects the v3 action in a v2 document rather than silently changing v2 serialization or semantics.
+V3 also adds `expect_tick_error`, which ticks exactly one participant, records the normalized error when it matches,
+and lets the scenario continue. It is intended for retryable transport refusals where a later action replays the same
+input after the prerequisite state arrives; an unexpected success or a different error still fails the scenario. An
+adapter must advertise both transport delivery and expected-transport-error observation before this action executes.
 That split is intentional because canonical JSON is persisted in vectors and failure capsules and exchanged with
 external campaign runners; adding fields to an existing action version would change the meaning accepted by a v2
 consumer even when this repository's current fixtures omit them.

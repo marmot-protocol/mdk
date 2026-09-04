@@ -125,6 +125,24 @@ fi
 grep -F 'pinned Hermes wheel URL does not match HERMES_AGENT_VERSION' \
     "$drift_stderr" >/dev/null
 
+# A pinned commit already present in a successful full clone must be checked
+# out locally instead of making a redundant fetch. This keeps the CI setup from
+# failing when GitHub rate-limits a second request immediately after the clone.
+local_ref_capture="$tmp_parent/github-local-ref-capture"
+local_ref_root="$tmp_parent/github-local-ref"
+env \
+    PATH="$auth_fake_bin:$PATH" \
+    GITHUB_TOKEN="test-actions-token" \
+    AUTH_CAPTURE="$local_ref_capture" \
+    "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
+        --root "$local_ref_root" \
+        --hermes-ref "$(printf 'ab%.0s' {1..20})" \
+        --no-enable-plugin
+[ "$(grep -c '^count=' "$local_ref_capture")" -eq 1 ]
+[ "$(grep -Fxc 'count=1' "$local_ref_capture")" -eq 1 ]
+[ "$(grep -Fxc 'key=http.https://github.com/.extraheader' "$local_ref_capture")" -eq 1 ]
+[ "$(grep -Fxc "value=AUTHORIZATION: basic $expected_basic" "$local_ref_capture")" -eq 1 ]
+
 "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
     --root "$dev_root" \
     --skip-hermes-install \

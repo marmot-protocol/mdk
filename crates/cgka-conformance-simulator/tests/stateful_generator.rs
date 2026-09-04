@@ -12,6 +12,7 @@ fn generated_journeys_are_deterministic_legal_canonical_ir() {
     assert_eq!(cases, generate_stateful_chat_journey_family(0x5eed, 8));
 
     let mut corpus_kinds = BTreeSet::new();
+    let mut observed_reentry = false;
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.scenario.spec_version, "3");
         compile_scenario(&case.scenario).expect("generated canonical IR compiles");
@@ -24,6 +25,7 @@ fn generated_journeys_are_deterministic_legal_canonical_ir() {
             .map(ScenarioStep::kind)
             .collect::<BTreeSet<_>>();
         corpus_kinds.extend(kinds.iter().copied());
+        observed_reentry |= contains_remove_then_reinvite(&case.scenario.steps);
         assert!(kinds.contains("update_group_profile"));
         assert!(kinds.contains("send_app_message"));
         assert!(kinds.contains("observe_exact"));
@@ -46,6 +48,11 @@ fn generated_journeys_are_deterministic_legal_canonical_ir() {
             assert!(kinds.contains("await_quiescence"));
         }
     }
+
+    assert!(
+        observed_reentry,
+        "the eight-case rotation must exercise a removed identity's fresh re-invitation"
+    );
 
     for required in [
         "invite_members",
@@ -188,6 +195,7 @@ fn assert_legal_journey(steps: &[ScenarioStep]) {
                 for invitee in invitees {
                     assert!(!members.contains(invitee));
                     members.insert(invitee.clone());
+                    online.insert(invitee.clone());
                 }
             }
             ScenarioStep::RemoveMembers {
@@ -201,7 +209,6 @@ fn assert_legal_journey(steps: &[ScenarioStep]) {
                 for member in removed {
                     assert!(members.remove(member));
                     admins.remove(member);
-                    online.remove(member);
                 }
             }
             ScenarioStep::SelfUpdate { client, .. }
@@ -241,4 +248,22 @@ fn assert_legal_journey(steps: &[ScenarioStep]) {
             _ => {}
         }
     }
+}
+
+fn contains_remove_then_reinvite(steps: &[ScenarioStep]) -> bool {
+    let mut removed = BTreeSet::new();
+    for step in steps {
+        match step {
+            ScenarioStep::RemoveMembers { members, .. } => {
+                removed.extend(members.iter().cloned());
+            }
+            ScenarioStep::InviteMembers { invitees, .. }
+                if invitees.iter().any(|invitee| removed.contains(invitee)) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
