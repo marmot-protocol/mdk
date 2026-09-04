@@ -61,6 +61,7 @@ pub struct HarnessClient {
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
+    deferred_peel_limits_override: Option<(usize, usize, usize)>,
     completed_replay_probe_count: u64,
     completed_engine_metrics: EngineMetricsSnapshot,
     virtual_time_tick_enabled: bool,
@@ -295,6 +296,24 @@ pub(crate) fn merge_engine_metrics(
         &mut target.deferred_peel_candidate_enumeration_ms,
         &source.deferred_peel_candidate_enumeration_ms,
     );
+    target.deferred_peel_row_capacity_refusals = target
+        .deferred_peel_row_capacity_refusals
+        .saturating_add(source.deferred_peel_row_capacity_refusals);
+    target.deferred_peel_group_byte_capacity_refusals = target
+        .deferred_peel_group_byte_capacity_refusals
+        .saturating_add(source.deferred_peel_group_byte_capacity_refusals);
+    target.deferred_peel_account_byte_capacity_refusals = target
+        .deferred_peel_account_byte_capacity_refusals
+        .saturating_add(source.deferred_peel_account_byte_capacity_refusals);
+    target.deferred_peel_peak_rows_per_group = target
+        .deferred_peel_peak_rows_per_group
+        .max(source.deferred_peel_peak_rows_per_group);
+    target.deferred_peel_peak_bytes_per_group = target
+        .deferred_peel_peak_bytes_per_group
+        .max(source.deferred_peel_peak_bytes_per_group);
+    target.deferred_peel_peak_bytes_per_account = target
+        .deferred_peel_peak_bytes_per_account
+        .max(source.deferred_peel_peak_bytes_per_account);
     merge_histogram(
         &mut target.queued_outbound_wait_ms,
         &source.queued_outbound_wait_ms,
@@ -422,7 +441,13 @@ mod tests {
             deferred_peel_candidate_cache_misses: 55,
             deferred_peel_candidate_cache_invalidations: 56,
             deferred_peel_candidate_enumeration_ms: histogram(57, 58, 59),
-            queued_outbound_wait_ms: histogram(60, 61, 62),
+            deferred_peel_row_capacity_refusals: 60,
+            deferred_peel_group_byte_capacity_refusals: 61,
+            deferred_peel_account_byte_capacity_refusals: 62,
+            deferred_peel_peak_rows_per_group: 63,
+            deferred_peel_peak_bytes_per_group: 64,
+            deferred_peel_peak_bytes_per_account: 65,
+            queued_outbound_wait_ms: histogram(66, 67, 68),
         };
         let mut target = EngineMetricsSnapshot::default();
 
@@ -657,6 +682,7 @@ pub struct ClientBuilder {
     convergence_clock: Option<Arc<dyn ConvergenceClock>>,
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
+    deferred_peel_limits_override: Option<(usize, usize, usize)>,
 }
 
 pub(crate) enum HarnessPublicationError {
@@ -797,6 +823,7 @@ impl ClientBuilder {
             convergence_clock: None,
             disable_app_witnesses_for_tests: false,
             replay_probe_budget_override: None,
+            deferred_peel_limits_override: None,
         }
     }
 
@@ -853,6 +880,18 @@ impl ClientBuilder {
         self
     }
 
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn deferred_peel_limits_for_tests(
+        mut self,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) -> Self {
+        self.deferred_peel_limits_override =
+            Some((rows_per_group, bytes_per_group, bytes_per_account));
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let storage_backing = match self.explicit_file_storage {
             Some(explicit) => HarnessStorageBacking::from_explicit(explicit),
@@ -872,6 +911,7 @@ impl ClientBuilder {
                 convergence_clock: self.convergence_clock.as_ref(),
                 disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
                 replay_probe_budget_override: self.replay_probe_budget_override,
+                deferred_peel_limits_override: self.deferred_peel_limits_override,
             },
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
@@ -889,6 +929,7 @@ impl ClientBuilder {
             convergence_clock: self.convergence_clock,
             disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
             replay_probe_budget_override: self.replay_probe_budget_override,
+            deferred_peel_limits_override: self.deferred_peel_limits_override,
             completed_replay_probe_count: 0,
             completed_engine_metrics: EngineMetricsSnapshot::default(),
             virtual_time_tick_enabled: false,
@@ -918,6 +959,7 @@ struct HarnessEngineOptions<'a> {
     convergence_clock: Option<&'a Arc<dyn ConvergenceClock>>,
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
+    deferred_peel_limits_override: Option<(usize, usize, usize)>,
 }
 
 fn build_harness_engine(
@@ -964,10 +1006,21 @@ fn build_harness_engine(
     if options.replay_probe_budget_override.is_some() {
         builder = builder.replay_probe_budget_for_tests(options.replay_probe_budget_override);
     }
+    #[cfg(feature = "test-policy-overrides")]
+    if let Some((rows_per_group, bytes_per_group, bytes_per_account)) =
+        options.deferred_peel_limits_override
+    {
+        builder = builder.deferred_peel_limits_for_tests(
+            rows_per_group,
+            bytes_per_group,
+            bytes_per_account,
+        );
+    }
     #[cfg(not(feature = "test-policy-overrides"))]
     let _ = (
         options.disable_app_witnesses_for_tests,
         options.replay_probe_budget_override,
+        options.deferred_peel_limits_override,
     );
     builder.build().expect("engine builds")
 }
@@ -1252,6 +1305,7 @@ impl HarnessClient {
                 convergence_clock: self.convergence_clock.as_ref(),
                 disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
                 replay_probe_budget_override: self.replay_probe_budget_override,
+                deferred_peel_limits_override: self.deferred_peel_limits_override,
             },
         );
         engine
@@ -1280,6 +1334,22 @@ impl HarnessClient {
     pub fn set_replay_probe_budget_for_tests(&mut self, limit: Option<u64>) {
         self.replay_probe_budget_override = limit;
         self.engine_mut().set_replay_probe_budget_for_tests(limit);
+    }
+
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn set_deferred_peel_limits_for_tests(
+        &mut self,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) {
+        self.deferred_peel_limits_override =
+            Some((rows_per_group, bytes_per_group, bytes_per_account));
+        self.engine_mut().set_deferred_peel_limits_for_tests(
+            rows_per_group,
+            bytes_per_group,
+            bytes_per_account,
+        );
     }
 
     /// Freeze the current durable pass at its quiescence boundary. This is a

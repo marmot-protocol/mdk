@@ -757,6 +757,7 @@ impl EngineHarnessSubject {
             protocol_profile,
             storage_mode,
             false,
+            None,
         )
     }
 
@@ -775,6 +776,29 @@ impl EngineHarnessSubject {
             protocol_profile,
             storage_mode,
             true,
+            None,
+        )
+    }
+
+    /// Build a resource-policy campaign subject with explicit deferred-peel
+    /// row and byte budgets. This seam is absent from production builds.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn new_with_deferred_peel_limits_for_tests(
+        clients: &[String],
+        topology: &crate::ScenarioTopologyV2,
+        protocol_profile: ProtocolProfile,
+        storage_mode: HarnessStorageMode,
+        rows_per_group: usize,
+        bytes_per_group: usize,
+        bytes_per_account: usize,
+    ) -> Result<Self, SubjectError> {
+        Self::new_with_topology_and_witness_mode(
+            clients,
+            topology,
+            protocol_profile,
+            storage_mode,
+            false,
+            Some((rows_per_group, bytes_per_group, bytes_per_account)),
         )
     }
 
@@ -784,6 +808,7 @@ impl EngineHarnessSubject {
         protocol_profile: ProtocolProfile,
         storage_mode: HarnessStorageMode,
         disable_app_witnesses_for_tests: bool,
+        deferred_peel_limits_override: Option<(usize, usize, usize)>,
     ) -> Result<Self, SubjectError> {
         let bus = TransportBus::ordered();
         let convergence_clock = ManualConvergenceClock::new(0, 0);
@@ -831,8 +856,18 @@ impl EngineHarnessSubject {
             } else {
                 builder
             };
+            #[cfg(feature = "test-policy-overrides")]
+            let builder =
+                if let Some((rows, group_bytes, account_bytes)) = deferred_peel_limits_override {
+                    builder.deferred_peel_limits_for_tests(rows, group_bytes, account_bytes)
+                } else {
+                    builder
+                };
             #[cfg(not(feature = "test-policy-overrides"))]
-            let _ = disable_app_witnesses_for_tests;
+            let _ = (
+                disable_app_witnesses_for_tests,
+                deferred_peel_limits_override,
+            );
             let client = builder.attach(&bus);
             attached.insert(label.clone(), client);
             identity_seeds.insert(label.clone(), identity_seed);

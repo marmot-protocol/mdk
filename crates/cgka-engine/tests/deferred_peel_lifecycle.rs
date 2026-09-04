@@ -1656,6 +1656,12 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
             ..
         }
     ));
+    let capacity_metrics = carol.engine_metrics();
+    assert_eq!(capacity_metrics.deferred_peel_row_capacity_refusals, 1);
+    assert_eq!(
+        capacity_metrics.deferred_peel_peak_rows_per_group,
+        MAX_PEEL_DEFERRED_ROWS_PER_GROUP as u64
+    );
 
     let retained = carol_storage
         .list_messages(&group_id, EpochId(0))
@@ -1702,6 +1708,120 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         carol.ingest(overflow).await.unwrap(),
         IngestOutcome::Processed
     ));
+}
+
+/// The test-only override can isolate the per-group byte budget independently
+/// of the row and account bounds.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn peel_deferred_group_byte_budget_refuses_growth_without_persisting_it() {
+    let (mut alice, mut carol, storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    carol.set_deferred_peel_limits_for_tests(512, usize::MAX, usize::MAX);
+
+    let template = send_app(&mut alice, &group_id, "group byte budget").await;
+    let first = TransportMessage {
+        id: MessageId::new(b"group-byte-0001".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(first.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let first_bytes = storage.get_message(&first.id).unwrap().payload.len();
+    carol.set_deferred_peel_limits_for_tests(512, first_bytes.saturating_mul(2), usize::MAX);
+
+    let second = TransportMessage {
+        id: MessageId::new(b"group-byte-0002".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(second).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+
+    let overflow = TransportMessage {
+        id: MessageId::new(b"group-byte-0003".to_vec()),
+        ..template
+    };
+    assert!(matches!(
+        carol.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert!(matches!(
+        storage.get_message(&overflow.id),
+        Err(StorageError::NotFound)
+    ));
+    let metrics = carol.engine_metrics();
+    assert_eq!(metrics.deferred_peel_row_capacity_refusals, 0);
+    assert_eq!(metrics.deferred_peel_group_byte_capacity_refusals, 1);
+    assert_eq!(metrics.deferred_peel_account_byte_capacity_refusals, 0);
+    assert_eq!(
+        metrics.deferred_peel_peak_bytes_per_group,
+        first_bytes.saturating_mul(2) as u64
+    );
+}
+
+/// Account-wide byte accounting is reconstructed from durable deferred rows
+/// after restart before a new row can be admitted.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn peel_deferred_account_byte_budget_is_restart_safe() {
+    let (mut alice, mut carol, storage, _peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let template = send_app(&mut alice, &group_id, "account byte budget").await;
+    let first = TransportMessage {
+        id: MessageId::new(b"account-byte-0001".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(first.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let first_bytes = storage.get_message(&first.id).unwrap().payload.len();
+    drop(carol);
+
+    let clock = ManualConvergenceClock::new(2_000, 20_000);
+    let (mut restarted, _, _) =
+        build_counting_client_with_storage_and_clock(b"carol", storage.clone(), clock);
+    restarted.hydrate_all_stored_groups().unwrap();
+    restarted.set_deferred_peel_limits_for_tests(512, usize::MAX, first_bytes.saturating_mul(2));
+
+    let second = TransportMessage {
+        id: MessageId::new(b"account-byte-0002".to_vec()),
+        ..template.clone()
+    };
+    assert!(matches!(
+        restarted.ingest(second).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+
+    let overflow = TransportMessage {
+        id: MessageId::new(b"account-byte-0003".to_vec()),
+        ..template
+    };
+    assert!(matches!(
+        restarted.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+            ..
+        }
+    ));
+    assert!(matches!(
+        storage.get_message(&overflow.id),
+        Err(StorageError::NotFound)
+    ));
+    let metrics = restarted.engine_metrics();
+    assert_eq!(metrics.deferred_peel_row_capacity_refusals, 0);
+    assert_eq!(metrics.deferred_peel_group_byte_capacity_refusals, 0);
+    assert_eq!(metrics.deferred_peel_account_byte_capacity_refusals, 1);
+    assert_eq!(
+        metrics.deferred_peel_peak_bytes_per_account,
+        first_bytes.saturating_mul(2) as u64
+    );
 }
 
 /// An application message from before this device joined is terminal on

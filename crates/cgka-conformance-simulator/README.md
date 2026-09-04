@@ -198,7 +198,9 @@ Every `ScenarioReport` embeds `campaign_measurements` v1. Its convergence latenc
 final successful `await_quiescence` action, or explicitly unavailable when the scenario does not request one;
 queued-send blocking time starts only when an engine accepts a send as queued and ends at publication or terminal
 refusal/rollback. Passes count observed convergence decisions across clients. Reorg count,
-rewind depth, and lateness use the engine's diagnostic counters/histograms and survive harness restarts. Input
+rewind depth, and lateness use the engine's diagnostic counters/histograms and survive harness restarts. Deferred-peel
+sweeps, row/group-byte/account-byte capacity refusals, and row/byte high-water marks expose aggregate policy pressure
+without identifiers or payloads and likewise survive harness restarts. Input
 dispositions and logical delivery/expiry/invalidation come from the final per-client scenario ledger; queue depth is
 the maximum sampled after scenario actions; replay probes are exact completed OpenMLS replay probes; database size is
 the aggregate SQLite, WAL, and SHM footprint for file-backed subjects.

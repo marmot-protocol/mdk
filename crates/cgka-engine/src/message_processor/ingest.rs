@@ -325,20 +325,28 @@ impl<S: StorageProvider> Engine<S> {
         // excluded from settlement math and replay through
         // retry_deferred_peels once repair clears the quarantine.
         if self.quarantined_reason(&group_id).is_some() {
-            let already_retained = matches!(
-                self.storage.get_message(&msg.id),
-                Ok(record) if record.state == MessageState::PeelDeferred
-            );
-            if already_retained || self.has_peel_deferred_capacity(&group_id)? {
+            let previous_deferred_payload_bytes = self
+                .storage
+                .get_message(&msg.id)
+                .ok()
+                .filter(|record| record.state == MessageState::PeelDeferred)
+                .map(|record| record.payload.len());
+            let deferred_payload_bytes = StoredMessagePayload::raw_transport(msg.clone())
+                .encode()
+                .map_err(|error| EngineError::Serialize(format!("{error:?}")))?
+                .len();
+            if self.has_peel_deferred_capacity(
+                &group_id,
+                previous_deferred_payload_bytes,
+                deferred_payload_bytes,
+            )? {
                 self.persist_transport_message_for_existing_group(
                     msg,
                     &group_id,
                     EpochId(0),
                     MessageState::PeelDeferred,
                 )?;
-                if !already_retained {
-                    self.note_peel_deferred_row_persisted(&group_id);
-                }
+                self.note_peel_deferred_row_persisted(&group_id, &msg.id, deferred_payload_bytes);
                 self.audit_group(
                     &group_id,
                     crate::audit_helpers::message_state_changed_event(
@@ -562,11 +570,21 @@ impl<S: StorageProvider> Engine<S> {
                     // per group; at the cap, new undecryptable input is
                     // dropped unpersisted and transport redelivery is the
                     // recovery path once the backlog drains.
-                    let already_retained = matches!(
-                        self.storage.get_message(&msg.id),
-                        Ok(record) if record.state == MessageState::PeelDeferred
-                    );
-                    if !already_retained && !self.has_peel_deferred_capacity(&group_id)? {
+                    let previous_deferred_payload_bytes = self
+                        .storage
+                        .get_message(&msg.id)
+                        .ok()
+                        .filter(|record| record.state == MessageState::PeelDeferred)
+                        .map(|record| record.payload.len());
+                    let deferred_payload_bytes = StoredMessagePayload::raw_transport(msg.clone())
+                        .encode()
+                        .map_err(|error| EngineError::Serialize(format!("{error:?}")))?
+                        .len();
+                    if !self.has_peel_deferred_capacity(
+                        &group_id,
+                        previous_deferred_payload_bytes,
+                        deferred_payload_bytes,
+                    )? {
                         self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
                         if self.should_audit_peel_deferred_cap_rejection(&group_id) {
                             self.audit_group(
@@ -596,9 +614,11 @@ impl<S: StorageProvider> Engine<S> {
                         current_epoch,
                         MessageState::PeelDeferred,
                     )?;
-                    if !already_retained {
-                        self.note_peel_deferred_row_persisted(&group_id);
-                    }
+                    self.note_peel_deferred_row_persisted(
+                        &group_id,
+                        &msg.id,
+                        deferred_payload_bytes,
+                    );
                     // A stable peel context may never change again. Keep
                     // the group scheduled so the durable residence
                     // deadline can retire this row without unrelated

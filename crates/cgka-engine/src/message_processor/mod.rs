@@ -20,6 +20,7 @@ pub(crate) use store::transition_staged_invite_welcomes;
 
 use crate::convergence_input::{ClassifiedConvergenceInput, ConvergenceInputContext};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
+use crate::engine_metrics::DeferredPeelCapacityResource;
 use crate::openmls_projection::decode_openmls_wire_projection;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
@@ -69,7 +70,25 @@ pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// the durable store without bound. At the cap, new undecryptable input is
 /// dropped unpersisted (transport redelivery is the recovery path once the
 /// backlog drains).
-pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
+pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 512;
+
+/// Maximum encoded `PeelDeferred` payload bytes retained for one group.
+///
+/// Row count alone is not a meaningful storage bound because the opaque
+/// transport payload is variable-length. This budget deliberately counts the
+/// exact encoded [`StoredMessagePayload`] bytes written to `MessageRecord`, so
+/// transport framing overhead is included and every storage backend applies
+/// the same policy.
+pub const MAX_PEEL_DEFERRED_BYTES_PER_GROUP: usize = 16 * 1024 * 1024;
+
+/// Maximum encoded `PeelDeferred` payload bytes retained across one
+/// account-device database.
+///
+/// The per-group byte budget prevents one routing id from consuming the
+/// account, while this wider budget prevents the same flood from being spread
+/// across many known groups. One engine owns one account-device database, so
+/// this is the natural aggregate resource boundary.
+pub const MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT: usize = 64 * 1024 * 1024;
 
 /// Per-group cap on retained outbound intents (mdk#1246). Unlike the
 /// deferred-peel cap above, these rows are not peer-mintable — every one
@@ -91,9 +110,10 @@ pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 256;
 /// Too low refuses a legitimate burst against a group that would have
 /// recovered in seconds; too high lets the queue's marginal durable footprint
 /// (each row duplicates an app-projection row the app wrote before the engine
-/// was called) grow past what a mobile device can absorb. 256 matches
-/// `MAX_PEEL_DEFERRED_ROWS_PER_GROUP` and the other per-scope retention caps in
-/// the workspace, and sits far above any plausible human burst across a stall.
+/// was called) grow past what a mobile device can absorb. 256 sits far above
+/// any plausible human burst across a stall. This locally originated queue has
+/// a different threat model from peer-mintable deferred transport input and is
+/// therefore intentionally independent of the deferred-peel limits above.
 ///
 /// At the cap the send is refused with
 /// [`EngineError::QueuedOutboundAtCapacity`](cgka_traits::error::EngineError::QueuedOutboundAtCapacity)
@@ -158,6 +178,11 @@ pub(crate) struct DeferredPeelGroupState {
     /// Refreshed from storage on every sweep; adjusted at the deferral /
     /// terminal transition sites in between.
     deferred_rows: usize,
+    /// Encoded payload bytes held by those rows.
+    deferred_bytes: usize,
+    /// Exact retained ids and encoded lengths make replacement and retirement
+    /// accounting idempotent across nested ingest/replay paths.
+    deferred_payload_bytes_by_id: HashMap<MessageId, usize>,
     /// Whether `deferred_rows` has been initialized from storage this
     /// session.
     counted: bool,
@@ -208,13 +233,40 @@ struct DeferredPeelCandidateEnumerationFailure {
 }
 
 impl DeferredPeelGroupState {
-    fn has_capacity(&self) -> bool {
-        self.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP
+    fn has_capacity(
+        &self,
+        incoming_rows: usize,
+        incoming_bytes: usize,
+        row_limit: usize,
+        byte_limit: usize,
+    ) -> bool {
+        (incoming_rows == 0 || self.deferred_rows.saturating_add(incoming_rows) <= row_limit)
+            && (incoming_bytes == 0
+                || self.deferred_bytes.saturating_add(incoming_bytes) <= byte_limit)
     }
 
-    fn note_row_persisted(&mut self) {
-        self.deferred_rows += 1;
+    fn note_row_persisted(&mut self, id: MessageId, payload_bytes: usize) -> Option<usize> {
+        let previous = self.deferred_payload_bytes_by_id.insert(id, payload_bytes);
+        match previous {
+            Some(previous) => {
+                self.deferred_bytes = self
+                    .deferred_bytes
+                    .saturating_sub(previous)
+                    .saturating_add(payload_bytes);
+            }
+            None => {
+                self.deferred_rows = self.deferred_rows.saturating_add(1);
+                self.deferred_bytes = self.deferred_bytes.saturating_add(payload_bytes);
+            }
+        }
+        previous
     }
+}
+
+#[derive(Default)]
+pub(crate) struct DeferredPeelAccountState {
+    bytes: usize,
+    counted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1624,11 +1676,7 @@ impl<S: StorageProvider> Engine<S> {
         // this group's peel context reads storage, so an empty backlog must not
         // pay for it on every drain.
         let total = deferred.len();
-        {
-            let state = self.deferred_peel.entry(group_id.clone()).or_default();
-            state.deferred_rows = total;
-            state.counted = true;
-        }
+        self.refresh_peel_deferred_group_usage(group_id, &deferred);
         if total == 0 {
             self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
@@ -2149,7 +2197,7 @@ impl<S: StorageProvider> Engine<S> {
                 // Release the flood-cap slot whenever the row leaves the retry
                 // lifecycle, whether this arm retired it or ingest already
                 // terminalized it.
-                self.note_peel_deferred_row_retired(group_id);
+                self.note_peel_deferred_row_retired(record);
                 Ok(true)
             }
             Ok(
@@ -2172,7 +2220,7 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 // The cap-slot release stays outside the guard: the row has left
                 // the retry lifecycle regardless of who terminalized it.
-                self.note_peel_deferred_row_retired(group_id);
+                self.note_peel_deferred_row_retired(record);
                 Ok(true)
             }
             Err(EngineError::ForkedEpoch {
@@ -2181,7 +2229,7 @@ impl<S: StorageProvider> Engine<S> {
                 conflicting_epoch,
             }) => {
                 self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
-                self.note_peel_deferred_row_retired(group_id);
+                self.note_peel_deferred_row_retired(record);
                 Err(EngineError::ForkedEpoch {
                     group_id: forked_group_id,
                     last_stable,
@@ -2190,7 +2238,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(e) => {
                 self.update_stored_message_state(&record.id, MessageState::Retryable)?;
-                self.note_peel_deferred_row_retired(group_id);
+                self.note_peel_deferred_row_retired(record);
                 Err(e)
             }
         }
@@ -2343,38 +2391,168 @@ impl<S: StorageProvider> Engine<S> {
         Ok(edges)
     }
 
-    /// Check capacity for one new `PeelDeferred` row, lazily counting the
-    /// group's retained rows on first use this session. This deliberately does
-    /// not consume a slot: the caller records the row only after its durable
-    /// write succeeds, so a storage error cannot leak in-memory capacity.
+    /// Reconstruct exact deferred-peel usage across this account on the first
+    /// capacity-sensitive ingest. State-filtered reads avoid decoding unrelated
+    /// history, and the result is maintained incrementally for the rest of the
+    /// engine incarnation.
+    fn ensure_peel_deferred_usage_initialized(&mut self) -> Result<(), EngineError> {
+        if self.deferred_peel_account.counted {
+            return Ok(());
+        }
+
+        let mut account_bytes = 0_usize;
+        let mut peak_group_rows = 0_usize;
+        let mut peak_group_bytes = 0_usize;
+        for group_id in self.storage.list_groups()? {
+            let records = self.storage.list_messages_in_states(
+                &group_id,
+                &[MessageState::PeelDeferred],
+                EpochId(0),
+            )?;
+            let rows = records.len();
+            let bytes = records.iter().fold(0_usize, |sum, record| {
+                sum.saturating_add(record.payload.len())
+            });
+            let state = self.deferred_peel.entry(group_id).or_default();
+            state.deferred_rows = rows;
+            state.deferred_bytes = bytes;
+            state.deferred_payload_bytes_by_id = records
+                .into_iter()
+                .map(|record| {
+                    let payload_bytes = record.payload.len();
+                    (record.id, payload_bytes)
+                })
+                .collect();
+            state.counted = true;
+            account_bytes = account_bytes.saturating_add(bytes);
+            peak_group_rows = peak_group_rows.max(rows);
+            peak_group_bytes = peak_group_bytes.max(bytes);
+        }
+        self.deferred_peel_account.bytes = account_bytes;
+        self.deferred_peel_account.counted = true;
+        self.engine_metrics.note_deferred_peel_usage(
+            peak_group_rows,
+            peak_group_bytes,
+            account_bytes,
+        );
+        Ok(())
+    }
+
+    /// Refresh one group's cached usage from a durable row enumeration. This
+    /// also reconciles the account total when it has already been initialized.
+    fn refresh_peel_deferred_group_usage(&mut self, group_id: &GroupId, records: &[MessageRecord]) {
+        let rows = records.len();
+        let bytes = records.iter().fold(0_usize, |sum, record| {
+            sum.saturating_add(record.payload.len())
+        });
+        let state = self.deferred_peel.entry(group_id.clone()).or_default();
+        let previous_bytes = state.deferred_bytes;
+        let was_counted = state.counted;
+        state.deferred_rows = rows;
+        state.deferred_bytes = bytes;
+        state.deferred_payload_bytes_by_id = records
+            .iter()
+            .map(|record| (record.id.clone(), record.payload.len()))
+            .collect();
+        state.counted = true;
+        if self.deferred_peel_account.counted {
+            if was_counted {
+                self.deferred_peel_account.bytes = self
+                    .deferred_peel_account
+                    .bytes
+                    .saturating_sub(previous_bytes)
+                    .saturating_add(bytes);
+            } else {
+                self.deferred_peel_account.bytes =
+                    self.deferred_peel_account.bytes.saturating_add(bytes);
+            }
+        }
+        self.engine_metrics
+            .note_deferred_peel_usage(rows, bytes, self.deferred_peel_account.bytes);
+    }
+
+    /// Check row, per-group byte, and account-wide byte capacity for one
+    /// `PeelDeferred` write. `previous_payload_bytes` is present when this is a
+    /// replacement of an already-retained id, in which case only growth is
+    /// charged and no row slot is consumed.
     pub(crate) fn has_peel_deferred_capacity(
         &mut self,
         group_id: &GroupId,
+        previous_payload_bytes: Option<usize>,
+        incoming_payload_bytes: usize,
     ) -> Result<bool, EngineError> {
-        if !self
-            .deferred_peel
-            .get(group_id)
-            .is_some_and(|state| state.counted)
-        {
-            let count = self
-                .storage
-                .list_messages(group_id, EpochId(0))?
-                .into_iter()
-                .filter(|record| record.state == MessageState::PeelDeferred)
-                .count();
-            let state = self.deferred_peel.entry(group_id.clone()).or_default();
-            state.deferred_rows = count;
-            state.counted = true;
-        }
+        self.ensure_peel_deferred_usage_initialized()?;
+        let incoming_rows = usize::from(previous_payload_bytes.is_none());
+        let additional_bytes =
+            incoming_payload_bytes.saturating_sub(previous_payload_bytes.unwrap_or_default());
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
-        Ok(state.has_capacity())
+        let group_has_capacity = state.has_capacity(
+            incoming_rows,
+            additional_bytes,
+            self.deferred_peel_row_limit,
+            self.deferred_peel_group_byte_limit,
+        );
+        let account_has_capacity = additional_bytes == 0
+            || self
+                .deferred_peel_account
+                .bytes
+                .saturating_add(additional_bytes)
+                <= self.deferred_peel_account_byte_limit;
+        let refusal = if incoming_rows > 0
+            && state.deferred_rows.saturating_add(incoming_rows) > self.deferred_peel_row_limit
+        {
+            Some(DeferredPeelCapacityResource::RowsPerGroup)
+        } else if additional_bytes > 0
+            && state.deferred_bytes.saturating_add(additional_bytes)
+                > self.deferred_peel_group_byte_limit
+        {
+            Some(DeferredPeelCapacityResource::BytesPerGroup)
+        } else if !account_has_capacity {
+            Some(DeferredPeelCapacityResource::BytesPerAccount)
+        } else {
+            None
+        };
+        if let Some(resource) = refusal {
+            self.engine_metrics
+                .note_deferred_peel_capacity_refusal(resource);
+        }
+        Ok(group_has_capacity && account_has_capacity)
     }
 
-    pub(crate) fn note_peel_deferred_row_persisted(&mut self, group_id: &GroupId) {
-        self.deferred_peel
-            .entry(group_id.clone())
-            .or_default()
-            .note_row_persisted();
+    pub(crate) fn note_peel_deferred_row_persisted(
+        &mut self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+        payload_bytes: usize,
+    ) {
+        let (group_rows, group_bytes) = {
+            let state = self.deferred_peel.entry(group_id.clone()).or_default();
+            match state.note_row_persisted(message_id.clone(), payload_bytes) {
+                Some(previous) => {
+                    if self.deferred_peel_account.counted {
+                        self.deferred_peel_account.bytes = self
+                            .deferred_peel_account
+                            .bytes
+                            .saturating_sub(previous)
+                            .saturating_add(payload_bytes);
+                    }
+                }
+                None => {
+                    if self.deferred_peel_account.counted {
+                        self.deferred_peel_account.bytes = self
+                            .deferred_peel_account
+                            .bytes
+                            .saturating_add(payload_bytes);
+                    }
+                }
+            }
+            (state.deferred_rows, state.deferred_bytes)
+        };
+        self.engine_metrics.note_deferred_peel_usage(
+            group_rows,
+            group_bytes,
+            self.deferred_peel_account.bytes,
+        );
     }
 
     /// Drop exporter-bearing candidate contexts for one group. The aggregate
@@ -2402,12 +2580,38 @@ impl<S: StorageProvider> Engine<S> {
     /// attempt-tracking entry. Once the backlog drops back below the cap, the
     /// cap-rejection audit re-arms so a fresh cap-full episode is recorded
     /// once more.
-    pub(crate) fn note_peel_deferred_row_retired(&mut self, group_id: &GroupId) {
-        if let Some(state) = self.deferred_peel.get_mut(group_id) {
+    pub(crate) fn note_peel_deferred_row_retired(&mut self, record: &MessageRecord) {
+        let account_was_full = self.deferred_peel_account.counted
+            && self.deferred_peel_account.bytes >= self.deferred_peel_account_byte_limit;
+        let local_reopened = if let Some(state) = self.deferred_peel.get_mut(&record.group_id) {
+            let Some(payload_bytes) = state.deferred_payload_bytes_by_id.remove(&record.id) else {
+                return;
+            };
             state.deferred_rows = state.deferred_rows.saturating_sub(1);
-            if state.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+            state.deferred_bytes = state.deferred_bytes.saturating_sub(payload_bytes);
+            if self.deferred_peel_account.counted {
+                self.deferred_peel_account.bytes = self
+                    .deferred_peel_account
+                    .bytes
+                    .saturating_sub(payload_bytes);
+            }
+            state.deferred_rows < self.deferred_peel_row_limit
+                && state.deferred_bytes < self.deferred_peel_group_byte_limit
+                && self.deferred_peel_account.bytes < self.deferred_peel_account_byte_limit
+        } else {
+            false
+        };
+        let account_reopened = account_was_full
+            && self.deferred_peel_account.bytes < self.deferred_peel_account_byte_limit;
+        if account_reopened {
+            // The account limit is shared by every group. Releasing bytes in
+            // one group starts a fresh capacity episode for any other group
+            // that was previously refused while the aggregate was full.
+            for state in self.deferred_peel.values_mut() {
                 state.cap_rejection_audited = false;
             }
+        } else if local_reopened && let Some(state) = self.deferred_peel.get_mut(&record.group_id) {
+            state.cap_rejection_audited = false;
         }
     }
 
@@ -2596,7 +2800,7 @@ impl<S: StorageProvider> Engine<S> {
                         // so it leaves the retry lifecycle and frees its cap
                         // slot (mdk#339), mirroring `retry_deferred_peels`.
                         self.update_stored_message_state(&record.id, MessageState::Processed)?;
-                        self.note_peel_deferred_row_retired(group_id);
+                        self.note_peel_deferred_row_retired(&record);
                     } else if self.raw_transport_row_awaiting_retry(&record.id)? {
                         // Keep the row replayable ONLY while ingest itself did
                         // not already resolve it. A peeled message buffered
@@ -2656,7 +2860,7 @@ impl<S: StorageProvider> Engine<S> {
                     // the slot whenever the row leaves the retry lifecycle — whether
                     // this arm retired it or ingest already terminalized it.
                     if was_peel_deferred {
-                        self.note_peel_deferred_row_retired(group_id);
+                        self.note_peel_deferred_row_retired(&record);
                     }
                 }
                 Err(EngineError::ForkedEpoch {
@@ -2666,7 +2870,7 @@ impl<S: StorageProvider> Engine<S> {
                 }) => {
                     self.update_stored_message_state(&record.id, MessageState::EpochInvalidated)?;
                     if was_peel_deferred {
-                        self.note_peel_deferred_row_retired(group_id);
+                        self.note_peel_deferred_row_retired(&record);
                     }
                     return Err(EngineError::ForkedEpoch {
                         group_id: forked_group_id,
@@ -2677,7 +2881,7 @@ impl<S: StorageProvider> Engine<S> {
                 Err(e) => {
                     self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     if was_peel_deferred {
-                        self.note_peel_deferred_row_retired(group_id);
+                        self.note_peel_deferred_row_retired(&record);
                     }
                     return Err(e);
                 }
@@ -2763,13 +2967,19 @@ mod deferred_peel_accounting_tests {
             ..Default::default()
         };
 
-        assert!(state.has_capacity());
+        assert!(state.has_capacity(1, 10, 2, 20));
         assert_eq!(
             state.deferred_rows, 0,
             "a failed write must consume no slot"
         );
 
-        state.note_row_persisted();
+        state.note_row_persisted(MessageId::new(vec![1]), 10);
         assert_eq!(state.deferred_rows, 1);
+        assert_eq!(state.deferred_bytes, 10);
+        assert!(
+            state.has_capacity(0, 0, 0, 0),
+            "same-size exact-id retries stay eligible after a limit is lowered"
+        );
+        assert!(!state.has_capacity(0, 1, 0, 0));
     }
 }

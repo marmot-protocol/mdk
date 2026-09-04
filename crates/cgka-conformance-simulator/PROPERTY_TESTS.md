@@ -273,9 +273,10 @@ restart after sync but before processing, and reverse three-copy competing commi
 profile provenance (including exact distinct-committer and retained-copy counts), every volume/recovery arm,
 terminal-only reconnect, the pre-catch-up zero-delivery boundary, the post-catch-up exact-one boundary, full Bob payload
 multiplicity, exact canonical equivalence, no pending work, active decryptability, and encrypted file-backed
-natural/duplicate canaries. A focused file-backed 384-message natural-history regression crosses the 256-row deferred
-cap and requires retained-history redelivery to satisfy the full strict oracle. Larger catalog blocks otherwise belong
-in isolated manual or scheduled campaigns.
+natural/duplicate canaries. A focused file-backed 384-message natural-history regression verifies that the production
+512-row limit avoids a redundant retained-history refetch. A feature-gated test override reproduces the old 256-row
+refetch, and an ignored 256/512/1,024 sweep records row refusals plus row and byte high-water marks for future policy
+decisions. Larger catalog blocks otherwise belong in isolated manual or scheduled campaigns.
 
 ### `cross-route-restart-permutations/v1`
 

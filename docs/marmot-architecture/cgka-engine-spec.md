@@ -132,8 +132,10 @@ returning `IngestOutcome::TransportDeferred` and retaining it as `PeelDeferred`.
 When a transport supplies authenticated source-epoch evidence and no retained snapshot can peel the object, the engine
 MAY establish a specific stale outcome such as `AlreadyAtEpoch`. The Nostr group envelope has no clear source-epoch
 hint, so a decrypt miss remains `TransportDeferred`: it might be a future-epoch object whose missing commit will later
-change the peel context. A local row or retry cap returns typed `ResourceRefused`, does not establish invalidity or
-permanent unreadability, and MUST leave exact-ID redelivery eligible.
+change the peel context. Local row, encoded-byte, or retry limits return typed `ResourceRefused`, do not establish
+invalidity or permanent unreadability, and MUST leave exact-ID redelivery eligible. Deferred-peel capacity MUST be
+bounded both per group and across the account-device database; restart MUST reconstruct usage from durable rows before
+admitting capacity-sensitive input.
 
 `PeelDeferred` rows MUST persist their distinct-context attempt count and conservative local residence deadline.
 Restart MUST NOT reset either budget. Live-process expiry uses monotonic time; restart rebases from durable wall time,

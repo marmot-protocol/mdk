@@ -91,6 +91,14 @@ pub fn conformance_constant_snapshot() -> ConformanceConstantSnapshot {
         crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP as u64,
     );
     values.insert(
+        "E3.max_peel_deferred_bytes_per_group".into(),
+        crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_GROUP as u64,
+    );
+    values.insert(
+        "E3.max_peel_deferred_bytes_per_account".into(),
+        crate::message_processor::MAX_PEEL_DEFERRED_BYTES_PER_ACCOUNT as u64,
+    );
+    values.insert(
         "E4.max_deferred_rows_per_sweep".into(),
         crate::message_processor::MAX_DEFERRED_ROWS_PER_SWEEP as u64,
     );
@@ -833,7 +841,7 @@ mod tests {
     fn constant_snapshot_pins_every_engine_owned_reliability_constant() {
         let snapshot = conformance_constant_snapshot();
         assert_eq!(snapshot.schema_version, "1");
-        assert_eq!(snapshot.values.len(), 23);
+        assert_eq!(snapshot.values.len(), 25);
         for key in [
             "P1.max_rewind_commits",
             "P2.app_message_past_epoch_limit",
@@ -848,6 +856,8 @@ mod tests {
             "E1.max_convergence_reprocessing_passes",
             "E2.max_deferred_peel_attempts",
             "E3.max_peel_deferred_rows_per_group",
+            "E3.max_peel_deferred_bytes_per_group",
+            "E3.max_peel_deferred_bytes_per_account",
             "E4.max_deferred_rows_per_sweep",
             "E5.candidate_replay_budget_slack",
             "E6.candidate_replay_budget_floor",

@@ -656,7 +656,7 @@ impl<S: StorageProvider> Engine<S> {
                 message_id: record.id.clone(),
                 resource,
             });
-        self.note_peel_deferred_row_retired(&record.group_id);
+        self.note_peel_deferred_row_retired(record);
         Ok(())
     }
 
@@ -688,7 +688,7 @@ impl<S: StorageProvider> Engine<S> {
                 // a `Retryable` row — input buffered pre-peel while the group
                 // could not ingest — sits outside the cap.
                 if record.state == MessageState::PeelDeferred {
-                    self.note_peel_deferred_row_retired(&record.group_id);
+                    self.note_peel_deferred_row_retired(&record);
                 }
                 Ok(())
             }
@@ -730,7 +730,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
                 // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339).
                 if record.state == MessageState::PeelDeferred {
-                    self.note_peel_deferred_row_retired(&record.group_id);
+                    self.note_peel_deferred_row_retired(&record);
                 }
                 Ok(())
             }
