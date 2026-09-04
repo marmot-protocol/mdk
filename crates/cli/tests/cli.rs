@@ -6947,6 +6947,12 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
         message.contains("removed from the group"),
         "removed-copy send should explain the terminal state; got {message}"
     );
+    // Refused before projection: the failed send left no optimistic row behind.
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "message", "list", "--group", group_id],
+    );
+    assert_no_message_plaintext(&bob_messages, "removed sender");
 }
 
 #[test]
