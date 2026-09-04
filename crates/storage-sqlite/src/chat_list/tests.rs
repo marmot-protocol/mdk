@@ -1736,9 +1736,7 @@ fn ensure_chat_list_rows_treats_unknown_self_membership_as_normalized() {
     // CASE) — otherwise it sees 'member' != '<unknown>' forever and rebuilds the
     // whole projection on every open.
     let store = setup_store();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
     {
         let conn = store.lock().unwrap();
@@ -2184,10 +2182,8 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     delivered.source_epoch = Some(8);
     store.record_app_event(&delivered).unwrap();
 
-    let row = store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
-        .unwrap()
-        .expect("chat row");
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(
         row.last_message
             .as_ref()
@@ -2210,7 +2206,7 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn, LOCAL, &no_mentions).unwrap(),
+            chat_list_projection_complete_tx(&conn).unwrap(),
             "failed-send preview priority must match the completeness query"
         );
     }
@@ -3299,11 +3295,22 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
             [],
         )
         .unwrap();
-        conn.execute(
-            "DELETE FROM chat_list_unread_ready_groups WHERE group_id_hex = ?1",
-            params![GROUP],
-        )
-        .unwrap();
+        let ready_groups: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_list_unread_ready_groups",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dirty_messages: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_list_unread_dirty_messages",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_groups, 1);
+        assert_eq!(dirty_messages, 0);
     }
 
     store.ensure_chat_list_rows(LOCAL, &mentions_local).unwrap();
@@ -3957,7 +3964,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn, LOCAL, &no_mentions).unwrap(),
+            chat_list_projection_complete_tx(&conn).unwrap(),
             "a pending leave request must not make the projection look stale"
         );
     }

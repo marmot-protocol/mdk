@@ -665,7 +665,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if !chat_list_projection_complete_tx(&conn, local_account_id_hex, mention_classifier)? {
+            if !chat_list_projection_complete_tx(&conn)? {
                 rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)?;
             }
             Ok(())
@@ -1203,11 +1203,10 @@ fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> Storage
 /// `ChatListRow::leave_requested_at_ms` is derived at read time rather than
 /// materialized, so there is no stored value that can drift out of date — and
 /// comparing a read-time-only field here would mark every row stale forever.
-fn chat_list_projection_complete_tx(
-    tx: &Connection,
-    _local_account_id_hex: &str,
-    _mention_classifier: &MentionClassifier<'_>,
-) -> StorageResult<bool> {
+fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
+    if chat_list_projection_version_tx(tx)? < CHAT_LIST_PROJECTION_VERSION {
+        return Ok(false);
+    }
     let activity_filter = chat_list_activity_filter_sql("mt.");
     let preview_order = chat_list_preview_order_desc("mt.");
     let preview_eligibility = chat_list_preview_eligibility_sql("mt.");
@@ -1383,12 +1382,6 @@ fn chat_list_projection_complete_tx(
     )? {
         return Ok(false);
     }
-    if chat_list_projection_version_tx(tx)? >= CHAT_LIST_PROJECTION_VERSION {
-        return Ok(true);
-    }
-    // Every group has durable membership now, so an account-wide marker left
-    // behind by targeted post-migration rebuilds can be advanced safely.
-    set_chat_list_projection_version_tx(tx, CHAT_LIST_PROJECTION_VERSION)?;
     Ok(true)
 }
 
