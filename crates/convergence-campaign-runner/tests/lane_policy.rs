@@ -43,13 +43,13 @@ fn workflow_artifact_retention_matches_lane_policy() {
     let nightly = include_str!("../../../.github/workflows/simulator-nightly.yml");
     let hardening = include_str!("../../../.github/workflows/convergence-hardening.yml");
 
-    assert_artifact_retention(
-        ci,
-        "name: cgka-conformance-simulator-reports",
-        &CampaignLaneConfigV1::builtin(CampaignLaneV1::PullRequest)
-            .budgets
-            .artifact_retention_days
-            .to_string(),
+    assert!(
+        !ci.contains("name: cgka-conformance-simulator-reports"),
+        "PR CI must not duplicate the full file-backed vector report"
+    );
+    assert!(
+        nightly.contains("--vectors crates/cgka-conformance-simulator/vectors"),
+        "nightly CI must retain the complete file-backed vector report"
     );
     assert_artifact_retention(
         nightly,
