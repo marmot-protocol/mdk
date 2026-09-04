@@ -77,6 +77,12 @@ pub(crate) const TIMELINE_WINDOW_LIMIT: usize = MAX_TIMELINE_LIMIT;
 /// chat-list subscriber performs its single presentation-only retry.
 const CHAT_LIST_PRESENTATION_LOOKUP_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// Counts failed initial direct-peer wake lookups so the runtime regression
+/// test can repair the cached storage handle before the bounded retry runs.
+#[cfg(test)]
+pub(super) static DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Re-materializes the timeline for a fixed account/group from the store.
 /// Captures the owning [`MarmotApp`] and account label so the subscription can
 /// run cursor queries off the caller thread without threading them through
@@ -1456,7 +1462,43 @@ impl MarmotAppRuntime {
                         .await
                         {
                             Ok(row) => row,
-                            Err(_) => continue,
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "marmot_app::runtime",
+                                    method = "subscribe_chat_list",
+                                    error_kind = error.privacy_safe_kind(),
+                                    "retrying a chat-list row lookup after a direct-peer presentation wake failed"
+                                );
+                                #[cfg(test)]
+                                DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tokio::select! {
+                                    _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                                    _ = tokio::time::sleep(CHAT_LIST_PRESENTATION_LOOKUP_RETRY_DELAY) => {}
+                                }
+                                let app_for_retry = app.clone();
+                                let account_label_for_retry = account_label.clone();
+                                let group_id_hex_for_retry = update.update.group_id_hex.clone();
+                                match blocking_app_task(move || {
+                                    app_for_retry.chat_list_row(
+                                        &account_label_for_retry,
+                                        &group_id_hex_for_retry,
+                                    )
+                                })
+                                .await
+                                {
+                                    Ok(row) => row,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            target: "marmot_app::runtime",
+                                            method = "subscribe_chat_list",
+                                            error_kind = error.privacy_safe_kind(),
+                                            "giving up after the bounded retry for a direct-peer presentation wake failed"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     } else if let Some(mut row) = update.update.chat_list_row.clone() {
                         // Ordinary projection events carry a row captured when

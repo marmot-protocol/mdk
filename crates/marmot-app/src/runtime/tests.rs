@@ -1990,6 +1990,69 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         ),
         "the bounded retry did not restore current presentation: {recovered:?}"
     );
+
+    // The direct-presentation wake itself gets the same bounded recovery. Make
+    // a durable profile change without broadcasting it, fail the wake's first
+    // full-row lookup through a closed cached handle, then repair that handle
+    // before the retry runs.
+    let storage = app.account_storage(&account.label).unwrap();
+    storage
+        .project_direct_peer_profile(
+            &account.account_id_hex,
+            &storage_sqlite::DirectPeerProfile {
+                peer_account_id_hex: replacement_peer,
+                display_name: Some("Direct Retry".to_owned()),
+                avatar_url: None,
+                profile_created_at: 3,
+            },
+        )
+        .unwrap();
+    storage.close().unwrap();
+    let lookup_failures_before = super::subscriptions::DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST
+        .load(std::sync::atomic::Ordering::Relaxed);
+    app.direct_peer_presentation_events
+        .send(crate::DirectPeerPresentationUpdate {
+            account_id_hex: account.account_id_hex.clone(),
+            account_label: account.label.clone(),
+            group_id_hex: group_id_hex.clone(),
+        })
+        .unwrap();
+    tokio::time::timeout(UPDATE_TIMEOUT, async {
+        loop {
+            if super::subscriptions::DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > lookup_failures_before
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the direct-peer wake's initial lookup should fail");
+    app.account_storages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&account.label);
+
+    let recovered = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the direct-peer wake lookup should recover")
+        .expect("chat-list recovery update");
+    assert!(
+        matches!(
+            &recovered,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                row,
+            } if row
+                .direct_peer_presentation
+                .as_ref()
+                .and_then(|presentation| presentation.display_name.as_deref())
+                == Some("Direct Retry")
+        ),
+        "the direct-peer wake retry did not load the current row: {recovered:?}"
+    );
 }
 
 fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMessageRecord {
