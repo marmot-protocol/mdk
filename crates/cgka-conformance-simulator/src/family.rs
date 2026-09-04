@@ -4458,6 +4458,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_minimizer_removes_irrelevant_message_storm_and_reproduces() {
+        fn reproduces_synthetic_failure(scenario: &ScenarioSpec) -> bool {
+            scenario
+                .steps
+                .iter()
+                .any(|step| matches!(step, ScenarioStep::CreateGroup { .. }))
+        }
+
+        let mut scenario = ScenarioSpec {
+            name: "completed-reduction".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into()],
+            steps: vec![ScenarioStep::CreateGroup {
+                creator: "alice".into(),
+                name: "retained-failure-trigger".into(),
+                invitees: Vec::new(),
+                required_features: Vec::new(),
+                initial_admins: None,
+                pending: "create".into(),
+            }],
+        };
+        for index in 0..24 {
+            scenario.steps.push(ScenarioStep::SendAppMessage {
+                sender: "alice".into(),
+                payload: format!("irrelevant storm message {index}"),
+            });
+        }
+
+        let outcome = minimize_scenario_with(
+            scenario,
+            GeneratedScenarioMinimizationBudget::default(),
+            |trial| async move { reproduces_synthetic_failure(&trial) },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.status,
+            crate::GeneratedScenarioMinimizationStatus::Complete
+        );
+        let minimized = outcome
+            .minimized_case
+            .expect("completed reduction records the smaller reproducer");
+        assert!(
+            minimized
+                .steps
+                .iter()
+                .all(|step| !matches!(step, ScenarioStep::SendAppMessage { .. }))
+        );
+        assert!(reproduces_synthetic_failure(&minimized));
+    }
+
+    #[tokio::test]
     async fn expensive_reproducer_exhausts_the_minimization_budget_after_the_original_run() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};

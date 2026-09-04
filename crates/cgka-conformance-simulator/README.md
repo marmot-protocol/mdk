@@ -634,8 +634,9 @@ greedy minimizer that removes removable delivery/app steps only when the semanti
 action type, and failure kind) still reproduces. The complete fingerprint, including the state digest, remains in the
 capsule for diagnosis. Report artifacts, fixture candidates, and failure capsules are written before reduction starts;
 completed minimization metadata replaces them atomically, so interruption leaves a complete original artifact rather
-than a truncated or missing one. Status is `complete`, `budget_exhausted`, `not_reproducible`, or `skipped`; a durable
-`pending` status identifies a worker interrupted during reduction.
+than a truncated or missing one. The process campaign removes replacement temporaries owned by a reaped worker and
+records cleanup failures as artifact-integrity errors. Status is `complete`, `budget_exhausted`, `not_reproducible`, or
+`skipped`; a durable `pending` status identifies a worker interrupted during reduction.
 
 Reduction defaults to a 30-second wall-clock budget, 256 total reproduction trials, and five seconds per trial. The
 report and isolated campaign CLIs accept `--minimization-wall-time-secs`, `--minimization-max-trials`, and

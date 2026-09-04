@@ -2343,7 +2343,7 @@ async fn strict_chaos_boundary_retires_pre_join_opaque_resource_work() {
 }
 
 #[tokio::test]
-async fn failing_generated_case_records_a_minimized_reproducer() {
+async fn failing_generated_case_records_bounded_minimization_outcome() {
     let mut scenario = ScenarioSpec {
         name: "convergence-chaos/minimizer-smoke/v1".into(),
         spec_version: "2".into(),
@@ -2442,7 +2442,7 @@ async fn failing_generated_case_records_a_minimized_reproducer() {
                 .steps
                 .iter()
                 .all(|step| !matches!(step, ScenarioStep::SendAppMessage { .. })),
-            "a completed semantic reduction should remove the entire application-message storm"
+            "a completed semantic reduction should remove all irrelevant application-message noise"
         );
     }
     let minimized_report =

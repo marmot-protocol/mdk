@@ -155,39 +155,19 @@ async fn run() -> Result<ExitCode, Box<dyn Error>> {
         }
         let started = Instant::now();
         let child = command.spawn()?;
+        let worker_pid = child.id();
         let usage = wait_with_usage(child, args.case_timeout)?;
-        let inspection = inspect_case_artifacts(&case, &paths, &usage);
-        observations.push(ProcessCaseMeasurementV1 {
+        let mut inspection = inspect_case_artifacts(&case, &paths, &usage);
+        inspection
+            .integrity_errors
+            .extend(cleanup_worker_temporary_artifacts(&paths, worker_pid));
+        observations.push(build_case_measurement(
             case_index,
-            generated_input: paths.generated_input,
-            report: paths.report,
-            fixture_candidate: paths
-                .fixture_candidate
-                .exists()
-                .then_some(paths.fixture_candidate),
-            failure_capsule: paths
-                .failure_capsule
-                .exists()
-                .then_some(paths.failure_capsule),
-            sensitive_replay_capsule: paths
-                .sensitive_replay_capsule
-                .exists()
-                .then_some(paths.sensitive_replay_capsule),
-            exit_code: usage.exit_code,
-            signal: usage.signal,
-            timed_out: usage.timed_out,
-            timeout_phase: inspection.timeout_phase,
-            minimization_status: inspection.minimization_status,
-            wall_us: elapsed_us(started.elapsed()),
-            user_cpu_us: usage.user_cpu_us,
-            system_cpu_us: usage.system_cpu_us,
-            peak_rss_bytes: usage.peak_rss_bytes,
-            database_bytes: inspection.database_bytes,
-            filesystem_block_write_lower_bound_bytes: usage
-                .filesystem_block_write_lower_bound_bytes,
-            unavailable_process_fields: usage.unavailable_process_fields,
-            artifact_integrity_errors: inspection.integrity_errors,
-        });
+            paths,
+            usage,
+            inspection,
+            started.elapsed(),
+        ));
     }
     let failed = observations.iter().any(|case| {
         case.timed_out
@@ -340,6 +320,98 @@ fn inspect_case_artifacts(
         database_bytes,
         timeout_phase,
         minimization_status,
+    }
+}
+
+/// Removes same-process atomic-replacement files that can survive a forced
+/// worker termination, returning integrity errors for anything not cleaned.
+fn cleanup_worker_temporary_artifacts(paths: &CaseArtifactPaths, worker_pid: u32) -> Vec<String> {
+    let Some(parent) = paths.report.parent() else {
+        return vec!["temporary_artifact_parent_missing".into()];
+    };
+    let marker = format!(".tmp-{worker_pid}-");
+    let prefixes = [
+        &paths.report,
+        &paths.failure_capsule,
+        &paths.sensitive_replay_capsule,
+    ]
+    .into_iter()
+    .filter_map(|path| path.file_name())
+    .map(|name| {
+        let mut prefix = name.as_encoded_bytes().to_vec();
+        prefix.extend_from_slice(marker.as_bytes());
+        prefix
+    })
+    .collect::<Vec<_>>();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => return vec![format!("temporary_artifact_scan_failed:{error}")],
+    };
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("temporary_artifact_scan_failed:{error}"));
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if !prefixes
+            .iter()
+            .any(|prefix| name.as_encoded_bytes().starts_with(prefix))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = std::fs::remove_file(&path) {
+            errors.push(format!(
+                "temporary_artifact_cleanup_failed:{}:{error}",
+                path.display()
+            ));
+        }
+    }
+    errors
+}
+
+/// Maps reaped process usage and durable artifact inspection into the schema
+/// written to the process-campaign summary.
+fn build_case_measurement(
+    case_index: usize,
+    paths: CaseArtifactPaths,
+    usage: ChildUsage,
+    inspection: CaseArtifactInspection,
+    elapsed: Duration,
+) -> ProcessCaseMeasurementV1 {
+    ProcessCaseMeasurementV1 {
+        case_index,
+        generated_input: paths.generated_input,
+        report: paths.report,
+        fixture_candidate: paths
+            .fixture_candidate
+            .exists()
+            .then_some(paths.fixture_candidate),
+        failure_capsule: paths
+            .failure_capsule
+            .exists()
+            .then_some(paths.failure_capsule),
+        sensitive_replay_capsule: paths
+            .sensitive_replay_capsule
+            .exists()
+            .then_some(paths.sensitive_replay_capsule),
+        exit_code: usage.exit_code,
+        signal: usage.signal,
+        timed_out: usage.timed_out,
+        timeout_phase: inspection.timeout_phase,
+        minimization_status: inspection.minimization_status,
+        wall_us: elapsed_us(elapsed),
+        user_cpu_us: usage.user_cpu_us,
+        system_cpu_us: usage.system_cpu_us,
+        peak_rss_bytes: usage.peak_rss_bytes,
+        database_bytes: inspection.database_bytes,
+        filesystem_block_write_lower_bound_bytes: usage.filesystem_block_write_lower_bound_bytes,
+        unavailable_process_fields: usage.unavailable_process_fields,
+        artifact_integrity_errors: inspection.integrity_errors,
     }
 }
 
@@ -856,6 +928,210 @@ mod tests {
             .to_string();
         assert!(error.contains("unsupported family unknown/v1"));
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_only_temporaries_owned_by_the_reaped_worker() {
+        let root = tempfile::tempdir().expect("temporary campaign root");
+        let case = generate_family_case("send-leave/v1", 42, 0).expect("case generates");
+        let paths = case_artifact_paths(root.path(), &case);
+        let report_temporary = replacement_temporary_path(&paths.report, 4242, 0);
+        let replay_temporary = replacement_temporary_path(&paths.sensitive_replay_capsule, 4242, 1);
+        let unrelated_temporary = replacement_temporary_path(&paths.report, 7777, 0);
+        for path in [&report_temporary, &replay_temporary, &unrelated_temporary] {
+            fs_private::write_private(path, b"private temporary artifact")
+                .expect("temporary artifact writes");
+        }
+
+        assert!(cleanup_worker_temporary_artifacts(&paths, 4242).is_empty());
+        assert!(!report_temporary.exists());
+        assert!(!replay_temporary.exists());
+        assert!(unrelated_temporary.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_minimization_preserves_original_artifacts_and_summary_phase() {
+        let root = tempfile::tempdir().expect("temporary campaign root");
+        let out = root.path().join("interrupted");
+        fs_private::create_dir_all_private(&out).expect("private output directory");
+        let case = interrupted_minimization_case();
+        let paths = case_artifact_paths(&out, &case);
+        fs_private::write_private(
+            &paths.generated_input,
+            &serde_json::to_vec_pretty(&GeneratedScenarioInputV1::new(case.clone()))
+                .expect("generated input serializes"),
+        )
+        .expect("generated input writes");
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable path"))
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::interrupted_minimization_worker_fixture",
+            ])
+            .env("CGKA_INTERRUPTED_WORKER_INPUT", &paths.generated_input)
+            .env("CGKA_INTERRUPTED_WORKER_OUT", &out)
+            .spawn()
+            .expect("worker fixture starts");
+        let worker_pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pending_report = loop {
+            if let Ok(bytes) = std::fs::read(&paths.report)
+                && let Ok(report) = serde_json::from_slice::<ScenarioReport>(&bytes)
+                && report.metadata.generated.as_ref().map(|generated| {
+                    generated.minimization.status == GeneratedScenarioMinimizationStatus::Pending
+                }) == Some(true)
+                && paths.fixture_candidate.is_file()
+                && cgka_conformance_simulator::read_failure_capsule(&paths.failure_capsule).is_ok()
+            {
+                break report;
+            }
+            if let Some(status) = child.try_wait().expect("worker status reads") {
+                panic!("worker exited before interruption evidence was durable: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("worker did not publish pending minimization evidence");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(
+            pending_report
+                .expectation_failures
+                .iter()
+                .any(|failure| failure.kind == "client_state_mismatch")
+        );
+        let usage = wait_with_usage(child, Duration::ZERO).expect("worker is killed and reaped");
+        assert!(usage.timed_out);
+        let mut inspection = inspect_case_artifacts(&case, &paths, &usage);
+        inspection
+            .integrity_errors
+            .extend(cleanup_worker_temporary_artifacts(&paths, worker_pid));
+        assert!(inspection.integrity_errors.is_empty());
+        let measurement =
+            build_case_measurement(0, paths, usage, inspection, Duration::from_millis(1));
+        let summary = ProcessCampaignReportV1 {
+            schema_version: "1".into(),
+            family: case.family_name,
+            seed: case.seed,
+            storage: "memory".into(),
+            case_timeout_ms: 1,
+            capture_sensitive_replay: false,
+            minimization_wall_time_ms: 300_000,
+            minimization_max_trials: 10_000,
+            minimization_trial_timeout_ms: 60_000,
+            cases: vec![measurement],
+        };
+        let value = serde_json::to_value(summary).expect("campaign summary serializes");
+        assert_eq!(value["cases"][0]["timed_out"], true);
+        assert_eq!(value["cases"][0]["minimization_status"], "pending");
+        assert_eq!(value["cases"][0]["timeout_phase"], "minimization");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "process fixture launched by interrupted_minimization_preserves_original_artifacts_and_summary_phase"]
+    async fn interrupted_minimization_worker_fixture() {
+        let input = PathBuf::from(
+            std::env::var_os("CGKA_INTERRUPTED_WORKER_INPUT").expect("worker fixture input path"),
+        );
+        let out = PathBuf::from(
+            std::env::var_os("CGKA_INTERRUPTED_WORKER_OUT").expect("worker fixture output path"),
+        );
+        let result = run_worker(&Args {
+            family: "interrupted-minimization/v1".into(),
+            seed: 0,
+            cases: 1,
+            out,
+            storage: HarnessStorageMode::InMemorySqlite,
+            case_timeout: Duration::from_secs(300),
+            minimization_budget: GeneratedScenarioMinimizationBudget {
+                wall_clock: Duration::from_secs(300),
+                max_trials: 10_000,
+                per_trial_timeout: Duration::from_secs(60),
+            },
+            input: Some(input),
+            capture_sensitive_replay: false,
+            worker: true,
+        })
+        .await;
+        panic!("worker fixture completed before being interrupted: {result:?}");
+    }
+
+    fn replacement_temporary_path(target: &Path, worker_pid: u32, id: u64) -> PathBuf {
+        let mut name = target
+            .file_name()
+            .expect("artifact target names a file")
+            .to_os_string();
+        name.push(format!(".tmp-{worker_pid}-{id}"));
+        target
+            .parent()
+            .expect("artifact target has a parent")
+            .join(name)
+    }
+
+    fn interrupted_minimization_case() -> GeneratedScenarioCase {
+        let mut scenario = cgka_conformance_simulator::ScenarioSpec {
+            name: "interrupted-minimization/v1/case-0".into(),
+            spec_version: "2".into(),
+            topology: Default::default(),
+            clients: vec!["alice".into(), "bob".into()],
+            steps: vec![
+                cgka_conformance_simulator::ScenarioStep::CreateGroup {
+                    creator: "alice".into(),
+                    name: "interrupted".into(),
+                    invitees: vec!["bob".into()],
+                    required_features: Vec::new(),
+                    initial_admins: None,
+                    pending: "create".into(),
+                },
+                cgka_conformance_simulator::ScenarioStep::accept_publication("alice", "create"),
+                cgka_conformance_simulator::ScenarioStep::DeliverAll,
+                cgka_conformance_simulator::ScenarioStep::Tick {
+                    clients: vec!["bob".into()],
+                },
+                cgka_conformance_simulator::ScenarioStep::ClearEvents {
+                    clients: vec!["alice".into(), "bob".into()],
+                },
+            ],
+        };
+        for index in 0..24 {
+            scenario
+                .steps
+                .push(cgka_conformance_simulator::ScenarioStep::SendAppMessage {
+                    sender: "bob".into(),
+                    payload: format!("interruption noise {index}"),
+                });
+        }
+        scenario.steps.extend([
+            cgka_conformance_simulator::ScenarioStep::DeliverAll,
+            cgka_conformance_simulator::ScenarioStep::Tick {
+                clients: vec!["alice".into()],
+            },
+            cgka_conformance_simulator::ScenarioStep::Observe {
+                clients: vec!["alice".into()],
+            },
+        ]);
+        GeneratedScenarioCase {
+            family_name: "interrupted-minimization/v1".into(),
+            generator_version: "1".into(),
+            seed: 17,
+            case_index: 0,
+            workload_profile: None,
+            subject: cgka_conformance_simulator::GeneratedSubjectKind::Engine,
+            scenario,
+            expected_outcomes: vec![cgka_conformance_simulator::TraceExpectation::ClientState {
+                client: "alice".into(),
+                epoch: 1,
+                member_count: 99,
+                received_payloads: None,
+                added_members: None,
+                removed_members: None,
+            }],
+        }
     }
 
     #[cfg(unix)]

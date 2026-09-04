@@ -118,7 +118,9 @@ provenance, and writes `process-campaign.v1.json`. This is the preferred local d
 one case cannot erase the remaining cases, and the summary contains real child-process resource measurements.
 The worker also saves the original report, fixture candidate, and failure capsule before optional semantic reduction.
 The campaign summary records each case's minimization status and classifies a process deadline as scenario execution,
-minimization, or later post-processing when enough durable evidence exists to tell them apart.
+minimization, or later post-processing when enough durable evidence exists to tell them apart. After reaping a worker,
+the parent removes any same-worker atomic-replacement temporaries; cleanup failures are retained as artifact-integrity
+errors rather than leaving undeclared evidence behind.
 
 Semantic reduction defaults to 30 seconds overall, 256 reproduction trials, and five seconds per trial. Override these
 with `--minimization-wall-time-secs`, `--minimization-max-trials`, and
