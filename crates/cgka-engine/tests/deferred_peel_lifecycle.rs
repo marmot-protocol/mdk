@@ -1767,7 +1767,6 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
 async fn later_deferring_group_first_sweep_keeps_exact_account_byte_total() {
     let (mut alice, mut carol, storage, _peeler, group_a, _commit2, _commit3) =
         carol_behind_two_epochs().await;
-    let group_b = add_group_two_epochs_ahead(&mut alice, &mut carol).await;
 
     let deferred_a = send_app(&mut alice, &group_a, "group A deferred bytes").await;
     assert!(matches!(
@@ -1776,6 +1775,9 @@ async fn later_deferring_group_first_sweep_keeps_exact_account_byte_total() {
     ));
     let bytes_a = storage.get_message(&deferred_a.id).unwrap().payload.len();
 
+    // Account reconstruction has now run without group B in storage. Creating
+    // B after that boundary is what exercises the original double-count path.
+    let group_b = add_group_two_epochs_ahead(&mut alice, &mut carol).await;
     let deferred_b = send_app(&mut alice, &group_b, "group B deferred bytes").await;
     assert!(matches!(
         carol.ingest(deferred_b.clone()).await.unwrap(),
