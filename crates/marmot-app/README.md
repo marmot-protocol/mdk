@@ -6,15 +6,24 @@ It wires the app-owned `AccountHome` to encrypted session storage, the Nostr MLS
 relay-backed transport state. The crate is intentionally below presentation layers like `wn` and above the generic
 account/session/engine crates.
 
-It owns the first app projections:
+It owns these local SQLite stores:
 
-- a per-account SQLCipher directory cache at `accounts/<label>/app-cache.sqlite3` for the Nostr user directory:
-  local-account links, profile metadata, follow-list caches, bounded search-graph edges, discovered user relay lists,
-  and KeyPackages (the root-level `app-cache.sqlite3` is a legacy location that is migrated and then removed);
 - per-account SQLCipher app state in the account's storage database (`accounts/<label>/session.sqlite`) for joined
   groups, app-component profile/image/admin/Nostr-routing projections, pending invite confirmation state, seen relay
   events, and sent/received message projections. The older `accounts/<label>/app.sqlite3` is the legacy projection
-  database; its contents are imported once (tracked by the `legacy-account-projection-v1` marker) and then superseded.
+  database; its contents are imported once (tracked by the `legacy-account-projection-v1` marker) and then superseded;
+- a per-account SQLCipher directory cache at `accounts/<label>/app-cache.sqlite3` for the Nostr user directory:
+  local-account links, profile metadata, follow-list caches, bounded search-graph edges, discovered user relay lists,
+  and KeyPackages (the root-level `app-cache.sqlite3` is a legacy location that is migrated and then removed);
+- an owner-only, unencrypted installation-wide `shared.sqlite3` containing a provenance-stripped public-directory
+  mirror, relay-telemetry and audit-log preferences, and the telemetry installation id.
+
+For `N` active signing accounts whose stores have been opened, this is up to `2N + 1` current SQLite files.
+`session.sqlite` contains authoritative protocol and recovery state and has a numbered migration history. The two
+directory tiers are reconcilable caches, but normal upgrades should preserve them; `shared.sqlite3` also contains
+durable installation settings that are not disposable. The per-account directory cache and shared store currently
+initialize tables without independent numbered migration ledgers, so schema evolution for either must not rely on the
+session database's migration version.
 
 The app runtime exposes those projections through account status, group listing/showing, message listing, and
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases
