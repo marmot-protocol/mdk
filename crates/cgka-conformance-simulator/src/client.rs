@@ -94,6 +94,8 @@ struct ScriptedConvergenceDrain {
     scheduled: bool,
     advance_generation: bool,
     fail_on_attempt: Option<usize>,
+    progress_captures: usize,
+    fail_progress_capture: Option<usize>,
 }
 
 #[cfg(test)]
@@ -109,6 +111,8 @@ impl ScriptedConvergenceDrain {
             scheduled: passes > 0,
             advance_generation: true,
             fail_on_attempt: None,
+            progress_captures: 0,
+            fail_progress_capture: None,
         }
     }
 
@@ -128,6 +132,12 @@ impl ScriptedConvergenceDrain {
         }
     }
 
+    /// Makes one structural assessment unavailable without failing work.
+    fn with_progress_failure(mut self, capture: usize) -> Self {
+        self.fail_progress_capture = Some(capture);
+        self
+    }
+
     /// Drains the scripted one-shot schedule edge.
     fn drain_pending_groups(&mut self) -> Vec<GroupId> {
         if !self.scheduled {
@@ -138,12 +148,18 @@ impl ScriptedConvergenceDrain {
     }
 
     /// Captures the same privacy-safe fields used by the real engine seam.
-    fn progress(&self) -> ConformanceStructuralProgressSnapshot {
+    fn progress(&mut self) -> Result<ConformanceStructuralProgressSnapshot, EngineError> {
+        self.progress_captures = self.progress_captures.saturating_add(1);
+        if self.fail_progress_capture == Some(self.progress_captures) {
+            return Err(EngineError::Backend(
+                "scripted progress assessment failure".into(),
+            ));
+        }
         let pending_work = cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot {
             scheduled_convergence_groups: usize::from(self.scheduled),
             ..Default::default()
         };
-        ConformanceStructuralProgressSnapshot {
+        Ok(ConformanceStructuralProgressSnapshot {
             current_epoch: self.generation,
             current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
             lifecycle: cgka_traits::engine_state::GroupLifecycleState::Stable,
@@ -153,7 +169,7 @@ impl ScriptedConvergenceDrain {
             earliest_next_wake_monotonic_ms: None,
             runnable_work: 1,
             terminal_unrecoverable: false,
-        }
+        })
     }
 
     /// Executes one scripted convergence round and re-arms when work remains.
@@ -314,13 +330,46 @@ fn ensure_convergence_drain_progress(
     initial: &ConformanceStructuralProgressSnapshot,
     current: &ConformanceStructuralProgressSnapshot,
 ) -> Result<(), EngineError> {
-    if attempts == HARNESS_CONVERGENCE_DRAIN_PASSES && continuation_scheduled && initial == current
+    if attempts == HARNESS_CONVERGENCE_DRAIN_PASSES
+        && continuation_scheduled
+        && convergence_drain_progress_key(initial) == convergence_drain_progress_key(current)
     {
         return Err(EngineError::Backend(
             "convergence scheduler repeated a drain without structural progress".into(),
         ));
     }
     Ok(())
+}
+
+/// Projects a snapshot onto durable fields that are stable across clocks.
+///
+/// Clock readings, derived wake/runnable values, and the one-shot schedule
+/// edge are observations of when work runs, not whether the drain changed its
+/// durable state.
+fn convergence_drain_progress_key(
+    snapshot: &ConformanceStructuralProgressSnapshot,
+) -> ConvergenceDrainProgressKey {
+    let mut pending_work = snapshot.pending_work.clone();
+    pending_work.scheduled_convergence_groups = 0;
+    ConvergenceDrainProgressKey {
+        current_epoch: snapshot.current_epoch,
+        lifecycle: snapshot.lifecycle,
+        pending_work,
+        pass_generation: snapshot.pass_generation,
+        pass_phase: snapshot.pass_phase,
+        terminal_unrecoverable: snapshot.terminal_unrecoverable,
+    }
+}
+
+/// Durable convergence state used by the local no-progress guard.
+#[derive(PartialEq, Eq)]
+struct ConvergenceDrainProgressKey {
+    current_epoch: u64,
+    lifecycle: cgka_traits::engine_state::GroupLifecycleState,
+    pending_work: cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot,
+    pass_generation: Option<u64>,
+    pass_phase: Option<ConvergencePassPhase>,
+    terminal_unrecoverable: bool,
 }
 
 #[cfg(test)]
@@ -394,6 +443,28 @@ mod tests {
             &progress,
         )
         .expect_err("identical scheduled state must not spin");
+
+        assert!(
+            matches!(error, EngineError::Backend(message) if message.contains("without structural progress"))
+        );
+    }
+
+    /// Clock-only observation changes do not hide an unchanged durable spin.
+    #[test]
+    fn clock_deltas_do_not_count_as_convergence_drain_progress() {
+        let initial = structural_progress(7);
+        let mut current = initial.clone();
+        current.current_monotonic_ms = current.current_monotonic_ms.saturating_add(1);
+        current.earliest_next_wake_monotonic_ms = Some(current.current_monotonic_ms);
+        current.runnable_work = current.runnable_work.saturating_add(1);
+
+        let error = ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &initial,
+            &current,
+        )
+        .expect_err("clock-derived deltas must not make a scheduler spin productive");
 
         assert!(
             matches!(error, EngineError::Backend(message) if message.contains("without structural progress"))
@@ -530,6 +601,25 @@ mod tests {
             [Err(EngineError::Backend(message))]
                 if message == "scripted underlying convergence failure"
         ));
+    }
+
+    /// An unavailable diagnostic snapshot does not synthesize a tick failure.
+    #[tokio::test]
+    async fn harness_tick_skips_an_unavailable_progress_assessment() {
+        for failed_capture in [1, 2] {
+            let script = ScriptedConvergenceDrain::retained_history(384, 12)
+                .with_progress_failure(failed_capture);
+            let mut client = scripted_client(script);
+
+            let outcomes = client.tick().await;
+
+            assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+            let script = client.scripted_convergence_drain.as_ref().unwrap();
+            assert_eq!(script.attempted_passes, HARNESS_CONVERGENCE_DRAIN_PASSES);
+            assert_eq!(script.remaining_passes, 4);
+            assert!(script.scheduled);
+            assert_eq!(script.progress_captures, failed_capture);
+        }
     }
 
     /// Wraps a scripted drain in a real `HarnessClient` tick surface.
@@ -2004,13 +2094,13 @@ impl HarnessClient {
 
     /// Captures structural progress through the production or scripted seam.
     fn harness_convergence_progress(
-        &self,
+        &mut self,
         group_id: &GroupId,
     ) -> Result<ConformanceStructuralProgressSnapshot, EngineError> {
         #[cfg(test)]
-        if let Some(script) = self.scripted_convergence_drain.as_ref() {
+        if let Some(script) = self.scripted_convergence_drain.as_mut() {
             assert_eq!(&script.group_id, group_id, "scripted convergence group");
-            return Ok(script.progress());
+            return script.progress();
         }
         self.engine()
             .conformance_structural_progress_snapshot(group_id)
@@ -2039,7 +2129,7 @@ impl HarnessClient {
     ) {
         let now_ms = self.harness_convergence_now_ms();
         let mut successful_attempts =
-            HashMap::<GroupId, (usize, ConformanceStructuralProgressSnapshot)>::new();
+            HashMap::<GroupId, (usize, Option<ConformanceStructuralProgressSnapshot>)>::new();
         let mut encountered_error = false;
         for _ in 0..HARNESS_CONVERGENCE_DRAIN_PASSES {
             let mut groups = self.drain_harness_convergence_groups();
@@ -2051,14 +2141,7 @@ impl HarnessClient {
                 let initial_progress = if successful_attempts.contains_key(&group_id) {
                     None
                 } else {
-                    match self.harness_convergence_progress(&group_id) {
-                        Ok(progress) => Some(progress),
-                        Err(error) => {
-                            outcomes.push(Err(error));
-                            encountered_error = true;
-                            continue;
-                        }
-                    }
+                    self.harness_convergence_progress(&group_id).ok()
                 };
                 let results = match self.harness_converge_and_drain(&group_id, now_ms).await {
                     Ok(results) => results,
@@ -2081,12 +2164,7 @@ impl HarnessClient {
                     .and_modify(|(attempts, _)| {
                         *attempts = attempts.saturating_add(1);
                     })
-                    .or_insert_with(|| {
-                        (
-                            1,
-                            initial_progress.expect("untracked group captured initial progress"),
-                        )
-                    });
+                    .or_insert_with(|| (1, initial_progress));
             }
         }
         if encountered_error {
@@ -2095,17 +2173,20 @@ impl HarnessClient {
         let mut successful_attempts = successful_attempts.into_iter().collect::<Vec<_>>();
         successful_attempts.sort_by(|(left, _), (right, _)| left.as_slice().cmp(right.as_slice()));
         for (group_id, (attempts, initial)) in successful_attempts {
-            let mut current = match self.harness_convergence_progress(&group_id) {
+            // Guard assessment is diagnostic: only a group that consumed the
+            // complete slice needs it, and an unavailable snapshot must not
+            // turn otherwise successful convergence work into a tick error.
+            if attempts != HARNESS_CONVERGENCE_DRAIN_PASSES {
+                continue;
+            }
+            let Some(initial) = initial else {
+                continue;
+            };
+            let current = match self.harness_convergence_progress(&group_id) {
                 Ok(progress) => progress,
-                Err(error) => {
-                    outcomes.push(Err(error));
-                    return;
-                }
+                Err(_) => continue,
             };
             let continuation_scheduled = current.pending_work.scheduled_convergence_groups > 0;
-            // The one-shot schedule edge was drained before the initial
-            // snapshot. Normalize a re-armed edge out of the comparison.
-            current.pending_work.scheduled_convergence_groups = 0;
             if let Err(error) = ensure_convergence_drain_progress(
                 attempts,
                 continuation_scheduled,
