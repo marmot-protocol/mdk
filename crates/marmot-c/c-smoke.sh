@@ -2,7 +2,10 @@
 # Build marmot-c and run the C smoke example against both linkage models:
 # the shared object and the static archive, for each compiler given as an
 # argument (default: cc). Runs the shared build under valgrind when
-# available. Usage: c-smoke.sh [cc...]
+# available. The default release build is the packaging/release gate; PR CI
+# uses --debug so it can reuse test-profile dependencies while still proving
+# the checked-in header compiles and both linkage models work.
+# Usage: c-smoke.sh [--debug] [cc...]
 
 set -euo pipefail
 
@@ -11,13 +14,25 @@ export PATH="$HOME/.cargo/bin:$PATH"
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
+PROFILE=release
+PROFILE_DIR=release
+if [[ "${1:-}" == "--debug" ]]; then
+    PROFILE=dev
+    PROFILE_DIR=debug
+    shift
+fi
+
 COMPILERS=("$@")
 [ ${#COMPILERS[@]} -gt 0 ] || COMPILERS=(cc)
 
 cd "$WORKSPACE_DIR"
 
-echo "==> Building marmot-c (release)"
-cargo build --release -p marmot-c
+echo "==> Building marmot-c ($PROFILE)"
+if [[ "$PROFILE" == "release" ]]; then
+    cargo build --release -p marmot-c
+else
+    cargo build -p marmot-c
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -38,18 +53,18 @@ run() {
     local bin="$1"; shift
     local home
     home="$(mktemp -d "$WORK/home.XXXXXX")"
-    env "$LIB_PATH_VAR=$TARGET_DIR/release" "$@" "$bin" "$home"
+    env "$LIB_PATH_VAR=$TARGET_DIR/$PROFILE_DIR" "$@" "$bin" "$home"
     rm -rf "$home"
 }
 
 for cc in "${COMPILERS[@]}"; do
     echo "==> [$cc] Compiling smoke.c against the shared object"
     "$cc" "${CFLAGS[@]}" "$CRATE_DIR/examples/smoke.c" \
-        -L"$TARGET_DIR/release" -lmarmot_c -o "$WORK/smoke-shared-$cc"
+        -L"$TARGET_DIR/$PROFILE_DIR" -lmarmot_c -o "$WORK/smoke-shared-$cc"
 
     echo "==> [$cc] Compiling smoke.c against the static archive"
     "$cc" "${CFLAGS[@]}" "$CRATE_DIR/examples/smoke.c" \
-        "$TARGET_DIR/release/libmarmot_c.a" "${STATIC_LIBS[@]}" -o "$WORK/smoke-static-$cc"
+        "$TARGET_DIR/$PROFILE_DIR/libmarmot_c.a" "${STATIC_LIBS[@]}" -o "$WORK/smoke-static-$cc"
 
     echo "==> [$cc] Running smoke (shared)"
     run "$WORK/smoke-shared-$cc"

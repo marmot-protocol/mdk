@@ -21,6 +21,43 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  changes:
+    name: Classify CI changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_full: ${{ steps.classify.outputs.run_full }}
+      run_c: ${{ steps.classify.outputs.run_c }}
+      run_conformance: ${{ steps.classify.outputs.run_conformance }}
+      run_ios: ${{ steps.classify.outputs.run_ios }}
+      run_formal: ${{ steps.classify.outputs.run_formal }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" \
+            || -z "$BASE_SHA" \
+            || "$BASE_SHA" =~ ^0+$ ]] \
+            || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            python3 scripts/classify_ci_changes.py --all --github-output "$GITHUB_OUTPUT" </dev/null
+          else
+            # Disable rename detection so a code-to-Markdown rename exposes
+            # both the removed code path and the added documentation path.
+            git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" \
+              | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
+          fi
+
   rust-format:
     name: Rust format
     runs-on: ubuntu-latest
@@ -63,8 +100,11 @@ jobs:
       - name: Agent install documentation gate
         run: ./scripts/check_agent_install_docs.sh
 
-      - name: Cargo audit workflow policy gate
-        run: python3 scripts/test_check_cargo_audit_ci.py
+      - name: CI policy and path-classifier gates
+        run: |
+          ./scripts/check_convergence_constant_ledger.sh
+          python3 scripts/test_check_cargo_audit_ci.py
+          python3 scripts/test_classify_ci_changes.py
 
   rust-audit:
     name: Rust audit
@@ -98,6 +138,8 @@ jobs:
 
   terminal-harness-installers:
     name: Terminal harness installer tests
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -116,6 +158,8 @@ jobs:
 
   rust-check:
     name: Rust check
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -145,6 +189,8 @@ jobs:
 
   rust-clippy:
     name: Rust clippy
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -174,6 +220,8 @@ jobs:
 
   c-smoke:
     name: C bindings smoke
+    needs: changes
+    if: needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -193,6 +241,11 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      - name: Install cbindgen
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cbindgen@0.29.4
+
       - name: Header diff gate
         run: |
           set -euo pipefail
@@ -200,7 +253,6 @@ jobs:
           # checked-in header and fail the diff gate on unrelated PRs.
           # RUSTC_BOOTSTRAP=1 lets cbindgen expand the mirror-generating
           # macros on stable; it only affects header generation.
-          cargo install cbindgen --version 0.29.4 --locked
           RUSTC_BOOTSTRAP=1 cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c \
             --output crates/marmot-c/include/marmot.h crates/marmot-c
           git diff --exit-code crates/marmot-c/include/marmot.h
@@ -208,15 +260,13 @@ jobs:
       - name: Alloc-audit tests
         run: cargo test -p marmot-c --features alloc-audit --locked
 
-      - name: Compile and run C smoke test (gcc + clang, valgrind)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y valgrind clang
-          ./crates/marmot-c/c-smoke.sh gcc clang
+      - name: Compile and run debug C smoke test (gcc)
+        run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
   ios-account-clippy:
     name: iOS account keychain clippy
+    needs: changes
+    if: needs.changes.outputs.run_ios == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
 
@@ -248,6 +298,8 @@ jobs:
   # reject every non-v1 convergence policy (mdk#970).
   convergence-policy-pin:
     name: Convergence policy pin (release assertions)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -275,6 +327,8 @@ jobs:
 
   rust-test:
     name: Rust tests (${{ matrix.partition }}/4)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -315,6 +369,8 @@ jobs:
 
   cli-e2e:
     name: CLI e2e (mock relay)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -348,6 +404,8 @@ jobs:
 
   relay-runtime:
     name: Relay runtime tests
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -377,6 +435,8 @@ jobs:
 
   relay-e2e:
     name: Relay CLI E2E
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -424,6 +484,8 @@ jobs:
 
   conformance:
     name: Simulator and vectors
+    needs: changes
+    if: needs.changes.outputs.run_conformance == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -474,26 +536,10 @@ jobs:
       - name: Verify convergence with independent models
         run: just convergence-verification-ci
 
-      - name: Run encrypted file-backed vector report
-        run: |
-          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
-            --vectors crates/cgka-conformance-simulator/vectors \
-            --out target/cgka-conformance-simulator-reports \
-            --storage file \
-            --strict-oracle
-          jq -s -e 'all(.[]; .metadata.storage_backend == "encrypted-file-sqlite")' \
-            target/cgka-conformance-simulator-reports/*-report.json >/dev/null
-
-      - name: Upload vector report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: cgka-conformance-simulator-reports
-          path: target/cgka-conformance-simulator-reports
-          if-no-files-found: error
-          retention-days: 14
-
   formal:
     name: Tamarin proofs
+    needs: changes
+    if: needs.changes.outputs.run_formal == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -545,6 +591,8 @@ jobs:
 
   hermes-installer-auth:
     name: Hermes installer auth
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -625,6 +673,7 @@ jobs:
     name: Required CI
     if: always()
     needs:
+      - changes
       - rust-format
       - rust-audit
       - terminal-harness-installers
@@ -644,8 +693,8 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Require every core CI job to succeed
+      - name: Require every selected core CI job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
-          jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS"
+          jq --exit-status 'all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS"

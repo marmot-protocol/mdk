@@ -57,7 +57,9 @@ int main(void) {
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
-against both linkage models (valgrind when available).
+against both linkage models (valgrind when available). Pass `--debug` first
+to reuse debug/test-profile dependencies for a faster local or PR smoke run;
+release and scheduled validation use the default release build.
 
 ## Rules of the road
 
