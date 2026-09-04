@@ -13956,6 +13956,112 @@ fn installed_group_routes(client: &AppClient, group_id: &GroupId) -> usize {
 
 /// A realized voluntary leave must stop routing, exactly as an eviction does.
 ///
+/// The deferred open is the path the field device ran (mdk#1161), and it is
+/// the one where the departed group's route cannot be filtered out up front:
+/// every `group_record` answers `GroupNotHydrated` while hydration is pending,
+/// so `routing_for` seeds the stale route. That is safe only because nothing
+/// has subscribed yet — group registration happens after the hydration
+/// pipeline, whose completion reconciles the route away. Pin both halves: no
+/// subscription is ever published for the departed group, and the route is
+/// gone once the pipeline finishes.
+#[tokio::test]
+async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let removed_group = alice
+        .create_group("deferred removal", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let kept_group = alice
+        .create_group("deferred keeper", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let joined = bob_client.sync().await.unwrap().joined_groups;
+    assert!(
+        joined.contains(&removed_group) && joined.contains(&kept_group),
+        "bob must join both groups before the removal commit"
+    );
+
+    alice
+        .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+        .await
+        .expect("the removal commit must fan out to bob's group route")
+        .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        panic!("the test did not overflow its account delivery queue");
+    };
+    bob_client
+        .ingest_received_delivery(*delivery)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bob_client
+        .runtime
+        .group_record(&removed_group)
+        .unwrap()
+        .removed
+    {
+        bob_client
+            .advance_convergence_after_runtime_sync(&removed_group)
+            .await
+            .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "convergence did not adopt the removal commit within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let subscriptions_before_reopen = group_subscriptions(&relay, &removed_group);
+    drop(bob_client);
+    drop(alice);
+    // The runtime's own open: hydration deferred, no transport preparation, so
+    // the route table is seeded from persisted state alone.
+    let mut reopened = app
+        .local_client_with_relay_plane_and_hydration("bob", &plane, None, true)
+        .await
+        .unwrap();
+    // The worker's pipeline, run to completion the way a reconnect does.
+    crate::runtime::account_worker::drain_deferred_hydration(&mut reopened)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        installed_group_routes(&reopened, &removed_group),
+        0,
+        "finishing the hydration pipeline must reconcile the departed group's route away"
+    );
+    assert!(
+        installed_group_routes(&reopened, &kept_group) > 0,
+        "the same reconciliation must keep routes for a group this device is still in"
+    );
+    assert_eq!(
+        group_subscriptions(&relay, &removed_group),
+        subscriptions_before_reopen,
+        "a deferred open must never publish a subscription for a departed group"
+    );
+}
+
 /// A voluntary leave and an eviction may be recorded with either app
 /// membership label — attribution depends on which seam realizes the
 /// departure — but the engine sets the same terminal `Group::removed` marker

@@ -533,6 +533,10 @@ impl AppClient {
         // it still precedes the first subscription, so a group this device has
         // left is never re-subscribed. Only the routing table changes unless a
         // prior route retired, which is the one case that persists.
+        //
+        // A quarantined group is the deliberate exception: `ensure_group_live`
+        // makes its record unreadable, so its route survives this seam and is
+        // reconciled on the next hydration that admits the group.
         if self.refresh_group_routes()?.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }

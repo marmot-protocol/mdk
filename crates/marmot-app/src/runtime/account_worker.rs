@@ -2135,7 +2135,7 @@ fn finish_deferred_hydration_reconciliation(client: &mut AppClient) {
 
 /// Eagerly drain a deferred open's hydration without serving commands, for
 /// paths (reconnect) whose callers previously relied on the fully-eager open.
-async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError> {
+pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(), AppError> {
     loop {
         let progress = client
             .runtime
