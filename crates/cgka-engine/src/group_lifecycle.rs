@@ -950,8 +950,8 @@ impl<S: StorageProvider> Engine<S> {
         // Building a group from a staged Welcome performs the same multi-row
         // OpenMLS store as group creation. Keep KeyPackage consumption, stale
         // live-state clearing, that store, every Marmot post-check, the
-        // discoverable group record, capability cache, and both durable
-        // Welcome dispositions in one transaction.
+        // discoverable group record, joined-epoch recovery anchor, capability
+        // cache, and both durable Welcome dispositions in one transaction.
         let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) =
             self.storage.with_transaction(|storage| {
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
@@ -990,6 +990,13 @@ impl<S: StorageProvider> Engine<S> {
                         .as_slice()
                         .to_vec(),
                 );
+                // The epoch is still unverified at this point. It is used only
+                // to decide whether a distinct Welcome is worth attempting as
+                // a replacement for local live state. Every replacement write
+                // remains inside this transaction and is committed only after
+                // OpenMLS verifies the GroupInfo and the Marmot membership,
+                // capability, and admin checks below all succeed.
+                let incoming_epoch = EpochId(processed.unverified_group_info().epoch().as_u64());
                 if storage.disband_tombstone(&group_id)?.is_some() {
                     return Err(EngineError::InvalidWelcome);
                 }
@@ -1002,12 +1009,23 @@ impl<S: StorageProvider> Engine<S> {
                                 .members
                                 .iter()
                                 .any(|member| &member.id == self.identity.self_id());
-                            if self_is_recorded_member && !group.unrecoverable {
+                            if self_is_recorded_member
+                                && !group.unrecoverable
+                                && incoming_epoch <= group.epoch
+                            {
                                 // A distinct transport/content id does not make a
-                                // second normal Welcome for an already-active group
-                                // a rejoin. Reject before OpenMLS staging and let
-                                // the surrounding transaction restore KeyPackage
+                                // same- or older-epoch Welcome for an already-active
+                                // group a rejoin. Reject before OpenMLS staging and
+                                // let the surrounding transaction restore KeyPackage
                                 // consumption and every tentative write.
+                                //
+                                // A strictly newer Welcome is different: local state
+                                // can still list this device because a delayed older
+                                // Welcome was accepted after the device had already
+                                // been removed elsewhere. A later legitimate re-add
+                                // must be allowed through the fully authenticated
+                                // replacement path below rather than being mistaken
+                                // for a duplicate solely from that stale local view.
                                 return Err(EngineError::WelcomeAlreadyProcessed);
                             }
                             // Unrecoverable is the explicit exception: a fully
@@ -1202,6 +1220,14 @@ impl<S: StorageProvider> Engine<S> {
                     lifecycle.last_consumed_at = Some(joined_at);
                     maintenance.put_key_package_lifecycle(&lifecycle)?;
                 }
+
+                // A Welcome-installed member must retain the joined epoch
+                // before it can safely advance locally. Otherwise a sibling
+                // commit authored from this epoch but delivered after our own
+                // publish cannot be peeled and never enters convergence. Keep
+                // the anchor in this transaction so a snapshot failure also
+                // restores the consumed KeyPackage and every staged join row.
+                self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
 
                 Ok::<_, EngineError>((
                     group_id,

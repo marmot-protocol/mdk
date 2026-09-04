@@ -121,6 +121,22 @@ fn content_id(msg: &TransportMessage) -> MessageId {
     MessageId::new(Sha256::digest(&msg.payload).to_vec())
 }
 
+fn take_welcome_for(
+    welcomes: &mut Vec<TransportMessage>,
+    recipient: &MemberId,
+) -> TransportMessage {
+    let index = welcomes
+        .iter()
+        .position(|welcome| {
+            matches!(
+                &welcome.envelope,
+                TransportEnvelope::Welcome { recipient: target } if target == recipient
+            )
+        })
+        .expect("welcome for recipient");
+    welcomes.remove(index)
+}
+
 /// Encode a `marmot.group.admin-policy.v1` state from raw 32-byte account keys,
 /// sorted + deduped per the component rules. Mirrors the same-named helper in
 /// `tests/update_group_data.rs`; kept file-local so this test file stays
@@ -1903,6 +1919,143 @@ async fn readd_after_remove_produces_fresh_welcome_join() {
     );
 }
 
+/// A delayed Welcome can install an apparently active local view after the
+/// rest of the group has already removed that identity. A later, strictly
+/// newer re-add Welcome must replace that stale view, while an older Welcome
+/// must never downgrade an already-current client.
+#[tokio::test]
+async fn newer_readd_welcome_replaces_stale_active_view_without_allowing_downgrade() {
+    let mut alice = build_client(b"alice-stale-welcome");
+    let mut bob = build_client(b"bob-stale-welcome");
+    let (mut carol, carol_storage) = build_with_storage(b"carol-stale-welcome");
+    let mut david = build_client(b"david-stale-welcome");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "stale Welcome re-entry".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Alice adds Carol and David at epoch 2, but both Welcomes are delayed.
+    let carol_id = carol.self_id().clone();
+    let david_id = david.self_id().clone();
+    let initial_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![
+                carol.fresh_key_package().await.unwrap(),
+                david.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (initial_pending, mut stale_welcomes) = match initial_invite {
+        SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } => (pending, welcomes),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(initial_pending).await.unwrap();
+    let stale_carol_welcome = take_welcome_for(&mut stale_welcomes, &carol_id);
+    let stale_david_welcome = take_welcome_for(&mut stale_welcomes, &david_id);
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+
+    // The canonical group removes both identities at epoch 3 before either
+    // delayed Welcome is delivered.
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol_id.clone(), david_id.clone()],
+        })
+        .await
+        .unwrap();
+    let remove_pending = match remove {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(remove_pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 3);
+
+    // Carol now accepts the delayed epoch-2 Welcome. Her local record says
+    // she is active even though the canonical group removed her at epoch 3.
+    carol.join_welcome(stale_carol_welcome).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
+    drop(carol);
+    let mut carol = build_client_on_storage(b"carol-stale-welcome", carol_storage);
+    carol.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        carol.epoch(&group_id).unwrap().0,
+        2,
+        "restart must preserve the stale active view"
+    );
+
+    // A legitimate re-add advances the canonical group to epoch 4. Carol's
+    // strictly newer Welcome must repair her stale active view.
+    let readd = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![
+                carol.fresh_key_package().await.unwrap(),
+                david.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (readd_pending, mut fresh_welcomes) = match readd {
+        SendResult::GroupEvolution {
+            pending, welcomes, ..
+        } => (pending, welcomes),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(readd_pending).await.unwrap();
+    let fresh_carol_welcome = take_welcome_for(&mut fresh_welcomes, &carol_id);
+    let fresh_david_welcome = take_welcome_for(&mut fresh_welcomes, &david_id);
+
+    carol.join_welcome(fresh_carol_welcome).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 4);
+    assert_eq!(
+        carol.members(&group_id).unwrap(),
+        alice.members(&group_id).unwrap()
+    );
+
+    // David takes the fresh Welcome first. His still-unconsumed epoch-2
+    // Welcome is distinct valid MLS material, but it must not replace epoch 4.
+    david.join_welcome(fresh_david_welcome).await.unwrap();
+    let downgrade_error = david
+        .join_welcome(stale_david_welcome)
+        .await
+        .expect_err("an older Welcome must not downgrade active group state");
+    assert!(matches!(
+        downgrade_error,
+        EngineError::WelcomeAlreadyProcessed
+    ));
+    assert_eq!(david.epoch(&group_id).unwrap().0, 4);
+    assert_eq!(
+        david.members(&group_id).unwrap(),
+        alice.members(&group_id).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn own_leaf_index_reports_mls_index_after_blank_leaf() {
     let mut alice = build_client(b"alice");
@@ -2113,6 +2266,100 @@ async fn join_rejects_welcome_authored_by_existing_non_admin() {
         matches!(err, EngineError::NotGroupAdmin { .. }),
         "expected NotGroupAdmin for non-admin Welcome signer, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn rejected_newer_welcome_rolls_back_active_group_replacement() {
+    let mut alice = build_client(b"alice-active-replacement");
+    let (mut bob, bob_storage) = build_with_storage(b"bob-active-replacement");
+    let (mut carol, carol_storage) = build_with_storage(b"carol-active-replacement");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "active replacement rollback".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (bob_welcome, carol_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (
+                take_welcome_for(&mut welcomes, &bob.self_id()),
+                take_welcome_for(&mut welcomes, &carol.self_id()),
+            )
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+    carol.join_welcome(carol_welcome).await.unwrap();
+
+    // Alice removes Carol and Bob applies that commit, while Carol deliberately
+    // retains her epoch-1 active view. Bob can now construct an MLS-valid Add
+    // for Carol at a newer epoch, but remains unauthorized by Marmot policy.
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id().clone()],
+        })
+        .await
+        .unwrap();
+    let (remove_commit, remove_pending) = match remove {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(remove_pending).await.unwrap();
+    let routed_remove = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..remove_commit
+    };
+    assert!(matches!(
+        bob.ingest(routed_remove).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    converge_buffered_commit(&mut bob, &group_id);
+    assert_eq!(bob.epoch(&group_id).unwrap().0, 2);
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 1);
+
+    let before = carol_storage.get_group(&group_id).unwrap();
+    let carol_replacement_kp = carol.fresh_key_package().await.unwrap();
+    let unauthorized_newer_welcome = welcome_from_existing_non_admin(
+        &bob_storage,
+        &bob.self_id(),
+        &group_id,
+        &carol_replacement_kp,
+    );
+
+    let error = carol
+        .join_welcome(unauthorized_newer_welcome)
+        .await
+        .expect_err("a newer Welcome from a non-admin must be rejected");
+    assert!(
+        matches!(error, EngineError::NotGroupAdmin { .. }),
+        "expected NotGroupAdmin after authenticated staging, got {error:?}"
+    );
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap(),
+        before,
+        "failed replacement must restore the original Marmot group record"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), before.epoch);
+    let payload = app_payload_for(&carol, b"original state remains usable");
+    carol
+        .send(SendIntent::AppMessage { group_id, payload })
+        .await
+        .expect("failed replacement must leave the original live group usable");
 }
 
 #[tokio::test]
