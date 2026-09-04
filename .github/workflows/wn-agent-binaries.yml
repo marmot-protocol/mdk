@@ -267,13 +267,12 @@ jobs:
           enable-cache: false
 
       - name: Prepare isolated Hermes dev root
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           dev_root="$RUNNER_TEMP/hermes-marmot-integration"
           ./scripts/hermes_marmot_dev_setup.sh \
             --root "$dev_root" \
+            --install-pinned-wheel \
             --no-enable-plugin
           echo "HERMES_MARMOT_DEV_ROOT=$dev_root" >> "$GITHUB_ENV"
 

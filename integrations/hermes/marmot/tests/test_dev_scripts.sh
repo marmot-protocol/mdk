@@ -39,6 +39,9 @@ esac
 SCRIPT
 cat >"$auth_fake_bin/uv" <<'SCRIPT'
 #!/usr/bin/env bash
+if [ -n "${UV_CAPTURE:-}" ]; then
+    printf '%s\n' "$*" >>"$UV_CAPTURE"
+fi
 exit 0
 SCRIPT
 chmod +x "$auth_fake_bin/git" "$auth_fake_bin/uv"
@@ -60,6 +63,67 @@ if grep -F 'test-actions-token' "$auth_capture" >/dev/null; then
     echo "raw GitHub token leaked into git configuration" >&2
     exit 1
 fi
+
+# The required CI path installs the released, hash-pinned wheel and must not
+# contact GitHub for a source checkout.
+wheel_dev_root="$tmp_parent/pinned-wheel"
+wheel_capture="$tmp_parent/pinned-wheel-uv-capture"
+env \
+    PATH="$auth_fake_bin:$PATH" \
+    UV_CAPTURE="$wheel_capture" \
+    "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
+        --root "$wheel_dev_root" \
+        --install-pinned-wheel \
+        --no-enable-plugin
+[ -d "$wheel_dev_root/hermes-agent" ]
+[ ! -e "$wheel_dev_root/hermes-agent/.git" ]
+grep -F 'venv .venv --python 3.11' "$wheel_capture" >/dev/null
+grep -F 'hermes-agent[all,dev] @ https://files.pythonhosted.org/' "$wheel_capture" >/dev/null
+grep -F '#sha256=' "$wheel_capture" >/dev/null
+if grep -F 'pip install -e ' "$wheel_capture" >/dev/null; then
+    echo "pinned wheel install unexpectedly used editable mode" >&2
+    exit 1
+fi
+
+# Pinned-wheel installs must not silently ignore an explicit source ref.
+ref_conflict_stderr="$tmp_parent/pinned-wheel-ref-conflict.stderr"
+if env \
+    PATH="$auth_fake_bin:$PATH" \
+    HERMES_AGENT_REF="test-ref" \
+    "$repo_root/scripts/hermes_marmot_dev_setup.sh" \
+        --root "$tmp_parent/pinned-wheel-ref-conflict" \
+        --install-pinned-wheel \
+        --no-enable-plugin 2>"$ref_conflict_stderr"; then
+    echo "pinned wheel install accepted an explicit Hermes ref" >&2
+    exit 1
+fi
+grep -F -- '--install-pinned-wheel cannot be combined with an explicit Hermes ref' \
+    "$ref_conflict_stderr" >/dev/null
+
+# A stale wheel URL must fail before CI can validate a different Hermes version
+# than the source-oriented lock fields describe.
+drift_repo="$tmp_parent/wheel-version-drift-repo"
+mkdir -p "$drift_repo/scripts" "$drift_repo/integrations/hermes/marmot"
+cp "$repo_root/scripts/hermes_marmot_dev_setup.sh" "$drift_repo/scripts/"
+cp "$repo_root/integrations/hermes/marmot/hermes-agent.lock" \
+    "$drift_repo/integrations/hermes/marmot/hermes-agent.lock"
+sed 's/^HERMES_AGENT_VERSION=.*/HERMES_AGENT_VERSION=version-drift-test/' \
+    "$drift_repo/integrations/hermes/marmot/hermes-agent.lock" \
+    >"$drift_repo/integrations/hermes/marmot/hermes-agent.lock.tmp"
+mv "$drift_repo/integrations/hermes/marmot/hermes-agent.lock.tmp" \
+    "$drift_repo/integrations/hermes/marmot/hermes-agent.lock"
+drift_stderr="$tmp_parent/wheel-version-drift.stderr"
+if env \
+    PATH="$auth_fake_bin:$PATH" \
+    "$drift_repo/scripts/hermes_marmot_dev_setup.sh" \
+        --root "$tmp_parent/wheel-version-drift" \
+        --install-pinned-wheel \
+        --no-enable-plugin 2>"$drift_stderr"; then
+    echo "pinned wheel install accepted a URL for the wrong Hermes version" >&2
+    exit 1
+fi
+grep -F 'pinned Hermes wheel URL does not match HERMES_AGENT_VERSION' \
+    "$drift_stderr" >/dev/null
 
 # A pinned commit already present in a successful full clone must be checked
 # out locally instead of making a redundant fetch. This keeps the CI setup from

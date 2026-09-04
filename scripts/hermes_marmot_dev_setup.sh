@@ -13,6 +13,7 @@ Options:
   --marmot-home PATH       Marmot/wn-agent home (default: ROOT/marmot-agent-home)
   --hermes-url URL         Hermes repo URL (default: https://github.com/NousResearch/hermes-agent.git)
   --hermes-ref REF         Optional branch, tag, or commit to checkout
+  --install-pinned-wheel   Install the hash-pinned Hermes wheel instead of cloning source
   --account-id-hex HEX     Export MARMOT_ACCOUNT_ID_HEX in env.sh
   --group-id-hex HEX       Export MARMOT_GROUP_ID_HEX in env.sh
   --auth-token TOKEN       Write TOKEN to ROOT/control.token and use token-gated control requests
@@ -43,6 +44,10 @@ USAGE
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 hermes_ref_override="${HERMES_AGENT_REF:-}"
+hermes_ref_is_explicit=0
+if [ -n "$hermes_ref_override" ]; then
+    hermes_ref_is_explicit=1
+fi
 . "$repo_root/integrations/hermes/marmot/hermes-agent.lock"
 default_tmp="${TMPDIR:-/tmp}"
 dev_root="${HERMES_MARMOT_DEV_ROOT:-${default_tmp%/}/hermes-marmot-test}"
@@ -58,6 +63,7 @@ socket_mode="${MARMOT_AGENT_SOCKET_MODE:-0600}"
 skip_hermes_install=0
 enable_plugin=1
 install_uv=0
+install_pinned_wheel=0
 force=0
 print_env=0
 relays=()
@@ -79,7 +85,12 @@ while [ "$#" -gt 0 ]; do
             ;;
         --hermes-ref)
             hermes_ref="$2"
+            hermes_ref_is_explicit=1
             shift 2
+            ;;
+        --install-pinned-wheel)
+            install_pinned_wheel=1
+            shift
             ;;
         --account-id-hex)
             account_id="$2"
@@ -153,6 +164,11 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$install_pinned_wheel" -eq 1 ] && [ "$hermes_ref_is_explicit" -eq 1 ]; then
+    echo "error: --install-pinned-wheel cannot be combined with an explicit Hermes ref" >&2
+    exit 2
+fi
 
 dev_parent="$(dirname "$dev_root")"
 dev_base="$(basename "$dev_root")"
@@ -267,21 +283,36 @@ fetch_hermes_ref() {
 }
 
 install_hermes() {
-    if [ ! -d "$hermes_repo/.git" ]; then
-        clone_hermes_repo "$hermes_repo"
-    fi
+    local install_args=(-e ".[all,dev]")
+    if [ "$install_pinned_wheel" -eq 1 ]; then
+        if [[ ! "$HERMES_AGENT_WHEEL_URL" =~ ^https://files\.pythonhosted\.org/ ]] \
+            || [[ ! "$HERMES_AGENT_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "error: invalid pinned Hermes wheel URL or SHA-256" >&2
+            exit 1
+        fi
+        if [[ "$HERMES_AGENT_WHEEL_URL" != *"/hermes_agent-${HERMES_AGENT_VERSION}-"* ]]; then
+            echo "error: pinned Hermes wheel URL does not match HERMES_AGENT_VERSION" >&2
+            exit 1
+        fi
+        mkdir -p "$hermes_repo"
+        install_args=("hermes-agent[all,dev] @ ${HERMES_AGENT_WHEEL_URL}#sha256=${HERMES_AGENT_WHEEL_SHA256}")
+    else
+        if [ ! -d "$hermes_repo/.git" ]; then
+            clone_hermes_repo "$hermes_repo"
+        fi
 
-    if [ -n "$hermes_ref" ]; then
-        if [[ "$hermes_ref" =~ ^[0-9a-fA-F]{40}$ ]] \
-            && git -C "$hermes_repo" cat-file -e "${hermes_ref}^{commit}" 2>/dev/null; then
-            # A normal full clone already contains the pinned commit when it is
-            # reachable from the default branch. Avoid a second GitHub request:
-            # under shared-runner pressure that redundant fetch can be 429'd
-            # immediately after the clone itself finally succeeds.
-            git -C "$hermes_repo" checkout --detach "$hermes_ref"
-        else
-            fetch_hermes_ref
-            git -C "$hermes_repo" checkout --detach FETCH_HEAD
+        if [ -n "$hermes_ref" ]; then
+            if [[ "$hermes_ref" =~ ^[0-9a-fA-F]{40}$ ]] \
+                && git -C "$hermes_repo" cat-file -e "${hermes_ref}^{commit}" 2>/dev/null; then
+                # A normal full clone already contains the pinned commit when it is
+                # reachable from the default branch. Avoid a second GitHub request:
+                # under shared-runner pressure that redundant fetch can be 429'd
+                # immediately after the clone itself finally succeeds.
+                git -C "$hermes_repo" checkout --detach "$hermes_ref"
+            else
+                fetch_hermes_ref
+                git -C "$hermes_repo" checkout --detach FETCH_HEAD
+            fi
         fi
     fi
 
@@ -289,7 +320,7 @@ install_hermes() {
         (
             cd "$hermes_repo"
             uv venv .venv --python 3.11
-            uv pip install -e ".[all,dev]"
+            uv pip install "${install_args[@]}"
         )
         return 0
     fi
@@ -300,7 +331,7 @@ install_hermes() {
             python3.11 -m venv .venv
             . .venv/bin/activate
             python -m pip install --upgrade pip
-            python -m pip install -e ".[all,dev]"
+            python -m pip install "${install_args[@]}"
         )
         return 0
     fi
