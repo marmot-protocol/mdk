@@ -330,3 +330,40 @@ async fn smoke_natural_and_duplicate_history_cases_pass_file_backed_strict_oracl
         }));
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_natural_history_retries_capacity_refused_relay_objects() {
+    let case = generate_offline_catchup_pressure_case(9101, 12);
+    let report = run_generated_case_report_with_storage_mode(
+        &case,
+        None,
+        HarnessStorageMode::TempFileBackedSqlite,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{}: {error}", case.scenario.name));
+
+    assert!(
+        report.expectation_failures.is_empty(),
+        "{} expectation failures: {:#?}",
+        case.scenario.name,
+        report.expectation_failures
+    );
+    assert!(
+        report.invariant_failures.is_empty(),
+        "{} invariant failures: {:#?}",
+        case.scenario.name,
+        report.invariant_failures
+    );
+    assert!(
+        report
+            .relay_sync_observations
+            .iter()
+            .filter(|observation| {
+                observation.client == "bob"
+                    && matches!(observation.mode, ScenarioRelaySyncModeV2::FullHistory)
+            })
+            .count()
+            >= 2,
+        "the capacity refusal must cause a bounded complete-history refetch"
+    );
+}

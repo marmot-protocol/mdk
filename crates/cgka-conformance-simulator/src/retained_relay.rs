@@ -10,17 +10,19 @@ use crate::{
     EngineHarnessSubject, HarnessStorageMode, ScenarioAdminPolicyObservation,
     ScenarioMessageSelectorV2, ScenarioPredicateObservationV2, ScenarioPredicateV2,
     ScenarioRelayV2, ScenarioTopologyV2, ScenarioTransportClass, SubjectCapability,
-    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectInviteMembers,
-    SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome, SubjectProgressSnapshot,
-    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
-    SubjectUpdateGroupData,
+    SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
+    SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
+    SubjectProgressSnapshot, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
+    SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
 };
 use async_trait::async_trait;
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 const DEFAULT_RELAY_ID: &str = "relay:retained-default";
+const MAX_REDELIVERY_NO_PROGRESS_TURNS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +108,8 @@ pub struct RetainedRelaySubject {
     action_ids: BTreeMap<String, String>,
     semantic_classes: BTreeMap<String, ScenarioTransportClass>,
     sync_observations: Vec<RelaySyncObservationV2>,
+    capacity_refused_redelivery: BTreeMap<String, usize>,
+    redelivery_no_progress_turns: BTreeMap<String, usize>,
 }
 
 impl RetainedRelaySubject {
@@ -188,6 +192,8 @@ impl RetainedRelaySubject {
             action_ids: BTreeMap::new(),
             semantic_classes: BTreeMap::new(),
             sync_observations: Vec::new(),
+            capacity_refused_redelivery: BTreeMap::new(),
+            redelivery_no_progress_turns: BTreeMap::new(),
         })
     }
 
@@ -432,6 +438,35 @@ fn relay_history_sets_equal(
     sets.all(|set| set == first)
 }
 
+fn redelivery_no_progress_turns(
+    previous_turns: usize,
+    attempted_objects: Option<usize>,
+    refused_objects: Option<usize>,
+    before_token: Option<&str>,
+    after_token: Option<&str>,
+) -> Result<usize, SubjectError> {
+    let stalled = attempted_objects.is_some()
+        && attempted_objects == refused_objects
+        && before_token.is_some()
+        && before_token == after_token;
+    if !stalled {
+        return Ok(0);
+    }
+
+    let turns = previous_turns.saturating_add(1);
+    if turns >= MAX_REDELIVERY_NO_PROGRESS_TURNS {
+        return Err(SubjectError::classified(
+            SubjectFailureCategory::Resource,
+            "retained_history_redelivery_no_progress",
+            format!(
+                "retained-history redelivery refused all {} object(s) for {turns} consecutive turns without engine progress",
+                attempted_objects.unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(turns)
+}
+
 #[async_trait]
 impl ConvergenceSubject for RetainedRelaySubject {
     fn descriptor(&self) -> SubjectDescriptor {
@@ -554,7 +589,50 @@ impl ConvergenceSubject for RetainedRelaySubject {
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
         for client in clients {
             if self.online.contains(client) {
-                self.engine.tick(std::slice::from_ref(client)).await?;
+                let retrying = self.capacity_refused_redelivery.get(client).copied();
+                let before = retrying
+                    .is_some()
+                    .then(|| self.engine.structural_progress())
+                    .transpose()?
+                    .map(|snapshot| snapshot.structural_token);
+                if retrying.is_some() {
+                    self.sync_one(client, &ScenarioRelaySyncModeV2::FullHistory)?;
+                }
+
+                let refused = self
+                    .engine
+                    .tick_observing_capacity_refusals(std::slice::from_ref(client))
+                    .await?
+                    .get(client)
+                    .copied();
+                if let Some(refused) = refused {
+                    self.capacity_refused_redelivery
+                        .insert(client.clone(), refused);
+                } else {
+                    self.capacity_refused_redelivery.remove(client);
+                }
+
+                let after = retrying
+                    .is_some()
+                    .then(|| self.engine.structural_progress())
+                    .transpose()?
+                    .map(|snapshot| snapshot.structural_token);
+                let no_progress_turns = redelivery_no_progress_turns(
+                    self.redelivery_no_progress_turns
+                        .get(client)
+                        .copied()
+                        .unwrap_or_default(),
+                    retrying,
+                    refused,
+                    before.as_deref(),
+                    after.as_deref(),
+                )?;
+                if no_progress_turns == 0 {
+                    self.redelivery_no_progress_turns.remove(client);
+                } else {
+                    self.redelivery_no_progress_turns
+                        .insert(client.clone(), no_progress_turns);
+                }
             }
         }
         Ok(())
@@ -617,7 +695,35 @@ impl ConvergenceSubject for RetainedRelaySubject {
     }
 
     fn structural_progress(&mut self) -> Result<SubjectProgressSnapshot, SubjectError> {
-        self.engine.structural_progress()
+        let mut snapshot = self.engine.structural_progress()?;
+        let refused_objects = self
+            .capacity_refused_redelivery
+            .values()
+            .copied()
+            .sum::<usize>();
+        let runnable_refused_objects = self
+            .capacity_refused_redelivery
+            .iter()
+            .filter(|(client, _)| self.online.contains(*client))
+            .map(|(_, count)| *count)
+            .sum::<usize>();
+        if refused_objects > 0 {
+            snapshot.runnable_work = snapshot
+                .runnable_work
+                .saturating_add(runnable_refused_objects);
+            snapshot.transport_delayed_messages = snapshot
+                .transport_delayed_messages
+                .saturating_add(refused_objects);
+            snapshot.structural_token.clear();
+            let encoded = serde_json::to_vec(&snapshot).map_err(|error| {
+                SubjectError::new(
+                    "progress_serialization_failed",
+                    format!("serialize retained-relay progress: {error}"),
+                )
+            })?;
+            snapshot.structural_token = hex::encode(Sha256::digest(encoded));
+        }
+        Ok(snapshot)
     }
 
     fn observe(&mut self, clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
@@ -803,6 +909,24 @@ mod tests {
         ScenarioProcessV2, ScenarioSpec, ScenarioStep, TraceExpectation,
         run_scenario_report_with_subject,
     };
+
+    #[test]
+    fn unchanged_full_refusal_returns_typed_no_progress_failure() {
+        let first =
+            redelivery_no_progress_turns(0, Some(4), Some(4), Some("unchanged"), Some("unchanged"))
+                .expect("first unchanged retry remains within the bound");
+        let error = redelivery_no_progress_turns(
+            first,
+            Some(4),
+            Some(4),
+            Some("unchanged"),
+            Some("unchanged"),
+        )
+        .expect_err("second unchanged retry reaches the no-progress bound");
+
+        assert_eq!(error.category, SubjectFailureCategory::Resource);
+        assert_eq!(error.code, "retained_history_redelivery_no_progress");
+    }
 
     fn split_relay_topology() -> ScenarioTopologyV2 {
         ScenarioTopologyV2 {

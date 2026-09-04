@@ -1263,6 +1263,46 @@ impl EngineHarnessSubject {
                 && candidate.resolution == Some(SubjectOutboundOutcome::Accepted)
         })
     }
+
+    pub(crate) async fn tick_observing_capacity_refusals(
+        &mut self,
+        clients: &[String],
+    ) -> Result<BTreeMap<String, usize>, SubjectError> {
+        let mut capacity_refused = BTreeMap::new();
+        for label in clients {
+            let recipient_tick = self.observed_recipient_ticks;
+            self.observed_recipient_ticks = self.observed_recipient_ticks.saturating_add(1);
+            let inbound = self.bus.mailbox_snapshot(self.client(label)?.bus_id);
+            let pending_replay = (self.replay_capture_target_tick == Some(recipient_tick))
+                .then(|| self.prepare_byte_replay(label))
+                .flatten();
+            let outcomes = self.client_mut(label)?.tick().await;
+            let refused_count = inbound
+                .iter()
+                .zip(&outcomes)
+                .filter(|(_, outcome)| {
+                    matches!(
+                        outcome,
+                        Ok(cgka_traits::ingest::IngestOutcome::ResourceRefused {
+                            resource:
+                                cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+                            ..
+                        })
+                    )
+                })
+                .count();
+            if refused_count > 0 {
+                capacity_refused.insert(label.clone(), refused_count);
+            }
+            if let Some(pending_replay) = pending_replay
+                && let Some(replay) = self.complete_byte_replay(pending_replay, &outcomes)
+            {
+                self.last_byte_replay = Some(replay);
+            }
+            ensure_tick_succeeded(outcomes)?;
+        }
+        Ok(capacity_refused)
+    }
 }
 
 #[async_trait]
@@ -1451,21 +1491,9 @@ impl ConvergenceSubject for EngineHarnessSubject {
     }
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
-        for label in clients {
-            let recipient_tick = self.observed_recipient_ticks;
-            self.observed_recipient_ticks = self.observed_recipient_ticks.saturating_add(1);
-            let pending_replay = (self.replay_capture_target_tick == Some(recipient_tick))
-                .then(|| self.prepare_byte_replay(label))
-                .flatten();
-            let outcomes = self.client_mut(label)?.tick().await;
-            if let Some(pending_replay) = pending_replay
-                && let Some(replay) = self.complete_byte_replay(pending_replay, &outcomes)
-            {
-                self.last_byte_replay = Some(replay);
-            }
-            ensure_tick_succeeded(outcomes)?;
-        }
-        Ok(())
+        self.tick_observing_capacity_refusals(clients)
+            .await
+            .map(|_| ())
     }
 
     fn activate_virtual_time(&mut self) -> Result<(), SubjectError> {
