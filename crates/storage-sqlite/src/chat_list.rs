@@ -925,13 +925,22 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            repair_invalidated_direct_peer_rows_tx(
+            let invalidated_direct_group_ids =
+                invalidated_direct_peer_group_ids_tx(&conn, local_account_id_hex)?;
+            let projection_complete = chat_list_projection_complete_tx(
                 &conn,
                 local_account_id_hex,
-                mention_classifier,
+                !invalidated_direct_group_ids.is_empty(),
             )?;
-            if !chat_list_projection_complete_tx(&conn, local_account_id_hex)? {
+            if !projection_complete {
                 rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)?;
+            } else if !invalidated_direct_group_ids.is_empty() {
+                repair_invalidated_direct_peer_rows_tx(
+                    &conn,
+                    local_account_id_hex,
+                    mention_classifier,
+                    &invalidated_direct_group_ids,
+                )?;
             }
             Ok(())
         })
@@ -1502,6 +1511,7 @@ fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> Storage
 fn chat_list_projection_complete_tx(
     tx: &Connection,
     local_account_id_hex: &str,
+    allow_repairable_invalidated_direct: bool,
 ) -> StorageResult<bool> {
     if chat_list_projection_version_tx(tx)? < CHAT_LIST_PROJECTION_VERSION {
         return Ok(false);
@@ -1548,8 +1558,24 @@ fn chat_list_projection_complete_tx(
             SELECT 1
             FROM account_groups AS ag
             JOIN chat_list_rows AS row ON row.group_id_hex = ag.group_id_hex
-            WHERE row.direct_peer_presentation_version != ?2
-               OR CASE
+            WHERE NOT (
+                    ?3 != 0
+                    AND row.direct_peer_presentation_state = 'invalidated'
+                    AND trim(ag.profile_name) = ''
+                    AND ag.member_count = 2
+                    AND EXISTS (
+                        SELECT 1 FROM direct_conversation_members AS local_member
+                        WHERE local_member.group_id_hex = ag.group_id_hex
+                          AND lower(local_member.member_id_hex) = lower(?1)
+                    )
+                    AND (
+                        SELECT COUNT(*) FROM direct_conversation_members AS exact_members
+                        WHERE exact_members.group_id_hex = ag.group_id_hex
+                    ) = 2
+                 )
+              AND (
+                   row.direct_peer_presentation_version != ?2
+                OR CASE
                     WHEN trim(ag.profile_name) = ''
                      AND ag.member_count = 2
                      AND EXISTS (
@@ -1592,10 +1618,12 @@ fn chat_list_projection_complete_tx(
                       OR row.direct_peer_profile_created_at IS NOT NULL
                       OR row.direct_peer_presentation_state NOT IN ('absent', 'invalidated')
                   END
+              )
          )",
         params![
             local_account_id_hex,
-            i64::from(DIRECT_PEER_PRESENTATION_SCHEMA_VERSION)
+            i64::from(DIRECT_PEER_PRESENTATION_SCHEMA_VERSION),
+            bool_i64(allow_repairable_invalidated_direct),
         ],
     )? {
         return Ok(false);
@@ -1782,44 +1810,49 @@ fn rebuild_chat_list_row_for_group_tx(
     Ok(())
 }
 
-/// Repair only exact Direct rows whose former peer presentation was
-/// invalidated by a roster change.
-///
-/// Without this targeted pass, one expected invalidation makes the global
-/// completeness check rebuild every chat-list row on the next cold open.
+/// Returns exact Direct rows whose former peer presentation was invalidated by
+/// a roster change and can therefore be repaired independently.
+fn invalidated_direct_peer_group_ids_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+) -> StorageResult<Vec<String>> {
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT row.group_id_hex
+             FROM chat_list_rows AS row
+             JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
+             WHERE row.direct_peer_presentation_state = 'invalidated'
+               AND trim(ag.profile_name) = ''
+               AND ag.member_count = 2
+               AND EXISTS (
+                    SELECT 1 FROM direct_conversation_members AS local_member
+                    WHERE local_member.group_id_hex = ag.group_id_hex
+                      AND lower(local_member.member_id_hex) = lower(?1)
+               )
+               AND (
+                    SELECT COUNT(*) FROM direct_conversation_members AS exact_members
+                    WHERE exact_members.group_id_hex = ag.group_id_hex
+               ) = 2",
+        )
+        .storage()?;
+    statement
+        .query_map(params![local_account_id_hex], |row| row.get::<_, String>(0))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+}
+
+/// Repair only the preflight-approved exact Direct rows. The caller first
+/// checks every other projection invariant so this work is never duplicated by
+/// an immediately following full rebuild.
 fn repair_invalidated_direct_peer_rows_tx(
     tx: &Connection,
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
+    group_ids: &[String],
 ) -> StorageResult<()> {
-    let group_ids = {
-        let mut statement = tx
-            .prepare_cached(
-                "SELECT row.group_id_hex
-                 FROM chat_list_rows AS row
-                 JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
-                 WHERE row.direct_peer_presentation_state = 'invalidated'
-                   AND trim(ag.profile_name) = ''
-                   AND ag.member_count = 2
-                   AND EXISTS (
-                        SELECT 1 FROM direct_conversation_members AS local_member
-                        WHERE local_member.group_id_hex = ag.group_id_hex
-                          AND lower(local_member.member_id_hex) = lower(?1)
-                   )
-                   AND (
-                        SELECT COUNT(*) FROM direct_conversation_members AS exact_members
-                        WHERE exact_members.group_id_hex = ag.group_id_hex
-                   ) = 2",
-            )
-            .storage()?;
-        statement
-            .query_map(params![local_account_id_hex], |row| row.get::<_, String>(0))
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?
-    };
     for group_id_hex in group_ids {
-        if let Some(group) = account_group_tx(tx, &group_id_hex)? {
+        if let Some(group) = account_group_tx(tx, group_id_hex)? {
             rebuild_chat_list_row_for_group_tx(
                 tx,
                 local_account_id_hex,

@@ -3013,7 +3013,7 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn, LOCAL).unwrap(),
+            chat_list_projection_complete_tx(&conn, LOCAL, false).unwrap(),
             "failed-send preview priority must match the completeness query"
         );
     }
@@ -4825,7 +4825,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn, LOCAL).unwrap(),
+            chat_list_projection_complete_tx(&conn, LOCAL, false).unwrap(),
             "a pending leave request must not make the projection look stale"
         );
     }

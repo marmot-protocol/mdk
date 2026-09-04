@@ -73,6 +73,10 @@ pub enum RuntimeTimelineMessageUpdate {
 /// without silently dropping rows off the scrolled-back edge.
 pub(crate) const TIMELINE_WINDOW_LIMIT: usize = MAX_TIMELINE_LIMIT;
 
+/// Gives a transient account-storage failure a brief recovery window before a
+/// chat-list subscriber performs its single presentation-only retry.
+const CHAT_LIST_PRESENTATION_LOOKUP_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Re-materializes the timeline for a fixed account/group from the store.
 /// Captures the owning [`MarmotApp`] and account label so the subscription can
 /// run cursor queries off the caller thread without threading them through
@@ -1437,6 +1441,7 @@ impl MarmotAppRuntime {
                         }
                         continue;
                     }
+                    let mut retry_direct_peer_presentation = false;
                     let row = if matches!(
                         update.update.chat_list_trigger,
                         ChatListUpdateTrigger::DirectPeerPresentationChanged
@@ -1497,6 +1502,7 @@ impl MarmotAppRuntime {
                                     "emitting a chat-list projection update without direct-peer presentation after its current projection lookup failed"
                                 );
                                 row.direct_peer_presentation = None;
+                                retry_direct_peer_presentation = true;
                                 Some(row)
                             }
                         }
@@ -1532,6 +1538,7 @@ impl MarmotAppRuntime {
                         }
                         continue;
                     }
+                    let retry_row = retry_direct_peer_presentation.then(|| row.clone());
                     if !send_chat_list_row_update(
                         &updates_tx,
                         &mut row_fingerprints,
@@ -1541,6 +1548,62 @@ impl MarmotAppRuntime {
                     .await
                     {
                         return;
+                    }
+                    if let Some(mut retry_row) = retry_row {
+                        tokio::select! {
+                            _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                            _ = tokio::time::sleep(CHAT_LIST_PRESENTATION_LOOKUP_RETRY_DELAY) => {}
+                        }
+                        let app_for_lookup = app.clone();
+                        let account_label_for_lookup = account_label.clone();
+                        let group_id_hex_for_lookup = update.update.group_id_hex.clone();
+                        match blocking_app_task(move || {
+                            let storage =
+                                app_for_lookup.account_storage(&account_label_for_lookup)?;
+                            let mut presentations = storage
+                                .direct_peer_presentations_for_group_ids(std::slice::from_ref(
+                                    &group_id_hex_for_lookup,
+                                ))?;
+                            Ok::<_, AppError>(presentations.remove(&group_id_hex_for_lookup))
+                        })
+                        .await
+                        {
+                            Ok(Some(current_presentation)) => {
+                                retry_row.direct_peer_presentation = current_presentation;
+                                remember_chat_list_mute_expiry(&mut mute_expiries, &retry_row);
+                                if !send_chat_list_row_update(
+                                    &updates_tx,
+                                    &mut row_fingerprints,
+                                    ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                                    retry_row,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                mute_expiries.remove(&update.update.group_id_hex);
+                                if !send_chat_list_remove_update(
+                                    &updates_tx,
+                                    &mut row_fingerprints,
+                                    ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                                    &update.update.group_id_hex,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "marmot_app::runtime",
+                                    method = "subscribe_chat_list",
+                                    error_kind = error.privacy_safe_kind(),
+                                    "giving up after the bounded retry for a chat-list direct-peer presentation lookup failed"
+                                );
+                            }
+                        }
                     }
                     continue;
                 }

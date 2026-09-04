@@ -163,7 +163,6 @@ c_mirror! {
         str group_name,
         opt_str avatar_url,
         opt_rec avatar: MarmotChatListAvatar,
-        opt_rec direct_peer_presentation: MarmotDirectPeerPresentation,
         opt_rec last_message: MarmotChatListMessagePreview,
         copy unread_count: u64,
         copy has_unread: bool,
@@ -191,6 +190,9 @@ c_mirror! {
         /// `has_leave_requested_at_ms`.
         copy leave_request_pending: bool,
         opt_copy has_leave_requested_at_ms/leave_requested_at_ms: u64,
+        /// Appended to preserve the offsets of every pre-existing field in
+        /// this stable C mirror.
+        opt_rec direct_peer_presentation: MarmotDirectPeerPresentation,
     }
 }
 

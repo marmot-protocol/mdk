@@ -1692,6 +1692,8 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
 
 #[tokio::test]
 async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() {
+    const UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
         .create_account("alice")
@@ -1765,7 +1767,7 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
     )
     .unwrap();
 
-    let update = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+    let update = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("profile refresh should wake the chat-list subscription")
         .expect("chat-list update");
@@ -1828,7 +1830,7 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         })
         .unwrap();
 
-    let update = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+    let update = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("delayed profile wake should refresh the current row")
         .expect("chat-list update");
@@ -1863,7 +1865,7 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         Some(delayed_unread_update),
         ChatListUpdateTrigger::UnreadChanged,
     );
-    let delayed = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+    let delayed = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("the ordinary projection change should still be delivered")
         .expect("chat-list update");
@@ -1901,7 +1903,7 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         Some(delayed_named_group),
         ChatListUpdateTrigger::UnreadChanged,
     );
-    let delayed = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+    let delayed = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("the stale named-group projection should still be delivered")
         .expect("chat-list update");
@@ -1938,13 +1940,13 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
         .close()
         .unwrap();
     runtime.publish_chat_list_projection_update(
-        account.account_id_hex,
-        account.label,
-        group_id_hex,
+        account.account_id_hex.clone(),
+        account.label.clone(),
+        group_id_hex.clone(),
         Some(lookup_failure_update),
         ChatListUpdateTrigger::UnreadChanged,
     );
-    let lookup_failure = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+    let lookup_failure = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
         .await
         .expect("the ordinary projection change must survive a presentation lookup failure")
         .expect("chat-list update");
@@ -1957,6 +1959,36 @@ async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() 
             } if row.unread_count == 3 && row.direct_peer_presentation.is_none()
         ),
         "a presentation lookup failure dropped or leaked presentation into the ordinary update: {lookup_failure:?}"
+    );
+
+    // Let the bounded retry reopen the same durable database. This simulates
+    // recovery from a transient cached-handle failure without changing the
+    // semantic unread update that the first emission carried.
+    app.account_storages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&account.label);
+    let recovered = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the bounded presentation retry should recover")
+        .expect("chat-list recovery update");
+    assert!(
+        matches!(
+            &recovered,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                row,
+            } if row.unread_count == 3
+                && row.direct_peer_presentation == Some(storage_sqlite::DirectPeerPresentation {
+                    schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+                    peer_account_id_hex: None,
+                    display_name: None,
+                    avatar_url: None,
+                    profile_created_at: None,
+                    state: storage_sqlite::DirectPeerPresentationState::Invalidated,
+                })
+        ),
+        "the bounded retry did not restore current presentation: {recovered:?}"
     );
 }
 

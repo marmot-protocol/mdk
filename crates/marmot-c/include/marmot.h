@@ -261,16 +261,6 @@ typedef enum MarmotPushRegistrationShareStatus {
 } MarmotPushRegistrationShareStatus;
 
 /**
- * Freshness/provenance of Direct peer display metadata.
- */
-typedef enum MarmotDirectPeerPresentationState {
-  MARMOT_DIRECT_PEER_PRESENTATION_STATE_ABSENT,
-  MARMOT_DIRECT_PEER_PRESENTATION_STATE_CURRENT,
-  MARMOT_DIRECT_PEER_PRESENTATION_STATE_LAST_KNOWN,
-  MARMOT_DIRECT_PEER_PRESENTATION_STATE_INVALIDATED,
-} MarmotDirectPeerPresentationState;
-
-/**
  * Safety classification of a link/image/autolink destination.
  */
 typedef enum MarmotMarkdownLinkDestinationKind {
@@ -355,6 +345,16 @@ typedef enum MarmotChatConversationKind {
   MARMOT_CHAT_CONVERSATION_KIND_DIRECT,
   MARMOT_CHAT_CONVERSATION_KIND_GROUP,
 } MarmotChatConversationKind;
+
+/**
+ * Freshness/provenance of Direct peer display metadata.
+ */
+typedef enum MarmotDirectPeerPresentationState {
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_ABSENT,
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_CURRENT,
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_LAST_KNOWN,
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_INVALIDATED,
+} MarmotDirectPeerPresentationState;
 
 /**
  * How far an account's setup has progressed.
@@ -1447,22 +1447,6 @@ typedef struct MarmotChatListAvatar {
 } MarmotChatListAvatar;
 
 /**
- * Versioned, display-only metadata for the exact peer of one Direct chat.
- */
-typedef struct MarmotDirectPeerPresentation {
-  uint16_t schema_version;
-  char *peer_account_id_hex;
-  char *display_name;
-  char *avatar_url;
-  bool has_profile_created_at;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t profile_created_at;
-  enum MarmotDirectPeerPresentationState state;
-} MarmotDirectPeerPresentation;
-
-/**
  * One referenced Nostr entity.
  */
 typedef struct MarmotMarkdownNostrEntity {
@@ -1749,6 +1733,22 @@ typedef struct MarmotChatListMessagePreview {
 } MarmotChatListMessagePreview;
 
 /**
+ * Versioned, display-only metadata for the exact peer of one Direct chat.
+ */
+typedef struct MarmotDirectPeerPresentation {
+  uint16_t schema_version;
+  char *peer_account_id_hex;
+  char *display_name;
+  char *avatar_url;
+  bool has_profile_created_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t profile_created_at;
+  enum MarmotDirectPeerPresentationState state;
+} MarmotDirectPeerPresentation;
+
+/**
  * One durable chat-list row.
  */
 typedef struct MarmotChatListRow {
@@ -1775,7 +1775,6 @@ typedef struct MarmotChatListRow {
   char *group_name;
   char *avatar_url;
   struct MarmotChatListAvatar *avatar;
-  struct MarmotDirectPeerPresentation *direct_peer_presentation;
   struct MarmotChatListMessagePreview *last_message;
   uint64_t unread_count;
   bool has_unread;
@@ -1823,6 +1822,11 @@ typedef struct MarmotChatListRow {
    *Only meaningful when the matching `has_` flag is set.
    */
   uint64_t leave_requested_at_ms;
+  /**
+   * Appended to preserve the offsets of every pre-existing field in
+   * this stable C mirror.
+   */
+  struct MarmotDirectPeerPresentation *direct_peer_presentation;
 } MarmotChatListRow;
 
 /**
