@@ -442,6 +442,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             }
             ScenarioStep::DeliverAll
             | ScenarioStep::Tick { .. }
+            | ScenarioStep::ExpectTickError { .. }
             | ScenarioStep::Observe { .. }
             | ScenarioStep::ObserveExact { .. }
             | ScenarioStep::ObserveAdminPolicy { .. }

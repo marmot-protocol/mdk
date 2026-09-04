@@ -151,12 +151,13 @@ automatically cover later production changes.
 For broad defect discovery, prioritize:
 
 1. `chat-journey/v1` for legal product histories;
-2. `convergence-chaos/v1` for adversarial schedule and traffic breadth;
-3. `bounded-convergence-pressure/v1` for the self-update/admin/profile pressure boundary;
-4. `large-group-pressure/v1` for explicit 10–200 member, administrator-population, committer-width, and traffic
+2. `membership-reentry/v1` for guaranteed single/repeated departure and fresh-Welcome re-entry interactions;
+3. `convergence-chaos/v1` for adversarial schedule and traffic breadth;
+4. `bounded-convergence-pressure/v1` for the self-update/admin/profile pressure boundary;
+5. `large-group-pressure/v1` for explicit 10–200 member, administrator-population, committer-width, and traffic
    profiles;
-5. `admin-churn/v1` for membership and administrator transitions; and
-6. the two twelve-case cross-route restart catalogs as fixed high-value regressions.
+6. `admin-churn/v1` for membership and administrator transitions; and
+7. the two twelve-case cross-route restart catalogs as fixed high-value regressions.
 
 Cover all registered families with a small seed matrix before making one family enormous. Then allocate additional
 cases using measured coverage gaps, failures, slow tails, and recent production changes.
@@ -174,7 +175,9 @@ High-value motifs that should drive future profiles include:
 
 - an offline founding member returning to a large application/commit backlog while group state changes (implemented
   as the retained-relay `offline-catchup-pressure/v1` family; membership-changing extensions remain future work);
-- sustained application traffic interspersed with proposals, commits, administrator handoff, removals, and re-adds;
+- sustained application traffic interspersed with proposals, commits, administrator handoff, removals, and re-adds
+  (the bounded departure/re-entry core is implemented by `membership-reentry/v1`; sustained traffic remains an
+  extension);
 - bounded self-update pressure racing administrator/profile commits, with explicit input closure;
 - restart after publication acceptance, ingest, freeze, selection, application, confirmation, rollback, or retained
   history repair;

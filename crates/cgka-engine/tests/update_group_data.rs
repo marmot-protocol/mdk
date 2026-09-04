@@ -2288,6 +2288,9 @@ async fn rebuilt_engine_convergence_withdraws_own_confirmed_rename_by_stamped_or
     drop(loser_engine);
     let mut loser =
         build_with_storage_and_peeler(loser_id, loser_storage.clone(), ephemeral_peeler());
+    loser
+        .hydrate_all_stored_groups()
+        .expect("restart hydrates the durable group before convergence replay");
     loser.drain_events();
     loser
         .buffer_openmls_convergence_message_at(&gid, route_to_group(&winner_commit, &gid), 1_000)
@@ -2464,6 +2467,9 @@ async fn rebuilt_engine_convergence_keeps_own_confirmed_rename_when_it_wins_sele
     drop(winner);
     let mut winner =
         build_with_storage_and_peeler(winner_id, winner_storage.clone(), ephemeral_peeler());
+    winner
+        .hydrate_all_stored_groups()
+        .expect("restart hydrates the durable group before convergence replay");
     winner.drain_events();
     winner
         .buffer_openmls_convergence_message_at(&gid, route_to_group(&loser_commit, &gid), 1_000)
@@ -2627,6 +2633,11 @@ async fn mutually_rebuilt_engines_converge_on_same_branch_after_concurrent_renam
     let mut alice =
         build_with_storage_and_peeler(b"alice", alice_storage.clone(), ephemeral_peeler());
     let mut bob = build_with_storage_and_peeler(b"bob", bob_storage.clone(), ephemeral_peeler());
+    alice
+        .hydrate_all_stored_groups()
+        .expect("alice restart hydrates the durable group before convergence replay");
+    bob.hydrate_all_stored_groups()
+        .expect("bob restart hydrates the durable group before convergence replay");
     alice.drain_events();
     bob.drain_events();
     alice
@@ -2887,6 +2898,9 @@ async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed
     drop(winner);
     let mut winner =
         build_with_storage_and_peeler(winner_id, winner_storage.clone(), mock_peeler());
+    winner
+        .hydrate_all_stored_groups()
+        .expect("restart hydrates the durable group before convergence replay");
     winner.drain_events();
 
     // Re-open carol's consumed proposal as a pending convergence input on the

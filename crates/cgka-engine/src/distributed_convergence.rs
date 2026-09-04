@@ -316,8 +316,15 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
-        let Some(policy_bytes) = self
-            .storage
+        self.convergence_policy_for_group_on_storage(&self.storage, group_id)
+    }
+
+    fn convergence_policy_for_group_on_storage(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+    ) -> Result<CanonicalizationPolicy, OpenMlsProjectionError> {
+        let Some(policy_bytes) = storage
             .convergence_policy(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
         else {
@@ -331,6 +338,28 @@ impl<S: StorageProvider> Engine<S> {
         let policy = decode_convergence_policy(&policy_bytes)?;
         self.accept_convergence_policy(&policy)?;
         Ok(policy)
+    }
+
+    pub(crate) fn retain_current_epoch_snapshot_on_storage(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+    ) -> Result<(), cgka_traits::error::EngineError> {
+        let policy = self
+            .convergence_policy_for_group_on_storage(storage, group_id)
+            .map_err(|error| {
+                cgka_traits::error::EngineError::Backend(format!(
+                    "load convergence policy: {error}"
+                ))
+            })?;
+        retain_current_group_epoch_snapshot(
+            storage,
+            group_id,
+            policy.convergence.max_rewind_commits,
+        )
+        .map_err(|error| {
+            cgka_traits::error::EngineError::Backend(format!("retain anchor: {error}"))
+        })
     }
 
     pub(crate) fn convergence_policy_for_group(

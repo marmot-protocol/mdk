@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub const STATEFUL_CHAT_JOURNEY_FAMILY: &str = "chat-journey/v1";
-pub const STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION: &str = "1";
+pub const STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION: &str = "2";
 
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
@@ -76,7 +76,7 @@ struct JourneyModel {
     members: BTreeSet<String>,
     admins: BTreeSet<String>,
     online: BTreeSet<String>,
-    never_joined: BTreeSet<String>,
+    non_members: BTreeSet<String>,
     group_name: String,
     group_description: String,
     received_payloads: BTreeMap<String, Vec<String>>,
@@ -92,7 +92,7 @@ impl JourneyModel {
     fn new(case_index: u64, profile: JourneyProfile) -> Self {
         let group_name = format!("chat-journey-{case_index}");
         let clients = client_labels();
-        let (members, never_joined, founding_invitees) = match profile {
+        let (members, non_members, founding_invitees) = match profile {
             JourneyProfile::Membership => (
                 BTreeSet::from(["alice".into(), "bob".into()]),
                 BTreeSet::from(["carol".into(), "david".into()]),
@@ -111,7 +111,7 @@ impl JourneyModel {
             members,
             admins: BTreeSet::from(["alice".into()]),
             online: clients.iter().cloned().collect(),
-            never_joined,
+            non_members,
             group_name: group_name.clone(),
             group_description: String::new(),
             received_payloads: clients
@@ -149,7 +149,7 @@ impl JourneyModel {
 
         if self.profile == JourneyProfile::Membership && self.online.contains("alice") {
             actions.extend(
-                self.never_joined
+                self.non_members
                     .iter()
                     .cloned()
                     .map(|invitee| JourneyAction::Invite { invitee }),
@@ -239,7 +239,7 @@ impl JourneyModel {
     fn apply(&mut self, action: JourneyAction) {
         match action {
             JourneyAction::Invite { invitee } => {
-                debug_assert!(self.never_joined.contains(&invitee));
+                debug_assert!(self.non_members.contains(&invitee));
                 let pending = self.next_publication("invite");
                 self.steps.push(ScenarioStep::InviteMembers {
                     inviter: "alice".into(),
@@ -247,7 +247,8 @@ impl JourneyModel {
                     pending: pending.clone(),
                 });
                 self.members.insert(invitee.clone());
-                self.never_joined.remove(&invitee);
+                self.non_members.remove(&invitee);
+                self.online.insert(invitee.clone());
                 self.confirmed_mutation("alice", &pending);
             }
             JourneyAction::Remove { member } => {
@@ -260,7 +261,8 @@ impl JourneyModel {
                     pending: pending.clone(),
                 });
                 self.members.remove(&member);
-                self.online.remove(&member);
+                self.non_members.insert(member.clone());
+                self.self_updated_clients.remove(&member);
                 self.confirmed_mutation("alice", &pending);
             }
             JourneyAction::Send { sender } => {
@@ -563,7 +565,19 @@ pub fn generate_stateful_chat_journey_case(seed: u64, case_index: u64) -> Genera
     };
     if required_kind != JourneyActionKind::Restart {
         let action = model.choose_kind(&mut rng, required_kind);
+        let removed_member = match &action {
+            JourneyAction::Remove { member } if profile == JourneyProfile::Membership => {
+                Some(member.clone())
+            }
+            _ => None,
+        };
         model.apply(action);
+        // A membership-profile case in every eight-case rotation guarantees
+        // the remove -> fresh re-invite interaction. Removed identities remain
+        // legal invite candidates for later random actions as well.
+        if let Some(invitee) = removed_member {
+            model.apply(JourneyAction::Invite { invitee });
+        }
     }
 
     let extra_actions = 4 + rng.gen_range(0..5);

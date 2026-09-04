@@ -37,6 +37,11 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     oracles, exact retained-join pending-work classification, sampled delivery/decryptability coverage, and the normal
     mid-size application and incremental-join executable canaries.
 
+- **File:** `membership_reentry_family.rs`
+  - **Owns:** Deterministic single/repeated departure and fresh-Welcome re-entry, restart/self-update/self-leave
+    interactions, stale-Welcome recovery, strict terminal state/input/decryptability oracles, and family registration
+    and prefix stability.
+
 - **File:** `offline_catchup_family.rs`
   - **Owns:** Deterministic offline-backlog volume/recovery profiles, retained-relay enforcement, terminal-only
     reconnect, exact backlog multiplicity, strict pending-work/equivalence/decryptability oracles, and file-backed

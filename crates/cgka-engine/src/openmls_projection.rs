@@ -1264,9 +1264,17 @@ fn seed_stored_openmls_graph_inputs<S: StorageProvider>(
                     state: record.state,
                 });
             }
+            // A proposal consumed by this device's locally confirmed commit
+            // is `Processed`, but it is still a prerequisite for replaying a
+            // sibling commit that references the same proposal. Excluding it
+            // makes every committer able to materialize only its own
+            // checkpointed branch, so each independently declares its local
+            // sibling canonical. Re-admit retained processed proposals to the
+            // candidate graph exactly like processed commits and application
+            // witnesses; canonical apply skips one already consumed by an
+            // accepted prefix using its authenticated source epoch.
             OpenMlsContentKind::Proposal
-                if record_state_is_canonicalization_input(record.state)
-                    && source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
+                if source_epoch.is_some_and(|epoch| epoch >= retained_anchor_epoch) =>
             {
                 pending_messages.push(message)
             }
@@ -3048,16 +3056,6 @@ fn required_capabilities_from_group(
     caps
 }
 
-fn record_state_is_canonicalization_input(state: MessageState) -> bool {
-    matches!(
-        state,
-        MessageState::Sent
-            | MessageState::Created
-            | MessageState::Retryable
-            | MessageState::ConvergenceDeferred
-    )
-}
-
 /// Whether a stored row in this state is an input to the OpenMLS graph the
 /// convergence pass builds — the unresolved canonicalization inputs plus
 /// already-applied (`Processed`) rows, which are re-admitted for scoring.
@@ -3117,7 +3115,7 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 ///   tip convergence settled on — the commit that advances the group to its
 ///   epoch has not been selected yet (ordinary out-of-order relay delivery,
 ///   mdk#144). Persisting it as the terminal `EpochInvalidated` would
-///   permanently drop it: `record_state_is_canonicalization_input` never
+///   permanently drop it: `record_state_can_contribute_to_openmls_graph` never
 ///   re-admits `EpochInvalidated`, so the buffered message could never re-enter
 ///   convergence once that commit arrives. Keep it `Retryable` so a later
 ///   canonicalize pass re-feeds and applies it; ordinary current results do not

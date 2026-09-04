@@ -38,6 +38,7 @@ pub enum SubjectCapability {
     GroupMutation,
     ApplicationMessaging,
     TransportDelivery,
+    ExpectedTransportErrorObservation,
     EventObservation,
     ExactConformanceObservation,
     ActiveDecryptabilityProbe,
@@ -64,6 +65,7 @@ impl SubjectCapability {
             Self::GroupMutation => "group_mutation",
             Self::ApplicationMessaging => "application_messaging",
             Self::TransportDelivery => "transport_delivery",
+            Self::ExpectedTransportErrorObservation => "expected_transport_error_observation",
             Self::EventObservation => "event_observation",
             Self::ExactConformanceObservation => "exact_conformance_observation",
             Self::ActiveDecryptabilityProbe => "active_decryptability_probe",
@@ -615,6 +617,11 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             capabilities.push(SubjectCapability::OutboundPublication);
         }
         capabilities
+    } else if matches!(step, ScenarioStep::ExpectTickError { .. }) {
+        vec![
+            SubjectCapability::TransportDelivery,
+            SubjectCapability::ExpectedTransportErrorObservation,
+        ]
     } else {
         vec![match step {
             ScenarioStep::CreateGroup { .. }
@@ -667,6 +674,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::Barrier { .. } => unreachable!("handled above"),
             ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
+            ScenarioStep::ExpectTickError { .. } => unreachable!("handled above"),
             ScenarioStep::InGroup { .. } => unreachable!("handled above"),
         }]
     }
@@ -877,6 +885,7 @@ impl EngineHarnessSubject {
             SubjectCapability::GroupMutation,
             SubjectCapability::ApplicationMessaging,
             SubjectCapability::TransportDelivery,
+            SubjectCapability::ExpectedTransportErrorObservation,
             SubjectCapability::EventObservation,
             SubjectCapability::ExactConformanceObservation,
             SubjectCapability::ActiveDecryptabilityProbe,

@@ -6,8 +6,8 @@ use cgka_conformance_simulator::{
     HarnessStorageMode, SCENARIO_IR_V3_ONLY_STEP_KINDS, ScenarioAccountV2, ScenarioAssertionV2,
     ScenarioComparison, ScenarioDeviceV2, ScenarioMessageSelectorV2, ScenarioPredicateV2,
     ScenarioProcessV2, ScenarioResourceMetric, ScenarioSpec, ScenarioStep, ScenarioTopologyV2,
-    ScenarioTransportClass, SubjectOutboundOutcome, VectorFixture, compile_scenario,
-    run_scenario_report, run_vector_fixture_report_with_capture,
+    ScenarioTransportClass, SubjectCapability, SubjectOutboundOutcome, VectorFixture,
+    compile_scenario, run_scenario_report, run_vector_fixture_report_with_capture,
 };
 
 fn topology_for_accounts(entries: &[(&str, &str)]) -> ScenarioTopologyV2 {
@@ -76,7 +76,7 @@ fn v2_schema_declares_every_v2_executable_step_kind() {
 }
 
 #[test]
-fn v3_schema_adds_full_group_profile_updates_without_rewriting_v2() {
+fn v3_schema_adds_post_v2_actions_without_rewriting_v2() {
     let v2_schema: serde_json::Value =
         serde_json::from_str(include_str!("../schemas/scenario-ir.v2.schema.json"))
             .expect("scenario IR v2 schema parses");
@@ -128,6 +128,45 @@ fn v3_schema_adds_full_group_profile_updates_without_rewriting_v2() {
             .copied()
             .collect::<BTreeSet<_>>()
     );
+}
+
+#[test]
+fn expected_tick_error_is_v3_only_and_validates_its_client() {
+    let mut scenario = ScenarioSpec {
+        name: "scenario-ir/expected-tick-error-v3".into(),
+        spec_version: "3".into(),
+        clients: vec!["alice".into()],
+        topology: Default::default(),
+        steps: vec![ScenarioStep::ExpectTickError {
+            client: "alice".into(),
+            error: "invalid_transition".into(),
+        }],
+    };
+
+    let compiled = compile_scenario(&scenario).expect("v3 expected tick error compiles");
+    assert_eq!(
+        compiled.actions[0].schedule.action_type,
+        "expect_tick_error"
+    );
+    assert_eq!(
+        compiled.actions[0].schedule.required_capabilities,
+        BTreeSet::from([
+            SubjectCapability::TransportDelivery,
+            SubjectCapability::ExpectedTransportErrorObservation,
+        ])
+    );
+
+    scenario.spec_version = "2".into();
+    let error = compile_scenario(&scenario).expect_err("v2 must reject the v3 action");
+    assert!(error.message.contains("requires ScenarioSpec version 3"));
+
+    scenario.spec_version = "3".into();
+    scenario.steps = vec![ScenarioStep::ExpectTickError {
+        client: "bob".into(),
+        error: "invalid_transition".into(),
+    }];
+    let error = compile_scenario(&scenario).expect_err("unknown client must fail");
+    assert!(error.message.contains("unknown client bob"));
 }
 
 #[test]
