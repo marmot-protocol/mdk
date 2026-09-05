@@ -4170,7 +4170,7 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
 }
 
 /// Run app-runtime integration chains on a stack large enough for debug
-/// OpenMLS group creation. Libtest's default 2 MiB stack is too small once a
+/// OpenMLS group creation. Smaller stacks are insufficient once a
 /// test composes the account worker with maintenance and push lifecycle work.
 fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
 where
@@ -4179,7 +4179,7 @@ where
 {
     let test_thread = std::thread::Builder::new()
         .name(thread_name.to_owned())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let test_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
