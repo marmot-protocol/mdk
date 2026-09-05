@@ -44,6 +44,10 @@ tokio = { workspace = true, features = ["time"] }
 # enabling the `schnorr` feature here pulls in BIP-340 x-only point validation.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+openmls = { workspace = true, features = ["js"] }
+
 [dev-dependencies]
 storage-sqlite = { workspace = true, features = ["storage-format-benchmarks"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
