@@ -71,7 +71,8 @@ App runtime bridge for the first real Marmot app surfaces.
   Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
   state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
   public `directory_*`/`*_user_directory` API, directory-cache lifecycle, and in-memory directory-record hydration),
-  `cache.rs` (the per-account SQLCipher directory cache), and `sync.rs` (the directory-subscription sync worker and
+  `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
+  `cache/migrations.rs` and frozen initial schema in `cache/v1.sql`), and `sync.rs` (the directory-subscription sync worker and
   plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
   files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
 - Keep stateless account relay-list and KeyPackage parsing/validation (relay-list status, KeyPackage tag/metadata

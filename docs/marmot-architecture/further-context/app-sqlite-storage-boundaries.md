@@ -1,7 +1,7 @@
 ---
 title: "App SQLite Storage Boundaries"
 created: 2026-09-04
-updated: 2026-09-04
+updated: 2026-09-05
 tags: [marmot, app-core, sqlite, storage, migrations]
 status: current-implementation
 ---
@@ -42,10 +42,25 @@ current store.
 
 ## Migration Domains
 
-Only `session.sqlite` currently has a numbered migration ledger and future-schema refusal. The two auxiliary stores
-initialize their current tables independently and must receive their own version histories before either schema makes
-a non-additive change.
+Both `session.sqlite` and the per-account `app-cache.sqlite3` have independent numbered migration histories and
+future-schema refusal. The directory cache uses `app_cache_schema_migrations`; it never reads or updates
+`cgka_schema_migrations`.
+
+Cache version 1 creates the six directory/search tables and indexes. Existing unversioned tables are adopted only
+after their columns, types, nullability, defaults, primary keys and index columns match the version-1 shape. Missing
+tables and indexes are created, but malformed existing tables fail rather than being silently marked migrated.
+The legacy `user_directory_records` JSON conversion and removal of its retired table are part of the same migration.
+
+Each migration runs under a write transaction together with its ledger insertion. A failure rolls back that migration's
+schema changes, converted records and ledger row; earlier committed migrations remain intact. Reopening a current
+cache skips applied migrations. Recorded names must match the compiled ordered history, and any newer recorded version
+returns `UnsupportedSchemaVersion` before a migration body runs. This refuses downgrades across a newer schema; it does
+not reverse committed migrations. SQLCipher hardening, owner-only files, terminal close behavior, and the legacy
+plaintext directory import remain in place.
+
+`shared.sqlite3` still initializes its tables without a numbered ledger or future-schema refusal. Versioning that store
+is a separate follow-up; its changes must remain additive and compatible with existing databases in the meantime.
+Directory mirroring/reconciliation, session storage, and the retired app-projection import are unchanged.
 
 Each store needs an independent schema identity because its release cadence, rollback behavior, and durability
-contract can diverge. A session migration version must never be treated as the version of either cache. Until those
-ledgers exist, auxiliary-store changes should remain additive and compatible with already-created databases.
+contract can diverge. A session migration version must never be treated as the version of either cache.

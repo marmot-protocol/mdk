@@ -1,3 +1,5 @@
+mod migrations;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,14 +69,13 @@ impl DirectoryCache {
         Self::from_connection(conn).map(Some)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, AppError> {
-        initialize_schema(&conn)?;
+    fn from_connection(mut conn: Connection) -> Result<Self, AppError> {
+        migrations::run_all(&mut conn)?;
         let cache = Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
             #[cfg(test)]
             put_count: Arc::new(AtomicUsize::new(0)),
         };
-        cache.migrate_legacy_json_records()?;
         Ok(cache)
     }
 
@@ -599,14 +600,12 @@ impl DirectoryCache {
         Ok(relays)
     }
 
-    fn migrate_legacy_json_records(&self) -> Result<(), AppError> {
-        let mut conn = self.lock()?;
-        if !Self::table_exists_locked(&conn, "user_directory_records")? {
+    fn migrate_legacy_json_records(conn: &Connection) -> Result<(), AppError> {
+        if !Self::table_exists_locked(conn, "user_directory_records")? {
             return Ok(());
         }
-        let tx = conn.transaction()?;
         let mut statement =
-            tx.prepare("SELECT entry_json FROM user_directory_records ORDER BY account_id_hex")?;
+            conn.prepare("SELECT entry_json FROM user_directory_records ORDER BY account_id_hex")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         let mut json_entries = Vec::new();
         for row in rows {
@@ -616,10 +615,9 @@ impl DirectoryCache {
 
         for json in json_entries {
             let entry = serde_json::from_str::<UserDirectoryRecord>(&json)?;
-            Self::put_with_reason_locked(&tx, &entry, "directory")?;
+            Self::put_with_reason_locked(conn, &entry, "directory")?;
         }
-        tx.execute_batch("DROP TABLE IF EXISTS user_directory_records;")?;
-        tx.commit()?;
+        conn.execute_batch("DROP TABLE user_directory_records;")?;
         Ok(())
     }
 
@@ -673,64 +671,6 @@ pub(crate) struct DirectorySearchGraphRecord {
     pub(crate) follows: Option<Vec<String>>,
     pub(crate) metadata_updated_at: Option<u64>,
     pub(crate) metadata_expires_at: Option<u64>,
-}
-
-fn initialize_schema(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS directory_users (
-            account_id_hex TEXT PRIMARY KEY NOT NULL,
-            npub TEXT NOT NULL,
-            local_account_json TEXT,
-            profile_json TEXT,
-            relay_lists_json TEXT NOT NULL,
-            key_package_json TEXT,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS directory_user_follows (
-            account_id_hex TEXT NOT NULL,
-            follow_account_id_hex TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (account_id_hex, follow_account_id_hex)
-        );
-        CREATE INDEX IF NOT EXISTS directory_user_follows_follow_idx
-            ON directory_user_follows(follow_account_id_hex);
-        CREATE TABLE IF NOT EXISTS directory_follow_source_relays (
-            account_id_hex TEXT NOT NULL,
-            relay_url TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (account_id_hex, relay_url)
-        );
-        CREATE TABLE IF NOT EXISTS directory_known_user_reasons (
-            account_id_hex TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            first_seen_at INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL,
-            PRIMARY KEY (account_id_hex, reason)
-        );
-        CREATE TABLE IF NOT EXISTS directory_search_graph_users (
-            account_id_hex TEXT PRIMARY KEY NOT NULL,
-            npub TEXT NOT NULL,
-            profile_json TEXT,
-            metadata_updated_at INTEGER,
-            metadata_expires_at INTEGER,
-            follows_known INTEGER NOT NULL DEFAULT 0,
-            follows_updated_at INTEGER,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
-            account_id_hex TEXT NOT NULL,
-            follow_account_id_hex TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (account_id_hex, follow_account_id_hex)
-        );
-        CREATE INDEX IF NOT EXISTS directory_search_graph_follows_follow_idx
-            ON directory_search_graph_follows(follow_account_id_hex);",
-    )?;
-    Ok(())
 }
 
 fn directory_user_row_from_row(
@@ -812,6 +752,159 @@ mod tests {
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         }
+    }
+
+    fn migration_rows(conn: &Connection) -> Vec<(i64, String)> {
+        conn.prepare("SELECT version, name FROM app_cache_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_fresh_encrypted_cache_and_reopen_are_idempotent() {
+        let (dir, cache) = test_cache();
+        {
+            let conn = cache.lock().unwrap();
+            assert_eq!(
+                migration_rows(&conn),
+                vec![(1, "0001_directory_cache".into())]
+            );
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'directory_%' AND type IN ('table', 'index')",
+                [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 8);
+            // A repeated migration would attempt to insert or update this ledger.
+            conn.execute_batch("CREATE TRIGGER prevent_migration_insert BEFORE INSERT ON app_cache_schema_migrations BEGIN SELECT RAISE(ABORT, 'rerun'); END;
+                CREATE TRIGGER prevent_migration_update BEFORE UPDATE ON app_cache_schema_migrations BEGIN SELECT RAISE(ABORT, 'rerun'); END;").unwrap();
+        }
+        cache.close().unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let cache = DirectoryCache::open(dir.path().join("directory.sqlite3"), &key).unwrap();
+        assert_eq!(
+            migration_rows(&cache.lock().unwrap()),
+            vec![(1, "0001_directory_cache".into())]
+        );
+    }
+
+    #[test]
+    fn migration_adopts_unversioned_cache_preserving_both_tiers() {
+        let (dir, cache) = test_cache();
+        let record = directory_record(account_id(1), vec![account_id(2)]);
+        cache.put(&record).unwrap();
+        cache
+            .remember_search_graph_follows(&account_id(3), "search-only", &[account_id(4)])
+            .unwrap();
+        cache
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE app_cache_schema_migrations")
+            .unwrap();
+        cache.close().unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let cache = DirectoryCache::open(dir.path().join("directory.sqlite3"), &key).unwrap();
+        assert_eq!(
+            cache.entry(&record.account_id_hex).unwrap().unwrap(),
+            record
+        );
+        assert!(cache.entry(&account_id(3)).unwrap().is_none());
+        assert_eq!(
+            cache.search_graph_follows(&account_id(3)).unwrap(),
+            Some(vec![account_id(4)])
+        );
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn migration_refuses_future_version_and_unexpected_name() {
+        let (dir, cache) = test_cache();
+        cache
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_cache_schema_migrations VALUES (2, 'private-name', 0)",
+                [],
+            )
+            .unwrap();
+        cache.close().unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let path = dir.path().join("directory.sqlite3");
+        assert!(matches!(
+            DirectoryCache::open(path.clone(), &key),
+            Err(AppError::Storage(
+                cgka_traits::storage::StorageError::UnsupportedSchemaVersion {
+                    found: 2,
+                    latest_supported: 1
+                }
+            ))
+        ));
+        let conn = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::live_cache()).unwrap();
+        conn.execute_batch(
+            "DELETE FROM app_cache_schema_migrations WHERE version = 2;
+            UPDATE app_cache_schema_migrations SET name = 'private-name'",
+        )
+        .unwrap();
+        drop(conn);
+        let error = DirectoryCache::open(path, &key).unwrap_err();
+        assert!(!error.to_string().contains("private-name"));
+    }
+
+    #[test]
+    fn migration_partial_schema_is_not_adopted() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE directory_users (account_id_hex TEXT PRIMARY KEY NOT NULL)",
+        )
+        .unwrap();
+        assert!(migrations::run_all(&mut conn).is_err());
+        assert!(
+            !DirectoryCache::table_exists_locked(&conn, "directory_search_graph_users").unwrap()
+        );
+        assert!(
+            !DirectoryCache::table_exists_locked(&conn, "app_cache_schema_migrations").unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_legacy_failure_rolls_back_schema_and_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE user_directory_records (account_id_hex TEXT PRIMARY KEY, entry_json TEXT NOT NULL)").unwrap();
+        conn.execute(
+            "INSERT INTO user_directory_records VALUES ('a', ?1)",
+            [
+                serde_json::to_string(&directory_record(account_id(1), vec![account_id(2)]))
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_directory_records VALUES ('b', ?1)",
+            [r#"{"account_id_hex": "private-profile", "npub": 123}"#],
+        )
+        .unwrap();
+        let error = migrations::run_all(&mut conn).unwrap_err();
+        assert!(!error.to_string().contains("private-profile"));
+        assert!(!DirectoryCache::table_exists_locked(&conn, "directory_users").unwrap());
+        assert!(
+            !DirectoryCache::table_exists_locked(&conn, "app_cache_schema_migrations").unwrap()
+        );
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM user_directory_records", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        conn.execute(
+            "DELETE FROM user_directory_records WHERE account_id_hex = 'b'",
+            [],
+        )
+        .unwrap();
+        migrations::run_all(&mut conn).unwrap();
+        assert_eq!(migration_rows(&conn).len(), 1);
+        assert!(!DirectoryCache::table_exists_locked(&conn, "user_directory_records").unwrap());
     }
 
     #[test]
@@ -1096,5 +1189,6 @@ mod tests {
         assert_eq!(entry.follows, vec![bob]);
         assert_eq!(user_count, 1);
         assert!(!legacy_table_exists);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 1);
     }
 }
