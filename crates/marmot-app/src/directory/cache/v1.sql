@@ -1,3 +1,6 @@
+-- Frozen version 1: IF NOT EXISTS adopts unversioned caches only after
+-- migrations.rs validates their shape. Do not copy this adoption pattern
+-- into later migrations without an explicit predecessor-schema contract.
 CREATE TABLE IF NOT EXISTS directory_users (
     account_id_hex TEXT PRIMARY KEY NOT NULL,
     npub TEXT NOT NULL,

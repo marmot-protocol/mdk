@@ -53,7 +53,9 @@ The legacy `user_directory_records` JSON conversion and removal of its retired t
 
 Each migration runs under a write transaction together with its ledger insertion. A failure rolls back that migration's
 schema changes, converted records and ledger row; earlier committed migrations remain intact. Reopening a current
-cache skips applied migrations. Recorded names must match the compiled ordered history, and any newer recorded version
+cache validates history with reads only and skips applied migrations; a pending migration rechecks history under
+the write lock to serialize concurrent openers. SQLite result codes and static history errors remain available without
+database-controlled error messages or legacy JSON values. Recorded names must match the compiled ordered history, and any newer recorded version
 returns `UnsupportedSchemaVersion` before a migration body runs. This refuses downgrades across a newer schema; it does
 not reverse committed migrations. SQLCipher hardening, owner-only files, terminal close behavior, and the legacy
 plaintext directory import remain in place.

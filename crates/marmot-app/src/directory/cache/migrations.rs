@@ -18,15 +18,26 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
 const VERSION_1_SQL: &str = include_str!("v1.sql");
 
+/// Open the cache's independent migration domain without exposing stored values.
 pub(super) fn run_all(conn: &mut Connection) -> Result<(), AppError> {
-    // SQLite/JSON errors can contain database-controlled names or values.
-    // Keep the typed downgrade error, but never surface those private details.
     run(conn, MIGRATIONS).map_err(|error| match error {
-        AppError::Storage(StorageError::UnsupportedSchemaVersion { .. }) => error,
+        // These errors are constructed here from static text or version numbers.
+        AppError::Storage(_) => error,
+        // Extended result codes preserve BUSY/IOERR/NOTADB diagnostics without
+        // SQLite's optional message (including user-defined trigger messages).
+        AppError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => {
+            AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
+        }
+        AppError::Json(_) => {
+            StorageError::Serialization("invalid legacy directory cache record".into()).into()
+        }
         _ => StorageError::Backend("directory cache schema migration failed".into()).into(),
     })
 }
 
+/// Mirror storage-sqlite/src/migrations.rs's atomic body-plus-ledger contract.
+/// Keep this runner local: that runner hardcodes the session ledger and owns
+/// session-specific legacy-name reconciliation, neither of which applies here.
 fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), AppError> {
     let mut previous = 0;
     for migration in migrations {
@@ -35,11 +46,20 @@ fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), AppError> 
         }
         previous = migration.version;
     }
-    let latest_supported = previous;
-    for migration in migrations {
-        // Lock before reading history so concurrent openers cannot both apply a
-        // migration. Even ledger creation is rolled back on first-open failure.
+    // A current cache needs only reads, even while another connection writes.
+    let applied = applied_count(conn, migrations)?;
+    for migration in &migrations[applied..] {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A concurrent opener may have migrated between the read and our lock.
+        // Revalidate under the lock before running any pending body.
+        let applied = applied_count(&tx, migrations)?;
+        if migrations[..applied]
+            .iter()
+            .any(|m| m.version == migration.version)
+        {
+            tx.commit()?;
+            continue;
+        }
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS app_cache_schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -47,50 +67,49 @@ fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), AppError> 
                 applied_at_unix_seconds INTEGER NOT NULL
             );",
         )?;
-        let recorded = {
-            let mut statement = tx.prepare(
-                "SELECT version, name FROM app_cache_schema_migrations ORDER BY version",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        if let Some((found, _)) = recorded.last()
-            && *found > latest_supported
-        {
-            return Err(StorageError::UnsupportedSchemaVersion {
-                found: *found,
-                latest_supported,
-            }
-            .into());
-        }
-        // History must be a prefix, with exactly the compiled names. Check all
-        // rows before any pending migration can change the database.
-        for (index, (version, name)) in recorded.iter().enumerate() {
-            let Some(expected) = migrations.get(index) else {
-                return Err(invalid_history());
-            };
-            if *version != expected.version || name != expected.name {
-                return Err(invalid_history());
-            }
-        }
-        if !recorded
-            .iter()
-            .any(|(version, _)| *version == migration.version)
-        {
-            (migration.apply)(&tx)?;
-            tx.execute(
-                "INSERT INTO app_cache_schema_migrations
-                    (version, name, applied_at_unix_seconds)
-                 VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
-                params![migration.version, migration.name],
-            )?;
-        }
+        (migration.apply)(&tx)?;
+        tx.execute(
+            "INSERT INTO app_cache_schema_migrations
+                (version, name, applied_at_unix_seconds)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
+            params![migration.version, migration.name],
+        )?;
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Validate history as an exact prefix and return the number already applied.
+fn applied_count(conn: &Connection, migrations: &[Migration]) -> Result<usize, AppError> {
+    if !DirectoryCache::table_exists_locked(conn, "app_cache_schema_migrations")? {
+        return Ok(0);
+    }
+    let latest_supported = migrations.last().map_or(0, |m| m.version);
+    let mut statement =
+        conn.prepare("SELECT version, name FROM app_cache_schema_migrations ORDER BY version")?;
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some((found, _)) = recorded.last()
+        && *found > latest_supported
+    {
+        return Err(StorageError::UnsupportedSchemaVersion {
+            found: *found,
+            latest_supported,
+        }
+        .into());
+    }
+    for (index, (version, name)) in recorded.iter().enumerate() {
+        let Some(expected) = migrations.get(index) else {
+            return Err(invalid_history());
+        };
+        if *version != expected.version || name != expected.name {
+            return Err(invalid_history());
+        }
+    }
+    Ok(recorded.len())
 }
 
 fn invalid_history() -> AppError {
@@ -138,16 +157,15 @@ fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
                 return Err(invalid_history());
             }
         }
-        // Names come exclusively from our frozen DDL, never stored user data.
         let query = if kind == "table" {
-            format!(
-                "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('{name}') ORDER BY cid"
-            )
+            r#"SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?1) ORDER BY cid"#
         } else {
-            format!("SELECT name, '', 0, NULL, 0 FROM pragma_index_info('{name}') ORDER BY seqno")
+            "SELECT name, '', 0, NULL, 0 FROM pragma_index_info(?1) ORDER BY seqno"
         };
-        if shape(conn, &query)? != shape(&reference, &query)? {
-            return Err(invalid_history());
+        if shape(conn, query, &name)? != shape(&reference, query, &name)? {
+            return Err(
+                StorageError::Backend("invalid directory cache schema shape".into()).into(),
+            );
         }
     }
     Ok(())
@@ -155,10 +173,10 @@ fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
 
 type ColumnShape = (String, String, i64, Option<String>, i64);
 
-fn shape(conn: &Connection, query: &str) -> Result<Vec<ColumnShape>, AppError> {
+fn shape(conn: &Connection, query: &str, name: &str) -> Result<Vec<ColumnShape>, AppError> {
     Ok(conn
         .prepare(query)?
-        .query_map([], |row| {
+        .query_map([name], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -173,6 +191,47 @@ fn shape(conn: &Connection, query: &str) -> Result<Vec<ColumnShape>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_cache_migrations_do_not_contend_with_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        let mut conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        run_all(&mut conn).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        run_all(&mut conn).expect("current history must not acquire a write lock");
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn migration_errors_preserve_safe_diagnostics_without_trigger_payloads() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+        conn.execute_batch(
+            "DELETE FROM app_cache_schema_migrations;
+            CREATE TRIGGER reject_history BEFORE INSERT ON app_cache_schema_migrations
+            BEGIN SELECT RAISE(ABORT, 'private profile data'); END;",
+        )
+        .unwrap();
+        let error = run_all(&mut conn).unwrap_err();
+        assert!(!error.to_string().contains("private profile data"));
+        assert!(
+            matches!(error, AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation)
+        );
+        conn.execute_batch(
+            "DROP TRIGGER reject_history;
+            INSERT INTO app_cache_schema_migrations VALUES (1, 'private name', 0)",
+        )
+        .unwrap();
+        assert_eq!(
+            run_all(&mut conn).unwrap_err().to_string(),
+            "backend failure: invalid directory cache migration history"
+        );
+    }
 
     #[test]
     fn migration_rejects_missing_columns_keys_and_wrong_indexes() {
