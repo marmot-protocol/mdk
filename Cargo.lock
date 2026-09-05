@@ -928,6 +928,7 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -3425,6 +3426,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "web-time",
 ]
 
 [[package]]
@@ -6348,6 +6350,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "web-time",
 ]
 
 [[package]]
