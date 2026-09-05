@@ -939,6 +939,13 @@ resource error instead of spinning.
 eight-round `seed=9101`, `case_index=11` regression from mdk#1671. The latter requires a selected path that spans
 several epochs to leave every intermediate retained anchor available to the next frozen convergence generation.
 
+`tests/offline_catchup_regression.rs` replays a fixed 368-message reduction of generator 1, seed 17001, case 19,
+retaining all 16 commit rounds. Both tests explicitly use `ProtocolProfile::Current` and encrypted file-backed storage.
+Reverse history previously stranded 125 messages after group state converged; changing only relay order to natural
+passed. The saved synthetic input retains full payload multiplicity, exact state, fresh decryption probes, and
+no-pending-work checks. Its Current founding acknowledgement omits the Legacy pending-create filter and expectation.
+Run it with `cargo test --release -p cgka-conformance-simulator --test offline_catchup_regression`.
+
 ### General Simulator Integrity Checks
 
 These tests keep the simulator machinery honest.

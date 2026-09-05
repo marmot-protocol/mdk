@@ -737,23 +737,23 @@ pub trait ConvergencePassStorage {
 
 // ── DeferredPeelGenerationStorage ────────────────────────────────────────
 
-/// Durable barrier for one contested deferred-peel evidence generation.
+/// Durable barrier for one deferred-peel evidence generation.
 ///
-/// A contested sweep may recover several messages before it has examined the
-/// complete deferred set. Applying convergence to that prefix can freeze a
-/// verdict that later evidence would have changed. The engine therefore
-/// persists this marker before buffering the first recovered contested row and
+/// A sweep may recover several messages before it has examined the complete
+/// deferred set. Applying convergence to that prefix can freeze an incomplete
+/// branch verdict or prune an epoch before its raw application rows are peeled.
+/// The engine therefore persists this marker before buffering recovered rows and
 /// clears it only after every row has received a definitive result under the
 /// final peel-context fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredPeelGeneration {
-    /// MLS group whose deferred rows belong to this contested generation.
+    /// MLS group whose deferred rows belong to this generation.
     pub group_id: GroupId,
     /// Complete peel-context fingerprint that defines this generation.
     pub context_fingerprint: [u8; 32],
 }
 
-/// Persistence for the contested deferred-peel generation barrier.
+/// Persistence for the deferred-peel generation barrier.
 pub trait DeferredPeelGenerationStorage {
     /// Return the active generation barrier for `group_id`, if any.
     fn deferred_peel_generation(

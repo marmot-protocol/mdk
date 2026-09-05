@@ -1252,9 +1252,8 @@ impl<S: StorageProvider> Engine<S> {
         // (`ensure_hydrated` no-ops; converge reports the blocked run).
         self.ensure_hydrated(group_id)?;
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
-            let contested_generation_active =
-                self.storage.deferred_peel_generation(group_id)?.is_some();
-            if self.has_unresolved_convergence_inputs(group_id)? && !contested_generation_active {
+            let peel_generation_active = self.storage.deferred_peel_generation(group_id)?.is_some();
+            if self.has_unresolved_convergence_inputs(group_id)? && !peel_generation_active {
                 let convergence_started = Instant::now();
                 let result = self
                     .converge_stored_openmls_messages_with_time(
@@ -1860,18 +1859,17 @@ impl<S: StorageProvider> Engine<S> {
                 candidate_enumeration_ms,
                 "deferred-peel candidate enumeration"
             );
-            if enumerated.contested {
-                self.storage
-                    .put_deferred_peel_generation(&DeferredPeelGeneration {
-                        group_id: group_id.clone(),
-                        context_fingerprint: fingerprint,
-                    })?;
-            }
-            let cached_generation_fingerprint = if enumerated.contested {
-                Some(fingerprint)
-            } else {
-                durable_generation_fingerprint
-            };
+            // Even an uncontested backlog is one evidence set. Advancing a
+            // recovered commit before all raw rows have tried this context can
+            // prune the only state that decrypts the rest of its epoch. Keep
+            // the barrier durable across bounded slices and restarts; the
+            // completed generation below releases it before convergence.
+            self.storage
+                .put_deferred_peel_generation(&DeferredPeelGeneration {
+                    group_id: group_id.clone(),
+                    context_fingerprint: fingerprint,
+                })?;
+            let cached_generation_fingerprint = Some(fingerprint);
             let enumerated = Arc::new(enumerated);
             self.deferred_peel
                 .entry(group_id.clone())
@@ -2004,7 +2002,11 @@ impl<S: StorageProvider> Engine<S> {
                 // the next normal convergence wake process the complete set.
                 self.storage.delete_deferred_peel_generation(group_id)?;
                 self.invalidate_deferred_peel_candidate_cache(group_id);
-                self.converge_stored_openmls_messages_with_time(group_id, now)
+                // Reingest records admission time while the async sweep runs.
+                // Its completion cannot settle with the pre-sweep instant:
+                // even a zero-quiescence pass would then appear not yet due.
+                let completed_at = self.convergence_now();
+                self.converge_stored_openmls_messages_with_time(group_id, completed_at)
                     .map_err(|error| {
                         EngineError::Backend(format!("converge swept batch: {error}"))
                     })?;

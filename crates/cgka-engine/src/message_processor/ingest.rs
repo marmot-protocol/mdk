@@ -41,29 +41,29 @@ use tls_codec::{Deserialize as _, Serialize as _};
 /// What a deferred-peel sweep offers the ingest seam for one retained row.
 ///
 /// The candidate branch states this sweep materialized are offered to a row the
-/// live context cannot read. Their presence is a ONE-WAY signal about the
-/// graph: a non-empty set proves a fork, but an empty set proves nothing, since
-/// [`candidate_branch_peel`] loses its contexts on every enumeration halt.
-/// Contested-ness therefore travels in its own field, decided from the stored
-/// commit graph before any replay.
+/// live context cannot read. Every sweep defers convergence until the complete
+/// readable batch is retained. This also matters without a fork: applying a
+/// recovered commit per row can prune an epoch before later raw rows are peeled.
+/// Candidate contexts independently control which applications become branch
+/// evidence; an enumeration halt must not change the batch drain policy.
 ///
 /// [`candidate_branch_peel`]: crate::openmls_projection::candidate_branch_peel
 #[derive(Clone, Copy)]
 pub(crate) struct DeferredPeelSweep<'a> {
-    contested: bool,
+    drain: ConvergenceDrain,
     branch_contexts: &'a [CandidateBranchPeelContext],
 }
 
 impl<'a> DeferredPeelSweep<'a> {
     /// Ordinary live ingest: no sweep, no candidate branches, no contest.
     pub(crate) const LIVE: Self = Self {
-        contested: false,
+        drain: ConvergenceDrain::Now,
         branch_contexts: &[],
     };
 
     pub(crate) fn over_branches(peel: &'a CandidateBranchPeel) -> Self {
         Self {
-            contested: peel.contested,
+            drain: ConvergenceDrain::DeferredToCaller,
             branch_contexts: &peel.contexts,
         }
     }
@@ -78,19 +78,10 @@ impl<'a> DeferredPeelSweep<'a> {
         !self.branch_contexts.is_empty()
     }
 
-    /// Whether this sweep is feeding a pass that has a fork to adjudicate.
-    pub(crate) fn is_contested(&self) -> bool {
-        self.contested
-    }
-
-    /// When a contested sweep buffers evidence, the drain waits for the whole
+    /// When a sweep buffers evidence, the drain waits for the whole
     /// batch. See [`ConvergenceDrain::DeferredToCaller`].
     fn drain_policy(&self) -> ConvergenceDrain {
-        if self.is_contested() {
-            ConvergenceDrain::DeferredToCaller
-        } else {
-            ConvergenceDrain::Now
-        }
+        self.drain
     }
 }
 
@@ -923,7 +914,7 @@ impl<S: StorageProvider> Engine<S> {
         // inverted. Commits need no such rule; `commit_should_enter_convergence`
         // below decides on epoch, which is already provenance-blind.
         //
-        // Keyed on captured contexts, NOT on `is_contested`. A contested sweep
+        // Keyed on captured contexts, NOT on graph contested-ness. A contested sweep
         // whose enumeration halted holds no rival state, so it reads only this
         // device's own branch — and the pass it would feed almost certainly
         // cannot read the rival either, having halted on the same missing
@@ -2865,9 +2856,9 @@ fn convergence_ingest_outcome(
 
 #[cfg(test)]
 mod tests {
-    //! The consumer side of the split, over hand-built peels: which decision
-    //! each field drives. That the PRODUCER keeps `contested` true through a
-    //! real enumeration halt is pinned separately, over a real forked graph, in
+    //! Batch draining is independent of candidate visibility. That the
+    //! producer keeps `contested` true through a real enumeration halt is
+    //! pinned separately, over a real forked graph, in
     //! `openmls_projection::candidate_branch_peel_halt_tests`.
 
     use super::{ConvergenceDrain, DeferredPeelSweep};
@@ -2888,7 +2879,7 @@ mod tests {
         let sweep = DeferredPeelSweep::over_branches(&halted);
 
         assert!(
-            sweep.is_contested(),
+            halted.contested,
             "a halt loses the contexts, never the fork"
         );
         assert!(
@@ -2902,20 +2893,22 @@ mod tests {
     }
 
     #[test]
-    fn an_uncontested_graph_drains_per_row() {
+    fn an_uncontested_sweep_defers_while_live_ingest_drains_immediately() {
         let uncontested = CandidateBranchPeel {
             contested: false,
             contexts: Vec::new(),
             replay_probe_count: 0,
         };
 
-        for sweep in [
-            DeferredPeelSweep::over_branches(&uncontested),
-            DeferredPeelSweep::LIVE,
-        ] {
-            assert!(!sweep.is_contested());
-            assert!(!sweep.has_branch_contexts());
-            assert!(matches!(sweep.drain_policy(), ConvergenceDrain::Now));
-        }
+        let sweep = DeferredPeelSweep::over_branches(&uncontested);
+        assert!(!sweep.has_branch_contexts());
+        assert!(matches!(
+            sweep.drain_policy(),
+            ConvergenceDrain::DeferredToCaller
+        ));
+        assert!(matches!(
+            DeferredPeelSweep::LIVE.drain_policy(),
+            ConvergenceDrain::Now
+        ));
     }
 }

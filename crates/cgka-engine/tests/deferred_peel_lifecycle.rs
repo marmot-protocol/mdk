@@ -290,6 +290,10 @@ impl NotifyEpochGatePeeler {
     fn gated_attempts(&self) -> u64 {
         self.gated_attempts.load(Ordering::SeqCst)
     }
+
+    fn unblock(&self) {
+        self.gated.store(false, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -1453,6 +1457,98 @@ async fn contested_generation_barrier_survives_restart_and_blocks_prefix_converg
             .is_none()
     );
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+}
+
+#[tokio::test]
+async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
+    let client = build_notify_client(b"carol");
+    let (mut alice, mut carol, storage, peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs_with(client).await;
+    let template = send_app(&mut alice, &group_id, "uncontested restart backlog").await;
+    for index in 0..65 {
+        assert!(matches!(
+            carol
+                .ingest(TransportMessage {
+                    id: MessageId::new(format!("uncontested-restart-{index}").into_bytes()),
+                    ..template.clone()
+                })
+                .await
+                .unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+
+    // Cancel the first foreground peel after enumeration, leaving a real
+    // partially examined generation rather than injecting its storage marker.
+    carol.set_foreground_deferred_peel_budget(25, 4);
+    peeler.block_on_attempt(1);
+    assert!(matches!(
+        carol
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&carol, "queued during catch-up"),
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_some()
+    );
+
+    peeler.unblock();
+    assert!(matches!(
+        carol.ingest(commit2).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    drop(carol);
+
+    let (mut restarted, _, _) = build_counting_client_with_storage_and_clock(
+        b"carol",
+        storage.clone(),
+        ManualConvergenceClock::new(3_000, 30_000),
+    );
+    restarted.hydrate_all_stored_groups().unwrap();
+    assert_eq!(
+        restarted
+            .converge_stored_openmls_messages(&group_id)
+            .unwrap()
+            .convergence_status,
+        cgka_engine::canonicalization::ConvergenceStatus::Syncing
+    );
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(1));
+
+    // Maintenance resumes in bounded background slices; an outbound preflight
+    // intentionally attempts only four rows and cannot finish this backlog.
+    for _ in 0..8 {
+        restarted.retry_deferred_peels(&group_id).await.unwrap();
+        if restarted.epoch(&group_id).unwrap() == EpochId(2) {
+            break;
+        }
+    }
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+    restarted.ingest(commit3).await.unwrap();
+    for _ in 0..8 {
+        restarted.retry_deferred_peels(&group_id).await.unwrap();
+    }
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(3));
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !storage
+            .list_messages(&group_id, EpochId(0))
+            .unwrap()
+            .iter()
+            .any(|record| record.state == MessageState::PeelDeferred)
+    );
 }
 
 /// The gate must not block legitimate retries: once the epoch advances, the

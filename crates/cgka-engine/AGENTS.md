@@ -368,11 +368,16 @@ whether the graph is contested, and `CandidateBranchPeel` carries it independent
 every path after it — released anchor, missing own-commit checkpoint, exhausted budget, fewer than two surviving
 candidate paths, no tip captured — loses contexts without saying anything about whether the graph is split. Reading
 contested-ness off an empty context set would report a fork as healed exactly when this device stopped being able to
-see it. The two then drive different decisions and must stay split: `DeferredPeelSweep::is_contested` gates only the
-drain policy (a contested sweep's recovered rows are one evidence set, so the drain waits for the whole batch), while
-routing live-readable application traffic into the convergence seam keys on `has_branch_contexts` — a sweep holding no
+see it. Routing live-readable application traffic into the convergence seam keys on `has_branch_contexts` — a sweep holding no
 rival state would only feed evidence to a pass that, having halted on the same checkpoint or the same budget, almost
 certainly cannot read the rival branch either.
+
+**Every deferred-peel generation drains as a complete batch.** Contested and uncontested sweeps both persist a
+`DeferredPeelGeneration` barrier before recovering rows. It survives bounded slices, cancellation, and restart, and
+clears only once every retained row has tried the final context fingerprint. Uncontested per-row convergence can
+advance commits and prune the only epoch state that decrypts later raw application rows. Live ingest retains its
+immediate drain behavior; application routing still depends on captured branch contexts. The Current-profile saved
+368-message regression and its natural-order control live in the simulator's `tests/offline_catchup_regression.rs`.
 
 **Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
 not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical

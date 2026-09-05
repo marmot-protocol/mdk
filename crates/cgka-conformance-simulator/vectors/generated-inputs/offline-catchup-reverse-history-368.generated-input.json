@@ -1,0 +1,5238 @@
+{
+  "schema_version": "1",
+  "case": {
+    "family_name": "offline-catchup-reverse-history/v1",
+    "generator_version": "fixed-regression/v1",
+    "seed": 17001,
+    "case_index": 19,
+    "subject": "retained_relay",
+    "scenario": {
+      "name": "offline-catchup-reverse-history-368",
+      "spec_version": "2",
+      "clients": [
+        "alice",
+        "bob",
+        "carol",
+        "david"
+      ],
+      "topology": {
+        "accounts": [
+          {
+            "id": "account:alice",
+            "roles": [
+              "member"
+            ]
+          },
+          {
+            "id": "account:bob",
+            "roles": [
+              "member"
+            ]
+          },
+          {
+            "id": "account:carol",
+            "roles": [
+              "member"
+            ]
+          },
+          {
+            "id": "account:david",
+            "roles": [
+              "member"
+            ]
+          }
+        ],
+        "devices": [
+          {
+            "id": "device:alice",
+            "account": "account:alice",
+            "process": "process:alice",
+            "client": "alice"
+          },
+          {
+            "id": "device:bob",
+            "account": "account:bob",
+            "process": "process:bob",
+            "client": "bob"
+          },
+          {
+            "id": "device:carol",
+            "account": "account:carol",
+            "process": "process:carol",
+            "client": "carol"
+          },
+          {
+            "id": "device:david",
+            "account": "account:david",
+            "process": "process:david",
+            "client": "david"
+          }
+        ],
+        "processes": [
+          {
+            "id": "process:alice",
+            "binary_version": "mdk-current",
+            "policy_version": "marmot-convergence-v1",
+            "relays": [
+              "relay:offline-catchup"
+            ]
+          },
+          {
+            "id": "process:bob",
+            "binary_version": "mdk-current",
+            "policy_version": "marmot-convergence-v1",
+            "relays": [
+              "relay:offline-catchup"
+            ]
+          },
+          {
+            "id": "process:carol",
+            "binary_version": "mdk-current",
+            "policy_version": "marmot-convergence-v1",
+            "relays": [
+              "relay:offline-catchup"
+            ]
+          },
+          {
+            "id": "process:david",
+            "binary_version": "mdk-current",
+            "policy_version": "marmot-convergence-v1",
+            "relays": [
+              "relay:offline-catchup"
+            ]
+          }
+        ],
+        "relays": [
+          {
+            "id": "relay:offline-catchup",
+            "implementation_version": "memory/v1",
+            "policy_version": "retain-all/v1"
+          }
+        ]
+      },
+      "steps": [
+        {
+          "type": "create_group",
+          "creator": "alice",
+          "name": "offline-catchup-19",
+          "invitees": [
+            "bob",
+            "carol",
+            "david"
+          ],
+          "required_features": [],
+          "initial_admins": [
+            "alice",
+            "bob",
+            "carol",
+            "david"
+          ],
+          "pending": "create"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "bob",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "clear_events",
+          "clients": [
+            "alice",
+            "bob",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "set_client_offline",
+          "client": "bob"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:0:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:1:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:2:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:3:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:4:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:5:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:6:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:7:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:8:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:9:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:10:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:11:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:12:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:13:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:14:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:15:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:16:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:17:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:18:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:19:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:20:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:21:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:22:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:23:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:24:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:25:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:26:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:27:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:28:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:29:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:30:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:31:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:32:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:33:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:34:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:35:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:36:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:37:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:38:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:39:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:40:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:41:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:42:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:43:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:44:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:45:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:46:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:47:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:48:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:49:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:50:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:51:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:52:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:53:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:54:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:55:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:56:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:57:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:58:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:59:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:60:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:61:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:62:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:63:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "update_group_data",
+          "client": "alice",
+          "name": "offline-catchup-19-round-0-branch-0",
+          "pending": "state-0-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "publication": "state-0-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:64:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:65:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:66:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:67:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:68:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:69:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:70:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:71:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:72:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:73:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:74:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:75:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:76:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:77:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:78:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:79:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:80:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:81:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:82:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:83:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:84:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:85:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:86:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:87:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:88:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:89:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:90:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:91:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:92:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:93:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:94:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:95:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:96:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:97:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:98:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:99:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:100:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:101:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:102:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:103:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:104:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:105:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:106:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:107:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:108:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:109:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:110:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:111:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:112:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:113:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:114:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:115:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:116:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:117:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:118:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:119:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:120:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:121:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:122:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:123:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:124:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:125:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:126:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:127:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "update_group_data",
+          "client": "alice",
+          "name": "offline-catchup-19-round-1-branch-0",
+          "pending": "state-1-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "publication": "state-1-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:128:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:129:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:130:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:131:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:132:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:133:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:134:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:135:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:136:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:137:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:138:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:139:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:140:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:141:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:142:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:143:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:144:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:145:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:146:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:147:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:148:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:149:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:150:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:151:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:152:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:153:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:154:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:155:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:156:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:157:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:158:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:159:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:160:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:161:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:162:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:163:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:164:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:165:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:166:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:167:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:168:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:169:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:170:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:171:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:172:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:173:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:174:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:175:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:176:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:177:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:178:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:179:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:180:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:181:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:182:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:183:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:184:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:185:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:186:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:187:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:188:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:189:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:190:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:191:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "update_group_data",
+          "client": "david",
+          "name": "offline-catchup-19-round-2-branch-0",
+          "pending": "state-2-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "publication": "state-2-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:192:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:193:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:194:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:195:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:196:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:197:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:198:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:199:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:200:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:201:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:202:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:203:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:204:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:205:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:206:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:207:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:208:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:209:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:210:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:211:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:212:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:213:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:214:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:215:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:216:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:217:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:218:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:219:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:220:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:221:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:222:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:223:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:224:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:225:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:226:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:227:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:228:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:229:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:230:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:231:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:232:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:233:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:234:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:235:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:236:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:237:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:238:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:239:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:240:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:241:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:242:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:243:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:244:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:245:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:246:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:247:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:248:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:249:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:250:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:251:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:252:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:253:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:254:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:255:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "update_group_data",
+          "client": "david",
+          "name": "offline-catchup-19-round-3-branch-0",
+          "pending": "state-3-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "publication": "state-3-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:256:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:257:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:258:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:259:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:260:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:261:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:262:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:263:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:264:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:265:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:266:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:267:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:268:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:269:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:270:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:271:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:272:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:273:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:274:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:275:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:276:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:277:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:278:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:279:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:280:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:281:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:282:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:283:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:284:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:285:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:286:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:287:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:288:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:289:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:290:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:291:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:292:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:293:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:294:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:295:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:296:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:297:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:298:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:299:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:300:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:301:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:302:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:303:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:304:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:305:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:306:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:307:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:308:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:309:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:310:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:311:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:312:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:313:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:314:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:315:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:316:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:317:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:318:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:319:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "update_group_data",
+          "client": "carol",
+          "name": "offline-catchup-19-round-4-branch-0",
+          "pending": "state-4-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "publication": "state-4-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:320:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:321:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:322:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:323:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:324:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:325:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:326:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:327:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:328:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:329:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:330:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:331:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:332:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:333:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:334:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:335:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:336:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:337:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:338:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:339:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:340:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:341:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:342:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:343:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:344:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:345:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:346:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:347:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:348:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:349:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:350:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:351:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:352:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:353:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:354:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:355:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:356:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:357:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:358:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:359:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:360:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:361:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:362:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "carol",
+          "payload": "offline-catchup:19:363:carol"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:364:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:365:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "david",
+          "payload": "offline-catchup:19:366:david"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "send_app_message",
+          "sender": "alice",
+          "payload": "offline-catchup:19:367:alice"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "update_group_data",
+          "client": "alice",
+          "name": "offline-catchup-19-round-5-branch-0",
+          "pending": "state-5-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "publication": "state-5-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "david",
+          "name": "offline-catchup-19-round-6-branch-0",
+          "pending": "state-6-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "publication": "state-6-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "carol",
+          "name": "offline-catchup-19-round-7-branch-0",
+          "pending": "state-7-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "publication": "state-7-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "david",
+          "name": "offline-catchup-19-round-8-branch-0",
+          "pending": "state-8-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "publication": "state-8-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "carol",
+          "name": "offline-catchup-19-round-9-branch-0",
+          "pending": "state-9-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "publication": "state-9-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "carol",
+          "name": "offline-catchup-19-round-10-branch-0",
+          "pending": "state-10-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "publication": "state-10-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "carol",
+          "name": "offline-catchup-19-round-11-branch-0",
+          "pending": "state-11-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "publication": "state-11-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "alice",
+          "name": "offline-catchup-19-round-12-branch-0",
+          "pending": "state-12-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "publication": "state-12-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "alice",
+          "name": "offline-catchup-19-round-13-branch-0",
+          "pending": "state-13-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "publication": "state-13-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "alice",
+          "name": "offline-catchup-19-round-14-branch-0",
+          "pending": "state-14-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "publication": "state-14-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "update_group_data",
+          "client": "david",
+          "name": "offline-catchup-19-round-15-branch-0",
+          "pending": "state-15-0"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "publication": "state-15-0",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "assert",
+          "assertion": {
+            "mode": "exactly",
+            "predicate": {
+              "type": "payload_count",
+              "client": "bob",
+              "payload": "offline-catchup:19:0:david",
+              "count": 0
+            }
+          }
+        },
+        {
+          "type": "configure_relay",
+          "relay": "relay:offline-catchup",
+          "order": "reverse",
+          "duplicate_copies": 1
+        },
+        {
+          "type": "reconnect_client",
+          "client": "bob"
+        },
+        {
+          "type": "sync_relay_history",
+          "clients": [
+            "bob"
+          ],
+          "sync": {
+            "mode": "full_history"
+          }
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "bob"
+          ]
+        },
+        {
+          "type": "assert",
+          "assertion": {
+            "mode": "eventually",
+            "predicate": {
+              "type": "payload_count",
+              "client": "bob",
+              "payload": "offline-catchup:19:367:alice",
+              "count": 1
+            },
+            "max_iterations": 128
+          }
+        },
+        {
+          "type": "probe_bidirectional_decryptability",
+          "clients": [
+            "alice",
+            "bob",
+            "carol"
+          ]
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "bob",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "alice",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "bob",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "carol",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "acknowledge_outbound",
+          "client": "david",
+          "selection": "all",
+          "outcome": "accepted"
+        },
+        {
+          "type": "deliver_all"
+        },
+        {
+          "type": "tick",
+          "clients": [
+            "alice",
+            "bob",
+            "carol",
+            "david"
+          ]
+        },
+        {
+          "type": "observe_exact",
+          "clients": [
+            "alice",
+            "bob",
+            "carol",
+            "david"
+          ]
+        }
+      ]
+    },
+    "expected_outcomes": [
+      {
+        "type": "clients_converged",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "david"
+        ],
+        "member_count": 4
+      },
+      {
+        "type": "application_payload_multiset",
+        "client": "bob",
+        "payloads": [
+          "offline-catchup:19:0:david",
+          "offline-catchup:19:1:alice",
+          "offline-catchup:19:2:carol",
+          "offline-catchup:19:3:carol",
+          "offline-catchup:19:4:carol",
+          "offline-catchup:19:5:carol",
+          "offline-catchup:19:6:david",
+          "offline-catchup:19:7:david",
+          "offline-catchup:19:8:carol",
+          "offline-catchup:19:9:alice",
+          "offline-catchup:19:10:alice",
+          "offline-catchup:19:11:david",
+          "offline-catchup:19:12:carol",
+          "offline-catchup:19:13:carol",
+          "offline-catchup:19:14:carol",
+          "offline-catchup:19:15:carol",
+          "offline-catchup:19:16:alice",
+          "offline-catchup:19:17:carol",
+          "offline-catchup:19:18:alice",
+          "offline-catchup:19:19:carol",
+          "offline-catchup:19:20:carol",
+          "offline-catchup:19:21:alice",
+          "offline-catchup:19:22:david",
+          "offline-catchup:19:23:carol",
+          "offline-catchup:19:24:david",
+          "offline-catchup:19:25:carol",
+          "offline-catchup:19:26:carol",
+          "offline-catchup:19:27:alice",
+          "offline-catchup:19:28:carol",
+          "offline-catchup:19:29:carol",
+          "offline-catchup:19:30:david",
+          "offline-catchup:19:31:carol",
+          "offline-catchup:19:32:carol",
+          "offline-catchup:19:33:david",
+          "offline-catchup:19:34:david",
+          "offline-catchup:19:35:carol",
+          "offline-catchup:19:36:carol",
+          "offline-catchup:19:37:david",
+          "offline-catchup:19:38:david",
+          "offline-catchup:19:39:alice",
+          "offline-catchup:19:40:carol",
+          "offline-catchup:19:41:carol",
+          "offline-catchup:19:42:alice",
+          "offline-catchup:19:43:alice",
+          "offline-catchup:19:44:alice",
+          "offline-catchup:19:45:carol",
+          "offline-catchup:19:46:david",
+          "offline-catchup:19:47:alice",
+          "offline-catchup:19:48:david",
+          "offline-catchup:19:49:carol",
+          "offline-catchup:19:50:alice",
+          "offline-catchup:19:51:alice",
+          "offline-catchup:19:52:alice",
+          "offline-catchup:19:53:carol",
+          "offline-catchup:19:54:alice",
+          "offline-catchup:19:55:alice",
+          "offline-catchup:19:56:carol",
+          "offline-catchup:19:57:carol",
+          "offline-catchup:19:58:alice",
+          "offline-catchup:19:59:carol",
+          "offline-catchup:19:60:david",
+          "offline-catchup:19:61:david",
+          "offline-catchup:19:62:alice",
+          "offline-catchup:19:63:alice",
+          "offline-catchup:19:64:david",
+          "offline-catchup:19:65:carol",
+          "offline-catchup:19:66:alice",
+          "offline-catchup:19:67:david",
+          "offline-catchup:19:68:carol",
+          "offline-catchup:19:69:alice",
+          "offline-catchup:19:70:alice",
+          "offline-catchup:19:71:david",
+          "offline-catchup:19:72:david",
+          "offline-catchup:19:73:alice",
+          "offline-catchup:19:74:david",
+          "offline-catchup:19:75:david",
+          "offline-catchup:19:76:alice",
+          "offline-catchup:19:77:carol",
+          "offline-catchup:19:78:alice",
+          "offline-catchup:19:79:david",
+          "offline-catchup:19:80:alice",
+          "offline-catchup:19:81:carol",
+          "offline-catchup:19:82:alice",
+          "offline-catchup:19:83:david",
+          "offline-catchup:19:84:david",
+          "offline-catchup:19:85:carol",
+          "offline-catchup:19:86:carol",
+          "offline-catchup:19:87:alice",
+          "offline-catchup:19:88:alice",
+          "offline-catchup:19:89:carol",
+          "offline-catchup:19:90:carol",
+          "offline-catchup:19:91:alice",
+          "offline-catchup:19:92:carol",
+          "offline-catchup:19:93:alice",
+          "offline-catchup:19:94:carol",
+          "offline-catchup:19:95:carol",
+          "offline-catchup:19:96:carol",
+          "offline-catchup:19:97:carol",
+          "offline-catchup:19:98:david",
+          "offline-catchup:19:99:carol",
+          "offline-catchup:19:100:carol",
+          "offline-catchup:19:101:david",
+          "offline-catchup:19:102:alice",
+          "offline-catchup:19:103:david",
+          "offline-catchup:19:104:carol",
+          "offline-catchup:19:105:david",
+          "offline-catchup:19:106:alice",
+          "offline-catchup:19:107:alice",
+          "offline-catchup:19:108:carol",
+          "offline-catchup:19:109:david",
+          "offline-catchup:19:110:carol",
+          "offline-catchup:19:111:carol",
+          "offline-catchup:19:112:david",
+          "offline-catchup:19:113:alice",
+          "offline-catchup:19:114:david",
+          "offline-catchup:19:115:carol",
+          "offline-catchup:19:116:david",
+          "offline-catchup:19:117:david",
+          "offline-catchup:19:118:alice",
+          "offline-catchup:19:119:carol",
+          "offline-catchup:19:120:carol",
+          "offline-catchup:19:121:david",
+          "offline-catchup:19:122:alice",
+          "offline-catchup:19:123:alice",
+          "offline-catchup:19:124:carol",
+          "offline-catchup:19:125:alice",
+          "offline-catchup:19:126:david",
+          "offline-catchup:19:127:alice",
+          "offline-catchup:19:128:david",
+          "offline-catchup:19:129:david",
+          "offline-catchup:19:130:carol",
+          "offline-catchup:19:131:david",
+          "offline-catchup:19:132:alice",
+          "offline-catchup:19:133:alice",
+          "offline-catchup:19:134:david",
+          "offline-catchup:19:135:david",
+          "offline-catchup:19:136:alice",
+          "offline-catchup:19:137:alice",
+          "offline-catchup:19:138:carol",
+          "offline-catchup:19:139:alice",
+          "offline-catchup:19:140:david",
+          "offline-catchup:19:141:carol",
+          "offline-catchup:19:142:alice",
+          "offline-catchup:19:143:carol",
+          "offline-catchup:19:144:alice",
+          "offline-catchup:19:145:carol",
+          "offline-catchup:19:146:alice",
+          "offline-catchup:19:147:carol",
+          "offline-catchup:19:148:alice",
+          "offline-catchup:19:149:david",
+          "offline-catchup:19:150:alice",
+          "offline-catchup:19:151:david",
+          "offline-catchup:19:152:carol",
+          "offline-catchup:19:153:carol",
+          "offline-catchup:19:154:carol",
+          "offline-catchup:19:155:alice",
+          "offline-catchup:19:156:carol",
+          "offline-catchup:19:157:alice",
+          "offline-catchup:19:158:carol",
+          "offline-catchup:19:159:david",
+          "offline-catchup:19:160:carol",
+          "offline-catchup:19:161:david",
+          "offline-catchup:19:162:alice",
+          "offline-catchup:19:163:david",
+          "offline-catchup:19:164:alice",
+          "offline-catchup:19:165:carol",
+          "offline-catchup:19:166:alice",
+          "offline-catchup:19:167:david",
+          "offline-catchup:19:168:carol",
+          "offline-catchup:19:169:carol",
+          "offline-catchup:19:170:david",
+          "offline-catchup:19:171:carol",
+          "offline-catchup:19:172:david",
+          "offline-catchup:19:173:carol",
+          "offline-catchup:19:174:carol",
+          "offline-catchup:19:175:alice",
+          "offline-catchup:19:176:david",
+          "offline-catchup:19:177:david",
+          "offline-catchup:19:178:alice",
+          "offline-catchup:19:179:carol",
+          "offline-catchup:19:180:carol",
+          "offline-catchup:19:181:carol",
+          "offline-catchup:19:182:david",
+          "offline-catchup:19:183:david",
+          "offline-catchup:19:184:carol",
+          "offline-catchup:19:185:carol",
+          "offline-catchup:19:186:carol",
+          "offline-catchup:19:187:david",
+          "offline-catchup:19:188:carol",
+          "offline-catchup:19:189:alice",
+          "offline-catchup:19:190:david",
+          "offline-catchup:19:191:david",
+          "offline-catchup:19:192:alice",
+          "offline-catchup:19:193:alice",
+          "offline-catchup:19:194:alice",
+          "offline-catchup:19:195:carol",
+          "offline-catchup:19:196:david",
+          "offline-catchup:19:197:david",
+          "offline-catchup:19:198:alice",
+          "offline-catchup:19:199:david",
+          "offline-catchup:19:200:carol",
+          "offline-catchup:19:201:david",
+          "offline-catchup:19:202:alice",
+          "offline-catchup:19:203:carol",
+          "offline-catchup:19:204:david",
+          "offline-catchup:19:205:alice",
+          "offline-catchup:19:206:david",
+          "offline-catchup:19:207:carol",
+          "offline-catchup:19:208:alice",
+          "offline-catchup:19:209:carol",
+          "offline-catchup:19:210:alice",
+          "offline-catchup:19:211:carol",
+          "offline-catchup:19:212:alice",
+          "offline-catchup:19:213:alice",
+          "offline-catchup:19:214:david",
+          "offline-catchup:19:215:david",
+          "offline-catchup:19:216:carol",
+          "offline-catchup:19:217:alice",
+          "offline-catchup:19:218:carol",
+          "offline-catchup:19:219:david",
+          "offline-catchup:19:220:carol",
+          "offline-catchup:19:221:carol",
+          "offline-catchup:19:222:alice",
+          "offline-catchup:19:223:david",
+          "offline-catchup:19:224:david",
+          "offline-catchup:19:225:alice",
+          "offline-catchup:19:226:carol",
+          "offline-catchup:19:227:alice",
+          "offline-catchup:19:228:carol",
+          "offline-catchup:19:229:carol",
+          "offline-catchup:19:230:carol",
+          "offline-catchup:19:231:david",
+          "offline-catchup:19:232:carol",
+          "offline-catchup:19:233:carol",
+          "offline-catchup:19:234:david",
+          "offline-catchup:19:235:carol",
+          "offline-catchup:19:236:alice",
+          "offline-catchup:19:237:carol",
+          "offline-catchup:19:238:carol",
+          "offline-catchup:19:239:alice",
+          "offline-catchup:19:240:david",
+          "offline-catchup:19:241:david",
+          "offline-catchup:19:242:david",
+          "offline-catchup:19:243:alice",
+          "offline-catchup:19:244:david",
+          "offline-catchup:19:245:alice",
+          "offline-catchup:19:246:carol",
+          "offline-catchup:19:247:carol",
+          "offline-catchup:19:248:david",
+          "offline-catchup:19:249:david",
+          "offline-catchup:19:250:alice",
+          "offline-catchup:19:251:david",
+          "offline-catchup:19:252:carol",
+          "offline-catchup:19:253:david",
+          "offline-catchup:19:254:carol",
+          "offline-catchup:19:255:alice",
+          "offline-catchup:19:256:alice",
+          "offline-catchup:19:257:carol",
+          "offline-catchup:19:258:carol",
+          "offline-catchup:19:259:carol",
+          "offline-catchup:19:260:alice",
+          "offline-catchup:19:261:david",
+          "offline-catchup:19:262:david",
+          "offline-catchup:19:263:carol",
+          "offline-catchup:19:264:carol",
+          "offline-catchup:19:265:david",
+          "offline-catchup:19:266:alice",
+          "offline-catchup:19:267:alice",
+          "offline-catchup:19:268:alice",
+          "offline-catchup:19:269:david",
+          "offline-catchup:19:270:david",
+          "offline-catchup:19:271:carol",
+          "offline-catchup:19:272:david",
+          "offline-catchup:19:273:carol",
+          "offline-catchup:19:274:carol",
+          "offline-catchup:19:275:alice",
+          "offline-catchup:19:276:alice",
+          "offline-catchup:19:277:alice",
+          "offline-catchup:19:278:carol",
+          "offline-catchup:19:279:carol",
+          "offline-catchup:19:280:david",
+          "offline-catchup:19:281:alice",
+          "offline-catchup:19:282:david",
+          "offline-catchup:19:283:carol",
+          "offline-catchup:19:284:david",
+          "offline-catchup:19:285:david",
+          "offline-catchup:19:286:david",
+          "offline-catchup:19:287:david",
+          "offline-catchup:19:288:carol",
+          "offline-catchup:19:289:david",
+          "offline-catchup:19:290:alice",
+          "offline-catchup:19:291:david",
+          "offline-catchup:19:292:david",
+          "offline-catchup:19:293:carol",
+          "offline-catchup:19:294:carol",
+          "offline-catchup:19:295:carol",
+          "offline-catchup:19:296:david",
+          "offline-catchup:19:297:carol",
+          "offline-catchup:19:298:alice",
+          "offline-catchup:19:299:alice",
+          "offline-catchup:19:300:alice",
+          "offline-catchup:19:301:alice",
+          "offline-catchup:19:302:alice",
+          "offline-catchup:19:303:carol",
+          "offline-catchup:19:304:alice",
+          "offline-catchup:19:305:carol",
+          "offline-catchup:19:306:carol",
+          "offline-catchup:19:307:carol",
+          "offline-catchup:19:308:alice",
+          "offline-catchup:19:309:david",
+          "offline-catchup:19:310:alice",
+          "offline-catchup:19:311:alice",
+          "offline-catchup:19:312:david",
+          "offline-catchup:19:313:alice",
+          "offline-catchup:19:314:alice",
+          "offline-catchup:19:315:alice",
+          "offline-catchup:19:316:david",
+          "offline-catchup:19:317:carol",
+          "offline-catchup:19:318:david",
+          "offline-catchup:19:319:david",
+          "offline-catchup:19:320:david",
+          "offline-catchup:19:321:carol",
+          "offline-catchup:19:322:alice",
+          "offline-catchup:19:323:alice",
+          "offline-catchup:19:324:david",
+          "offline-catchup:19:325:alice",
+          "offline-catchup:19:326:carol",
+          "offline-catchup:19:327:carol",
+          "offline-catchup:19:328:alice",
+          "offline-catchup:19:329:david",
+          "offline-catchup:19:330:alice",
+          "offline-catchup:19:331:david",
+          "offline-catchup:19:332:david",
+          "offline-catchup:19:333:david",
+          "offline-catchup:19:334:alice",
+          "offline-catchup:19:335:carol",
+          "offline-catchup:19:336:carol",
+          "offline-catchup:19:337:alice",
+          "offline-catchup:19:338:carol",
+          "offline-catchup:19:339:david",
+          "offline-catchup:19:340:david",
+          "offline-catchup:19:341:alice",
+          "offline-catchup:19:342:alice",
+          "offline-catchup:19:343:david",
+          "offline-catchup:19:344:carol",
+          "offline-catchup:19:345:carol",
+          "offline-catchup:19:346:carol",
+          "offline-catchup:19:347:alice",
+          "offline-catchup:19:348:david",
+          "offline-catchup:19:349:alice",
+          "offline-catchup:19:350:david",
+          "offline-catchup:19:351:david",
+          "offline-catchup:19:352:david",
+          "offline-catchup:19:353:david",
+          "offline-catchup:19:354:alice",
+          "offline-catchup:19:355:carol",
+          "offline-catchup:19:356:alice",
+          "offline-catchup:19:357:carol",
+          "offline-catchup:19:358:carol",
+          "offline-catchup:19:359:carol",
+          "offline-catchup:19:360:alice",
+          "offline-catchup:19:361:david",
+          "offline-catchup:19:362:david",
+          "offline-catchup:19:363:carol",
+          "offline-catchup:19:364:alice",
+          "offline-catchup:19:365:alice",
+          "offline-catchup:19:366:david",
+          "offline-catchup:19:367:alice",
+          "cgka-decryptability-probe/v1/812/alice",
+          "cgka-decryptability-probe/v1/812/carol"
+        ]
+      },
+      {
+        "type": "clients_bidirectionally_decryptable",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 135,
+        "client": "alice",
+        "pending": "state-0-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 267,
+        "client": "alice",
+        "pending": "state-1-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 399,
+        "client": "david",
+        "pending": "state-2-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 531,
+        "client": "david",
+        "pending": "state-3-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 663,
+        "client": "carol",
+        "pending": "state-4-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 763,
+        "client": "alice",
+        "pending": "state-5-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 767,
+        "client": "david",
+        "pending": "state-6-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 771,
+        "client": "carol",
+        "pending": "state-7-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 775,
+        "client": "david",
+        "pending": "state-8-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 779,
+        "client": "carol",
+        "pending": "state-9-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 783,
+        "client": "carol",
+        "pending": "state-10-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 787,
+        "client": "carol",
+        "pending": "state-11-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 791,
+        "client": "alice",
+        "pending": "state-12-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 795,
+        "client": "alice",
+        "pending": "state-13-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 799,
+        "client": "alice",
+        "pending": "state-14-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "pending_resolution",
+        "step_index": 803,
+        "client": "david",
+        "pending": "state-15-0",
+        "resolution": "confirmed"
+      },
+      {
+        "type": "clients_exactly_equivalent",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "david"
+        ]
+      },
+      {
+        "type": "no_pending_work",
+        "clients": [
+          "alice",
+          "bob",
+          "carol",
+          "david"
+        ]
+      }
+    ]
+  }
+}
