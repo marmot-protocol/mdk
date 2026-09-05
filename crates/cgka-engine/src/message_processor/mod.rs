@@ -37,7 +37,8 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
@@ -1933,7 +1934,7 @@ impl<S: StorageProvider> Engine<S> {
             attempted += 1;
             let reingest = self.reingest_deferred_peel_row(group_id, &record, sweep);
             let result = if let Some(remaining) = execution.remaining() {
-                match tokio::time::timeout(remaining, reingest).await {
+                match crate::deadline::timeout(remaining, reingest).await {
                     Ok(result) => result,
                     Err(_) => {
                         timed_out = true;

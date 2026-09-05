@@ -48,7 +48,7 @@ openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "
 tls_codec = "~0.5"
 
 # async
-tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -59,7 +59,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
-getrandom = "0.3"
+getrandom = "0.4.3"
+web-time = "1.1"
 hmac = "0.12"
 libc = "0.2"
 hkdf = "0.12"

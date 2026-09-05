@@ -7,7 +7,7 @@
 //! their existing clocks.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// One paired convergence-clock observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
