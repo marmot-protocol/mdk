@@ -891,7 +891,8 @@ impl NostrTransportAdapter {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportAdapter for NostrTransportAdapter {
     async fn activate_account(
         &self,
