@@ -1484,6 +1484,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
         | AppError::GroupDisbanding(_)
+        | AppError::GroupRemoved(_)
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
         | AppError::AgentStreamUnsupportedRoute

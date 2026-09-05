@@ -597,6 +597,19 @@ impl ObservedHumanActionAudit {
     }
 }
 
+/// Whether the engine record marks this device terminal in the group (removed
+/// or disbanded), so no route for it may stay installed.
+///
+/// Only readable after hydration: at a deferred open (mdk#1161) every engine
+/// record answers `GroupNotHydrated`, which is why `routing_for` filters on the
+/// app-owned disband tombstone instead. Takes the runtime rather than the whole
+/// client so callers can hold a mutable borrow of the projection alongside it.
+pub(crate) fn group_is_terminal(runtime: &AppRuntime, group_id: &GroupId) -> bool {
+    runtime
+        .group_record(group_id)
+        .is_ok_and(|group| group.is_terminal())
+}
+
 fn record_app_performance(
     telemetry: Option<&AppPerformanceTelemetry>,
     operation: AppPerformanceOperation,
@@ -4017,12 +4030,22 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
-        let terminal = self
-            .runtime
-            .group_record(group_id)
-            .map(|group| group.disbanded.is_some())
-            .unwrap_or(false);
-        if terminal || self.runtime.disbanding_in_progress(group_id)? {
+        // One `is_terminal` gate, two errors. Both terminal reasons block the
+        // send, but they are not the same news for the user: disbanded means
+        // the group is gone for everyone, removed means it goes on without
+        // this device. Reporting "disbanding" for a removal claims a group no
+        // longer exists when it does.
+        if let Ok(group) = self.runtime.group_record(group_id)
+            && group.is_terminal()
+        {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            return Err(if group.removed {
+                AppError::GroupRemoved(group_id_hex)
+            } else {
+                AppError::GroupDisbanding(group_id_hex)
+            });
+        }
+        if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
         }
         Ok(())
@@ -4396,11 +4419,7 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            if self
-                .runtime
-                .group_record(&group_id)
-                .is_ok_and(|group| group.disbanded.is_some())
-            {
+            if group_is_terminal(&self.runtime, &group_id) {
                 if self.routing.replace_group_routes(&group_id, Vec::new()) {
                     refresh.routing_changed = true;
                 }
@@ -4437,10 +4456,21 @@ impl AppClient {
         Ok(refresh)
     }
 
+    /// Rebuild the whole routing table and install it.
+    ///
+    /// The rebuild reseeds every projected group, including ones this device is
+    /// terminal in: `routing_for` can only filter disband tombstones. Prune
+    /// those routes before the table goes live, because every caller hands it
+    /// straight to the adapter (`activate_transport` / `sync_runtime_groups`),
+    /// which would re-subscribe the removed group.
     fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
         self.preserve_local_deleted_group_routes(&routing)?;
-        self.routing.replace(routing.snapshot());
+        let mut snapshot = routing.snapshot();
+        snapshot
+            .group_routes
+            .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
+        self.routing.replace(snapshot);
         Ok(())
     }
 

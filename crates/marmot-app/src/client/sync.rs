@@ -3680,11 +3680,7 @@ impl AppClient {
         let Some(group_id) = event_group_id(event) else {
             return Ok(false);
         };
-        if self
-            .runtime
-            .group_record(group_id)
-            .is_ok_and(|group| group.removed || group.disbanded.is_some())
-        {
+        if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(false);
         }
         if matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }) {
@@ -3974,7 +3970,7 @@ impl AppClient {
     /// withdrew.
     ///
     /// Returns whether the event forces a transport-route refresh.
-    fn observe_event_projection_effects(
+    pub(crate) fn observe_event_projection_effects(
         &self,
         event: &cgka_traits::engine::GroupEvent,
         local_account_id_hex: &str,
@@ -4021,6 +4017,12 @@ impl AppClient {
             if member_id_hex.eq_ignore_ascii_case(local_account_id_hex) {
                 self.app
                     .set_group_self_membership(&self.state.label, &group_id_hex, membership)?;
+                // Terminal for this device's copy, so its transport routes are
+                // now stale. Same obligation as the disband arm below: the
+                // ingest seam persists this membership write before route
+                // reconciliation, and the route teardown reaches the relay in
+                // this pass instead of the next one.
+                routes_dirty = true;
             }
         }
         if let cgka_traits::engine::GroupEvent::GroupStateChanged {
