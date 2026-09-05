@@ -43,7 +43,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tls_codec::{Deserialize as _, Serialize as _};
+use tls_codec::Serialize as _;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
