@@ -37,16 +37,22 @@ marmot-forensics.workspace = true
 nostr.workspace = true
 rand.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["time"] }
 # Pure-Rust secp256k1 used only to validate that a Marmot credential identity
 # is a well-formed BIP-340 x-only public key (foundation/identity.md). Already
 # resolved transitively via openmls_rust_crypto -> hpke-rs-rust-crypto -> k256;
 # enabling the `schnorr` feature here pulls in BIP-340 x-only point validation.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+futures.workspace = true
+gloo-timers = { version = "0.3", features = ["futures"] }
+
 [dev-dependencies]
 storage-sqlite = { workspace = true, features = ["storage-format-benchmarks"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros"] }
 test-log.workspace = true
 insta.workspace = true
 tempfile.workspace = true
@@ -59,6 +65,10 @@ sha2.workspace = true
 # binding uses, so engine visibility in tests matches production.
 chacha20poly1305.workspace = true
 criterion.workspace = true
+futures.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
 name = "group_lifecycle"
