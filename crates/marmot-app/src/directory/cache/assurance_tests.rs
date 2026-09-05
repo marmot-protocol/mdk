@@ -146,16 +146,11 @@ fn populated_historical_encrypted_cache_preserves_all_120000_rows() {
     assert!(before.iter().all(|(count, _)| *count == 20_000));
     drop(conn);
 
-    let started = std::time::Instant::now();
     let cache = DirectoryCache::open(
         path.clone(),
         &SqlCipherKey::new("synthetic-upgrade-test-key").unwrap(),
     )
     .unwrap();
-    eprintln!(
-        "historical cache open with 120000 rows: {:?}",
-        started.elapsed()
-    );
     assert_eq!(snapshot(&cache.lock().unwrap(), TABLES, -1), before);
     cache.close().unwrap();
     let conn = encrypted_connection(&path);
