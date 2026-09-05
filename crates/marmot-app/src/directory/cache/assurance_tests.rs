@@ -183,6 +183,10 @@ fn legacy_conversion_disk_full_preserves_both_tiers_and_retries() {
         "disk exhaustion must occur after at least one legacy record was converted"
     );
     assert!(
+        super::super::LEGACY_RECORDS_CONVERTED.with(|count| count.get()) < expected.len(),
+        "disk exhaustion must interrupt legacy conversion"
+    );
+    assert!(
         matches!(error, AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
         if code.code == rusqlite::ErrorCode::DiskFull)
     );
