@@ -96,6 +96,8 @@ The canonical protocol specification lives in
   WN Agent `v<version> - wn-agent`, and MarmotKit `v<version> - MarmotKit`.
 - Prefer `just release-all <version>` for a full MDK/WN Agent/MarmotKit cohort release, or
   `just release-all-draft <version>` when releases should stay draft for manual publication.
+- Sign every commit before pushing. This repository accepts only cryptographically signed commits;
+  configure Git SSH signing (or another accepted signing method) and verify the signature locally.
 - When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification
