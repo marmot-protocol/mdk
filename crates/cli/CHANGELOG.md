@@ -9,8 +9,37 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-09-05
+
+### Changed
+
+- Account databases advance through migrations 57–59: OpenMLS values use
+  MessagePack, successfully processed transport wrappers retain durable replay
+  deduplication, and unread chat-list membership is maintained incrementally.
+  Upgrades are transactional; downgrade is unsupported. Re-upgrade or restore
+  a pre-upgrade database/export instead of removing migration rows. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before `0.9.15` also cross migration 47: back up first and keep
+  at least 3.25 times the account database size free for its history-table
+  rebuild and gradual post-readiness promotion. The 2,048-row release check
+  measured a 4.01-times peak footprint (3.01 times additional space), an
+  8,757 ms migration, 9,237 ms promotion, and 294 ms slowest 32-row batch.
+- Loaded MLS groups, cached SQL statements, batched message writes, and typed
+  subscription fingerprints reduce repeated storage and projection work.
+- Media transfers reuse vetted Blossom clients, bound locator startup and
+  download latency, and preserve the longer timeout for large upload retries.
+- Audit uploads send each sealed segment once instead of repeatedly uploading
+  the complete log.
+
 ### Fixed
 
+- Membership reentry after self-removal and convergence replay retain the
+  intermediate anchors needed to recover compatible history. Branch-selection
+  withdrawals are announced once and reversed when a branch is re-adopted.
+- Deferred message recovery accepts larger backlogs within explicit byte
+  budgets, while retained-history simulation redelivers capacity-refused work.
+- Invitations require usable inbox routes before changing membership. Relay
+  directory updates reject stale events and preserve partial subscription state.
 - Sender-provided QUIC stream candidates cannot use `--insecure-local` to dial
   private, link-local, CGNAT, ULA, or other non-public network ranges. The
   explicit development opt-in now permits loopback endpoints only.
@@ -1995,7 +2024,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...HEAD
+[0.9.18]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...v0.9.17
 [0.9.16]: https://github.com/marmot-protocol/mdk/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/marmot-protocol/mdk/compare/v0.9.14...v0.9.15
