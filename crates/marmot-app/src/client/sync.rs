@@ -3680,11 +3680,7 @@ impl AppClient {
         let Some(group_id) = event_group_id(event) else {
             return Ok(false);
         };
-        if self
-            .runtime
-            .group_record(group_id)
-            .is_ok_and(|group| group.is_terminal())
-        {
+        if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(false);
         }
         if matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. }) {

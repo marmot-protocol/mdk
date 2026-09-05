@@ -597,6 +597,19 @@ impl ObservedHumanActionAudit {
     }
 }
 
+/// Whether the engine record marks this device terminal in the group (removed
+/// or disbanded), so no route for it may stay installed.
+///
+/// Only readable after hydration: at a deferred open (mdk#1161) every engine
+/// record answers `GroupNotHydrated`, which is why `routing_for` filters on the
+/// app-owned disband tombstone instead. Takes the runtime rather than the whole
+/// client so callers can hold a mutable borrow of the projection alongside it.
+pub(crate) fn group_is_terminal(runtime: &AppRuntime, group_id: &GroupId) -> bool {
+    runtime
+        .group_record(group_id)
+        .is_ok_and(|group| group.is_terminal())
+}
+
 fn record_app_performance(
     telemetry: Option<&AppPerformanceTelemetry>,
     operation: AppPerformanceOperation,
@@ -4406,11 +4419,7 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            if self
-                .runtime
-                .group_record(&group_id)
-                .is_ok_and(|group| group.is_terminal())
-            {
+            if group_is_terminal(&self.runtime, &group_id) {
                 if self.routing.replace_group_routes(&group_id, Vec::new()) {
                     refresh.routing_changed = true;
                 }
@@ -4447,10 +4456,21 @@ impl AppClient {
         Ok(refresh)
     }
 
+    /// Rebuild the whole routing table and install it.
+    ///
+    /// The rebuild reseeds every projected group, including ones this device is
+    /// terminal in: `routing_for` can only filter disband tombstones. Prune
+    /// those routes before the table goes live, because every caller hands it
+    /// straight to the adapter (`activate_transport` / `sync_runtime_groups`),
+    /// which would re-subscribe the removed group.
     fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
         self.preserve_local_deleted_group_routes(&routing)?;
-        self.routing.replace(routing.snapshot());
+        let mut snapshot = routing.snapshot();
+        snapshot
+            .group_routes
+            .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
+        self.routing.replace(snapshot);
         Ok(())
     }
 

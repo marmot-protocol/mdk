@@ -210,11 +210,7 @@ impl AppClient {
                 change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
                 ..
             }
-        ) || self
-            .runtime
-            .group_record(group_id)
-            .ok()
-            .is_some_and(|group| group.is_terminal());
+        ) || super::group_is_terminal(&self.runtime, group_id);
         if terminal {
             return Ok(Some(self.routing.replace_group_routes(
                 group_id,
@@ -314,12 +310,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<TransportGroupSubscription>, AppError> {
-        if self
-            .runtime
-            .group_record(group_id)
-            .map_err(AppError::from)
-            .is_ok_and(|group| group.is_terminal())
-        {
+        if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(Vec::new());
         }
         let routing = self.nostr_routing_for_group(group_id)?;

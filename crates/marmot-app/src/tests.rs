@@ -14325,6 +14325,109 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     );
 }
 
+/// A later routing rebuild must not resurrect the removed group's route.
+///
+/// `refresh_group_routes` clears the terminal group's route in place, but every
+/// outbound lifecycle command (key-package publish/rotate, group create, invite,
+/// local delete) rebuilds the whole table from `routing_for`, which filters only
+/// disband tombstones. The removed group is still in `state.groups`, so the
+/// rebuild seeded its subscriptions back and handed them straight to the adapter.
+#[tokio::test]
+async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+
+    let removed_group = alice
+        .create_group("removal target", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let kept_group = alice
+        .create_group("still a member", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let joined = bob_client.sync().await.unwrap().joined_groups;
+    assert!(
+        joined.contains(&removed_group) && joined.contains(&kept_group),
+        "bob must join both groups before the removal commit"
+    );
+
+    alice
+        .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+        .await
+        .expect("the removal commit must fan out to bob's group route")
+        .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        panic!("the test did not overflow its account delivery queue");
+    };
+    bob_client
+        .ingest_received_delivery(*delivery)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bob_client
+        .runtime
+        .group_record(&removed_group)
+        .unwrap()
+        .removed
+    {
+        bob_client
+            .advance_convergence_after_runtime_sync(&removed_group)
+            .await
+            .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "convergence did not adopt the removal commit within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        installed_group_routes(&bob_client, &removed_group),
+        0,
+        "the removal must clear the removed group's route"
+    );
+
+    // Any outbound lifecycle command rebuilds the routing table wholesale. A
+    // key-package rotation is the smallest one bob can run on his own; it
+    // refreshes routing and then activates transport with that table.
+    let subscriptions_before_rebuild = group_subscriptions(&relay, &removed_group);
+    bob_client.rotate_key_package().await.unwrap();
+
+    assert_eq!(
+        installed_group_routes(&bob_client, &removed_group),
+        0,
+        "a routing rebuild must not reinstall the removed group's route"
+    );
+    assert!(
+        installed_group_routes(&bob_client, &kept_group) > 0,
+        "the same rebuild must keep routes for a group this device is still in"
+    );
+    assert_eq!(
+        group_subscriptions(&relay, &removed_group),
+        subscriptions_before_rebuild,
+        "a routing rebuild must not re-subscribe the removed group on the relay"
+    );
+}
+
 /// A device an admin removed must fail a composer send before it projects a row.
 ///
 /// The engine rejects the send at its own terminal gate, but the app records
