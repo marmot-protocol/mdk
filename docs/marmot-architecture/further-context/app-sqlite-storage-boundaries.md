@@ -66,3 +66,25 @@ Directory mirroring/reconciliation, session storage, and the retired app-project
 
 Each store needs an independent schema identity because its release cadence, rollback behavior, and durability
 contract can diverge. A session migration version must never be treated as the version of either cache.
+
+## Upgrade Assurance And Limits
+
+The directory-cache assurance tests use DDL extracted independently from
+`9db9dbc092d52eb7b2d5bc6dcfb1f9beb3125464`, where this cache module entered MDK. The structured DDL is unchanged
+across the eight master-lineage revisions touching the cache through `7368c737`. This is repository-history evidence,
+not a census of deployed app builds or databases.
+
+The encrypted populated-cache test adopts 120,000 rows across all six tables and compares hashes of every typed value
+and rowid before and after opening. Nulls, Unicode, unknown metadata and even invalid cached JSON remain untouched:
+ordinary structured adoption does not deserialize or rewrite those records.
+
+Legacy conversion tests combine existing structured records with 1,000 JSON records. They check every converted record
+and preserve existing rows, force SQLite page-limit exhaustion and retry, and exit a child process without destructors
+after conversion/table removal but before the ledger commit. Both rollback-journal and WAL reopen paths recover the
+original data, leave the migration unrecorded, retry successfully and pass SQLite integrity checks.
+
+These tests do not establish a numerical field failure rate or guarantee zero risk. Page-limit exhaustion exercises
+`SQLITE_FULL`, not every operating-system I/O failure; child-process exit is not a device power-loss test. Production-device
+upgrade testing, representative deployed-cache copies and rollout monitoring remain additional evidence. A refused
+malformed schema preserves the file but can still make directory operations unavailable until repaired; preserving data
+and preserving availability are separate requirements.

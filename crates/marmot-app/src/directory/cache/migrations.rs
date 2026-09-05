@@ -344,3 +344,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 }
+
+#[cfg(test)]
+#[path = "assurance_tests.rs"]
+mod assurance_tests;
