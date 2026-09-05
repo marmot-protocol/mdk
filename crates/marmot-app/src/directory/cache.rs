@@ -31,6 +31,13 @@ pub(crate) const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
 /// Message carried by every storage error this cache raises after a close.
 const CLOSED_DETAIL: &str = "directory cache is closed";
 
+#[cfg(test)]
+thread_local! {
+    // Count successful writes before an injected failure, even if SQLite has
+    // already rolled back the transaction when it returns SQLITE_FULL.
+    static LEGACY_RECORDS_CONVERTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryCache {
     conn: Arc<CloseableConnection>,
@@ -616,6 +623,8 @@ impl DirectoryCache {
         for json in json_entries {
             let entry = serde_json::from_str::<UserDirectoryRecord>(&json)?;
             Self::put_with_reason_locked(conn, &entry, "directory")?;
+            #[cfg(test)]
+            LEGACY_RECORDS_CONVERTED.with(|count| count.set(count.get() + 1));
         }
         conn.execute_batch("DROP TABLE user_directory_records;")?;
         Ok(())

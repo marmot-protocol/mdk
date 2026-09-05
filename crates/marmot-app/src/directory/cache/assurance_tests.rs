@@ -172,10 +172,16 @@ fn legacy_conversion_disk_full_preserves_both_tiers_and_retries() {
     let pages: i64 = conn
         .pragma_query_value(None, "page_count", |r| r.get(0))
         .unwrap();
-    // Permit the ledger to be created but not the duplicated legacy records.
-    conn.pragma_update(None, "max_page_count", pages + 4)
+    // Permit the ledger and some converted records, but not the full conversion.
+    // The progress assertion below guards this premise against allocation changes.
+    conn.pragma_update(None, "max_page_count", pages + 64)
         .unwrap();
+    super::super::LEGACY_RECORDS_CONVERTED.with(|count| count.set(0));
     let error = run_all(&mut conn).unwrap_err();
+    assert!(
+        super::super::LEGACY_RECORDS_CONVERTED.with(|count| count.get()) > 0,
+        "disk exhaustion must occur after at least one legacy record was converted"
+    );
     assert!(
         matches!(error, AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
         if code.code == rusqlite::ErrorCode::DiskFull)

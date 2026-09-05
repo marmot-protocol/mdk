@@ -116,6 +116,10 @@ fn invalid_history() -> AppError {
     StorageError::Backend("invalid directory cache migration history".into()).into()
 }
 
+fn invalid_shape() -> AppError {
+    StorageError::Backend("invalid directory cache schema shape".into()).into()
+}
+
 fn version_1(tx: &Transaction<'_>) -> Result<(), AppError> {
     tx.execute_batch(VERSION_1_SQL)?;
     validate_version_1(tx)?;
@@ -144,7 +148,7 @@ fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
         let actual: (String, String) =
             conn.query_row(object_query, [&name], |row| Ok((row.get(0)?, row.get(1)?)))?;
         if actual != expected {
-            return Err(invalid_history());
+            return Err(invalid_shape());
         }
         if kind == "index" {
             let query = r#"SELECT "unique", partial FROM pragma_index_list(?1) WHERE name = ?2"#;
@@ -154,7 +158,7 @@ fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
                 })
             };
             if flags(conn)? != flags(&reference)? {
-                return Err(invalid_history());
+                return Err(invalid_shape());
             }
         }
         let query = if kind == "table" {
@@ -163,9 +167,7 @@ fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
             "SELECT name, '', 0, NULL, 0 FROM pragma_index_info(?1) ORDER BY seqno"
         };
         if shape(conn, query, &name)? != shape(&reference, query, &name)? {
-            return Err(
-                StorageError::Backend("invalid directory cache schema shape".into()).into(),
-            );
+            return Err(invalid_shape());
         }
     }
     Ok(())
@@ -249,7 +251,11 @@ mod tests {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(VERSION_1_SQL).unwrap();
             conn.execute_batch(mutation).unwrap();
-            assert!(run_all(&mut conn).is_err(), "{mutation}");
+            assert_eq!(
+                run_all(&mut conn).unwrap_err().to_string(),
+                "backend failure: invalid directory cache schema shape",
+                "{mutation}"
+            );
             assert!(!DirectoryCache::table_exists_locked(&conn, "app_cache_schema_migrations").unwrap());
         }
     }
