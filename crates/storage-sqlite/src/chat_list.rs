@@ -15,7 +15,7 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
-use cgka_traits::storage::StorageResult;
+use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -740,24 +740,60 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
+        self.save_account_projection_delta_and_refresh_chat_list_row_acking_application_events_and_visibility_batches(
+            state,
+            max_seen_events,
+            max_future_skew_secs,
+            frontiers_to_clear,
+            application_event_ids_to_ack,
+            &[],
+            local_account_id_hex,
+            group_id_hex,
+            mention_classifier,
+        )
+    }
+
+    /// Persist an exact account-projection delta, acknowledge both engine
+    /// application events and lower account-visibility batches, and materialize
+    /// one chat-list row in the same SQLCipher transaction.
+    ///
+    /// This is the visibility-aware created-group boundary. A failed row refresh
+    /// rolls back the projection, frontier clears, and both outbox transfers;
+    /// success returns the row committed with all of them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_account_projection_delta_and_refresh_chat_list_row_acking_application_events_and_visibility_batches(
+        &self,
+        state: &StoredAccountState,
+        max_seen_events: usize,
+        max_future_skew_secs: u64,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[cgka_traits::MessageId],
+        visibility_batch_ids_to_ack: &[Vec<u8>],
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<Option<ChatListRow>> {
         self.connection.with_transaction(|| {
             // `with_transaction` is intentionally nestable on the owning
             // thread, so the projection helper participates in this outer
             // transaction and cannot commit before the chat-list row exists.
-            self.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            self.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events_and_visibility_batches(
                 state,
                 max_seen_events,
                 max_future_skew_secs,
                 frontiers_to_clear,
                 application_event_ids_to_ack,
+                visibility_batch_ids_to_ack,
             )?;
             let conn = self.lock()?;
-            refresh_chat_list_row_tx(
+            let row = refresh_chat_list_row_tx(
                 &conn,
                 local_account_id_hex,
                 group_id_hex,
                 mention_classifier,
-            )
+            )?
+            .ok_or(StorageError::NotFound)?;
+            Ok(Some(row))
         })
     }
 

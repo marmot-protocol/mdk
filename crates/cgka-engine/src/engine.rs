@@ -2276,6 +2276,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
                 requested_at_ms: self.convergence_now_ms(),
                 last_proposed_epoch: Some(group.epoch),
+                last_proposed_message_id: None,
             };
             self.storage.put_leave_request(&request)?;
             return Ok(Some(request));

@@ -9,9 +9,13 @@
 //! Mode application is Unix-only; on other platforms the helpers still create
 //! the artifacts and the mode calls are no-ops.
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ATOMIC_PRIVATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Owner-only mode for files holding private data.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -779,6 +783,110 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Atomically replace `path` with owner-only `bytes`.
+///
+/// The complete new value is written and synced through a private sibling
+/// inode before rename, then the parent directory is synced where supported.
+/// A process or power failure on Unix therefore leaves either the previous
+/// value or the complete new value, never a truncate-before-write fragment.
+/// The parent directory must already exist; this helper never creates or
+/// changes its permissions.
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic private write target must name a file",
+        )
+    })?;
+
+    let mut allocated = None;
+    for _ in 0..32 {
+        let attempt = ATOMIC_PRIVATE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Keep the sibling component short. Embedding `file_name` would overflow
+        // NAME_MAX when the target is already at the filesystem limit.
+        let temp_name = OsString::from(format!(".atomic.tmp.{}.{}", std::process::id(), attempt));
+        let temp_path = parent.join(temp_name);
+        match create_new_private(&temp_path) {
+            Ok(file) => {
+                allocated = Some((file, temp_path));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (mut file, temp_path) = allocated.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate unique atomic private write temp file",
+        )
+    })?;
+
+    let result = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_private_file(&temp_path, path)?;
+        sync_private_parent(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_private_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_path = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            temp_path.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_private_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+    std::fs::rename(temp_path, path)
+}
+
+#[cfg(unix)]
+fn sync_private_parent(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_private_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Open `path` for appending, creating it 0600; tightens a pre-existing file
 /// to 0600.
 pub fn open_private_append(path: &Path) -> io::Result<std::fs::File> {
@@ -1071,6 +1179,65 @@ mod tests {
             assert!(parse_octal_mode(input).is_err(), "input {input:?}");
         }
     }
+
+    #[test]
+    fn write_private_atomic_replaces_complete_value_without_temp_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frontier.json");
+        write_private_atomic(&path, b"old").unwrap();
+        write_private_atomic(&path, b"complete replacement").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete replacement");
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![path.file_name().unwrap()]);
+    }
+
+    #[test]
+    fn write_private_atomic_removes_temp_after_failed_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("occupied");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(write_private_atomic(&path, b"replacement").is_err());
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![path.file_name().unwrap()]);
+    }
+
+    #[test]
+    fn write_private_atomic_requires_an_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("missing");
+        let error = write_private_atomic(&missing_parent.join("frontier.json"), b"value")
+            .expect_err("atomic writes must not create their parent");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn write_private_atomic_replaces_maximum_length_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        // POSIX NAME_MAX is 255. Do not query libc::NAME_MAX; it is not
+        // portable across the libc crate's Unix cfgs.
+        let name = "a".repeat(255);
+        let path = dir.path().join(&name);
+
+        write_private_atomic(&path, b"old").unwrap();
+        write_private_atomic(&path, b"complete replacement").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete replacement");
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![path.file_name().unwrap()]);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1089,6 +1256,61 @@ mod unix_tests {
         write_private(&path, b"secret").unwrap();
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn write_private_atomic_replacement_remains_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frontier.json");
+        write_private_atomic(&path, b"old").unwrap();
+        write_private_atomic(&path, b"new").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn write_private_atomic_preserves_existing_parent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("externally-managed");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = parent.join("frontier.json");
+        write_private_atomic(&path, b"value").unwrap();
+
+        assert_eq!(mode_of(&parent), 0o755);
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn write_private_atomic_bare_relative_filename_child_process() {
+        let Some(directory) = std::env::var_os("FS_PRIVATE_ATOMIC_RELATIVE_CHILD_DIR") else {
+            return;
+        };
+        std::env::set_current_dir(&directory).unwrap();
+
+        write_private_atomic(Path::new("frontier.json"), b"value").unwrap();
+
+        assert_eq!(mode_of(Path::new(".")), 0o755);
+        assert_eq!(mode_of(Path::new("frontier.json")), 0o600);
+    }
+
+    #[test]
+    fn write_private_atomic_bare_relative_filename_preserves_current_directory_mode() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("unix_tests::write_private_atomic_bare_relative_filename_child_process")
+            .arg("--nocapture")
+            .env("FS_PRIVATE_ATOMIC_RELATIVE_CHILD_DIR", dir.path())
+            .status()
+            .expect("run bare-relative atomic-write child test");
+
+        assert!(status.success(), "atomic-write child process failed");
+        assert_eq!(mode_of(dir.path()), 0o755);
+        assert_eq!(mode_of(&dir.path().join("frontier.json")), 0o600);
     }
 
     #[test]

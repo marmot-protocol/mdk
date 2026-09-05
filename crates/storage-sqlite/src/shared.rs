@@ -258,6 +258,33 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         Ok(Some(record))
     }
 
+    /// Remove one exact cached KeyPackage projection without disturbing the
+    /// identity's public profile, relay lists, follow edges, or their generic
+    /// event provenance.
+    ///
+    /// `expected_key_package_json` makes this a compare-and-swap: a sibling
+    /// device may publish under a different NIP-33 `d` slot while a removed
+    /// local slot is being scrubbed, and that newer projection must survive.
+    pub fn clear_public_directory_key_package_if_matches(
+        &self,
+        account_id_hex: &str,
+        expected_key_package_json: &str,
+    ) -> StorageResult<bool> {
+        retry_on_busy(|| {
+            let conn = self.lock()?;
+            let changed = conn
+                .execute(
+                    "UPDATE directory_users
+                     SET key_package_json = NULL
+                     WHERE account_id_hex = ?1
+                       AND key_package_json = ?2",
+                    params![account_id_hex, expected_key_package_json],
+                )
+                .storage()?;
+            Ok(changed != 0)
+        })
+    }
+
     pub fn public_directory_users(&self) -> StorageResult<Vec<PublicDirectoryUserRecord>> {
         self.public_directory_users_capped(PUBLIC_DIRECTORY_USERS_MAX)
     }
@@ -621,6 +648,64 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn conditional_key_package_clear_preserves_public_identity_projection() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let record = PublicDirectoryUserRecord {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1example".to_owned(),
+            profile_json: Some(r#"{"name":"Alice"}"#.to_owned()),
+            relay_lists_json: r#"{"nip65":["wss://relay.example"]}"#.to_owned(),
+            key_package_json: Some(r#"{"key_package_id":"removed-slot"}"#.to_owned()),
+            event_id_hex: Some("bb".repeat(32)),
+            // These columns describe the combined public-directory projection,
+            // not exclusively its KeyPackage. Use profile-like provenance so
+            // this regression catches a scrub that damages profile ordering.
+            event_kind: Some(0),
+            event_created_at: Some(1_700_000_000),
+            follows: vec!["cc".repeat(32)],
+        };
+        storage.put_public_directory_user(&record).unwrap();
+
+        assert!(
+            !storage
+                .clear_public_directory_key_package_if_matches(
+                    &record.account_id_hex,
+                    r#"{"key_package_id":"sibling-slot"}"#,
+                )
+                .unwrap(),
+            "a changed sibling-device projection must win the CAS"
+        );
+        assert_eq!(
+            storage
+                .public_directory_user(&record.account_id_hex)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+
+        assert!(
+            storage
+                .clear_public_directory_key_package_if_matches(
+                    &record.account_id_hex,
+                    record.key_package_json.as_deref().unwrap(),
+                )
+                .unwrap()
+        );
+        let scrubbed = storage
+            .public_directory_user(&record.account_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scrubbed.npub, record.npub);
+        assert_eq!(scrubbed.profile_json, record.profile_json);
+        assert_eq!(scrubbed.relay_lists_json, record.relay_lists_json);
+        assert_eq!(scrubbed.follows, record.follows);
+        assert!(scrubbed.key_package_json.is_none());
+        assert_eq!(scrubbed.event_id_hex, record.event_id_hex);
+        assert_eq!(scrubbed.event_kind, record.event_kind);
+        assert_eq!(scrubbed.event_created_at, record.event_created_at);
     }
 
     #[test]

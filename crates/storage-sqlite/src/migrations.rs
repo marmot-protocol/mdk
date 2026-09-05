@@ -116,6 +116,12 @@ mod migration_0057_openmls_values_msgpack;
 mod migration_0058_processed_transport_ids;
 #[path = "migrations/0059_chat_list_unread_membership.rs"]
 mod migration_0059_chat_list_unread_membership;
+#[path = "migrations/0060_key_package_lifecycle_privacy_journal.rs"]
+mod migration_0060_key_package_lifecycle_privacy_journal;
+#[path = "migrations/0061_epoch_backfill_intent_journal.rs"]
+mod migration_0061_epoch_backfill_intent_journal;
+#[path = "migrations/0062_account_visibility_journal.rs"]
+mod migration_0062_account_visibility_journal;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -426,6 +432,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "0059_chat_list_unread_membership",
         apply: migration_0059_chat_list_unread_membership::apply,
     },
+    Migration {
+        version: 60,
+        name: "0060_key_package_lifecycle_privacy_journal",
+        apply: migration_0060_key_package_lifecycle_privacy_journal::apply,
+    },
+    Migration {
+        version: 61,
+        name: "0061_epoch_backfill_intent_journal",
+        apply: migration_0061_epoch_backfill_intent_journal::apply,
+    },
+    Migration {
+        version: 62,
+        name: "0062_account_visibility_journal",
+        apply: migration_0062_account_visibility_journal::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -632,8 +653,9 @@ mod tests {
         SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, epoch_to_i64, message_state_to_i64,
         open_hardened_sqlcipher, serialize,
     };
+    use cgka_traits::maintenance::KeyPackageLifecycleState;
     use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage, MessageStorage};
     use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
     use std::io::{Read, Write};
     use std::path::Path;
@@ -649,6 +671,10 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
+    const KEY_PACKAGE_PRIVACY_JOURNAL_TRIGGERS: [&str; 2] = [
+        "cgka_key_package_lifecycle_privacy_journal_insert",
+        "cgka_key_package_lifecycle_privacy_journal_update",
+    ];
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
@@ -718,6 +744,58 @@ mod tests {
             .collect();
         drop(connection);
         messages
+    }
+
+    fn schema_51_key_package_lifecycle_record() -> Vec<u8> {
+        let mut record =
+            serde_json::to_value(KeyPackageLifecycleState::slot_only("slot".into())).unwrap();
+        let fields = record.as_object_mut().unwrap();
+        fields.remove("cutover_publication_blocked");
+        fields.remove("deleted_live_revision_event_ids");
+        fields.remove("deletion_overflow_owner_event_id");
+        fields.remove("retired_publications_pending_deletion");
+        fields.remove("consumed_key_package_refs");
+        serde_json::to_vec(&record).unwrap()
+    }
+
+    fn seed_file_backed_schema_51_key_package_lifecycle(path: &Path) -> Vec<u8> {
+        let mut connection = keyed_connection(path);
+        run(&mut connection, &MIGRATIONS[..51]).unwrap();
+        let record = schema_51_key_package_lifecycle_record();
+        connection
+            .execute(
+                "INSERT INTO cgka_key_package_lifecycle (singleton, record) VALUES (1, ?1)",
+                params![record.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        record
+    }
+
+    fn key_package_privacy_journal_triggers(connection: &rusqlite::Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT name
+                   FROM sqlite_schema
+                  WHERE type = 'trigger'
+                    AND name IN (?1, ?2)
+                  ORDER BY name",
+            )
+            .unwrap();
+        statement
+            .query_map(
+                params![
+                    KEY_PACKAGE_PRIVACY_JOURNAL_TRIGGERS[0],
+                    KEY_PACKAGE_PRIVACY_JOURNAL_TRIGGERS[1]
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     fn benchmark_message_id(index: usize) -> cgka_traits::MessageId {
@@ -930,6 +1008,36 @@ mod tests {
     }
 
     #[test]
+    fn key_package_privacy_journal_migration_refuses_schema_51_writer() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut connection, &MIGRATIONS[..60]).unwrap();
+        let privacy_journal = br#"{"stable_slot_id":"slot","cutover_publication_blocked":true,"deleted_live_revision_event_ids":[[1,2,3]],"deletion_overflow_owner_event_id":[4,5,6],"retired_publications_pending_deletion":[{"event_id":[4,5,6]}],"consumed_key_package_refs":[[7,8,9]]}"#;
+        connection
+            .execute(
+                "INSERT INTO cgka_key_package_lifecycle (singleton, record) VALUES (1, ?1)",
+                params![privacy_journal.as_slice()],
+            )
+            .unwrap();
+
+        let error = run(&mut connection, &MIGRATIONS[..59]).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::UnsupportedSchemaVersion {
+                found: 60,
+                latest_supported: 59,
+            }
+        ));
+        let retained: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_key_package_lifecycle WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, privacy_journal);
+    }
+
+    #[test]
     fn file_backed_v1_database_upgrades_once_and_refuses_downgrade() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("v1-upgrade.sqlite3");
@@ -950,13 +1058,19 @@ mod tests {
             .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
             .unwrap();
         let error = run(&mut older_connection, &MIGRATIONS[..46]).unwrap_err();
-        assert!(matches!(
-            error,
+        match error {
             StorageError::UnsupportedSchemaVersion {
-                found: 59,
+                found,
                 latest_supported: 46,
-            }
-        ));
+            } => assert_eq!(
+                found,
+                MIGRATIONS
+                    .last()
+                    .expect("migration registry is nonempty")
+                    .version
+            ),
+            other => panic!("expected downgrade refusal, got {other:?}"),
+        }
         let after: i64 = older_connection
             .query_row("SELECT count(*) FROM cgka_messages", [], |row| row.get(0))
             .unwrap();
@@ -1006,13 +1120,19 @@ mod tests {
             connection
         };
         let error = run(&mut older_connection, &MIGRATIONS[..46]).unwrap_err();
-        assert!(matches!(
-            error,
+        match error {
             StorageError::UnsupportedSchemaVersion {
-                found: 59,
+                found,
                 latest_supported: 46,
-            }
-        ));
+            } => assert_eq!(
+                found,
+                MIGRATIONS
+                    .last()
+                    .expect("migration registry is nonempty")
+                    .version
+            ),
+            other => panic!("expected downgrade refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1166,6 +1286,114 @@ mod tests {
     }
 
     #[test]
+    fn process_kill_mid_key_package_privacy_migration_retries_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory
+            .path()
+            .join("key-package-privacy-migration-kill.sqlite3");
+        let schema_51_record = seed_file_backed_schema_51_key_package_lifecycle(&database);
+
+        kill_child_at(
+            "migrations::tests::storage_format_migration_crash_child",
+            "migration",
+            "MDK_STORAGE_TEST_MIGRATION_CRASH_VERSION",
+            "60",
+            &database,
+            "migration-60",
+        );
+
+        let connection = keyed_connection(&database);
+        assert_eq!(applied_name(&connection, 60).unwrap(), None);
+        let rolled_back_record: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_key_package_lifecycle WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rolled_back_record, schema_51_record);
+        let rolled_back_json: serde_json::Value =
+            serde_json::from_slice(&rolled_back_record).unwrap();
+        for field in [
+            "cutover_publication_blocked",
+            "deleted_live_revision_event_ids",
+            "deletion_overflow_owner_event_id",
+            "retired_publications_pending_deletion",
+            "consumed_key_package_refs",
+        ] {
+            assert!(
+                rolled_back_json.get(field).is_none(),
+                "killed migration must roll back the {field} backfill"
+            );
+        }
+        assert!(key_package_privacy_journal_triggers(&connection).is_empty());
+        drop(connection);
+
+        let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let lifecycle = store.key_package_lifecycle().unwrap().unwrap();
+        assert!(
+            lifecycle.cutover_publication_blocked,
+            "an upgraded schema-51 lifecycle must remain fail-closed until relay cutover completes"
+        );
+        assert!(lifecycle.deleted_live_revision_event_ids.is_empty());
+        assert!(lifecycle.deletion_overflow_owner_event_id.is_none());
+        assert!(lifecycle.retired_publications_pending_deletion.is_empty());
+        assert!(lifecycle.consumed_key_package_refs.is_empty());
+
+        let connection = store.lock().unwrap();
+        assert_eq!(
+            applied_name(&connection, 60).unwrap().as_deref(),
+            Some("0060_key_package_lifecycle_privacy_journal")
+        );
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM cgka_schema_migrations WHERE version = 60",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+        assert_eq!(
+            key_package_privacy_journal_triggers(&connection),
+            KEY_PACKAGE_PRIVACY_JOURNAL_TRIGGERS.map(str::to_owned)
+        );
+        let storage_type: String = connection
+            .query_row(
+                "SELECT typeof(record) FROM cgka_key_package_lifecycle WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(storage_type, "blob");
+        let upgraded_record: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM cgka_key_package_lifecycle WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let upgraded_json: serde_json::Value = serde_json::from_slice(&upgraded_record).unwrap();
+        assert_eq!(
+            upgraded_json.get("cutover_publication_blocked"),
+            Some(&serde_json::json!(true))
+        );
+        for field in [
+            "deleted_live_revision_event_ids",
+            "deletion_overflow_owner_event_id",
+            "retired_publications_pending_deletion",
+            "consumed_key_package_refs",
+        ] {
+            let expected = if field == "deletion_overflow_owner_event_id" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!([])
+            };
+            assert_eq!(upgraded_json.get(field), Some(&expected));
+        }
+    }
+
+    #[test]
     fn process_kill_mid_promotion_rolls_back_and_retry_converges() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("promotion-kill.sqlite3");
@@ -1310,13 +1538,19 @@ mod tests {
         run(&mut connection, MIGRATIONS).unwrap();
 
         let error = run(&mut connection, &MIGRATIONS[..46]).unwrap_err();
-        assert!(matches!(
-            error,
+        match error {
             StorageError::UnsupportedSchemaVersion {
-                found: 59,
+                found,
                 latest_supported: 46,
-            }
-        ));
+            } => assert_eq!(
+                found,
+                MIGRATIONS
+                    .last()
+                    .expect("migration registry is nonempty")
+                    .version
+            ),
+            other => panic!("expected downgrade refusal, got {other:?}"),
+        }
         assert_eq!(
             applied_migrations_from_connection(&connection),
             expected_migrations(),
