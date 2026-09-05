@@ -201,6 +201,13 @@ int main(int argc, char **argv) {
     check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
           "chat_notification_settings on unknown account -> UNKNOWN_ACCOUNT");
 
+    MarmotDirectPeerPresentation *presentation = NULL;
+    st = marmot_chat_list_direct_peer_presentation(
+        client, "no-such-account", "aabb", &presentation);
+    check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT && presentation == NULL,
+          "direct-peer presentation on unknown account -> UNKNOWN_ACCOUNT");
+    marmot_direct_peer_presentation_free(presentation);
+
     uint64_t accepted = 0;
     st = marmot_rotate_key_package(client, "no-such-account", &accepted);
     check(st == MARMOT_STATUS_UNKNOWN_ACCOUNT,
