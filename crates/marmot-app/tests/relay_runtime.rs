@@ -7599,8 +7599,16 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .create_group("retired media epoch", &["bob"])
         .await
         .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
-    alice.update_message_retention(&group_id, 2).await.unwrap();
+    // Keep automatic wall-clock pruning out of this regression: relay sync
+    // may take longer than a short retention window, including for the later
+    // message that must remain retained across the commit.
+    let retention_seconds = 24 * 60 * 60;
+    alice
+        .update_message_retention(&group_id, retention_seconds)
+        .await
+        .unwrap();
     bob.sync().await.unwrap();
 
     let expired = alice
@@ -7625,11 +7633,32 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
     let expired_source_epoch = expired_reference.source_epoch;
     bob.sync().await.unwrap();
 
-    sleep(Duration::from_secs(3)).await;
-    let pruned = bob
-        .secure_delete_expired_plaintext_for_group(&group_id)
+    let expired_message_id = &expired.sent.as_ref().unwrap().message_ids[0];
+    let expired_message = app
+        .messages("bob")
+        .unwrap()
+        .into_iter()
+        .find(|message| &message.message_id_hex == expired_message_id)
+        .expect("the first media message must be retained before the explicit sweep");
+    let retention = expired_message.retention.unwrap();
+    assert_eq!(retention.retention_seconds, retention_seconds);
+    app.mark_timeline_message_read("bob", &group_id_hex, expired_message_id)
         .unwrap();
+    // Drive the existing sweep from the durable authenticated expiry, past
+    // its five-second clock-skew guard, without advancing the real clock.
+    let prune_at_ms = (retention.expires_at.unwrap() + 6) * 1_000;
+    let report = bob.sweep_expired_retention(prune_at_ms).unwrap();
+    assert_eq!(report.groups.len(), 1);
+    let pruned = &report.groups[0];
+    assert_eq!(pruned.group_id_hex, group_id_hex);
+    assert_eq!(pruned.status, RetentionSweepStatus::Pruned);
     assert!(pruned.pruned_messages > 0);
+    assert!(pruned.secrets_deleted > 0);
+    assert!(
+        pruned
+            .media_ciphertext_sha256
+            .contains(&expired_reference.ciphertext_sha256)
+    );
     assert!(
         bob.download_media(&group_id, expired_reference.clone())
             .await
