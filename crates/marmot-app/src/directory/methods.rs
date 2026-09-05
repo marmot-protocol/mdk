@@ -1119,11 +1119,30 @@ impl MarmotApp {
         account_id_hex: &str,
         profile: &UserProfileMetadata,
     ) -> Result<(), AppError> {
+        self.remember_directory_profile_with_updates(account_id_hex, profile)?;
+        Ok(())
+    }
+
+    pub(crate) fn remember_directory_profile_with_updates(
+        &self,
+        account_id_hex: &str,
+        profile: &UserProfileMetadata,
+    ) -> Result<Vec<crate::DirectPeerPresentationUpdate>, AppError> {
         let mut entry = self
             .directory_entry_for_account_id(account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
         entry.profile = Some(profile.clone());
-        self.save_directory_entry(&entry)
+        self.save_directory_entry(&entry)?;
+        let accepted_profile = self
+            .directory_entry_for_account_id(account_id_hex)?
+            .and_then(|entry| entry.profile)
+            .ok_or_else(|| AppError::MissingDirectoryEntry(account_id_hex.to_owned()))?;
+        let updates =
+            self.project_direct_peer_profile_for_accounts(account_id_hex, &accepted_profile)?;
+        for update in &updates {
+            let _ = self.direct_peer_presentation_events.send(update.clone());
+        }
+        Ok(updates)
     }
 
     pub(crate) fn remember_directory_profile_if_newer(
@@ -1131,6 +1150,15 @@ impl MarmotApp {
         account_id_hex: &str,
         profile: &UserProfileMetadata,
     ) -> Result<(), AppError> {
+        self.remember_directory_profile_if_newer_with_updates(account_id_hex, profile)?;
+        Ok(())
+    }
+
+    pub(crate) fn remember_directory_profile_if_newer_with_updates(
+        &self,
+        account_id_hex: &str,
+        profile: &UserProfileMetadata,
+    ) -> Result<Vec<crate::DirectPeerPresentationUpdate>, AppError> {
         // Retain the cached profile when it is at least as recent as the
         // fetched copy. Nostr `created_at` is second-resolution, so a rapid
         // profile republish can carry the same timestamp as the previous
@@ -1146,9 +1174,9 @@ impl MarmotApp {
                 .as_ref()
                 .is_some_and(|cached| cached.created_at >= profile.created_at)
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        self.remember_directory_profile(account_id_hex, profile)
+        self.remember_directory_profile_with_updates(account_id_hex, profile)
     }
 
     fn remember_directory_relay_list_event(

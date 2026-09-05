@@ -8934,6 +8934,409 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 }
 
 #[test]
+fn direct_peer_presentation_is_local_on_the_first_frame_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let peer_account_id_hex = "bb".repeat(32);
+    let group_id_hex = "11".repeat(32);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    app.account_storage("alice")
+        .unwrap()
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![storage_sqlite::StoredAccountGroup {
+                    group_id_hex: group_id_hex.clone(),
+                    endpoint: "wss://relay.example".to_owned(),
+                    profile_name: String::new(),
+                    profile_description: String::new(),
+                    image_hash_hex: String::new(),
+                    image_key_hex: String::new(),
+                    image_nonce_hex: String::new(),
+                    image_upload_key_hex: String::new(),
+                    image_media_type: None,
+                    admin_keys_hex: String::new(),
+                    archived: false,
+                    pending_confirmation: false,
+                    member_count: Some(2),
+                    direct_member_ids_hex: Some(vec![
+                        alice.account_id_hex.clone(),
+                        peer_account_id_hex.clone(),
+                    ]),
+                    welcomer_account_id_hex: None,
+                    via_welcome_message_id_hex: None,
+                    nostr_routing_last_epoch: 0,
+                    prior_nostr_routes: Vec::new(),
+                    self_membership: storage_sqlite::SelfMembership::Member,
+                    components: Vec::new(),
+                }],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    app.remember_directory_profile(
+        &peer_account_id_hex,
+        &UserProfileMetadata {
+            display_name: Some("Remote Otter".to_owned()),
+            picture: Some("https://cdn.example.com/remote.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+
+    let first = app.chat_list("alice", false).unwrap().remove(0);
+    assert_eq!(first.activity_sort_at, first.conversation_created_at);
+    assert_eq!(
+        first.direct_peer_presentation,
+        Some(storage_sqlite::DirectPeerPresentation {
+            schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(peer_account_id_hex.clone()),
+            display_name: Some("Remote Otter".to_owned()),
+            avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+            profile_created_at: Some(42),
+            state: storage_sqlite::DirectPeerPresentationState::Current,
+        })
+    );
+    app.remember_directory_profile_if_newer(
+        &peer_account_id_hex,
+        &UserProfileMetadata {
+            display_name: Some(" \u{0000}Renamed Otter ".to_owned()),
+            picture: Some(" https://cdn.example.com/\u{0007}renamed.png ".to_owned()),
+            created_at: 43,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+    let refreshed = app
+        .account_storage("alice")
+        .unwrap()
+        .chat_list_row(&group_id_hex)
+        .unwrap()
+        .expect("profile refresh projects the direct row immediately");
+    assert_eq!(refreshed.activity_sort_at, first.activity_sort_at);
+    assert_eq!(
+        refreshed
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.display_name.as_deref()),
+        Some("Renamed Otter")
+    );
+    assert_eq!(
+        refreshed
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.avatar_url.as_deref()),
+        Some("https://cdn.example.com/renamed.png")
+    );
+    let mut quarantined = NostrTransportEvent::new_unsigned(
+        peer_account_id_hex.clone(),
+        KIND_NOSTR_METADATA,
+        Vec::new(),
+        "{malformed-profile".to_owned(),
+    );
+    quarantined.created_at = 44;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://source.example".to_owned())],
+        event: quarantined,
+    })
+    .unwrap();
+    let after_quarantine = app
+        .account_storage("alice")
+        .unwrap()
+        .chat_list_row(&group_id_hex)
+        .unwrap()
+        .expect("quarantined profile retains accepted presentation");
+    assert_eq!(
+        after_quarantine.direct_peer_presentation,
+        refreshed.direct_peer_presentation
+    );
+    assert_eq!(
+        after_quarantine.activity_sort_at,
+        refreshed.activity_sort_at
+    );
+    drop(app);
+
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let first_after_restart = reopened.chat_list("alice", false).unwrap().remove(0);
+    assert_eq!(
+        first_after_restart.direct_peer_presentation,
+        refreshed.direct_peer_presentation
+    );
+    assert_eq!(first_after_restart.activity_sort_at, first.activity_sort_at);
+}
+
+#[test]
+fn direct_peer_hydration_is_best_effort_and_does_not_use_local_label_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let group_id_hex = "11".repeat(32);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    app.account_storage(&alice.label)
+        .unwrap()
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: alice.label.clone(),
+                groups: vec![storage_sqlite::StoredAccountGroup {
+                    group_id_hex: group_id_hex.clone(),
+                    endpoint: "wss://relay.example".to_owned(),
+                    profile_name: String::new(),
+                    profile_description: String::new(),
+                    image_hash_hex: String::new(),
+                    image_key_hex: String::new(),
+                    image_nonce_hex: String::new(),
+                    image_upload_key_hex: String::new(),
+                    image_media_type: None,
+                    admin_keys_hex: String::new(),
+                    archived: false,
+                    pending_confirmation: false,
+                    member_count: Some(2),
+                    direct_member_ids_hex: Some(vec![
+                        alice.account_id_hex.clone(),
+                        bob.account_id_hex.clone(),
+                    ]),
+                    welcomer_account_id_hex: None,
+                    via_welcome_message_id_hex: None,
+                    nostr_routing_last_epoch: 0,
+                    prior_nostr_routes: Vec::new(),
+                    self_membership: storage_sqlite::SelfMembership::Member,
+                    components: Vec::new(),
+                }],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    app.remember_directory_profile(
+        &bob.account_id_hex,
+        &UserProfileMetadata {
+            picture: Some("https://cdn.example.com/bob.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+
+    let first = app.chat_list(&alice.label, false).unwrap().remove(0);
+    assert_eq!(
+        first
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.display_name.as_deref()),
+        None,
+        "a local account label must not become remotely sourced peer presentation"
+    );
+
+    let alice_cache = app.directory_cache_for_account(&alice).unwrap();
+    let bob_cache = app.directory_cache_for_account(&bob).unwrap();
+    alice_cache.close().unwrap();
+    bob_cache.close().unwrap();
+
+    let after_directory_failure = app
+        .chat_list(&alice.label, false)
+        .expect("derived directory hydration failure must not hide a readable chat row")
+        .remove(0);
+    assert_eq!(
+        after_directory_failure.direct_peer_presentation,
+        first.direct_peer_presentation
+    );
+}
+
+#[test]
+fn direct_peer_hydration_rechecks_presentation_after_a_roster_race() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let former_peer = "bb".repeat(32);
+    let replacement_peer = "cc".repeat(32);
+    let group_id_hex = "11".repeat(32);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let direct_group = |peer: String| storage_sqlite::StoredAccountGroup {
+        group_id_hex: group_id_hex.clone(),
+        endpoint: "wss://relay.example".to_owned(),
+        profile_name: String::new(),
+        profile_description: String::new(),
+        image_hash_hex: String::new(),
+        image_key_hex: String::new(),
+        image_nonce_hex: String::new(),
+        image_upload_key_hex: String::new(),
+        image_media_type: None,
+        admin_keys_hex: String::new(),
+        archived: false,
+        pending_confirmation: false,
+        member_count: Some(2),
+        direct_member_ids_hex: Some(vec![alice.account_id_hex.clone(), peer]),
+        welcomer_account_id_hex: None,
+        via_welcome_message_id_hex: None,
+        nostr_routing_last_epoch: 0,
+        prior_nostr_routes: Vec::new(),
+        self_membership: storage_sqlite::SelfMembership::Member,
+        components: Vec::new(),
+    };
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(former_peer.clone())],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    app.remember_directory_profile(
+        &former_peer,
+        &UserProfileMetadata {
+            display_name: Some("Former Peer".to_owned()),
+            picture: Some("https://private.example/former.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+    let mut stale_row = app.chat_list("alice", false).unwrap().remove(0);
+    let mut stale_row_when_storage_is_unavailable = stale_row.clone();
+    assert_eq!(
+        stale_row
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.display_name.as_deref()),
+        Some("Former Peer")
+    );
+
+    // This models the interleaving where chat_list read the former row, then a
+    // projection worker committed a new roster before hydration completed.
+    storage
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct_group(replacement_peer)],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    app.hydrate_direct_peer_presentations(&alice, std::slice::from_mut(&mut stale_row))
+        .unwrap();
+
+    assert_eq!(
+        stale_row.direct_peer_presentation,
+        Some(storage_sqlite::DirectPeerPresentation {
+            schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: None,
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: storage_sqlite::DirectPeerPresentationState::Invalidated,
+        })
+    );
+
+    // If storage closes in the same window, hydration cannot perform its
+    // roster-safe re-read. The chat row remains usable, but the presentation
+    // must fail closed instead of returning the former peer's values.
+    app.close_storage().unwrap();
+    app.hydrate_direct_peer_presentations(
+        &alice,
+        std::slice::from_mut(&mut stale_row_when_storage_is_unavailable),
+    )
+    .unwrap();
+    assert!(
+        stale_row_when_storage_is_unavailable
+            .direct_peer_presentation
+            .is_none()
+    );
+}
+
+#[test]
+fn direct_peer_profile_projection_continues_past_an_unavailable_account_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let zed = home.create_account("zed").unwrap();
+    let peer = "bb".repeat(32);
+    let alice_group = "11".repeat(32);
+    let zed_group = "22".repeat(32);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let direct_group =
+        |group_id_hex: String, local_account_id_hex: String| storage_sqlite::StoredAccountGroup {
+            group_id_hex,
+            endpoint: "wss://relay.example".to_owned(),
+            profile_name: String::new(),
+            profile_description: String::new(),
+            image_hash_hex: String::new(),
+            image_key_hex: String::new(),
+            image_nonce_hex: String::new(),
+            image_upload_key_hex: String::new(),
+            image_media_type: None,
+            admin_keys_hex: String::new(),
+            archived: false,
+            pending_confirmation: false,
+            member_count: Some(2),
+            direct_member_ids_hex: Some(vec![local_account_id_hex, peer.clone()]),
+            welcomer_account_id_hex: None,
+            via_welcome_message_id_hex: None,
+            nostr_routing_last_epoch: 0,
+            prior_nostr_routes: Vec::new(),
+            self_membership: storage_sqlite::SelfMembership::Member,
+            components: Vec::new(),
+        };
+    for (account, group_id_hex) in [(&alice, &alice_group), (&zed, &zed_group)] {
+        app.account_storage(&account.label)
+            .unwrap()
+            .save_account_projection_state(
+                &storage_sqlite::StoredAccountState {
+                    label: account.label.clone(),
+                    groups: vec![direct_group(
+                        group_id_hex.clone(),
+                        account.account_id_hex.clone(),
+                    )],
+                    ..storage_sqlite::StoredAccountState::default()
+                },
+                16,
+                300,
+            )
+            .unwrap();
+        app.chat_list(&account.label, false).unwrap();
+    }
+    app.account_storage(&zed.label).unwrap().close().unwrap();
+
+    let updates = app
+        .remember_directory_profile_with_updates(
+            &peer,
+            &UserProfileMetadata {
+                display_name: Some("Available Peer".to_owned()),
+                created_at: 42,
+                ..UserProfileMetadata::default()
+            },
+        )
+        .expect("a derived projection failure must not reject the accepted directory profile");
+
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].account_id_hex, alice.account_id_hex);
+    assert_eq!(updates[0].group_id_hex, alice_group);
+    assert_eq!(
+        app.account_storage(&alice.label)
+            .unwrap()
+            .chat_list_row(&updates[0].group_id_hex)
+            .unwrap()
+            .expect("available account row")
+            .direct_peer_presentation
+            .and_then(|presentation| presentation.display_name),
+        Some("Available Peer".to_owned())
+    );
+}
+
+#[test]
 fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

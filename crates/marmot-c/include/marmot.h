@@ -137,6 +137,16 @@ typedef int32_t MarmotStatus;
 #endif // __cplusplus
 
 /**
+ * Freshness/provenance of Direct peer display metadata.
+ */
+typedef enum MarmotDirectPeerPresentationState {
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_ABSENT,
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_CURRENT,
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_LAST_KNOWN,
+  MARMOT_DIRECT_PEER_PRESENTATION_STATE_INVALIDATED,
+} MarmotDirectPeerPresentationState;
+
+/**
  * Which relay list is missing from an incomplete account relay setup.
  */
 typedef enum MarmotMissingRelayListKind {
@@ -539,6 +549,12 @@ typedef enum MarmotChatListUpdateTrigger {
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_PIN_ORDER_CHANGED,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_SNAPSHOT_REFRESH,
   MARMOT_CHAT_LIST_UPDATE_TRIGGER_REMOVED,
+  /**
+   * The row's presentation changed. Fetch the C-only sidecar with
+   * `marmot_chat_list_direct_peer_presentation`; the legacy row stays
+   * layout-compatible for existing array consumers.
+   */
+  MARMOT_CHAT_LIST_UPDATE_TRIGGER_DIRECT_PEER_PRESENTATION_CHANGED,
 } MarmotChatListUpdateTrigger;
 
 /**
@@ -774,6 +790,22 @@ typedef struct MarmotSecretStore {
    */
   MarmotSecretStoreDestroyFn destroy;
 } MarmotSecretStore;
+
+/**
+ * Versioned, display-only metadata for the exact peer of one Direct chat.
+ */
+typedef struct MarmotDirectPeerPresentation {
+  uint16_t schema_version;
+  char *peer_account_id_hex;
+  char *display_name;
+  char *avatar_url;
+  bool has_profile_created_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t profile_created_at;
+  enum MarmotDirectPeerPresentationState state;
+} MarmotDirectPeerPresentation;
 
 /**
  * One signed-in (or signed-out but known) account.
@@ -3745,6 +3777,24 @@ void marmot_string_free(char *s);
  * been freed already.
  */
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
+
+/**
+ * Read the direct-peer presentation attached to one durable chat-list row.
+ *
+ * This is a separate accessor because `MarmotChatListRow` is a stable C ABI
+ * type returned in contiguous arrays; growing that struct would change the
+ * array stride for already-compiled clients. A missing row or missing
+ * presentation writes NULL with `MARMOT_STATUS_OK`. Free a non-NULL result
+ * with `marmot_direct_peer_presentation_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; both strings must be valid NUL-terminated
+ * UTF-8; `out` must be valid.
+ */
+MarmotStatus marmot_chat_list_direct_peer_presentation(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       const char *group_id_hex,
+                                                       struct MarmotDirectPeerPresentation **out);
 
 /**
  * List every account known to this device. Free the result with
@@ -7118,6 +7168,16 @@ void marmot_chat_pin_state_free(struct MarmotChatPinState *ptr);
  * this library.
  */
 void marmot_chat_notification_settings_free(struct MarmotChatNotificationSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_direct_peer_presentation_free(struct MarmotDirectPeerPresentation *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

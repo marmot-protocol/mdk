@@ -1,3 +1,4 @@
+use crate::chat_list::invalidate_direct_peer_presentation_for_roster_tx;
 use crate::connection::CachedSql;
 use crate::{
     SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt, bool_i64,
@@ -3812,6 +3813,12 @@ pub(crate) fn replace_direct_conversation_members_tx(
     member_ids_hex: Option<&[String]>,
     persist_direct: bool,
 ) -> StorageResult<()> {
+    invalidate_direct_peer_presentation_for_roster_tx(
+        conn,
+        group_id_hex,
+        member_ids_hex,
+        persist_direct,
+    )?;
     conn.execute_cached(
         "DELETE FROM direct_conversation_members WHERE group_id_hex = ?1",
         params![group_id_hex],

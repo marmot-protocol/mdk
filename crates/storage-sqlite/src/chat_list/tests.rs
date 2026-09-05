@@ -490,11 +490,20 @@ fn conversation_kind_uses_durable_current_roster_projection() {
     store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_eq!(
         store
-            .chat_list_row(GROUP)
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row")
             .conversation_kind,
         ChatConversationKind::Direct
+    );
+    assert!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("chat row")
+            .direct_peer_presentation
+            .is_none(),
+        "member count without an exact durable roster must not synthesize a peer"
     );
 
     let mut expanded = group();
@@ -520,6 +529,27 @@ fn conversation_kind_uses_durable_current_roster_projection() {
         ChatConversationKind::Group
     );
 
+    let mut named = group();
+    named.member_count = Some(2);
+    named.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![named],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let named = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("named chat row");
+    assert_eq!(named.conversation_kind, ChatConversationKind::Group);
+    assert!(named.direct_peer_presentation.is_none());
+
     let mut legacy = group();
     legacy.profile_name.clear();
     legacy.member_count = None;
@@ -536,11 +566,741 @@ fn conversation_kind_uses_durable_current_roster_projection() {
         .unwrap();
     assert_eq!(
         store
-            .chat_list_row(GROUP)
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row")
             .conversation_kind,
         ChatConversationKind::Unknown
+    );
+}
+
+#[test]
+fn refresh_chat_list_row_projects_direct_peer_presentation() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("direct-peer.sqlite3");
+    let key = SqlCipherKey::new("direct peer presentation persistence key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    let initial = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("direct chat row");
+    assert_eq!(
+        initial.direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(REMOTE.to_owned()),
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Absent,
+        })
+    );
+
+    let updated = store
+        .project_direct_peer_profile(
+            LOCAL,
+            &DirectPeerProfile {
+                peer_account_id_hex: REMOTE.to_owned(),
+                display_name: Some("Remote Otter".to_owned()),
+                avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+                profile_created_at: 42,
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].activity_sort_at, initial.activity_sort_at);
+    assert_eq!(
+        updated[0].direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(REMOTE.to_owned()),
+            display_name: Some("Remote Otter".to_owned()),
+            avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+            profile_created_at: Some(42),
+            state: DirectPeerPresentationState::Current,
+        })
+    );
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("persisted direct chat row")
+            .direct_peer_presentation,
+        updated[0].direct_peer_presentation
+    );
+
+    let persisted = updated[0].direct_peer_presentation.clone();
+    let activity_sort_at = updated[0].activity_sort_at;
+    drop(store);
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let after_restart = reopened
+        .chat_list_row(GROUP)
+        .unwrap()
+        .expect("direct chat row after restart");
+    assert_eq!(after_restart.direct_peer_presentation, persisted);
+    assert_eq!(after_restart.activity_sort_at, activity_sort_at);
+
+    // A Direct -> named Group transition invalidates every peer-bound value.
+    let mut named_group = group();
+    named_group.member_count = Some(2);
+    named_group.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    reopened
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![named_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let named = reopened
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("named group row");
+    assert_eq!(named.conversation_kind, ChatConversationKind::Group);
+    assert_eq!(
+        named.direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: None,
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Invalidated,
+        })
+    );
+
+    // A separate account database cannot observe another account's projected
+    // peer, even when the group id happens to collide.
+    let isolated_path = directory.path().join("isolated-account.sqlite3");
+    let isolated_key = SqlCipherKey::new("isolated direct peer key").unwrap();
+    let isolated = SqliteAccountStorage::open_encrypted(&isolated_path, &isolated_key).unwrap();
+    let mut isolated_direct = group();
+    isolated_direct.profile_name.clear();
+    isolated_direct.member_count = Some(2);
+    isolated_direct.direct_member_ids_hex = Some(vec!["cc".to_owned(), "dd".to_owned()]);
+    isolated
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "carol".to_owned(),
+                groups: vec![isolated_direct],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let isolated_initial = isolated
+        .refresh_chat_list_row("cc", GROUP, &no_mentions)
+        .unwrap()
+        .expect("isolated direct row");
+    assert_eq!(
+        isolated_initial
+            .direct_peer_presentation
+            .expect("isolated absent presentation")
+            .state,
+        DirectPeerPresentationState::Absent
+    );
+    assert!(
+        isolated
+            .project_direct_peer_profile(
+                "cc",
+                &DirectPeerProfile {
+                    peer_account_id_hex: REMOTE.to_owned(),
+                    display_name: Some("Wrong Account Peer".to_owned()),
+                    avatar_url: None,
+                    profile_created_at: 99,
+                },
+            )
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn direct_peer_profile_updates_are_monotonic_and_retain_last_known_values() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let store = setup_store_with_group(direct);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let project = |created_at, name: &str| {
+        store
+            .project_direct_peer_profile(
+                LOCAL,
+                &DirectPeerProfile {
+                    peer_account_id_hex: REMOTE.to_owned(),
+                    display_name: Some(name.to_owned()),
+                    avatar_url: Some(format!("https://cdn.example.com/{name}.png")),
+                    profile_created_at: created_at,
+                },
+            )
+            .unwrap()
+            .remove(0)
+    };
+    assert_eq!(
+        project(42, "current")
+            .direct_peer_presentation
+            .expect("current presentation")
+            .display_name
+            .as_deref(),
+        Some("current")
+    );
+    assert!(
+        store
+            .project_direct_peer_profile(
+                LOCAL,
+                &DirectPeerProfile {
+                    peer_account_id_hex: REMOTE.to_owned(),
+                    display_name: Some("stale".to_owned()),
+                    avatar_url: Some("https://cdn.example.com/stale.png".to_owned()),
+                    profile_created_at: 41,
+                },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("newer presentation retained")
+            .direct_peer_presentation
+            .expect("direct peer presentation")
+            .display_name
+            .as_deref(),
+        Some("current")
+    );
+    let newer = project(43, "newer");
+    let retained = store
+        .mark_direct_peer_profile_unavailable(LOCAL, REMOTE)
+        .unwrap()
+        .remove(0);
+    assert_eq!(retained.activity_sort_at, newer.activity_sort_at);
+    assert_eq!(
+        retained.direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(REMOTE.to_owned()),
+            display_name: Some("newer".to_owned()),
+            avatar_url: Some("https://cdn.example.com/newer.png".to_owned()),
+            profile_created_at: Some(43),
+            state: DirectPeerPresentationState::LastKnown,
+        })
+    );
+}
+
+#[test]
+fn direct_peer_profile_saturates_oversized_timestamps_and_batch_reads_current_snapshot() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let store = setup_store_with_group(direct);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    let profile = DirectPeerProfile {
+        peer_account_id_hex: REMOTE.to_owned(),
+        display_name: Some("private display name".to_owned()),
+        avatar_url: Some("https://private.example/avatar.png".to_owned()),
+        profile_created_at: u64::MAX,
+    };
+    let debug = format!("{profile:?}");
+    assert!(!debug.contains(REMOTE));
+    assert!(!debug.contains("private display name"));
+    assert!(!debug.contains("private.example"));
+
+    let projected = store
+        .project_direct_peer_profile(LOCAL, &profile)
+        .unwrap()
+        .remove(0);
+    let presentation = projected
+        .direct_peer_presentation
+        .clone()
+        .expect("projected presentation");
+    assert_eq!(presentation.profile_created_at, Some(i64::MAX as u64));
+
+    assert!(
+        store
+            .project_direct_peer_profile(LOCAL, &profile)
+            .unwrap()
+            .is_empty(),
+        "the normalized timestamp must compare equal on later hydration"
+    );
+    let current = store
+        .direct_peer_presentations_for_group_ids(&[GROUP.to_owned(), "missing-group".to_owned()])
+        .unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current.get(GROUP), Some(&Some(presentation)));
+    assert!(!current.contains_key("missing-group"));
+}
+
+#[test]
+fn direct_peer_batch_hydration_skips_unchanged_write_transactions() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("direct-peer-batch.sqlite3");
+    let key = SqlCipherKey::new("direct peer batch hydration key").unwrap();
+    let options = crate::SqliteStorageOptions {
+        busy_timeout_ms: 0,
+        ..crate::SqliteStorageOptions::default()
+    };
+    let store =
+        SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone()).unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    let profile = DirectPeerProfile {
+        peer_account_id_hex: REMOTE.to_owned(),
+        display_name: Some("Remote Otter".to_owned()),
+        avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+        profile_created_at: 42,
+    };
+    store
+        .hydrate_direct_peer_profiles(LOCAL, std::slice::from_ref(&profile), &[])
+        .unwrap();
+
+    let competing =
+        SqliteAccountStorage::open_encrypted_with_options(&path, &key, options).unwrap();
+    let competing_conn = competing.lock().unwrap();
+    competing_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store
+        .hydrate_direct_peer_profiles(LOCAL, std::slice::from_ref(&profile), &[])
+        .expect("unchanged profiles must not compete for the write lock");
+    competing_conn.execute_batch("ROLLBACK").unwrap();
+
+    let unavailable = vec![REMOTE.to_owned()];
+    store
+        .hydrate_direct_peer_profiles(LOCAL, &[], &unavailable)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("direct row")
+            .direct_peer_presentation
+            .expect("direct peer presentation")
+            .state,
+        DirectPeerPresentationState::LastKnown
+    );
+
+    competing_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store
+        .hydrate_direct_peer_profiles(LOCAL, &[], &unavailable)
+        .expect("an unchanged unavailable profile must not compete for the write lock");
+    competing_conn.execute_batch("ROLLBACK").unwrap();
+
+    store
+        .hydrate_direct_peer_profiles(LOCAL, std::slice::from_ref(&profile), &unavailable)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("direct row")
+            .direct_peer_presentation
+            .expect("direct peer presentation")
+            .state,
+        DirectPeerPresentationState::Current,
+        "an available profile must win conflicting hydration evidence"
+    );
+}
+
+#[test]
+fn direct_peer_profile_projection_is_driven_by_member_index() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let conn = store.lock().unwrap();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        direct_conversation_group_ids_for_peer_sql()
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let plan = statement
+        .query_map(params![LOCAL, REMOTE], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n")
+        .to_ascii_lowercase();
+
+    assert!(
+        plan.contains("idx_direct_conversation_members_member"),
+        "profile projection must be driven by the member index: {plan}"
+    );
+    assert!(
+        !plan.contains("scan account_groups"),
+        "profile projection must not scan every account group: {plan}"
+    );
+
+    let batch_sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        direct_peer_profile_hydration_needed_sql(1)
+    );
+    let mut batch_statement = conn.prepare(&batch_sql).unwrap();
+    let batch_plan = batch_statement
+        .query_map(params![REMOTE, LOCAL], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n")
+        .to_ascii_lowercase();
+    assert!(
+        batch_plan.contains("idx_direct_conversation_members_member"),
+        "batch hydration must be driven by the member index: {batch_plan}"
+    );
+    assert!(
+        !batch_plan.contains("scan account_groups"),
+        "batch hydration must not scan every account group: {batch_plan}"
+    );
+}
+
+#[test]
+fn roster_change_invalidates_direct_peer_presentation_atomically() {
+    const OTHER: &str = "cc";
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let store = setup_store_with_group(direct);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .project_direct_peer_profile(
+            LOCAL,
+            &DirectPeerProfile {
+                peer_account_id_hex: REMOTE.to_owned(),
+                display_name: Some("Former Peer".to_owned()),
+                avatar_url: Some("https://cdn.example.com/former.png".to_owned()),
+                profile_created_at: 42,
+            },
+        )
+        .unwrap();
+
+    let mut changed_peer = group();
+    changed_peer.profile_name.clear();
+    changed_peer.member_count = Some(2);
+    changed_peer.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), OTHER.to_owned()]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![changed_peer],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("existing row")
+            .direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: None,
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Invalidated,
+        })
+    );
+
+    let refreshed = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .expect("refreshed row");
+    assert_eq!(
+        refreshed.direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(OTHER.to_owned()),
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Absent,
+        })
+    );
+
+    store
+        .project_direct_peer_profile(
+            LOCAL,
+            &DirectPeerProfile {
+                peer_account_id_hex: OTHER.to_owned(),
+                display_name: Some("Replacement Peer".to_owned()),
+                avatar_url: None,
+                profile_created_at: 43,
+            },
+        )
+        .unwrap();
+    let mut local_removed = group();
+    local_removed.profile_name.clear();
+    local_removed.member_count = Some(2);
+    local_removed.direct_member_ids_hex = Some(vec![OTHER.to_owned(), "dd".to_owned()]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![local_removed],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("row after local member removal")
+            .direct_peer_presentation
+            .expect("invalidated presentation")
+            .state,
+        DirectPeerPresentationState::Invalidated
+    );
+}
+
+#[test]
+fn ensure_chat_list_rows_repairs_only_invalidated_direct_rows() {
+    const OTHER: &str = "cc";
+    const UNRELATED_GROUP: &str = "22";
+    const UNRELATED_SENTINEL_UPDATED_AT: i64 = 4_000_000_000;
+
+    let unrelated_group = || {
+        let mut unrelated = group();
+        unrelated.group_id_hex = UNRELATED_GROUP.to_owned();
+        unrelated.profile_name = "Unaffected group".to_owned();
+        unrelated
+    };
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![direct, unrelated_group()],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    store
+        .project_direct_peer_profile(
+            LOCAL,
+            &DirectPeerProfile {
+                peer_account_id_hex: REMOTE.to_owned(),
+                display_name: Some("Former Peer".to_owned()),
+                avatar_url: None,
+                profile_created_at: 42,
+            },
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET updated_at = ?2 WHERE group_id_hex = ?1",
+            params![UNRELATED_GROUP, UNRELATED_SENTINEL_UPDATED_AT],
+        )
+        .unwrap();
+    }
+
+    let mut changed_peer = group();
+    changed_peer.profile_name.clear();
+    changed_peer.member_count = Some(2);
+    changed_peer.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), OTHER.to_owned()]);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![changed_peer, unrelated_group()],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("invalidated direct row")
+            .direct_peer_presentation
+            .expect("invalidated presentation")
+            .state,
+        DirectPeerPresentationState::Invalidated
+    );
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("repaired direct row")
+            .direct_peer_presentation,
+        Some(DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(OTHER.to_owned()),
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Absent,
+        })
+    );
+    assert_eq!(
+        store
+            .chat_list_row(UNRELATED_GROUP)
+            .unwrap()
+            .expect("unrelated row")
+            .updated_at,
+        u64::try_from(UNRELATED_SENTINEL_UPDATED_AT).unwrap(),
+        "repairing one invalidated Direct row must not rebuild unrelated rows"
+    );
+}
+
+#[test]
+fn ensure_chat_list_rows_backfills_direct_peer_presentation_after_upgrade() {
+    let mut direct = group();
+    direct.profile_name.clear();
+    direct.member_count = Some(2);
+    direct.direct_member_ids_hex = Some(vec![LOCAL.to_owned(), REMOTE.to_owned()]);
+    let store = setup_store_with_group(direct);
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows
+             SET direct_peer_account_id_hex = NULL,
+                 direct_peer_display_name = NULL,
+                 direct_peer_avatar_url = NULL,
+                 direct_peer_profile_created_at = NULL,
+                 direct_peer_presentation_state = 'absent'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chat_list_projection_meta SET mention_counts_version = 2 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("repaired direct row")
+            .direct_peer_presentation
+            .expect("backfilled direct peer")
+            .peer_account_id_hex
+            .as_deref(),
+        Some(REMOTE)
+    );
+
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows
+             SET direct_peer_presentation_version = -1,
+                 direct_peer_account_id_hex = ?1,
+                 direct_peer_display_name = 'must-not-leak',
+                 direct_peer_avatar_url = 'https://private.example/must-not-leak.png',
+                 direct_peer_profile_created_at = 42,
+                 direct_peer_presentation_state = 'future-state'",
+            params![REMOTE],
+        )
+        .unwrap();
+    }
+    let corrupt = store
+        .chat_list_row(GROUP)
+        .unwrap()
+        .expect("corrupt row fails closed")
+        .direct_peer_presentation
+        .expect("invalidated presentation");
+    assert_eq!(corrupt.schema_version, 0);
+    assert_eq!(corrupt.state, DirectPeerPresentationState::Invalidated);
+    assert!(corrupt.peer_account_id_hex.is_none());
+    assert!(corrupt.display_name.is_none());
+    assert!(corrupt.avatar_url.is_none());
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let repaired = store
+        .chat_list_row(GROUP)
+        .unwrap()
+        .expect("schema mismatch repaired")
+        .direct_peer_presentation
+        .expect("repaired absent presentation");
+    assert_eq!(
+        repaired,
+        DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: Some(REMOTE.to_owned()),
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Absent,
+        }
+    );
+    // The repaired representation must converge rather than forcing a rebuild
+    // on every warm open.
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(
+        store
+            .chat_list_row(GROUP)
+            .unwrap()
+            .expect("converged row")
+            .direct_peer_presentation,
+        Some(repaired)
     );
 }
 
@@ -558,6 +1318,7 @@ fn direct_row(group_id_hex: &str, activity_sort_at: u64) -> ChatListRow {
         group_name: String::new(),
         avatar_url: None,
         avatar: None,
+        direct_peer_presentation: None,
         last_message: None,
         unread_count: 0,
         has_unread: false,
@@ -2252,7 +3013,7 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn).unwrap(),
+            chat_list_projection_complete_tx(&conn, LOCAL, false).unwrap(),
             "failed-send preview priority must match the completeness query"
         );
     }
@@ -4064,7 +4825,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     {
         let conn = store.lock().unwrap();
         assert!(
-            chat_list_projection_complete_tx(&conn).unwrap(),
+            chat_list_projection_complete_tx(&conn, LOCAL, false).unwrap(),
             "a pending leave request must not make the projection look stale"
         );
     }

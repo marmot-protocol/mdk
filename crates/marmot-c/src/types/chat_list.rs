@@ -4,7 +4,8 @@ use marmot_uniffi::conversions::{
     ChatConversationKindFfi, ChatListAttachmentKindFfi, ChatListAvatarFfi,
     ChatListMessageDeliveryStateFfi, ChatListMessagePreviewFfi, ChatListRowFfi,
     ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi,
-    ChatPinStateFfi, ExistingDirectConversationFfi,
+    ChatPinStateFfi, DirectPeerPresentationFfi, DirectPeerPresentationStateFfi,
+    ExistingDirectConversationFfi,
 };
 
 use super::group::{MarmotDisbandRequest, MarmotGroupLifecycleState, MarmotSelfMembership};
@@ -103,6 +104,29 @@ c_enum! {
     }
 }
 
+c_enum! {
+    /// Freshness/provenance of Direct peer display metadata.
+    MarmotDirectPeerPresentationState from DirectPeerPresentationStateFfi {
+        Absent,
+        Current,
+        LastKnown,
+        Invalidated,
+    }
+}
+
+c_mirror! {
+    /// Versioned, display-only metadata for the exact peer of one Direct chat.
+    MarmotDirectPeerPresentation from DirectPeerPresentationFfi,
+    free marmot_direct_peer_presentation_free {
+        copy schema_version: u16,
+        opt_str peer_account_id_hex,
+        opt_str display_name,
+        opt_str avatar_url,
+        opt_copy has_profile_created_at/profile_created_at: u64,
+        copy state: MarmotDirectPeerPresentationState,
+    }
+}
+
 c_mirror! {
     /// Preview of a chat row's last message.
     MarmotChatListMessagePreview from ChatListMessagePreviewFfi {
@@ -187,6 +211,10 @@ c_enum! {
         PinOrderChanged,
         SnapshotRefresh,
         Removed,
+        /// The row's presentation changed. Fetch the C-only sidecar with
+        /// `marmot_chat_list_direct_peer_presentation`; the legacy row stays
+        /// layout-compatible for existing array consumers.
+        DirectPeerPresentationChanged,
     }
 }
 
@@ -261,7 +289,125 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_update_free(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::ffi::{CStr, CString, c_char};
+
     use crate::memory::boxed;
+    #[cfg(unix)]
+    use crate::memory::owned_vec;
+
+    #[cfg(unix)]
+    fn compatibility_row(group_id_hex: &str) -> MarmotChatListRow {
+        MarmotChatListRow {
+            group_id_hex: owned_c_string(group_id_hex.to_owned()),
+            pinned: false,
+            has_pinned_position: false,
+            pinned_position: 0,
+            archived: false,
+            pending_confirmation: false,
+            lifecycle_state: MarmotGroupLifecycleState::Stable,
+            disbanding: false,
+            disband_request: std::ptr::null_mut(),
+            title: std::ptr::null_mut(),
+            group_name: std::ptr::null_mut(),
+            avatar_url: std::ptr::null_mut(),
+            avatar: std::ptr::null_mut(),
+            last_message: std::ptr::null_mut(),
+            unread_count: 0,
+            has_unread: false,
+            manually_marked_unread: false,
+            unread_mention_count: 0,
+            unread_mention: false,
+            first_unread_message_id_hex: std::ptr::null_mut(),
+            last_read_message_id_hex: std::ptr::null_mut(),
+            has_last_read_timeline_at: false,
+            last_read_timeline_at: 0,
+            conversation_created_at: 0,
+            activity_sort_at: 0,
+            updated_at: 0,
+            self_membership: MarmotSelfMembership::Member,
+            conversation_kind: MarmotChatConversationKind::Unknown,
+            muted: false,
+            has_muted_until_ms: false,
+            muted_until_ms: 0,
+            leave_request_pending: false,
+            has_leave_requested_at_ms: false,
+            leave_requested_at_ms: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_compiled_previous_header_reads_two_current_chat_list_rows() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let temp_dir = tempfile::tempdir().expect("temporary C build directory");
+        let library_name = if cfg!(target_os = "macos") {
+            "libprevious_chat_list_row.dylib"
+        } else {
+            "libprevious_chat_list_row.so"
+        };
+        let library_path = temp_dir.path().join(library_name);
+        let mut compiler = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
+        if cfg!(target_os = "macos") {
+            compiler.arg("-dynamiclib");
+        } else {
+            compiler.args(["-shared", "-fPIC"]);
+        }
+        let output = compiler
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(fixture_dir.join("read_previous_chat_list_row.c"))
+            .arg("-I")
+            .arg(&fixture_dir)
+            .arg("-o")
+            .arg(&library_path)
+            .output()
+            .expect("compile previous-header C consumer");
+        assert!(
+            output.status.success(),
+            "previous-header C fixture failed to compile:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let library_path = CString::new(library_path.as_os_str().as_bytes()).unwrap();
+        let size_symbol = CString::new("marmot_previous_header_chat_list_row_size").unwrap();
+        let second_symbol = CString::new("marmot_previous_header_second_group_id").unwrap();
+        let handle = unsafe { libc::dlopen(library_path.as_ptr(), libc::RTLD_NOW) };
+        assert!(!handle.is_null(), "load previous-header C fixture");
+
+        let c_row_size = unsafe { libc::dlsym(handle, size_symbol.as_ptr()) };
+        let c_second_group_id = unsafe { libc::dlsym(handle, second_symbol.as_ptr()) };
+        assert!(!c_row_size.is_null(), "resolve previous-header size helper");
+        assert!(
+            !c_second_group_id.is_null(),
+            "resolve previous-header row reader"
+        );
+        let c_row_size: unsafe extern "C" fn() -> usize =
+            unsafe { std::mem::transmute(c_row_size) };
+        let c_second_group_id: unsafe extern "C" fn(*const MarmotChatListRow) -> *const c_char =
+            unsafe { std::mem::transmute(c_second_group_id) };
+
+        assert_eq!(
+            unsafe { c_row_size() },
+            std::mem::size_of::<MarmotChatListRow>(),
+            "the current library changed the previous header's array stride"
+        );
+        let _guard = crate::memory::audit::test_lock();
+        let (rows, rows_len) = owned_vec(vec![
+            compatibility_row("first"),
+            compatibility_row("second"),
+        ]);
+        let second_group_id = unsafe { CStr::from_ptr(c_second_group_id(rows)) };
+        assert_eq!(second_group_id.to_str(), Ok("second"));
+
+        unsafe {
+            free_vec(rows, rows_len);
+            libc::dlclose(handle);
+        }
+    }
 
     #[test]
     fn pin_state_deep_roundtrip() {
@@ -309,5 +455,29 @@ mod tests {
         assert!(timed.has_muted_until_ms);
         assert_eq!(timed.muted_until_ms, 1_700_000_000_000);
         unsafe { marmot_chat_notification_settings_free(boxed(timed)) };
+    }
+
+    #[test]
+    fn direct_peer_presentation_deep_free_releases_owned_strings() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let mirror: MarmotDirectPeerPresentation = DirectPeerPresentationFfi {
+            schema_version: 1,
+            peer_account_id_hex: Some("bb".repeat(32)),
+            display_name: Some("Remote Otter".to_owned()),
+            avatar_url: Some("https://cdn.example.com/remote.png".to_owned()),
+            profile_created_at: Some(42),
+            state: DirectPeerPresentationStateFfi::Current,
+        }
+        .into();
+        assert!(!mirror.peer_account_id_hex.is_null());
+        assert!(mirror.has_profile_created_at);
+        assert_eq!(mirror.profile_created_at, 42);
+
+        unsafe { marmot_direct_peer_presentation_free(boxed(mirror)) };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
     }
 }

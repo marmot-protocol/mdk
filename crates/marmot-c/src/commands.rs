@@ -34,7 +34,7 @@ use crate::types::audit::{
 };
 use crate::types::chat_list::{
     MarmotChatListRow, MarmotChatListRowList, MarmotChatNotificationSettings, MarmotChatPinState,
-    MarmotExistingDirectConversation,
+    MarmotDirectPeerPresentation, MarmotExistingDirectConversation,
 };
 use crate::types::common::{MarmotMessageTag, MarmotStringArray, MarmotStringList};
 use crate::types::directory::MarmotCachedIdentityProjectionList;
@@ -505,6 +505,37 @@ macro_rules! c_cmd {
     (@call $client:ident, async, $method:ident, $($a:tt)*) => {
         $client.block_on($client.marmot.$method($($a)*))
     };
+}
+
+/// Read the direct-peer presentation attached to one durable chat-list row.
+///
+/// This is a separate accessor because `MarmotChatListRow` is a stable C ABI
+/// type returned in contiguous arrays; growing that struct would change the
+/// array stride for already-compiled clients. A missing row or missing
+/// presentation writes NULL with `MARMOT_STATUS_OK`. Free a non-NULL result
+/// with `marmot_direct_peer_presentation_free`.
+///
+/// # Safety
+/// `client` must be a live handle; both strings must be valid NUL-terminated
+/// UTF-8; `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_chat_list_direct_peer_presentation(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    out: *mut *mut MarmotDirectPeerPresentation,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let result = client
+            .marmot
+            .chat_list_row(account_ref, group_id_hex)
+            .map(|row| row.and_then(|row| row.direct_peer_presentation));
+        unsafe { deliver_opt(result, out) }
+    })
 }
 
 c_cmd! {

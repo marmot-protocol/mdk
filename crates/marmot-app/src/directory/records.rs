@@ -98,10 +98,8 @@ pub(crate) fn display_name_for_profile(profile: Option<&UserProfileMetadata>) ->
     profile
         .display_name
         .as_deref()
-        .or(profile.name.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .and_then(sanitize_profile_field)
+        .or_else(|| profile.name.as_deref().and_then(sanitize_profile_field))
 }
 
 pub(crate) fn cached_identity_projection(
@@ -373,17 +371,26 @@ fn is_known_profile_field(field: &str) -> bool {
 /// result valid UTF-8.
 const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 
-fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+/// Normalize one untrusted profile field without retaining control characters,
+/// edge whitespace, empty values, or more than the defensive character cap.
+pub(crate) fn sanitize_profile_field(value: &str) -> Option<String> {
     let value = value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)?;
-    let value = value
+        // Removing control characters first must not let one at either edge
+        // shield adjacent whitespace from trimming. Matching both classes at
+        // the boundary is equivalent without allocating an unbounded
+        // intermediate attacker-controlled string.
+        .trim_matches(|character: char| character.is_control() || character.is_whitespace())
         .chars()
         .filter(|character| !character.is_control())
         .take(MAX_PROFILE_FIELD_CHARS)
         .collect::<String>();
-    (!value.is_empty()).then_some(value)
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    let value = value.get(field).and_then(serde_json::Value::as_str)?;
+    sanitize_profile_field(value)
 }
 
 pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
@@ -692,7 +699,8 @@ mod tests {
     #[test]
     fn profile_string_fields_strip_control_characters() {
         let content = serde_json::json!({
-            "name": "  alice\u{1b}[2J\nadmin\u{7}  ",
+            "name": "\u{0}  alice\u{1b}[2J\nadmin\u{7}  ",
+            "picture": "\u{7} https://cdn.example/avatar.png\u{0} ",
             "about": "\u{0}\u{1b}",
         });
 
@@ -700,7 +708,26 @@ mod tests {
             string_field(&content, "name").as_deref(),
             Some("alice[2Jadmin")
         );
+        assert_eq!(
+            string_field(&content, "picture").as_deref(),
+            Some("https://cdn.example/avatar.png")
+        );
         assert_eq!(string_field(&content, "about"), None);
+    }
+
+    #[test]
+    fn profile_string_fields_trim_whitespace_exposed_by_the_character_cap() {
+        let oversized = format!("{} trailing", "a".repeat(MAX_PROFILE_FIELD_CHARS - 1));
+
+        let sanitized = sanitize_profile_field(&oversized).expect("non-empty sanitized field");
+
+        assert_eq!(sanitized, "a".repeat(MAX_PROFILE_FIELD_CHARS - 1));
+        assert!(
+            sanitized
+                .chars()
+                .last()
+                .is_some_and(|character| !character.is_whitespace())
+        );
     }
 
     #[test]

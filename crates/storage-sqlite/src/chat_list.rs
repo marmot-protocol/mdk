@@ -6,8 +6,9 @@ use crate::storage::disband_requests::{
 };
 use crate::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
-    SelfMembership, SqliteAccountStorage, SqliteResultExt, StoredAccountState, bool_i64,
-    i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
+    SQLITE_BIND_PARAMETER_CHUNK, SelfMembership, SqliteAccountStorage, SqliteResultExt,
+    StoredAccountState, bool_i64, i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms,
+    unix_now_seconds,
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::{
@@ -109,6 +110,170 @@ pub enum ChatConversationKind {
     Unknown,
     Direct,
     Group,
+}
+
+/// Schema carried with every durable direct-peer presentation record.
+pub const DIRECT_PEER_PRESENTATION_SCHEMA_VERSION: u16 = 1;
+
+/// Freshness/provenance of the display-only peer metadata in a chat-list row.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectPeerPresentationState {
+    /// The current Direct peer is known, but no accepted profile is available.
+    #[default]
+    Absent,
+    /// The values came from the latest accepted local profile projection.
+    Current,
+    /// The values are retained for the same peer while fresh evidence is unavailable.
+    LastKnown,
+    /// A roster or conversation-kind change invalidated the former peer values.
+    Invalidated,
+}
+
+impl DirectPeerPresentationState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Current => "current",
+            Self::LastKnown => "last_known",
+            Self::Invalidated => "invalidated",
+        }
+    }
+
+    fn from_storage(value: &str) -> Self {
+        match value {
+            "absent" => Self::Absent,
+            "current" => Self::Current,
+            "last_known" => Self::LastKnown,
+            "invalidated" => Self::Invalidated,
+            // Unknown provenance must fail closed. Treating it as `Absent`
+            // could expose values written by a newer or corrupt projection.
+            _ => Self::Invalidated,
+        }
+    }
+}
+
+pub(crate) fn invalidate_direct_peer_presentation_for_roster_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    member_ids_hex: Option<&[String]>,
+    persist_direct: bool,
+) -> StorageResult<()> {
+    let stored_peer = conn
+        .query_row_cached(
+            "SELECT direct_peer_account_id_hex
+             FROM chat_list_rows
+             WHERE group_id_hex = ?1",
+            params![group_id_hex],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .storage()?
+        .flatten();
+    let Some(stored_peer) = stored_peer else {
+        return Ok(());
+    };
+    let prior_local_member = conn
+        .query_row_cached(
+            "SELECT member.member_id_hex
+             FROM direct_conversation_members AS member
+             WHERE member.group_id_hex = ?1
+               AND lower(member.member_id_hex) != lower(?2)
+               AND (
+                    SELECT COUNT(*) FROM direct_conversation_members AS exact_members
+                    WHERE exact_members.group_id_hex = member.group_id_hex
+               ) = 2
+             LIMIT 1",
+            params![group_id_hex, stored_peer],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .storage()?;
+    let peer_remains = persist_direct
+        && prior_local_member.is_some()
+        && member_ids_hex.is_some_and(|member_ids| {
+            member_ids.len() == 2
+                && member_ids
+                    .iter()
+                    .any(|member_id| member_id.trim().eq_ignore_ascii_case(stored_peer.as_str()))
+                && member_ids.iter().any(|member_id| {
+                    prior_local_member.as_ref().is_some_and(|prior_local| {
+                        member_id.trim().eq_ignore_ascii_case(prior_local.as_str())
+                    })
+                })
+        });
+    if peer_remains {
+        return Ok(());
+    }
+    conn.execute_cached(
+        "UPDATE chat_list_rows
+         SET direct_peer_presentation_version = ?2,
+             direct_peer_account_id_hex = NULL,
+             direct_peer_display_name = NULL,
+             direct_peer_avatar_url = NULL,
+             direct_peer_profile_created_at = NULL,
+             direct_peer_presentation_state = ?3,
+             updated_at = ?4
+         WHERE group_id_hex = ?1",
+        params![
+            group_id_hex,
+            i64::from(DIRECT_PEER_PRESENTATION_SCHEMA_VERSION),
+            DirectPeerPresentationState::Invalidated.as_str(),
+            u64_to_i64(unix_now_seconds())?,
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+/// Versioned, display-only identity projection for one Direct conversation.
+///
+/// The peer id is correlation data only. It must never be used as membership
+/// authority; the current roster and [`ChatConversationKind`] remain the
+/// authoritative membership inputs.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectPeerPresentation {
+    pub schema_version: u16,
+    pub peer_account_id_hex: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_created_at: Option<u64>,
+    pub state: DirectPeerPresentationState,
+}
+
+impl std::fmt::Debug for DirectPeerPresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectPeerPresentation")
+            .field("schema_version", &self.schema_version)
+            .field(
+                "peer_account_id_hex",
+                &self.peer_account_id_hex.as_ref().map(|_| "<redacted>"),
+            )
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_avatar_url", &self.avatar_url.is_some())
+            .field("has_profile_created_at", &self.profile_created_at.is_some())
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// Latest accepted profile values to project into matching Direct chat rows.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DirectPeerProfile {
+    pub peer_account_id_hex: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_created_at: u64,
+}
+
+impl std::fmt::Debug for DirectPeerProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectPeerProfile")
+            .field("peer_account_id_hex", &"<redacted>")
+            .field("has_display_name", &self.display_name.is_some())
+            .field("has_avatar_url", &self.avatar_url.is_some())
+            .finish()
+    }
 }
 
 /// Authoritative reuse decision for one existing direct conversation.
@@ -314,6 +479,9 @@ pub struct ChatListRow {
     pub group_name: String,
     pub avatar_url: Option<String>,
     pub avatar: Option<ChatListAvatar>,
+    /// Durable display-only peer metadata for an unnamed two-member chat.
+    #[serde(default)]
+    pub direct_peer_presentation: Option<DirectPeerPresentation>,
     pub last_message: Option<ChatListMessagePreview>,
     pub unread_count: u64,
     pub has_unread: bool,
@@ -427,6 +595,98 @@ impl SqliteAccountStorage {
     pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_row_tx(&conn, group_id_hex)
+    }
+
+    /// Read the current durable direct-peer presentation for a bounded set of
+    /// chat rows in one snapshot. Missing chat rows are omitted from the map.
+    pub fn direct_peer_presentations_for_group_ids(
+        &self,
+        group_ids_hex: &[String],
+    ) -> StorageResult<HashMap<String, Option<DirectPeerPresentation>>> {
+        let conn = self.lock()?;
+        direct_peer_presentations_for_group_ids_tx(&conn, group_ids_hex)
+    }
+
+    /// Project one accepted profile into every exact two-member Direct chat
+    /// whose roster is `{local_account_id_hex, profile.peer_account_id_hex}`.
+    /// The write changes presentation only; it never advances activity order.
+    pub fn project_direct_peer_profile(
+        &self,
+        local_account_id_hex: &str,
+        profile: &DirectPeerProfile,
+    ) -> StorageResult<Vec<ChatListRow>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            project_direct_peer_profile_tx(&conn, local_account_id_hex, profile)
+        })
+    }
+
+    /// Retain the last accepted values for a Direct peer when a refresh yields
+    /// no usable profile evidence. This never clears known display data on a
+    /// transient miss or quarantined event.
+    pub fn mark_direct_peer_profile_unavailable(
+        &self,
+        local_account_id_hex: &str,
+        peer_account_id_hex: &str,
+    ) -> StorageResult<Vec<ChatListRow>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            mark_direct_peer_profile_unavailable_tx(
+                &conn,
+                local_account_id_hex,
+                peer_account_id_hex,
+            )
+        })
+    }
+
+    /// Hydrate a batch of cached direct-peer profiles with at most one write
+    /// transaction.
+    ///
+    /// A read-only preflight skips the transaction entirely when every
+    /// presentation is already current. Available profiles take precedence if
+    /// a peer is also listed in `unavailable_peer_ids_hex`.
+    pub fn hydrate_direct_peer_profiles(
+        &self,
+        local_account_id_hex: &str,
+        profiles: &[DirectPeerProfile],
+        unavailable_peer_ids_hex: &[String],
+    ) -> StorageResult<()> {
+        let available_peer_ids = profiles
+            .iter()
+            .map(|profile| profile.peer_account_id_hex.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let unavailable_peer_ids = unavailable_peer_ids_hex
+            .iter()
+            .map(|peer| peer.trim().to_ascii_lowercase())
+            .filter(|peer| !available_peer_ids.contains(peer))
+            .collect::<HashSet<_>>();
+        let needs_write = {
+            let conn = self.lock()?;
+            direct_peer_profile_hydration_needed_tx(
+                &conn,
+                local_account_id_hex,
+                profiles,
+                &unavailable_peer_ids,
+            )?
+        };
+        if !needs_write {
+            return Ok(());
+        }
+
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            for profile in profiles {
+                project_direct_peer_profile_tx(&conn, local_account_id_hex, profile)?;
+            }
+            for peer_account_id_hex in &unavailable_peer_ids {
+                mark_direct_peer_profile_unavailable_tx(
+                    &conn,
+                    local_account_id_hex,
+                    peer_account_id_hex,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
@@ -665,8 +925,22 @@ impl SqliteAccountStorage {
     ) -> StorageResult<()> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if !chat_list_projection_complete_tx(&conn)? {
+            let invalidated_direct_group_ids =
+                invalidated_direct_peer_group_ids_tx(&conn, local_account_id_hex)?;
+            let projection_complete = chat_list_projection_complete_tx(
+                &conn,
+                local_account_id_hex,
+                !invalidated_direct_group_ids.is_empty(),
+            )?;
+            if !projection_complete {
                 rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)?;
+            } else if !invalidated_direct_group_ids.is_empty() {
+                repair_invalidated_direct_peer_rows_tx(
+                    &conn,
+                    local_account_id_hex,
+                    mention_classifier,
+                    &invalidated_direct_group_ids,
+                )?;
             }
             Ok(())
         })
@@ -1028,7 +1302,7 @@ fn refresh_chat_list_row_for_messages_tx(
             message_ids_hex,
             mention_classifier,
         )?;
-        write_chat_list_row_for_group_tx(tx, &group, unread)?;
+        write_chat_list_row_for_group_tx(tx, local_account_id_hex, &group, unread)?;
     }
     chat_list_row_tx(tx, group_id_hex)
 }
@@ -1065,9 +1339,12 @@ fn dirty_unread_messages_are_covered_tx(
 /// Version 1 covered unread-mention counts (#750). Version 2 additionally
 /// projects kind-1210 group-system rows into preview, activity, and unread state
 /// (#822). Version 3 materializes per-message unread membership so incremental
-/// refreshes do not rescan the unread window. The persisted column keeps its legacy `mention_counts_version` name
-/// for schema compatibility, but now gates the complete derived-row contract.
-const CHAT_LIST_PROJECTION_VERSION: i64 = 3;
+/// refreshes do not rescan the unread window. Version 4 binds display-only
+/// direct-peer presentation to the exact
+/// durable two-member roster (#1517). The persisted column keeps its legacy
+/// `mention_counts_version` name for schema compatibility, but now gates the
+/// complete derived-row contract.
+const CHAT_LIST_PROJECTION_VERSION: i64 = 4;
 
 const CHAT_LIST_GROUP_ACTIVITY_TYPES: [&str; 5] = [
     GROUP_SYSTEM_TYPE_MEMBER_ADDED,
@@ -1231,7 +1508,11 @@ fn set_chat_list_projection_version_tx(tx: &Connection, version: i64) -> Storage
 /// `ChatListRow::leave_requested_at_ms` is derived at read time rather than
 /// materialized, so there is no stored value that can drift out of date — and
 /// comparing a read-time-only field here would mark every row stale forever.
-fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
+fn chat_list_projection_complete_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    allow_repairable_invalidated_direct: bool,
+) -> StorageResult<bool> {
     if chat_list_projection_version_tx(tx)? < CHAT_LIST_PROJECTION_VERSION {
         return Ok(false);
     }
@@ -1268,6 +1549,82 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
             WHERE ready.group_id_hex IS NULL
          )",
         [],
+    )? {
+        return Ok(false);
+    }
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+            SELECT 1
+            FROM account_groups AS ag
+            JOIN chat_list_rows AS row ON row.group_id_hex = ag.group_id_hex
+            WHERE NOT (
+                    ?3 != 0
+                    AND row.direct_peer_presentation_state = 'invalidated'
+                    AND trim(ag.profile_name) = ''
+                    AND ag.member_count = 2
+                    AND EXISTS (
+                        SELECT 1 FROM direct_conversation_members AS local_member
+                        WHERE local_member.group_id_hex = ag.group_id_hex
+                          AND lower(local_member.member_id_hex) = lower(?1)
+                    )
+                    AND (
+                        SELECT COUNT(*) FROM direct_conversation_members AS exact_members
+                        WHERE exact_members.group_id_hex = ag.group_id_hex
+                    ) = 2
+                 )
+              AND (
+                   row.direct_peer_presentation_version != ?2
+                OR CASE
+                    WHEN trim(ag.profile_name) = ''
+                     AND ag.member_count = 2
+                     AND EXISTS (
+                        SELECT 1 FROM direct_conversation_members AS local_member
+                        WHERE local_member.group_id_hex = ag.group_id_hex
+                          AND lower(local_member.member_id_hex) = lower(?1)
+                     )
+                     AND (
+                        SELECT COUNT(*) FROM direct_conversation_members AS exact_members
+                        WHERE exact_members.group_id_hex = ag.group_id_hex
+                    ) = 2
+                    THEN row.direct_peer_account_id_hex IS NOT (
+                            SELECT lower(peer_member.member_id_hex)
+                            FROM direct_conversation_members AS peer_member
+                            WHERE peer_member.group_id_hex = ag.group_id_hex
+                              AND lower(peer_member.member_id_hex) != lower(?1)
+                            LIMIT 1
+                         )
+                      OR row.direct_peer_presentation_state NOT IN (
+                            'absent', 'current', 'last_known'
+                         )
+                      OR (
+                            row.direct_peer_presentation_state = 'absent'
+                            AND (
+                                row.direct_peer_display_name IS NOT NULL
+                                OR row.direct_peer_avatar_url IS NOT NULL
+                                OR row.direct_peer_profile_created_at IS NOT NULL
+                            )
+                         )
+                      OR (
+                            row.direct_peer_presentation_state IN ('current', 'last_known')
+                            AND (
+                                row.direct_peer_profile_created_at IS NULL
+                                OR row.direct_peer_profile_created_at < 0
+                            )
+                         )
+                    ELSE row.direct_peer_account_id_hex IS NOT NULL
+                      OR row.direct_peer_display_name IS NOT NULL
+                      OR row.direct_peer_avatar_url IS NOT NULL
+                      OR row.direct_peer_profile_created_at IS NOT NULL
+                      OR row.direct_peer_presentation_state NOT IN ('absent', 'invalidated')
+                  END
+              )
+         )",
+        params![
+            local_account_id_hex,
+            i64::from(DIRECT_PEER_PRESENTATION_SCHEMA_VERSION),
+            bool_i64(allow_repairable_invalidated_direct),
+        ],
     )? {
         return Ok(false);
     }
@@ -1438,7 +1795,7 @@ fn rebuild_chat_list_row_for_group_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
-    write_chat_list_row_for_group_tx(tx, &group, unread)?;
+    write_chat_list_row_for_group_tx(tx, local_account_id_hex, &group, unread)?;
     tx.execute_cached(
         "DELETE FROM chat_list_unread_dirty_messages WHERE group_id_hex = ?1",
         params![group.group_id_hex],
@@ -1453,8 +1810,63 @@ fn rebuild_chat_list_row_for_group_tx(
     Ok(())
 }
 
+/// Returns exact Direct rows whose former peer presentation was invalidated by
+/// a roster change and can therefore be repaired independently.
+fn invalidated_direct_peer_group_ids_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+) -> StorageResult<Vec<String>> {
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT row.group_id_hex
+             FROM chat_list_rows AS row
+             JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
+             WHERE row.direct_peer_presentation_state = 'invalidated'
+               AND trim(ag.profile_name) = ''
+               AND ag.member_count = 2
+               AND EXISTS (
+                    SELECT 1 FROM direct_conversation_members AS local_member
+                    WHERE local_member.group_id_hex = ag.group_id_hex
+                      AND lower(local_member.member_id_hex) = lower(?1)
+               )
+               AND (
+                    SELECT COUNT(*) FROM direct_conversation_members AS exact_members
+                    WHERE exact_members.group_id_hex = ag.group_id_hex
+               ) = 2",
+        )
+        .storage()?;
+    statement
+        .query_map(params![local_account_id_hex], |row| row.get::<_, String>(0))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+}
+
+/// Repair only the preflight-approved exact Direct rows. The caller first
+/// checks every other projection invariant so this work is never duplicated by
+/// an immediately following full rebuild.
+fn repair_invalidated_direct_peer_rows_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    mention_classifier: &MentionClassifier<'_>,
+    group_ids: &[String],
+) -> StorageResult<()> {
+    for group_id_hex in group_ids {
+        if let Some(group) = account_group_tx(tx, group_id_hex)? {
+            rebuild_chat_list_row_for_group_tx(
+                tx,
+                local_account_id_hex,
+                group,
+                mention_classifier,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn write_chat_list_row_for_group_tx(
     tx: &Connection,
+    local_account_id_hex: &str,
     group: &AccountGroupRow,
     unread: UnreadSummary,
 ) -> StorageResult<()> {
@@ -1472,6 +1884,8 @@ fn write_chat_list_row_for_group_tx(
                 .and_then(|state| state.last_read_timeline_at),
         )
         .fold(group.conversation_created_at, u64::max);
+    let direct_peer_presentation =
+        direct_peer_presentation_for_rebuild_tx(tx, local_account_id_hex, group)?;
     let now = unix_now_seconds();
     tx.execute_cached(
         "INSERT INTO chat_list_rows (
@@ -1486,12 +1900,16 @@ fn write_chat_list_row_for_group_tx(
             first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
             conversation_created_at, activity_sort_at, retained_activity_sort_at,
-            accepted_activity_insert_order, updated_at, self_membership
+            accepted_activity_insert_order, updated_at, self_membership,
+            direct_peer_presentation_version, direct_peer_account_id_hex,
+            direct_peer_display_name, direct_peer_avatar_url,
+            direct_peer_profile_created_at, direct_peer_presentation_state
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30,
+            ?31, ?32, ?33, ?34, ?35, ?36
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1529,7 +1947,13 @@ fn write_chat_list_row_for_group_tx(
                 excluded.accepted_activity_insert_order
             ),
             updated_at = excluded.updated_at,
-            self_membership = excluded.self_membership",
+            self_membership = excluded.self_membership,
+            direct_peer_presentation_version = excluded.direct_peer_presentation_version,
+            direct_peer_account_id_hex = excluded.direct_peer_account_id_hex,
+            direct_peer_display_name = excluded.direct_peer_display_name,
+            direct_peer_avatar_url = excluded.direct_peer_avatar_url,
+            direct_peer_profile_created_at = excluded.direct_peer_profile_created_at,
+            direct_peer_presentation_state = excluded.direct_peer_presentation_state",
         params![
             &group.group_id_hex,
             bool_i64(group.archived),
@@ -1594,10 +2018,422 @@ fn write_chat_list_row_for_group_tx(
             accepted_activity_insert_order,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
+            direct_peer_presentation
+                .as_ref()
+                .map(|value| i64::from(value.schema_version))
+                .unwrap_or(i64::from(DIRECT_PEER_PRESENTATION_SCHEMA_VERSION)),
+            direct_peer_presentation
+                .as_ref()
+                .and_then(|value| value.peer_account_id_hex.as_deref()),
+            direct_peer_presentation
+                .as_ref()
+                .and_then(|value| value.display_name.as_deref()),
+            direct_peer_presentation
+                .as_ref()
+                .and_then(|value| value.avatar_url.as_deref()),
+            optional_u64_to_i64(
+                direct_peer_presentation
+                    .as_ref()
+                    .and_then(|value| value.profile_created_at)
+            )?,
+            direct_peer_presentation
+                .as_ref()
+                .map(|value| value.state.as_str())
+                .unwrap_or_else(|| DirectPeerPresentationState::Absent.as_str()),
         ],
     )
     .storage()?;
     Ok(())
+}
+
+fn direct_peer_presentation_for_rebuild_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group: &AccountGroupRow,
+) -> StorageResult<Option<DirectPeerPresentation>> {
+    let existing = stored_direct_peer_presentation_tx(tx, &group.group_id_hex)?;
+    let current_peer = current_direct_peer_account_id_tx(
+        tx,
+        local_account_id_hex,
+        &group.group_id_hex,
+        &group.profile_name,
+    )?;
+    let Some(current_peer) = current_peer else {
+        return Ok(existing.map(|_| DirectPeerPresentation {
+            schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+            peer_account_id_hex: None,
+            display_name: None,
+            avatar_url: None,
+            profile_created_at: None,
+            state: DirectPeerPresentationState::Invalidated,
+        }));
+    };
+    if let Some(existing) = existing
+        && existing.schema_version == DIRECT_PEER_PRESENTATION_SCHEMA_VERSION
+        && existing.peer_account_id_hex.as_deref() == Some(current_peer.as_str())
+        && existing.state != DirectPeerPresentationState::Invalidated
+    {
+        return Ok(Some(existing));
+    }
+    Ok(Some(DirectPeerPresentation {
+        schema_version: DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+        peer_account_id_hex: Some(current_peer),
+        display_name: None,
+        avatar_url: None,
+        profile_created_at: None,
+        state: DirectPeerPresentationState::Absent,
+    }))
+}
+
+fn current_direct_peer_account_id_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    group_name: &str,
+) -> StorageResult<Option<String>> {
+    if !group_name.trim().is_empty() {
+        return Ok(None);
+    }
+    let local = local_account_id_hex.trim().to_ascii_lowercase();
+    if local.is_empty() {
+        return Ok(None);
+    }
+    tx.query_row_cached(
+        "SELECT peer.member_id_hex
+         FROM direct_conversation_members AS peer
+         JOIN account_groups AS ag ON ag.group_id_hex = peer.group_id_hex
+         WHERE peer.group_id_hex = ?1
+           AND ag.member_count = 2
+           AND lower(peer.member_id_hex) != ?2
+           AND EXISTS (
+                SELECT 1 FROM direct_conversation_members AS local_member
+                WHERE local_member.group_id_hex = peer.group_id_hex
+                  AND lower(local_member.member_id_hex) = ?2
+           )
+           AND (
+                SELECT COUNT(*) FROM direct_conversation_members AS member_count
+                WHERE member_count.group_id_hex = peer.group_id_hex
+           ) = 2
+         LIMIT 1",
+        params![group_id_hex, local],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .storage()
+    .map(|peer| peer.map(|value| value.trim().to_ascii_lowercase()))
+}
+
+fn stored_direct_peer_presentation_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<Option<DirectPeerPresentation>> {
+    tx.query_row_cached(
+        "SELECT direct_peer_presentation_version, direct_peer_account_id_hex,
+                direct_peer_display_name, direct_peer_avatar_url,
+                direct_peer_profile_created_at, direct_peer_presentation_state
+         FROM chat_list_rows
+         WHERE group_id_hex = ?1",
+        params![group_id_hex],
+        direct_peer_presentation_from_row,
+    )
+    .optional()
+    .storage()
+    .map(Option::flatten)
+}
+
+fn direct_peer_presentations_for_group_ids_tx(
+    tx: &Connection,
+    group_ids_hex: &[String],
+) -> StorageResult<HashMap<String, Option<DirectPeerPresentation>>> {
+    let mut presentations = HashMap::with_capacity(group_ids_hex.len());
+    for group_ids_hex in group_ids_hex.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = vec!["?"; group_ids_hex.len()].join(", ");
+        let sql = format!(
+            "SELECT group_id_hex, direct_peer_presentation_version,
+                    direct_peer_account_id_hex, direct_peer_display_name,
+                    direct_peer_avatar_url, direct_peer_profile_created_at,
+                    direct_peer_presentation_state
+             FROM chat_list_rows
+             WHERE group_id_hex IN ({placeholders})"
+        );
+        let mut statement = tx.prepare(&sql).storage()?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(group_ids_hex.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    direct_peer_presentation_from_columns(row, 1)?,
+                ))
+            })
+            .storage()?;
+        for row in rows {
+            let (group_id_hex, presentation) = row.storage()?;
+            presentations.insert(group_id_hex, presentation);
+        }
+    }
+    Ok(presentations)
+}
+
+fn direct_peer_presentation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<DirectPeerPresentation>> {
+    direct_peer_presentation_from_columns(row, 0)
+}
+
+fn project_direct_peer_profile_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    profile: &DirectPeerProfile,
+) -> StorageResult<Vec<ChatListRow>> {
+    let local = local_account_id_hex.trim().to_ascii_lowercase();
+    let peer = profile.peer_account_id_hex.trim().to_ascii_lowercase();
+    if local.is_empty() || peer.is_empty() || local == peer {
+        return Ok(Vec::new());
+    }
+    let group_ids = direct_conversation_group_ids_for_peer_tx(tx, &local, &peer)?;
+    // SQLite INTEGER is signed even though Nostr timestamps are represented as
+    // u64. Saturating accepted metadata keeps an oversized remote timestamp
+    // from making every chat-list hydration fail or rewrite forever.
+    let profile_created_at = profile.profile_created_at.min(i64::MAX as u64);
+
+    let mut rows = Vec::with_capacity(group_ids.len());
+    for group_id_hex in group_ids {
+        let existing = stored_direct_peer_presentation_tx(tx, &group_id_hex)?;
+        if !direct_peer_profile_projection_needed(
+            existing.as_ref(),
+            &peer,
+            profile,
+            profile_created_at,
+        ) {
+            continue;
+        }
+        let changed = tx
+            .execute_cached(
+                "UPDATE chat_list_rows
+             SET direct_peer_presentation_version = ?2,
+                 direct_peer_account_id_hex = ?3,
+                 direct_peer_display_name = ?4,
+                 direct_peer_avatar_url = ?5,
+                 direct_peer_profile_created_at = ?6,
+                 direct_peer_presentation_state = ?7,
+                 updated_at = ?8
+             WHERE group_id_hex = ?1",
+                params![
+                    group_id_hex,
+                    i64::from(DIRECT_PEER_PRESENTATION_SCHEMA_VERSION),
+                    peer,
+                    profile.display_name,
+                    profile.avatar_url,
+                    u64_to_i64(profile_created_at)?,
+                    DirectPeerPresentationState::Current.as_str(),
+                    u64_to_i64(unix_now_seconds())?,
+                ],
+            )
+            .storage()?;
+        if changed > 0
+            && let Some(row) = chat_list_row_tx(tx, &group_id_hex)?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Determine whether a bounded hydration batch would change any exact Direct
+/// chat. One indexed set query replaces the prior query-per-peer hot path.
+fn direct_peer_profile_hydration_needed_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    profiles: &[DirectPeerProfile],
+    unavailable_peer_ids: &HashSet<String>,
+) -> StorageResult<bool> {
+    let local = local_account_id_hex.trim().to_ascii_lowercase();
+    if local.is_empty() {
+        return Ok(false);
+    }
+
+    let mut profiles_by_peer = HashMap::<String, Vec<&DirectPeerProfile>>::new();
+    for profile in profiles {
+        let peer = profile.peer_account_id_hex.trim().to_ascii_lowercase();
+        if !peer.is_empty() && peer != local {
+            profiles_by_peer.entry(peer).or_default().push(profile);
+        }
+    }
+    let mut peer_ids = profiles_by_peer.keys().cloned().collect::<HashSet<_>>();
+    peer_ids.extend(
+        unavailable_peer_ids
+            .iter()
+            .filter(|peer| !peer.is_empty() && *peer != &local)
+            .cloned(),
+    );
+    let peer_ids = peer_ids.into_iter().collect::<Vec<_>>();
+    for peer_ids in peer_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK.saturating_sub(1)) {
+        let sql = direct_peer_profile_hydration_needed_sql(peer_ids.len());
+        let mut parameters = peer_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        parameters.push(local.as_str());
+        let mut statement = tx.prepare(&sql).storage()?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    direct_peer_presentation_from_columns(row, 1)?,
+                ))
+            })
+            .storage()?;
+        for row in rows {
+            let (peer, existing) = row.storage()?;
+            if let Some(peer_profiles) = profiles_by_peer.get(&peer) {
+                if peer_profiles.iter().any(|profile| {
+                    direct_peer_profile_projection_needed(
+                        existing.as_ref(),
+                        &peer,
+                        profile,
+                        profile.profile_created_at.min(i64::MAX as u64),
+                    )
+                }) {
+                    return Ok(true);
+                }
+            } else if unavailable_peer_ids.contains(&peer)
+                && existing.is_some_and(|presentation| {
+                    presentation.peer_account_id_hex.as_deref() == Some(peer.as_str())
+                        && presentation.state == DirectPeerPresentationState::Current
+                })
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// SQL for the batch hydration preflight, parameterized by a non-empty peer
+/// page. Peer parameters precede the final local-account parameter.
+fn direct_peer_profile_hydration_needed_sql(peer_count: usize) -> String {
+    debug_assert!(peer_count > 0);
+    let placeholders = vec!["?"; peer_count].join(", ");
+    format!(
+        "SELECT peer_member.member_id_hex,
+                    row.direct_peer_presentation_version,
+                    row.direct_peer_account_id_hex,
+                    row.direct_peer_display_name,
+                    row.direct_peer_avatar_url,
+                    row.direct_peer_profile_created_at,
+                    row.direct_peer_presentation_state
+             FROM direct_conversation_members AS peer_member
+             JOIN account_groups AS ag
+               ON ag.group_id_hex = peer_member.group_id_hex
+             JOIN chat_list_rows AS row
+               ON row.group_id_hex = peer_member.group_id_hex
+             WHERE peer_member.member_id_hex IN ({placeholders})
+               AND trim(ag.profile_name) = ''
+               AND ag.member_count = 2
+               AND EXISTS (
+                    SELECT 1 FROM direct_conversation_members AS local_member
+                    WHERE local_member.group_id_hex = peer_member.group_id_hex
+                      AND local_member.member_id_hex = ?
+               )
+               AND (
+                    SELECT COUNT(*) FROM direct_conversation_members AS member_count
+                    WHERE member_count.group_id_hex = peer_member.group_id_hex
+               ) = 2"
+    )
+}
+
+fn direct_peer_profile_projection_needed(
+    existing: Option<&DirectPeerPresentation>,
+    peer_account_id_hex: &str,
+    profile: &DirectPeerProfile,
+    profile_created_at: u64,
+) -> bool {
+    !existing.is_some_and(|existing| {
+        existing.peer_account_id_hex.as_deref() == Some(peer_account_id_hex)
+            && (existing
+                .profile_created_at
+                .is_some_and(|created_at| created_at > profile_created_at)
+                || (existing.profile_created_at == Some(profile_created_at)
+                    && existing.display_name == profile.display_name
+                    && existing.avatar_url == profile.avatar_url
+                    && existing.state == DirectPeerPresentationState::Current))
+    })
+}
+
+fn mark_direct_peer_profile_unavailable_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    peer_account_id_hex: &str,
+) -> StorageResult<Vec<ChatListRow>> {
+    let local = local_account_id_hex.trim().to_ascii_lowercase();
+    let peer = peer_account_id_hex.trim().to_ascii_lowercase();
+    if local.is_empty() || peer.is_empty() || local == peer {
+        return Ok(Vec::new());
+    }
+    let group_ids = direct_conversation_group_ids_for_peer_tx(tx, &local, &peer)?;
+
+    let mut rows = Vec::with_capacity(group_ids.len());
+    for group_id_hex in group_ids {
+        let changed = tx
+            .execute_cached(
+                "UPDATE chat_list_rows
+             SET direct_peer_presentation_state = ?2,
+                 updated_at = ?3
+             WHERE group_id_hex = ?1
+               AND direct_peer_account_id_hex = ?4
+               AND direct_peer_presentation_state = ?5",
+                params![
+                    group_id_hex,
+                    DirectPeerPresentationState::LastKnown.as_str(),
+                    u64_to_i64(unix_now_seconds())?,
+                    peer,
+                    DirectPeerPresentationState::Current.as_str(),
+                ],
+            )
+            .storage()?;
+        if changed > 0
+            && let Some(row) = chat_list_row_tx(tx, &group_id_hex)?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn direct_conversation_group_ids_for_peer_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    peer_account_id_hex: &str,
+) -> StorageResult<Vec<String>> {
+    let mut statement = tx
+        .prepare_cached(direct_conversation_group_ids_for_peer_sql())
+        .storage()?;
+    statement
+        .query_map(params![local_account_id_hex, peer_account_id_hex], |row| {
+            row.get::<_, String>(0)
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+}
+
+fn direct_conversation_group_ids_for_peer_sql() -> &'static str {
+    // Member ids are normalized on every index write. Exact comparisons keep
+    // the peer covering index usable while the remaining predicates preserve
+    // the exact two-member Direct-chat contract.
+    "SELECT peer_member.group_id_hex
+             FROM direct_conversation_members AS peer_member
+             JOIN account_groups AS ag
+               ON ag.group_id_hex = peer_member.group_id_hex
+             WHERE peer_member.member_id_hex = ?2
+               AND trim(ag.profile_name) = ''
+               AND ag.member_count = 2
+               AND EXISTS (
+                    SELECT 1 FROM direct_conversation_members AS local_member
+                    WHERE local_member.group_id_hex = peer_member.group_id_hex
+                      AND local_member.member_id_hex = ?1
+               )
+               AND (
+                    SELECT COUNT(*) FROM direct_conversation_members AS member_count
+                    WHERE member_count.group_id_hex = peer_member.group_id_hex
+               ) = 2
+             ORDER BY peer_member.group_id_hex"
 }
 
 #[derive(Clone, Debug)]
@@ -2429,7 +3265,13 @@ const CHAT_LIST_ROW_SELECT_LIST: &str =
                 SELECT COUNT(*)
                 FROM chat_pin_positions AS earlier_pin
                 WHERE earlier_pin.ordinal < pin.ordinal
-            ) END";
+            ) END,
+            row.direct_peer_presentation_version,
+            row.direct_peer_account_id_hex,
+            row.direct_peer_display_name,
+            row.direct_peer_avatar_url,
+            row.direct_peer_profile_created_at,
+            row.direct_peer_presentation_state";
 
 const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
     "SELECT row.group_id_hex, row.archived, row.pending_confirmation,
@@ -2457,7 +3299,13 @@ const CHAT_LIST_ROW_SELECT_AND_JOINS: &str =
                 SELECT COUNT(*)
                 FROM chat_pin_positions AS earlier_pin
                 WHERE earlier_pin.ordinal < pin.ordinal
-            ) END
+            ) END,
+            row.direct_peer_presentation_version,
+            row.direct_peer_account_id_hex,
+            row.direct_peer_display_name,
+            row.direct_peer_avatar_url,
+            row.direct_peer_profile_created_at,
+            row.direct_peer_presentation_state
      FROM chat_list_rows AS row
      LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
      LEFT JOIN chat_notification_settings AS mute
@@ -2526,6 +3374,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let pinned_position = row
         .get::<_, Option<i64>>(34)?
         .and_then(|value| u32::try_from(value).ok());
+    let direct_peer_presentation = direct_peer_presentation_from_columns(row, 35)?;
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
         pinned,
@@ -2545,6 +3394,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             image_upload_key_hex,
             media_type,
         }),
+        direct_peer_presentation,
         last_message,
         unread_count,
         has_unread: unread_count > 0 || manually_marked_unread,
@@ -2567,6 +3417,67 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         // `cgka_leave_requests` after the row is decoded.
         leave_requested_at_ms: None,
     })
+}
+
+fn direct_peer_presentation_from_columns(
+    row: &rusqlite::Row<'_>,
+    start: usize,
+) -> rusqlite::Result<Option<DirectPeerPresentation>> {
+    let raw_version = row.get::<_, i64>(start)?;
+    let schema_version = u16::try_from(raw_version).unwrap_or_default();
+    let mut peer_account_id_hex = row.get::<_, Option<String>>(start + 1)?;
+    let mut display_name = row.get::<_, Option<String>>(start + 2)?;
+    let mut avatar_url = row.get::<_, Option<String>>(start + 3)?;
+    let raw_profile_created_at = row.get::<_, Option<i64>>(start + 4)?;
+    let mut profile_created_at = raw_profile_created_at.and_then(|value| value.try_into().ok());
+    let mut state = DirectPeerPresentationState::from_storage(&row.get::<_, String>(start + 5)?);
+    if schema_version != DIRECT_PEER_PRESENTATION_SCHEMA_VERSION {
+        peer_account_id_hex = None;
+        display_name = None;
+        avatar_url = None;
+        profile_created_at = None;
+        state = DirectPeerPresentationState::Invalidated;
+    } else {
+        match state {
+            DirectPeerPresentationState::Absent => {
+                display_name = None;
+                avatar_url = None;
+                profile_created_at = None;
+            }
+            DirectPeerPresentationState::Current | DirectPeerPresentationState::LastKnown
+                if peer_account_id_hex.is_none() || profile_created_at.is_none() =>
+            {
+                peer_account_id_hex = None;
+                display_name = None;
+                avatar_url = None;
+                profile_created_at = None;
+                state = DirectPeerPresentationState::Invalidated;
+            }
+            DirectPeerPresentationState::Current | DirectPeerPresentationState::LastKnown => {}
+            DirectPeerPresentationState::Invalidated => {
+                peer_account_id_hex = None;
+                display_name = None;
+                avatar_url = None;
+                profile_created_at = None;
+            }
+        }
+    }
+    if peer_account_id_hex.is_none()
+        && display_name.is_none()
+        && avatar_url.is_none()
+        && profile_created_at.is_none()
+        && state == DirectPeerPresentationState::Absent
+    {
+        return Ok(None);
+    }
+    Ok(Some(DirectPeerPresentation {
+        schema_version,
+        peer_account_id_hex,
+        display_name,
+        avatar_url,
+        profile_created_at,
+        state,
+    }))
 }
 
 fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {

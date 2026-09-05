@@ -1668,6 +1668,7 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         group_name: title.to_owned(),
         avatar_url: None,
         avatar: None,
+        direct_peer_presentation: None,
         last_message: None,
         unread_count: 0,
         has_unread: false,
@@ -1687,6 +1688,387 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         muted_until_ms: None,
         leave_requested_at_ms: None,
     }
+}
+
+#[tokio::test]
+async fn chat_list_subscription_updates_when_direct_peer_presentation_changes() {
+    const UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(directory.path())
+        .create_account("alice")
+        .unwrap();
+    let peer_account_id_hex = "bb".repeat(32);
+    let group_id_hex = "11".repeat(32);
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    app.account_storage("alice")
+        .unwrap()
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![storage_sqlite::StoredAccountGroup {
+                    group_id_hex: group_id_hex.clone(),
+                    endpoint: "wss://relay.example".to_owned(),
+                    profile_name: String::new(),
+                    profile_description: String::new(),
+                    image_hash_hex: String::new(),
+                    image_key_hex: String::new(),
+                    image_nonce_hex: String::new(),
+                    image_upload_key_hex: String::new(),
+                    image_media_type: None,
+                    admin_keys_hex: String::new(),
+                    archived: false,
+                    pending_confirmation: false,
+                    member_count: Some(2),
+                    direct_member_ids_hex: Some(vec![
+                        account.account_id_hex.clone(),
+                        peer_account_id_hex.clone(),
+                    ]),
+                    welcomer_account_id_hex: None,
+                    via_welcome_message_id_hex: None,
+                    nostr_routing_last_epoch: 0,
+                    prior_nostr_routes: Vec::new(),
+                    self_membership: storage_sqlite::SelfMembership::Member,
+                    components: Vec::new(),
+                }],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    app.remember_directory_profile(
+        &peer_account_id_hex,
+        &UserProfileMetadata {
+            display_name: Some("Before".to_owned()),
+            created_at: 1,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut subscription = runtime.subscribe_chat_list("alice", false).await.unwrap();
+    let stale_before_roster_change = subscription.snapshot[0].clone();
+    assert_eq!(
+        subscription.snapshot[0]
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.display_name.as_deref()),
+        Some("Before")
+    );
+
+    app.remember_directory_profile_if_newer(
+        &peer_account_id_hex,
+        &UserProfileMetadata {
+            display_name: Some("After".to_owned()),
+            created_at: 2,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+
+    let update = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("profile refresh should wake the chat-list subscription")
+        .expect("chat-list update");
+    assert!(matches!(
+        update,
+        RuntimeChatListUpdate::Row {
+            trigger: ChatListUpdateTrigger::DirectPeerPresentationChanged,
+            row,
+        } if row
+            .direct_peer_presentation
+            .as_ref()
+            .and_then(|presentation| presentation.display_name.as_deref())
+            == Some("After")
+    ));
+
+    let replacement_peer = "cc".repeat(32);
+    app.account_storage("alice")
+        .unwrap()
+        .save_account_projection_state(
+            &storage_sqlite::StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![storage_sqlite::StoredAccountGroup {
+                    group_id_hex: group_id_hex.clone(),
+                    endpoint: "wss://relay.example".to_owned(),
+                    profile_name: String::new(),
+                    profile_description: String::new(),
+                    image_hash_hex: String::new(),
+                    image_key_hex: String::new(),
+                    image_nonce_hex: String::new(),
+                    image_upload_key_hex: String::new(),
+                    image_media_type: None,
+                    admin_keys_hex: String::new(),
+                    archived: false,
+                    pending_confirmation: false,
+                    member_count: Some(2),
+                    direct_member_ids_hex: Some(vec![
+                        account.account_id_hex.clone(),
+                        replacement_peer.clone(),
+                    ]),
+                    welcomer_account_id_hex: None,
+                    via_welcome_message_id_hex: None,
+                    nostr_routing_last_epoch: 0,
+                    prior_nostr_routes: Vec::new(),
+                    self_membership: storage_sqlite::SelfMembership::Member,
+                    components: Vec::new(),
+                }],
+                ..storage_sqlite::StoredAccountState::default()
+            },
+            16,
+            300,
+        )
+        .unwrap();
+    // A delayed profile wake must be treated as a key, not as an authoritative
+    // row payload: the roster has already replaced the former peer.
+    app.direct_peer_presentation_events
+        .send(crate::DirectPeerPresentationUpdate {
+            account_id_hex: account.account_id_hex.clone(),
+            account_label: account.label.clone(),
+            group_id_hex: group_id_hex.clone(),
+        })
+        .unwrap();
+
+    let update = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("delayed profile wake should refresh the current row")
+        .expect("chat-list update");
+    assert!(
+        matches!(
+            &update,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                row,
+            } if row.direct_peer_presentation == Some(storage_sqlite::DirectPeerPresentation {
+                schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+                peer_account_id_hex: None,
+                display_name: None,
+                avatar_url: None,
+                profile_created_at: None,
+                state: storage_sqlite::DirectPeerPresentationState::Invalidated,
+            })
+        ),
+        "delayed wake exposed an unexpected row: {update:?}"
+    );
+
+    // Ordinary projection rows and direct-peer wakes use separate broadcast
+    // channels. A delayed ordinary row must not restore presentation captured
+    // before the roster replacement after the canonical wake was delivered.
+    let mut delayed_unread_update = stale_before_roster_change.clone();
+    delayed_unread_update.unread_count = 1;
+    delayed_unread_update.has_unread = true;
+    runtime.publish_chat_list_projection_update(
+        account.account_id_hex.clone(),
+        account.label.clone(),
+        group_id_hex.clone(),
+        Some(delayed_unread_update),
+        ChatListUpdateTrigger::UnreadChanged,
+    );
+    let delayed = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the ordinary projection change should still be delivered")
+        .expect("chat-list update");
+    assert!(
+        matches!(
+            &delayed,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::UnreadChanged,
+                row,
+            } if row.unread_count == 1
+                && row.direct_peer_presentation == Some(storage_sqlite::DirectPeerPresentation {
+                    schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+                    peer_account_id_hex: None,
+                    display_name: None,
+                    avatar_url: None,
+                    profile_created_at: None,
+                    state: storage_sqlite::DirectPeerPresentationState::Invalidated,
+                })
+        ),
+        "a delayed ordinary projection did not preserve current peer presentation: {delayed:?}"
+    );
+
+    // The inverse transition is just as important: a payload captured while
+    // the conversation looked like a named group must not hide presentation
+    // after the durable row has become direct.
+    let mut delayed_named_group = stale_before_roster_change;
+    delayed_named_group.conversation_kind = crate::ChatConversationKind::Group;
+    delayed_named_group.direct_peer_presentation = None;
+    delayed_named_group.unread_count = 2;
+    delayed_named_group.has_unread = true;
+    runtime.publish_chat_list_projection_update(
+        account.account_id_hex.clone(),
+        account.label.clone(),
+        group_id_hex.clone(),
+        Some(delayed_named_group),
+        ChatListUpdateTrigger::UnreadChanged,
+    );
+    let delayed = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the stale named-group projection should still be delivered")
+        .expect("chat-list update");
+    assert!(
+        matches!(
+            &delayed,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::UnreadChanged,
+                row,
+            } if row.unread_count == 2
+                && row.direct_peer_presentation == Some(storage_sqlite::DirectPeerPresentation {
+                    schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+                    peer_account_id_hex: None,
+                    display_name: None,
+                    avatar_url: None,
+                    profile_created_at: None,
+                    state: storage_sqlite::DirectPeerPresentationState::Invalidated,
+                })
+        ),
+        "a delayed named-group projection hid current peer presentation: {delayed:?}"
+    );
+
+    // An ordinary row can be the only carrier for an unread/preview update.
+    // If its presentation revalidation fails, deliver those semantic fields
+    // without replaying the captured (potentially cross-peer) presentation.
+    let RuntimeChatListUpdate::Row { row, .. } = delayed else {
+        panic!("expected the delayed ordinary row")
+    };
+    let mut lookup_failure_update = *row;
+    lookup_failure_update.unread_count = 3;
+    lookup_failure_update.has_unread = true;
+    app.account_storage(&account.label)
+        .unwrap()
+        .close()
+        .unwrap();
+    let ordinary_lookup_failures_before =
+        super::subscriptions::ORDINARY_PRESENTATION_LOOKUP_FAILURES_FOR_TEST
+            .load(std::sync::atomic::Ordering::Relaxed);
+    runtime.publish_chat_list_projection_update(
+        account.account_id_hex.clone(),
+        account.label.clone(),
+        group_id_hex.clone(),
+        Some(lookup_failure_update),
+        ChatListUpdateTrigger::UnreadChanged,
+    );
+    tokio::time::timeout(UPDATE_TIMEOUT, async {
+        loop {
+            if super::subscriptions::ORDINARY_PRESENTATION_LOOKUP_FAILURES_FOR_TEST
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > ordinary_lookup_failures_before
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the ordinary event's presentation lookup should fail");
+    app.account_storages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&account.label);
+    let lookup_failure = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the ordinary projection change must survive a presentation lookup failure")
+        .expect("chat-list update");
+    assert!(
+        matches!(
+            &lookup_failure,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::UnreadChanged,
+                row,
+            } if row.unread_count == 3 && row.direct_peer_presentation.is_none()
+        ),
+        "a presentation lookup failure dropped or leaked presentation into the ordinary update: {lookup_failure:?}"
+    );
+
+    // The bounded retry now reopens the same durable database. This simulates
+    // recovery from a transient cached-handle failure without changing the
+    // semantic unread update that the first emission carried.
+    let recovered = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the bounded presentation retry should recover")
+        .expect("chat-list recovery update");
+    assert!(
+        matches!(
+            &recovered,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                row,
+            } if row.unread_count == 3
+                && row.direct_peer_presentation == Some(storage_sqlite::DirectPeerPresentation {
+                    schema_version: storage_sqlite::DIRECT_PEER_PRESENTATION_SCHEMA_VERSION,
+                    peer_account_id_hex: None,
+                    display_name: None,
+                    avatar_url: None,
+                    profile_created_at: None,
+                    state: storage_sqlite::DirectPeerPresentationState::Invalidated,
+                })
+        ),
+        "the bounded retry did not restore current presentation: {recovered:?}"
+    );
+
+    // The direct-presentation wake itself gets the same bounded recovery. Make
+    // a durable profile change without broadcasting it, fail the wake's first
+    // full-row lookup through a closed cached handle, then repair that handle
+    // before the retry runs.
+    let storage = app.account_storage(&account.label).unwrap();
+    storage
+        .project_direct_peer_profile(
+            &account.account_id_hex,
+            &storage_sqlite::DirectPeerProfile {
+                peer_account_id_hex: replacement_peer,
+                display_name: Some("Direct Retry".to_owned()),
+                avatar_url: None,
+                profile_created_at: 3,
+            },
+        )
+        .unwrap();
+    storage.close().unwrap();
+    let lookup_failures_before = super::subscriptions::DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST
+        .load(std::sync::atomic::Ordering::Relaxed);
+    app.direct_peer_presentation_events
+        .send(crate::DirectPeerPresentationUpdate {
+            account_id_hex: account.account_id_hex.clone(),
+            account_label: account.label.clone(),
+            group_id_hex: group_id_hex.clone(),
+        })
+        .unwrap();
+    tokio::time::timeout(UPDATE_TIMEOUT, async {
+        loop {
+            if super::subscriptions::DIRECT_PEER_WAKE_LOOKUP_FAILURES_FOR_TEST
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > lookup_failures_before
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the direct-peer wake's initial lookup should fail");
+    app.account_storages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&account.label);
+
+    let recovered = tokio::time::timeout(UPDATE_TIMEOUT, subscription.recv())
+        .await
+        .expect("the direct-peer wake lookup should recover")
+        .expect("chat-list recovery update");
+    assert!(
+        matches!(
+            &recovered,
+            RuntimeChatListUpdate::Row {
+                trigger: ChatListUpdateTrigger::DirectPeerPresentationChanged,
+                row,
+            } if row
+                .direct_peer_presentation
+                .as_ref()
+                .and_then(|presentation| presentation.display_name.as_deref())
+                == Some("Direct Retry")
+        ),
+        "the direct-peer wake retry did not load the current row: {recovered:?}"
+    );
 }
 
 fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMessageRecord {

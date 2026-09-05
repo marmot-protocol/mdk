@@ -116,6 +116,8 @@ mod migration_0057_openmls_values_msgpack;
 mod migration_0058_processed_transport_ids;
 #[path = "migrations/0059_chat_list_unread_membership.rs"]
 mod migration_0059_chat_list_unread_membership;
+#[path = "migrations/0060_direct_peer_presentation.rs"]
+mod migration_0060_direct_peer_presentation;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -425,6 +427,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 59,
         name: "0059_chat_list_unread_membership",
         apply: migration_0059_chat_list_unread_membership::apply,
+    },
+    Migration {
+        version: 60,
+        name: "0060_direct_peer_presentation",
+        apply: migration_0060_direct_peer_presentation::apply,
     },
 ];
 
@@ -953,7 +960,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 59,
+                found: 60,
                 latest_supported: 46,
             }
         ));
@@ -1009,7 +1016,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 59,
+                found: 60,
                 latest_supported: 46,
             }
         ));
@@ -1313,7 +1320,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 59,
+                found: 60,
                 latest_supported: 46,
             }
         ));
@@ -2200,6 +2207,61 @@ mod tests {
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(applied_migrations(&reopened), expected_migrations());
+    }
+
+    #[test]
+    fn direct_peer_presentation_migration_preserves_existing_rows_as_absent() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+             VALUES ('group', 'wss://relay.example', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_list_rows (group_id_hex, updated_at)
+             VALUES ('group', 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        for column in [
+            "direct_peer_presentation_version",
+            "direct_peer_account_id_hex",
+            "direct_peer_display_name",
+            "direct_peer_avatar_url",
+            "direct_peer_profile_created_at",
+            "direct_peer_presentation_state",
+        ] {
+            assert!(connection_has_column(&conn, "chat_list_rows", column));
+        }
+        let migrated = conn
+            .query_row(
+                "SELECT direct_peer_presentation_version,
+                        direct_peer_account_id_hex,
+                        direct_peer_display_name,
+                        direct_peer_avatar_url,
+                        direct_peer_profile_created_at,
+                        direct_peer_presentation_state
+                 FROM chat_list_rows WHERE group_id_hex = 'group'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(migrated, (1, None, None, None, None, "absent".to_owned()));
     }
 
     #[test]
