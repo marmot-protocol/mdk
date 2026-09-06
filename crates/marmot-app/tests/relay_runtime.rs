@@ -11796,6 +11796,109 @@ async fn outbox_acceptance_external_signer_required_discovery_failure_does_not_p
     assert_required_discovery_failure_does_not_publish_defaults(true).await;
 }
 
+async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
+    let discovery = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    discovery.run().await.unwrap();
+    let discovery_url = discovery.url().await.to_string();
+    let healthy = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    healthy.run().await.unwrap();
+    let healthy_url = healthy.url().await.to_string();
+    // W1 reaches EOSE with no inbox declaration. W2 never completes its
+    // handshake: W1's absence cannot establish what W2 may hold.
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_url = format!("ws://{}", unavailable.local_addr().unwrap());
+    let held_outbox = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = unavailable.accept().await {
+            held.push(socket);
+        }
+    });
+    let keys = Keys::generate();
+    let publisher =
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    publisher
+        .publish_event(
+            &[endpoint(&discovery_url)],
+            &NostrTransportEvent::new_unsigned(
+                keys.public_key().to_hex(),
+                10002,
+                vec![
+                    vec!["r".into(), healthy_url.clone(), "write".into()],
+                    vec!["r".into(), unavailable_url, "write".into()],
+                ],
+                String::new(),
+            ),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(publications.swap(0, Ordering::SeqCst), 1);
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    ));
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&healthy_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = timeout(Duration::from_secs(40), async {
+        if external_signer {
+            runtime
+                .login_external_signer(
+                    keys.public_key().to_hex(),
+                    TestExternalAccountSigner { keys },
+                    request,
+                )
+                .await
+        } else {
+            runtime
+                .create_or_import_account(AccountSetupRequest {
+                    import_nsec: Some(zeroize::Zeroizing::new(
+                        keys.secret_key().to_bech32().unwrap(),
+                    )),
+                    ..request
+                })
+                .await
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    held_outbox.abort();
+    let _ = held_outbox.await;
+    assert!(matches!(
+        result.expect("partial outbox discovery must remain bounded"),
+        Err(AppError::RelayDirectory(_))
+    ));
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        0,
+        "a healthy-empty outbox must not authorize overwriting an unavailable sibling's metadata"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_partial_outbox_failure_does_not_publish_defaults() {
+    partial_outbox_failure_does_not_publish_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_partial_outbox_failure_does_not_publish_defaults() {
+    partial_outbox_failure_does_not_publish_defaults(true).await;
+}
+
 async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empty_outbox: bool) {
     use nostr::prelude::ToBech32;
 
