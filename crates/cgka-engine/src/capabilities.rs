@@ -29,10 +29,10 @@ pub(crate) fn leaf_capabilities(
     ciphersuite: Ciphersuite,
     protocol_profile: ProtocolProfile,
 ) -> Capabilities {
-    let mut ext_types: Vec<ExtensionType> = vec![
-        ExtensionType::RequiredCapabilities,
-        ExtensionType::AppDataDictionary,
-    ];
+    // RFC 9420 section 7.2 forbids advertising default extension types such
+    // as RequiredCapabilities. Their support is implicit; the GroupContext
+    // still carries its RequiredCapabilities extension as usual.
+    let mut ext_types: Vec<ExtensionType> = vec![ExtensionType::AppDataDictionary];
     if protocol_profile == ProtocolProfile::Legacy {
         ext_types.push(crate::account_identity_proof::account_identity_proof_capability());
     }

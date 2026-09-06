@@ -2412,6 +2412,103 @@ async fn create_group_rejects_relabelled_legacy_key_package_profile() {
 }
 
 #[tokio::test]
+async fn fresh_key_packages_omit_default_mls_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let mut alice = build_profile_client_on_storage(
+            b"alice",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let kp = alice.fresh_key_package().await.unwrap();
+        let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+        let key_package = match message.extract() {
+            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+            other => panic!("expected KeyPackage, got {other:?}"),
+        }
+        .validate(
+            &openmls_rust_crypto::RustCrypto::default(),
+            ProtocolVersion::Mls10,
+        )
+        .unwrap();
+        assert_non_default_mls_capabilities(key_package.leaf_node().capabilities());
+        assert_eq!(
+            key_package
+                .leaf_node()
+                .capabilities()
+                .extensions()
+                .contains(&ExtensionType::from(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)),
+            profile == ProtocolProfile::Legacy,
+        );
+    }
+}
+
+#[tokio::test]
+async fn founding_leaves_omit_default_mls_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
+        let (group_id, _) = alice
+            .create_group(CreateGroupRequest {
+                name: "capability advertisement".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_non_default_mls_capabilities(group.own_leaf_node().unwrap().capabilities());
+        // RequiredCapabilities remains a valid GroupContext extension even
+        // though its default type must not be advertised in LeafNode capabilities.
+        let required = group.extensions().required_capabilities().unwrap();
+        assert!(
+            required
+                .extension_types()
+                .contains(&ExtensionType::AppDataDictionary)
+        );
+        assert!(
+            required
+                .proposal_types()
+                .contains(&openmls::prelude::ProposalType::AppDataUpdate)
+        );
+    }
+}
+
+fn assert_non_default_mls_capabilities(capabilities: &Capabilities) {
+    // RFC 9420 section 7.2: default extension ids 1..=5 and proposal ids
+    // 1..=7 MUST NOT appear in the signed LeafNode capability lists.
+    for extension in capabilities.extensions() {
+        assert!(
+            !(1..=5).contains(&u16::from(*extension)),
+            "default extension {extension:?}"
+        );
+    }
+    for proposal in capabilities.proposals() {
+        assert!(
+            !(1..=7).contains(&u16::from(*proposal)),
+            "default proposal {proposal:?}"
+        );
+    }
+    assert!(
+        capabilities
+            .extensions()
+            .contains(&ExtensionType::AppDataDictionary)
+    );
+    assert!(
+        capabilities
+            .proposals()
+            .contains(&openmls::prelude::ProposalType::AppDataUpdate)
+    );
+}
+
+#[tokio::test]
 async fn fresh_key_package_uses_draft10_last_resort_component() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
