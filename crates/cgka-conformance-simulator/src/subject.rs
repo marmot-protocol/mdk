@@ -155,7 +155,7 @@ impl SubjectError {
         }
     }
 
-    fn unsupported(capability: SubjectCapability) -> Self {
+    pub(crate) fn unsupported(capability: SubjectCapability) -> Self {
         Self::new(
             "unsupported_capability",
             format!("subject does not support {capability}"),

@@ -46,7 +46,7 @@ not see post-removal messages.
 | `06_small_offline_backlog` | Recover 12 offline messages and a profile update, then exchange fresh traffic |
 
 These are explicit public acceptance companions, not evidence that every existing generated scenario has been
-replayed through the app. They begin the coverage expansion. Remaining work includes self-update/leave, re-add,
+replayed through the app. They begin the coverage expansion. Additional generated coverage is described below. Remaining work includes self-update,
 multiple groups, duplicate/reordered retained history, partitions, competing commits, and the broader generated
 catalog. Capability-preflight failures must stay visible as coverage gaps; do not discard incompatible assertions
 and call the original scenario covered.
@@ -60,7 +60,7 @@ The original and cap-only worktrees were preserved and their changes reconciled 
 ### Inventory existing generated families before expanding execution
 
 `cgka-conformance-app-inventory` checks the actual app adapter's action capabilities against a bounded selection
-from all twelve registered families. It defaults to seeds 7, 42 and 17001; explicit seed arguments replace them.
+from the twelve original families and three new public journey families. It defaults to seeds 7, 42 and 17001; explicit seed arguments replace them.
 It saves unchanged generated inputs only for action-compatible cases and records every rejected case with its missing
 capabilities. This is preflight coverage, not a test pass: each selected case must still pass its strict runtime oracle.
 
@@ -124,3 +124,68 @@ database snapshots. All runtime shutdown work happens before the final test asse
 
 Local run results for this work are recorded in the root handoff and the ignored evidence directory. The defect stays
 open until the large public assertion passes; smaller passing cases only establish their own listed contracts.
+
+
+## Seeded public companion families
+
+The public send/leave, membership re-entry and small offline recovery families are documented in
+[SCENARIOS.md](SCENARIOS.md#public-app-journey-families). Each input owns its public expectations; no engine
+assertions are stripped during replay. `Exactly` and bounded `Eventually` predicates now read public app epoch,
+member count and visible payload counts. Exact engine state and private pending work still fail capability preflight;
+virtual-time `Within`/`Never` assertions remain unsupported. `Eventually` bounds tick rounds, not wall time; the
+campaign child deadline separately bounds a stuck runtime operation.
+
+Run the ordinary generator/capability checks, then the explicit real-socket canaries:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p cgka-conformance-simulator \
+  --test public_app_families -- --test-threads=1
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p cgka-conformance-simulator \
+  --test public_app_families -- --ignored --test-threads=1
+```
+
+For broader execution, build the campaign binary, run one file-backed case per family as a canary, and then widen
+passing families to six cases at seeds 7, 42 and 17001. Use a fresh output directory for each invocation:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo run --release --locked -p cgka-conformance-simulator \
+  --bin cgka-conformance-campaign -- --family public-app-offline-recovery/v1 --seed 42 --cases 6 \
+  --storage file --case-timeout-secs 360 --out target/public-offline-seed42-attempt1
+```
+
+The input preserves the logical workload, assertions, family version and seed. It does not preserve cryptographic
+randomness or socket scheduling. These small generated cases do not close the known 1,024-message failure.
+
+
+### First generated execution results (2026-09-06)
+
+Five isolated membership re-entry cases passed at seeds 7, 42 and 17001 (case 0 at seed 7; cases 0/1 at the other
+seeds). The maintained re-entry oracle mutation canary and all nine existing app-adapter tests passed. The updated
+inventory has 462 sampled cases: 90 action-compatible across four public families and 372 capability gaps.
+
+The four-message offline case (seed 7, case 0) failed twice at payload assertion 98: Bob reached the expected epoch
+but lacked Carol's third offline message after 30 catch-up rounds. The send/leave canary hit a 180-second deadline;
+a longer rerun failed on Carol's epoch 4 versus modeled epoch 2 with the correct three-member roster. The latter
+needs an oracle-versus-runtime investigation before calling it a product regression. Neither failing family is
+promoted to passing coverage; the explicit canaries assert success and remain red when those outcomes occur.
+
+Source provenance, exact inputs, commands, reports and failure capsules are under
+`target/public-app-families-20260906/`. Its `REPORT.md` separates initial harness failures, repeated delivery failures,
+oracle uncertainty and test passes. No full CI or production SQLCipher fix is claimed.
+
+### Four-message projection regression follow-up (2026-09-06)
+
+The saved offline seed-7/case-0 input now passes all 435 actions with zero expectation/invariant failures after
+an app projection fix. Every participant has all 11 messages at epoch 2; Bob retains them after reopen. The engine
+had already decoded the previously missing message. Live effects observation reused one source ID for a batch,
+causing a UNIQUE source-message constraint failure. Each message now projects with its own durable event source.
+The unit regressions cover scheduled convergence, send-applied effects, inbound effects, and restart replay.
+The original failure and post-fix public observations are preserved in `target/offline-four-20260906/REPORT.md`.
+The separate send/leave epoch mismatch remains uninvestigated; this does not promote that family to passing coverage.
+
+The maintained small offline canary passes too (84.70 seconds). The post-fix 1,024-message regression remains red:
+a group-members query hits `AccountWorkerResponseTimedOut` during repair pass 3; the final recipient snapshot is
+270/1,024 messages at epoch 8 versus peers at epoch 22. No background storage errors were captured, and teardown
+reported no errors. The 191.60-second run exited as an ordinary test failure; it did not exhaust the full recovery
+budget or reach fresh-message/persistence checks. Keep the large gate open and investigate account-worker response
+availability during sustained recovery separately from the now-fixed source-ID collision.

@@ -670,7 +670,32 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   selected subject adapter and expectations. `--generated-input FILE` reexecutes it through the same report path; the
   ordinary report, promotable vector candidate, and any failure capsule remain separate artifacts.
 
+### Public app journey families
+
+`public-app-send-leave/v1`, `public-app-membership-reentry/v1`, and `public-app-offline-recovery/v1`
+use `generate_public_app_journey_case` (generator version `1`) and the shared stateful journey model.
+They default to `AppRuntimeHarness`: public Marmot app operations, real local Nostr relay sockets, and separate
+SQLCipher databases. Existing engine families and private oracles are unchanged.
+
+- **Send/leave:** seed chooses the departing member; even indices reopen it before leaving. The remaining admin
+  must process departure, update the profile, and exchange fresh messages among all survivors. The departed member's
+  exact history excludes later traffic.
+- **Membership re-entry:** even/odd indices remove and freshly invite the same member once/twice. Traffic while
+  absent must remain absent after re-entry; traffic before departure must persist. Indices 0/1 modulo 4 reopen the
+  removed participant before the fresh invitation. The returning member sends after each admission.
+- **Offline recovery:** indices modulo 3 select 4/8/12 offline messages with 1/2/3 interleaved profile changes;
+  indices 3 through 5 modulo 6 repeat the offline/reconnect cycle. Bob remains offline for each entire batch.
+- **Shared oracle:** bounded public epoch/member-count assertions after transitions, visible payload-count
+  checkpoints, exact terminal payload multisets for all four participants, expected active profile/admin state,
+  fresh sends by every survivor, and history persistence across reopen followed by another send. These are serialized
+  recovery journeys, not crash races or a proof of engine-private quiescence. Real relay timing is not seed-controlled.
+- **Maintained tests:** `tests/public_app_families.rs` pins determinism, prefix stability, required interactions,
+  capability rejection for private assertions, and explicit socket canaries whose oracles reject missing/duplicate
+  messages and incorrect public state. Run and campaign commands are in `APP_PATH_COVERAGE.md`.
+
 ### `send-leave/v1`
+
+See also the separate public companions below; they do not replace this engine oracle.
 
 - Generator: `generate_send_leave_family` (generator version `2`)
 - Setup: three clients start in one group. The generator emits app sends and self-remove leaves.

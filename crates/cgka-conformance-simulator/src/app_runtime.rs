@@ -779,6 +779,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::ApplicationMessaging,
                 SubjectCapability::TransportDelivery,
                 SubjectCapability::EventObservation,
+                SubjectCapability::AssertionEvaluation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,
                 SubjectCapability::OutboundPublication,
@@ -836,6 +837,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 .active_scenario_group
                 .clone()
                 .unwrap_or_else(|| "default".into());
+            // Single-group IR omits InGroup. Keep the implicit group selected
+            // for subsequent public reads and commands, just like explicit IR.
+            self.active_scenario_group = Some(group_label.clone());
             self.scenario_groups.insert(group_label, group_id.clone());
             let message_ids = self
                 .apply_admin_set(action.creator, &group_id, action.initial_admins)
@@ -1087,6 +1091,56 @@ impl ConvergenceSubject for AppRuntimeHarness {
 
     fn observe(&mut self, clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
         self.legacy_observations(clients)
+    }
+
+    fn evaluate_predicate(
+        &mut self,
+        predicate: &crate::ScenarioPredicateV2,
+    ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
+        use crate::ScenarioPredicateV2;
+        let (matched, actual) = match predicate {
+            ScenarioPredicateV2::ClientState {
+                client,
+                epoch,
+                member_count,
+            } => {
+                let observation = self.layered_observation(client)?;
+                let state = observation.protocol;
+                (
+                    epoch.is_none_or(|expected| state.epoch == expected)
+                        && member_count.is_none_or(|expected| state.member_count == expected),
+                    serde_json::json!({
+                        "client": client,
+                        "epoch": state.epoch,
+                        "member_count": state.member_count,
+                    }),
+                )
+            }
+            ScenarioPredicateV2::PayloadCount {
+                client,
+                payload,
+                count,
+            } => {
+                let observation = self.layered_observation(client)?;
+                let actual_count = observation
+                    .application
+                    .visible_plaintexts
+                    .iter()
+                    .filter(|value| *value == payload)
+                    .count();
+                (
+                    actual_count == *count,
+                    serde_json::json!({"count": actual_count}),
+                )
+            }
+            ScenarioPredicateV2::ClientsExactlyEquivalent { .. }
+            | ScenarioPredicateV2::NoPendingWork { .. } => {
+                return Err(SubjectError::unsupported(
+                    SubjectCapability::ExactConformanceObservation,
+                ));
+            }
+        };
+        Ok(crate::ScenarioPredicateObservationV2 { matched, actual })
     }
 
     fn observe_admin_policy(

@@ -7,6 +7,10 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 ## Files
 
+- **File:** `public_app_families.rs`
+  - **Owns:** Seeded public send/leave, membership re-entry and small offline recovery family contracts,
+    capability preflight, interaction coverage, and explicit real-socket strict oracle canaries.
+
 - **File:** `app_runtime_journeys.rs`
   - **Owns:** Basic public app acceptance journeys and the explicit unresolved 1,024-message public catch-up gate.
     Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart

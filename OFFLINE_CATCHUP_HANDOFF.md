@@ -1,10 +1,82 @@
 # Offline catch-up: work-in-progress checkpoint
 
-**Not fixed end to end. Do not describe this checkpoint as a completed catch-up fix.**
+**Small app projection defect fixed; 1,024-message public recovery remains unresolved.**
 
 Working branch: `codex/fix-offline-catchup-continued`.
 Base: `565bbb2f36c5f8a7d4715c225f0067358de7aca7` from `codex/fix-offline-catchup`.
-The original checkout `/Volumes/Worktrees/codex/69d9/mdk` was preserved. Its uncommitted prototype was copied here before further work. No commit or push has been made by this task.
+The original checkout `/Volumes/Worktrees/codex/69d9/mdk` was preserved. Its uncommitted prototype was copied here before further work. The signed checkpoint commit is `77356248bddddf13e3498a68fec2513d7b458b72`; no push has been made.
+
+## Four-message app projection fix (2026-09-06)
+
+The small failure is now localized and fixed in `crates/marmot-app/src/client/sync.rs`. The engine received,
+decoded and durably processed the missing message. Live app observation assigned one triggering source ID to
+an entire effects batch, including an empty ID for scheduled convergence and send-applied effects. Multiple
+messages collided on `UNIQUE app_events.source_message_id_hex`, leaving the live timeline incomplete. Reopen
+replayed the durable pending events through a drain path that already used each event's own stable source ID.
+
+The shared observer now uses that per-event identity for message and Welcome events. It also avoids attributing
+an unrelated triggering envelope's timestamp to a released buffered message. The restart drain shares the identity
+helper. This is an app projection fix; no storage schema, SQLCipher encryption, backlog cap, or epoch policy changes
+were made in this investigation. General retry after arbitrary projection failures is still a separate question.
+
+The exact saved seed-7/case-0 public input passes all 435 actions after the fix, with zero expectation/invariant
+failures. All four participants have 11 messages at epoch 2, including the four offline messages and subsequent
+traffic; Bob retains the complete timeline after reopening. No background storage errors or native crashes were
+observed. Before the fix, the audited repeat failed at action 98, additional repairs did not recover the message,
+and reopening did. The retained-relay engine companion passes all four incoming payloads at epoch 2.
+
+Three maintained app unit regressions cover scheduled, send-applied and inbound batches, exact source metadata,
+and idempotent replay through the drain seam. The scheduled/send tests were red before the fix with the exact
+UNIQUE constraint error. Nineteen focused/neighboring app tests pass; release library and debug test clippy pass
+with warnings denied. App unit tests require debug plus test-policy-overrides because existing legacy test helpers
+are absent in release; public runtime tests use release production policy without that feature.
+
+The maintained small offline canary also passes (84.70 seconds); the exact saved-input audit run completes in
+89.60 seconds including extra repair/reopen diagnostics. The large gate still fails (191.60 seconds), now at repair
+pass 3 because public `group_members` returns `AccountWorkerResponseTimedOut`. Bob's final snapshot has 270/1,024
+messages at epoch 8 versus peers at epoch 22. No background storage errors were captured and close reported no
+errors; the process exited with ordinary test failure, not a native crash. The full repair budget and post-success
+checks were not reached. This is an availability failure during catch-up, not proof of permanent loss.
+
+`group_members` queues a worker command with a 10-second local response deadline. Scheduled convergence runs
+synchronous engine/SQLite work inside that same worker. Long uninterrupted processing is the next hypothesis to
+measure; this run does not identify which operation consumed the deadline. Do not raise the deadline or relax the
+oracle just to make the test pass. General live replay after arbitrary projection failures is another follow-up.
+
+Temporary diagnostic hooks have been removed; their source, frozen binaries and traces remain under
+`target/offline-four-20260906/` with a readable `REPORT.md`. Simulator release clippy, formatting and diff-whitespace
+checks also pass. The projection checkpoint captures the public-family expansion, app fix and regressions together. No push, full
+fast-ci or full workspace suite has been run for this change. The following sections retain the historical pre-fix results.
+
+## Latest checkpoint and public family expansion (2026-09-06)
+
+The 17-file WIP checkpoint was committed and its GPG signature verified as `77356248`.
+The initial uncommitted expansion changed simulator code/tests/docs only: three public seeded companion
+families (send/leave, membership re-entry, small offline recovery), public state/payload predicate support, and
+implicit single-group selection in the app adapter. Existing engine generators keep their versions and oracles.
+
+Five strict re-entry cases passed across seeds 7, 42 and 17001, including one/two removal and fresh invitation cycles.
+The maintained re-entry oracle canary, all nine existing app-adapter tests, new generator/capability tests, existing
+shared-generator legality test, focused release clippy and formatting also passed. The inventory grows from 36
+compatible cross-route inputs to 90 across four public families; preflight is not a runtime pass.
+
+**New small reproduction:** seed 7 case 0 in `public-app-offline-recovery/v1` failed twice at action 98. Bob reached
+the expected epoch after only four offline messages and one profile change, but Carol's third offline message remained
+absent after 30 catch-up rounds. This is bounded incomplete public delivery, not proof of permanent loss or cause.
+
+**Separate unresolved oracle/convergence question:** `public-app-send-leave/v1`, seed 7 case 0 exceeded 180 seconds;
+a 360-second rerun failed at action 32 after 203.54 seconds. Carol had the expected three members but epoch 4 rather
+than the model's epoch 2. Determine whether asynchronous app commits require a different public epoch contract
+before calling this a product regression or changing its oracle. The new live canaries are explicit/ignored and
+retain successful-recovery assertions; the failing families are not promoted to passing coverage.
+
+No SQLCipher SIGSEGV was seen. The one campaign deadline used intentional SIGKILL. No production SQLCipher fix,
+full fast-ci, push or full-workspace validation is claimed. The 1,024-message problem remains open.
+
+Exact source patches/hashes, saved inputs, reports, failures and commands:
+`target/public-app-families-20260906/REPORT.md`. Next: localize the four-message publication-to-projection gap,
+resolve the send/leave epoch contract, then widen the remaining public catalog/relay faults. The sections below
+retain the earlier checkpoint history and validation boundaries.
 
 ## What changed
 
