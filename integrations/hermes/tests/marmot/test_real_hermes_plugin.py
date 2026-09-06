@@ -96,35 +96,29 @@ def _module_matches_path(module, expected: Path) -> bool:
     return isinstance(module_file, str) and Path(module_file).resolve() == expected
 
 
-def _legacy_plugin_repository(mdk_source: Path, mdk_ref: str, temp_root: Path) -> Path:
-    """Build an immutable plugin-only source repository for older Hermes."""
+def _pinned_source_checkout(mdk_source: Path, mdk_ref: str, temp_root: Path) -> Path:
+    """Clone MDK locally and detach at the exact revision used by old Hermes."""
 
-    repository = temp_root / "marmot-plugin-source"
-    repository.mkdir()
-    for name in ("__init__.py", "adapter.py", "agent_control.py", "plugin.yaml", "README.md"):
-        content = subprocess.check_output(
-            ["git", "show", f"{mdk_ref}:integrations/hermes/marmot/{name}"],
-            cwd=mdk_source,
-        )
-        (repository / name).write_bytes(content)
-    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    checkout = temp_root / "mdk-plugin-source"
     subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=MDK compatibility test",
-            "-c",
-            "user.email=compatibility-test@example.invalid",
-            "commit",
-            "-q",
-            "-m",
-            "Pin Marmot plugin fixture",
-        ],
-        cwd=repository,
+        ["git", "clone", "-q", "--no-checkout", f"file://{mdk_source}", str(checkout)],
         check=True,
     )
-    return repository
+    subprocess.run(
+        ["git", "checkout", "-q", "--detach", mdk_ref],
+        cwd=checkout,
+        check=True,
+    )
+    installed_ref = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        text=True,
+    ).strip()
+    if installed_ref != mdk_ref:
+        raise AssertionError(
+            f"pinned MDK checkout resolved to {installed_ref}, expected {mdk_ref}"
+        )
+    return checkout
 
 
 def main() -> int:
@@ -162,12 +156,15 @@ def main() -> int:
             identifier = f"file://{mdk_source}#integrations/hermes/marmot"
             cmd_install(identifier, force=False, enable=True, ref=resolved_ref)
         else:
-            # Hermes releases before immutable monorepo-subdirectory refs still
-            # accept a normal source plugin repository. Materialize only the
-            # exact MDK plugin files from resolved_ref so the compatibility
-            # probe stays immutable without importing private Hermes helpers.
-            legacy_source = _legacy_plugin_repository(mdk_source, resolved_ref, home)
-            cmd_install(f"file://{legacy_source}", force=False, enable=True)
+            # Hermes 0.19.0 supports local monorepo subdirectories but has no
+            # --ref option. Exercise the documented portable path: detach a
+            # local checkout at the exact MDK commit, then install its subdir.
+            pinned_source = _pinned_source_checkout(mdk_source, resolved_ref, home)
+            cmd_install(
+                f"file://{pinned_source}#integrations/hermes/marmot",
+                force=False,
+                enable=True,
+            )
 
         plugin_dir = home / ".hermes" / "plugins" / "marmot"
         required = {

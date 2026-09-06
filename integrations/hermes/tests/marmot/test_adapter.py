@@ -5979,6 +5979,20 @@ class ConfigResolutionTests(unittest.TestCase):
             "/srv/marmot/dev/wn-agent.sock",
         )
 
+    def test_documented_install_path_supports_the_hermes_floor(self):
+        readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
+        install_section = readme.split(
+            "Install through Hermes's standard plugin flow", 1
+        )[1].split("## Release Install", 1)[0]
+        self.assertIn("set -eu", install_section)
+        self.assertIn('test "${#MDK_PLUGIN_REF}" -eq 40', install_section)
+        self.assertIn('checkout --detach "$MDK_PLUGIN_REF"', install_section)
+        self.assertIn(
+            '"file://$MDK_PLUGIN_CHECKOUT#integrations/hermes/marmot"',
+            install_section,
+        )
+        self.assertNotIn('--ref "$MDK_PLUGIN_REF"', install_section)
+
 
 class CoalesceInboundTests(unittest.TestCase):
     def setUp(self):

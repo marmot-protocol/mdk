@@ -28,23 +28,39 @@ id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must
 not be logged or persisted.
 
-Install directly through Hermes's standard plugin flow from one reviewed MDK
-revision. Keep the full 40-character commit explicit; do not install a moving
-branch for production:
+Install through Hermes's standard plugin flow from one reviewed MDK revision.
+Hermes 0.19.0 does not expose `plugins install --ref`, so the portable immutable
+path is to check out the exact commit first and install its plugin subdirectory
+from that local repository. Keep the full 40-character commit explicit; do not
+install a moving branch for production:
 
 ```sh
+set -eu
 MDK_PLUGIN_REF=<40-character-reviewed-MDK-commit>
+case "$MDK_PLUGIN_REF" in
+  *[!0-9a-f]*|'') printf '%s\n' "MDK_PLUGIN_REF must be lowercase hexadecimal" >&2; exit 1 ;;
+esac
+test "${#MDK_PLUGIN_REF}" -eq 40
+MDK_PLUGIN_CHECKOUT="$(mktemp -d)"
+trap 'rm -rf "$MDK_PLUGIN_CHECKOUT"' EXIT HUP INT TERM
+git clone --filter=blob:none --no-checkout \
+  https://github.com/marmot-protocol/mdk.git "$MDK_PLUGIN_CHECKOUT"
+git -C "$MDK_PLUGIN_CHECKOUT" fetch --depth=1 origin "$MDK_PLUGIN_REF"
+git -C "$MDK_PLUGIN_CHECKOUT" checkout --detach "$MDK_PLUGIN_REF"
+test "$(git -C "$MDK_PLUGIN_CHECKOUT" rev-parse HEAD)" = "$MDK_PLUGIN_REF"
 hermes plugins install \
-  marmot-protocol/mdk/integrations/hermes/marmot \
-  --ref "$MDK_PLUGIN_REF"
+  "file://$MDK_PLUGIN_CHECKOUT#integrations/hermes/marmot"
 hermes plugins enable marmot
 ```
 
-Hermes clones the repository into a temporary directory and copies only this
-plugin subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
-workspace. The release installer below consumes an archive built from these
-same files. A community-index entry should pin an immutable commit or release
-tag; until such an entry is published, use the explicit source command above.
+Hermes clones the detached exact-commit checkout and copies only this plugin
+subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
+workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
+installed plugin. Hermes versions that expose `plugins install --ref` may use it
+as a shorter equivalent. The release installer below consumes an archive built
+from these same files. A community-index entry should pin an immutable commit
+or release tag; until such an entry is published, use the exact-checkout source
+command above.
 
 ## Release Install (Hermes Already Installed)
 
