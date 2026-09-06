@@ -285,7 +285,14 @@ def _plugin_only_repository(mdk_source: Path, mdk_ref: str, temp_root: Path) -> 
 
     repository = temp_root / "marmot-plugin-only-source"
     repository.mkdir()
-    for name in ("__init__.py", "adapter.py", "agent_control.py", "plugin.yaml", "README.md"):
+    for name in (
+        "__init__.py",
+        "adapter.py",
+        "agent_control.py",
+        "inbound_spool.py",
+        "plugin.yaml",
+        "README.md",
+    ):
         content = subprocess.check_output(
             ["git", "show", f"{mdk_ref}:integrations/hermes/marmot/{name}"],
             cwd=mdk_source,
@@ -382,6 +389,7 @@ def main() -> int:
             "__init__.py",
             "adapter.py",
             "agent_control.py",
+            "inbound_spool.py",
             "plugin.yaml",
             "README.md",
         }
@@ -426,6 +434,18 @@ def main() -> int:
         )
         if adapter_module is None:
             raise AssertionError("real Hermes discovery did not load adapter.py")
+        spool_file = (plugin_dir / "inbound_spool.py").resolve()
+        spool_module = next(
+            (
+                module
+                for module in tuple(sys.modules.values())
+                if module is not None
+                and _module_matches_path(module, spool_file)
+            ),
+            None,
+        )
+        if spool_module is None:
+            raise AssertionError("real Hermes discovery did not import installed inbound_spool.py")
         config_module = importlib.import_module("gateway.config")
         media_calls = asyncio.run(
             _exercise_media_routes(adapter_module, config_module.PlatformConfig, home)
