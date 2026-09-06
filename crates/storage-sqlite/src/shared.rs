@@ -1,3 +1,5 @@
+mod migrations;
+
 use crate::connection::CachedSql;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,8 +7,7 @@ use std::time::Duration;
 
 use crate::connection::{CloseableConnection, ConnectionGuard};
 use crate::{
-    SqliteResultExt, bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64,
-    unix_now_ms, usize_to_i64,
+    bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64, unix_now_ms, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -68,12 +69,14 @@ impl SqliteSharedStorage {
         // The shared cache is unencrypted, so file-level 0600 (including
         // sidecars) is the only thing keeping it from other local users.
         crate::connection::ensure_private_db_files(path)?;
-        let conn = rusqlite::Connection::open(path).storage()?;
+        let conn = rusqlite::Connection::open(path).map_err(migrations::sqlite_error)?;
         Self::from_connection(conn)
     }
 
     pub fn in_memory() -> StorageResult<Self> {
-        Self::from_connection(rusqlite::Connection::open_in_memory().storage()?)
+        Self::from_connection(
+            rusqlite::Connection::open_in_memory().map_err(migrations::sqlite_error)?,
+        )
     }
 
     /// Checkpoint the WAL and close this shared database, releasing its file
@@ -91,58 +94,20 @@ impl SqliteSharedStorage {
         self.conn.is_closed()
     }
 
-    fn from_connection(conn: rusqlite::Connection) -> StorageResult<Self> {
+    fn from_connection(mut conn: rusqlite::Connection) -> StorageResult<Self> {
         conn.busy_timeout(Duration::from_millis(SHARED_BUSY_TIMEOUT_MS))
-            .storage()?;
-        conn.pragma_update(None, "foreign_keys", true).storage()?;
+            .map_err(migrations::sqlite_error)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(migrations::sqlite_error)?;
         conn.pragma_update(None, "trusted_schema", false)
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;",
         )
-        .storage()?;
-        conn.execute_batch(
-            r#"
-CREATE TABLE IF NOT EXISTS directory_users (
-    account_id_hex TEXT PRIMARY KEY NOT NULL,
-    npub TEXT NOT NULL,
-    profile_json TEXT,
-    relay_lists_json TEXT NOT NULL,
-    key_package_json TEXT,
-    event_id_hex TEXT,
-    event_kind INTEGER,
-    event_created_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS directory_user_follows (
-    account_id_hex TEXT NOT NULL REFERENCES directory_users(account_id_hex) ON DELETE CASCADE,
-    follow_account_id_hex TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    event_id_hex TEXT,
-    event_created_at INTEGER,
-    PRIMARY KEY (account_id_hex, follow_account_id_hex)
-);
-	CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
-	    id INTEGER PRIMARY KEY CHECK (id = 1),
-	    export_enabled INTEGER NOT NULL DEFAULT 0,
-	    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
-	    updated_at_ms INTEGER NOT NULL
-	);
-		CREATE TABLE IF NOT EXISTS audit_log_settings (
-		    id INTEGER PRIMARY KEY CHECK (id = 1),
-		    enabled INTEGER NOT NULL DEFAULT 0,
-		    updated_at_ms INTEGER NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS telemetry_install (
-		    id INTEGER PRIMARY KEY CHECK (id = 1),
-		    install_id TEXT NOT NULL,
-		    updated_at_ms INTEGER NOT NULL
-		);
-		"#,
-        )
-        .storage()?;
-        Self::clear_legacy_relay_telemetry_endpoint(&conn)?;
+        .map_err(migrations::sqlite_error)?;
+        migrations::run_all(&mut conn)?;
         Ok(Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
         })
@@ -156,7 +121,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
             let mut conn = self.lock()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             tx.execute_cached(
                 "INSERT INTO directory_users (
                 account_id_hex, npub, profile_json, relay_lists_json, key_package_json,
@@ -182,12 +147,12 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                     optional_u64_to_i64(record.event_created_at)?,
                 ],
             )
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
             tx.execute_cached(
                 "DELETE FROM directory_user_follows WHERE account_id_hex = ?1",
                 params![&record.account_id_hex],
             )
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
             for (position, follow) in record.follows.iter().enumerate() {
                 tx.execute_cached(
                     "INSERT OR IGNORE INTO directory_user_follows (
@@ -202,9 +167,9 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                         optional_u64_to_i64(record.event_created_at)?,
                     ],
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             }
-            tx.commit().storage()
+            tx.commit().map_err(migrations::sqlite_error)
         })
     }
 
@@ -213,7 +178,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicDirectoryUserRecord>> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
+        let tx = conn.transaction().map_err(migrations::sqlite_error)?;
         let Some(mut record) = tx
             .query_row_cached(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
@@ -236,9 +201,9 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                 },
             )
             .optional()
-            .storage()?
+            .map_err(migrations::sqlite_error)?
         else {
-            tx.commit().storage()?;
+            tx.commit().map_err(migrations::sqlite_error)?;
             return Ok(None);
         };
         let mut stmt = tx
@@ -247,14 +212,14 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                  WHERE account_id_hex = ?1
                  ORDER BY position, follow_account_id_hex",
             )
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
         record.follows = stmt
             .query_map(params![account_id_hex], |row| row.get::<_, String>(0))
-            .storage()?
+            .map_err(migrations::sqlite_error)?
             .collect::<Result<Vec<_>, _>>()
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
         drop(stmt);
-        tx.commit().storage()?;
+        tx.commit().map_err(migrations::sqlite_error)?;
         Ok(Some(record))
     }
 
@@ -277,7 +242,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         // each user's follows by position then follow id).
         let cap = i64::try_from(max).unwrap_or(i64::MAX);
         let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
+        let tx = conn.transaction().map_err(migrations::sqlite_error)?;
         let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         {
@@ -290,14 +255,14 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                      )
                      ORDER BY account_id_hex, position, follow_account_id_hex",
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             let rows = stmt
                 .query_map(params![cap], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             for row in rows {
-                let (account_id_hex, follow) = row.storage()?;
+                let (account_id_hex, follow) = row.map_err(migrations::sqlite_error)?;
                 follows_by_account
                     .entry(account_id_hex)
                     .or_default()
@@ -312,7 +277,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                  ORDER BY account_id_hex
                  LIMIT ?1",
             )
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
         let records = stmt
             .query_map(params![cap], |row| {
                 Ok(PublicDirectoryUserRecord {
@@ -327,11 +292,11 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                     follows: Vec::new(),
                 })
             })
-            .storage()?
+            .map_err(migrations::sqlite_error)?
             .collect::<Result<Vec<_>, _>>()
-            .storage()?;
+            .map_err(migrations::sqlite_error)?;
         drop(stmt);
-        tx.commit().storage()?;
+        tx.commit().map_err(migrations::sqlite_error)?;
         if records.len() >= max {
             // no silent caps: surface (aggregate count only, privacy-safe) that
             // the listing was truncated so an operator can tell the bound bit.
@@ -369,7 +334,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                     })
                 },
             )
-            .storage()
+            .map_err(migrations::sqlite_error)
     }
 
     pub fn set_relay_telemetry_settings(
@@ -393,7 +358,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                         unix_now_ms(),
                     ],
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             Ok(())
         })
     }
@@ -408,7 +373,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                 |row| row.get(0),
             )
             .optional()
-            .storage()
+            .map_err(migrations::sqlite_error)
     }
 
     pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
@@ -422,7 +387,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                     updated_at_ms = excluded.updated_at_ms",
                     params![install_id, unix_now_ms()],
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             Ok(())
         })
     }
@@ -441,7 +406,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                     })
                 },
             )
-            .storage()
+            .map_err(migrations::sqlite_error)
     }
 
     pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
@@ -455,7 +420,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                     updated_at_ms = excluded.updated_at_ms",
                     params![bool_i64(settings.enabled), unix_now_ms()],
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             Ok(())
         })
     }
@@ -487,29 +452,9 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                  ON CONFLICT(id) DO NOTHING",
                     params![unix_now_ms()],
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             Ok(())
         })
-    }
-
-    fn clear_legacy_relay_telemetry_endpoint(conn: &rusqlite::Connection) -> StorageResult<()> {
-        let columns = {
-            let mut stmt = conn
-                .prepare_cached("PRAGMA table_info(relay_telemetry_settings)")
-                .storage()?;
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .storage()?
-                .collect::<Result<Vec<_>, _>>()
-                .storage()?
-        };
-        if columns.iter().any(|column| column == "otlp_endpoint") {
-            conn.execute_cached(
-                "UPDATE relay_telemetry_settings SET otlp_endpoint = NULL",
-                [],
-            )
-            .storage()?;
-        }
-        Ok(())
     }
 
     fn ensure_audit_log_settings(&self) -> StorageResult<()> {
@@ -523,7 +468,7 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
                  ON CONFLICT(id) DO NOTHING",
                     params![unix_now_ms()],
                 )
-                .storage()?;
+                .map_err(migrations::sqlite_error)?;
             Ok(())
         })
     }
@@ -847,5 +792,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_mode, "full_data");
+    }
+}
+
+#[cfg(test)]
+mod migration_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_shared_storage_records_version_one() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let row: (i64, String) = storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT version, name FROM shared_schema_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, "0001_shared_store".into()));
+    }
+
+    #[test]
+    fn shared_storage_refuses_malformed_unversioned_table() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE directory_users (account_id_hex TEXT)")
+            .unwrap();
+        assert!(SqliteSharedStorage::from_connection(conn).is_err());
     }
 }
