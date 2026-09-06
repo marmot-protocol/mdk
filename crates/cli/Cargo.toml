@@ -36,7 +36,7 @@ ratatui-image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread"] }
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
 unicode-properties.workspace = true

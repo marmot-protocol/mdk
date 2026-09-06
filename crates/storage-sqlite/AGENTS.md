@@ -23,6 +23,9 @@ not "fix" it into the per-account database.
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |
 | `src/timeline.rs` | Materialized message-timeline aggregation. |
 | `src/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
+| `src/shared/error.rs` | Shared-store redacting SQLite error mapper and result extension. |
+| `src/shared/migrations.rs`, `src/shared/v1.sql`, `src/shared/legacy.sql` | Independent `shared_schema_migrations` runner, frozen v1 schema and recognized retired columns. |
+| `src/shared/migration_tests.rs`, `src/shared/assurance_tests.rs`, `src/shared/fixtures/` | Shared migration contract, populated historical upgrades and bounded interrupted-transaction recovery. |
 | `src/shared.rs` | `SqliteSharedStorage`: a separate non-account-scoped database for cross-identity state (public-directory cache, relay-telemetry/audit-log settings, telemetry install id). |
 
 ## Invariants

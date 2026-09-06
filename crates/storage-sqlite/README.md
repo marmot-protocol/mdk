@@ -22,11 +22,14 @@ The crate is split around storage concerns:
   and SQLite error mapping; `shared.rs` owns `SqliteSharedStorage`, a separate (non-account-scoped) database for
   cross-identity state: the public-directory user cache, relay-telemetry settings, audit-log settings, and the telemetry
   install id.
-- `migrations.rs` owns the migration runner and migration tests.
+- `migrations.rs` owns the account/session migration runner and migration tests.
+- `shared/migrations.rs` owns the independent shared-store runner; `shared/v1.sql` freezes its initial schema,
+  `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
+  tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
 ## Migrations
 
-Schema changes go through Rust migrations, not external SQL files. The runner and ordered registry live in
+Account/session schema changes go through Rust migrations. The runner and ordered registry live in
 `src/migrations.rs`; migration bodies live in numbered files like `src/migrations/0001_initial_schema.rs`. Each
 migration has a monotonically increasing integer version, a matching padded name, and an `apply` function that runs
 inside a SQLite transaction. That function can execute DDL, rewrite rows, or perform more complex data-shape changes
@@ -34,6 +37,30 @@ when storage semantics evolve.
 
 Applied migrations are recorded in `cgka_schema_migrations`. Opening an encrypted database applies any missing
 migrations after SQLCipher keying and before storage handles are exposed.
+
+The three current app database categories have independent histories: `session.sqlite` uses
+`cgka_schema_migrations`, the per-account `app-cache.sqlite3` uses marmot-app's `app_cache_schema_migrations`, and
+installation-wide `shared.sqlite3` uses `shared_schema_migrations`. No runner reads another store's ledger.
+
+Shared version `1 / 0001_shared_store` establishes the five live tables. Each migration body and its ledger row commit
+in the same immediate transaction; failure rolls back both. Recorded versions and names must be an exact prefix of
+the compiled registry. Future versions return `StorageError::UnsupportedSchemaVersion`. A pending opener rechecks the
+prefix under the write lock; an already-current opener validates history using reads only.
+
+Unversioned shared tables must match frozen current or verified historical definitions before adoption. Validation
+covers columns, types, nullability, defaults, primary keys, foreign keys, CHECK expressions, collations and indexes.
+Conservative DDL comparison can refuse equivalent but unrecognized SQL; incompatible shapes fail with static errors
+and no version row. Missing tables are created. Public users, ordered follows, live settings, timestamps, installation
+identity and rowids are preserved. Existing unused directory tables remain untouched; their pre-existing orphaned rows do not gate live-store adoption. The recognized nullable
+`otlp_endpoint` column (inline or appended) is retained but non-NULL values are cleared transactionally; retained audit `data_mode` columns
+(inline or historically appended) remain inert and unchanged by subsequent settings writes. No full-data audit mode
+is reintroduced. SQLite errors retain extended result codes and transient BUSY/LOCKED classification without
+SQLite's database-controlled message.
+
+The shared store remains unencrypted and owner-only, with WAL, synchronous NORMAL, a 5-second busy timeout,
+foreign keys ON, trusted_schema OFF, temp_store MEMORY and terminal close behavior. Its fixture provenance and
+assurance limits are documented in [shared/fixtures/README.md](src/shared/fixtures/README.md) and the
+[app storage boundaries](../../docs/marmot-architecture/further-context/app-sqlite-storage-boundaries.md).
 
 ## Operational boundary
 

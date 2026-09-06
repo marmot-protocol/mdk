@@ -116,7 +116,10 @@ This repository now has the main engine candidate:
   relay/directory cache, relay-list setup, KeyPackage lookup, runtime subscriptions, and app-facing
   group/message/member methods. Detailed group creation returns the exact chat-list row committed with the local
   projection; founding Welcome fanout stays post-response and its app repair index is reconstructed from
-  engine-authoritative retained obligations.
+  engine-authoritative retained obligations. Its per-account directory cache has an independent numbered migration
+  ledger and future-version refusal; installation-wide `shared.sqlite3` now has its own independent
+  `shared_schema_migrations` history with transactional adoption of recognized unversioned layouts. See
+  [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
 - `crates/cli` — first real CLI, daemon, and TUI surface over `marmot-app`. It is intentionally product-facing rather
   than a lab harness, and its JSON envelope is shaped for daemon/TUI/testing callers.
 - `crates/storage-sqlite` — SQLCipher-backed SQLite storage for Marmot and custom OpenMLS state, with Rust migrations

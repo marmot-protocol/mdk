@@ -21,9 +21,12 @@ It owns these local SQLite stores:
 For `N` active signing accounts whose stores have been opened, this is up to `2N + 1` current SQLite files.
 `session.sqlite` contains authoritative protocol and recovery state and has a numbered migration history. The two
 directory tiers are reconcilable caches, but normal upgrades should preserve them; `shared.sqlite3` also contains
-durable installation settings that are not disposable. The per-account directory cache and shared store currently
-initialize tables without independent numbered migration ledgers, so schema evolution for either must not rely on the
-session database's migration version.
+durable installation settings that are not disposable. The per-account cache has its own numbered
+`app_cache_schema_migrations` ledger and refuses versions newer than the binary supports. Each migration commits its
+schema/data changes and ledger row atomically; version 1 validates and adopts existing unversioned tables and converts
+legacy JSON records without discarding directory or search data. Invalid shapes or migration names fail closed.
+The shared store still initializes tables without a numbered ledger; neither tier uses the session database's
+migration version.
 
 The app runtime exposes those projections through account status, group listing/showing, message listing, and
 snapshot-plus-live subscription APIs so CLI and TUI surfaces can inspect app state without opening the databases

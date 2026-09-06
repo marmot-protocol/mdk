@@ -1,3 +1,8 @@
+mod error;
+mod migrations;
+
+use error::SharedSqliteResultExt;
+
 use crate::connection::CachedSql;
 use std::path::Path;
 use std::sync::Arc;
@@ -5,8 +10,7 @@ use std::time::Duration;
 
 use crate::connection::{CloseableConnection, ConnectionGuard};
 use crate::{
-    SqliteResultExt, bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64,
-    unix_now_ms, usize_to_i64,
+    bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64, unix_now_ms, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -91,7 +95,7 @@ impl SqliteSharedStorage {
         self.conn.is_closed()
     }
 
-    fn from_connection(conn: rusqlite::Connection) -> StorageResult<Self> {
+    fn from_connection(mut conn: rusqlite::Connection) -> StorageResult<Self> {
         conn.busy_timeout(Duration::from_millis(SHARED_BUSY_TIMEOUT_MS))
             .storage()?;
         conn.pragma_update(None, "foreign_keys", true).storage()?;
@@ -103,46 +107,7 @@ impl SqliteSharedStorage {
              PRAGMA temp_store = MEMORY;",
         )
         .storage()?;
-        conn.execute_batch(
-            r#"
-CREATE TABLE IF NOT EXISTS directory_users (
-    account_id_hex TEXT PRIMARY KEY NOT NULL,
-    npub TEXT NOT NULL,
-    profile_json TEXT,
-    relay_lists_json TEXT NOT NULL,
-    key_package_json TEXT,
-    event_id_hex TEXT,
-    event_kind INTEGER,
-    event_created_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS directory_user_follows (
-    account_id_hex TEXT NOT NULL REFERENCES directory_users(account_id_hex) ON DELETE CASCADE,
-    follow_account_id_hex TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    event_id_hex TEXT,
-    event_created_at INTEGER,
-    PRIMARY KEY (account_id_hex, follow_account_id_hex)
-);
-	CREATE TABLE IF NOT EXISTS relay_telemetry_settings (
-	    id INTEGER PRIMARY KEY CHECK (id = 1),
-	    export_enabled INTEGER NOT NULL DEFAULT 0,
-	    export_interval_seconds INTEGER NOT NULL DEFAULT 60,
-	    updated_at_ms INTEGER NOT NULL
-	);
-		CREATE TABLE IF NOT EXISTS audit_log_settings (
-		    id INTEGER PRIMARY KEY CHECK (id = 1),
-		    enabled INTEGER NOT NULL DEFAULT 0,
-		    updated_at_ms INTEGER NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS telemetry_install (
-		    id INTEGER PRIMARY KEY CHECK (id = 1),
-		    install_id TEXT NOT NULL,
-		    updated_at_ms INTEGER NOT NULL
-		);
-		"#,
-        )
-        .storage()?;
-        Self::clear_legacy_relay_telemetry_endpoint(&conn)?;
+        migrations::run_all(&mut conn)?;
         Ok(Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
         })
@@ -492,26 +457,6 @@ CREATE TABLE IF NOT EXISTS directory_user_follows (
         })
     }
 
-    fn clear_legacy_relay_telemetry_endpoint(conn: &rusqlite::Connection) -> StorageResult<()> {
-        let columns = {
-            let mut stmt = conn
-                .prepare_cached("PRAGMA table_info(relay_telemetry_settings)")
-                .storage()?;
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .storage()?
-                .collect::<Result<Vec<_>, _>>()
-                .storage()?
-        };
-        if columns.iter().any(|column| column == "otlp_endpoint") {
-            conn.execute_cached(
-                "UPDATE relay_telemetry_settings SET otlp_endpoint = NULL",
-                [],
-            )
-            .storage()?;
-        }
-        Ok(())
-    }
-
     fn ensure_audit_log_settings(&self) -> StorageResult<()> {
         retry_on_busy(|| {
             self.lock()?
@@ -847,5 +792,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_mode, "full_data");
+    }
+}
+
+#[cfg(test)]
+mod migration_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_shared_storage_records_version_one() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let row: (i64, String) = storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT version, name FROM shared_schema_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, "0001_shared_store".into()));
+    }
+
+    #[test]
+    fn shared_storage_refuses_malformed_unversioned_table() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE directory_users (account_id_hex TEXT)")
+            .unwrap();
+        assert!(SqliteSharedStorage::from_connection(conn).is_err());
     }
 }
