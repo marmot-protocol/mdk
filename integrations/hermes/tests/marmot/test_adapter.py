@@ -6270,6 +6270,104 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("11" * 32, json.dumps(result))
         self.assertNotIn("22" * 32, json.dumps(result))
 
+    async def test_register_bridges_standard_plugin_settings_into_callbacks(self):
+        settings = {
+            "socket_path": "/tmp/marmot-plugin.sock",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "home_channel": "33" * 32,
+        }
+
+        class FakeContext:
+            def __init__(self):
+                self.platforms = []
+
+            def get_config(self, key, default=None):
+                return settings.get(key, default)
+
+            def register_platform(self, **kwargs):
+                self.platforms.append(kwargs)
+
+        ctx = FakeContext()
+        self.adapter_module.register(ctx)
+        platform = ctx.platforms[0]
+        config = sys.modules["gateway.config"].PlatformConfig(enabled=True)
+
+        self.assertTrue(platform["validate_config"](config))
+        built = platform["adapter_factory"](config)
+        self.assertEqual(built.socket_path, settings["socket_path"])
+        self.assertEqual(built.account_id_hex, settings["account_id_hex"])
+        self.assertEqual(built.group_id_hex, settings["group_id_hex"])
+        self.assertEqual(config.extra, {})
+
+        captured = {}
+
+        async def fake_standalone(effective, *args, **kwargs):
+            captured["config"] = effective
+            return {"success": True}
+
+        with unittest.mock.patch.object(
+            self.adapter_module,
+            "_standalone_send",
+            side_effect=fake_standalone,
+        ):
+            result = await platform["standalone_sender_fn"](
+                config,
+                settings["group_id_hex"],
+                "hello",
+            )
+        self.assertTrue(result["success"])
+        effective = captured["config"]
+        self.assertEqual(effective.extra["socket_path"], settings["socket_path"])
+        self.assertEqual(effective.home_channel.chat_id, settings["home_channel"])
+
+    async def test_marmot_status_reports_staged_failures(self):
+        module = self.adapter_module
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+
+        class MissingConnector:
+            async def account_list(self):
+                raise OSError("missing")
+
+        class Unauthorized:
+            async def account_list(self):
+                raise module.AgentControlError("denied", code="unauthorized")
+
+        class AmbiguousAccount:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True},
+                        {"account_id_hex": "22" * 32, "local_signing": True},
+                    ]
+                }
+
+        class MissingHome:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+        for client, expected in (
+            (MissingConnector(), "wn_agent_unreachable"),
+            (Unauthorized(), "not_authenticated"),
+            (AmbiguousAccount(), "account_unselected"),
+            (MissingHome(), "home_unresolved"),
+        ):
+            with self.subTest(state=expected):
+                live = type("FakeAdapter", (), {})()
+                live.config = config_cls(
+                    enabled=True,
+                    extra={"socket_path": "/tmp/passive-probe.sock"},
+                )
+                live.client = client
+                module._remember_live_adapter(live)
+                status = json.loads(await module._marmot_status_tool({}))
+                self.assertFalse(status["ok"])
+                self.assertEqual(status["state"], expected)
+
     async def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []
 

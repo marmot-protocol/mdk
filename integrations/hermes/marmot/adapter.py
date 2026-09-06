@@ -8,6 +8,7 @@ preview streams.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import importlib
 import json
@@ -24,6 +25,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Literal, Optional, Tuple
 
 from .agent_control import (
@@ -49,6 +51,13 @@ _HermesMediaKind = getattr(importlib.import_module("gateway.platforms.base"), "M
 
 logger = logging.getLogger(__name__)
 _LIVE_ADAPTER_REF: Optional[weakref.ReferenceType] = None
+_PLUGIN_SETTING_KEYS = (
+    "socket_path",
+    "home",
+    "account_id_hex",
+    "group_id_hex",
+    "home_channel",
+)
 
 
 def _remember_live_adapter(adapter: "MarmotPlatformAdapter") -> "MarmotPlatformAdapter":
@@ -3318,6 +3327,40 @@ def media_capability_status() -> Dict[str, Any]:
     }
 
 
+def _plugin_settings(ctx) -> Dict[str, Any]:
+    """Read non-secret values from the standard plugin settings namespace."""
+    get_config = getattr(ctx, "get_config", None)
+    if not callable(get_config):
+        return {}
+    return {
+        key: value
+        for key in _PLUGIN_SETTING_KEYS
+        if (value := get_config(key, None)) not in (None, "")
+    }
+
+
+def _effective_platform_config(config, plugin_settings: Dict[str, Any]):
+    """Merge plugin settings without mutating Hermes's shared config object."""
+    if not plugin_settings:
+        return config
+    effective = copy.copy(config)
+    extra = dict(getattr(config, "extra", {}) or {})
+    for key in ("socket_path", "home", "account_id_hex", "group_id_hex"):
+        value = plugin_settings.get(key)
+        if value not in (None, ""):
+            extra.setdefault(key, value)
+    effective.extra = extra
+    home_channel = plugin_settings.get("home_channel")
+    if home_channel and getattr(effective, "home_channel", None) is None:
+        effective.home_channel = SimpleNamespace(
+            platform=Platform("marmot"),
+            chat_id=str(home_channel),
+            name="Marmot",
+            thread_id=None,
+        )
+    return effective
+
+
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     return bool(
@@ -3359,7 +3402,11 @@ async def probe_readiness(
     try:
         response = await adapter.client.account_list()
     except AgentControlError as exc:
-        status["state"] = "wn_agent_unreachable"
+        if exc.code == "unauthorized":
+            status["wn_agent_reachable"] = True
+            status["state"] = "not_authenticated"
+        else:
+            status["state"] = "wn_agent_unreachable"
         status["error_code"] = exc.code
         return status
     except OSError:
@@ -3462,7 +3509,8 @@ async def _standalone_send(
     adapter = MarmotPlatformAdapter(pconfig)
     if media_files:
         attachments = []
-        for media_path in media_files:
+        for media_file in media_files:
+            media_path = media_file[0] if isinstance(media_file, (tuple, list)) else media_file
             path = Path(str(media_path)).expanduser()
             attachments.append(
                 {
@@ -3654,16 +3702,42 @@ async def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
 
 def register(ctx):
     """Hermes plugin entry point."""
+    plugin_settings = _plugin_settings(ctx)
+
+    def effective(config):
+        return _effective_platform_config(config, plugin_settings)
+
+    def adapter_factory(config):
+        return _remember_live_adapter(MarmotPlatformAdapter(effective(config)))
+
+    async def standalone_sender(
+        config,
+        chat_id,
+        message,
+        *,
+        thread_id=None,
+        media_files=None,
+        force_document=False,
+    ):
+        return await _standalone_send(
+            effective(config),
+            chat_id,
+            message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+        )
+
     ctx.register_platform(
         name="marmot",
         label="Marmot",
-        adapter_factory=lambda cfg: _remember_live_adapter(MarmotPlatformAdapter(cfg)),
+        adapter_factory=adapter_factory,
         check_fn=check_requirements,
-        is_connected=validate_config,
-        validate_config=validate_config,
+        is_connected=lambda config: validate_config(effective(config)),
+        validate_config=lambda config: validate_config(effective(config)),
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="MARMOT_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send,
+        standalone_sender_fn=standalone_sender,
         allowed_users_env="MARMOT_ALLOWED_USERS",
         allow_all_env="MARMOT_ALLOW_ALL_USERS",
         max_message_length=0,

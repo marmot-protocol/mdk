@@ -310,7 +310,16 @@ class MarmotPlatformEnablementTests(unittest.TestCase):
         self.adapter_module.register(self.registry)
 
     def test_register_wires_is_connected_for_env_override_gate(self):
-        self.assertIs(self.registry.entry.get("is_connected"), self.adapter_module.validate_config)
+        callback = self.registry.entry.get("is_connected")
+        self.assertTrue(callable(callback))
+        self.assertTrue(
+            callback(
+                PlatformConfigHarness(
+                    enabled=True,
+                    extra={"socket_path": "/tmp/marmot-agent.sock"},
+                )
+            )
+        )
 
     def test_unconfigured_platform_stays_disabled_without_marmot_env(self):
         saved_env = clear_marmot_env()

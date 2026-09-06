@@ -31,6 +31,13 @@ It never returns account or group identifiers. `state: ready` is the only fully
 ready result; `gateway_inactive` means no live Marmot adapter is available to
 probe in that Hermes process.
 
+On current Hermes releases, non-secret values from
+`plugins.entries.marmot.settings` are merged into the effective platform config
+before validation, adapter construction, standalone delivery, and readiness
+checks. Legacy `platforms.marmot.extra` values take precedence when both forms
+are present; environment variables remain available for legacy cohorts and
+secret-bearing configuration.
+
 For live previews, the plugin retries `stream_begin` with one stable v2 request
 id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must

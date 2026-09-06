@@ -32,7 +32,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def _exercise_media_routes(adapter_module, platform_config, temp_root: Path) -> int:
+async def _exercise_media_routes(adapter_module, platform_config, temp_root: Path):
     class FakeClient:
         def __init__(self) -> None:
             self.calls = []
@@ -48,9 +48,22 @@ async def _exercise_media_routes(adapter_module, platform_config, temp_root: Pat
             response_timeout=None,
         ):
             self.calls.append(
-                (account_id_hex, group_id_hex, attachments, caption, idempotency_key)
+                ("SendMedia", account_id_hex, group_id_hex, attachments, caption)
             )
             return {"type": "final_sent", "message_ids_hex": ["33" * 32]}
+
+        async def send_final(
+            self,
+            account_id_hex,
+            group_id_hex,
+            text,
+            *,
+            idempotency_key=None,
+            reply_to_message_id_hex=None,
+            operation_events=None,
+        ):
+            self.calls.append(("SendFinal", account_id_hex, group_id_hex, text))
+            return {"type": "final_sent", "message_id_hex": "44" * 32}
 
     media_root = temp_root / "media"
     media_root.mkdir()
@@ -67,32 +80,157 @@ async def _exercise_media_routes(adapter_module, platform_config, temp_root: Pat
     fake = FakeClient()
     adapter = adapter_module.MarmotPlatformAdapter(config, client=fake)
     group_id = "22" * 32
+    routes = []
 
+    before = len(fake.calls)
     ordinary = await adapter.send_document(group_id, str(sample), caption="ordinary reply")
-    explicit = await adapter.send_image_file(group_id, str(sample), caption="explicit send tool")
-    if not ordinary.success or not explicit.success:
-        raise AssertionError(
-            f"real Hermes explicit/ordinary media adapter route failed: "
-            f"ordinary={ordinary!r}, explicit={explicit!r}"
-        )
+    if not ordinary.success or len(fake.calls) != before + 1 or fake.calls[-1][0] != "SendMedia":
+        raise AssertionError(f"real Hermes reply adapter hook failed: {ordinary!r}")
+    routes.append("reply-adapter-hook")
 
+    send_tool = importlib.import_module("tools.send_message_tool")
+    gateway_run = None
+    original_gateway_ref = None
+    if hasattr(send_tool, "_live_adapter"):
+        live_hook_name = "_live_adapter"
+        original_live_hook = send_tool._live_adapter
+    elif hasattr(send_tool, "_resolve_live_adapter"):
+        live_hook_name = "_resolve_live_adapter"
+        original_live_hook = send_tool._resolve_live_adapter
+    else:
+        live_hook_name = None
+        original_live_hook = None
+        gateway_run = importlib.import_module("gateway.run")
+        original_gateway_ref = gateway_run._gateway_runner_ref
     original_client = adapter_module.MarmotAgentControlClient
     adapter_module.MarmotAgentControlClient = lambda *_args, **_kwargs: fake
+
+    def set_live_adapter(value) -> None:
+        if live_hook_name == "_live_adapter":
+            setattr(send_tool, live_hook_name, lambda _platform: (None, value))
+        elif live_hook_name == "_resolve_live_adapter":
+            setattr(send_tool, live_hook_name, lambda _platform: value)
+        elif value is None:
+            gateway_run._gateway_runner_ref = lambda: None
+        else:
+            runner = type("Runner", (), {"adapters": {"marmot": value}})()
+            gateway_run._gateway_runner_ref = lambda: runner
+
     try:
-        for label in ("home-cron", "kanban-artifact"):
-            sent = await adapter_module._standalone_send(
-                config,
-                group_id,
-                label,
-                media_files=[str(sample)],
-                force_document=True,
+        set_live_adapter(adapter)
+        before = len(fake.calls)
+        explicit = await send_tool._send_via_adapter(
+            "marmot",
+            config,
+            group_id,
+            "explicit send tool",
+            media_files=[(str(sample), False)],
+            force_document=True,
+        )
+        if not explicit.get("success"):
+            raise AssertionError(f"real Hermes send-tool dispatch failed: {explicit!r}")
+        live_calls = fake.calls[before:]
+        if callable(getattr(send_tool, "_send_live_adapter_media", None)):
+            media_calls = [call for call in live_calls if call[0] == "SendMedia"]
+            if len(media_calls) != 1:
+                raise AssertionError(f"real Hermes live media dispatcher bypassed SendMedia: {live_calls!r}")
+            routes.append("send-tool-live")
+        else:
+            if any(call[0] == "SendMedia" for call in live_calls):
+                raise AssertionError("legacy Hermes unexpectedly claimed live media dispatch")
+            routes.append("send-tool-live:host-media-unsupported")
+
+        set_live_adapter(None)
+        before = len(fake.calls)
+        standalone = await send_tool._send_via_adapter(
+            "marmot",
+            config,
+            group_id,
+            "standalone send tool",
+            media_files=[(str(sample), False)],
+            force_document=True,
+        )
+        standalone_calls = fake.calls[before:]
+        if (
+            not standalone.get("success")
+            or len(standalone_calls) != 1
+            or standalone_calls[0][0] != "SendMedia"
+        ):
+            raise AssertionError(
+                f"real Hermes standalone dispatcher failed: result={standalone!r}, "
+                f"calls={standalone_calls!r}"
             )
-            if not sent:
-                raise AssertionError(f"real Hermes standalone {label} media route failed")
+        routes.append("send-tool-standalone")
+
+        try:
+            scheduler_delivery = importlib.import_module("cron.scheduler_delivery")
+        except ImportError:
+            scheduler_delivery = None
+        scheduler_send = getattr(scheduler_delivery, "_standalone_send", None)
+        if callable(scheduler_send):
+            target = type(
+                "Target",
+                (),
+                {
+                    "job": {"id": "real-hermes-probe"},
+                    "where": f"marmot:{group_id}",
+                    "platform": "marmot",
+                    "pconfig": config,
+                    "chat_id": group_id,
+                    "thread_id": None,
+                },
+            )()
+            before = len(fake.calls)
+            cron_result, cron_error = await asyncio.to_thread(
+                scheduler_send,
+                target,
+                "home cron",
+                [(str(sample), False)],
+            )
+            cron_calls = fake.calls[before:]
+            if (
+                cron_error is not None
+                or not isinstance(cron_result, dict)
+                or not cron_result.get("success")
+                or len(cron_calls) != 1
+                or cron_calls[0][0] != "SendMedia"
+            ):
+                raise AssertionError(
+                    f"real Hermes cron dispatch failed: result={cron_result!r}, "
+                    f"error={cron_error!r}, calls={cron_calls!r}"
+                )
+            routes.append("cron")
+        else:
+            routes.append("cron:host-dispatcher-unavailable")
     finally:
+        if live_hook_name is not None:
+            setattr(send_tool, live_hook_name, original_live_hook)
+        else:
+            gateway_run._gateway_runner_ref = original_gateway_ref
         adapter_module.MarmotAgentControlClient = original_client
 
-    return len(fake.calls)
+    try:
+        kanban_module = importlib.import_module("gateway.kanban_watchers")
+        mixin_class = getattr(kanban_module, "GatewayKanbanWatchersMixin")
+    except (ImportError, AttributeError):
+        routes.append("kanban:host-dispatcher-unavailable")
+    else:
+        before = len(fake.calls)
+        errors = await mixin_class()._deliver_kanban_artifacts(
+            adapter=adapter,
+            chat_id=group_id,
+            metadata={},
+            event_payload={"artifacts": [str(sample)]},
+            task=None,
+        )
+        kanban_calls = fake.calls[before:]
+        if errors or len(kanban_calls) != 1 or kanban_calls[0][0] != "SendMedia":
+            raise AssertionError(
+                f"real Hermes Kanban dispatch failed: errors={errors!r}, calls={kanban_calls!r}"
+            )
+        routes.append("kanban")
+
+    return {"connector_calls": len(fake.calls), "routes": routes}
 
 
 def _module_matches_path(module, expected: Path) -> bool:
