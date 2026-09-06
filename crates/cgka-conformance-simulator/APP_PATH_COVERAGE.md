@@ -345,3 +345,12 @@ Readiness now uses the storage backend's state-filtered query, excluding unrelat
 [#1715](https://github.com/marmot-protocol/mdk/issues/1715) covers payload-free readiness queries, preparation cost
 and repeated zero-attempt wake pressure. [#1716](https://github.com/marmot-protocol/mdk/issues/1716) covers fairness
 when the bounded SDK reconciliation cursor map evicts active routes.
+
+### CI recovery driver correction after #1711 merged
+
+The earlier #1713 CI run `34054398652` reached 256/1,024 messages and epoch 8 after 30 repair
+passes, with progress still occurring in its final passes. It failed the pass-count guard at 613 seconds,
+not the 900-second watchdog. The driver now keeps attempting within that unchanged watchdog.
+Exact payload/state equality, fresh traffic, restart persistence, and clean runtime closure are still required.
+This corrects premature test termination; it does not establish a preparation-time bound or claim to fix
+all large-backlog recovery failures (see #1715).
