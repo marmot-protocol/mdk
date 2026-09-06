@@ -7751,6 +7751,44 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
 }
 
 #[tokio::test]
+async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let id = &accounts[0].account_id_hex;
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.tags.clear();
+        }
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+    let error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::RelayDirectory(_)));
+    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert!(cached.relay_lists.inbox.created_at > 0);
+    assert!(cached.relay_lists.inbox.relays.is_empty());
+    assert_eq!(fetcher.requests.lock().unwrap().len(), 2);
+
+    // The same signed empty declaration becomes actionable only when the
+    // outbox also completes; retaining it in the cache must not mask retries.
+    *fetcher.incomplete_endpoint.lock().unwrap() = None;
+    let error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Inbox])
+    );
+}
+
+#[tokio::test]
 async fn account_read_only_nip65_returns_typed_missing_write_routes() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;

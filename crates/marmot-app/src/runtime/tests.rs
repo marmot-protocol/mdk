@@ -236,15 +236,8 @@ async fn failed_import_relay_discovery_does_not_publish_default_lists() {
         .await
         .expect_err("failed discovery must not become a write of request defaults");
 
-    assert!(matches!(
-        error,
-        AppError::MissingRelayLists(missing)
-            if missing
-                == vec![
-                    crate::MissingRelayListKind::Nip65,
-                    crate::MissingRelayListKind::Inbox,
-                ]
-    ));
+    // A failed lookup is retryable uncertainty, not confirmed missing lists.
+    assert!(matches!(error, AppError::RelayDirectory(_)));
 }
 
 #[test]

@@ -216,13 +216,13 @@ impl MarmotApp {
             || (status.inbox.created_at > 0 && status.inbox.relays.is_empty());
         let uncertain_absence =
             !complete && (status.nip65.relays.is_empty() || status.inbox.relays.is_empty());
-        if explicit_empty {
-            return Err(AppError::MissingRelayLists(status.missing.clone()));
-        }
         if uncertain_absence {
             return Err(AppError::RelayDirectory(
                 "relay-list absence was not authoritatively established".to_owned(),
             ));
+        }
+        if explicit_empty {
+            return Err(AppError::MissingRelayLists(status.missing.clone()));
         }
         Ok(status)
     }
