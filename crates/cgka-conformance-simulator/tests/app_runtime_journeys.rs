@@ -344,8 +344,10 @@ async fn large_backlog(
     let mut previous = None;
     let mut unchanged = 0;
     let mut restarts = 0;
-    let mut recovered = false;
-    for pass in 0..30 {
+    // Production slices are bounded by elapsed time, so a repair call has no
+    // minimum message throughput. Keep driving within check()'s existing
+    // 900-second watchdog instead of declaring failure after 30 calls.
+    for pass in 0_usize.. {
         subject
             .repair_full_history(&["bob".into()])
             .await
@@ -362,7 +364,7 @@ async fn large_backlog(
             .iter()
             .find(|o| o.participant == "bob")
             .ok_or("missing bob")?;
-        recovered = complete(&observations, &expected, clients.len());
+        let recovered = complete(&observations, &expected, clients.len());
         save(
             out,
             &format!("recovery-{pass:02}.json"),
@@ -386,7 +388,9 @@ async fn large_backlog(
         };
         if unchanged >= 6 {
             if restarts >= 3 {
-                break;
+                return Err(
+                    "large backlog stopped progressing after three recovery restarts".into(),
+                );
             }
             subject.reopen("bob").await?;
             restarts += 1;
@@ -394,9 +398,6 @@ async fn large_backlog(
         }
         previous = Some(progress);
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    if !recovered {
-        return Err("large backlog failed complete public recovery within 30 repair passes".into());
     }
     for client in clients {
         let payload = format!("post-recovery-{client}");

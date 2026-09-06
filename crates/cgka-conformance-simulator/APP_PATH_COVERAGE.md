@@ -23,8 +23,9 @@ This is a public workload companion to the pinned 1,024-message engine input. It
 order; this does **not** reproduce the engine fixture's forced reverse delivery. Initial group creation uses public
 app acknowledgement semantics. Private MLS assertions and simulated relay steps are not presented as app coverage.
 
-The reproduction allows 30 explicit full-history repairs, two seconds between passes, and up to three recipient
-reopens after six unchanged transitions. A 900-second watchdog bounds the whole journey. Success additionally checks
+The reproduction repeats explicit full-history repairs with two seconds between passes, allowing up to three recipient
+reopens after six unchanged transitions. A 900-second watchdog bounds the whole journey; there is no separate pass-count
+cutoff because production time-bounded slices guarantee no minimum message throughput per call. Success additionally checks
 every participant's exact payload multiset, then fresh bidirectional messaging and recipient restart persistence.
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.
 
