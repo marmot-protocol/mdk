@@ -530,6 +530,14 @@ c_cmd! {
     /// NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
 
+    /// Retry onboarding against explicitly selected discovery relays.
+    async fn marmot_set_onboarding_discovery_relays(account_ref: str, discovery_relays/discovery_relays_len: str_arr) -> rec(MarmotOnboardingSnapshot) = set_onboarding_discovery_relays;
+    /// Acknowledge the displayed one-device notice and resume setup.
+    async fn marmot_acknowledge_onboarding_single_device(account_ref: str, revision: val u64) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device;
+    /// Cancel unfinished onboarding, retaining the signed-out identity and private state.
+    /// An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+    async fn marmot_cancel_onboarding(account_ref: str) -> unit = cancel_onboarding;
+
     /// Create a brand-new Nostr identity, store its secret in the account
     /// secret store, and publish initial relay lists + key package. Free with
     /// `marmot_account_summary_free`.
@@ -2238,4 +2246,301 @@ where
         out.push(convert(unsafe { &*ptr.add(i) })?);
     }
     Ok(out)
+}
+
+use crate::types::onboarding::{MarmotOnboardingSnapshot, MarmotOnboardingStep};
+/// Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_begin_onboarding(
+    client: *const MarmotClient,
+    nsec: *const c_char,
+    default_relays: *const *const c_char,
+    default_relays_len: usize,
+    discovery_relays: *const *const c_char,
+    discovery_relays_len: usize,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let nsec = try_arg!(unsafe { required_str(nsec) });
+        let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
+        let discovery_relays =
+            try_arg!(unsafe { str_array(discovery_relays, discovery_relays_len) });
+        let options = marmot_uniffi::OnboardingOptionsFfi {
+            default_relays,
+            discovery_relays,
+        };
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.begin_onboarding(nsec, options)),
+                out,
+            )
+        }
+    })
+}
+/// Read the persisted onboarding snapshot. Writes NULL with MARMOT_STATUS_OK when no checkpoint exists.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_onboarding_snapshot(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        unsafe { deliver_opt(client.marmot.onboarding_snapshot(account_ref), out) }
+    })
+}
+/// Resume pending checks until user input or a retry is needed. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_run_onboarding(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.run_onboarding(account_ref)),
+                out,
+            )
+        }
+    })
+}
+/// Retry an offered step; earlier checks invalidate downstream readiness. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_retry_onboarding_step(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    step: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let step = try_arg!(MarmotOnboardingStep::from_c(step)).to_ffi();
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.retry_onboarding_step(account_ref, step)),
+                out,
+            )
+        }
+    })
+}
+/// Explicitly skip an optional profile or follows step when offered. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_continue_onboarding_without(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    step: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let step = try_arg!(MarmotOnboardingStep::from_c(step)).to_ffi();
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.continue_onboarding_without(account_ref, step)),
+                out,
+            )
+        }
+    })
+}
+/// Prepare the configured default relay proposal without publishing. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_propose_onboarding_recommended_relays(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    step: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let step = try_arg!(MarmotOnboardingStep::from_c(step)).to_ffi();
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .propose_onboarding_recommended_relays(account_ref, step),
+                ),
+                out,
+            )
+        }
+    })
+}
+/// Prepare a relay proposal without publishing; inbox proposals require an empty write list. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_propose_onboarding_relays(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    step: u32,
+    read_relays: *const *const c_char,
+    read_relays_len: usize,
+    write_relays: *const *const c_char,
+    write_relays_len: usize,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let step = try_arg!(MarmotOnboardingStep::from_c(step)).to_ffi();
+        let read_relays = try_arg!(unsafe { str_array(read_relays, read_relays_len) });
+        let write_relays = try_arg!(unsafe { str_array(write_relays, write_relays_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.propose_onboarding_relays(
+                    account_ref,
+                    step,
+                    read_relays,
+                    write_relays,
+                )),
+                out,
+            )
+        }
+    })
+}
+/// Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_propose_onboarding_profile(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    profile: *const MarmotUserProfileMetadata,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let profile = try_arg!(unsafe { borrowed(profile) });
+        let profile = try_arg!(unsafe { profile.to_ffi() });
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .propose_onboarding_profile(account_ref, profile),
+                ),
+                out,
+            )
+        }
+    })
+}
+/// Prepare a follow-list replacement without publishing; an empty list is valid. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_propose_onboarding_follows(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    follows: *const *const c_char,
+    follows_len: usize,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let follows = try_arg!(unsafe { str_array(follows, follows_len) });
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .propose_onboarding_follows(account_ref, follows),
+                ),
+                out,
+            )
+        }
+    })
+}
+/// Approve the proposal at the current snapshot revision and resume publication; stale revisions are rejected. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_approve_onboarding_repair(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    revision: u64,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .approve_onboarding_repair(account_ref, revision),
+                ),
+                out,
+            )
+        }
+    })
+}
+/// Dismiss an unapproved repair proposal; an approved repair must be resumed. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_cancel_onboarding_repair(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.cancel_onboarding_repair(account_ref)),
+                out,
+            )
+        }
+    })
 }

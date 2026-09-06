@@ -43,9 +43,9 @@ pub use telemetry::{
 };
 
 pub(crate) use directory::{
-    DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryRelayEventRecord,
-    DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
-    DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
+    DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
+    DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
+    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::RelaySafetyPolicy;
 pub(crate) use telemetry::rollup_from_snapshots;
@@ -933,6 +933,27 @@ impl MarmotRelayPlane {
         self.inner
             .directory
             .fetch_events_with_completion(DirectoryFetchRequest::new(endpoints, queries)?)
+            .await
+    }
+
+    pub(crate) async fn inspect_directory_events(
+        &self,
+        endpoint: TransportEndpoint,
+        query: DirectoryEventQuery,
+        signer: Option<Arc<dyn nostr::NostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, directory::DirectoryInspectionError> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(vec![endpoint], "onboarding inspection")
+            .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?;
+        self.inner
+            .directory
+            .inspect_events(
+                DirectoryFetchRequest::new(endpoints, vec![query])
+                    .map_err(|_| directory::DirectoryInspectionError::InvalidRequest)?,
+                signer,
+            )
             .await
     }
 

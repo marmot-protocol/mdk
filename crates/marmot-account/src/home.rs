@@ -122,6 +122,8 @@ pub enum AccountSetupKind {
     GeneratedIdentity,
     PublicIdentity,
     ExternalSigner,
+    /// Host-driven setup must remain gated until its app checkpoint completes.
+    InteractiveIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -411,6 +413,24 @@ impl AccountHome {
         &self,
         secret_key: &str,
     ) -> AccountHomeResult<NostrAccountImport> {
+        self.import_nostr_account_with_setup_kind(secret_key, AccountSetupKind::ImportedIdentity)
+    }
+
+    /// Persist the interactive setup provenance before making a new identity
+    /// visible. A crash before the app writes its detailed checkpoint remains
+    /// distinguishable from a completed or legacy account.
+    pub fn import_nostr_account_for_onboarding(
+        &self,
+        secret_key: &str,
+    ) -> AccountHomeResult<NostrAccountImport> {
+        self.import_nostr_account_with_setup_kind(secret_key, AccountSetupKind::InteractiveIdentity)
+    }
+
+    fn import_nostr_account_with_setup_kind(
+        &self,
+        secret_key: &str,
+        kind: AccountSetupKind,
+    ) -> AccountHomeResult<NostrAccountImport> {
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
         let account_id_hex = keys.public_key().to_hex();
@@ -445,9 +465,7 @@ impl AccountHome {
             signed_out: false,
         };
         if let Some(setup) = self.raw_account_setup_state(&account.label)? {
-            if setup.account_id_hex != account.account_id_hex
-                || setup.kind != AccountSetupKind::ImportedIdentity
-            {
+            if setup.account_id_hex != account.account_id_hex || setup.kind != kind {
                 return Err(AccountHomeError::AccountExists(account.label));
             }
             match self.secret_store.load_secret(&account) {
@@ -481,7 +499,7 @@ impl AccountHome {
         let setup = AccountSetupState {
             account_id_hex: account.account_id_hex.clone(),
             reused_account_id_credential,
-            kind: AccountSetupKind::ImportedIdentity,
+            kind,
             phase: AccountSetupPhase::LocalStateCreated,
         };
         self.write_account_setup_state(&account.label, &setup)?;
@@ -620,6 +638,65 @@ impl AccountHome {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// App-owned onboarding checkpoint. Unlike setup context, this survives
+    /// setup completion so a host can distinguish checked from legacy accounts.
+    /// Bytes are private and atomically replaced; this layer assigns no meaning
+    /// to their schema or to the onboarding policy.
+    pub fn set_account_onboarding(&self, account_ref: &str, bytes: &[u8]) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        write_secret_bytes(
+            self.account_dir(&account.label).join("onboarding.json"),
+            bytes,
+        )
+    }
+
+    pub fn account_onboarding(&self, account_ref: &str) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(self.account_dir(&account.label).join("onboarding.json")) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Retain the last cancelled checkpoint while removing its active gate.
+    /// The caller must first durably sign out and retain any setup journal.
+    pub fn archive_account_onboarding(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.signed_out {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let directory = self.account_dir(&account.label);
+        match fs::rename(
+            directory.join("onboarding.json"),
+            directory.join("onboarding-cancelled.json"),
+        ) {
+            Ok(()) => {
+                fs::File::open(directory)?.sync_all()?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Read the retained cancellation record for an explicit onboarding restart.
+    pub fn cancelled_account_onboarding(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(
+            self.account_dir(&account.label)
+                .join("onboarding-cancelled.json"),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 

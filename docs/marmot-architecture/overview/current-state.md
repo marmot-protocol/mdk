@@ -19,6 +19,14 @@ status: overview
 
 # Current State — Implementations & Spec
 
+MDK now exposes opt-in durable onboarding for imported identities, with per-step
+validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
+It requires single-device acknowledgment before KeyPackage publication and offers
+advisory detection of packages that may belong to another installation.
+Account onboarding gates normal worker commands until required checks and
+KeyPackage publication complete. Host apps still need to adopt the identity-only
+entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).
+
 Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the
 unifying bump above the previous `0.8.0` release), Marmot-TS gives us an independent TypeScript implementation, and the
 CGKA engine/convergence workspace here is being shaped into spec text.

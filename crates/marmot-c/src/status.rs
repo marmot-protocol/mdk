@@ -96,6 +96,8 @@ pub enum MarmotStatus {
     GroupInviteNotPending = 61,
     MissingMemberInboxRoute = 62,
     GroupRemoved = 63,
+    OnboardingActionUnavailable = 64,
+    OnboardingRequired = 65,
 }
 
 thread_local! {
@@ -155,6 +157,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
         MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
+        MarmotKitError::OnboardingActionUnavailable => MarmotStatus::OnboardingActionUnavailable,
+        MarmotKitError::OnboardingRequired => MarmotStatus::OnboardingRequired,
         MarmotKitError::AccountSetupRetryRequired => MarmotStatus::AccountSetupRetryRequired,
         MarmotKitError::AccountSetupResetNotApplicable => {
             MarmotStatus::AccountSetupResetNotApplicable
@@ -192,6 +196,13 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboarding_status_codes_preserve_the_master_group_removed_value() {
+        assert_eq!(MarmotStatus::GroupRemoved as i32, 63);
+        assert_eq!(MarmotStatus::OnboardingActionUnavailable as i32, 64);
+        assert_eq!(MarmotStatus::OnboardingRequired as i32, 65);
+    }
 
     #[test]
     fn every_runtime_error_variant_maps_to_a_distinct_status() {

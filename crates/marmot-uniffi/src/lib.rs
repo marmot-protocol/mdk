@@ -48,7 +48,8 @@ uniffi::setup_scaffolding!();
 
 pub use commands::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
-    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
+    OnboardingSubscription, PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
+    parse_media_imeta_tag,
 };
 pub use conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,
@@ -69,8 +70,11 @@ pub use conversions::{
     MediaUploadResultFfi, MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi,
     MessageDraftFfi, MessageDraftSummaryFfi, MessageTagFfi, NotificationCollectionStatusFfi,
     NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
-    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
-    PeriodicMaintenancePolicyFfi, PushPlatformFfi, PushRegistrationFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, OnboardingActionFfi,
+    OnboardingDeviceDiscoveryFfi, OnboardingDevicePackageFfi, OnboardingFindingFfi,
+    OnboardingIssueFfi, OnboardingOptionsFfi, OnboardingRepairProposalFfi,
+    OnboardingSingleDeviceNoticeFfi, OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi,
+    OnboardingStepStateFfi, PeriodicMaintenancePolicyFfi, PushPlatformFfi, PushRegistrationFfi,
     PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
     RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
     RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,

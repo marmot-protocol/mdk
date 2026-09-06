@@ -1161,6 +1161,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::AccountSetupRecoveryRequired => {
             "read_marker_failed:account_setup_recovery_required"
         }
+        AppError::OnboardingActionUnavailable => "read_marker_failed:onboarding_action_unavailable",
+        AppError::OnboardingRequired => "read_marker_failed:onboarding_required",
         AppError::AccountSetupRetryRequired => "read_marker_failed:account_setup_retry_required",
         AppError::AccountSetupResetNotApplicable => {
             "read_marker_failed:account_setup_reset_not_applicable"

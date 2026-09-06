@@ -17,6 +17,7 @@ mod group;
 mod media;
 mod message;
 mod notification;
+mod onboarding;
 mod push;
 mod relay;
 mod subscription;
@@ -28,3 +29,4 @@ pub use group::{
     PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi,
 };
 pub use media::parse_media_imeta_tag;
+pub use onboarding::OnboardingSubscription;

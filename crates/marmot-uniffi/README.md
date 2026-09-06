@@ -114,3 +114,123 @@ The output directories are ignored because generated bindings and packaged nativ
 Regenerate them from this crate before vendoring into an app repository.
 
 See [`AGENTS.md`](AGENTS.md) for scope, invariants, and verification commands.
+
+## Interactive account onboarding
+
+Imported identities can use the durable preflight API instead of `login`:
+
+1. Call `begin_onboarding(nsec, options)` or
+   `begin_external_signer_onboarding(public_key, signer, options)`. Supply the
+   same `default_relays` as new-account creation and a separate set of trusted
+   `discovery_relays`. These methods return a persisted account and snapshot
+   before fetching or publishing Nostr records.
+2. Display the snapshot steps in their returned order (profile, follows, general
+   relays, inbox relays, single-device notice, KeyPackage). Use step identities,
+   not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial
+   `snapshot`, and drive `next` concurrently with `run_onboarding`.
+3. Localize the typed status, findings, and actions. A healthy account advances
+   automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
+   explicit `continue_onboarding_without`. Empty follow lists are valid.
+4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
+   `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
+   a proposal. Profile fields left unset preserve their current values; an
+   explicit empty string clears a field. Display the proposed edits, then pass the returned
+   snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
+   `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
+   a proposal until approval has been recorded.
+5. `retry_onboarding_step` requires an offered `Retry` action; `set_onboarding_discovery_relays`
+   retries with explicitly chosen discovery sources without publishing them.
+   After process restart, read `onboarding_snapshot`, register the external
+   signer again if applicable, and run/resume or retry the indicated step.
+6. Enter the normal app only when `snapshot.ready` is true. Normal worker
+   commands reject unfinished onboarding; the workflow alone can publish its
+   initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
+   interactive workflow is complete.
+
+The `SingleDevice` step always pauses before initial KeyPackage publication.
+Display a general notice that White Noise does not yet support synchronized
+multi-device use and recommends one device. The snapshot's `single_device_notice`
+adds evidence with `OtherInstallationPossible`, `NoneFound`, or `Unknown` discovery.
+When another installation is possible, explain that invitations may reach only
+one installation and conversations will not automatically appear on both.
+Reinstallation or cleared local state can produce the same evidence; do not
+claim to have identified a physical device or a particular app.
+
+Offer **Cancel** and **Continue anyway**. For Cancel, call
+`cancel_onboarding(account_ref)`: it signs the identity out, retains local data and
+completed repairs, and archives the checkpoint to remove the active gate. A later
+sign-in can use either the legacy or interactive entry point. The registered
+external-signer callback remains attached for explicit sign-in within this runtime;
+a process restart still requires the host to register it again. Cancellation is
+idempotent; if interrupted with `cancellation_pending`, call it again to finish.
+Normal onboarding mutations are blocked during that interval. Cancellation is
+not offered while an approved repair is unfinished and cannot discard that repair.
+For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
+MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
+The acknowledgment survives KeyPackage publication failure, task interruption,
+and restart. Rechecking an earlier prerequisite, changing discovery sources,
+approving another repair, explicitly retrying `SingleDevice`, or signing in again
+after signing out a completed account invalidates it and requires a fresh notice.
+Retries preserve optional steps the user skipped unless that skipped step is the
+explicit retry target. Older checkpoints refresh their derived retry hints on
+read, and package records without a `usable` field default to `false`.
+
+Detection reads verified kind-30443 records through the validated relay routes
+without starting an account worker. It compares the newest record per slot with
+the local stable slot and durably owned private packages, including retained
+rotation material. `other_packages` retains signed foreign-slot evidence even
+when the payload is malformed or expired. `usable` describes package validity;
+the reference and expiration are optional when validation cannot extract them.
+The publication timestamp comes from the verified event. No recency cutoff
+excludes a foreign slot:
+republication retains the original event timestamp, so it is not last-active time.
+No public device identifier is introduced, and continuing never deletes another
+installation's packages.
+
+`discovery_complete` describes only the bounded queries to the selected sources;
+it is false for failed, malformed, future-dated, or potentially truncated results.
+Positive evidence can accompany incomplete discovery. `Unknown` means discovery
+was inconclusive; `NoneFound` means none were found on those sources. Neither is
+an assurance that multi-device use is safe. Both still require the general notice.
+Completed pre-notice checkpoints remain ready; incomplete checkpoints acquire
+the notice before KeyPackage publication when upgraded.
+
+Snapshots are complete states, not deltas. A slow subscriber may miss
+intermediate states but receives the latest persisted state. Interrupting an
+async check can leave a step `Checking`; `run_onboarding` resumes it. Once a repair is approved,
+a retry resumes that repair before other checks. It cannot be cancelled as if
+nothing had been published: a relay may already have accepted it. Signed bytes
+are retained before the first send and replayed unchanged on retry.
+
+Discovery reads require a completed relay query. Failed/partial empty discovery
+is distinct from absence and never offers automatic replacement. A valid record
+from a partially successful lookup may pass while retaining `DiscoveryIncomplete`
+and source failures in its findings; a passed step is not necessarily warning-free.
+Off-filter records are ignored. Single-device discovery remains incomplete if
+any selected source fails, even when another source returns an empty result. Fresh signed
+records remain available for inspection even when their contents are malformed;
+a newer malformed record does not silently fall back to an older valid one.
+Repairs re-fetch the source before signing and reject a changed record. Nostr
+has no conditional replace operation, so simultaneous edits after this check
+remain subject to its normal replaceable-event ordering.
+
+Relay checks include syntax, local safety/retirement policy, read/write roles,
+and bounded queries through the relevant routes. Inbox queries filter for the
+account's recipient tag and use an isolated account-bound signer. They retain no
+inbox payloads. Read permission and KeyPackage publication are checked separately;
+these checks do not guarantee future availability or every relay's acceptance of
+future third-party inbox messages. Incomplete workflows recheck reachability
+older than five minutes. Completed onboarding is retained and reruns when a
+signed-out account enters the identity-only flow again.
+
+The existing `login` and generated-account APIs remain compatible. Apps must
+adopt the new identity-only APIs and screen to enable this experience. Legacy
+accounts without an onboarding checkpoint are not retroactively blocked. Active
+legacy accounts and accounts with unfinished legacy setup are not silently
+enrolled: finish or resume their existing setup first. Signed-out legacy accounts
+without pending setup can explicitly opt in. Completed checkpoints defer to normal
+setup/recovery readiness. Corrupt or newer-version checkpoints gate only their own
+account; they must be restored or opened with a compatible runtime, not silently
+discarded because they may contain approved publication intent. C
+consumers have equivalent methods and subscriptions; external-signer entry
+points retain the C API's existing callback-vtable limitation.

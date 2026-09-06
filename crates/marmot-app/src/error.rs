@@ -211,6 +211,10 @@ pub enum AppError {
     AccountSetupRecoveryRequired,
     #[error("durable account setup can be resumed by retrying the original operation")]
     AccountSetupRetryRequired,
+    #[error("onboarding action is unavailable or stale")]
+    OnboardingActionUnavailable,
+    #[error("account must complete interactive onboarding")]
+    OnboardingRequired,
     #[error("account is not in the legacy incomplete-setup reset state")]
     AccountSetupResetNotApplicable,
     #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
@@ -310,6 +314,8 @@ impl AppError {
             Self::AccountWorkerBusy => "account_worker_busy",
             Self::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
             Self::AccountSetupRecoveryRequired => "account_setup_recovery_required",
+            Self::OnboardingActionUnavailable => "onboarding_action_unavailable",
+            Self::OnboardingRequired => "onboarding_required",
             Self::AccountSetupRetryRequired => "account_setup_retry_required",
             Self::AccountSetupResetNotApplicable => "account_setup_reset_not_applicable",
             Self::AccountSetupKeyPackageRecoveryAvailable => {

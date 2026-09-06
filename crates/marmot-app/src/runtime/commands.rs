@@ -1702,7 +1702,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<usize, AppError> {
-        let command = self.worker_commands(account_ref).await?;
+        let command = self.worker_commands_for_setup(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::PublishSetupKeyPackage { respond })

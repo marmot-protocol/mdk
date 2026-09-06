@@ -18,6 +18,17 @@ use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
+/// Stable errors for a bounded, isolated relay inspection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectoryInspectionError {
+    Unreachable,
+    TimedOut,
+    AuthenticationRequired,
+    PaymentRequired,
+    Restricted,
+    InvalidRequest,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirectoryRelayConnectOutcome {
     Connected,
@@ -144,11 +155,33 @@ pub(crate) trait DirectoryRelayFetcher: Send + Sync {
                 complete: false,
             })
     }
+
+    /// A single-relay read that must reach EOSE. Pool fetches may silently
+    /// aggregate partial results and cannot establish absence for onboarding.
+    async fn inspect_directory_events(
+        &self,
+        _request: DirectoryFetchRequest,
+        _signer: Option<Arc<dyn nostr::NostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        Err(DirectoryInspectionError::Unreachable)
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct NostrSdkDirectoryRelayFetcher {
     client: NostrSdkClient,
+}
+
+struct ScopedInspectionClient(NostrSdkClient);
+impl Drop for ScopedInspectionClient {
+    fn drop(&mut self) {
+        let client = self.0.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = client.shutdown().await;
+            });
+        }
+    }
 }
 
 impl DirectoryEventQuery {
@@ -198,6 +231,13 @@ impl DirectoryFetchRequest {
 }
 
 impl DirectoryRelayPlane {
+    pub(crate) async fn inspect_events(
+        &self,
+        request: DirectoryFetchRequest,
+        signer: Option<Arc<dyn nostr::NostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        self.fetcher.inspect_directory_events(request, signer).await
+    }
     pub(crate) fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
         Self {
             fetcher,
@@ -565,6 +605,95 @@ impl NostrSdkDirectoryRelayFetcher {
 
 #[async_trait]
 impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
+    async fn inspect_directory_events(
+        &self,
+        request: DirectoryFetchRequest,
+        signer: Option<Arc<dyn nostr::NostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        use DirectoryInspectionError::*;
+        use nostr_sdk::prelude::ReqExitPolicy;
+        // The signer belongs to this request only, never to a shared mutable
+        // directory client that could authenticate as another account.
+        let builder = NostrSdkClient::builder();
+        let client = ScopedInspectionClient(match signer {
+            Some(signer) => builder.signer(signer).build(),
+            None => builder.build(),
+        });
+        let client = &client.0;
+        let urls = parsed_directory_relay_urls(&request.endpoints).map_err(|_| InvalidRequest)?;
+        if urls.len() != 1 {
+            return Err(InvalidRequest);
+        }
+        let url = urls[0].clone();
+        client
+            .add_relay(url.clone())
+            .await
+            .map_err(|_| Unreachable)?;
+        timeout(
+            DIRECTORY_RELAY_CONNECT_WAIT,
+            client.connect_relay(url.clone()),
+        )
+        .await
+        .map_err(|_| TimedOut)?
+        .map_err(|_| Unreachable)?;
+        let relay = client.relay(url).await.map_err(|_| Unreachable)?;
+        let mut records = Vec::new();
+        for query in request.queries {
+            let keys = query
+                .authors
+                .iter()
+                .map(|key| PublicKey::parse(key))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| InvalidRequest)?;
+            let kind = u16::try_from(query.kind).map_err(|_| InvalidRequest)?;
+            let filter = if query.kind == 1059 {
+                Filter::new().pubkeys(keys)
+            } else {
+                Filter::new().authors(keys)
+            }
+            .kind(Kind::from(kind))
+            .limit(query.limit);
+            let events = relay
+                .fetch_events(
+                    filter,
+                    DIRECTORY_RELAY_FETCH_WAIT,
+                    ReqExitPolicy::ExitOnEOSE,
+                )
+                .await
+                .map_err(|error| {
+                    use nostr_sdk::pool::relay::Error;
+                    match error {
+                        Error::Timeout => TimedOut,
+                        Error::AuthenticationFailed => AuthenticationRequired,
+                        Error::RelayMessage(message) if message.starts_with("auth-required:") => {
+                            AuthenticationRequired
+                        }
+                        Error::RelayMessage(message)
+                            if message.starts_with("payment-required:") =>
+                        {
+                            PaymentRequired
+                        }
+                        Error::RelayMessage(_)
+                        | Error::ReadDisabled
+                        | Error::ConnectionRejected { .. } => Restricted,
+                        _ => Unreachable,
+                    }
+                })?;
+            if query.kind == 1059 {
+                continue;
+            } // Read probe only; do not retain inbox payloads.
+            for event in events {
+                if let Some(event) = validated_directory_event(&event, &query) {
+                    records.push(DirectoryRelayEventRecord {
+                        endpoints: request.endpoints.clone(),
+                        event,
+                    });
+                }
+            }
+        }
+        Ok(records)
+    }
+
     async fn fetch_directory_events(
         &self,
         request: DirectoryFetchRequest,
@@ -770,6 +899,28 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn signerless_inspection_never_retains_relays_in_the_shared_client() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        for (author, succeeds) in [(author, true), ("invalid-author".into(), false)] {
+            let result = fetcher
+                .inspect_directory_events(
+                    DirectoryFetchRequest::new(
+                        vec![endpoint.clone()],
+                        vec![DirectoryEventQuery::new(0, vec![author], 1)],
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .await;
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(fetcher.client.relays().await.is_empty());
+        }
+    }
 
     #[test]
     fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {

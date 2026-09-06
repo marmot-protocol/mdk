@@ -85,6 +85,10 @@ pub enum MarmotKitError {
     AccountSetupRecoveryRequired,
     #[error("durable account setup can be resumed by retrying")]
     AccountSetupRetryRequired,
+    #[error("onboarding action is unavailable or stale")]
+    OnboardingActionUnavailable,
+    #[error("account must complete interactive onboarding")]
+    OnboardingRequired,
     #[error("account is not eligible for incomplete-setup reset")]
     AccountSetupResetNotApplicable,
     #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
@@ -325,6 +329,8 @@ impl From<AppError> for MarmotKitError {
             AppError::AccountWorkerBusy => Self::AccountWorkerBusy,
             AppError::AccountWorkerResponseTimedOut => Self::AccountWorkerResponseTimedOut,
             AppError::AccountSetupRecoveryRequired => Self::AccountSetupRecoveryRequired,
+            AppError::OnboardingActionUnavailable => Self::OnboardingActionUnavailable,
+            AppError::OnboardingRequired => Self::OnboardingRequired,
             AppError::AccountSetupRetryRequired => Self::AccountSetupRetryRequired,
             AppError::AccountSetupResetNotApplicable => Self::AccountSetupResetNotApplicable,
             AppError::AccountSetupKeyPackageRecoveryAvailable => {
