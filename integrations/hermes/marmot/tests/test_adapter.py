@@ -172,9 +172,12 @@ def load_adapter_module():
     ]:
         sys.modules.pop(name, None)
     install_fake_hermes_modules()
-    spec = importlib.util.spec_from_file_location("marmot_hermes_adapter", ADAPTER_PATH)
+    package = types.ModuleType("marmot_hermes")
+    package.__path__ = [str(PLUGIN_DIR)]
+    sys.modules["marmot_hermes"] = package
+    spec = importlib.util.spec_from_file_location("marmot_hermes.adapter", ADAPTER_PATH)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["marmot_hermes_adapter"] = module
+    sys.modules["marmot_hermes.adapter"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -372,7 +375,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
 
         with unittest.mock.patch.object(
-            self.adapter,
+            sys.modules["marmot_hermes.agent_control"],
             "SEND_MEDIA_COMPLETION_TIMEOUT_S",
             0.01,
         ):
