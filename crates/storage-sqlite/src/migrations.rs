@@ -118,6 +118,8 @@ mod migration_0058_processed_transport_ids;
 mod migration_0059_chat_list_unread_membership;
 #[path = "migrations/0060_released_transport_receipts.rs"]
 mod migration_0060_released_transport_receipts;
+#[path = "migrations/0061_transport_reconciliation_replay_cursor.rs"]
+mod migration_0061_transport_reconciliation_replay_cursor;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -432,6 +434,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 60,
         name: "0060_released_transport_receipts",
         apply: migration_0060_released_transport_receipts::apply,
+    },
+    Migration {
+        version: 61,
+        name: "0061_transport_reconciliation_replay_cursor",
+        apply: migration_0061_transport_reconciliation_replay_cursor::apply,
     },
 ];
 
@@ -931,6 +938,65 @@ mod tests {
     }
 
     #[test]
+    fn replay_cursor_migration_preserves_existing_route_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = keyed_connection(&dir.path().join("replay-upgrade.db"));
+        run(&mut conn, &MIGRATIONS[..60]).unwrap();
+        conn.execute(
+            "INSERT INTO transport_reconciliation_route_state
+            (route_kind, route_id, inventory_since) VALUES (0, X'', 123)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transport_reconciliation_items
+            (route_kind, route_id, event_id, created_at) VALUES (0, X'', ?1, 124)",
+            params![[7_u8; 32].as_slice()],
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let state: (i64, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT inventory_since, replay_after FROM transport_reconciliation_route_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (123, None));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM transport_reconciliation_items",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "UPDATE transport_reconciliation_route_state SET replay_after = ?1",
+            params![[8_u8; 32].as_slice()],
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let cursor: Vec<u8> = conn
+            .query_row(
+                "SELECT replay_after FROM transport_reconciliation_route_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, [8; 32]);
+        assert!(
+            conn.execute(
+                "UPDATE transport_reconciliation_route_state SET replay_after = X'01'",
+                []
+            )
+            .is_err()
+        );
+        conn.close().unwrap();
+    }
+
+    #[test]
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
@@ -960,7 +1026,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 60,
+                found: 61,
                 latest_supported: 46,
             }
         ));
@@ -1016,7 +1082,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 60,
+                found: 61,
                 latest_supported: 46,
             }
         ));
@@ -1320,7 +1386,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 60,
+                found: 61,
                 latest_supported: 46,
             }
         ));

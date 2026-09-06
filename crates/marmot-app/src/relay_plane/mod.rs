@@ -1790,6 +1790,7 @@ impl MarmotRelayPlaneAccountAdapter {
         local_items: &[NostrReconciliationItem],
         reconcile_since: u64,
         reconcile_until: u64,
+        progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
     ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
@@ -1818,6 +1819,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 local_items,
                 reconcile_since,
                 reconcile_until,
+                progress,
             )
             .await;
         let metric = result
@@ -1848,6 +1850,7 @@ impl MarmotRelayPlaneAccountAdapter {
         local_items: &[NostrReconciliationItem],
         reconcile_since: u64,
         reconcile_until: u64,
+        progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
     ) -> Result<Option<NostrReconciliationSummary>, TransportAdapterError> {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
@@ -1882,6 +1885,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 local_items,
                 reconcile_since,
                 reconcile_until,
+                progress,
             )
             .await;
         let metric = result

@@ -73,6 +73,11 @@ one-second selection-relevant quiescence window and five-second absolute cap, re
 only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
 another group.
 
+Relay reconciliation replay progress is owned by each account's encrypted route state. It survives
+subscription rebuilds and advances before fetch I/O, independently of admitted event inventory.
+The SDK requires a route-scoped progress store instead of evicting cursors from a shared cache;
+see [reconciliation progress ownership](../../../crates/transport-nostr-adapter/README.md#reconciliation-progress-ownership).
+
 ## Protocol implementations
 
 ### MDK (this repository)
