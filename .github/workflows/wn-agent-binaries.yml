@@ -257,12 +257,15 @@ jobs:
           - cohort: supported-floor
             install_mode: wheel
             hermes_ref: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
+            expected_source_install_mode: monorepo
           - cohort: current-candidate
             install_mode: source
             hermes_ref: 7166071fcaadb36df26f6d753dda97da6b5d699e
+            expected_source_install_mode: monorepo
           - cohort: media-api-candidate
             install_mode: source
             hermes_ref: 672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc
+            expected_source_install_mode: plugin-only
 
     steps:
       - name: Check out repository
@@ -307,7 +310,8 @@ jobs:
             integrations/hermes/tests/marmot/test_real_hermes_plugin.py \
             --hermes-source "$HERMES_MARMOT_DEV_ROOT/hermes-agent" \
             --mdk-source "$GITHUB_WORKSPACE" \
-            --mdk-ref "$GITHUB_SHA"
+            --mdk-ref "$GITHUB_SHA" \
+            --expect-source-install-mode "${{ matrix.expected_source_install_mode }}"
 
   openclaw-host-compat:
     name: OpenClaw beta host compatibility

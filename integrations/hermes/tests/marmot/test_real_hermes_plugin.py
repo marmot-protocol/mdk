@@ -25,6 +25,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hermes-source", type=Path, required=True)
     parser.add_argument("--mdk-source", type=Path, required=True)
     parser.add_argument("--mdk-ref", required=True)
+    parser.add_argument(
+        "--expect-source-install-mode",
+        choices=("monorepo", "plugin-only"),
+    )
     return parser.parse_args()
 
 
@@ -121,6 +125,54 @@ def _pinned_source_checkout(mdk_source: Path, mdk_ref: str, temp_root: Path) -> 
     return checkout
 
 
+def _source_install_supports_subdirectories(plugins_cmd_module) -> bool:
+    """Probe whether this Hermes source-install parser splits URL fragments."""
+
+    resolver = getattr(plugins_cmd_module, "_resolve_git_url", None)
+    if not callable(resolver):
+        return False
+    probe_url = "file:///tmp/mdk-source-probe#integrations/hermes/marmot"
+    try:
+        resolved = resolver(probe_url)
+    except (TypeError, ValueError):
+        return False
+    return resolved == (
+        "file:///tmp/mdk-source-probe",
+        "integrations/hermes/marmot",
+    )
+
+
+def _plugin_only_repository(mdk_source: Path, mdk_ref: str, temp_root: Path) -> Path:
+    """Build an exact-content plugin repository for pre-subdirectory Hermes."""
+
+    repository = temp_root / "marmot-plugin-only-source"
+    repository.mkdir()
+    for name in ("__init__.py", "adapter.py", "agent_control.py", "plugin.yaml", "README.md"):
+        content = subprocess.check_output(
+            ["git", "show", f"{mdk_ref}:integrations/hermes/marmot/{name}"],
+            cwd=mdk_source,
+        )
+        (repository / name).write_bytes(content)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=MDK compatibility test",
+            "-c",
+            "user.email=compatibility-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "Pin Marmot plugin fixture",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    return repository
+
+
 def main() -> int:
     args = _parse_args()
     hermes_source = args.hermes_source.resolve()
@@ -152,9 +204,19 @@ def main() -> int:
         cmd_install = plugins_cmd_module.cmd_install
 
         install_parameters = inspect.signature(cmd_install).parameters
-        if "ref" in install_parameters:
+        if "ref" in install_parameters and _source_install_supports_subdirectories(
+            plugins_cmd_module
+        ):
             identifier = f"file://{mdk_source}#integrations/hermes/marmot"
             cmd_install(identifier, force=False, enable=True, ref=resolved_ref)
+            source_install_mode = "monorepo"
+        elif "ref" in install_parameters:
+            # Some older candidate builds expose --ref but predate source
+            # subdirectories. Keep that capability independent and avoid
+            # passing a URL fragment through to git clone as a path.
+            plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
+            cmd_install(f"file://{plugin_source}", force=False, enable=True)
+            source_install_mode = "plugin-only"
         else:
             # Hermes 0.19.0 supports local monorepo subdirectories but has no
             # --ref option. Exercise the documented portable path: detach a
@@ -164,6 +226,16 @@ def main() -> int:
                 f"file://{pinned_source}#integrations/hermes/marmot",
                 force=False,
                 enable=True,
+            )
+            source_install_mode = "monorepo"
+
+        if (
+            args.expect_source_install_mode is not None
+            and source_install_mode != args.expect_source_install_mode
+        ):
+            raise AssertionError(
+                "Hermes source install capability mismatch: "
+                f"selected {source_install_mode}, expected {args.expect_source_install_mode}"
             )
 
         plugin_dir = home / ".hermes" / "plugins" / "marmot"
@@ -208,7 +280,8 @@ def main() -> int:
 
         print(
             "real-hermes plugin install/discovery/media passed "
-            f"(hermes_source={hermes_source}, mdk_ref={resolved_ref}, media_calls={media_calls})"
+            f"(hermes_source={hermes_source}, mdk_ref={resolved_ref}, "
+            f"source_install_mode={source_install_mode}, media_calls={media_calls})"
         )
     return 0
 
