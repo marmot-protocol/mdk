@@ -204,20 +204,14 @@ def main() -> int:
         cmd_install = plugins_cmd_module.cmd_install
 
         install_parameters = inspect.signature(cmd_install).parameters
-        if "ref" in install_parameters and _source_install_supports_subdirectories(
+        supports_subdirectories = _source_install_supports_subdirectories(
             plugins_cmd_module
-        ):
+        )
+        if supports_subdirectories and "ref" in install_parameters:
             identifier = f"file://{mdk_source}#integrations/hermes/marmot"
             cmd_install(identifier, force=False, enable=True, ref=resolved_ref)
             source_install_mode = "monorepo"
-        elif "ref" in install_parameters:
-            # Some older candidate builds expose --ref but predate source
-            # subdirectories. Keep that capability independent and avoid
-            # passing a URL fragment through to git clone as a path.
-            plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
-            cmd_install(f"file://{plugin_source}", force=False, enable=True)
-            source_install_mode = "plugin-only"
-        else:
+        elif supports_subdirectories:
             # Hermes 0.19.0 supports local monorepo subdirectories but has no
             # --ref option. Exercise the documented portable path: detach a
             # local checkout at the exact MDK commit, then install its subdir.
@@ -228,6 +222,13 @@ def main() -> int:
                 enable=True,
             )
             source_install_mode = "monorepo"
+        else:
+            # Some older candidate builds predate source subdirectories,
+            # independently of whether they expose --ref. Avoid passing a URL
+            # fragment through to git clone as a literal path.
+            plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
+            cmd_install(f"file://{plugin_source}", force=False, enable=True)
+            source_install_mode = "plugin-only"
 
         if (
             args.expect_source_install_mode is not None
