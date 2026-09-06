@@ -124,6 +124,10 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         def enforces_own_access_policy(self):
             return False
 
+        @property
+        def is_connected(self):
+            return self._running
+
         def _mark_connected(self):
             self._running = True
 
@@ -941,6 +945,40 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_enablement_is_distinct_from_live_readiness(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+        config = platform_config(
+            enabled=True,
+            extra={"socket_path": "/tmp/marmot-no-companion-service.sock"},
+        )
+
+        class FakeContext:
+            plugin_settings = {}
+
+            def register_platform(self, **kwargs):
+                self.platform = kwargs
+
+        class UnreachableClient:
+            async def account_list(self):
+                raise adapter.AgentControlError(
+                    "wn-agent unavailable",
+                    code="connect_failed",
+                    retryable=True,
+                )
+
+        ctx = FakeContext()
+        adapter.register(ctx)
+        live_adapter = adapter.MarmotPlatformAdapter(config, client=UnreachableClient())
+
+        # Hermes uses PlatformEntry.is_connected synchronously as a config-only
+        # auto-enablement gate. Runtime connectivity stays on BasePlatformAdapter.
+        self.assertTrue(ctx.platform["is_connected"](config))
+        self.assertFalse(live_adapter.is_connected)
+        readiness = await adapter.probe_readiness(config, client=live_adapter.client)
+        self.assertEqual(readiness["state"], "wn_agent_unreachable")
+        self.assertFalse(readiness["wn_agent_reachable"])
+
     async def test_probe_distinguishes_disabled_invalid_and_ready(self):
         adapter = load_adapter_module()
         platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")

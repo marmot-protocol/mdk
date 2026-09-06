@@ -3710,6 +3710,18 @@ def register(ctx):
     def adapter_factory(config):
         return _remember_live_adapter(MarmotPlatformAdapter(effective(config)))
 
+    def configured_for_enablement(config):
+        """Synchronous Hermes config gate; this is not a live health probe.
+
+        Hermes calls PlatformEntry.is_connected while loading configuration to
+        decide whether an opted-in platform is configured. Blocking socket I/O
+        there would stall setup and auto-enablement. Operational connectivity
+        remains BasePlatformAdapter.is_connected after connect(); staged live
+        health is exposed separately by marmot_status/probe_readiness().
+        """
+
+        return validate_config(effective(config))
+
     async def standalone_sender(
         config,
         chat_id,
@@ -3733,8 +3745,8 @@ def register(ctx):
         label="Marmot",
         adapter_factory=adapter_factory,
         check_fn=check_requirements,
-        is_connected=lambda config: validate_config(effective(config)),
-        validate_config=lambda config: validate_config(effective(config)),
+        is_connected=configured_for_enablement,
+        validate_config=configured_for_enablement,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="MARMOT_HOME_CHANNEL",
         standalone_sender_fn=standalone_sender,

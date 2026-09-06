@@ -31,6 +31,14 @@ It never returns account or group identifiers. `state: ready` is the only fully
 ready result; `gateway_inactive` means no live Marmot adapter is available to
 probe in that Hermes process.
 
+Hermes's `PlatformEntry.is_connected` callback is a synchronous configuration
+and auto-enablement gate, so this plugin deliberately keeps that callback free
+of socket I/O: it means "configured", not "the companion service is live".
+Operational `BasePlatformAdapter.is_connected` remains false until `connect()`
+successfully reaches `wn-agent`; `marmot_status` is the authoritative staged
+health readback. A configured plugin with no companion service is therefore not
+reported as operationally connected.
+
 On current Hermes releases, non-secret values from
 `plugins.entries.marmot.settings` are merged into the effective platform config
 before validation, adapter construction, standalone delivery, and readiness
