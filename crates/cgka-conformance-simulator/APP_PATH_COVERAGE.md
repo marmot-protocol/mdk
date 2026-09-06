@@ -168,7 +168,7 @@ own contracts. Every subsequent revision must pass the dedicated large recovery 
 The public send/leave, membership re-entry, admin handoff and small offline recovery families are documented in
 [SCENARIOS.md](SCENARIOS.md#public-app-journey-families). Each input owns its public expectations; no engine
 assertions are stripped during replay. `Exactly` and bounded `Eventually` predicates now read public app epoch,
-member count and visible payload counts. Generator version 3 also checks exact expected public roster/admin/profile
+member count and visible payload counts. Generator version 4 also checks exact expected public roster/admin/profile
 state jointly across online members, agreement on epoch and a logical-mutation epoch lower bound. It permits additional
 automatic-maintenance epochs. Exact engine state and private pending work still fail capability preflight;
 virtual-time `Within`/`Never` assertions remain unsupported. `Eventually` bounds tick rounds, not wall time; the
@@ -354,3 +354,13 @@ not the 900-second watchdog. The driver now keeps attempting within that unchang
 Exact payload/state equality, fresh traffic, restart persistence, and clean runtime closure are still required.
 This corrects premature test termination; it does not establish a preparation-time bound or claim to fix
 all large-backlog recovery failures (see #1715).
+
+
+### Revocation enforcement coverage
+
+Public journey generator version 4 adds a negative authorization probe after every delegated-admin revocation,
+including the revoke-then-reopen variant. The delegate attempts to promote itself through the public app; only
+`NotGroupAdmin` maps to the expected `not_group_admin` result. Busy workers, timeouts and storage errors cannot
+satisfy it. The harness pauses unrelated maintenance while checking that the attempt changes neither public
+protocol state nor relay publication count, then resumes maintenance and checks ordinary messaging still works.
+The strict admin-handoff canary executes cases 0 and 2; the saved version-3 inputs retain their earlier contracts.

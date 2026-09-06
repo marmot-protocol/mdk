@@ -1004,6 +1004,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectUpdateAdminPolicy<'_>,
     ) -> Result<(), SubjectError> {
+        if action.action_id.is_none() {
+            return self.probe_admin_policy_refusal(action).await;
+        }
         let before = self.relay_publication_cursor().await;
         let group_id = self.active_group()?;
         let message_ids = self
@@ -1327,6 +1330,40 @@ impl ConvergenceSubject for AppRuntimeHarness {
 }
 
 impl AppRuntimeHarness {
+    // Expected-error steps must observe the real command's refusal, including
+    // its side effects. Pause unrelated maintenance while comparing public
+    // state and relay publications, and always resume before returning.
+    async fn probe_admin_policy_refusal(
+        &mut self,
+        action: SubjectUpdateAdminPolicy<'_>,
+    ) -> Result<(), SubjectError> {
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let clients = vec![action.client.to_owned()];
+            self.refresh_cached_members(&clients).await?;
+            let before = self.layered_observation(action.client)?.protocol;
+            let publications = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let result = self
+                .apply_admin_set(action.client, &group_id, action.admins)
+                .await;
+            self.refresh_cached_members(&clients).await?;
+            let after = self.layered_observation(action.client)?.protocol;
+            if result.is_err()
+                && (before != after || publications != self.relay_publication_cursor().await)
+            {
+                return Err(SubjectError::new(
+                    "admin_refusal_changed_state_or_published",
+                    "expected admin refusal changed public state or published a relay event",
+                ));
+            }
+            result.map(|_| ())
+        }
+        .await;
+        self.set_all_maintenance_paused(false).await?;
+        result
+    }
+
     async fn apply_admin_set(
         &self,
         actor: &str,
@@ -1651,6 +1688,16 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
 }
 
 fn app_error(error: AppError) -> SubjectError {
+    if matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::error::EngineError::NotGroupAdmin { .. })
+    ) {
+        return SubjectError::classified(
+            SubjectFailureCategory::ExpectedRefusal,
+            "not_group_admin",
+            "local identity is not a group administrator",
+        );
+    }
     let category = match error {
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
@@ -1849,8 +1896,23 @@ mod tests {
         assert_eq!(protocol.category, SubjectFailureCategory::Protocol);
         assert!(!protocol.message.contains(marker));
 
-        let resource = app_error(AppError::RuntimeBusy);
-        assert_eq!(resource.category, SubjectFailureCategory::Resource);
+        let denied = app_error(AppError::Account(marmot_account::AccountError::Engine(
+            cgka_traits::error::EngineError::NotGroupAdmin {
+                group_id: GroupId::new(marker.as_bytes().to_vec()),
+            },
+        )));
+        assert_eq!(denied.category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(denied.code, "not_group_admin");
+        assert!(!denied.message.contains(marker));
+        for failure in [
+            AppError::RuntimeBusy,
+            AppError::AccountWorkerResponseTimedOut,
+        ] {
+            let resource = app_error(failure);
+            assert_eq!(resource.category, SubjectFailureCategory::Resource);
+            assert_ne!(resource.code, denied.code);
+        }
+        assert_ne!(environment.code, denied.code);
 
         let refusal = app_error(AppError::GroupInviteNotPending);
         assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);

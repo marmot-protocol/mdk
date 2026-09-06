@@ -54,7 +54,7 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
         );
         for case in long {
             assert_eq!(case.subject, GeneratedSubjectKind::AppRuntime);
-            assert_eq!(case.generator_version, "3");
+            assert_eq!(case.generator_version, "4");
             preflight_compiled_scenario(&compile_scenario(&case.scenario).unwrap(), &descriptor)
                 .unwrap();
             for client in &case.scenario.clients {
@@ -199,7 +199,12 @@ fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
                 PUBLIC_APP_ADMIN_HANDOFF_FAMILY => {
                     assert_eq!(count("update_admin_policy"), 2 * (1 + index as usize % 2));
                     assert_eq!(count("update_group_profile"), 1 + index as usize % 2);
+                    assert_eq!(
+                        count("expect_update_admin_policy_error"),
+                        1 + index as usize % 2
+                    );
                     let mut delegated = None;
+                    let mut revoked = None;
                     let mut did_edit = false;
                     for step in steps {
                         match step {
@@ -217,7 +222,22 @@ fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
                                     did_edit,
                                     "delegated permission must be exercised before revocation"
                                 );
-                                delegated = None;
+                                revoked = delegated.take();
+                            }
+                            ScenarioStep::ExpectUpdateAdminPolicyError {
+                                client,
+                                admins,
+                                error,
+                            } => {
+                                assert_eq!(Some(client), revoked.take());
+                                assert!(admins.contains(client));
+                                assert_eq!(error, "not_group_admin");
+                            }
+                            ScenarioStep::SendAppMessage { .. } => {
+                                assert!(
+                                    revoked.is_none(),
+                                    "probe revocation before ordinary messaging"
+                                );
                             }
                             _ => {}
                         }
@@ -230,8 +250,8 @@ fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
     }
 }
 
-async fn strict_canary(family: &str) {
-    let case = generate_family_case(family, 7, 0).unwrap();
+async fn strict_canary(family: &str, case_index: u64) {
+    let case = generate_family_case(family, 7, case_index).unwrap();
     let mut subject = AppRuntimeHarness::new_with_pinned_settlement(&case.scenario.clients)
         .await
         .unwrap();
@@ -291,6 +311,14 @@ async fn strict_canary(family: &str) {
         report.oracle
     );
     let trace = report.observed_trace.unwrap();
+    if family == PUBLIC_APP_ADMIN_HANDOFF_FAMILY {
+        assert_eq!(trace.errors.len(), 1 + case_index as usize % 2);
+        let mut wrong_refusal = trace.clone();
+        wrong_refusal.errors[0].error = "app_runtime_operation_failed".into();
+        assert!(
+            !compare_trace_expectations(None, &case.expected_outcomes, &wrong_refusal).is_empty()
+        );
+    }
     let mut wrong_admins = trace.clone();
     wrong_admins
         .admin_policies
@@ -326,23 +354,24 @@ async fn strict_canary(family: &str) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
 async fn public_send_leave_strict_canary() {
-    strict_canary(FAMILIES[0]).await;
+    strict_canary(FAMILIES[0], 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
 async fn public_membership_reentry_strict_canary() {
-    strict_canary(FAMILIES[1]).await;
+    strict_canary(FAMILIES[1], 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
 async fn public_offline_recovery_strict_canary() {
-    strict_canary(FAMILIES[2]).await;
+    strict_canary(FAMILIES[2], 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
 async fn public_admin_handoff_strict_canary() {
-    strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY).await;
+    strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 0).await;
+    strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 2).await;
 }

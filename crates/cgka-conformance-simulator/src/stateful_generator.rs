@@ -23,7 +23,7 @@ pub const PUBLIC_APP_SEND_LEAVE_FAMILY: &str = "public-app-send-leave/v1";
 pub const PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY: &str = "public-app-membership-reentry/v1";
 pub const PUBLIC_APP_OFFLINE_RECOVERY_FAMILY: &str = "public-app-offline-recovery/v1";
 pub const PUBLIC_APP_ADMIN_HANDOFF_FAMILY: &str = "public-app-admin-handoff/v1";
-pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "3";
+pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "4";
 
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
@@ -779,6 +779,23 @@ pub fn generate_public_app_journey_case(
                         client: victim.clone(),
                     });
                 }
+                let refusal_step = model.steps.len();
+                let mut forbidden_admins = model.admins.clone();
+                forbidden_admins.insert(victim.clone());
+                model
+                    .steps
+                    .push(ScenarioStep::ExpectUpdateAdminPolicyError {
+                        client: victim.clone(),
+                        admins: forbidden_admins.into_iter().collect(),
+                        error: "not_group_admin".into(),
+                    });
+                model.expected.push(TraceExpectation::ExpectedError {
+                    step_index: refusal_step,
+                    client: victim.clone(),
+                    operation: "update_admin_policy".into(),
+                    error: "not_group_admin".into(),
+                });
+                model.public_state_checkpoint();
                 model.apply(JourneyAction::Send {
                     sender: victim.clone(),
                 });

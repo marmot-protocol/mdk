@@ -674,7 +674,7 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 `public-app-send-leave/v1`, `public-app-membership-reentry/v1`, `public-app-offline-recovery/v1`,
 and `public-app-admin-handoff/v1`
-use `generate_public_app_journey_case` (generator version `3`) and the shared stateful journey model.
+use `generate_public_app_journey_case` (generator version `4`) and the shared stateful journey model.
 They default to `AppRuntimeHarness`: public Marmot app operations, real local Nostr relay sockets, and separate
 SQLCipher databases. Existing engine families and private oracles are unchanged.
 
@@ -689,6 +689,8 @@ SQLCipher databases. Existing engine families and private oracles are unchanged.
 - **Admin handoff:** seed chooses a non-founder who is granted admin rights, edits the group profile, then loses
   admin rights while retaining membership and messaging. Even/odd indices run one/two grant-revoke cycles;
   indices 0/1 modulo 4 reopen the delegate before exercising the grant, while 2/3 reopen after revocation.
+  After every revocation (including reopen), the delegate attempts to promote itself and must receive
+  `not_group_admin` without a relay publication or public-state change, then still sends an ordinary message.
   The final profile must match the delegate's edit and the final admin set must contain only the founder.
 - **Shared oracle:** bounded checkpoints require all online members to agree on epoch, exact roster identities,
   admin identities and expected profile, with an epoch lower bound covering the requested mutations. Automatic app

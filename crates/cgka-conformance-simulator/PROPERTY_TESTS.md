@@ -318,6 +318,9 @@ binds every restart action id to a matching durable `restarted` lifecycle event.
 `tests/public_app_families.rs` covers deterministic replay, prefix stability, seeded workload variation and full
 app capability preflight for send/leave, membership re-entry, offline recovery and admin handoff. The admin family
 requires a delegated profile edit between every grant and revocation, with reopen on both sides across the catalog.
+Version 4 also requires a precise unauthorized self-promotion refusal after each revoke, with no public-state
+change or relay publication. The socket canary executes the revoke/reopen case and rejects a generic runtime
+error substituted for the expected authorization refusal.
 Explicit socket canaries execute through MarmotAppRuntime and per-participant SQLCipher databases. Their terminal
 oracle mutation checks reject loss, duplicate messages, wrong membership count, wrong profile, wrong admin set and
 divergent epochs. The public group checkpoint also rejects a same-size wrong roster and an epoch below the logical
