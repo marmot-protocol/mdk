@@ -18697,7 +18697,7 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
 fn released_transport_is_replayed_after_lost_effect_and_reopen() {
     run_composed_app_runtime_test("released-transport-replay", || async {
         use cgka_traits::storage::MessageStorage;
-        for handling in ["checkpoint", "reopen", "failed effects"] {
+        for handling in ["checkpoint", "reopen", "failed effects", "unsaved receipts"] {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let (app, mut client, route) =
@@ -18716,6 +18716,23 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
             // Include a pending in-memory receipt that a later checkpoint would
             // otherwise write back, as well as the already checkpointed receipt.
             client.pending_seen_event_count = client.state.seen_events.len();
+            if handling == "unsaved receipts" {
+                // Construct the state left by a best-effort inventory write
+                // failure and an uncheckpointed seen ring: retained raw bytes,
+                // active in-memory receipt, no durable receipt or old journal.
+                // The storage-only consume deliberately leaves client memory
+                // untouched; this is fixture setup, not the app integration.
+                storage.release_message_for_replay(&record).unwrap();
+                storage.consume_released_transport_receipts().unwrap();
+                storage.put_message(&record).unwrap();
+                assert!(
+                    !app.load_state("alice")
+                        .unwrap()
+                        .seen_events
+                        .contains(&probe.id)
+                );
+                assert!(client.seen_events_index.contains(&probe.id));
+            }
             storage.release_message_for_replay(&record).unwrap();
             if handling == "reopen" {
                 drop(client);
