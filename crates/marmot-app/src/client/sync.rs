@@ -652,6 +652,12 @@ impl AppClient {
         self.seen_events_index.retain(|id| !released.contains(id));
         self.state.seen_events.retain(|id| !released.contains(id));
         self.pending_seen_event_count = self.state.seen_events.len();
+        tracing::info!(
+            target: "marmot_app::relay_plane",
+            method = "reconcile_released_transport_receipts",
+            released_count = released.len(),
+            "retired released transport receipt claims and restored replay eligibility"
+        );
         self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
         Ok(released.into_iter().collect())
     }
@@ -2902,9 +2908,21 @@ impl AppClient {
     }
 
     fn clear_epoch_backfill_intent(&self, pending: &PendingEpochBackfill) -> Result<(), AppError> {
+        let mut completed = pending.clone();
+        // A release during this execution can rearm the same group at the same
+        // epoch. Epoch equality alone cannot distinguish the new durable intent
+        // from the one this execution served. Leave cleanup to its next owner,
+        // including work rotated into the queue, so restart cannot lose it.
+        completed.groups.retain(|group_id, _| {
+            !self
+                .pending_epoch_backfill
+                .iter()
+                .chain(self.queued_epoch_backfills.iter())
+                .any(|next| next.groups.contains_key(group_id))
+        });
         self.app.clear_epoch_backfill_intents(
             &self.state.label,
-            &Self::stored_epoch_backfill_intents(pending),
+            &Self::stored_epoch_backfill_intents(&completed),
         )
     }
 
@@ -4993,6 +5011,102 @@ mod tests {
             crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch },
         );
         pending
+    }
+
+    #[tokio::test]
+    async fn older_backfill_completion_preserves_released_intent_across_reopen() {
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
+        use marmot_forensics::EpochBackfillExecutionSeam;
+
+        for (queued, epoch_increment) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let mut client = app.client("alice").await.unwrap();
+            let group = client
+                .create_group("release during replay", &[])
+                .await
+                .unwrap();
+            let epoch = client.group_mls_state(&group).unwrap().epoch;
+            let old = armed_backfill(&group, epoch);
+            client.persist_epoch_backfill_intent(&old).unwrap();
+            client.pending_epoch_backfill = Some(old);
+            let execution = client
+                .begin_epoch_backfill_execution(EpochBackfillExecutionSeam::ExplicitCatchUp)
+                .unwrap();
+            assert!(!client.has_pending_epoch_backfill());
+
+            // Engine release occurs during the old replay's final drain. Its
+            // journal is consumed before EOSE completion clears old work.
+            let storage = app.account_storage("alice").unwrap();
+            let raw = MessageRecord {
+                id: MessageId::new(vec![0xfe; 32]),
+                group_id: group.clone(),
+                epoch: EpochId(epoch + epoch_increment),
+                state: MessageState::PeelDeferred,
+                payload: Vec::new(),
+                deferred_peel: None,
+            };
+            storage.put_message(&raw).unwrap();
+            storage.release_message_for_replay(&raw).unwrap();
+            client.reconcile_released_transport_receipts().unwrap();
+            if queued {
+                let pending = client.pending_epoch_backfill.take().unwrap();
+                client.queued_epoch_backfills.push_back(pending);
+            }
+            client
+                .clear_epoch_backfill_intent(&execution.pending)
+                .unwrap();
+            assert_eq!(
+                storage.pending_epoch_backfill_intents().unwrap().len(),
+                1,
+                "old completion consumed a rearmed intent: queued={queued}, epoch_increment={epoch_increment}"
+            );
+            drop(client); // Crash boundary: no later attempt has persisted again.
+            let mut reopened = app.client("alice").await.unwrap();
+            assert!(reopened.has_pending_epoch_backfill());
+            let next = reopened.take_next_pending_epoch_backfill().unwrap();
+            assert_eq!(next.groups[&group].stalled_epoch, epoch + epoch_increment);
+            reopened.clear_epoch_backfill_intent(&next).unwrap();
+            assert!(
+                storage.pending_epoch_backfill_intents().unwrap().is_empty(),
+                "the final execution must still clean up completed work"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn older_backfill_completion_still_clears_groups_without_new_work() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let primary = client.create_group("primary rearm", &[]).await.unwrap();
+        let queued = client.create_group("queued rearm", &[]).await.unwrap();
+        let finished = client.create_group("finished", &[]).await.unwrap();
+        let mut completed = armed_backfill(&primary, 0);
+        completed.groups.extend(armed_backfill(&queued, 0).groups);
+        completed.groups.extend(armed_backfill(&finished, 0).groups);
+        client.persist_epoch_backfill_intent(&completed).unwrap();
+        client.pending_epoch_backfill = Some(armed_backfill(&primary, 0));
+        client
+            .queued_epoch_backfills
+            .push_back(armed_backfill(&queued, 0));
+        client.clear_epoch_backfill_intent(&completed).unwrap();
+        let remaining = app.pending_epoch_backfill_intents("alice").unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            !remaining
+                .iter()
+                .any(|intent| intent.group_id_hex == hex::encode(finished.as_slice()))
+        );
     }
 
     fn failed_replay_outcome() -> EpochBackfillReplayOutcome {

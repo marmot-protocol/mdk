@@ -43,8 +43,12 @@ in one transaction. The caller then clears its in-memory seen ring/index
 synchronously, before any await or fallible operation. Process death before
 consumption leaves the journal; death after acknowledgment leaves clean disk
 receipts and durable backfill. Neither case relies on delivery of the engine's
-in-memory `TransportObjectResourceRefused` event. Exact-ID replay still passes
-through the ordinary authentication and engine deduplication paths.
+in-memory `TransportObjectResourceRefused` event. Completing an older backfill
+must retain durable intents for groups rearmed into pending or queued work,
+including a new release at the same epoch. The next execution owns their cleanup;
+otherwise an old completion can erase the restart recovery edge before that
+execution starts. Exact-ID replay still passes through the ordinary authentication
+and engine deduplication paths.
 
 This prevents future release/receipt mismatches. It cannot reconstruct releases
 that happened before this journal existed; bounded repair of historical receipt
