@@ -9976,3 +9976,38 @@ async fn join_epoch_is_anchored_so_a_rival_forking_there_adjudicates() {
     assert!(members.iter().any(|member| member.id == eve.self_id()));
     assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
+
+/// A retry sweep cannot cache a group verdict for subsequent live arrivals:
+/// the graph can gain a rival between calls without the canonical epoch moving.
+#[tokio::test]
+async fn live_deferral_reclassifies_graph_after_a_retry_sweep_and_new_rival() {
+    let (mut carol, group_id, commits, witness) =
+        forked_epoch_with_an_unreadable_witness("deferral-lineage-after-retry").await;
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, commits[0].clone(), 1_000)
+        .unwrap();
+    assert_eq!(
+        carol.ingest(witness.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred {
+            group_id: group_id.clone(),
+            lineage: DeferralLineage::Uncontested,
+        }
+    );
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    carol
+        .buffer_openmls_convergence_message_at(&group_id, commits[1].clone(), 1_000)
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let redelivered = TransportMessage {
+        id: MessageId::new(b"new-wrapper-after-rival".to_vec()),
+        ..witness
+    };
+    assert_eq!(
+        carol.ingest(redelivered).await.unwrap(),
+        IngestOutcome::TransportDeferred {
+            group_id,
+            lineage: DeferralLineage::ContestedFork,
+        },
+        "live recovery evidence must use the current stored graph"
+    );
+}

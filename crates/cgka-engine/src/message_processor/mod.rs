@@ -2200,7 +2200,12 @@ impl<S: StorageProvider> Engine<S> {
     /// group that has since forked, which is the inversion this whole
     /// discriminator exists to prevent.
     ///
-    /// The scan is therefore paid per deferral, and bounded by where it sits.
+    /// The scan is paid only for a live-ingest deferral. Internal retry sweeps
+    /// return an unclassified deferral: their caller only maintains the retry
+    /// lifecycle, so no lineage claim escapes that boundary. Live classifications
+    /// always read the current graph, including commits retained by earlier
+    /// sweeps; no cached verdict can become stale after graph mutation.
+    /// The live scan is bounded by where it sits.
     /// It runs only after the per-group retained-row cap has admitted the row
     /// (`has_peel_deferred_capacity`), so a flood of attacker-minted
     /// undecryptable input is answered `ResourceRefused` without ever reaching
@@ -2210,6 +2215,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<DeferralLineage, EngineError> {
+        self.engine_metrics.note_deferred_lineage_classification();
         let group = self.storage.get_group(group_id)?;
         let policy = self
             .convergence_policy_for_group_ungated(group_id)
@@ -2282,6 +2288,8 @@ impl<S: StorageProvider> Engine<S> {
         record: &MessageRecord,
         sweep: crate::message_processor::ingest::DeferredPeelSweep<'_>,
     ) -> Result<bool, EngineError> {
+        use ingest::GroupMessageIngestOutcome::{Deferred, Outcome};
+
         let stored_payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         let Some(msg) = stored_payload.as_raw_transport().cloned() else {
@@ -2291,31 +2299,24 @@ impl<S: StorageProvider> Engine<S> {
             .ingest_group_message_from_sweep(&msg, group_id.as_slice().to_vec(), sweep)
             .await
         {
-            // Still unreadable: the row keeps its place in the retry lifecycle
-            // and the caller charges its budget. The verdict's `lineage` is
-            // dropped on purpose. There is exactly one lineage site
-            // (`Self::deferral_lineage`, reached from the single deferral return
-            // in `ingest_group_message_from_sweep`), and it answers about the
-            // GROUP's stored commit graph rather than about this row — so a
-            // sweep can only ever restate what live ingest already reported for
-            // this group, over rows the app's stall detector counted when they
-            // first arrived. Routing it out would re-count that evidence, not
-            // sharpen it.
-            Ok(IngestOutcome::TransportDeferred { .. }) => Ok(false),
-            Ok(IngestOutcome::ResourceRefused {
+            // The live caller classifies lineage for recovery evidence. A
+            // sweep consumes only retention/progress, so its opaque result
+            // deliberately carries no lineage and does not scan stored history.
+            Ok(Deferred(_)) | Ok(Outcome(IngestOutcome::TransportDeferred { .. })) => Ok(false),
+            Ok(Outcome(IngestOutcome::ResourceRefused {
                 resource: InboundResourceLimit::TransportDeferredCapacity,
                 ..
-            }) => Ok(false),
-            Ok(IngestOutcome::LocalState {
+            })) => Ok(false),
+            Ok(Outcome(IngestOutcome::LocalState {
                 state: LocalIngestState::Quarantined,
-            }) => {
+            })) => {
                 // Defense-in-depth: the gates above should keep this from
                 // running for a quarantined group at all, but if a row still
                 // classifies Quarantined it must keep its PeelDeferred state —
                 // the catch-all arm below would retire the replay buffer.
                 Ok(false)
             }
-            Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
+            Ok(Outcome(IngestOutcome::Buffered { .. } | IngestOutcome::Processed)) => {
                 // The peeled content now has its own content-derived record;
                 // retire the raw transport wrapper so it does not keep
                 // re-entering this retry loop as a stale duplicate — but ONLY
@@ -2335,13 +2336,13 @@ impl<S: StorageProvider> Engine<S> {
                 self.note_peel_deferred_row_retired(record);
                 Ok(true)
             }
-            Ok(
+            Ok(Outcome(
                 IngestOutcome::Stale { .. }
                 | IngestOutcome::Ignored { .. }
                 | IngestOutcome::LocalState { .. }
                 | IngestOutcome::ResourceRefused { .. }
                 | IngestOutcome::Rejected { .. },
-            ) => {
+            )) => {
                 // Terminal stale classifications are still successful
                 // reclassifications of this raw deferred row. Retire it only
                 // while it is still awaiting retry: the reachable case is
