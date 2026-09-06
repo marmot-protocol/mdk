@@ -1746,8 +1746,11 @@ impl RelayTelemetryExporter {
 }
 
 #[cfg(feature = "otlp-export")]
+mod host_safety;
+
+#[cfg(feature = "otlp-export")]
 mod otlp {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{
@@ -1762,6 +1765,7 @@ mod otlp {
 
     use crate::config::RelayTelemetryResource;
 
+    use super::host_safety::{self, REQUEST_TIMEOUT};
     use super::{ExportMetricValue, RelayExportError, RelayTelemetryExportBatch};
 
     const SCOPE_NAME: &str = "marmot.relay_telemetry";
@@ -1925,33 +1929,55 @@ mod otlp {
         authorization_bearer_token: &str,
         started_at: SystemTime,
     ) -> Result<(), RelayExportError> {
-        let request = to_request(
+        push_with_resolver(
             batch,
+            metrics_url,
             resource,
-            unix_nano(started_at),
-            unix_nano(SystemTime::now()),
-        );
-        let body = request.encode_to_vec();
-        // Bound both connect and overall request time so a stuck collector
-        // cannot hang an export indefinitely (both stay well under the default
-        // poll interval).
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| RelayExportError::Request)?;
-        let response = client
-            .post(metrics_url)
-            .header("content-type", "application/x-protobuf")
-            .bearer_auth(authorization_bearer_token)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| RelayExportError::Request)?;
-        if !response.status().is_success() {
-            return Err(RelayExportError::Status(response.status().as_u16()));
-        }
-        Ok(())
+            authorization_bearer_token,
+            started_at,
+            host_safety::system_resolve,
+        )
+        .await
+    }
+
+    async fn push_with_resolver<F, Fut>(
+        batch: &RelayTelemetryExportBatch,
+        metrics_url: &str,
+        resource: &RelayTelemetryResource,
+        authorization_bearer_token: &str,
+        started_at: SystemTime,
+        resolver: F,
+    ) -> Result<(), RelayExportError>
+    where
+        F: FnOnce(String, u16) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>>,
+    {
+        // Include our explicit DNS lookup in the overall attempt deadline.
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let pin = host_safety::resolve_with(metrics_url, resolver).await?;
+            let client = pin.build_client()?;
+            let request = to_request(
+                batch,
+                resource,
+                unix_nano(started_at),
+                unix_nano(SystemTime::now()),
+            );
+            let body = request.encode_to_vec();
+            let response = client
+                .post(pin.url)
+                .header("content-type", "application/x-protobuf")
+                .bearer_auth(authorization_bearer_token)
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| RelayExportError::Request)?;
+            if !response.status().is_success() {
+                return Err(RelayExportError::Status(response.status().as_u16()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RelayExportError::Request)?
     }
 
     #[cfg(test)]
@@ -1963,6 +1989,93 @@ mod otlp {
             ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayTelemetryExportBatch,
             metric_names,
         };
+
+        fn test_resource() -> RelayTelemetryResource {
+            RelayTelemetryResource {
+                service_version: "1.0".into(),
+                service_instance_id: "test-instance".into(),
+                deployment_environment: "test".into(),
+                tenant: "test-tenant".into(),
+                os_type: "test-os".into(),
+                os_version: "1.0".into(),
+                device_model_identifier: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn relay_telemetry_host_safety_rejects_before_any_connection() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            for endpoint in [
+                format!(
+                    "https://public.example:{}/private?secret=query",
+                    addr.port()
+                ),
+                format!("http://public.example:{}/private?secret=query", addr.port()),
+                format!("http://user:password@localhost:{}/", addr.port()),
+                format!("http://localhost:{}/#fragment", addr.port()),
+            ] {
+                let result = push_with_resolver(
+                    &RelayTelemetryExportBatch::default(),
+                    &endpoint,
+                    &test_resource(),
+                    "bearer-secret",
+                    SystemTime::now(),
+                    |_, _| async { Ok(vec![addr.ip()]) },
+                )
+                .await;
+                let error = result.unwrap_err();
+                assert_eq!(format!("{error:?}"), "Request");
+                assert_eq!(
+                    error.to_string(),
+                    "relay telemetry export request failed to send"
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "unsafe or malformed destination received a connection"
+            );
+        }
+
+        #[tokio::test]
+        async fn relay_telemetry_host_safety_incomplete_config_never_resolves_or_sends() {
+            use crate::config::RelayTelemetryExportConfig;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let complete = RelayTelemetryExportConfig {
+                enabled: true,
+                endpoint: Some(format!(
+                    "http://localhost:{}/metrics",
+                    listener.local_addr().unwrap().port()
+                )),
+                authorization_bearer_token: Some("bearer-secret".into()),
+                resource: Some(test_resource()),
+                ..Default::default()
+            };
+            let plane = crate::MarmotRelayPlane::full_history();
+            assert!(plane.telemetry_exporter(complete.clone()).is_some());
+            for case in 0..7 {
+                let mut config = complete.clone();
+                match case {
+                    0 => config.enabled = false,
+                    1 => config.endpoint = None,
+                    2 => config.authorization_bearer_token = None,
+                    3 => config.authorization_bearer_token = Some(" ".into()),
+                    4 => config.resource = None,
+                    5 => config.resource.as_mut().unwrap().tenant.clear(),
+                    _ => config.endpoint = Some("https://user:password@localhost/".into()),
+                }
+                // Construction is the only entrance to export; no exporter
+                // exists on these paths to invoke a DNS resolver or HTTP push.
+                assert!(plane.telemetry_exporter(config).is_none());
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
 
         #[test]
         fn to_request_maps_points_to_otlp_metrics() {

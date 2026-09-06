@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-04
+updated: 2026-09-06
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -392,13 +392,29 @@ be resolved. The gate requires all the following:
 
 - `enabled == true`;
 - an endpoint is configured;
-- the endpoint is `https`, or `http` to a loopback host (`localhost`, `127.0.0.1`, or `::1`) for local testing;
+- the endpoint has a host and a usable port, no embedded credentials or fragment, and uses `https`, or `http` to
+  exact `localhost` or a loopback IP literal for local testing;
 - `authorization_bearer_token` is present and non-empty;
 - `resource` is present and has all required attributes.
 
 If export is enabled but the URL/auth/resource gate is incomplete, construction fails closed and logs a warning without
 resolving relay identities or pushing metrics. If `marmot-app` is built without `otlp-export`, runtime configuration
 logs a warning when export is requested, but no exporter task is started.
+
+Before each OTLP request attempt (including retries), the exporter resolves the configured hostname once, validates
+**every** address with the shared host-safety classifier, and pins reqwest to those addresses. Mixed public/unsafe
+answers and empty/failed DNS results fail closed. Literal IPs use the same classifier without DNS. The explicit
+loopback-test endpoints must resolve exclusively to loopback, so even a misresolved HTTP `localhost` cannot send
+plaintext bearer auth off-device. Normal HTTPS names resolving to loopback are rejected. TLS certificate verification
+and SNI stay tied to the original URL; local HTTPS does not bypass verification.
+
+The exporter disables automatic redirects and system proxies, keeps the configured path/query, and attaches bearer
+auth only after the destination is validated and pinned. A 3xx response returns a numeric non-success status without
+contacting its target. Connect and overall attempt limits remain 10s and 30s; DNS has its own 10s bound inside the
+30s attempt. No DNS lease or connection pool survives to a retry. Validation, DNS, and transport failures map to the
+existing privacy-safe `RelayExportError::Request`; error display/debug contains no endpoint, address, token, or body.
+See [Dial Safety](./overview/dial-safety.md). This change does not alter collection, labels, consent, batching, retry
+scheduling, or the no-disk-queue contract, and does not add private-network collector support.
 
 Runtime behavior:
 
