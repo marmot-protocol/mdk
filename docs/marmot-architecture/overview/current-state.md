@@ -19,6 +19,12 @@ status: overview
 
 # Current State — Implementations & Spec
 
+Deferred transport resource release now preserves app replay eligibility across
+lost engine effects and restart. SQLCipher records release evidence atomically
+with raw-byte deletion; app recovery retires both inventory and duplicate
+receipts before readmission. See [released transport receipts](../storage-format-v2.md#released-transport-receipts).
+The production retention and retry limits remain unchanged.
+
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
 It requires single-device acknowledgment before KeyPackage publication and offers

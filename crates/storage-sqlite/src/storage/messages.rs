@@ -14,6 +14,7 @@ use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
+const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
 const NORMALIZED_MESSAGE_STORAGE_FORMAT: i64 = 2;
 const MESSAGE_FORMAT_PROMOTION_BATCH_MAX: usize = 256;
 
@@ -49,6 +50,53 @@ pub struct StorageFormatBenchSizes {
 }
 
 impl SqliteAccountStorage {
+    /// Retire stale host receipts and durably arm backfill before acknowledging
+    /// release evidence. The caller must remove returned ids from its in-memory
+    /// seen ring synchronously, before its next checkpoint or duplicate check.
+    /// A process death after commit is safe: both disk receipt stores are already
+    /// clean and backfill intent survives. An interrupted engine effects batch
+    /// needs no special handling because the release journal is authoritative.
+    pub fn consume_released_transport_receipts(&self) -> StorageResult<Vec<MessageId>> {
+        // Avoid a write transaction on the ordinary no-release hot path.
+        if !self
+            .lock()?
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM cgka_released_transport_receipts)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .storage()?
+        {
+            return Ok(Vec::new());
+        }
+        let consume = || {
+            let conn = self.lock()?;
+            let ids = conn
+                .prepare_cached("SELECT id FROM cgka_released_transport_receipts ORDER BY id")
+                .storage()?
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            for id in &ids {
+                retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+            }
+            conn.execute_cached(
+                "INSERT INTO app_epoch_backfill_intents(group_id, stalled_epoch, updated_at)
+                 SELECT group_id, MAX(epoch), unixepoch() FROM cgka_released_transport_receipts
+                 GROUP BY group_id
+                 ON CONFLICT(group_id) DO UPDATE SET
+                    stalled_epoch = MAX(app_epoch_backfill_intents.stalled_epoch, excluded.stalled_epoch),
+                    updated_at = excluded.updated_at",
+                [],
+            ).storage()?;
+            conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
+                .storage()?;
+            Ok(ids.into_iter().map(MessageId::new).collect())
+        };
+        retry_on_busy(|| self.connection.with_transaction(consume))
+    }
+
     /// Read aggregate value sizes without returning any stored content.
     #[cfg(feature = "storage-format-benchmarks")]
     pub fn storage_format_bench_sizes(
@@ -212,6 +260,41 @@ impl MessageStorage for SqliteAccountStorage {
                 tx.commit().storage()?;
                 Ok(())
             })
+        }
+    }
+
+    fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
+        let release = || {
+            let conn = self.lock()?;
+            // Bound journal metadata even if a host never consumes it. At the
+            // bound, fail before deleting bytes; never evict replay evidence.
+            let recorded = conn
+                .execute_cached(
+                    "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
+                 SELECT ?1, ?2, ?3 WHERE
+                    (SELECT count(*) FROM cgka_released_transport_receipts) < ?4
+                    OR EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = ?1)
+                 ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
+                    params![
+                        record.id.as_slice(),
+                        record.group_id.as_slice(),
+                        epoch_to_i64(record.epoch)?,
+                        RELEASED_TRANSPORT_RECEIPT_CAPACITY
+                    ],
+                )
+                .storage()?;
+            if recorded == 0 {
+                return Err(StorageError::Backend(
+                    "released transport receipt journal is full".into(),
+                ));
+            }
+            retire_transport_receipts(&conn, &record.id)?;
+            delete_message_on_connection(&conn, &record.id)
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            release()
+        } else {
+            retry_on_busy(|| self.connection.with_transaction(release))
         }
     }
 
@@ -842,6 +925,20 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
+fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
+    conn.execute_cached(
+        "DELETE FROM seen_events WHERE event_id = ?1",
+        params![hex::encode(id.as_slice())],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "DELETE FROM transport_reconciliation_items WHERE event_id = ?1",
+        params![id.as_slice()],
+    )
+    .storage()?;
+    Ok(())
+}
+
 /// Delete a protocol message and its not-yet-acknowledged application event on
 /// the same connection/transaction so neither row can outlive the other.
 fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
@@ -894,7 +991,166 @@ mod tests {
     use cgka_traits::storage::{
         GroupStorage, MessageStorage, StorageError, StorageProvider, StorageResult,
     };
-    use cgka_traits::types::{EpochId, MemberId};
+    use cgka_traits::types::{EpochId, MemberId, MessageId};
+    use rusqlite::params;
+
+    #[test]
+    fn released_transport_receipts_survive_reopen_and_retire_both_receipt_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.db");
+        let key = crate::SqlCipherKey::new("synthetic release regression").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        let seed_receipts = |store: &SqliteAccountStorage| {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "INSERT INTO seen_events(event_id, seen_at) VALUES (?1, 1)",
+                params![hex::encode(record.id.as_slice())],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO transport_reconciliation_items(route_kind, route_id, event_id, created_at)
+                VALUES(1, ?1, ?2, 1)", params![vec![9_u8; 32], record.id.as_slice()]).unwrap();
+        };
+        seed_receipts(&store);
+        store.release_message_for_replay(&record).unwrap();
+        assert!(matches!(
+            store.get_message(&record.id),
+            Err(StorageError::NotFound)
+        ));
+        for table in ["seen_events", "transport_reconciliation_items"] {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        // Model an old app checkpoint before it has consumed the release.
+        seed_receipts(&store);
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id.clone()]
+        );
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.pending_epoch_backfill_intents().unwrap().len(), 1);
+        for table in ["seen_events", "transport_reconciliation_items"] {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            store.pending_epoch_backfill_intents().unwrap().len(),
+            1,
+            "death after journal acknowledgement must not lose recovery intent"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn released_transport_receipt_transaction_rolls_back_with_raw_bytes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut record = sample_message(mid(1), gid(1), 0);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            storage.release_message_for_replay(&record)?;
+            Err(StorageError::Backend("injected interruption".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(store.get_message(&record.id).unwrap(), record);
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        store.release_message_for_replay(&record).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_release_ack BEFORE DELETE ON
+            cgka_released_transport_receipts BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        assert!(store.consume_released_transport_receipts().is_err());
+        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_release_ack;")
+            .unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id]
+        );
+    }
+
+    #[test]
+    fn released_transport_receipt_capacity_never_drops_replay_evidence_or_raw_bytes() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .with_transaction(|storage| -> StorageResult<()> {
+                let conn = storage.lock()?;
+                for id in 0_u64..8192 {
+                    conn.execute(
+                        "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
+                    VALUES(?1, ?2, 0)",
+                        params![id.to_be_bytes().as_slice(), gid(1).as_slice()],
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let record = sample_message(mid(42), gid(1), 0);
+        store.put_message(&record).unwrap();
+        assert!(store.release_message_for_replay(&record).is_err());
+        assert_eq!(store.get_message(&record.id).unwrap(), record);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM cgka_released_transport_receipts",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            8192
+        );
+        store.delete_group(&gid(1)).unwrap();
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty(),
+            "account group deletion must retire its release journal"
+        );
+    }
 
     #[test]
     fn deferred_metadata_does_not_read_normalized_payloads() {

@@ -694,7 +694,7 @@ impl<S: StorageProvider> Engine<S> {
                 .max(self.convergence_now().wall_ms)
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
-        self.storage.delete_message(&record.id)?;
+        self.storage.release_message_for_replay(record)?;
         self.audit_group(
             &record.group_id,
             crate::audit_helpers::deferred_peel_resource_refused_event(
