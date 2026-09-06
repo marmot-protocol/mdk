@@ -28,9 +28,12 @@ the database, lock, WAL, and shared-memory files are kept mode `0600`.
 One process owns a spool through a non-blocking advisory lock and a persisted
 generation. On startup, an exclusive new owner reclaims prior-generation
 `claimed` rows in per-group FIFO order. Queue-capacity rejection leaves the row
-pending with bounded backoff rather than dropping it. Debounce batches retain
-all source ids, the effective reply anchor, and explicit coalesced dispositions.
-Mention-policy and profile-onboarding decisions are terminal explicit skips.
+pending with bounded backoff rather than dropping it. Debounce-buffered rows
+are explicitly ineligible for live retry-loop claims until their batch is
+persisted; a new exclusive owner releases an abandoned buffer for FIFO replay.
+Debounce batches retain all source ids, the effective reply anchor, and explicit
+coalesced dispositions. Mention-policy and profile-onboarding decisions are
+terminal explicit skips.
 Pending rows are never evicted to satisfy a bound; an exhausted, corrupt,
 newer-schema, unsafe-permission, or unwritable spool fails connection/intake
 closed and preserves the existing state for operator recovery.

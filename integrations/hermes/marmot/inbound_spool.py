@@ -160,7 +160,12 @@ class InboundSpool:
         finally:
             self._close_handles(lock_fd)
 
-    def record(self, event: dict[str, Any]) -> tuple[bool, str]:
+    def record(
+        self,
+        event: dict[str, Any],
+        *,
+        debounce_buffered: bool = False,
+    ) -> tuple[bool, str]:
         db = self._require_db()
         account_id = str(event["account_id_hex"])
         group_id = str(event["group_id_hex"])
@@ -183,7 +188,8 @@ class InboundSpool:
                     raise InboundSpoolFull("inbound spool capacity exhausted")
                 db.execute(
                     "INSERT INTO events(account_id,group_id,message_id,state,event_json,source_ids_json,"
-                    "reply_anchor,attempts,next_attempt_at,created_at,changed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "reply_anchor,attempts,next_attempt_at,disposition,created_at,changed_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         account_id,
                         group_id,
@@ -194,6 +200,7 @@ class InboundSpool:
                         self._reply_anchor(event),
                         0,
                         0.0,
+                        "debounce_buffered" if debounce_buffered else None,
                         now,
                         now,
                     ),
@@ -227,7 +234,7 @@ class InboundSpool:
                 raise InboundSpoolError("inbound batch members are not all pending")
             db.execute(
                 "UPDATE events SET event_json=?, source_ids_json=?, reply_anchor=?, batch_id=?, "
-                "disposition='batch_representative', changed_at=? WHERE message_id=?",
+                "next_attempt_at=0, disposition='batch_representative', changed_at=? WHERE message_id=?",
                 (
                     json.dumps(merged_event, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
                     json.dumps(list(ids)),
@@ -253,6 +260,7 @@ class InboundSpool:
         at = time.time() if now is None else float(now)
         rows = db.execute(
             "SELECT * FROM events e WHERE e.state='pending' AND e.next_attempt_at<=? "
+            "AND COALESCE(e.disposition,'')<>'debounce_buffered' "
             "AND (e.batch_id IS NULL OR e.batch_id=e.message_id) "
             "AND NOT EXISTS (SELECT 1 FROM events older WHERE older.group_id=e.group_id "
             "AND older.seq<e.seq AND older.state NOT IN ('handed','completed','intentionally_skipped','unresolved','failed','coalesced')) "
@@ -261,12 +269,17 @@ class InboundSpool:
         ).fetchall()
         return [self._record_from_row(row) for row in rows]
 
-    def claim(self, message_id: str) -> SpoolRecord:
+    def claim(self, message_id: str, *, ignore_backoff: bool = False) -> SpoolRecord:
         db = self._require_db()
         now = time.time()
         with db:
             row = db.execute("SELECT * FROM events WHERE message_id=?", (message_id,)).fetchone()
-            if row is None or row["state"] != "pending":
+            if (
+                row is None
+                or row["state"] != "pending"
+                or row["disposition"] == "debounce_buffered"
+                or (not ignore_backoff and float(row["next_attempt_at"]) > now)
+            ):
                 raise StaleClaim("inbound obligation is no longer pending")
             blocked = db.execute(
                 "SELECT 1 FROM events WHERE group_id=? AND seq<? AND state NOT IN "
@@ -361,6 +374,11 @@ class InboundSpool:
             db.execute(
                 "UPDATE events SET state='pending',owner_id=NULL,generation=NULL,next_attempt_at=0,"
                 "disposition='recovered_abandoned_claim',changed_at=? WHERE state='claimed'",
+                (now,),
+            )
+            db.execute(
+                "UPDATE events SET next_attempt_at=0,disposition='recovered_debounce_buffer',changed_at=? "
+                "WHERE state='pending' AND disposition='debounce_buffered'",
                 (now,),
             )
             db.execute("DELETE FROM owners")

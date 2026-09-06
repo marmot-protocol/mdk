@@ -2795,25 +2795,40 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 await asyncio.sleep(1.0)
                 continue
             for record in records:
-                self._try_admit_spooled(record.message_id)
+                try:
+                    self._try_admit_spooled(record.message_id)
+                except InboundSpoolError:
+                    logger.error("Marmot inbound spool retry admission failed", exc_info=True)
 
     def _admit_due_spooled(self) -> None:
         if not self._inbound_spool.is_open:
             return
         for record in self._inbound_spool.due():
-            self._try_admit_spooled(record.message_id)
+            try:
+                self._try_admit_spooled(record.message_id)
+            except InboundSpoolError:
+                logger.error("Marmot inbound spool admission failed", exc_info=True)
 
-    def _try_admit_spooled(self, message_id_hex: str) -> bool:
+    def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
         try:
-            record = self._inbound_spool.claim(message_id_hex)
+            record = self._inbound_spool.claim(message_id_hex, ignore_backoff=ignore_backoff)
         except StaleClaim:
             return False
-        task = self._inbound_queue.enqueue(
-            record.group_id,
-            lambda rec=record: self._dispatch_inbound_message(
-                rec.event, spool_message_id=rec.message_id
-            ),
-        )
+        try:
+            task = self._inbound_queue.enqueue(
+                record.group_id,
+                lambda rec=record: self._dispatch_inbound_message(
+                    rec.event, spool_message_id=rec.message_id
+                ),
+            )
+        except Exception as exc:
+            self._inbound_spool.defer(
+                record.message_id,
+                delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
+                reason="queue_admission_failed",
+            )
+            self._inbound_spool_wakeup.set()
+            raise InboundSpoolError("inbound queue admission failed") from exc
         if task is None:
             delay_index = min(record.attempts, len(INBOUND_SPOOL_RETRY_BACKOFF_S) - 1)
             self._inbound_spool.defer(
@@ -2857,11 +2872,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # or queue admission. If this write fails the subscription is allowed to
         # fail/reconnect so the connector can replay; we never claim acceptance.
         self._ensure_inbound_spool_open()
-        inserted, prior_state = self._inbound_spool.record(event)
+        inserted, prior_state = self._inbound_spool.record(
+            event,
+            debounce_buffered=self.debounce_ms > 0,
+        )
         if not inserted:
             if prior_state == "pending":
                 self._inbound_spool_wakeup.set()
-                self._try_admit_spooled(message_id_hex)
+                self._try_admit_spooled(message_id_hex, ignore_backoff=True)
             return
         self._pending_inbound_ids.add(message_id_hex)
 
@@ -3040,6 +3058,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     spool_message_id,
                     delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
                     reason="dispatch_cancelled_before_handoff",
+                )
+            elif spool_message_id and spool_state == "handed":
+                self._inbound_spool.transition(
+                    spool_message_id,
+                    "unresolved",
+                    "host_handoff_outcome_unknown",
                 )
             raise
         except Exception:

@@ -114,6 +114,41 @@ class InboundSpoolTests(unittest.TestCase):
             )
             store.close()
 
+    def test_debounce_buffered_rows_are_inadmissible_until_batched_or_recovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "spool.sqlite3"
+            store = spool.InboundSpool(path)
+            store.open()
+            first, second = event(1), event(2)
+            store.record(first, debounce_buffered=True)
+            store.record(second, debounce_buffered=True)
+
+            self.assertEqual([], store.due())
+            with self.assertRaises(spool.StaleClaim):
+                store.claim(first["message_id_hex"])
+
+            merged = dict(second)
+            merged["text"] = "private payload 1\nprivate payload 2"
+            representative = store.form_batch(
+                [first["message_id_hex"], second["message_id_hex"]], merged
+            )
+            self.assertEqual(first["message_id_hex"], representative)
+            self.assertEqual(representative, store.claim(representative).message_id)
+            store.close(graceful=False)
+
+            recovery_path = Path(tmp) / "recovery.sqlite3"
+            crashed = spool.InboundSpool(recovery_path)
+            crashed.open()
+            crashed.record(first, debounce_buffered=True)
+            crashed.close(graceful=False)
+            reopened = spool.InboundSpool(recovery_path)
+            reopened.open()
+            self.assertEqual(
+                [first["message_id_hex"]],
+                [record.message_id for record in reopened.due()],
+            )
+            reopened.close()
+
     def test_per_group_fifo_blocks_newer_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")
@@ -270,7 +305,7 @@ async def adapter_crash_child(path: Path, marker: Path, point: str):
     adapter = module.MarmotPlatformAdapter(config, client=object())
 
     if point == "before_claim":
-        def stop_before_claim(message_id):
+        def stop_before_claim(message_id, **_kwargs):
             marker.write_text("ready")
             while True:
                 time.sleep(1)

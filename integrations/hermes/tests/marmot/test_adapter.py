@@ -3870,6 +3870,45 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         for source in (event, sibling):
             self.assertIn(source["message_id_hex"], adapter._recent_inbound_ids)
 
+    async def test_retry_loop_cannot_bypass_live_debounce_or_duplicate_replay(self):
+        first = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "first",
+            "mentions_self": True,
+        }
+        second = dict(first, message_id_hex="55" * 32, text="second")
+        adapter = self._adapter(client=object(), extra={"debounce_ms": 50})
+
+        await adapter._handle_control_event(wire_event(first))
+        await adapter._handle_control_event(wire_event(second))
+        # Connector replay of the first id while its batch is still live must
+        # retain debounce ownership rather than claim the durable row directly.
+        await adapter._handle_control_event(wire_event(first))
+
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        adapter._inbound_spool_wakeup.set()
+        key = adapter._debounce_key(first)
+        try:
+            await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
+            # Let the queue task's done callback retire it before join() samples
+            # the queue's pending set.
+            await asyncio.sleep(0)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+
+        self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
+        # An empty/queued host return is not a durable finality callback. Both
+        # source ids retain explicit handoff/coalescing dispositions until
+        # Phase 2 provides one.
+        self.assertEqual("handed", adapter._inbound_spool.get(first["message_id_hex"]).state)
+        self.assertEqual("coalesced", adapter._inbound_spool.get(second["message_id_hex"]).state)
+
     # --- Behavior 3: stream_progress wire type --------------------------------
     async def test_stream_progress_sends_progress_wire_type(self):
         requests = []
@@ -6619,6 +6658,40 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("mention_policy_skip", record.disposition)
         self.assertEqual([], adapter.events)
         adapter._inbound_spool.close()
+
+    async def test_retry_loop_survives_one_admission_error(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        adapter._inbound_spool.record(event)
+        original_admit = adapter._try_admit_spooled
+        attempts = 0
+        failed_once = asyncio.Event()
+
+        def flaky_admit(message_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                failed_once.set()
+                raise self.adapter_module.InboundSpoolError("synthetic admission failure")
+            return original_admit(message_id)
+
+        adapter._try_admit_spooled = flaky_admit
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            adapter._inbound_spool_wakeup.set()
+            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            self.assertFalse(retry.done())
+            adapter._inbound_spool_wakeup.set()
+            for _ in range(20):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([item.text for item in adapter.events], ["durable"])
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            adapter._inbound_spool.close()
 
 
 if __name__ == "__main__":
