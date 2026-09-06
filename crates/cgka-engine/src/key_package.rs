@@ -128,7 +128,8 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
         key_package.ciphersuite(),
     )?;
     ensure_key_package_profile(kp, protocol_profile)?;
-    let capabilities = crate::capabilities::capabilities_of_key_package(&key_package);
+    let capabilities =
+        crate::capabilities::advertised_capabilities_of_leaf(key_package.leaf_node());
     let key_package_ref = key_package
         .hash_ref(&crypto)
         .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;

@@ -16,9 +16,13 @@ use openmls::extensions::RequiredCapabilitiesExtension;
 use openmls::prelude::{Capabilities, ExtensionType, ProposalType};
 use openmls_traits::types::Ciphersuite;
 
+// RFC 9420 section 7.2. These types are implicitly supported, never advertised.
+pub(crate) const DEFAULT_MLS_EXTENSION_TYPES: std::ops::RangeInclusive<u16> = 1..=5;
+pub(crate) const DEFAULT_MLS_PROPOSAL_TYPES: std::ops::RangeInclusive<u16> = 1..=7;
+
 /// Derive the per-leaf `Capabilities` this client advertises. Includes every
-/// feature in the registry regardless of level — that's what "I support this"
-/// means at the leaf.
+/// non-default MLS capability in the registry regardless of requirement level;
+/// default MLS capabilities are implicitly supported and must be omitted.
 ///
 /// Runtime support deliberately remains broader than the profile emitted for
 /// new KeyPackages: create/invite gates require candidates to match the target
@@ -45,6 +49,9 @@ pub(crate) fn leaf_capabilities(
             CTCapability::AppComponent(_) => {}
         }
     }
+    // Registry entries must not reintroduce default types into signed leaves.
+    ext_types.retain(|t| !DEFAULT_MLS_EXTENSION_TYPES.contains(&u16::from(*t)));
+    proposal_types.retain(|t| !DEFAULT_MLS_PROPOSAL_TYPES.contains(&u16::from(*t)));
     ext_types.sort();
     ext_types.dedup();
     proposal_types.sort();
@@ -145,25 +152,40 @@ pub(crate) fn extension_from_group_capabilities(
     RequiredCapabilitiesExtension::new(&ext_types, &proposal_types, &[])
 }
 
-/// Read a KeyPackage's advertised capabilities into a Marmot
-/// [`GroupCapabilities`]. Used by `constructable_capabilities` and by the
+/// Read a KeyPackage's supported capabilities, including implicit MLS defaults,
+/// into Marmot [`GroupCapabilities`]. Used by `constructable_capabilities` and by the
 /// invite-validation path.
 pub(crate) fn capabilities_of_key_package(kp: &openmls::prelude::KeyPackage) -> GroupCapabilities {
     capabilities_of_leaf(kp.leaf_node())
 }
 
-/// Read a LeafNode's advertised capabilities for constructability checks and
+/// Read a LeafNode's supported capabilities for constructability checks and
 /// cache-on-ingest updates.
 pub(crate) fn capabilities_of_leaf(leaf: &openmls::prelude::LeafNode) -> GroupCapabilities {
-    let mut out = group_capabilities_from_caps(leaf.capabilities());
+    with_implicit_default_capabilities(advertised_capabilities_of_leaf(leaf))
+}
+
+/// Read only the signed advertisements for publication metadata. Implicit MLS
+/// support must never be added to these wire-facing lists.
+pub(crate) fn advertised_capabilities_of_leaf(
+    leaf: &openmls::prelude::LeafNode,
+) -> GroupCapabilities {
+    let mut out = advertised_capabilities_from_caps(leaf.capabilities());
     out.app_components = crate::app_components::app_components_of_leaf(leaf)
         .unwrap_or_else(|_| AppComponentSet::default());
     out
 }
 
+/// Expand an internal support set without changing any wire advertisements.
+pub(crate) fn with_implicit_default_capabilities(mut caps: GroupCapabilities) -> GroupCapabilities {
+    caps.extensions.extend(DEFAULT_MLS_EXTENSION_TYPES);
+    caps.proposals.extend(DEFAULT_MLS_PROPOSAL_TYPES);
+    caps
+}
+
 /// Convert OpenMLS [`Capabilities`] into Marmot [`GroupCapabilities`]
 /// (extensions + proposals only; app components are carried separately).
-fn group_capabilities_from_caps(caps: &Capabilities) -> GroupCapabilities {
+fn advertised_capabilities_from_caps(caps: &Capabilities) -> GroupCapabilities {
     let mut out = GroupCapabilities::default();
     for ext in caps.extensions() {
         if !ext.is_grease() {
@@ -176,10 +198,10 @@ fn group_capabilities_from_caps(caps: &Capabilities) -> GroupCapabilities {
     out
 }
 
-/// The full set of capabilities this client supports at runtime: the MLS
-/// extensions/proposals it advertises (derived from the feature registry, same
-/// as [`leaf_capabilities`]) plus the app components it supports. Used by the
-/// join path to reject a Welcome whose group requires capabilities this client
+/// The full set of capabilities this client supports at runtime:
+/// implicit MLS defaults, extensions/proposals it advertises (derived from the
+/// feature registry, same as [`leaf_capabilities`]), and supported app components.
+/// Used by the join path to reject a Welcome whose group requires capabilities this client
 /// cannot apply (joining.md:65, convergence.md:19), independent of what the
 /// consumed KeyPackage's leaf happened to advertise.
 pub(crate) fn self_supported_capabilities(
@@ -190,7 +212,7 @@ pub(crate) fn self_supported_capabilities(
     // Runtime support is deliberately broader than the profile emitted by a
     // fresh KeyPackage: one upgraded engine must continue operating existing
     // legacy groups while producing current-profile state for new groups.
-    let mut out = group_capabilities_from_caps(&leaf_capabilities(
+    let mut out = advertised_capabilities_from_caps(&leaf_capabilities(
         registry,
         ciphersuite,
         ProtocolProfile::Legacy,
@@ -198,5 +220,5 @@ pub(crate) fn self_supported_capabilities(
     out.app_components = supported_app_components.clone();
     out.app_components
         .insert(cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
-    out
+    with_implicit_default_capabilities(out)
 }
