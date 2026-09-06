@@ -466,6 +466,7 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
         tracker_listener,
         tracker_observed,
     ));
+    runtime_bob_boot2.set_audit_log_batch_window_for_test(Duration::ZERO);
     runtime_bob_boot2
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{tracker_addr}/api/v1/audit-logs/")),
@@ -513,9 +514,7 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
         1,
         "the test must exercise the injected mid-batch failure",
     );
-    // The partial summary schedules the normal 30-second automatic batch.
-    // Keep this a real HTTP assertion; manual upload would bypass the contract.
-    tokio::time::timeout(Duration::from_secs(45), tracker_request)
+    tokio::time::timeout(Duration::from_secs(10), tracker_request)
         .await
         .expect("partial summary must schedule the audit tracker")
         .expect("audit tracker observation channel");

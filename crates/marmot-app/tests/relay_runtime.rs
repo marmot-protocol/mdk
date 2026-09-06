@@ -41,8 +41,18 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
-// Allow the fixed 30-second batch window plus local HTTP processing.
+#[cfg(feature = "test-policy-overrides")]
+const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(feature = "test-policy-overrides"))]
 const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn use_fast_audit_batches(runtime: &MarmotAppRuntime) {
+    #[cfg(feature = "test-policy-overrides")]
+    runtime.set_audit_log_batch_window_for_test(Duration::ZERO);
+    #[cfg(not(feature = "test-policy-overrides"))]
+    let _ = runtime;
+}
+
 const AUDIT_TRACKER_NON_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn mock_relay() -> (MockRelay, String) {
@@ -3447,6 +3457,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let (tx, rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3472,14 +3483,14 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             .await
     });
 
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive background upload")
+        .unwrap();
     timeout(AUDIT_TRACKER_NON_BLOCKING_TIMEOUT, send)
         .await
         .expect("send should finish before tracker response is released")
         .unwrap()
-        .unwrap();
-    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
-        .await
-        .expect("audit tracker should receive background upload")
         .unwrap();
 
     assert_eq!(captured.method, "POST");
@@ -3520,6 +3531,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
     let (tx, rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3537,14 +3549,14 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
             .await
     });
 
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive welcome-triggered upload")
+        .unwrap();
     timeout(AUDIT_TRACKER_NON_BLOCKING_TIMEOUT, create)
         .await
         .expect("create_group should finish before tracker response is released")
         .unwrap()
-        .unwrap();
-    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
-        .await
-        .expect("audit tracker should receive welcome-triggered upload")
         .unwrap();
 
     assert_eq!(captured.method, "POST");
@@ -3582,6 +3594,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let (tx, rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3652,6 +3665,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(forward_audit_upload_bodies(listener, body_tx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3765,6 +3779,7 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
     let server = tokio::spawn(capture_delayed_audit_upload_with_overlap_probe(
         listener, tx, overlap_tx, release_rx,
     ));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),

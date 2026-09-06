@@ -2287,6 +2287,14 @@ impl MarmotAppRuntime {
         post_audit_log_tracker_update_for_app(&self.accounts.app, config).await
     }
 
+    /// Test-only per-runtime window override; production keeps the 30-second default.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub fn set_audit_log_batch_window_for_test(&self, duration: Duration) {
+        if let Some(uploader) = &self.shared.audit_log_tracker_uploader {
+            uploader.set_batch_window_for_test(duration);
+        }
+    }
+
     /// Test seam: fire one tracker trigger through the same scheduling path
     /// ordinary send/receive/convergence activity uses, so a burst can be
     /// observed coalescing instead of queueing N runs (mdk#1181).

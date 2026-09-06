@@ -22,7 +22,6 @@ const AUDIT_RETRY_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 struct AuditPassSchedule {
-    pending: bool,
     retry_after: Option<Duration>,
 }
 
@@ -32,11 +31,28 @@ impl AuditPassSchedule {
     }
 }
 
+#[derive(Clone, Default)]
+struct AuditBatchWindow {
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    override_duration: Arc<StdMutex<Option<Duration>>>,
+}
+
+impl AuditBatchWindow {
+    fn duration(&self) -> Duration {
+        #[cfg(any(test, feature = "test-policy-overrides"))]
+        if let Some(duration) = *self.override_duration.lock().unwrap() {
+            return duration;
+        }
+        AUDIT_BATCH_WINDOW
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AuditLogTrackerUploader {
     app: MarmotApp,
     config: Arc<StdMutex<AuditLogTrackerConfig>>,
     lifecycle: RuntimeLifecycle,
+    batch_window: AuditBatchWindow,
     worker: Arc<StdMutex<Option<AuditLogTrackerWorker>>>,
 }
 
@@ -55,8 +71,14 @@ impl AuditLogTrackerUploader {
             app,
             config,
             lifecycle,
+            batch_window: AuditBatchWindow::default(),
             worker: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub(crate) fn set_batch_window_for_test(&self, duration: Duration) {
+        *self.batch_window.override_duration.lock().unwrap() = Some(duration);
     }
 
     pub(crate) fn schedule(&self, trigger: &'static str) {
@@ -75,6 +97,7 @@ impl AuditLogTrackerUploader {
                 self.config.clone(),
                 receiver,
                 stopping,
+                self.batch_window.clone(),
             ));
             *worker = Some(AuditLogTrackerWorker { commands, handle });
         }
@@ -128,100 +151,114 @@ async fn run_audit_log_tracker_uploader(
     config: Arc<StdMutex<AuditLogTrackerConfig>>,
     commands: mpsc::Receiver<&'static str>,
     stopping: watch::Receiver<bool>,
+    window: AuditBatchWindow,
 ) {
-    run_batched_audit_uploads(commands, stopping, || async {
-        let config = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        let mut schedule = AuditPassSchedule::default();
-        if config.upload_allowed_with_endpoints(app.service_endpoints())
-            && post_audit_log_tracker_update(&app, config, true, &mut schedule).await.is_err()
-        {
-            tracing::warn!(target: "marmot_app::audit_log", method = "schedule_audit_log_tracker_update",
-                error_kind = "audit_log_tracker_update_failed", "automatic audit upload pass failed");
-            schedule.failed(Duration::ZERO);
+    run_batched_audit_uploads(commands, stopping, window, |trigger| {
+        let app = &app;
+        let config = config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        async move {
+            let mut schedule = AuditPassSchedule::default();
+            match post_audit_log_tracker_update(app, config, true, &mut schedule).await {
+                Ok(result) => {
+                    tracing::debug!(
+                        target: "marmot_app::audit_log",
+                        method = "schedule_audit_log_tracker_update",
+                        trigger,
+                        skipped_reason = result.skipped_reason.as_deref(),
+                        uploaded = result.uploaded.len(),
+                        "completed automatic audit upload pass"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::audit_log",
+                        method = "schedule_audit_log_tracker_update",
+                        trigger,
+                        error_kind = "audit_log_tracker_update_failed",
+                        "automatic audit upload pass failed"
+                    );
+                    schedule.failed(Duration::ZERO);
+                }
+            }
+            schedule
         }
-        schedule
-    }).await;
+    })
+    .await;
 }
 
-/// Fixed windows, not debounce: additional triggers never postpone the deadline.
-/// Incomplete snapshots get a quick retry, then back off while idle. Fresh activity
-/// restores their normal cadence, but cannot shorten a failure cooldown.
+/// Additional triggers join a fixed window without postponing its deadline or
+/// shortening a failure cooldown. Incomplete rows wait for the next activity.
 async fn run_batched_audit_uploads<F, Fut>(
     mut commands: mpsc::Receiver<&'static str>,
     mut stopping: watch::Receiver<bool>,
+    window: AuditBatchWindow,
     mut upload: F,
 ) where
-    F: FnMut() -> Fut,
+    F: FnMut(&'static str) -> Fut,
     Fut: Future<Output = AuditPassSchedule>,
 {
     let mut deadline = None;
-    let mut failure_cooldown = false;
+    let mut trigger = "retry";
     let mut retry_delay = AUDIT_RETRY_INITIAL;
-    let mut pending_delay = AUDIT_BATCH_WINDOW;
     loop {
         if runtime_shutdown_requested(&stopping) {
             return;
         }
-        let mut due = match deadline {
+        let due = match deadline {
             Some(due) => due,
             None => {
-                tokio::select! {
+                trigger = tokio::select! {
                     biased;
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                    trigger = commands.recv() => if trigger.is_none() { return; },
-                }
-                Instant::now() + AUDIT_BATCH_WINDOW
+                    next = commands.recv() => match next { Some(next) => next, None => return },
+                };
+                Instant::now() + window.duration()
             }
         };
-        let mut fresh_activity = false;
         loop {
             tokio::select! {
                 biased;
                 _ = wait_for_runtime_shutdown(&mut stopping) => return,
                 _ = sleep_until(due) => break,
-                trigger = commands.recv() => {
-                    if trigger.is_none() { return; }
-                    fresh_activity = true;
-                    if !failure_cooldown { due = due.min(Instant::now() + AUDIT_BATCH_WINDOW); }
-                },
+                next = commands.recv() => if next.is_none() { return; },
             }
         }
-        // Consume activity already covered by the snapshot about to be taken.
-        fresh_activity |= commands.try_recv().is_ok();
-        if fresh_activity {
-            pending_delay = AUDIT_BATCH_WINDOW;
-        }
+        let _ = commands.try_recv();
         let schedule = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
-            result = upload() => result,
+            result = upload(trigger) => result,
         };
-        failure_cooldown = schedule.retry_after.is_some();
         deadline = if let Some(minimum) = schedule.retry_after {
-            pending_delay = AUDIT_BATCH_WINDOW;
+            trigger = "retry";
             let delay = retry_delay.max(minimum);
             retry_delay = (retry_delay * 2).min(AUDIT_RETRY_MAX);
             Some(Instant::now() + delay)
         } else {
             retry_delay = AUDIT_RETRY_INITIAL;
             match commands.try_recv() {
-                Ok(_) => {
-                    pending_delay = AUDIT_BATCH_WINDOW;
-                    Some(Instant::now() + AUDIT_BATCH_WINDOW)
+                Ok(next) => {
+                    trigger = next;
+                    Some(Instant::now() + window.duration())
                 }
-                Err(mpsc::error::TryRecvError::Empty) if schedule.pending => {
-                    let delay = pending_delay;
-                    pending_delay = (pending_delay * 2).min(AUDIT_RETRY_MAX);
-                    Some(Instant::now() + delay)
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    pending_delay = AUDIT_BATCH_WINDOW;
-                    None
-                }
+                Err(mpsc::error::TryRecvError::Empty) => None,
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         };
     }
+}
+
+fn audit_upload_stops_batch(attempt: &Result<AuditUploadAttempt, AppError>) -> bool {
+    matches!(
+        attempt,
+        Ok(AuditUploadAttempt::Rejected {
+            status: 401 | 403 | 429 | 500..=599,
+            ..
+        }) | Err(AppError::AuditLogUpload(_))
+    )
 }
 
 pub(crate) async fn post_audit_log_tracker_update_for_app(
@@ -345,7 +382,9 @@ async fn post_audit_log_tracker_update(
                 );
                 continue;
             }
-            match app.post_audit_log_snapshot(&file.path, &config).await {
+            let attempt = app.post_audit_log_snapshot(&file.path, &config).await;
+            stop_batch = automatic && audit_upload_stops_batch(&attempt);
+            match attempt {
                 Ok(AuditUploadAttempt::Uploaded(receipt)) => {
                     if receipt.complete
                         && receipt.observed_bytes == file.size_bytes
@@ -357,15 +396,11 @@ async fn post_audit_log_tracker_update(
                             AuditUploadOutcome::Uploaded,
                         );
                         checkpoint_changed = true;
-                    } else {
-                        schedule.pending = true;
                     }
                     uploaded.push(receipt.result);
                 }
                 // No complete row yet: no request, checkpoint, or failure warning.
-                Ok(AuditUploadAttempt::Deferred) => {
-                    schedule.pending = true;
-                }
+                Ok(AuditUploadAttempt::Deferred) => {}
                 Ok(AuditUploadAttempt::Rejected {
                     status,
                     retry_after: minimum,
@@ -379,15 +414,11 @@ async fn post_audit_log_tracker_update(
                             Duration::ZERO
                         });
                     schedule.failed(delay);
-                    if automatic && matches!(status, 401 | 403 | 429 | 500..=599) {
-                        stop_batch = true;
-                    }
                     tracing::warn!(target: "marmot_app::audit_log", method = "post_audit_log_tracker_update", http_status = status,
                         "forensic audit upload rejected");
                 }
-                Err(err) => {
+                Ok(AuditUploadAttempt::FileFailure(_err)) | Err(_err) => {
                     schedule.failed(Duration::ZERO);
-                    stop_batch = automatic && matches!(err, AppError::AuditLogUpload(_));
                     // Unacknowledged: left out of the checkpoint so the next
                     // trigger retries it.
                     failed += 1;

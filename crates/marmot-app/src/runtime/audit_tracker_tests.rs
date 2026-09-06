@@ -19,7 +19,7 @@ impl Scheduler {
         let gate = release.clone();
         let mut results = VecDeque::from(results);
         let worker = tokio::spawn(async move {
-            run_batched_audit_uploads(commands, stopping, || {
+            run_batched_audit_uploads(commands, stopping, AuditBatchWindow::default(), |_| {
                 let result = results.pop_front().expect("unexpected extra upload");
                 let gate = gate.clone();
                 started.send(Instant::now()).unwrap();
@@ -27,7 +27,6 @@ impl Scheduler {
                     gate.notified().await;
                     AuditPassSchedule {
                         retry_after: result,
-                        ..Default::default()
                     }
                 }
             })
@@ -139,12 +138,12 @@ async fn retries_back_off_without_new_activity_and_reset_after_success() {
 
 #[tokio::test(start_paused = true)]
 async fn server_delay_survives_continuous_activity() {
-    let mut s = Scheduler::new(vec![Some(Duration::from_secs(600)), None]);
+    let mut s = Scheduler::new(vec![Some(Duration::from_secs(300)), None]);
     s.trigger().await;
     s.advance(30).await;
     let first = s.starts.try_recv().unwrap();
     s.finish().await;
-    for _ in 0..19 {
+    for _ in 0..9 {
         s.advance(30).await;
         s.trigger().await;
     }
@@ -152,51 +151,9 @@ async fn server_delay_survives_continuous_activity() {
     s.advance(30).await;
     assert_eq!(
         s.starts.try_recv().unwrap() - first,
-        Duration::from_secs(600)
+        Duration::from_secs(300)
     );
     s.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn unfinished_snapshot_retries_quickly_then_backs_off_while_idle() {
-    let (triggers, commands) = mpsc::channel(1);
-    let (stop, stopping) = watch::channel(false);
-    let (started, mut starts) = mpsc::unbounded_channel();
-    let worker = tokio::spawn(async move {
-        run_batched_audit_uploads(commands, stopping, || {
-            started.send(Instant::now()).unwrap();
-            async {
-                AuditPassSchedule {
-                    pending: true,
-                    retry_after: None,
-                }
-            }
-        })
-        .await;
-    });
-    triggers.send("test").await.unwrap();
-    tokio::task::yield_now().await;
-    let start = Instant::now();
-    let mut elapsed = 0;
-    for seconds in [30, 30, 60, 120, 240, 300] {
-        elapsed += seconds;
-        tokio::time::advance(Duration::from_secs(seconds)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            starts.try_recv().unwrap() - start,
-            Duration::from_secs(elapsed)
-        );
-    }
-    triggers.send("new activity").await.unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(AUDIT_BATCH_WINDOW).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        starts.try_recv().unwrap() - start,
-        Duration::from_secs(elapsed + 30)
-    );
-    stop.send(true).unwrap();
-    worker.await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -285,4 +242,43 @@ async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
         assert!(observed.try_recv().is_err());
         server.abort();
     }
+}
+
+#[test]
+fn batch_window_override_is_local_to_one_uploader() {
+    let first = AuditBatchWindow::default();
+    let second = AuditBatchWindow::default();
+    *first.override_duration.lock().unwrap() = Some(Duration::ZERO);
+    assert_eq!(first.clone().duration(), Duration::ZERO);
+    assert_eq!(second.duration(), Duration::from_secs(30));
+}
+
+#[tokio::test(start_paused = true)]
+async fn batches_preserve_first_trigger_and_label_automatic_retries() {
+    let (triggers, commands) = mpsc::channel(1);
+    let (stop, stopping) = watch::channel(false);
+    let (seen, mut observed) = mpsc::unbounded_channel();
+    let worker = tokio::spawn(run_batched_audit_uploads(
+        commands,
+        stopping,
+        AuditBatchWindow::default(),
+        move |trigger| {
+            seen.send(trigger).unwrap();
+            async {
+                AuditPassSchedule {
+                    retry_after: Some(Duration::ZERO),
+                }
+            }
+        },
+    ));
+    triggers.send("send_message").await.unwrap();
+    tokio::task::yield_now().await;
+    triggers.send("inbound_event").await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(observed.recv().await.unwrap(), "send_message");
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(observed.recv().await.unwrap(), "retry");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
 }

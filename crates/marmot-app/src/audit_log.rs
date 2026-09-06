@@ -85,6 +85,7 @@ pub(crate) struct AuditUploadReceipt {
 pub(crate) enum AuditUploadAttempt {
     Uploaded(AuditUploadReceipt),
     Deferred,
+    FileFailure(AppError),
     Rejected {
         status: u16,
         retry_after: Option<Duration>,
@@ -92,7 +93,7 @@ pub(crate) enum AuditUploadAttempt {
 }
 
 /// Retry-After accepts either delta seconds or an HTTP date. Bound untrusted
-/// deadlines to one day to avoid timer overflow or effectively disabling uploads.
+/// deadlines to five minutes so one response cannot silence incident evidence for a day.
 fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
     let value = value?.trim();
     let delay = value
@@ -104,7 +105,7 @@ fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
                 .ok()
                 .map(|date| date.duration_since(now).unwrap_or_default())
         })?;
-    Some(delay.min(Duration::from_secs(24 * 60 * 60)))
+    Some(delay.min(Duration::from_secs(5 * 60)))
 }
 
 struct AuditUploadSnapshot {
@@ -536,6 +537,7 @@ impl MarmotApp {
             AuditUploadAttempt::Deferred => Err(AppError::AuditLogUpload(
                 "audit snapshot has no complete lines".into(),
             )),
+            AuditUploadAttempt::FileFailure(error) => Err(error),
             AuditUploadAttempt::Rejected { status, .. } => Err(AppError::AuditLogUpload(format!(
                 "upload returned HTTP {status}"
             ))),
@@ -548,7 +550,10 @@ impl MarmotApp {
         path: &str,
         config: &config::AuditLogTrackerConfig,
     ) -> Result<AuditUploadAttempt, AppError> {
-        let path = self.validate_audit_log_path(path)?;
+        let path = match self.validate_audit_log_path(path) {
+            Ok(path) => path,
+            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
+        };
         let config = config
             .clone()
             .normalize()
@@ -562,8 +567,15 @@ impl MarmotApp {
                     config.authorization_bearer_token.as_deref(),
                 )
             })?;
-        let file = tokio::fs::File::open(&path).await?;
-        let snapshot = AuditUploadSnapshot::capture(file).await?;
+        let snapshot = match async {
+            let file = tokio::fs::File::open(&path).await?;
+            AuditUploadSnapshot::capture(file).await
+        }
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
+        };
         if snapshot.body.is_empty() {
             return Ok(AuditUploadAttempt::Deferred);
         }
@@ -888,16 +900,16 @@ mod tests {
             audit_retry_after(Some("120"), now),
             Some(Duration::from_secs(120))
         );
-        let date = httpdate::fmt_http_date(now + Duration::from_secs(600));
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(180));
         assert_eq!(
             audit_retry_after(Some(&date), now),
-            Some(Duration::from_secs(600))
+            Some(Duration::from_secs(180))
         );
         let past = httpdate::fmt_http_date(now - Duration::from_secs(1));
         assert_eq!(audit_retry_after(Some(&past), now), Some(Duration::ZERO));
         assert_eq!(
             audit_retry_after(Some("18446744073709551615"), now),
-            Some(Duration::from_secs(86400))
+            Some(Duration::from_secs(300))
         );
         for value in [None, Some("nonsense"), Some("-1")] {
             assert_eq!(audit_retry_after(value, now), None);
