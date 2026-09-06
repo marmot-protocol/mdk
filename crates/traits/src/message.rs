@@ -726,6 +726,30 @@ pub struct MessageRecord {
     pub deferred_peel: Option<DeferredPeelLifecycle>,
 }
 
+/// Payload-free view of a deferred row for scheduling, resource accounting and
+/// selecting bounded peel work. Payload bytes are fetched only for chosen rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredMessageMetadata {
+    pub id: MessageId,
+    pub group_id: GroupId,
+    pub epoch: EpochId,
+    /// Exact byte length of the encoded `MessageRecord::payload`, not a wire estimate.
+    pub payload_len: usize,
+    pub deferred_peel: Option<DeferredPeelLifecycle>,
+}
+
+impl From<MessageRecord> for DeferredMessageMetadata {
+    fn from(record: MessageRecord) -> Self {
+        Self {
+            id: record.id,
+            group_id: record.group_id,
+            epoch: record.epoch,
+            payload_len: record.payload.len(),
+            deferred_peel: record.deferred_peel,
+        }
+    }
+}
+
 /// Per-message state.
 ///
 /// Transitions:

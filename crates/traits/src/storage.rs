@@ -17,7 +17,7 @@ use crate::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
     MaintenanceObligation, PeriodicMaintenancePolicy,
 };
-use crate::message::{MessageRecord, MessageState};
+use crate::message::{DeferredMessageMetadata, MessageRecord, MessageState};
 use crate::transport_adapter::OutboundFanout;
 use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
@@ -250,6 +250,21 @@ pub trait MessageStorage {
             .list_messages(group_id, at_or_after_epoch)?
             .into_iter()
             .filter(|record| states.contains(&record.state))
+            .collect())
+    }
+
+    /// Deferred rows in the same stable order as `list_messages_in_states`,
+    /// without copying payload bytes when the backend supports separate metadata.
+    /// This is a complete metadata enumeration: callers must still discover work
+    /// behind an already-attempted prefix. Legacy backends may use the fallback.
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DeferredMessageMetadata>> {
+        Ok(self
+            .list_messages_in_states(group_id, &[MessageState::PeelDeferred], EpochId(0))?
+            .into_iter()
+            .map(DeferredMessageMetadata::from)
             .collect())
     }
 
