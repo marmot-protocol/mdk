@@ -46,14 +46,9 @@ static AUDIT_LOG_UPLOAD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(AUDIT_LOG_UPLOAD_CONNECT_TIMEOUT)
         .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("audit log upload client configuration should be valid")
 });
-// Manual passes may overlap the coalesced worker. Keep each staged checkpoint
-// write/rename indivisible, including its destination identity. Losing the
-// latest acknowledgment is safe; mixing two writers' JSON is not.
-static AUDIT_UPLOAD_CHECKPOINT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditLogFile {
@@ -76,115 +71,6 @@ pub struct AuditLogTrackerUpdateResult {
     pub enabled: bool,
     pub uploaded: Vec<AuditLogUploadResult>,
     pub skipped_reason: Option<String>,
-    /// Files that failed this pass and remain eligible for retry.
-    pub failed_files: u64,
-    /// Accepted prefixes whose unfinished tails remain eligible for retry.
-    pub incomplete_files: u64,
-    /// Files above the upload limit, including previously reported ones.
-    pub oversized_files: u64,
-}
-
-pub(crate) enum AuditUploadFailure {
-    Local(AppError),
-    Http(u16),
-    Timeout,
-    Connection,
-    Transport,
-    InvalidAcknowledgment,
-}
-
-impl AuditUploadFailure {
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::Local(error) => error.privacy_safe_kind(),
-            Self::Http(401 | 403) => "authentication",
-            Self::Http(400 | 422) => "validation",
-            Self::Http(413) => "oversized",
-            Self::Http(429) => "rate_limited",
-            Self::Http(500..=599) => "server",
-            Self::Http(_) => "http",
-            Self::Timeout => "timeout",
-            Self::Connection => "connection",
-            Self::Transport => "transport",
-            Self::InvalidAcknowledgment => "invalid_acknowledgment",
-        }
-    }
-
-    pub(crate) fn status(&self) -> Option<u16> {
-        if let Self::Http(status) = self {
-            Some(*status)
-        } else {
-            None
-        }
-    }
-}
-
-impl From<AppError> for AuditUploadFailure {
-    fn from(error: AppError) -> Self {
-        Self::Local(error)
-    }
-}
-
-impl From<std::io::Error> for AuditUploadFailure {
-    fn from(error: std::io::Error) -> Self {
-        Self::Local(error.into())
-    }
-}
-
-impl From<AuditUploadFailure> for AppError {
-    fn from(error: AuditUploadFailure) -> Self {
-        match error {
-            AuditUploadFailure::Local(error) => error,
-            AuditUploadFailure::Http(status) => {
-                Self::AuditLogUpload(format!("upload returned HTTP {status}"))
-            }
-            other => Self::AuditLogUpload(other.kind().into()),
-        }
-    }
-}
-
-/// Goggles acceptance is a structured validation result, not just a 2xx page.
-/// Bound response consumption even if a proxy returns a large error document.
-async fn validate_goggles_acknowledgment(
-    mut response: reqwest::Response,
-) -> Result<(), AuditUploadFailure> {
-    const MAX_ACK_BYTES: usize = 1024 * 1024;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(audit_upload_transport_error)?
-    {
-        if bytes.len().saturating_add(chunk.len()) > MAX_ACK_BYTES {
-            return Err(AuditUploadFailure::InvalidAcknowledgment);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    if valid_goggles_acknowledgment(&bytes) {
-        Ok(())
-    } else {
-        Err(AuditUploadFailure::InvalidAcknowledgment)
-    }
-}
-
-fn valid_goggles_acknowledgment(bytes: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    value["artifact_type"] == "audit_log"
-        && value["validation_status"] == "valid"
-        && value["invalid_event_count"].as_u64() == Some(0)
-        && value["id"].as_u64().is_some_and(|id| id > 0)
-}
-
-fn audit_upload_transport_error(error: reqwest::Error) -> AuditUploadFailure {
-    if error.is_timeout() {
-        AuditUploadFailure::Timeout
-    } else if error.is_connect() {
-        AuditUploadFailure::Connection
-    } else {
-        AuditUploadFailure::Transport
-    }
 }
 
 /// Internal receipt: only a complete snapshot of the enumerated file may be
@@ -213,7 +99,7 @@ impl AuditUploadSnapshot {
                 AUDIT_LOG_UPLOAD_MAX_BYTES
             )));
         }
-        let mut body = Vec::new();
+        let mut body = Vec::with_capacity(observed_bytes as usize);
         // Opening once preserves identity across rename/replacement. Bounding
         // the read excludes later appends, but is not sufficient by itself:
         // metadata can have sampled the middle of a JSONL write/flush.
@@ -223,11 +109,6 @@ impl AuditUploadSnapshot {
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |i| i + 1);
         body.truncate(end);
-        if body.is_empty() {
-            return Err(AppError::AuditLogUpload(
-                "audit snapshot has no complete lines".into(),
-            ));
-        }
         Ok(Self {
             complete: body.len() as u64 == observed_bytes,
             body,
@@ -277,29 +158,10 @@ pub(crate) struct AuditUploadCheckpointEntry {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct AuditUploadCheckpoint {
     #[serde(default)]
-    destination: Option<String>,
-    #[serde(default)]
     files: std::collections::BTreeMap<String, AuditUploadCheckpointEntry>,
 }
 
 impl AuditUploadCheckpoint {
-    /// Versioned, non-secret destination identity. Credentials do not determine
-    /// the receiving dataset; credential rotation must not replay all history.
-    pub(crate) fn bind_destination(&mut self, endpoint: &str) -> bool {
-        let canonical = reqwest::Url::parse(endpoint)
-            .map(|mut url| {
-                url.set_fragment(None);
-                url.to_string()
-            })
-            .unwrap_or_else(|_| endpoint.to_owned());
-        let identity = format!("v1:{}", hex::encode(Sha256::digest(canonical.as_bytes())));
-        if self.destination.as_ref() == Some(&identity) {
-            return false;
-        }
-        self.files.clear();
-        self.destination = Some(identity);
-        true
-    }
     /// What the tracker already did with `file`, if its content is unchanged
     /// since then.
     pub(crate) fn acknowledged(&self, file: &AuditLogFile) -> Option<AuditUploadOutcome> {
@@ -311,9 +173,8 @@ impl AuditUploadCheckpoint {
             .map(|entry| entry.outcome)
     }
 
-    /// Record an exact complete snapshot or the observed oversized-file verdict.
-    /// The tracker checks captured size/mtime against enumeration before storing
-    /// a successful upload, so racing appends/replacements cost a repeat.
+    /// Record the observed oversized-file verdict or an accepted complete snapshot.
+    /// Successful uploads are checked against enumeration before checkpointing.
     pub(crate) fn acknowledge(
         &mut self,
         file: &AuditLogFile,
@@ -479,6 +340,20 @@ fn validate_audit_upload_endpoint(
     Ok(endpoint.to_owned())
 }
 
+fn audit_log_reqwest_error(err: reqwest::Error) -> AppError {
+    if let Some(status) = err.status() {
+        AppError::AuditLogUpload(format!("HTTP {}", status.as_u16()))
+    } else if err.is_timeout() {
+        AppError::AuditLogUpload("request timed out".into())
+    } else if err.is_connect() {
+        AppError::AuditLogUpload("connection failed".into())
+    } else if err.is_body() {
+        AppError::AuditLogUpload("invalid response body".into())
+    } else {
+        AppError::AuditLogUpload("request failed".into())
+    }
+}
+
 impl MarmotApp {
     pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
         Ok(audit_log_settings_from_storage(
@@ -597,9 +472,6 @@ impl MarmotApp {
         account_ref: &str,
         checkpoint: &AuditUploadCheckpoint,
     ) -> Result<(), AppError> {
-        let _write_guard = AUDIT_UPLOAD_CHECKPOINT_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = self
             .account_dir(account_ref)
             .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
@@ -635,16 +507,17 @@ impl MarmotApp {
         config: &config::AuditLogTrackerConfig,
     ) -> Result<AuditLogUploadResult, AppError> {
         self.post_audit_log_snapshot(path, config)
-            .await
+            .await?
             .map(|receipt| receipt.result)
-            .map_err(Into::into)
+            .ok_or_else(|| AppError::AuditLogUpload("audit snapshot has no complete lines".into()))
     }
 
+    /// An empty complete-line prefix is deferred without an HTTP request.
     pub(crate) async fn post_audit_log_snapshot(
         &self,
         path: &str,
         config: &config::AuditLogTrackerConfig,
-    ) -> Result<AuditUploadReceipt, AuditUploadFailure> {
+    ) -> Result<Option<AuditUploadReceipt>, AppError> {
         let path = self.validate_audit_log_path(path)?;
         let config = config
             .clone()
@@ -661,10 +534,10 @@ impl MarmotApp {
             })?;
         let file = tokio::fs::File::open(&path).await?;
         let snapshot = AuditUploadSnapshot::capture(file).await?;
+        if snapshot.body.is_empty() {
+            return Ok(None);
+        }
         let bytes_sent = snapshot.body.len() as u64;
-        let goggles_endpoint = reqwest::Url::parse(&endpoint)
-            .ok()
-            .is_some_and(|url| url.host_str() == Some("goggles.ipf.dev"));
         let mut request = AUDIT_LOG_UPLOAD_CLIENT
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
@@ -682,26 +555,15 @@ impl MarmotApp {
         if let Some(value) = config.source.app_version.as_deref() {
             request = request.header("X-Goggles-App-Version", value);
         }
-        let response = request.send().await.map_err(audit_upload_transport_error)?;
+        let response = request.send().await.map_err(audit_log_reqwest_error)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(AuditUploadFailure::Http(status.as_u16()));
+            return Err(AppError::AuditLogUpload(format!(
+                "upload returned HTTP {}",
+                status.as_u16()
+            )));
         }
-        // Preserve generic HTTP upload endpoints (including 204 responses),
-        // but require a valid receipt from Goggles and JSON-speaking trackers.
-        let json_receipt = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
-            });
-        if goggles_endpoint || json_receipt {
-            validate_goggles_acknowledgment(response).await?;
-        }
-        Ok(AuditUploadReceipt {
+        Ok(Some(AuditUploadReceipt {
             observed_bytes: snapshot.observed_bytes,
             modified_at_ms: snapshot.modified_at_ms,
             complete: snapshot.complete,
@@ -710,7 +572,7 @@ impl MarmotApp {
                 status: status.as_u16(),
                 bytes_sent,
             },
-        })
+        }))
     }
 
     /// Open the file-backed forensic recorder for `label`, or `None` if it
@@ -1026,90 +888,6 @@ mod tests {
         let snapshot = AuditUploadSnapshot::capture(file).await.unwrap();
         assert_eq!(snapshot.body, b"{\"seq\":1}\n");
         assert!(snapshot.complete);
-    }
-
-    #[test]
-    fn concurrent_checkpoint_writers_preserve_whole_destination_states() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AccountHome::open(dir.path());
-        home.create_account("alice").unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        let mut first = AuditUploadCheckpoint::default();
-        first.bind_destination("https://example.com/first");
-        let mut second = AuditUploadCheckpoint::default();
-        second.bind_destination("https://example.com/second");
-        let file = AuditLogFile {
-            account_ref: "alice".into(),
-            path: "audit-test.jsonl".into(),
-            file_name: "audit-test.jsonl".into(),
-            size_bytes: 10,
-            modified_at_ms: Some(20),
-        };
-        second.acknowledge(&file, 10, AuditUploadOutcome::Uploaded);
-        let barrier = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            let mut writers = Vec::new();
-            for state in [&first, &second] {
-                let app = &app;
-                let first = &first;
-                let second = &second;
-                let barrier = &barrier;
-                writers.push(scope.spawn(move || {
-                    let mut valid = true;
-                    for _ in 0..20 {
-                        barrier.wait();
-                        valid &= app.store_audit_upload_checkpoint("alice", state).is_ok();
-                        let observed = app.audit_upload_checkpoint("alice");
-                        valid &= &observed == first || &observed == second;
-                    }
-                    valid
-                }));
-            }
-            // Assert only after both writers have left the barrier loop, so a
-            // failing observation cannot strand the other thread there.
-            for writer in writers {
-                assert!(writer.join().unwrap());
-            }
-        });
-    }
-
-    #[test]
-    fn goggles_acknowledgments_require_valid_acceptance() {
-        assert!(valid_goggles_acknowledgment(br#"{"id":42,"artifact_type":"audit_log","validation_status":"valid","invalid_event_count":0}"#));
-        for body in [b"<html>login</html>".as_slice(), b"{}", br#"{"id":42,"artifact_type":"audit_log","validation_status":"invalid","invalid_event_count":1}"#] {
-            assert!(!valid_goggles_acknowledgment(body));
-        }
-        assert_eq!(AuditUploadFailure::Http(401).kind(), "authentication");
-        assert_eq!(AuditUploadFailure::Http(400).kind(), "validation");
-        assert_eq!(AuditUploadFailure::Http(413).kind(), "oversized");
-        assert_eq!(AuditUploadFailure::Http(429).kind(), "rate_limited");
-        assert_eq!(AuditUploadFailure::Http(500).kind(), "server");
-    }
-
-    #[test]
-    fn checkpoint_destination_changes_replay_but_credentials_do_not_scope_it() {
-        let file = AuditLogFile {
-            account_ref: "account".into(),
-            path: "audit-active.jsonl".into(),
-            file_name: "audit-active.jsonl".into(),
-            size_bytes: 12,
-            modified_at_ms: Some(34),
-        };
-        let mut checkpoint = AuditUploadCheckpoint::default();
-        checkpoint.acknowledge(&file, 12, AuditUploadOutcome::Uploaded);
-        assert!(checkpoint.bind_destination("https://example.com/ingest?dataset=a"));
-        assert!(
-            checkpoint.acknowledged(&file).is_none(),
-            "legacy checkpoints replay safely"
-        );
-        checkpoint.acknowledge(&file, 12, AuditUploadOutcome::Uploaded);
-        assert!(!checkpoint.bind_destination("https://EXAMPLE.com:443/ingest?dataset=a#fragment"));
-        assert_eq!(
-            checkpoint.acknowledged(&file),
-            Some(AuditUploadOutcome::Uploaded)
-        );
-        assert!(checkpoint.bind_destination("https://example.com/ingest?dataset=b"));
-        assert!(checkpoint.acknowledged(&file).is_none());
     }
 
     use super::*;

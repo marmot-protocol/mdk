@@ -16,8 +16,6 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   separate, explicit operation.
 - Retry failed segment rolls after bounded backoff, without requiring a recorder restart or destructive rotation.
   A failed flush must not seal buffered data. Preserve the actual writer path if rename compensation fails.
-- Repeat the latest `SourceContext` at each segment start with a fresh sequence/time and the same recorder session.
-  Do not copy an old serialized row or fabricate `RecorderStarted`; segments remain independently interpretable.
 - Keep audit logging opt-in and explicit. The sole supported event model is privacy-safe: hashed/truncated identifiers,
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.

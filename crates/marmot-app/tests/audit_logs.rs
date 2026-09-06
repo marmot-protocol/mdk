@@ -290,8 +290,6 @@ async fn post_audit_log_tracker_update_continues_after_file_upload_failure() {
     assert_eq!(result.uploaded.len(), 1);
     assert_eq!(result.uploaded[0].status, 204);
     assert_eq!(result.uploaded[0].bytes_sent, successful_body.len() as u64);
-    assert_eq!(result.failed_files, 1);
-    assert_eq!(result.incomplete_files, 0);
 
     let captured = rx.await.unwrap();
     assert_eq!(captured.len(), 2);
@@ -1032,12 +1030,12 @@ async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
     let sink = CaptureSink::start().await;
     let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
     let first = runtime.post_audit_log_tracker_update().await.unwrap();
-    assert_eq!(first.incomplete_files, 1);
-    assert_eq!(first.failed_files, 0);
+    assert_eq!(first.uploaded.len(), 1);
     assert_eq!(sink.take_bodies(), vec![b"{\"seq\":1}\n".to_vec()]);
-    let checkpoint: Value =
-        serde_json::from_slice(&std::fs::read(checkpoint_path(&home, &account.label)).unwrap())
-            .unwrap();
+    let checkpoint: Value = serde_json::from_slice(
+        &std::fs::read(checkpoint_path(&home, &account.label)).unwrap_or_else(|_| b"{}".to_vec()),
+    )
+    .unwrap();
     assert!(checkpoint["files"]["audit-active.jsonl"].is_null());
     std::fs::OpenOptions::new()
         .append(true)
@@ -1046,7 +1044,7 @@ async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
         .write_all(b"}\n")
         .unwrap();
     let next = runtime.post_audit_log_tracker_update().await.unwrap();
-    assert_eq!(next.incomplete_files, 0);
+    assert_eq!(next.uploaded.len(), 1);
     let bodies = sink.take_bodies();
     assert_eq!(bodies, vec![b"{\"seq\":1}\n{\"seq\":2}\n".to_vec()]);
     for line in std::str::from_utf8(&bodies[0]).unwrap().lines() {
@@ -1063,18 +1061,33 @@ async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
 }
 
 #[tokio::test]
-async fn destination_changes_replay_while_credential_rotation_preserves_checkpoint() {
+async fn unfinished_first_row_is_deferred_until_complete() {
+    use std::io::Write;
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    std::fs::write(
-        home.account_dir(&account.label).join("audit-active.jsonl"),
-        b"{\"seq\":1}\n",
-    )
-    .unwrap();
-    let first = CaptureSink::start().await;
-    let second = CaptureSink::start().await;
-    let runtime = tracker_runtime(tmp.path(), &first.endpoint());
+    let path = home.account_dir(&account.label).join("audit-active.jsonl");
+    std::fs::write(&path, b"{\"seq\":1}").unwrap();
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    for _ in 0..2 {
+        assert!(
+            runtime
+                .post_audit_log_tracker_update()
+                .await
+                .unwrap()
+                .uploaded
+                .is_empty()
+        );
+    }
+    assert!(sink.take_bodies().is_empty());
+    assert!(!checkpoint_path(&home, &account.label).exists());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
     assert_eq!(
         runtime
             .post_audit_log_tracker_update()
@@ -1084,13 +1097,7 @@ async fn destination_changes_replay_while_credential_rotation_preserves_checkpoi
             .len(),
         1
     );
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(first.endpoint()),
-            authorization_bearer_token: Some("rotated-test-credential".into()),
-            source: AuditLogUploadSource::default(),
-        })
-        .unwrap();
+    assert_eq!(sink.take_bodies(), vec![b"{\"seq\":1}\n".to_vec()]);
     assert!(
         runtime
             .post_audit_log_tracker_update()
@@ -1099,27 +1106,11 @@ async fn destination_changes_replay_while_credential_rotation_preserves_checkpoi
             .uploaded
             .is_empty()
     );
-    runtime
-        .set_audit_log_tracker_config(AuditLogTrackerConfig {
-            endpoint: Some(second.endpoint()),
-            authorization_bearer_token: Some("rotated-test-credential".into()),
-            source: AuditLogUploadSource::default(),
-        })
-        .unwrap();
-    assert_eq!(
-        runtime
-            .post_audit_log_tracker_update()
-            .await
-            .unwrap()
-            .uploaded
-            .len(),
-        1
-    );
-    assert_eq!(first.take_bodies(), second.take_bodies());
+    assert!(sink.take_bodies().is_empty());
 }
 
 #[tokio::test]
-async fn invalid_json_acknowledgment_is_not_checkpointed() {
+async fn custom_json_acknowledgment_is_checkpointed() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
@@ -1131,28 +1122,20 @@ async fn invalid_json_acknowledgment_is_not_checkpointed() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/ingest", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        for body in [
-            "{}",
-            r#"{"id":7,"artifact_type":"audit_log","validation_status":"valid","invalid_event_count":0}"#,
-        ] {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_captured_request(&mut stream).await.unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
-        }
+        let body = r#"{"ok":true}"#;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_captured_request(&mut stream).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
     });
     let runtime = tracker_runtime(tmp.path(), &endpoint);
     let first = runtime.post_audit_log_tracker_update().await.unwrap();
-    assert_eq!(first.failed_files, 1);
-    assert!(first.uploaded.is_empty());
-    let retry = runtime.post_audit_log_tracker_update().await.unwrap();
-    assert_eq!(retry.failed_files, 0);
-    assert_eq!(retry.uploaded.len(), 1);
+    assert_eq!(first.uploaded.len(), 1);
     assert!(
         runtime
             .post_audit_log_tracker_update()

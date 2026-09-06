@@ -64,9 +64,6 @@ pub struct AuditLogTrackerUpdateResultFfi {
     pub enabled: bool,
     pub uploaded: Vec<AuditLogUploadResultFfi>,
     pub skipped_reason: Option<String>,
-    pub failed_files: u64,
-    pub incomplete_files: u64,
-    pub oversized_files: u64,
 }
 
 impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
@@ -75,9 +72,6 @@ impl From<AuditLogTrackerUpdateResult> for AuditLogTrackerUpdateResultFfi {
             enabled: value.enabled,
             uploaded: value.uploaded.into_iter().map(Into::into).collect(),
             skipped_reason: value.skipped_reason,
-            failed_files: value.failed_files,
-            incomplete_files: value.incomplete_files,
-            oversized_files: value.oversized_files,
         }
     }
 }

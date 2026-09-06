@@ -1463,14 +1463,8 @@ fn normalize_run(bytes: &[u8]) -> String {
 /// mdk#1181: a transient roll failure must not stop rotation for the rest of
 /// the recorder's life.
 ///
-/// This is the counter-lifetime hazard class. `segment_roll_failed` is a latch
-/// whose lifetime is the *directory-unwritable episode*, not the recorder's,
-/// so every site that resets the other per-episode fields (`active_bytes`,
-/// `seq`, the session id, the health counters) must reset it too. Leaving it
-/// set through `swap_to_fresh_file` meant a single `EACCES`/`ENOSPC`/`EMFILE`
-/// let the active file grow back past the app's 64 MiB upload ceiling — the
-/// permanent-failure cliff this issue exists to close. Adding another
-/// per-episode field means enumerating reset-sites x fields again.
+/// A successful destructive rotation must clear the retry deadline as well as
+/// resetting the recorder state, so a subsequent full file can roll immediately.
 #[test]
 #[cfg(unix)]
 fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
@@ -1489,7 +1483,7 @@ fn a_transient_roll_failure_does_not_disable_rotation_for_the_session() {
     .unwrap();
 
     // The episode: the directory is momentarily unwritable, so the roll-on-open
-    // cannot rename and latches.
+    // cannot rename and schedules a retry.
     fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
     if fs::write(logs.join("probe.tmp"), b"").is_ok() {
         // Root ignores permission bits, so the roll cannot be made to fail
@@ -1574,10 +1568,22 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
     // Enough rows to seal more than one segment, so this covers two boundaries
     // rather than one.
     const ROWS: usize = 8_000;
+    fn record_source_context(recorder: &JsonlRecorder) {
+        recorder.record(AuditRecord::new(
+            None,
+            AuditEventKind::SourceContext {
+                source: AuditSourceContext {
+                    platform: Some("test".into()),
+                    ..Default::default()
+                },
+            },
+        ));
+    }
 
     let rotated_dir = TempDir::new().unwrap();
     let rotated_path = default_jsonl_path(rotated_dir.path(), "engine-abc");
     let rotated = JsonlRecorder::open(&rotated_path, "engine-abc".to_string()).unwrap();
+    record_source_context(&rotated);
     record_numbered_rows(&rotated, ROWS);
     let segments = segment_paths(&rotated_path);
     assert!(
@@ -1591,13 +1597,15 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
     }
     rotated_bytes.extend_from_slice(&fs::read(&rotated_path).unwrap());
 
-    // The baseline: one recorder, the same rows, no rotation. Failing its first
-    // reopen latches `segment_roll_failed`, so after the compensating
-    // rename-back it writes one continuous file for the rest of the run.
+    // Disable rotation explicitly for the baseline; elapsed wall time must not
+    // change whether this recorder rolls on a loaded runner.
     let plain_dir = TempDir::new().unwrap();
     let plain_path = default_jsonl_path(plain_dir.path(), "engine-abc");
     let plain = JsonlRecorder::open(&plain_path, "engine-abc".to_string()).unwrap();
-    plain.fail_next_segment_reopen();
+    plain
+        .disable_segment_rotation
+        .store(true, Ordering::Relaxed);
+    record_source_context(&plain);
     record_numbered_rows(&plain, ROWS);
     assert!(
         segment_paths(&plain_path).is_empty(),
@@ -1642,49 +1650,6 @@ fn segment_retry_recovers_without_restart_after_backoff() {
 }
 
 #[test]
-fn every_later_segment_has_fresh_source_context_and_continuous_sequence() {
-    let dir = TempDir::new().unwrap();
-    let path = default_jsonl_path(dir.path(), "engine-abc");
-    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
-    recorder.record(AuditRecord::new(
-        None,
-        AuditEventKind::SourceContext {
-            source: AuditSourceContext {
-                account_label: Some("test account".into()),
-                ..Default::default()
-            },
-        },
-    ));
-    record_until_segment_rolls(&recorder, &path, 0);
-    record_until_segment_rolls(&recorder, &path, 1);
-    let mut paths = segment_paths(&path);
-    paths.push(path);
-    let mut all: Vec<AuditEvent> = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
-        let rows: Vec<AuditEvent> = fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        if index > 0 {
-            let AuditEventKind::SourceContext { source } = &rows[0].kind else {
-                panic!("segment must start with source metadata")
-            };
-            assert_eq!(source.account_label.as_deref(), Some("test account"));
-        }
-        all.extend(rows);
-    }
-    assert!(all.windows(2).all(|rows| rows[1].seq == rows[0].seq + 1
-        && rows[1].recorder_session_id == rows[0].recorder_session_id));
-    assert_eq!(
-        all.iter()
-            .filter(|row| matches!(row.kind, AuditEventKind::RecorderStarted { .. }))
-            .count(),
-        1
-    );
-}
-
-#[test]
 fn failed_flush_does_not_seal_or_discard_buffered_rows() {
     let dir = TempDir::new().unwrap();
     let path = default_jsonl_path(dir.path(), "engine-abc");
@@ -1715,6 +1680,16 @@ fn failed_compensation_keeps_a_tracked_writer_and_can_recover() {
     assert_ne!(inner.writer_path, path);
     assert!(inner.writer_path.exists());
     assert!(!path.exists());
+    let pending_path = inner.writer_path.clone();
+    let pending_bytes = fs::read(&pending_path).unwrap();
+    drop(inner);
+    assert!(
+        recorder.rotate().is_err(),
+        "must not report discarding a file it retained"
+    );
+    assert_eq!(fs::read(&pending_path).unwrap(), pending_bytes);
+    assert!(!path.exists());
+    let mut inner = recorder.inner.lock().unwrap();
     assert!(JsonlRecorder::write_record(
         &mut inner,
         AuditRecord::new(
@@ -1740,4 +1715,5 @@ fn failed_compensation_keeps_a_tracked_writer_and_can_recover() {
         .collect();
     assert_eq!(all.len(), 2);
     assert_eq!(all[1].seq, all[0].seq + 1);
+    recorder.rotate().unwrap();
 }

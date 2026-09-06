@@ -1287,6 +1287,8 @@ pub struct JsonlRecorder {
     fail_segment_reopen: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_segment_restore: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    disable_segment_rotation: std::sync::atomic::AtomicBool,
 }
 
 struct JsonlInner {
@@ -1300,8 +1302,6 @@ struct JsonlInner {
     active_bytes: u64,
     /// Retry deadline after a failed roll; recording continues during backoff.
     segment_retry_after: Option<Instant>,
-    /// Last source context, repeated with a fresh sequence at each segment.
-    source_context: Option<AuditSourceContext>,
     /// The writer may remain at a segment path if compensation also failed.
     writer_path: PathBuf,
     /// Lower-bound hint for the next unclaimed segment index, so a roll does
@@ -1357,7 +1357,6 @@ impl JsonlRecorder {
                 health: AuditRecorderHealthSnapshot::default(),
                 active_bytes,
                 segment_retry_after: None,
-                source_context: None,
                 writer_path: path.clone(),
                 next_segment_index: None,
             }),
@@ -1365,6 +1364,8 @@ impl JsonlRecorder {
             fail_segment_reopen: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_segment_restore: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            disable_segment_rotation: std::sync::atomic::AtomicBool::new(false),
         };
         // Upgrade path: a file left over-threshold by a build without segment
         // rotation — including one already past the app's upload ceiling, which
@@ -1486,9 +1487,6 @@ impl JsonlRecorder {
         let seq = inner.seq;
         inner.seq = seq.wrapping_add(1);
         let kind = record.kind;
-        if let AuditEventKind::SourceContext { source } = &kind {
-            inner.source_context = Some(source.clone());
-        }
         let context = stamp_system_human_action(record.context, &kind);
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
@@ -1526,6 +1524,10 @@ impl JsonlRecorder {
     }
 
     fn try_roll_segment(&self, inner: &mut JsonlInner, now: Instant) {
+        #[cfg(test)]
+        if self.disable_segment_rotation.load(Ordering::Relaxed) {
+            return;
+        }
         if inner.active_bytes < AUDIT_LOG_SEGMENT_MAX_BYTES
             || inner
                 .segment_retry_after
@@ -1547,6 +1549,11 @@ impl JsonlRecorder {
     /// session id, and health state untouched and still recording. The caller
     /// must hold the inner lock.
     fn swap_to_fresh_file(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
+        if inner.writer_path != self.path {
+            return Err(std::io::Error::other(
+                "audit writer must recover its active path before destructive rotation",
+            ));
+        }
         // Best-effort flush of whatever is buffered into the file we are about
         // to discard.
         let _ = inner.writer.flush();
@@ -1592,8 +1599,8 @@ impl JsonlRecorder {
     ///
     /// Nothing is deleted or truncated: the rename hands the *same inode* — and
     /// therefore every recorded byte — to the segment name, and the concatenation
-    /// of segments and the active file preserves every original event, with fresh
-    /// source-context rows added at segment boundaries. Retention and disk bounding
+    /// of the segments and the active file is byte-identical to the single file
+    /// this recorder would otherwise have written. Retention and disk bounding
     /// of the sealed segments are deliberately out of scope here; they belong to
     /// mdk#1014.
     ///
@@ -1623,13 +1630,6 @@ impl JsonlRecorder {
                 inner.active_bytes = 0;
                 inner.next_segment_index = Some(index.saturating_add(1));
                 inner.writer_path = self.path.clone();
-                if let Some(source) = inner.source_context.clone() {
-                    // Write directly, without recursive header-only rotation.
-                    Self::write_record(
-                        inner,
-                        AuditRecord::new(None, AuditEventKind::SourceContext { source }),
-                    );
-                }
                 Ok(())
             }
             Err(err) => {

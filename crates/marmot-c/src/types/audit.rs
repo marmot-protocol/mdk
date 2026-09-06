@@ -113,8 +113,5 @@ c_mirror! {
         copy enabled: bool,
         vec uploaded/uploaded_len: MarmotAuditLogUploadResult,
         opt_str skipped_reason,
-        copy failed_files: u64,
-        copy incomplete_files: u64,
-        copy oversized_files: u64,
     }
 }

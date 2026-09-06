@@ -1423,9 +1423,6 @@ typedef struct MarmotAuditLogTrackerUpdateResult {
   struct MarmotAuditLogUploadResult *uploaded;
   uintptr_t uploaded_len;
   char *skipped_reason;
-  uint64_t failed_files;
-  uint64_t incomplete_files;
-  uint64_t oversized_files;
 } MarmotAuditLogTrackerUpdateResult;
 
 /**

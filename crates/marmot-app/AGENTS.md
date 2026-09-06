@@ -49,7 +49,7 @@ App runtime bridge for the first real Marmot app surfaces.
   unit tests live in its own `#[cfg(test)] mod tests`.
 - Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
   never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
-  Checkpoint only complete immutable upload snapshots after destination-scoped acceptance.
+  Checkpoint only complete immutable upload snapshots after successful upload.
   Defer an unfinished trailing JSONL row and preserve it for a later upload; an HTTP length limit alone is insufficient.
   Do not add a trigger path that bypasses the size-1 coalescing queue in `runtime/audit_tracker.rs`, and do not let one
   oversized or failing file block the files behind it. Retention/deletion of sealed segments is mdk#1014, not this
