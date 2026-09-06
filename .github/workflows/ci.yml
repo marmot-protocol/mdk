@@ -575,6 +575,7 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
           MDK_APP_JOURNEY_ARTIFACTS: ${{ github.workspace }}/target/public-app-catchup-evidence
+          MDK_BACKLOG_TRACE: "1"
         # Keep this separate from workspace test-policy feature unification.
         # Both journeys own a 900-second watchdog and close every runtime.
         run: >-

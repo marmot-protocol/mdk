@@ -894,6 +894,7 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "transport-nostr-peeler",
  "transport-quic-broker",
  "transport-quic-stream",

@@ -695,6 +695,14 @@ impl<S: StorageProvider> Engine<S> {
                 .saturating_sub(lifecycle.first_observed_wall_ms)
         });
         self.storage.release_message_for_replay(record)?;
+        tracing::info!(
+            target: "cgka_engine::message_processor",
+            method = "release_deferred_peel_row",
+            retry_count,
+            residence_ms,
+            release_reason = disposition.tag(),
+            "deferred transport row released for replay"
+        );
         self.audit_group(
             &record.group_id,
             crate::audit_helpers::deferred_peel_resource_refused_event(
