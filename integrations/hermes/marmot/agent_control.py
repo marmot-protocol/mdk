@@ -15,7 +15,34 @@ from typing import Any, AsyncIterator, Dict, Iterable, Optional
 PROTOCOL = "marmot.agent-control.v2"
 MAX_FRAME_BYTES = 1024 * 1024
 SEND_MEDIA_COMPLETION_TIMEOUT_S = 15 * 60.0
+WRITER_CLOSE_TIMEOUT_S = 1.0
 _DEFAULT_READ_TIMEOUT = object()
+
+_EXPECTED_RESPONSE_TYPES = {
+    "account_list": frozenset({"account_list"}),
+    "timeline_message_get": frozenset({"timeline_message"}),
+    "timeline_list": frozenset({"timeline_page"}),
+    "account_profile_lookup": frozenset({"profile_lookup"}),
+    "account_publish_profile": frozenset({"profile_published"}),
+    "send_final": frozenset({"final_sent"}),
+    "delete_message": frozenset({"app_event_sent"}),
+    "send_reaction": frozenset({"app_event_sent"}),
+    "remove_reaction": frozenset({"app_event_sent"}),
+    "group_info": frozenset({"group_info"}),
+    "send_media": frozenset({"final_sent"}),
+    "download_media": frozenset({"media_downloaded"}),
+    "allowlist_list": frozenset({"allowlist"}),
+    "allowlist_add": frozenset({"allowlist"}),
+    "allowlist_remove": frozenset({"allowlist"}),
+    "stream_begin": frozenset({"stream_begun"}),
+    "stream_append": frozenset({"ack"}),
+    "stream_status": frozenset({"ack"}),
+    "stream_progress": frozenset({"ack"}),
+    "stream_finalize": frozenset({"stream_finalized"}),
+    "stream_cancel": frozenset({"ack"}),
+    "send_agent_activity": frozenset({"app_event_sent"}),
+    "send_agent_operation_event": frozenset({"app_event_sent"}),
+}
 
 class AgentControlError(RuntimeError):
     """Raised when the local ``wn-agent`` control socket rejects a request."""
@@ -54,23 +81,49 @@ class MarmotAgentControlClient:
         request_id: Optional[str] = None,
         timeout: Optional[float] = None,
         response_timeout: Any = _DEFAULT_READ_TIMEOUT,
+        expected_types: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
         request_id = request_id or uuid.uuid4().hex
         effective_timeout = self.request_timeout if timeout is None else float(timeout)
         effective_response_timeout = (
             effective_timeout if response_timeout is _DEFAULT_READ_TIMEOUT else response_timeout
         )
-        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        writer: Optional[asyncio.StreamWriter] = None
         try:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(
+                        self.socket_path,
+                        limit=MAX_FRAME_BYTES + 1,
+                    ),
+                    timeout=effective_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise AgentControlError(
+                    "timed out while connecting to agent control socket",
+                    code="timeout",
+                    retryable=True,
+                ) from exc
             await self._write_envelope(writer, payload, request_id=request_id, timeout=effective_timeout)
             response = await self._read_envelope(reader, timeout=effective_response_timeout)
+            if response is None:
+                raise AgentControlError("agent control socket closed", code="socket_closed", retryable=True)
             self._validate_response_id(response, request_id)
             self._raise_if_error(response)
+            allowed = frozenset(
+                expected_types or _EXPECTED_RESPONSE_TYPES.get(str(payload.get("type")), ())
+            )
+            if allowed and response.get("type") not in allowed:
+                raise AgentControlError(
+                    "unexpected agent control response type",
+                    code="unexpected_response",
+                )
             return response
         except OSError as exc:
             raise AgentControlError(str(exc), code="socket_io", retryable=True) from exc
         finally:
-            await _close_writer(writer)
+            if writer is not None:
+                await _close_writer(writer)
 
     async def account_list(self) -> Dict[str, Any]:
         return await self.request({"type": "account_list"})
@@ -517,8 +570,22 @@ class MarmotAgentControlClient:
         group_id_hex: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         request_id = uuid.uuid4().hex
-        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        writer: Optional[asyncio.StreamWriter] = None
         try:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(
+                        self.socket_path,
+                        limit=MAX_FRAME_BYTES + 1,
+                    ),
+                    timeout=self.request_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise AgentControlError(
+                    "timed out while connecting to agent control socket",
+                    code="timeout",
+                    retryable=True,
+                ) from exc
             await self._write_envelope(
                 writer,
                 {
@@ -529,6 +596,8 @@ class MarmotAgentControlClient:
                 request_id=request_id,
             )
             ack = await self._read_envelope(reader)
+            if ack is None:
+                raise AgentControlError("agent control socket closed", code="socket_closed", retryable=True)
             self._validate_response_id(ack, request_id)
             self._raise_if_error(ack)
             if ack.get("type") != "ack":
@@ -544,7 +613,8 @@ class MarmotAgentControlClient:
         except OSError as exc:
             raise AgentControlError(str(exc), code="socket_io", retryable=True) from exc
         finally:
-            await _close_writer(writer)
+            if writer is not None:
+                await _close_writer(writer)
 
     async def _write_envelope(
         self,
@@ -585,22 +655,33 @@ class MarmotAgentControlClient:
         read_timeout = self.request_timeout if timeout is _DEFAULT_READ_TIMEOUT else timeout
         try:
             if read_timeout is None:
-                raw = await reader.readline()
+                raw = await reader.readuntil(b"\n")
             else:
-                raw = await asyncio.wait_for(reader.readline(), timeout=float(read_timeout))
+                raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=float(read_timeout))
         except asyncio.TimeoutError as exc:
             raise AgentControlError(
                 "timed out while reading agent control response",
                 code="timeout",
                 retryable=True,
             ) from exc
-        if not raw:
-            if allow_eof:
+        except asyncio.LimitOverrunError as exc:
+            raise AgentControlError("agent control frame is too large", code="frame_too_large") from exc
+        except asyncio.IncompleteReadError as exc:
+            if not exc.partial and allow_eof:
                 return None
-            raise AgentControlError("agent control socket closed", code="socket_closed", retryable=True)
+            if not exc.partial:
+                raise AgentControlError("agent control socket closed", code="socket_closed", retryable=True) from exc
+            raise AgentControlError("agent control frame is incomplete", code="malformed_frame") from exc
         if len(raw) > MAX_FRAME_BYTES:
             raise AgentControlError("agent control frame is too large", code="frame_too_large")
-        envelope = json.loads(raw.decode("utf-8"))
+        if raw == b"\n":
+            raise AgentControlError("agent control frame is empty", code="malformed_frame")
+        try:
+            envelope = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AgentControlError("agent control frame is malformed", code="malformed_frame") from exc
+        if not isinstance(envelope, dict):
+            raise AgentControlError("agent control frame must be a JSON object", code="malformed_frame")
         if envelope.get("marmot_agent_control") != PROTOCOL:
             raise AgentControlError(
                 f"wrong agent control protocol: {envelope.get('marmot_agent_control')!r}",
@@ -656,9 +737,9 @@ def _normalize_stream_capability(value: Any) -> str:
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
     writer.close()
     try:
-        await writer.wait_closed()
-    except Exception as exc:
-        logger.debug("error while closing Marmot socket writer: %s", exc)
+        await asyncio.wait_for(writer.wait_closed(), timeout=WRITER_CLOSE_TIMEOUT_S)
+    except (asyncio.TimeoutError, BrokenPipeError, ConnectionError, OSError):
+        pass
 
 __all__ = [
     "AgentControlError",

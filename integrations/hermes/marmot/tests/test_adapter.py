@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import suppress
+import enum
 import importlib.util
 import json
 import sys
@@ -41,7 +42,7 @@ def wire_event(event):
     return flat
 
 
-def install_fake_hermes_modules():
+def install_fake_hermes_modules(*, media_kinds: bool = False):
     gateway = types.ModuleType("gateway")
     gateway_platforms = types.ModuleType("gateway.platforms")
     gateway_base = types.ModuleType("gateway.platforms.base")
@@ -49,6 +50,12 @@ def install_fake_hermes_modules():
 
     class MessageType:
         TEXT = "text"
+
+    class MediaKind(enum.Enum):
+        IMAGE = "image"
+        VIDEO = "video"
+        VOICE = "voice"
+        DOCUMENT = "document"
 
     @dataclass
     class SendResult:
@@ -151,6 +158,8 @@ def install_fake_hermes_modules():
     gateway_base.MessageEvent = MessageEvent
     gateway_base.MessageType = MessageType
     gateway_base.SendResult = SendResult
+    if media_kinds:
+        setattr(gateway_base, "MediaKind", MediaKind)
     gateway_config.Platform = Platform
     gateway_config.PlatformConfig = PlatformConfig
 
@@ -161,9 +170,12 @@ def install_fake_hermes_modules():
     return PlatformConfig
 
 
-def load_adapter_module():
+def load_adapter_module(*, media_kinds: bool = False):
     for name in [
         "marmot_hermes_adapter",
+        "marmot_hermes.adapter",
+        "marmot_hermes.agent_control",
+        "marmot_hermes",
         "gateway",
         "gateway.platforms",
         "gateway.platforms.base",
@@ -171,7 +183,7 @@ def load_adapter_module():
         "gateway.stream_events",
     ]:
         sys.modules.pop(name, None)
-    install_fake_hermes_modules()
+    install_fake_hermes_modules(media_kinds=media_kinds)
     package = types.ModuleType("marmot_hermes")
     package.__path__ = [str(PLUGIN_DIR)]
     sys.modules["marmot_hermes"] = package
@@ -802,6 +814,129 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "timeout")
         self.assertTrue(raised.exception.retryable)
+
+    async def test_rejects_malformed_non_object_and_unterminated_frames(self):
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.05)
+        control = sys.modules["marmot_hermes.agent_control"]
+        cases = (
+            (b"\n", "malformed_frame"),
+            (b"{not-json}\n", "malformed_frame"),
+            (b"\xff\n", "malformed_frame"),
+            (b"[]\n", "malformed_frame"),
+            (b'{"marmot_agent_control":"marmot.agent-control.v2"}', "malformed_frame"),
+        )
+        for raw, code in cases:
+            with self.subTest(raw=raw[:24]):
+                reader = asyncio.StreamReader(limit=control.MAX_FRAME_BYTES + 1)
+                reader.feed_data(raw)
+                reader.feed_eof()
+                with self.assertRaises(self.adapter.AgentControlError) as raised:
+                    await client._read_envelope(reader)
+                self.assertEqual(raised.exception.code, code)
+
+    async def test_rejects_oversized_unterminated_frame_without_unbounded_read(self):
+        control = sys.modules["marmot_hermes.agent_control"]
+        reader = asyncio.StreamReader(limit=control.MAX_FRAME_BYTES + 1)
+        reader.feed_data(b"x" * (control.MAX_FRAME_BYTES + 2))
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.05)
+
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client._read_envelope(reader)
+
+        self.assertEqual(raised.exception.code, "frame_too_large")
+
+    async def test_rejects_unexpected_typed_response(self):
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": [],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_list()
+
+        self.assertEqual(raised.exception.code, "unexpected_response")
+
+    async def test_connect_timeout_is_retryable_and_does_not_require_a_writer(self):
+        control = sys.modules["marmot_hermes.agent_control"]
+
+        async def never_connect(*_args, **_kwargs):
+            await asyncio.sleep(1)
+
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+        with unittest.mock.patch.object(control.asyncio, "open_unix_connection", never_connect):
+            with self.assertRaises(self.adapter.AgentControlError) as raised:
+                await client.account_list()
+
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
+
+    async def test_concurrent_requests_keep_response_ids_isolated(self):
+        request_ids = set()
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            request_ids.add(request["id"])
+            await asyncio.sleep(0 if len(request_ids) % 2 else 0.01)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "account_list",
+                    "accounts": [],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        responses = await asyncio.gather(*(client.account_list() for _ in range(12)))
+
+        self.assertEqual(len(request_ids), 12)
+        self.assertTrue(all(response["type"] == "account_list" for response in responses))
+
+
+class MediaCapabilityContractTests(unittest.TestCase):
+    def test_stable_hermes_keeps_explicit_overrides_without_claiming_host_dispatch(self):
+        adapter = load_adapter_module()
+
+        self.assertNotIn("MEDIA_KINDS", adapter.MarmotPlatformAdapter.__dict__)
+        self.assertEqual(
+            adapter.media_capability_status(),
+            {
+                "inbound": ["document", "image", "video", "voice"],
+                "outbound": ["document", "image", "video", "voice"],
+                "host_outbound_dispatch": False,
+            },
+        )
+
+    def test_candidate_hermes_declares_only_implemented_media_kinds(self):
+        adapter = load_adapter_module(media_kinds=True)
+        media_kind = getattr(sys.modules["gateway.platforms.base"], "MediaKind")
+
+        self.assertEqual(
+            adapter.MarmotPlatformAdapter.MEDIA_KINDS,
+            frozenset(
+                {
+                    media_kind.IMAGE,
+                    media_kind.VIDEO,
+                    media_kind.VOICE,
+                    media_kind.DOCUMENT,
+                }
+            ),
+        )
+        self.assertTrue(adapter.media_capability_status()["host_outbound_dispatch"])
 
 
 class TranscriptTests(unittest.TestCase):
@@ -5894,7 +6029,7 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertIsNone(name)
 
 
-class PluginRegistrationTests(unittest.TestCase):
+class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
@@ -5918,12 +6053,14 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
         self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
+        self.assertTrue(history["is_async"])
         reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
         self.assertEqual(reaction["toolset"], "platform")
         self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
         self.assertIs(reaction["handler"], self.adapter_module._marmot_reaction_tool)
+        self.assertTrue(reaction["is_async"])
 
-    def test_marmot_history_fetches_one_exact_materialized_message(self):
+    async def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []
 
         class FakeClient:
@@ -5943,37 +6080,22 @@ class PluginRegistrationTests(unittest.TestCase):
             async def _ensure_account_id(self):
                 return "11" * 32
 
-        class AdapterMap:
-            def get(self, _platform):
-                return FakeAdapter()
-
-        gateway_run = types.ModuleType("gateway.run")
-        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
-            adapters=AdapterMap()
-        )
-        model_tools = types.ModuleType("model_tools")
-        model_tools._run_async = asyncio.run
-        sys.modules["gateway.run"] = gateway_run
-        sys.modules["model_tools"] = model_tools
-
-        try:
-            result = json.loads(
-                self.adapter_module._marmot_history_tool(
-                    {
-                        "group_id_hex": "22" * 32,
-                        "message_id_hex": "33" * 32,
-                    }
-                )
+        adapter = FakeAdapter()
+        self.adapter_module._remember_live_adapter(adapter)
+        result = json.loads(
+            await self.adapter_module._marmot_history_tool(
+                {
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                }
             )
-        finally:
-            sys.modules.pop("gateway.run", None)
-            sys.modules.pop("model_tools", None)
+        )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["type"], "timeline_message")
         self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
 
-    def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
+    async def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
         calls = []
 
         class FakeAdapter:
@@ -5985,43 +6107,28 @@ class PluginRegistrationTests(unittest.TestCase):
                 calls.append(("remove", group_id_hex, message_id_hex, emoji))
                 return {"success": True, "message_id": message_id_hex}
 
-        class AdapterMap:
-            def get(self, _platform):
-                return FakeAdapter()
-
-        gateway_run = types.ModuleType("gateway.run")
-        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
-            adapters=AdapterMap()
+        adapter = FakeAdapter()
+        self.adapter_module._remember_live_adapter(adapter)
+        added = json.loads(
+            await self.adapter_module._marmot_reaction_tool(
+                {
+                    "action": "add",
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "emoji": "👀",
+                }
+            )
         )
-        model_tools = types.ModuleType("model_tools")
-        model_tools._run_async = asyncio.run
-        sys.modules["gateway.run"] = gateway_run
-        sys.modules["model_tools"] = model_tools
-
-        try:
-            added = json.loads(
-                self.adapter_module._marmot_reaction_tool(
-                    {
-                        "action": "add",
-                        "group_id_hex": "22" * 32,
-                        "message_id_hex": "33" * 32,
-                        "emoji": "👀",
-                    }
-                )
+        removed = json.loads(
+            await self.adapter_module._marmot_reaction_tool(
+                {
+                    "action": "remove",
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "emoji": "👀",
+                }
             )
-            removed = json.loads(
-                self.adapter_module._marmot_reaction_tool(
-                    {
-                        "action": "remove",
-                        "group_id_hex": "22" * 32,
-                        "message_id_hex": "33" * 32,
-                        "emoji": "👀",
-                    }
-                )
-            )
-        finally:
-            sys.modules.pop("gateway.run", None)
-            sys.modules.pop("model_tools", None)
+        )
 
         self.assertTrue(added["ok"])
         self.assertTrue(removed["ok"])

@@ -28,15 +28,23 @@ id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must
 not be logged or persisted.
 
-For a real Hermes install, install it by copying or symlinking this directory to:
+Install directly through Hermes's standard plugin flow from one reviewed MDK
+revision. Keep the full 40-character commit explicit; do not install a moving
+branch for production:
 
 ```sh
-~/.hermes/plugins/marmot
+MDK_PLUGIN_REF=<40-character-reviewed-MDK-commit>
+hermes plugins install \
+  marmot-protocol/mdk/integrations/hermes/marmot \
+  --ref "$MDK_PLUGIN_REF"
+hermes plugins enable marmot
 ```
 
-The current Hermes plugin loader expects platform plugins as directories directly
-under `~/.hermes/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and
-adapter implementation files.
+Hermes clones the repository into a temporary directory and copies only this
+plugin subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
+workspace. The release installer below consumes an archive built from these
+same files. A community-index entry should pin an immutable commit or release
+tag; until such an entry is published, use the explicit source command above.
 
 ## Release Install (Hermes Already Installed)
 
@@ -50,6 +58,22 @@ Prerequisites:
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+
+### Hermes compatibility
+
+| Cohort | Immutable source | Required result |
+| --- | --- | --- |
+| Supported floor | Hermes Agent `0.19.0` (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) | Plugin install, discovery, explicit media methods, and standalone sender work. Hermes has no generic outbound-media capability contract, so the plugin does not claim one. |
+| Current candidate | `7166071fcaadb36df26f6d753dda97da6b5d699e` | Same compatibility surface as the floor, tested from source. |
+| Outbound-media API candidate | `672367f44245a8b4e5e0233eae0b205d409e4286` from Hermes PR 36817 | The plugin feature-detects `MediaKind` and declares image, document, video, and voice routing through `MEDIA_KINDS`. |
+
+Inbound and outbound capabilities are reported separately by
+`adapter.media_capability_status()`. Inbound attachments use bounded local
+copies provided by `wn-agent`; outbound attachments are restaged and revalidated
+before publication. Operators may continue using the explicit `send_image`,
+`send_document`, `send_video`, and `send_voice` methods on every supported
+cohort. Generic Hermes media dispatch is advertised only when the host exports
+its candidate capability API.
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 

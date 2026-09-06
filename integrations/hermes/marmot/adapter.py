@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import mimetypes
@@ -18,6 +19,7 @@ import shutil
 import stat
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -41,7 +43,22 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+# Hermes 0.19.0 has no generic media-capability contract. Keep the adapter's
+# explicit send_* overrides there, but do not claim host routing.
+_HermesMediaKind = getattr(importlib.import_module("gateway.platforms.base"), "MediaKind", None)
+
 logger = logging.getLogger(__name__)
+_LIVE_ADAPTER_REF: Optional[weakref.ReferenceType] = None
+
+
+def _remember_live_adapter(adapter: "MarmotPlatformAdapter") -> "MarmotPlatformAdapter":
+    global _LIVE_ADAPTER_REF
+    _LIVE_ADAPTER_REF = weakref.ref(adapter)
+    return adapter
+
+
+def _live_adapter() -> Optional["MarmotPlatformAdapter"]:
+    return _LIVE_ADAPTER_REF() if _LIVE_ADAPTER_REF is not None else None
 
 DEFAULT_SOCKET_HOME = "~/.marmot"
 DEFAULT_STREAM_CHUNK_BYTES = 1024
@@ -1329,6 +1346,13 @@ class MarmotLiveStream:
 
 class MarmotPlatformAdapter(BasePlatformAdapter):
     """Hermes adapter that exposes Marmot groups as a platform."""
+
+    # Inbound and outbound are intentionally separate. The connector supplies
+    # normalized local paths for inbound context; outbound publication is
+    # implemented by the explicit send_* methods below. MEDIA_KINDS is added
+    # only when the host provides the candidate generic dispatch contract.
+    INBOUND_MEDIA_KINDS = frozenset({"image", "video", "voice", "document"})
+    OUTBOUND_MEDIA_KINDS = frozenset({"image", "video", "voice", "document"})
 
     def __init__(self, config: PlatformConfig, client: Optional[MarmotAgentControlClient] = None):
         super().__init__(config, Platform("marmot"))
@@ -3277,6 +3301,16 @@ def check_requirements() -> bool:
     return True
 
 
+def media_capability_status() -> Dict[str, Any]:
+    """Return passive, truthful media support without probing or mutation."""
+
+    return {
+        "inbound": sorted(MarmotPlatformAdapter.INBOUND_MEDIA_KINDS),
+        "outbound": sorted(MarmotPlatformAdapter.OUTBOUND_MEDIA_KINDS),
+        "host_outbound_dispatch": _HermesMediaKind is not None,
+    }
+
+
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     return bool(
@@ -3366,7 +3400,7 @@ async def _standalone_send(
     return {"error": result.error or "Marmot send failed"}
 
 
-def _delete_marmot_message_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
+async def _delete_marmot_message_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     message_id = str(args.get("message_id") or "").strip()
     if not message_id:
         return json.dumps({"ok": False, "error": "message_id required"})
@@ -3381,12 +3415,7 @@ def _delete_marmot_message_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
             chat_id = target
 
     try:
-        from gateway.config import Platform
-        from gateway.run import _gateway_runner_ref
-        from model_tools import _run_async
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        adapter = _live_adapter()
         if adapter is None:
             return json.dumps(
                 {
@@ -3394,13 +3423,13 @@ def _delete_marmot_message_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
                     "error": "delete_marmot_message requires a live Marmot adapter in the running gateway",
                 }
             )
-        deleted = _run_async(adapter.delete_message(chat_id or "", message_id))
+        deleted = await adapter.delete_message(chat_id or "", message_id)
         return json.dumps({"ok": bool(deleted), "deleted": bool(deleted)})
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
-def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
+async def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     group_id_hex = str(args.get("group_id_hex") or "").strip()
     if not group_id_hex:
         return json.dumps({"ok": False, "error": "group_id_hex required"})
@@ -3419,12 +3448,7 @@ def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
         )
 
     try:
-        from gateway.config import Platform
-        from gateway.run import _gateway_runner_ref
-        from model_tools import _run_async
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        adapter = _live_adapter()
         if adapter is None:
             return json.dumps(
                 {
@@ -3432,14 +3456,12 @@ def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
                     "error": "marmot_history requires a live Marmot adapter",
                 }
             )
-        account_id_hex = _run_async(adapter._ensure_account_id())
+        account_id_hex = await adapter._ensure_account_id()
         if message_id_hex:
-            response = _run_async(
-                adapter.client.timeline_message_get(
-                    account_id_hex,
-                    group_id_hex,
-                    message_id_hex,
-                )
+            response = await adapter.client.timeline_message_get(
+                account_id_hex,
+                group_id_hex,
+                message_id_hex,
             )
         else:
             before = (
@@ -3450,20 +3472,18 @@ def _marmot_history_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
                 if before_recorded_at is not None
                 else None
             )
-            response = _run_async(
-                adapter.client.timeline_list(
-                    account_id_hex,
-                    group_id_hex,
-                    before=before,
-                    limit=max(1, min(50, int(args.get("limit") or 20))),
-                )
+            response = await adapter.client.timeline_list(
+                account_id_hex,
+                group_id_hex,
+                before=before,
+                limit=max(1, min(50, int(args.get("limit") or 20))),
             )
         return json.dumps({"ok": True, **response})
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
-def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
+async def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     action = str(args.get("action") or "").strip().lower()
     group_id_hex = str(args.get("group_id_hex") or "").strip()
     message_id_hex = str(args.get("message_id_hex") or "").strip() or None
@@ -3476,12 +3496,7 @@ def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps({"ok": False, "error": "emoji required for add"})
 
     try:
-        from gateway.config import Platform
-        from gateway.run import _gateway_runner_ref
-        from model_tools import _run_async
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("marmot")) if runner is not None else None
+        adapter = _live_adapter()
         if adapter is None:
             return json.dumps(
                 {
@@ -3490,11 +3505,9 @@ def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
                 }
             )
         if action == "add":
-            result = _run_async(adapter.add_reaction(group_id_hex, emoji, message_id_hex))
+            result = await adapter.add_reaction(group_id_hex, emoji, message_id_hex)
         else:
-            result = _run_async(
-                adapter.remove_reaction(group_id_hex, message_id_hex, emoji or None)
-            )
+            result = await adapter.remove_reaction(group_id_hex, message_id_hex, emoji or None)
         return json.dumps({"ok": bool(result.get("success")), **result})
     except Exception as exc:
         return json.dumps(
@@ -3511,7 +3524,7 @@ def register(ctx):
     ctx.register_platform(
         name="marmot",
         label="Marmot",
-        adapter_factory=lambda cfg: MarmotPlatformAdapter(cfg),
+        adapter_factory=lambda cfg: _remember_live_adapter(MarmotPlatformAdapter(cfg)),
         check_fn=check_requirements,
         is_connected=validate_config,
         validate_config=validate_config,
@@ -3553,6 +3566,7 @@ def register(ctx):
                 "required": ["message_id"],
             },
             handler=_delete_marmot_message_tool,
+            is_async=True,
         )
         register_tool(
             name="marmot_history",
@@ -3586,6 +3600,7 @@ def register(ctx):
                 "required": ["group_id_hex"],
             },
             handler=_marmot_history_tool,
+            is_async=True,
         )
         register_tool(
             name="marmot_reaction",
@@ -3621,6 +3636,7 @@ def register(ctx):
                 "required": ["action", "group_id_hex"],
             },
             handler=_marmot_reaction_tool,
+            is_async=True,
         )
 
 
@@ -4036,3 +4052,14 @@ def _log_scheduled_activity_error(future) -> None:
         future.result()
     except Exception:
         logger.debug("Marmot scheduled agent activity failed", exc_info=True)
+
+
+if _HermesMediaKind is not None:
+    MarmotPlatformAdapter.MEDIA_KINDS = frozenset(
+        {
+            _HermesMediaKind.IMAGE,
+            _HermesMediaKind.VIDEO,
+            _HermesMediaKind.VOICE,
+            _HermesMediaKind.DOCUMENT,
+        }
+    )

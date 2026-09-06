@@ -207,6 +207,7 @@ jobs:
           fi
           cp integrations/hermes/marmot/__init__.py "$bundle_dir/"
           cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
+          cp integrations/hermes/marmot/agent_control.py "$bundle_dir/"
           cp integrations/hermes/marmot/README.md "$bundle_dir/"
           cp scripts/hermes_marmot_configure_gateway.py "$bundle_dir/configure_gateway.py"
 
@@ -221,6 +222,7 @@ jobs:
               "plugin.yaml",
               "__init__.py",
               "adapter.py",
+              "agent_control.py",
               "configure_gateway.py",
               "README.md",
               "manifest.json"
