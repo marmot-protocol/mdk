@@ -410,3 +410,51 @@ fn migration_and_settings_errors_never_log_or_return_private_trigger_text() {
         assert!(!messages.contains(private));
     }
 }
+
+#[test]
+fn conversion_errors_keep_categories_without_names_values_or_causes() {
+    use rusqlite::types::Type;
+    for (error, category) in [
+        (
+            rusqlite::Error::InvalidColumnType(2, "private-column-name".into(), Type::Text),
+            "column type",
+        ),
+        (
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                Type::Text,
+                Box::new(std::io::Error::other("private-conversion-value")),
+            ),
+            "conversion",
+        ),
+        (
+            rusqlite::Error::IntegralValueOutOfRange(4, 918273645),
+            "out of range",
+        ),
+        (rusqlite::Error::QueryReturnedNoRows, "no rows"),
+    ] {
+        let message = sqlite_error(error).to_string();
+        assert!(message.contains(category), "{message}");
+        assert!(!message.contains("private"));
+        assert!(!message.contains("918273645"));
+    }
+}
+
+#[test]
+fn ledger_integer_primary_key_rejects_text_and_bad_name_is_invalid_history() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(LEDGER_SQL).unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO shared_schema_migrations VALUES ('not-integer', 'test', 0)",
+            []
+        )
+        .is_err()
+    );
+    conn.execute_batch("INSERT INTO shared_schema_migrations VALUES (1, x'ff', 0)")
+        .unwrap();
+    assert_eq!(
+        run_all(&mut conn).unwrap_err().to_string(),
+        "backend failure: invalid shared store migration history"
+    );
+}

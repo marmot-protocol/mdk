@@ -25,7 +25,7 @@ The crate is split around storage concerns:
 - `migrations.rs` owns the account/session migration runner and migration tests.
 - `shared/migrations.rs` owns the independent shared-store runner; `shared/v1.sql` freezes its initial schema,
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
-  tests cover adoption and recovery.
+  tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
 ## Migrations
 
@@ -51,8 +51,8 @@ Unversioned shared tables must match frozen current or verified historical defin
 covers columns, types, nullability, defaults, primary keys, foreign keys, CHECK expressions, collations and indexes.
 Conservative DDL comparison can refuse equivalent but unrecognized SQL; incompatible shapes fail with static errors
 and no version row. Missing tables are created. Public users, ordered follows, live settings, timestamps, installation
-identity and rowids are preserved. Existing unused directory tables remain untouched. The recognized nullable
-`otlp_endpoint` column is retained but non-NULL values are cleared transactionally; retained audit `data_mode` columns
+identity and rowids are preserved. Existing unused directory tables remain untouched; their pre-existing orphaned rows do not gate live-store adoption. The recognized nullable
+`otlp_endpoint` column (inline or appended) is retained but non-NULL values are cleared transactionally; retained audit `data_mode` columns
 (inline or historically appended) remain inert and unchanged by subsequent settings writes. No full-data audit mode
 is reintroduced. SQLite errors retain extended result codes and transient BUSY/LOCKED classification without
 SQLite's database-controlled message.

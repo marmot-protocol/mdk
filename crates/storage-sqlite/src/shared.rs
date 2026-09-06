@@ -1,4 +1,7 @@
+mod error;
 mod migrations;
+
+use error::SharedSqliteResultExt;
 
 use crate::connection::CachedSql;
 use std::path::Path;
@@ -69,14 +72,12 @@ impl SqliteSharedStorage {
         // The shared cache is unencrypted, so file-level 0600 (including
         // sidecars) is the only thing keeping it from other local users.
         crate::connection::ensure_private_db_files(path)?;
-        let conn = rusqlite::Connection::open(path).map_err(migrations::sqlite_error)?;
+        let conn = rusqlite::Connection::open(path).storage()?;
         Self::from_connection(conn)
     }
 
     pub fn in_memory() -> StorageResult<Self> {
-        Self::from_connection(
-            rusqlite::Connection::open_in_memory().map_err(migrations::sqlite_error)?,
-        )
+        Self::from_connection(rusqlite::Connection::open_in_memory().storage()?)
     }
 
     /// Checkpoint the WAL and close this shared database, releasing its file
@@ -96,17 +97,16 @@ impl SqliteSharedStorage {
 
     fn from_connection(mut conn: rusqlite::Connection) -> StorageResult<Self> {
         conn.busy_timeout(Duration::from_millis(SHARED_BUSY_TIMEOUT_MS))
-            .map_err(migrations::sqlite_error)?;
-        conn.pragma_update(None, "foreign_keys", true)
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
+        conn.pragma_update(None, "foreign_keys", true).storage()?;
         conn.pragma_update(None, "trusted_schema", false)
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;",
         )
-        .map_err(migrations::sqlite_error)?;
+        .storage()?;
         migrations::run_all(&mut conn)?;
         Ok(Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
@@ -121,7 +121,7 @@ impl SqliteSharedStorage {
             let mut conn = self.lock()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             tx.execute_cached(
                 "INSERT INTO directory_users (
                 account_id_hex, npub, profile_json, relay_lists_json, key_package_json,
@@ -147,12 +147,12 @@ impl SqliteSharedStorage {
                     optional_u64_to_i64(record.event_created_at)?,
                 ],
             )
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
             tx.execute_cached(
                 "DELETE FROM directory_user_follows WHERE account_id_hex = ?1",
                 params![&record.account_id_hex],
             )
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
             for (position, follow) in record.follows.iter().enumerate() {
                 tx.execute_cached(
                     "INSERT OR IGNORE INTO directory_user_follows (
@@ -167,9 +167,9 @@ impl SqliteSharedStorage {
                         optional_u64_to_i64(record.event_created_at)?,
                     ],
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             }
-            tx.commit().map_err(migrations::sqlite_error)
+            tx.commit().storage()
         })
     }
 
@@ -178,7 +178,7 @@ impl SqliteSharedStorage {
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicDirectoryUserRecord>> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction().map_err(migrations::sqlite_error)?;
+        let tx = conn.transaction().storage()?;
         let Some(mut record) = tx
             .query_row_cached(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
@@ -201,9 +201,9 @@ impl SqliteSharedStorage {
                 },
             )
             .optional()
-            .map_err(migrations::sqlite_error)?
+            .storage()?
         else {
-            tx.commit().map_err(migrations::sqlite_error)?;
+            tx.commit().storage()?;
             return Ok(None);
         };
         let mut stmt = tx
@@ -212,14 +212,14 @@ impl SqliteSharedStorage {
                  WHERE account_id_hex = ?1
                  ORDER BY position, follow_account_id_hex",
             )
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
         record.follows = stmt
             .query_map(params![account_id_hex], |row| row.get::<_, String>(0))
-            .map_err(migrations::sqlite_error)?
+            .storage()?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
         drop(stmt);
-        tx.commit().map_err(migrations::sqlite_error)?;
+        tx.commit().storage()?;
         Ok(Some(record))
     }
 
@@ -242,7 +242,7 @@ impl SqliteSharedStorage {
         // each user's follows by position then follow id).
         let cap = i64::try_from(max).unwrap_or(i64::MAX);
         let mut conn = self.lock()?;
-        let tx = conn.transaction().map_err(migrations::sqlite_error)?;
+        let tx = conn.transaction().storage()?;
         let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         {
@@ -255,14 +255,14 @@ impl SqliteSharedStorage {
                      )
                      ORDER BY account_id_hex, position, follow_account_id_hex",
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             let rows = stmt
                 .query_map(params![cap], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             for row in rows {
-                let (account_id_hex, follow) = row.map_err(migrations::sqlite_error)?;
+                let (account_id_hex, follow) = row.storage()?;
                 follows_by_account
                     .entry(account_id_hex)
                     .or_default()
@@ -277,7 +277,7 @@ impl SqliteSharedStorage {
                  ORDER BY account_id_hex
                  LIMIT ?1",
             )
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
         let records = stmt
             .query_map(params![cap], |row| {
                 Ok(PublicDirectoryUserRecord {
@@ -292,11 +292,11 @@ impl SqliteSharedStorage {
                     follows: Vec::new(),
                 })
             })
-            .map_err(migrations::sqlite_error)?
+            .storage()?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(migrations::sqlite_error)?;
+            .storage()?;
         drop(stmt);
-        tx.commit().map_err(migrations::sqlite_error)?;
+        tx.commit().storage()?;
         if records.len() >= max {
             // no silent caps: surface (aggregate count only, privacy-safe) that
             // the listing was truncated so an operator can tell the bound bit.
@@ -334,7 +334,7 @@ impl SqliteSharedStorage {
                     })
                 },
             )
-            .map_err(migrations::sqlite_error)
+            .storage()
     }
 
     pub fn set_relay_telemetry_settings(
@@ -358,7 +358,7 @@ impl SqliteSharedStorage {
                         unix_now_ms(),
                     ],
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             Ok(())
         })
     }
@@ -373,7 +373,7 @@ impl SqliteSharedStorage {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(migrations::sqlite_error)
+            .storage()
     }
 
     pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
@@ -387,7 +387,7 @@ impl SqliteSharedStorage {
                     updated_at_ms = excluded.updated_at_ms",
                     params![install_id, unix_now_ms()],
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             Ok(())
         })
     }
@@ -406,7 +406,7 @@ impl SqliteSharedStorage {
                     })
                 },
             )
-            .map_err(migrations::sqlite_error)
+            .storage()
     }
 
     pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
@@ -420,7 +420,7 @@ impl SqliteSharedStorage {
                     updated_at_ms = excluded.updated_at_ms",
                     params![bool_i64(settings.enabled), unix_now_ms()],
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             Ok(())
         })
     }
@@ -452,7 +452,7 @@ impl SqliteSharedStorage {
                  ON CONFLICT(id) DO NOTHING",
                     params![unix_now_ms()],
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             Ok(())
         })
     }
@@ -468,7 +468,7 @@ impl SqliteSharedStorage {
                  ON CONFLICT(id) DO NOTHING",
                     params![unix_now_ms()],
                 )
-                .map_err(migrations::sqlite_error)?;
+                .storage()?;
             Ok(())
         })
     }

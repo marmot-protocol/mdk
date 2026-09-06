@@ -19,11 +19,15 @@ by executing that historical ALTER against the independently extracted pre-mode 
 only the older settings tables are supported by the historical tests; missing live tables are created during adoption.
 
 Repository history does not establish which shapes shipped to which devices. In particular, the endpoint and pre-mode
-audit shapes are compatibility-test evidence, not a claim about an identified deployed build.
+audit shapes are compatibility-test evidence, not a claim about an identified deployed build. The review-added
+appended-endpoint test executes `ALTER TABLE relay_telemetry_settings ADD COLUMN otlp_endpoint TEXT` against
+`pre_ledger.sql`. This is defensive compatibility coverage, not an invented historical fixture or deployment claim.
 
 Adoption retains retired columns: endpoints are set to NULL transactionally, while data_mode remains unread and
 unchanged by current writes. This avoids rebuilding tables or changing rowids. Retired directory tables are preserved,
-including populated synthetic rows, and are neither recreated nor used by the current API.
+including populated synthetic rows, and are neither recreated nor used by the current API. Adoption checks only the
+live schema foreign key. A separate retired-orphan regression intentionally retains a pre-existing FK violation in
+`directory_key_packages` while verifying live FK integrity and successful adoption.
 
 Normal CI assurance includes 30,003 populated rows with exact typed-value/rowid comparison, all fixture upgrades,
 foreign-key and integrity checks, rollback on body/ledger failure, and bounded (20-second child deadline) process-exit

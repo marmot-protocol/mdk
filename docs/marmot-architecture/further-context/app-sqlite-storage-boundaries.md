@@ -69,19 +69,21 @@ remaining transient, while omitting database-controlled messages (including trig
 Before creating missing tables or recording version 1, the shared runner recognizes existing tables against frozen
 current and historical definitions. Introspection checks columns, types, nullability, defaults, primary keys, foreign
 keys, index columns/collations/order and uniqueness. Conservative DDL comparison also pins CHECK expressions, conflict
-policies and table options. Unknown definitions, extra indexes or triggers on live tables, and foreign-key violations
-fail closed with stable static errors. Equivalent but unrecognized hand-edited SQL can also be refused. No user data
+policies and table options. At adoption time, unknown definitions, extra indexes or triggers on live tables, and live
+foreign-key violations fail closed with stable static errors. Already-current opens validate history without rechecking
+triggers or table shapes. Retired-table foreign-key violations remain untouched and do not gate the live store. Equivalent but unrecognized hand-edited SQL can also be refused. No user data
 is deleted to recover an unknown layout.
 
 Adoption preserves public-directory users, follow ordering, telemetry enabled/interval values, audit enabled values,
 timestamps and installation identity, including rowids. Recognized retired columns are retained to avoid table rebuilds:
-nullable `relay_telemetry_settings.otlp_endpoint` values become NULL within the migration transaction, while audit
+nullable `relay_telemetry_settings.otlp_endpoint` values (inline or appended) become NULL within the migration
+transaction, while audit
 `data_mode` (inline or appended by the historical repair) stays inert and unchanged. Subsequent settings writes do not
 reactivate either field. Already-current opens do not repeat endpoint writes. Old unused directory tables and their
 rows remain untouched; new databases do not create them.
 
-The shared store remains unencrypted and owner-only with its existing 5-second busy timeout, WAL, synchronous NORMAL,
-foreign keys ON, trusted_schema OFF, temp_store MEMORY and terminal close semantics. Directory mirroring/reconciliation,
+The shared store retains the unencrypted, owner-only operational posture documented in
+[storage-sqlite migrations](../../../crates/storage-sqlite/README.md#migrations). Directory mirroring/reconciliation,
 session storage, app-cache migrations, and the retired app-projection import are unchanged.
 
 Each store needs an independent schema identity because its release cadence, rollback behavior, and durability
@@ -114,11 +116,13 @@ Shared-store fixtures independently extract the three master-lineage DDL generat
 tables), `5464b34e` (five tables with audit data mode), and `fe133b82` (five current tables). All six master-lineage
 revisions touching shared.rs through `6b2b041b` fall into these generations. The original revision's tests and additive
 repair independently establish the legacy endpoint layout and both audit-column positions. These compatibility tests
-are evidence of supported input, not proof of a particular deployed release. See the
+are evidence of supported input, not proof of a particular deployed release. Review also prompted defensive acceptance
+of an endpoint appended to the current relay-settings schema; history does not establish that variant was deployed. See the
 [fixture provenance](../../../crates/storage-sqlite/src/shared/fixtures/README.md).
 
 Shared assurance compares every typed value and rowid across 30,003 populated current-shape rows, checks all historical
-fixtures (including retained unused tables), and verifies integrity and foreign keys after upgrades. Failure injection
+fixtures (including retained unused tables), and verifies integrity and foreign keys after upgrades. An additional
+retired-orphan fixture verifies live foreign keys while deliberately preserving the pre-existing retired-table violation. Failure injection
 covers migration-body and ledger-insert rollback, including rollback of endpoint neutralization. A bounded child process
 exits without destructors after schema and endpoint changes and forced dirty-page spill, before ledger insertion;
 rollback-journal and WAL recovery preserve the original rows and allow retry. This proves transaction recovery under

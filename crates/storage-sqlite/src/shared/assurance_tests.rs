@@ -309,3 +309,69 @@ fn interrupted_shared_upgrade_recovers_in_delete_and_wal_modes() {
         assert_eq!(endpoint, None);
     }
 }
+
+#[test]
+fn appended_endpoint_is_neutralized_without_rewriting_live_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.sqlite3");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(PRE_LEDGER).unwrap();
+    // Defensive compatibility case from review, not a claimed historical build.
+    conn.execute_batch("ALTER TABLE relay_telemetry_settings ADD COLUMN otlp_endpoint TEXT;
+        INSERT INTO relay_telemetry_settings VALUES (1, 1, 37, 1234, 'https://collector.example/?token=secret')").unwrap();
+    let before = snapshot(&conn, &["relay_telemetry_settings"]);
+    let storage = SqliteSharedStorage::open(&path).unwrap();
+    let mut expected = before;
+    *expected[0][0].last_mut().unwrap() = Value::Null;
+    assert_eq!(
+        snapshot(&storage.lock().unwrap(), &["relay_telemetry_settings"]),
+        expected
+    );
+    assert_integrity(&storage.lock().unwrap());
+    storage.close().unwrap();
+    let storage = SqliteSharedStorage::open(&path).unwrap();
+    let mut conn = storage.lock().unwrap();
+    conn.pragma_update(None, "query_only", true).unwrap();
+    run_all(&mut conn).unwrap();
+    assert_eq!(snapshot(&conn, &["relay_telemetry_settings"]), expected);
+}
+
+#[test]
+fn retired_orphans_do_not_gate_live_store_adoption() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(ORIGINAL).unwrap();
+    seed(&mut conn, 3);
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute_batch(
+        "INSERT INTO directory_key_packages VALUES ('retired-orphan', NULL, NULL, 'unused', 99)",
+    )
+    .unwrap();
+    let before = snapshot(&conn, &["directory_key_packages"]);
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    run_all(&mut conn).unwrap();
+    assert_eq!(snapshot(&conn, &["directory_key_packages"]), before);
+    assert!(
+        conn.prepare("PRAGMA foreign_key_check(directory_user_follows)")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    // Retired data remains untouched, including the pre-existing violation.
+    assert!(
+        conn.prepare("PRAGMA foreign_key_check(directory_key_packages)")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_some()
+    );
+}

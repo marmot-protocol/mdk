@@ -1,5 +1,6 @@
 //! Installation-wide shared.sqlite3 migration domain. Independent of account
 //! and app-cache ledgers; never copies their histories or application records.
+use super::error::sqlite_error;
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -29,18 +30,6 @@ const TABLES: &[&str] = &[
     "audit_log_settings",
     "telemetry_install",
 ];
-
-/// Drop SQLite's optional database-controlled message before mapping the error.
-/// Existing StorageError variants retain the extended code in their safe text
-/// and classify BUSY/LOCKED (including extended codes) as transient.
-pub(super) fn sqlite_error(error: rusqlite::Error) -> StorageError {
-    match error {
-        rusqlite::Error::SqliteFailure(code, _) => {
-            crate::codec::map_sqlite_error(rusqlite::Error::SqliteFailure(code, None))
-        }
-        _ => StorageError::Backend("shared store SQLite operation failed".into()),
-    }
-}
 
 pub(super) fn run_all(conn: &mut Connection) -> StorageResult<()> {
     run(conn, MIGRATIONS)
@@ -104,7 +93,10 @@ fn applied_count(conn: &Connection, migrations: &[Migration]) -> StorageResult<u
             [],
             |row| row.get(0),
         )
-        .map_err(sqlite_error)?;
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(..) => sqlite_error(error),
+            _ => invalid_history(),
+        })?;
     if let Some(found) = found
         && found > latest_supported
     {
@@ -166,6 +158,12 @@ fn version_1(tx: &Transaction<'_>) -> StorageResult<()> {
     appended.execute_batch("ALTER TABLE audit_log_settings ADD COLUMN data_mode TEXT NOT NULL DEFAULT 'obfuscated_sensitive_data'")
         .map_err(sqlite_error)?;
 
+    // Accept the review's additive endpoint layout defensively. History proves
+    // the inline layout only; this is not evidence of an additional shipped build.
+    appended
+        .execute_batch("ALTER TABLE relay_telemetry_settings ADD COLUMN otlp_endpoint TEXT")
+        .map_err(sqlite_error)?;
+
     let mut legacy_endpoint = false;
     for table in TABLES {
         if !table_exists(tx, table)? {
@@ -176,20 +174,28 @@ fn version_1(tx: &Transaction<'_>) -> StorageResult<()> {
             [table], |r| r.get(0),
         ).map_err(sqlite_error)?;
         // No historical shared-table triggers exist. Refuse side effects that
-        // could alter live rows during the endpoint update or later writes.
+        // could alter live rows during adoption. Current opens do not recheck triggers.
         if has_trigger {
             return Err(invalid_shape());
         }
         if table_matches(tx, &reference, table)? {
             continue;
         }
-        if *table == "relay_telemetry_settings" && table_matches(tx, &legacy, table)? {
-            legacy_endpoint = true;
-        } else if !(*table == "audit_log_settings"
-            && (table_matches(tx, &legacy, table)? || table_matches(tx, &appended, table)?))
-        {
+        let alternatives: &[&Connection] = match *table {
+            "relay_telemetry_settings" | "audit_log_settings" => &[&legacy, &appended],
+            _ => &[],
+        };
+        let mut recognized = false;
+        for alternative in alternatives {
+            if table_matches(tx, alternative, table)? {
+                recognized = true;
+                break;
+            }
+        }
+        if !recognized {
             return Err(invalid_shape());
         }
+        legacy_endpoint |= *table == "relay_telemetry_settings";
     }
     // Missing tables are safe to create only after existing ones are recognized.
     // Leave old unused directory tables and all their rows untouched.
@@ -198,9 +204,11 @@ fn version_1(tx: &Transaction<'_>) -> StorageResult<()> {
         tx.execute("UPDATE relay_telemetry_settings SET otlp_endpoint = NULL WHERE otlp_endpoint IS NOT NULL", [])
             .map_err(sqlite_error)?;
     }
-    // A ledger never blesses pre-existing orphaned rows; this check is read-only.
+    // Validate the only FK in the live v1 contract. Retired tables are outside
+    // this migration's authority; existing orphaned rows there remain untouched
+    // and must not make live settings or the installation identity unavailable.
     let mut check = tx
-        .prepare("PRAGMA foreign_key_check")
+        .prepare("PRAGMA foreign_key_check(directory_user_follows)")
         .map_err(sqlite_error)?;
     if check
         .query([])
