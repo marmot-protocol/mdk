@@ -1668,6 +1668,13 @@ impl<S: StorageProvider> Engine<S> {
         execution: &mut DeferredPeelExecution<'_>,
     ) -> Result<DeferredPeelWorkResult, EngineError> {
         let sweep_started = Instant::now();
+        // The background deadline is cooperative: a started row always finishes.
+        // Give a slice that started with available time the same guarantee when
+        // its synchronous preparation uses the quantum. Otherwise a slow storage
+        // read repeats forever without ever reaching one durable row attempt.
+        // Foreground preflight and already-expired slices retain strict checks.
+        let mut finish_one_background_row =
+            matches!(execution, DeferredPeelExecution::Background { .. }) && !execution.exhausted();
         self.engine_metrics.note_deferred_peel_sweep();
         let foreground_budget_ms = match execution {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
@@ -1727,7 +1734,7 @@ impl<S: StorageProvider> Engine<S> {
             budget_exhausted = execution.exhausted(),
             "deferred-peel preparation"
         );
-        if execution.exhausted() {
+        if execution.exhausted() && !finish_one_background_row {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -1741,7 +1748,39 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
         let row_limit = execution.row_limit();
-        if self.normalize_deferred_peel_lifecycles(&mut deferred, now, row_limit)? {
+        // Charge normalization only to the wall-clock worker's allowance.
+        // Deterministic retries retain their existing normalize-then-peel slice;
+        // foreground preflight retains its independent strict budget behavior.
+        let normalization_rows = if matches!(
+            execution,
+            DeferredPeelExecution::Background {
+                deadline: Some(_),
+                ..
+            }
+        ) {
+            deferred
+                .iter()
+                .filter(|record| {
+                    record.deferred_peel.as_ref().is_none_or(|lifecycle| {
+                        lifecycle.clock_instance_id != self.convergence_clock_instance_id
+                    })
+                })
+                .take(row_limit)
+                .count()
+        } else {
+            0
+        };
+        let normalization_pending =
+            self.normalize_deferred_peel_lifecycles(&mut deferred, now, row_limit)?;
+        for _ in 0..normalization_rows {
+            execution.consume_row();
+        }
+        if normalization_rows > 0 {
+            // Durable normalization is useful bounded progress too; do not
+            // grant an additional row past the deadline after making it.
+            finish_one_background_row = false;
+        }
+        if normalization_pending {
             // Legacy initialization and restart rebasing are durable writes,
             // so migrate them in the same bounded slices as peel attempts.
             // The pending edge keeps the scheduler advancing the backlog.
@@ -1758,6 +1797,21 @@ impl<S: StorageProvider> Engine<S> {
                 progressed: 0,
             });
         }
+
+        if execution.exhausted() && !finish_one_background_row {
+            self.note_foreground_deferred_phase(
+                sweep_started,
+                foreground_budget_ms,
+                0,
+                deferred.len(),
+                crate::engine_metrics::DeferredPeelMetricOutcome::BudgetExhausted,
+            );
+            return Ok(DeferredPeelWorkResult {
+                status: DeferredPeelWorkStatus::BudgetExhausted,
+                progressed: 0,
+            });
+        }
+        let row_limit = execution.row_limit();
 
         // Residence expiry is independent of peel-context changes. Check it
         // before the fingerprint gate so a permanently stable group can still
@@ -1776,9 +1830,10 @@ impl<S: StorageProvider> Engine<S> {
         if !due.is_empty() {
             let mut released = 0usize;
             for metadata in &due {
-                if execution.exhausted() {
+                if execution.exhausted() && !finish_one_background_row {
                     break;
                 }
+                finish_one_background_row = false;
                 execution.consume_row();
                 let record = self.storage.get_message(&metadata.id)?;
                 self.release_deferred_peel_row(
@@ -1895,7 +1950,7 @@ impl<S: StorageProvider> Engine<S> {
             .or_default()
             .sweep_count += 1;
 
-        if execution.exhausted() {
+        if execution.exhausted() && !finish_one_background_row {
             self.note_foreground_deferred_phase(
                 sweep_started,
                 foreground_budget_ms,
@@ -2029,7 +2084,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut timed_out = false;
         let mut contexts_invalidated = false;
         for metadata in unattempted.into_iter().take(row_limit) {
-            if execution.exhausted() {
+            if execution.exhausted() && !finish_one_background_row {
                 timed_out = true;
                 break;
             }
@@ -2046,6 +2101,7 @@ impl<S: StorageProvider> Engine<S> {
                 contexts_invalidated = true;
                 break;
             }
+            finish_one_background_row = false;
             let record = self.storage.get_message(&metadata.id)?;
             let lifecycle = record
                 .deferred_peel
