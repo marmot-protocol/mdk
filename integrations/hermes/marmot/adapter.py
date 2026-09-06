@@ -17,6 +17,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import time
 import uuid
@@ -1542,6 +1543,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         for task in self._debounce_tasks.values():
             if not task.done():
                 task.cancel()
+        for items in self._debounce_pending.values():
+            self._release_debounce_items(items, reason="debounce_cancelled")
         self._debounce_tasks.clear()
         self._debounce_pending.clear()
         self._pending_inbound_ids.clear()
@@ -2790,23 +2793,29 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._inbound_spool_wakeup.clear()
             try:
                 records = self._inbound_spool.due()
-            except InboundSpoolError:
+            except (InboundSpoolError, OSError, sqlite3.Error):
                 logger.error("Marmot inbound spool retry read failed", exc_info=True)
                 await asyncio.sleep(1.0)
                 continue
             for record in records:
                 try:
                     self._try_admit_spooled(record.message_id)
-                except InboundSpoolError:
+                except (InboundSpoolError, OSError, sqlite3.Error):
                     logger.error("Marmot inbound spool retry admission failed", exc_info=True)
 
     def _admit_due_spooled(self) -> None:
         if not self._inbound_spool.is_open:
             return
-        for record in self._inbound_spool.due():
+        try:
+            records = self._inbound_spool.due()
+        except (InboundSpoolError, OSError, sqlite3.Error):
+            logger.error("Marmot inbound spool admission read failed", exc_info=True)
+            self._inbound_spool_wakeup.set()
+            return
+        for record in records:
             try:
                 self._try_admit_spooled(record.message_id)
-            except InboundSpoolError:
+            except (InboundSpoolError, OSError, sqlite3.Error):
                 logger.error("Marmot inbound spool admission failed", exc_info=True)
 
     def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
@@ -2887,7 +2896,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             try:
                 self._enqueue_debounced(event)
             except BaseException:
-                self._pending_inbound_ids.discard(message_id_hex)
+                key = self._debounce_key(event)
+                task = self._debounce_tasks.pop(key, None)
+                if task is not None and not task.done():
+                    task.cancel()
+                items = self._debounce_pending.pop(key, [])
+                if not any(item.get("message_id_hex") == message_id_hex for item in items):
+                    items.append(event)
+                self._release_debounce_items(items, reason="debounce_enqueue_failed")
+                self._admit_due_spooled()
                 raise
             return
 
@@ -3060,11 +3077,20 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     reason="dispatch_cancelled_before_handoff",
                 )
             elif spool_message_id and spool_state == "handed":
-                self._inbound_spool.transition(
-                    spool_message_id,
-                    "unresolved",
-                    "host_handoff_outcome_unknown",
-                )
+                try:
+                    self._inbound_spool.transition(
+                        spool_message_id,
+                        "unresolved",
+                        "host_handoff_outcome_unknown",
+                    )
+                except (InboundSpoolError, OSError, sqlite3.Error):
+                    # Shutdown may close the spool while a handed host turn is
+                    # cancelled. Preserve cancellation; the next generation
+                    # converts the durable handed row to unresolved.
+                    logger.error(
+                        "Marmot inbound cancellation disposition could not be persisted",
+                        exc_info=True,
+                    )
             raise
         except Exception:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
@@ -3205,9 +3231,30 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             merged = _coalesce_inbound_events(items)
             representative = self._inbound_spool.form_batch(message_ids, merged)
             self._try_admit_spooled(representative)
+        except BaseException:
+            self._release_debounce_items(items, reason="debounce_flush_aborted")
+            self._admit_due_spooled()
+            raise
         finally:
             for message_id_hex in message_ids:
                 self._pending_inbound_ids.discard(message_id_hex)
+
+    def _release_debounce_items(
+        self,
+        items: Iterable[Dict[str, Any]],
+        *,
+        reason: str,
+    ) -> None:
+        message_ids = [str(item.get("message_id_hex") or "") for item in items]
+        message_ids = [message_id for message_id in message_ids if message_id]
+        if not message_ids or not self._inbound_spool.is_open:
+            return
+        try:
+            self._inbound_spool.release_debounce(message_ids, reason=reason)
+        except (InboundSpoolError, OSError, sqlite3.Error):
+            logger.error("Marmot inbound debounce release failed", exc_info=True)
+        finally:
+            self._inbound_spool_wakeup.set()
 
     async def _handle_mutation(self, event: Dict[str, Any]) -> None:
         # Mutations are quiet next-turn context and never trigger an agent turn.

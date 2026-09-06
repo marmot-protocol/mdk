@@ -149,6 +149,38 @@ class InboundSpoolTests(unittest.TestCase):
             )
             reopened.close()
 
+    def test_release_debounce_is_compare_and_set_and_restores_fifo_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")
+            store.open()
+            first, second = event(1), event(2)
+            store.record(first, debounce_buffered=True)
+            store.record(second, debounce_buffered=True)
+
+            self.assertEqual(
+                2,
+                store.release_debounce(
+                    [first["message_id_hex"], second["message_id_hex"]],
+                    reason="debounce_schedule_failed",
+                ),
+            )
+            self.assertEqual(
+                [first["message_id_hex"]],
+                [record.message_id for record in store.due()],
+            )
+            self.assertEqual(
+                0,
+                store.release_debounce(
+                    [first["message_id_hex"], second["message_id_hex"]],
+                    reason="must_not_overwrite",
+                ),
+            )
+            self.assertEqual(
+                "debounce_schedule_failed",
+                store.get(first["message_id_hex"]).disposition,
+            )
+            store.close()
+
     def test_per_group_fifo_blocks_newer_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")

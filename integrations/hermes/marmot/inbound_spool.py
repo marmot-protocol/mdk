@@ -255,6 +255,32 @@ class InboundSpool:
         self._checkpoint_and_verify_bound()
         return representative
 
+    def release_debounce(self, source_ids: Iterable[str], *, reason: str) -> int:
+        """Make abandoned debounce rows eligible for ordinary FIFO admission.
+
+        The state/disposition predicate is a compare-and-set boundary: a row
+        that already advanced to a batch, claim, or terminal state is untouched.
+        """
+        ids = tuple(dict.fromkeys(str(value) for value in source_ids if value))
+        if not ids:
+            return 0
+        db = self._require_db()
+        now = time.time()
+        try:
+            with db:
+                changed = db.execute(
+                    f"UPDATE events SET next_attempt_at=0,disposition=?,changed_at=? "
+                    f"WHERE message_id IN ({','.join('?' for _ in ids)}) "
+                    "AND state='pending' AND disposition='debounce_buffered'",
+                    (reason, now, *ids),
+                ).rowcount
+            self._checkpoint_and_verify_bound()
+            return int(changed)
+        except InboundSpoolError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise InboundSpoolError("inbound debounce release failed") from exc
+
     def due(self, *, now: Optional[float] = None) -> list[SpoolRecord]:
         db = self._require_db()
         at = time.time() if now is None else float(now)

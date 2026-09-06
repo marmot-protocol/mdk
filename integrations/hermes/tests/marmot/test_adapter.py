@@ -6693,6 +6693,111 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(retry, return_exceptions=True)
             adapter._inbound_spool.close()
 
+    async def test_debounce_enqueue_failure_releases_and_preserves_same_group_fifo(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 10}
+        )
+        original_enqueue = adapter._enqueue_debounced
+
+        def fail_after_buffering(event):
+            key = adapter._debounce_key(event)
+            adapter._debounce_pending.setdefault(key, []).append(event)
+            raise RuntimeError("synthetic timer registration failure")
+
+        adapter._enqueue_debounced = fail_after_buffering
+        with self.assertRaisesRegex(RuntimeError, "timer registration"):
+            await adapter._handle_control_event(
+                self.make_event(message_id="33", text="first")
+            )
+        adapter._enqueue_debounced = original_enqueue
+        for _ in range(100):
+            if len(adapter.events) == 1:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual([item.text for item in adapter.events], ["first"])
+        await adapter._handle_control_event(
+            self.make_event(message_id="55", text="second")
+        )
+        normalized_second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        key = adapter._debounce_key(normalized_second)
+        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
+        for _ in range(100):
+            if len(adapter.events) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual([item.text for item in adapter.events], ["first", "second"])
+        self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
+        adapter._inbound_spool.close()
+
+    async def test_retry_loop_survives_raw_sqlite_read_error(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        adapter._inbound_spool.record(event)
+        original_due = adapter._inbound_spool.due
+        failed_once = asyncio.Event()
+
+        def flaky_due(*, now=None):
+            if not failed_once.is_set():
+                failed_once.set()
+                raise self.adapter_module.sqlite3.OperationalError(
+                    "synthetic raw sqlite failure"
+                )
+            return original_due(now=now)
+
+        adapter._inbound_spool.due = flaky_due
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            adapter._inbound_spool_wakeup.set()
+            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            self.assertFalse(retry.done())
+            adapter._inbound_spool_wakeup.set()
+            for _ in range(150):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([item.text for item in adapter.events], ["durable"])
+            self.assertFalse(retry.done())
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            adapter._inbound_spool.close()
+
+    async def test_cancel_after_handoff_preserves_cancellation_and_recovers_unresolved(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event)
+        adapter._inbound_spool.claim(message_id)
+        handed = asyncio.Event()
+
+        async def blocking_handle(message):
+            handed.set()
+            await asyncio.Event().wait()
+
+        adapter.handle_message = blocking_handle
+        dispatch = asyncio.create_task(
+            adapter._dispatch_inbound_message(event, spool_message_id=message_id)
+        )
+        await asyncio.wait_for(handed.wait(), timeout=1)
+        self.assertEqual("handed", adapter._inbound_spool.get(message_id).state)
+        adapter._inbound_spool.close(graceful=False)
+        dispatch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await dispatch
+
+        recovery = adapter._inbound_spool.open()
+        self.assertEqual({"reclaimed": 0, "unresolved": 1}, recovery)
+        record = adapter._inbound_spool.get(message_id)
+        self.assertEqual("unresolved", record.state)
+        self.assertEqual("host_handoff_outcome_unknown", record.disposition)
+        adapter._inbound_spool.close()
+
 
 if __name__ == "__main__":
     unittest.main()
