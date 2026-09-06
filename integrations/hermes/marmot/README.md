@@ -562,5 +562,5 @@ not a disk-streaming or low-memory-mobile transfer mode.
 Run the shim tests with:
 
 ```sh
-python3 -m unittest discover -s integrations/hermes/tests/marmot
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
 ```
