@@ -190,7 +190,9 @@ reached durable local readiness. `Publishing` includes bounded in-session retry 
 local visibility via `wn relay-stats`, an opt-in index→identity resolution boundary, a relay-plane rollup, and an
 opt-in OTLP exporter (wire encoding behind the `marmot-app` `otlp-export` feature) — all aggregate, off by default, and
 carrying relay identity as the sole label. Wiring its periodic push into a long-running host against the production
-first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md).
+first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md). Each OTLP attempt
+now validates every resolved collector address and pins the client, with redirects and proxies disabled. The existing
+explicit loopback-test endpoint contract remains local-only; see [Dial Safety](dial-safety.md).
 - **Nostr account transport shape** — the likely production shape includes a Nostr user directory, account bootstrap for
   relay-list events, a shared multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing, and explicit
   relay URL safety policy. This is captured as a working note in

@@ -25,6 +25,7 @@ struct CapturedRequest {
     authorization: Option<String>,
     content_type: Option<String>,
     body_len: usize,
+    body: Vec<u8>,
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -90,6 +91,7 @@ async fn capture_one_request(listener: TcpListener, tx: oneshot::Sender<Captured
             authorization,
             content_type,
             body_len: content_length,
+            body: buf[header_end..header_end + content_length].to_vec(),
         });
         return;
     }
@@ -163,6 +165,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<CapturedRequ
             authorization: header_value("authorization"),
             content_type: header_value("content-type"),
             body_len: content_length,
+            body: buf[header_end..header_end + content_length].to_vec(),
         });
     }
 }
@@ -201,40 +204,60 @@ fn runtime_config_without_endpoint() -> RelayTelemetryRuntimeConfig {
 
 #[tokio::test]
 async fn export_once_pushes_otlp_metrics_over_http() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
-    let server = tokio::spawn(capture_one_request(listener, tx));
+    for host in ["127.0.0.1", "[::1]", "localhost"] {
+        let bind = if host == "[::1]" {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let listener = TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        let server = tokio::spawn(capture_one_request(listener, tx));
 
-    let relay_plane = MarmotRelayPlane::full_history();
-    let endpoint = format!("http://{addr}/custom/v1/metrics");
-    let exporter = relay_plane
-        .telemetry_exporter(
-            RelayTelemetryExportConfig::enabled(endpoint.clone())
-                .with_runtime_config(runtime_config(endpoint)),
+        let relay_plane = MarmotRelayPlane::full_history();
+        let endpoint = format!(
+            "http://{host}:{}/custom/v1/metrics?tenant=one%2Ftwo",
+            addr.port()
+        );
+        let exporter = relay_plane
+            .telemetry_exporter(
+                RelayTelemetryExportConfig::enabled(endpoint.clone())
+                    .with_runtime_config(runtime_config(endpoint)),
+            )
+            .expect("opted-in exporter is constructed");
+
+        let count = exporter
+            .export_once(None)
+            .await
+            .expect("export push succeeds");
+        assert!(count > 0, "population metrics are always present");
+
+        let captured = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("server responded in time")
+            .expect("captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/custom/v1/metrics?tenant=one%2Ftwo");
+        use prost::Message;
+        let decoded =
+        opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest::decode(
+            captured.body.as_slice(),
         )
-        .expect("opted-in exporter is constructed");
+        .unwrap();
+        assert_eq!(
+            decoded.resource_metrics[0].scope_metrics[0].metrics.len(),
+            count
+        );
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(
+            captured.content_type.as_deref(),
+            Some("application/x-protobuf")
+        );
+        assert!(captured.body_len > 0, "OTLP protobuf body is non-empty");
 
-    let count = exporter
-        .export_once(None)
-        .await
-        .expect("export push succeeds");
-    assert!(count > 0, "population metrics are always present");
-
-    let captured = tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .expect("server responded in time")
-        .expect("captured request");
-    assert_eq!(captured.method, "POST");
-    assert_eq!(captured.path, "/custom/v1/metrics");
-    assert_eq!(captured.authorization.as_deref(), Some("Bearer test-token"));
-    assert_eq!(
-        captured.content_type.as_deref(),
-        Some("application/x-protobuf")
-    );
-    assert!(captured.body_len > 0, "OTLP protobuf body is non-empty");
-
-    server.await.unwrap();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -403,4 +426,73 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
 
     runtime.shutdown().await;
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/metrics", source.local_addr().unwrap());
+    let location = format!("http://{}/stolen", target.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = source.accept().await.unwrap();
+        let request = read_request(&mut stream).await.unwrap();
+        assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+        stream.write_all(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ).as_bytes()).await.unwrap();
+    });
+    // Respond if the vulnerable client follows, so the regression fails promptly.
+    let (tx, mut rx) = oneshot::channel();
+    let redirect_server = tokio::spawn(capture_one_request(target, tx));
+    let exporter = MarmotRelayPlane::full_history()
+        .telemetry_exporter(
+            RelayTelemetryExportConfig::enabled(endpoint.clone())
+                .with_runtime_config(runtime_config(endpoint)),
+        )
+        .unwrap();
+    let result = exporter.export_once(None).await;
+    server.await.unwrap();
+    let received = tokio::time::timeout(Duration::from_millis(150), &mut rx).await;
+    redirect_server.abort();
+    assert!(received.is_err(), "redirect target received a request");
+    assert!(matches!(
+        result,
+        Err(marmot_app::RelayExportError::Status(307))
+    ));
+}
+
+#[tokio::test]
+async fn relay_telemetry_host_safety_stalled_push_keeps_export_window_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+    let (tx, rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await.unwrap();
+        tx.send(request).ok();
+        // Keep the accepted socket alive without a response until the test
+        // aborts this server, forcing the export-window deadline to win.
+        std::future::pending::<()>().await;
+        drop(stream);
+    });
+    let exporter = MarmotRelayPlane::full_history()
+        .telemetry_exporter(
+            RelayTelemetryExportConfig::enabled(endpoint.clone())
+                .with_interval(Duration::from_millis(250))
+                .with_runtime_config(runtime_config(endpoint)),
+        )
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        exporter.export_once_with_retries(None),
+    )
+    .await;
+    server.abort();
+    assert!(matches!(
+        result.unwrap(),
+        Err(marmot_app::RelayExportError::Request)
+    ));
+    let received = rx.await.unwrap();
+    assert_eq!(received.authorization.as_deref(), Some("Bearer test-token"));
 }

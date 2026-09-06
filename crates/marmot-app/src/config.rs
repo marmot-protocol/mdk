@@ -804,7 +804,7 @@ impl RelayTelemetryExportConfig {
             && self
                 .endpoint
                 .as_deref()
-                .is_some_and(endpoint_transport_allowed)
+                .is_some_and(|endpoint| parse_relay_telemetry_endpoint(endpoint).is_some())
             && self
                 .authorization_bearer_token
                 .as_deref()
@@ -814,6 +814,24 @@ impl RelayTelemetryExportConfig {
                 .as_ref()
                 .is_some_and(RelayTelemetryResource::has_required_attributes)
     }
+}
+
+/// Structural gate shared by exporter construction and each OTLP dial attempt.
+/// Keep the exact `localhost`/loopback-IP test contract; do not admit subdomains
+/// or grant loopback access because an ordinary hostname resolves there.
+pub(crate) fn parse_relay_telemetry_endpoint(endpoint: &str) -> Option<url::Url> {
+    let url = url::Url::parse(endpoint).ok()?;
+    let host = url.host()?;
+    if url.port_or_known_default()? == 0
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.scheme(), "https" | "http")
+        || (url.scheme() == "http" && !host_is_loopback(host))
+    {
+        return None;
+    }
+    Some(url)
 }
 
 /// Accept `https` for any host; accept `http` only for a loopback host (a local
@@ -978,6 +996,27 @@ mod tests {
                 .with_runtime_config(runtime_config())
                 .export_allowed()
         );
+    }
+
+    #[test]
+    fn relay_telemetry_host_safety_rejects_invalid_structure() {
+        for endpoint in [
+            "https://user:password@collector.example/v1/metrics",
+            "https://user@collector.example/v1/metrics",
+            "https://collector.example/v1/metrics#fragment",
+            "https://collector.example:0/v1/metrics",
+            "https://collector.example:65536/v1/metrics",
+            "https:///",
+            "file:///v1/metrics",
+            "http://collector.example/v1/metrics",
+            "http://10.0.0.1/v1/metrics",
+            "http://dev.localhost/v1/metrics",
+        ] {
+            let mut config =
+                RelayTelemetryExportConfig::enabled(endpoint).with_runtime_config(runtime_config());
+            config.endpoint = Some(endpoint.to_owned());
+            assert!(!config.export_allowed(), "accepted invalid structure");
+        }
     }
 
     #[test]
