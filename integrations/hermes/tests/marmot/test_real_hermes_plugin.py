@@ -131,8 +131,7 @@ def main() -> int:
     args = _parse_args()
     hermes_source = args.hermes_source.resolve()
     mdk_source = args.mdk_source.resolve()
-    if not (hermes_source / "hermes_cli" / "plugins_cmd.py").is_file():
-        raise SystemExit(f"invalid Hermes source checkout: {hermes_source}")
+    source_checkout = (hermes_source / "hermes_cli" / "plugins_cmd.py").is_file()
     if not (mdk_source / "integrations/hermes/marmot/plugin.yaml").is_file():
         raise SystemExit(f"invalid MDK source checkout: {mdk_source}")
 
@@ -150,7 +149,8 @@ def main() -> int:
         home = Path(temp)
         os.environ["HOME"] = str(home)
         os.environ["HERMES_HOME"] = str(home / ".hermes")
-        sys.path.insert(0, str(hermes_source))
+        if source_checkout:
+            sys.path.insert(0, str(hermes_source))
 
         plugins_module = importlib.import_module("hermes_cli.plugins")
         plugins_cmd_module = importlib.import_module("hermes_cli.plugins_cmd")
