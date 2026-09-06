@@ -127,7 +127,7 @@ hermes-dev-teardown args="":
     ./scripts/hermes_marmot_dev_teardown.sh {{args}}
 
 hermes-dev-script-test:
-    integrations/hermes/marmot/tests/test_dev_scripts.sh
+    integrations/hermes/tests/marmot/test_dev_scripts.sh
 
 [positional-arguments]
 hermes-verify-persisted-config root="":
@@ -149,7 +149,7 @@ release-wn-agent-dry-run version:
     ./scripts/cut-wn-agent-release.sh --dry-run {{version}}
 
 hermes-bootstrap-test:
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/marmot/tests -p 'test_bootstrap_agent.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot -p 'test_bootstrap_agent.py'
 
 hermes-phone-test-up:
     docker compose --profile hermes-phone-test up -d --build hermes-marmot-phone-test

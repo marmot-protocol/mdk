@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1]
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
 
 

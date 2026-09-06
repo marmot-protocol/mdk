@@ -39,7 +39,7 @@ def load_module():
 
 
 def load_adapter_module():
-    helper_path = REPO_ROOT / "integrations" / "hermes" / "marmot" / "tests" / "test_adapter.py"
+    helper_path = REPO_ROOT / "integrations" / "hermes" / "tests" / "marmot" / "test_adapter.py"
     spec = importlib.util.spec_from_file_location("hermes_marmot_test_adapter_helpers", helper_path)
     helper = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

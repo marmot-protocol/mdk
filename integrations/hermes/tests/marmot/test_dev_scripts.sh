@@ -445,6 +445,6 @@ case "$installer_generated_identity_dry_run" in
     *) ;;
 esac
 
-bash "$repo_root/integrations/hermes/marmot/tests/test_installer_env.sh"
+bash "$repo_root/integrations/hermes/tests/marmot/test_installer_env.sh"
 
 echo "dev script test passed"

@@ -30,8 +30,8 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` first
 ## Verification
 
 ```sh
-python3 -m unittest discover -s integrations/hermes/marmot/tests
-integrations/hermes/marmot/tests/test_dev_scripts.sh
+python3 -m unittest discover -s integrations/hermes/tests/marmot
+integrations/hermes/tests/marmot/test_dev_scripts.sh
 # or from the repo root:
 just hermes-dev-script-test
 just hermes-dev-smoke
