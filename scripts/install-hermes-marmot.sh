@@ -991,9 +991,6 @@ enable_or_restart_systemd_user_service() {
 
 install_linux_user_service() {
     local service_dir service program relay
-    if ! command -v systemctl >/dev/null 2>&1; then
-        return 1
-    fi
     service_dir="$HOME/.config/systemd/user"
     service="$service_dir/$MARMOT_AGENT_SERVICE_NAME.service"
     program="$(wn_agent_path)"
@@ -1002,6 +999,10 @@ install_linux_user_service() {
         log "would install systemd user unit $service"
         log "would enable/start, or restart if already active, systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
         return 0
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
     fi
 
     run mkdir -p "$service_dir" "$MARMOT_HOME/logs" "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1

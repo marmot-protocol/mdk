@@ -10,6 +10,7 @@ plugin subdirectory was installed.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import os
 from pathlib import Path
@@ -24,6 +25,74 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mdk-source", type=Path, required=True)
     parser.add_argument("--mdk-ref", required=True)
     return parser.parse_args()
+
+
+async def _exercise_media_routes(adapter_module, platform_config, temp_root: Path) -> int:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def send_media(
+            self,
+            account_id_hex,
+            group_id_hex,
+            attachments,
+            *,
+            caption=None,
+            idempotency_key=None,
+            response_timeout=None,
+        ):
+            self.calls.append(
+                (account_id_hex, group_id_hex, attachments, caption, idempotency_key)
+            )
+            return {"type": "final_sent", "message_ids_hex": ["33" * 32]}
+
+    media_root = temp_root / "media"
+    media_root.mkdir()
+    sample = media_root / "sample.bin"
+    sample.write_bytes(b"real-hermes-media")
+    config = platform_config(
+        enabled=True,
+        extra={
+            "account_id_hex": "11" * 32,
+            "home": str(temp_root / "marmot-home"),
+            "media_local_roots": [str(media_root)],
+        },
+    )
+    fake = FakeClient()
+    adapter = adapter_module.MarmotPlatformAdapter(config, client=fake)
+    group_id = "22" * 32
+
+    ordinary = await adapter.send_document(group_id, str(sample), caption="ordinary reply")
+    explicit = await adapter.send_image_file(group_id, str(sample), caption="explicit send tool")
+    if not ordinary.success or not explicit.success:
+        raise AssertionError(
+            f"real Hermes explicit/ordinary media adapter route failed: "
+            f"ordinary={ordinary!r}, explicit={explicit!r}"
+        )
+
+    original_client = adapter_module.MarmotAgentControlClient
+    adapter_module.MarmotAgentControlClient = lambda *_args, **_kwargs: fake
+    try:
+        for label in ("home-cron", "kanban-artifact"):
+            sent = await adapter_module._standalone_send(
+                config,
+                group_id,
+                label,
+                media_files=[str(sample)],
+                force_document=True,
+            )
+            if not sent:
+                raise AssertionError(f"real Hermes standalone {label} media route failed")
+    finally:
+        adapter_module.MarmotAgentControlClient = original_client
+
+    return len(fake.calls)
+
+
+def _module_matches_path(module, expected: Path) -> bool:
+    module_file = getattr(module, "__file__", None)
+    return isinstance(module_file, str) and Path(module_file).resolve() == expected
 
 
 def main() -> int:
@@ -82,12 +151,27 @@ def main() -> int:
         if loaded is None or loaded.manifest.version != "0.1.0":
             raise AssertionError("real Hermes discovery did not load the expected manifest")
 
-        manager.unload_all()
+        adapter_file = (plugin_dir / "adapter.py").resolve()
+        adapter_module = next(
+            (
+                module
+                for module in tuple(sys.modules.values())
+                if module is not None
+                and _module_matches_path(module, adapter_file)
+            ),
+            None,
+        )
+        if adapter_module is None:
+            raise AssertionError("real Hermes discovery did not load adapter.py")
+        base_module = importlib.import_module("gateway.platforms.base")
+        media_calls = asyncio.run(
+            _exercise_media_routes(adapter_module, base_module.PlatformConfig, home)
+        )
 
-    print(
-        "real-hermes plugin install/discovery passed "
-        f"(hermes_source={hermes_source}, mdk_ref={resolved_ref})"
-    )
+        print(
+            "real-hermes plugin install/discovery/media passed "
+            f"(hermes_source={hermes_source}, mdk_ref={resolved_ref}, media_calls={media_calls})"
+        )
     return 0
 
 
