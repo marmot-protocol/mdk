@@ -633,6 +633,29 @@ impl AppClient {
         }
     }
 
+    /// Repair durable release evidence independently of lossy engine effects.
+    pub(crate) fn reconcile_released_transport_receipts(
+        &mut self,
+    ) -> Result<Vec<String>, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let released = storage.consume_released_transport_receipts()?;
+        if released.is_empty() {
+            return Ok(Vec::new());
+        }
+        let released = released
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<HashSet<_>>();
+        // No await or fallible operation between acknowledging the durable
+        // journal and removing its ids from memory. Never checkpoint stale ids
+        // back over the transactional deletion, including unsaved ring entries.
+        self.seen_events_index.retain(|id| !released.contains(id));
+        self.state.seen_events.retain(|id| !released.contains(id));
+        self.pending_seen_event_count = self.state.seen_events.len();
+        self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
+        Ok(released.into_iter().collect())
+    }
+
     /// Apply the publish gate to `effects`, observing the same batch's
     /// epoch-gap recovery evidence first.
     ///
@@ -658,6 +681,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
+        self.reconcile_released_transport_receipts()?;
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
@@ -721,7 +745,8 @@ impl AppClient {
     /// Each route reconciles against the exact event-id set retained in this
     /// account's SQLCipher database, so traffic in one busy group cannot move
     /// or evict another route's completeness state.
-    async fn reconcile_transport_history(&self, reconcile_until: u64) -> Result<(), AppError> {
+    async fn reconcile_transport_history(&mut self, reconcile_until: u64) -> Result<(), AppError> {
+        self.reconcile_released_transport_receipts()?;
         let storage = self.app.account_storage(&self.state.label)?;
         let routing = self.routing.snapshot();
         let mut work = Vec::with_capacity(routing.group_routes.len().saturating_add(1));
@@ -1113,6 +1138,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        self.reconcile_released_transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
@@ -1455,6 +1481,7 @@ impl AppClient {
                     ));
                 }
             };
+            self.reconcile_released_transport_receipts()?;
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
@@ -1949,6 +1976,18 @@ impl AppClient {
             // Any delivery proves the stream is alive, including one this drain
             // goes on to skip as an echo or a duplicate.
             silence_started = std::time::Instant::now();
+            if let Err(error) = self.reconcile_released_transport_receipts() {
+                return Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        counts.clone(),
+                        StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await);
+            }
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index)
                 || self.seen_events_index.contains(&event_id)
@@ -2242,9 +2281,12 @@ impl AppClient {
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
             transport_reconciliation_record(self.adapter.account_id(), &delivery);
+        self.reconcile_released_transport_receipts()?;
         let effects = self.runtime.ingest_delivery(delivery).await?;
+        let released = self.reconcile_released_transport_receipts()?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
-        let must_stay_fetchable = effects.left_object_unpersisted;
+        let must_stay_fetchable =
+            effects.left_object_unpersisted || released.contains(&source_message_id_hex);
         if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
             self.record_transport_reconciliation_item(route, item);
         }
@@ -3876,6 +3918,7 @@ impl AppClient {
         &mut self,
         created_group_id_hex: Option<&str>,
     ) -> Result<Option<crate::ChatListRow>, AppError> {
+        self.reconcile_released_transport_receipts()?;
         let frontiers_to_clear = self
             .pending_local_group_deletion_frontier_clears
             .iter()

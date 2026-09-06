@@ -18690,3 +18690,95 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
     );
     runtime.shutdown().await;
 }
+
+/// The storage release is the durable boundary; no engine event is delivered
+/// here, modeling cancellation after engine deletion but before app projection.
+#[test]
+fn released_transport_is_replayed_after_lost_effect_and_reopen() {
+    run_composed_app_runtime_test("released-transport-replay", || async {
+        use cgka_traits::storage::MessageStorage;
+        for handling in ["checkpoint", "reopen", "failed effects"] {
+            let dir = tempfile::tempdir().unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let (app, mut client, route) =
+                undecryptable_probe_route(&dir, &relay, MarmotAppConfig::default()).await;
+            let created_at = crate::unix_now_seconds() - 1_000;
+            let probe = epoch_gap_probe(&route.nostr_group_id_hex, created_at, "release-replay");
+            let mut delivery = route.probe(created_at, "release-replay");
+            delivery.message = probe.to_transport_message().unwrap();
+            client
+                .ingest_received_delivery(delivery.clone())
+                .await
+                .unwrap();
+            let storage = app.account_storage("alice").unwrap();
+            let record = storage.get_message(&delivery.message.id).unwrap();
+            assert!(client.seen_events_index.contains(&probe.id));
+            // Include a pending in-memory receipt that a later checkpoint would
+            // otherwise write back, as well as the already checkpointed receipt.
+            client.pending_seen_event_count = client.state.seen_events.len();
+            storage.release_message_for_replay(&record).unwrap();
+            if handling == "reopen" {
+                drop(client);
+                client = client_on_app_relay_plane(&app, "alice").await;
+            } else if handling == "failed effects" {
+                let mut effects = marmot_account::AccountDeviceEffects::default();
+                effects.events.push(
+                    cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
+                        group_id: route.group_id.clone(),
+                        message_id: delivery.message.id.clone(),
+                        resource:
+                            cgka_traits::ingest::InboundResourceLimit::TransportDeferredRetryBudget,
+                    },
+                );
+                effects.failures.push(marmot_account::PublishFailure {
+                    message_id: delivery.message.id.clone(),
+                    reason: "injected".into(),
+                });
+                effects
+                    .pending
+                    .push(marmot_account::PendingResolution::RolledBack {
+                        pending: cgka_traits::engine_state::PendingStateRef::new(7),
+                    });
+                assert!(
+                    client
+                        .observe_drained_session_events(&effects)
+                        .await
+                        .is_err()
+                );
+            } else {
+                client
+                    .save_state_with_pending_local_group_deletion_frontier_clears()
+                    .unwrap();
+            }
+            assert!(!client.seen_events_index.contains(&probe.id));
+            assert!(!client.state.seen_events.contains(&probe.id));
+            assert!(client.has_pending_epoch_backfill());
+            let inventory = storage
+                .transport_reconciliation_inventory(
+                    &storage_sqlite::TransportReconciliationRoute::Group(
+                        hex::decode(&route.nostr_group_id_hex)
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                    ),
+                    crate::unix_now_seconds(),
+                )
+                .unwrap();
+            assert!(
+                !inventory
+                    .items
+                    .iter()
+                    .any(|item| hex::encode(item.event_id) == probe.id)
+            );
+            inject_epoch_gap_probe(&app, probe.clone()).await;
+            client.sync().await.unwrap();
+            assert_eq!(
+                recorded_ingest_outcomes(&app, &probe.id).len(),
+                2,
+                "the exact same transport id must reach engine admission again"
+            );
+            assert!(storage.get_message(&delivery.message.id).is_ok());
+            assert!(client.seen_events_index.contains(&probe.id));
+        }
+    });
+}

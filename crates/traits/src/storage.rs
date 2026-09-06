@@ -210,6 +210,15 @@ pub trait MessageStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()>;
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord>;
     fn delete_message(&self, id: &MessageId) -> StorageResult<()>;
+
+    /// Release retained transport bytes without a terminal deduplication verdict.
+    /// Backends with host receipt bookkeeping must atomically retain evidence
+    /// that those receipts are obsolete, so losing the engine event cannot
+    /// prevent exact-id redelivery. Backends without such bookkeeping may delete.
+    fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
+        self.delete_message(&record.id)
+    }
+
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()>;
     fn list_messages(
         &self,

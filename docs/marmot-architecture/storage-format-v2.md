@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-09-03
+updated: 2026-09-06
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -12,6 +12,34 @@ This document owns MDK's local SQLCipher storage-format contract. It is not a
 Marmot wire format and does not constrain other Marmot implementations. The
 canonical protocol specifies which state must be reproducible; this document
 specifies how `storage-sqlite` currently persists that state.
+
+## Released transport receipts
+
+Schema migration `0060_released_transport_receipts` adds a bounded, account-local
+release journal. The engine calls `MessageStorage::release_message_for_replay`
+when resource policy releases retained raw transport bytes. A backend without
+host receipt bookkeeping may use the trait's delete-only default. A backend
+that advertises possession or suppresses delivery must atomically revoke those
+receipts or persist the evidence needed to revoke them after restart.
+
+SQLCipher atomically deletes the raw row, removes its reconciliation inventory
+and persisted seen entry, and records the id and owning group in
+`cgka_released_transport_receipts`. Ordinary message deletion does not create
+replay work. The journal retains no payload or secret, cascades when the group
+is deleted, and refuses a new release before deleting bytes when 8,192 pending
+entries already exist. It never evicts outstanding replay evidence to admit a
+new journal entry.
+
+The app consumes this evidence on account open and before receipt checkpoints,
+reconciliation, duplicate/echo shortcuts, and after engine ingest. Consumption
+again removes both durable receipts (including an intervening stale checkpoint),
+arms the existing durable group backfill intent, and acknowledges the journal
+in one transaction. The caller then clears its in-memory seen ring/index
+synchronously, before any await or fallible operation. Process death before
+consumption leaves the journal; death after acknowledgment leaves clean disk
+receipts and durable backfill. Neither case relies on delivery of the engine's
+in-memory `TransportObjectResourceRefused` event. Exact-ID replay still passes
+through the ordinary authentication and engine deduplication paths.
 
 ## Versioning model
 
