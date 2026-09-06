@@ -673,7 +673,7 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 ### Public app journey families
 
 `public-app-send-leave/v1`, `public-app-membership-reentry/v1`, and `public-app-offline-recovery/v1`
-use `generate_public_app_journey_case` (generator version `1`) and the shared stateful journey model.
+use `generate_public_app_journey_case` (generator version `2`) and the shared stateful journey model.
 They default to `AppRuntimeHarness`: public Marmot app operations, real local Nostr relay sockets, and separate
 SQLCipher databases. Existing engine families and private oracles are unchanged.
 

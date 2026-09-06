@@ -1523,7 +1523,7 @@ async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
 
     // Cancel the first foreground peel after enumeration, leaving a real
     // partially examined generation rather than injecting its storage marker.
-    carol.set_foreground_deferred_peel_budget(25, 4);
+    carol.set_foreground_deferred_peel_budget(5_000, 4);
     peeler.block_on_attempt(1);
     assert!(matches!(
         carol
@@ -1542,6 +1542,11 @@ async fn uncontested_partial_sweep_blocks_commit_replay_across_restart() {
             .is_some()
     );
 
+    assert_eq!(
+        peeler.gated_attempts(),
+        1,
+        "the sweep must reach the blocked peel"
+    );
     peeler.unblock();
     assert!(matches!(
         carol.ingest(commit2).await.unwrap(),

@@ -198,9 +198,16 @@ The unit regressions cover scheduled convergence, send-applied effects, inbound 
 The original failure and post-fix public observations are preserved in `target/offline-four-20260906/REPORT.md`.
 The separate send/leave epoch mismatch remains uninvestigated; this does not promote that family to passing coverage.
 
-The maintained small offline canary passes too (84.70 seconds). The post-fix 1,024-message regression remains red:
+Historical result at checkpoint `775e6459`, before the bounded background recovery fix: the small offline
+canary passed (84.70 seconds), but the 1,024-message regression was red:
 a group-members query hits `AccountWorkerResponseTimedOut` during repair pass 3; the final recipient snapshot is
 270/1,024 messages at epoch 8 versus peers at epoch 22. No background storage errors were captured, and teardown
 reported no errors. The 191.60-second run exited as an ordinary test failure; it did not exhaust the full recovery
-budget or reach fresh-message/persistence checks. Keep the large gate open and investigate account-worker response
-availability during sustained recovery separately from the now-fixed source-ID collision.
+budget or reach fresh-message/persistence checks.
+
+**Current large-backlog acceptance status:** passing at `fe395e8c`. The bounded background recovery fix
+resolved this worker timeout. The post-cleanup run passed all seven public journeys (330.50 seconds), including
+all 1,024 original messages, fresh traffic and recipient persistence after restart. See
+[`OFFLINE_CATCHUP_HANDOFF.md`](../../OFFLINE_CATCHUP_HANDOFF.md#verification-and-reproduction) for the exact
+release-policy commands and artifact directories. These local results do not imply that the full GitHub CI
+matrix passes; its separate failures are tracked in PR #1711.

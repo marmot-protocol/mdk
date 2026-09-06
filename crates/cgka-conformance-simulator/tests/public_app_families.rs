@@ -40,7 +40,7 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
         );
         for case in long {
             assert_eq!(case.subject, GeneratedSubjectKind::AppRuntime);
-            assert_eq!(case.generator_version, "1");
+            assert_eq!(case.generator_version, "2");
             preflight_compiled_scenario(&compile_scenario(&case.scenario).unwrap(), &descriptor)
                 .unwrap();
             for client in &case.scenario.clients {

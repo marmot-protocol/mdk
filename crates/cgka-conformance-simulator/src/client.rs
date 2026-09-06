@@ -2080,8 +2080,19 @@ impl HarnessClient {
                     })
                 )
             });
-        if let Some(gid) = self.default_group.clone() {
-            let now_ms = self.harness_convergence_now_ms();
+        // A multi-group scenario selects the same group for every client,
+        // including clients outside its membership. Ingest still drains their
+        // other groups, but there is no selected group state to settle here.
+        if let Some(gid) = self.default_group.clone()
+            && self.has_active_group()
+        {
+            let now_ms = match self.harness_convergence_now_ms() {
+                Ok(now_ms) => now_ms,
+                Err(error) => {
+                    outcomes.push(Err(error));
+                    return outcomes;
+                }
+            };
             let initial_epoch = self.engine().epoch(&gid).ok();
             // The legacy harness shortcut represents both sides of a timer
             // boundary in one tick. Give newly peeled inputs an explicit
@@ -2256,7 +2267,13 @@ impl HarnessClient {
         &mut self,
         outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
     ) {
-        let now_ms = self.harness_convergence_now_ms();
+        let now_ms = match self.harness_convergence_now_ms() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                outcomes.push(Err(error));
+                return;
+            }
+        };
         let mut successful_attempts =
             HashMap::<GroupId, (usize, Option<ConformanceStructuralProgressSnapshot>)>::new();
         let mut encountered_error = false;
@@ -2331,15 +2348,27 @@ impl HarnessClient {
     /// A subject switches to its injected clock on the first virtual-time
     /// advance. Other harness clients retain the historical far-future
     /// settlement shortcut.
-    fn harness_convergence_now_ms(&self) -> u64 {
+    fn harness_convergence_now_ms(&self) -> Result<u64, EngineError> {
         if self.virtual_time_tick_enabled {
-            self.convergence_clock
+            return Ok(self
+                .convergence_clock
                 .as_ref()
                 .map(|clock| clock.now().monotonic_ms)
-                .unwrap_or(HARNESS_CONVERGENCE_SETTLED_AT_MS)
-        } else {
-            HARNESS_CONVERGENCE_SETTLED_AT_MS
+                .unwrap_or(HARNESS_CONVERGENCE_SETTLED_AT_MS));
         }
+        // A bounded catch-up can open another collection pass after the
+        // original far-future point. Reusing that fixed timestamp forever
+        // strands its later cutoff. Legacy ticks model due convergence,
+        // so include pending pass cutoffs, never retention/residence timers.
+        let mut now_ms = HARNESS_CONVERGENCE_SETTLED_AT_MS;
+        for group_id in self.engine().live_group_ids()? {
+            if let Some(pass) = self.storage().convergence_pass(&group_id)?
+                && pass.phase == ConvergencePassPhase::Collecting
+            {
+                now_ms = now_ms.max(pass.cutoff_monotonic_ms());
+            }
+        }
+        Ok(now_ms)
     }
 
     async fn publish_send_result(&mut self, result: SendResult) -> Result<(), EngineError> {

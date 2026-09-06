@@ -22,7 +22,7 @@ pub const STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION: &str = "2";
 pub const PUBLIC_APP_SEND_LEAVE_FAMILY: &str = "public-app-send-leave/v1";
 pub const PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY: &str = "public-app-membership-reentry/v1";
 pub const PUBLIC_APP_OFFLINE_RECOVERY_FAMILY: &str = "public-app-offline-recovery/v1";
-pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "1";
+pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "2";
 
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
@@ -297,7 +297,7 @@ impl JourneyModel {
                 }
                 self.deliver_to_online();
                 if self.public_app {
-                    self.public_payload_checkpoint();
+                    self.public_delivered_payload_checkpoint(&payload);
                 }
             }
             JourneyAction::UpdateProfile { actor } => {
@@ -573,6 +573,23 @@ impl JourneyModel {
                 client,
                 epoch: Some(self.epoch),
                 member_count: Some(self.members.len()),
+            });
+        }
+    }
+
+    fn public_delivered_payload_checkpoint(&mut self, payload: &str) {
+        // Generated payloads are unique. Only current online members can have
+        // received this send; full history checks belong at persistence boundaries.
+        for client in self
+            .members
+            .intersection(&self.online)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.eventually(crate::ScenarioPredicateV2::PayloadCount {
+                client,
+                payload: payload.to_owned(),
+                count: 1,
             });
         }
     }
@@ -875,5 +892,58 @@ fn single_relay_topology() -> ScenarioTopologyV2 {
             implementation_version: "memory/v1".into(),
             policy_version: "retain-all/v1".into(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn public_send_checks_only_new_payload_but_restart_checks_full_history() {
+        let mut model = JourneyModel::new_public(0);
+        for _ in 0..2 {
+            model.apply(JourneyAction::Send {
+                sender: "alice".into(),
+            });
+        }
+        model.steps.clear();
+        model.apply(JourneyAction::Send {
+            sender: "alice".into(),
+        });
+        let payloads = model.received_payloads["alice"].clone();
+        let assertions = model
+            .steps
+            .iter()
+            .filter(|step| matches!(step, ScenarioStep::Assert { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(assertions.len(), model.members.len());
+        for step in assertions {
+            assert!(matches!(step, ScenarioStep::Assert {
+                assertion: crate::ScenarioAssertionV2::Eventually {
+                    predicate: crate::ScenarioPredicateV2::PayloadCount { payload, count: 1, .. }, ..
+                }
+            } if payload == &payloads[2]));
+        }
+        model.steps.clear();
+        model.apply(JourneyAction::Restart {
+            client: "bob".into(),
+        });
+        let checks = model
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    ScenarioStep::Assert {
+                        assertion: crate::ScenarioAssertionV2::Eventually {
+                            predicate: crate::ScenarioPredicateV2::PayloadCount { .. },
+                            ..
+                        }
+                    }
+                )
+            })
+            .count();
+        assert_eq!(checks, model.members.len() * payloads.len());
     }
 }
