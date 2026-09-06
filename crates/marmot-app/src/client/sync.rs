@@ -639,7 +639,8 @@ impl AppClient {
     ) -> Result<Vec<String>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let released = storage.consume_released_transport_receipts()?;
-        if released.is_empty() {
+        self.released_backfill_reload_pending |= !released.is_empty();
+        if !self.released_backfill_reload_pending {
             return Ok(Vec::new());
         }
         let released = released
@@ -652,13 +653,23 @@ impl AppClient {
         self.seen_events_index.retain(|id| !released.contains(id));
         self.state.seen_events.retain(|id| !released.contains(id));
         self.pending_seen_event_count = self.state.seen_events.len();
-        tracing::info!(
-            target: "marmot_app::relay_plane",
-            method = "reconcile_released_transport_receipts",
-            released_count = released.len(),
-            "retired released transport receipt claims and restored replay eligibility"
-        );
+        if !released.is_empty() {
+            tracing::info!(
+                target: "marmot_app::relay_plane",
+                method = "reconcile_released_transport_receipts",
+                released_count = released.len(),
+                "retired released transport receipt claims and restored replay eligibility"
+            );
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_released_backfill_reload) {
+            return Err(cgka_traits::storage::StorageError::Busy(
+                "injected released backfill intent read failure".into(),
+            )
+            .into());
+        }
         self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
+        self.released_backfill_reload_pending = false;
         Ok(released.into_iter().collect())
     }
 
@@ -5011,6 +5022,77 @@ mod tests {
             crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch },
         );
         pending
+    }
+
+    #[tokio::test]
+    async fn released_backfill_reload_retries_after_consumption_without_reopen() {
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("reload failure", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let raw = MessageRecord {
+            id: MessageId::new(vec![0xfd; 32]),
+            group_id: group.clone(),
+            epoch: EpochId(client.group_mls_state(&group).unwrap().epoch),
+            state: MessageState::PeelDeferred,
+            payload: Vec::new(),
+            deferred_peel: None,
+        };
+        let id_hex = hex::encode(raw.id.as_slice());
+        client.seen_events_index.insert(id_hex.clone());
+        client.state.seen_events.push(id_hex.clone());
+        storage.put_message(&raw).unwrap();
+        storage.release_message_for_replay(&raw).unwrap();
+        client.fail_next_released_backfill_reload = true;
+        assert!(matches!(
+            client.reconcile_released_transport_receipts(),
+            Err(crate::AppError::Storage(
+                cgka_traits::storage::StorageError::Busy(_)
+            ))
+        ));
+        assert!(client.released_backfill_reload_pending);
+        assert!(!client.seen_events_index.contains(&id_hex));
+        assert!(!client.state.seen_events.contains(&id_hex));
+        assert!(
+            storage
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
+        assert!(!client.has_pending_epoch_backfill());
+
+        // No new release and no reopen: the same client must retry the read
+        // after acknowledgment has already emptied the durable journal.
+        assert!(
+            client
+                .reconcile_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(client.has_pending_epoch_backfill());
+        assert!(!client.released_backfill_reload_pending);
+        let pending = client.pending_epoch_backfill.as_ref().unwrap();
+        assert_eq!(pending.groups[&group].stalled_epoch, raw.epoch.0);
+
+        // Successful reload disarms the flag: steady-state empty reconciles
+        // must not pay for a full pending-intent read on every delivery.
+        client.fail_next_released_backfill_reload = true;
+        assert!(
+            client
+                .reconcile_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(client.fail_next_released_backfill_reload);
     }
 
     #[tokio::test]
