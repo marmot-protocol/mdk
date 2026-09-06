@@ -3136,9 +3136,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<SendResult>, EngineError> {
-        let now_ms = self.convergence_now_ms();
-        self.converge_and_drain_queued_outbound_intents(group_id, now_ms)
-            .await
+        self.advance_convergence_and_drain_queued(group_id).await
     }
 
     fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError> {

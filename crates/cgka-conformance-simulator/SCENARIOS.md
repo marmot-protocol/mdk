@@ -670,7 +670,32 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   selected subject adapter and expectations. `--generated-input FILE` reexecutes it through the same report path; the
   ordinary report, promotable vector candidate, and any failure capsule remain separate artifacts.
 
+### Public app journey families
+
+`public-app-send-leave/v1`, `public-app-membership-reentry/v1`, and `public-app-offline-recovery/v1`
+use `generate_public_app_journey_case` (generator version `2`) and the shared stateful journey model.
+They default to `AppRuntimeHarness`: public Marmot app operations, real local Nostr relay sockets, and separate
+SQLCipher databases. Existing engine families and private oracles are unchanged.
+
+- **Send/leave:** seed chooses the departing member; even indices reopen it before leaving. The remaining admin
+  must process departure, update the profile, and exchange fresh messages among all survivors. The departed member's
+  exact history excludes later traffic.
+- **Membership re-entry:** even/odd indices remove and freshly invite the same member once/twice. Traffic while
+  absent must remain absent after re-entry; traffic before departure must persist. Indices 0/1 modulo 4 reopen the
+  removed participant before the fresh invitation. The returning member sends after each admission.
+- **Offline recovery:** indices modulo 3 select 4/8/12 offline messages with 1/2/3 interleaved profile changes;
+  indices 3 through 5 modulo 6 repeat the offline/reconnect cycle. Bob remains offline for each entire batch.
+- **Shared oracle:** bounded public epoch/member-count assertions after transitions, visible payload-count
+  checkpoints, exact terminal payload multisets for all four participants, expected active profile/admin state,
+  fresh sends by every survivor, and history persistence across reopen followed by another send. These are serialized
+  recovery journeys, not crash races or a proof of engine-private quiescence. Real relay timing is not seed-controlled.
+- **Maintained tests:** `tests/public_app_families.rs` pins determinism, prefix stability, required interactions,
+  capability rejection for private assertions, and explicit socket canaries whose oracles reject missing/duplicate
+  messages and incorrect public state. Run and campaign commands are in `APP_PATH_COVERAGE.md`.
+
 ### `send-leave/v1`
+
+See also the separate public companions below; they do not replace this engine oracle.
 
 - Generator: `generate_send_leave_family` (generator version `2`)
 - Setup: three clients start in one group. The generator emits app sends and self-remove leaves.
@@ -939,6 +964,23 @@ resource error instead of spinning.
 eight-round `seed=9101`, `case_index=11` regression from mdk#1671. The latter requires a selected path that spans
 several epochs to leave every intermediate retained anchor available to the next frozen convergence generation.
 
+`tests/offline_catchup_regression.rs` replays a fixed 368-message reduction and the original 1,024-message workload
+from generator 1, seed 17001, case 19, retaining all 16 commit rounds. Each uses `ProtocolProfile::Current` and
+encrypted file-backed storage, with reverse history and a natural-order control. The smaller reverse case previously
+stranded 125 messages after state converged because commit replay ran before the retained peel generation completed.
+The larger case also exercises capacity refusal: background engine work yields after epoch advancement and the
+retained-relay scheduler retries refused history before draining further epochs. The input and full payload
+multiplicity, exact state, fresh decryption probes, and no-pending-work assertions remain unchanged. Current founding
+acknowledgement omits only the Legacy pending-create filter and expectation. The shared test builder in
+`tests/support/offline_catchup.rs` reproduces both checkpoint inputs exactly, with hashes over the complete
+serialized metadata, actions and expected outcomes. The expanded JSON is retained in checkpoint `9282a643`;
+the large public app journey also writes `backlog-input.json` alongside its run evidence. Set
+`MDK_OFFLINE_REGRESSION_ARTIFACTS` to retain expanded inputs and full engine reports in fresh private directories.
+The active decryptability probe drains bounded transport turns for messages published during convergence and
+requires publication evidence plus exact recipient delivery. Queued admission alone remains a failed probe.
+Run with `cargo test --release --locked -p cgka-conformance-simulator --test offline_catchup_regression`.
+This engine-and-retained-relay regression does not establish app queue, SDK delivery, or relay pagination behavior.
+
 ### General Simulator Integrity Checks
 
 These tests keep the simulator machinery honest.
@@ -1007,6 +1049,23 @@ These tests keep the simulator machinery honest.
   recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across
   candidate orderings.
+
+## Public app-path acceptance journeys
+
+`tests/app_runtime_journeys.rs` starts the public-runtime companion coverage with creation/bidirectional messaging,
+profile edits, late join, removal, reopen/continued messaging, and a 12-message offline catch-up. Each uses a real
+local Nostr relay, encrypted participant databases, exact public payload multisets, shared public state, fresh
+messaging, and recipient restart persistence. These are ordinary smoke tests.
+
+The same file maintains `public_app_1024_message_backlog_recovers_completely`, an explicitly ignored slow
+full-recovery regression using all sends and 16 profile updates from the pinned 1,024-message input. It uses native
+relay order and public app operations, not the engine fixture's forced reverse schedule or private oracles. Skipping
+it is not a passing catch-up result. Commands, limits, and remaining coverage gaps are in
+[`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
+
+`cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
+capabilities before spending runtime budget. Its first bounded selection covers twelve families and records
+unsupported cases explicitly; it does not create new families, remove assertions, or count preflight as a pass.
 
 ## Byte Fixtures
 

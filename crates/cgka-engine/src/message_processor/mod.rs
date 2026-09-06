@@ -70,7 +70,7 @@ pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// the durable store without bound. At the cap, new undecryptable input is
 /// dropped unpersisted (transport redelivery is the recovery path once the
 /// backlog drains).
-pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 512;
+pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 2048;
 
 /// Maximum encoded `PeelDeferred` payload bytes retained for one group.
 ///
@@ -138,6 +138,10 @@ pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 /// events are never blocked behind irrelevant history.
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 
+/// Cooperative budget for one background convergence call. Stop only between
+/// complete row/MLS operations; never cancel a live snapshot rollback guard.
+pub const BACKGROUND_CONVERGENCE_BUDGET_MS: u64 = 500;
+
 /// Maximum deferred-history work admitted to one foreground outbound
 /// preflight (mdk#1176). The time bound is cooperative for synchronous storage
 /// and MLS operations already in progress; asynchronous peel waits receive
@@ -189,6 +193,10 @@ pub(crate) struct DeferredPeelGroupState {
     /// per rejected message; this suppresses the repeats until the backlog
     /// drops back below the cap and re-arms.
     cap_rejection_audited: bool,
+    /// Scheduling hint after an unretained capacity refusal. While this
+    /// backlog drains, background work returns to transport between epochs.
+    /// This neither owns the refused input nor gates convergence on its return.
+    yield_for_transport_redelivery: bool,
     /// Candidate branch contexts for one exact process-local generation.
     ///
     /// These contexts contain exporter-derived secret material. The cache is
@@ -373,7 +381,10 @@ impl ForegroundPeelBudget {
 
 enum DeferredPeelExecution<'a> {
     Foreground(&'a mut ForegroundPeelBudget),
-    Background,
+    Background {
+        deadline: Option<Instant>,
+        rows_remaining: usize,
+    },
 }
 
 impl DeferredPeelExecution<'_> {
@@ -392,24 +403,35 @@ impl DeferredPeelExecution<'_> {
     fn row_limit(&self) -> usize {
         match self {
             Self::Foreground(budget) => budget.rows_remaining,
-            Self::Background => MAX_DEFERRED_ROWS_PER_SWEEP,
+            Self::Background { rows_remaining, .. } => *rows_remaining,
         }
     }
 
     fn exhausted(&self) -> bool {
-        matches!(self, Self::Foreground(budget) if budget.exhausted())
+        match self {
+            Self::Foreground(budget) => budget.exhausted(),
+            Self::Background {
+                deadline,
+                rows_remaining,
+            } => {
+                *rows_remaining == 0 || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            }
+        }
     }
 
     fn consume_row(&mut self) {
-        if let Self::Foreground(budget) = self {
-            budget.consume_row();
+        match self {
+            Self::Foreground(budget) => budget.consume_row(),
+            Self::Background { rows_remaining, .. } => {
+                *rows_remaining = rows_remaining.saturating_sub(1)
+            }
         }
     }
 
     fn remaining(&self) -> Option<Duration> {
         match self {
             Self::Foreground(budget) => budget.remaining(),
-            Self::Background => None,
+            Self::Background { .. } => None,
         }
     }
 }
@@ -760,10 +782,34 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group_id)
     }
 
+    pub(crate) async fn advance_convergence_and_drain_queued(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Vec<SendResult>, EngineError> {
+        self.converge_and_drain_with_deadline(
+            group_id,
+            self.convergence_now_ms(),
+            Some(Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)),
+        )
+        .await
+    }
+
+    /// Explicit-time drain: background work has a deterministic row allowance.
+    /// Queued outbound preflight retains its separate foreground budget.
     pub async fn converge_and_drain_queued_outbound_intents(
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
+    ) -> Result<Vec<SendResult>, EngineError> {
+        self.converge_and_drain_with_deadline(group_id, now_ms, None)
+            .await
+    }
+
+    async fn converge_and_drain_with_deadline(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+        deadline: Option<Instant>,
     ) -> Result<Vec<SendResult>, EngineError> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
@@ -774,7 +820,7 @@ impl<S: StorageProvider> Engine<S> {
             self.advance_before_queued_outbound_intents(group_id, now_ms)
                 .await?
         } else {
-            self.advance_convergence_inputs_until_settled(group_id, now_ms)
+            self.advance_convergence_inputs_with_deadline(group_id, now_ms, deadline)
                 .await?
         };
         if !settled {
@@ -1212,25 +1258,44 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         }
         let now_ms = self.convergence_now_ms();
-        self.advance_convergence_inputs_until_settled(group_id, now_ms)
-            .await
+        self.advance_convergence_inputs_with_deadline(
+            group_id,
+            now_ms,
+            Some(Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)),
+        )
+        .await
     }
 
     /// Drive stored OpenMLS inputs to stability at an explicit monotonic time.
     ///
     /// This lower-level form is used by deterministic harnesses. Hosts should
     /// normally call [`Self::advance_convergence_inputs`] so the engine owns
-    /// the convergence clock.
+    /// the convergence clock and applies its cooperative wall-time budget.
+    /// This form shares the same row allowance but never consults elapsed real
+    /// time: `false` leaves durable work for a later deterministic tick.
     pub async fn advance_convergence_inputs_until_settled(
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<bool, EngineError> {
+        self.advance_convergence_inputs_with_deadline(group_id, now_ms, None)
+            .await
+    }
+
+    async fn advance_convergence_inputs_with_deadline(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+        deadline: Option<Instant>,
+    ) -> Result<bool, EngineError> {
         Ok(matches!(
             self.advance_convergence_inputs_with_execution(
                 group_id,
                 now_ms,
-                DeferredPeelExecution::Background,
+                DeferredPeelExecution::Background {
+                    deadline,
+                    rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+                },
             )
             .await?,
             AdvanceConvergenceStatus::Settled
@@ -1251,10 +1316,32 @@ impl<S: StorageProvider> Engine<S> {
         // Already-quarantined groups keep their pre-existing semantics
         // (`ensure_hydrated` no-ops; converge reports the blocked run).
         self.ensure_hydrated(group_id)?;
+        let initial_epoch = self.storage.get_group(group_id)?.epoch;
+        let yield_for_transport_redelivery = self
+            .deferred_peel
+            .get(group_id)
+            .is_some_and(|state| state.yield_for_transport_redelivery);
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
-            let contested_generation_active =
-                self.storage.deferred_peel_generation(group_id)?.is_some();
-            if self.has_unresolved_convergence_inputs(group_id)? && !contested_generation_active {
+            if matches!(execution, DeferredPeelExecution::Background { .. })
+                && execution.exhausted()
+            {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(AdvanceConvergenceStatus::Pending);
+            }
+            // A background quantum must return to transport admission after
+            // advancing the epoch. Capacity-refused input is still owned by
+            // the transport: sweeping the admitted suffix all the way to its
+            // tip can prune the context needed by that missing prefix before
+            // the caller gets another opportunity to redeliver it.
+            if yield_for_transport_redelivery
+                && matches!(execution, DeferredPeelExecution::Background { .. })
+                && self.storage.get_group(group_id)?.epoch != initial_epoch
+            {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(AdvanceConvergenceStatus::Pending);
+            }
+            let peel_generation_active = self.storage.deferred_peel_generation(group_id)?.is_some();
+            if self.has_unresolved_convergence_inputs(group_id)? && !peel_generation_active {
                 let convergence_started = Instant::now();
                 let result = self
                     .converge_stored_openmls_messages_with_time(
@@ -1289,7 +1376,12 @@ impl<S: StorageProvider> Engine<S> {
                 execution.finish_phase();
                 let peel = peel?;
                 if peel.status == DeferredPeelWorkStatus::BudgetExhausted {
-                    return Ok(AdvanceConvergenceStatus::ForegroundBudgetExhausted);
+                    self.schedule_pending_convergence_group(group_id);
+                    return Ok(if record_outbound_phases {
+                        AdvanceConvergenceStatus::ForegroundBudgetExhausted
+                    } else {
+                        AdvanceConvergenceStatus::Pending
+                    });
                 }
                 let fairness_slot_available =
                     self.storage
@@ -1312,7 +1404,12 @@ impl<S: StorageProvider> Engine<S> {
             let peel = peel?;
             match peel.status {
                 DeferredPeelWorkStatus::BudgetExhausted => {
-                    return Ok(AdvanceConvergenceStatus::ForegroundBudgetExhausted);
+                    self.schedule_pending_convergence_group(group_id);
+                    return Ok(if record_outbound_phases {
+                        AdvanceConvergenceStatus::ForegroundBudgetExhausted
+                    } else {
+                        AdvanceConvergenceStatus::Pending
+                    });
                 }
                 DeferredPeelWorkStatus::Pending => continue,
                 DeferredPeelWorkStatus::Complete => {
@@ -1542,7 +1639,10 @@ impl<S: StorageProvider> Engine<S> {
     /// [`Self::retry_deferred_peels_with_execution`] with the stricter
     /// 250 ms/four-attempt budget (mdk#1176).
     pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
-        let mut execution = DeferredPeelExecution::Background;
+        let mut execution = DeferredPeelExecution::Background {
+            deadline: None,
+            rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+        };
         Ok(self
             .retry_deferred_peels_with_execution(group_id, &mut execution)
             .await?
@@ -1558,7 +1658,7 @@ impl<S: StorageProvider> Engine<S> {
         self.engine_metrics.note_deferred_peel_sweep();
         let foreground_budget_ms = match execution {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
-            DeferredPeelExecution::Background => None,
+            DeferredPeelExecution::Background { .. } => None,
         };
         // A quarantined group has no epoch_manager entry, so the Stable gate
         // below would fall through and re-ingest its retained rows against
@@ -1706,6 +1806,9 @@ impl<S: StorageProvider> Engine<S> {
         let total = deferred.len();
         self.refresh_peel_deferred_group_usage(group_id, &deferred);
         if total == 0 {
+            if let Some(state) = self.deferred_peel.get_mut(group_id) {
+                state.yield_for_transport_redelivery = false;
+            }
             self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
@@ -1860,18 +1963,17 @@ impl<S: StorageProvider> Engine<S> {
                 candidate_enumeration_ms,
                 "deferred-peel candidate enumeration"
             );
-            if enumerated.contested {
-                self.storage
-                    .put_deferred_peel_generation(&DeferredPeelGeneration {
-                        group_id: group_id.clone(),
-                        context_fingerprint: fingerprint,
-                    })?;
-            }
-            let cached_generation_fingerprint = if enumerated.contested {
-                Some(fingerprint)
-            } else {
-                durable_generation_fingerprint
-            };
+            // Even an uncontested backlog is one evidence set. Advancing a
+            // recovered commit before all raw rows have tried this context can
+            // prune the only state that decrypts the rest of its epoch. Keep
+            // the barrier durable across bounded slices and restarts; the
+            // completed generation below releases it before convergence.
+            self.storage
+                .put_deferred_peel_generation(&DeferredPeelGeneration {
+                    group_id: group_id.clone(),
+                    context_fingerprint: fingerprint,
+                })?;
+            let cached_generation_fingerprint = Some(fingerprint);
             let enumerated = Arc::new(enumerated);
             self.deferred_peel
                 .entry(group_id.clone())
@@ -1889,7 +1991,9 @@ impl<S: StorageProvider> Engine<S> {
             cache_hit = candidate_cache_hit,
             "deferred-peel candidate cache lookup"
         );
-        let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel);
+        let past_contexts = crate::message_processor::ingest::PastPeelContextCache::default();
+        let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
+            .with_past_contexts(&past_contexts);
 
         let mut progressed = 0usize;
         let mut terminal = 0usize;
@@ -2004,7 +2108,11 @@ impl<S: StorageProvider> Engine<S> {
                 // the next normal convergence wake process the complete set.
                 self.storage.delete_deferred_peel_generation(group_id)?;
                 self.invalidate_deferred_peel_candidate_cache(group_id);
-                self.converge_stored_openmls_messages_with_time(group_id, now)
+                // Reingest records admission time while the async sweep runs.
+                // Its completion cannot settle with the pre-sweep instant:
+                // even a zero-quiescence pass would then appear not yet due.
+                let completed_at = self.convergence_now();
+                self.converge_stored_openmls_messages_with_time(group_id, completed_at)
                     .map_err(|error| {
                         EngineError::Backend(format!("converge swept batch: {error}"))
                     })?;
@@ -2295,17 +2403,35 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(None);
         }
         let now = self.convergence_now();
-        let mut deferred = self
-            .storage
-            .list_messages(group_id, EpochId(0))?
-            .into_iter()
-            .filter(|record| record.state == MessageState::PeelDeferred)
-            .collect::<Vec<_>>();
+        // Match the sweep's indexed state filter. Readiness must inspect all
+        // deferred rows, but unrelated processed history need not be loaded.
+        let mut deferred = self.storage.list_messages_in_states(
+            group_id,
+            &[MessageState::PeelDeferred],
+            EpochId(0),
+        )?;
         let normalization_pending = self.normalize_deferred_peel_lifecycles(
             &mut deferred,
             now,
             MAX_DEFERRED_ROWS_PER_SWEEP,
         )?;
+        // A background advance may yield with raw rows that have never tried
+        // the new epoch or candidate graph. Their next wake is retry work,
+        // not residence expiry. Derive readiness from the durable per-row
+        // fingerprint so cancellation and reopen preserve the same decision.
+        // The app clamps ready wakes to 10 ms and backs off errors. Successful
+        // zero-row slices remain ready; they must not wait for residence expiry.
+        if !deferred.is_empty() {
+            let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+            if deferred.iter().any(|record| {
+                record
+                    .deferred_peel
+                    .as_ref()
+                    .is_none_or(|lifecycle| lifecycle.last_context_fingerprint != Some(fingerprint))
+            }) {
+                return Ok(Some(0));
+            }
+        }
         let mut earliest = None;
         for record in deferred {
             let deadline = record
@@ -2564,6 +2690,10 @@ impl<S: StorageProvider> Engine<S> {
         message_id: &MessageId,
     ) -> IngestOutcome {
         self.retryable_unpersisted_ingest_id = Some(message_id.clone());
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .yield_for_transport_redelivery = true;
         if self.should_audit_peel_deferred_cap_rejection(group_id) {
             self.audit_group(
                 group_id,
@@ -3021,6 +3151,82 @@ pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
 #[cfg(test)]
 mod deferred_peel_accounting_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn zero_budget_advance_preserves_row_and_rearms_recovery() {
+        use cgka_traits::engine::{CgkaEngine, CreateGroupRequest};
+        use cgka_traits::message::{MessageRecord, StoredMessagePayload};
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportSource};
+        let mut engine = crate::distributed_convergence::tests::test_engine();
+        let (group_id, created) = engine
+            .create_group(CreateGroupRequest {
+                name: "zero-budget recovery".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        if let SendResult::GroupCreated { pending, .. } = created {
+            engine.confirm_published(pending).await.unwrap();
+        }
+        let id = MessageId::new(vec![0x71; 32]);
+        let record = MessageRecord {
+            id: id.clone(),
+            group_id: group_id.clone(),
+            epoch: EpochId(0),
+            state: MessageState::PeelDeferred,
+            payload: StoredMessagePayload::raw_transport(TransportMessage {
+                id: id.clone(),
+                payload: vec![0x42],
+                timestamp: Timestamp(1),
+                causal_deps: vec![],
+                source: TransportSource("test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![0x31; 32],
+                },
+            })
+            .encode()
+            .unwrap(),
+            deferred_peel: None,
+        };
+        engine.storage.put_message(&record).unwrap();
+        let status = engine
+            .advance_convergence_inputs_with_execution(
+                &group_id,
+                0,
+                DeferredPeelExecution::Background {
+                    deadline: Some(Instant::now()),
+                    rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(status, AdvanceConvergenceStatus::Pending));
+        assert_eq!(engine.storage.get_message(&id).unwrap(), record);
+        assert!(
+            engine
+                .drain_pending_convergence_groups()
+                .contains(&group_id)
+        );
+        assert_eq!(
+            engine.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            engine
+                .storage
+                .get_message(&id)
+                .unwrap()
+                .deferred_peel
+                .unwrap()
+                .distinct_context_attempts,
+            0
+        );
+    }
 
     #[test]
     fn capacity_check_does_not_consume_slot_before_persist() {

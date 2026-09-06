@@ -36,36 +36,59 @@ use openmls::prelude::{
     ProtocolMessage, QueuedProposal, Sender, ValidationError,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// What a deferred-peel sweep offers the ingest seam for one retained row.
 ///
 /// The candidate branch states this sweep materialized are offered to a row the
-/// live context cannot read. Their presence is a ONE-WAY signal about the
-/// graph: a non-empty set proves a fork, but an empty set proves nothing, since
-/// [`candidate_branch_peel`] loses its contexts on every enumeration halt.
-/// Contested-ness therefore travels in its own field, decided from the stored
-/// commit graph before any replay.
+/// live context cannot read. Every sweep defers convergence until the complete
+/// readable batch is retained. This also matters without a fork: applying a
+/// recovered commit per row can prune an epoch before later raw rows are peeled.
+/// Candidate contexts independently control which applications become branch
+/// evidence; an enumeration halt must not change the batch drain policy.
 ///
 /// [`candidate_branch_peel`]: crate::openmls_projection::candidate_branch_peel
 #[derive(Clone, Copy)]
 pub(crate) struct DeferredPeelSweep<'a> {
-    contested: bool,
+    drain: ConvergenceDrain,
     branch_contexts: &'a [CandidateBranchPeelContext],
+    past_contexts: Option<&'a PastPeelContextCache>,
+}
+
+/// Secret-bearing, single-group cache owned by one bounded sweep, never persisted.
+/// The caller stops the sweep if canonical context changes. Inactive snapshots
+/// are cached as None; failures are not cached and can be retried normally.
+#[derive(Default)]
+pub(super) struct PastPeelContextCache {
+    contexts: Mutex<HashMap<String, Option<Arc<PastPeelContext>>>>,
+}
+
+struct PastPeelContext {
+    context: cgka_traits::group_context::GroupContextSnapshot,
+    message_retention_seconds: Option<u64>,
 }
 
 impl<'a> DeferredPeelSweep<'a> {
     /// Ordinary live ingest: no sweep, no candidate branches, no contest.
     pub(crate) const LIVE: Self = Self {
-        contested: false,
+        drain: ConvergenceDrain::Now,
         branch_contexts: &[],
+        past_contexts: None,
     };
 
     pub(crate) fn over_branches(peel: &'a CandidateBranchPeel) -> Self {
         Self {
-            contested: peel.contested,
+            drain: ConvergenceDrain::DeferredToCaller,
             branch_contexts: &peel.contexts,
+            past_contexts: None,
         }
+    }
+
+    pub(super) fn with_past_contexts(mut self, contexts: &'a PastPeelContextCache) -> Self {
+        self.past_contexts = Some(contexts);
+        self
     }
 
     fn branch_contexts(&self) -> &'a [CandidateBranchPeelContext] {
@@ -78,19 +101,10 @@ impl<'a> DeferredPeelSweep<'a> {
         !self.branch_contexts.is_empty()
     }
 
-    /// Whether this sweep is feeding a pass that has a fork to adjudicate.
-    pub(crate) fn is_contested(&self) -> bool {
-        self.contested
-    }
-
-    /// When a contested sweep buffers evidence, the drain waits for the whole
+    /// When a sweep buffers evidence, the drain waits for the whole
     /// batch. See [`ConvergenceDrain::DeferredToCaller`].
     fn drain_policy(&self) -> ConvergenceDrain {
-        if self.is_contested() {
-            ConvergenceDrain::DeferredToCaller
-        } else {
-            ConvergenceDrain::Now
-        }
+        self.drain
     }
 }
 
@@ -486,7 +500,7 @@ impl<S: StorageProvider> Engine<S> {
                         msg,
                         &group_id,
                         current_epoch,
-                        sweep.branch_contexts(),
+                        sweep,
                     )
                     .await
                 {
@@ -616,7 +630,7 @@ impl<S: StorageProvider> Engine<S> {
                         msg,
                         &group_id,
                         current_epoch,
-                        sweep.branch_contexts(),
+                        sweep,
                     )
                     .await
                 {
@@ -923,7 +937,7 @@ impl<S: StorageProvider> Engine<S> {
         // inverted. Commits need no such rule; `commit_should_enter_convergence`
         // below decides on epoch, which is already provenance-blind.
         //
-        // Keyed on captured contexts, NOT on `is_contested`. A contested sweep
+        // Keyed on captured contexts, NOT on graph contested-ness. A contested sweep
         // whose enumeration halted holds no rival state, so it reads only this
         // device's own branch — and the pass it would feed almost certainly
         // cannot read the rival either, having halted on the same missing
@@ -2487,16 +2501,17 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Branch contexts come first because they need no storage access at all —
     /// they are owned values whose exporter secret was derived while the
-    /// candidate state was materialized — whereas each anchor attempt rolls the
-    /// group back and forward again.
+    /// candidate state was materialized. A bounded sweep lazily materializes
+    /// each historical anchor once, restores live state, and reuses the owned
+    /// context until that sweep ends. Live ingest has no cross-message cache.
     async fn try_peel_group_message_from_recovery_contexts(
         &self,
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
-        branch_contexts: &[CandidateBranchPeelContext],
+        sweep: DeferredPeelSweep<'_>,
     ) -> Result<Option<PastPeelRecovery>, EngineError> {
-        for (index, branch) in branch_contexts.iter().enumerate() {
+        for (index, branch) in sweep.branch_contexts().iter().enumerate() {
             match self.peeler.peel_group_message(msg, &branch.context).await {
                 Ok(peeled) => {
                     return Ok(Some(PastPeelRecovery {
@@ -2512,8 +2527,13 @@ impl<S: StorageProvider> Engine<S> {
                 Err(err) => return Err(EngineError::Peeler(err)),
             }
         }
-        self.try_peel_group_message_from_available_snapshots(msg, group_id, current_epoch)
-            .await
+        self.try_peel_group_message_from_available_snapshots(
+            msg,
+            group_id,
+            current_epoch,
+            sweep.past_contexts,
+        )
+        .await
     }
 
     async fn try_peel_group_message_from_available_snapshots(
@@ -2521,8 +2541,8 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
+        cache: Option<&PastPeelContextCache>,
     ) -> Result<Option<PastPeelRecovery>, EngineError> {
-        use crate::snapshot_guard::SnapshotRollbackGuard;
         let snapshots = self.available_past_peel_snapshots(group_id)?;
         let mut attempt_count = 0_u64;
         for (source_epoch, snapshot_name) in snapshots {
@@ -2530,48 +2550,11 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             }
             attempt_count = attempt_count.saturating_add(1);
-            // Privacy: do not embed `group_id` or `msg.id` as hex in the
-            // snapshot name. Storage error messages and any future
-            // tracing on snapshot names would otherwise leak routing /
-            // dedup-key material that observability.md explicitly
-            // forbids.
-            let mut hasher = Sha256::new();
-            hasher.update(b"cgka-engine-peel-restore/v1");
-            hasher.update(group_id.as_slice());
-            hasher.update(current_epoch.0.to_be_bytes());
-            hasher.update(msg.id.as_slice());
-            let snapshot_digest = hasher.finalize();
-            let restore_snapshot = format!(
-                "peel-restore-{}-{}",
-                current_epoch.0,
-                hex::encode(&snapshot_digest[..8])
-            );
-            // RAII guard: rollback + release on any unwind path
-            // (panic, early error, async cancel) so the live group
-            // state never leaks past this scope as the past-snapshot
-            // state.
-            let guard = SnapshotRollbackGuard::create_group_state(
-                &self.storage,
-                group_id.clone(),
-                restore_snapshot,
-            )?;
-            let (ctx, message_retention_seconds) =
-                match self.context_from_group_snapshot(group_id, &snapshot_name) {
-                    Ok(Some(context)) => context,
-                    Ok(None) => {
-                        // Evicted-era snapshot: no exporter secret exists for
-                        // it. Restore live state and try the next snapshot.
-                        guard.commit()?;
-                        continue;
-                    }
-                    Err(err) => {
-                        // Drop on `guard` rolls back to live + releases.
-                        guard.commit()?;
-                        return Err(err);
-                    }
-                };
-            let peeled = self.peeler.peel_group_message(msg, &ctx).await;
-            guard.commit()?;
+            let context = self.past_peel_context(group_id, &snapshot_name, cache)?;
+            let Some(context) = context else {
+                continue;
+            };
+            let peeled = self.peeler.peel_group_message(msg, &context.context).await;
             match peeled {
                 Ok(peeled) => {
                     return Ok(Some(PastPeelRecovery {
@@ -2579,7 +2562,7 @@ impl<S: StorageProvider> Engine<S> {
                         source_epoch,
                         source: PeelRecoverySource::RetainedAnchor {
                             snapshot_name,
-                            message_retention_seconds,
+                            message_retention_seconds: context.message_retention_seconds,
                         },
                         attempt_count,
                     }));
@@ -2589,6 +2572,51 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(None)
+    }
+
+    fn past_peel_context(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+        cache: Option<&PastPeelContextCache>,
+    ) -> Result<Option<Arc<PastPeelContext>>, EngineError> {
+        if let Some(cache) = cache {
+            let contexts = cache
+                .contexts
+                .lock()
+                .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))?;
+            if let Some(context) = contexts.get(snapshot_name) {
+                return Ok(context.clone());
+            }
+        }
+        // Restore live state before calling an async peeler. Contexts own only
+        // the exporter material and authenticated retention policy they need.
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-peel-restore/v2");
+        hasher.update(group_id.as_slice());
+        hasher.update(snapshot_name.as_bytes());
+        let restore_snapshot = format!("peel-restore-{}", hex::encode(&hasher.finalize()[..8]));
+        let guard = SnapshotRollbackGuard::create_group_state(
+            &self.storage,
+            group_id.clone(),
+            restore_snapshot,
+        )?;
+        let context = self.context_from_group_snapshot(group_id, snapshot_name);
+        guard.commit()?;
+        let context = context?.map(|(context, message_retention_seconds)| {
+            Arc::new(PastPeelContext {
+                context,
+                message_retention_seconds,
+            })
+        });
+        if let Some(cache) = cache {
+            cache
+                .contexts
+                .lock()
+                .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))?
+                .insert(snapshot_name.to_owned(), context.clone());
+        }
+        Ok(context)
     }
 
     fn has_retained_anchor_snapshot(
@@ -2865,9 +2893,9 @@ fn convergence_ingest_outcome(
 
 #[cfg(test)]
 mod tests {
-    //! The consumer side of the split, over hand-built peels: which decision
-    //! each field drives. That the PRODUCER keeps `contested` true through a
-    //! real enumeration halt is pinned separately, over a real forked graph, in
+    //! Batch draining is independent of candidate visibility. That the
+    //! producer keeps `contested` true through a real enumeration halt is
+    //! pinned separately, over a real forked graph, in
     //! `openmls_projection::candidate_branch_peel_halt_tests`.
 
     use super::{ConvergenceDrain, DeferredPeelSweep};
@@ -2888,7 +2916,7 @@ mod tests {
         let sweep = DeferredPeelSweep::over_branches(&halted);
 
         assert!(
-            sweep.is_contested(),
+            halted.contested,
             "a halt loses the contexts, never the fork"
         );
         assert!(
@@ -2902,20 +2930,22 @@ mod tests {
     }
 
     #[test]
-    fn an_uncontested_graph_drains_per_row() {
+    fn an_uncontested_sweep_defers_while_live_ingest_drains_immediately() {
         let uncontested = CandidateBranchPeel {
             contested: false,
             contexts: Vec::new(),
             replay_probe_count: 0,
         };
 
-        for sweep in [
-            DeferredPeelSweep::over_branches(&uncontested),
-            DeferredPeelSweep::LIVE,
-        ] {
-            assert!(!sweep.is_contested());
-            assert!(!sweep.has_branch_contexts());
-            assert!(matches!(sweep.drain_policy(), ConvergenceDrain::Now));
-        }
+        let sweep = DeferredPeelSweep::over_branches(&uncontested);
+        assert!(!sweep.has_branch_contexts());
+        assert!(matches!(
+            sweep.drain_policy(),
+            ConvergenceDrain::DeferredToCaller
+        ));
+        assert!(matches!(
+            DeferredPeelSweep::LIVE.drain_policy(),
+            ConvergenceDrain::Now
+        ));
     }
 }
