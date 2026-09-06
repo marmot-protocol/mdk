@@ -78,7 +78,7 @@ api_version: 1
 config_schema:
   socket_path:
     type: string
-    default: ~/.local/share/whitenoise/agent-control.sock
+    default: ""
     description: Unix socket exposed by wn-agent serve --enable-agent-control
   home:
     type: string

@@ -572,6 +572,38 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["type"], "account_list")
         self.assertEqual(requests[0]["auth_token"], "test-token")
 
+    async def test_account_list_rejects_malformed_accounts(self):
+        malformed_account_values = (
+            None,
+            {"unexpected": "object"},
+            "not-a-list",
+            ["not-an-object"],
+        )
+        malformed_accounts = iter(malformed_account_values)
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            accounts = next(malformed_accounts)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "account_list",
+                    "accounts": accounts,
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        for accounts in malformed_account_values:
+            with self.subTest(accounts=accounts):
+                with self.assertRaises(self.adapter.AgentControlError) as raised:
+                    await client.account_list()
+                self.assertEqual(raised.exception.code, "protocol_error")
+
     async def test_account_lookup_profile_writes_typed_lookup_request(self):
         requests = []
 
@@ -5934,6 +5966,17 @@ class ConfigResolutionTests(unittest.TestCase):
         self.assertEqual(
             self.adapter_module.resolve_mention_patterns(extra),
             ["bot", "assistant", "Marvin"],
+        )
+
+    def test_manifest_default_allows_socket_derivation_from_home(self):
+        manifest = (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8")
+        socket_schema = manifest.split("  socket_path:\n", 1)[1].split("  home:\n", 1)[0]
+        self.assertIn('    default: ""\n', socket_schema)
+        self.assertEqual(
+            self.adapter_module.resolve_socket_path(
+                {"socket_path": "", "home": "/srv/marmot"}
+            ),
+            "/srv/marmot/dev/wn-agent.sock",
         )
 
 

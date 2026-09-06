@@ -126,7 +126,16 @@ class MarmotAgentControlClient:
                 await _close_writer(writer)
 
     async def account_list(self) -> Dict[str, Any]:
-        return await self.request({"type": "account_list"})
+        response = await self.request({"type": "account_list"})
+        accounts = response.get("accounts")
+        if not isinstance(accounts, list) or any(
+            not isinstance(account, dict) for account in accounts
+        ):
+            raise AgentControlError(
+                "wn-agent returned invalid account_list response",
+                code="protocol_error",
+            )
+        return response
 
     async def timeline_message_get(
         self,

@@ -204,9 +204,9 @@ def main() -> int:
         )
         if adapter_module is None:
             raise AssertionError("real Hermes discovery did not load adapter.py")
-        base_module = importlib.import_module("gateway.platforms.base")
+        config_module = importlib.import_module("gateway.config")
         media_calls = asyncio.run(
-            _exercise_media_routes(adapter_module, base_module.PlatformConfig, home)
+            _exercise_media_routes(adapter_module, config_module.PlatformConfig, home)
         )
 
         print(
