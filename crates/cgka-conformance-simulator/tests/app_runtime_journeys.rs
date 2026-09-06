@@ -25,6 +25,7 @@ enum Journey {
     Restart,
     Offline,
     LargeBacklog,
+    LargeBacklogExtraEpochs,
 }
 
 fn save(out: &Path, name: &str, value: &impl serde::Serialize) -> TestResult {
@@ -105,7 +106,10 @@ async fn exercise(
         clients
     };
     subject.select_scenario_group("main", true)?;
-    let admins = if matches!(journey, Journey::LargeBacklog) {
+    let admins = if matches!(
+        journey,
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs
+    ) {
         clients
     } else {
         &clients[..1]
@@ -125,8 +129,16 @@ async fn exercise(
     subject
         .await_observable_settlement(founders, SETTLEMENT)
         .await?;
-    if matches!(journey, Journey::LargeBacklog) {
-        return large_backlog(subject, clients, out).await;
+    if matches!(
+        journey,
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs
+    ) {
+        let prelude_updates = if matches!(journey, Journey::LargeBacklogExtraEpochs) {
+            2
+        } else {
+            0
+        };
+        return large_backlog(subject, clients, out, prelude_updates).await;
     }
 
     let mut expected = founders
@@ -216,7 +228,7 @@ async fn exercise(
             subject.set_online("bob", true).await?;
             subject.repair_full_history(&["bob".into()]).await?;
         }
-        Journey::LargeBacklog => unreachable!(),
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs => unreachable!(),
     }
     expect_timeline(subject, &expected, out, "after-change.json").await?;
     // Every remaining member must both send and receive in the recovered epoch.
@@ -248,6 +260,7 @@ async fn large_backlog(
     subject: &mut AppRuntimeHarness,
     clients: &[String],
     out: &Path,
+    prelude_updates: usize,
 ) -> TestResult {
     let input = resolve_scenario_input_bytes(&offline_catchup::bytes(1024))?;
     let online = clients
@@ -256,6 +269,30 @@ async fn large_backlog(
         .cloned()
         .collect::<Vec<_>>();
     subject.set_online("bob", false).await?;
+    // Extra legitimate epoch activity can cross the deferred retry boundary;
+    // released raw objects must remain replayable through the public app.
+    let prelude = (0..prelude_updates)
+        .map(|index| format!("recovery-prelude-{index}"))
+        .collect::<Vec<_>>();
+    save(
+        out,
+        "prelude.json",
+        &json!({ "version": 1, "sender": "alice", "profile_names": prelude }),
+    )?;
+    for name in prelude {
+        subject
+            .update_group_data(SubjectUpdateGroupData {
+                action_id: &name,
+                client: "alice",
+                name: Some(&name),
+                description: None,
+                pending: &name,
+            })
+            .await?;
+        subject
+            .await_observable_settlement(&online, SETTLEMENT)
+            .await?;
+    }
     let mut payloads = Vec::new();
     let mut rounds = 0;
     // Deliberate public workload companion, not an adapter override of private IR:
@@ -388,12 +425,17 @@ async fn check(journey: Journey) {
     fs_private::create_dir_all_private(artifacts.path()).unwrap();
     let labels: &[&str] = match journey {
         Journey::Invite | Journey::Removal => &["alice", "bob", "carol"],
-        Journey::LargeBacklog => &["alice", "bob", "carol", "david"],
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs => {
+            &["alice", "bob", "carol", "david"]
+        }
         _ => &["alice", "bob"],
     };
     let clients = labels.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
-    let backlog_source =
-        matches!(journey, Journey::LargeBacklog).then(|| offline_catchup::bytes(1024));
+    let backlog_source = matches!(
+        journey,
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs
+    )
+    .then(|| offline_catchup::bytes(1024));
     if let Some(bytes) = &backlog_source {
         fs_private::write_private(&artifacts.path().join("backlog-input.json"), bytes).unwrap();
     }
@@ -476,4 +518,10 @@ journey_test!(public_app_06_small_offline_backlog, Offline);
 #[ignore = "explicit slow recovery gate; see APP_PATH_COVERAGE.md"]
 async fn public_app_1024_message_backlog_recovers_completely() {
     check(Journey::LargeBacklog).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery gate; covers resource release and replay"]
+async fn public_app_1024_message_backlog_with_extra_epochs_recovers_completely() {
+    check(Journey::LargeBacklogExtraEpochs).await;
 }

@@ -3,7 +3,11 @@
 ## Large offline catch-up regression
 
 `public_app_1024_message_backlog_recovers_completely` in
-[`tests/app_runtime_journeys.rs`](tests/app_runtime_journeys.rs) is the maintained public regression.
+[`tests/app_runtime_journeys.rs`](tests/app_runtime_journeys.rs) is the original maintained public regression.
+`public_app_1024_message_backlog_with_extra_epochs_recovers_completely` adds two public profile updates while
+the recipient is offline, before the same workload. This variant reproduced retry-budget release followed by
+blocked app redelivery in #1721; it requires the same complete recovery contract. Each run records its extra
+updates in `prelude.json`, alongside the unchanged expanded `backlog-input.json`.
 It requires all 1,024 original payloads exactly once, shared public group state, fresh messages from every member,
 and complete recipient history after restart. Reaching the repair budget is a failure, never success.
 
@@ -25,7 +29,7 @@ every participant's exact payload multiset, then fresh bidirectional messaging a
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.
 
 The test remains ignored in ordinary crate runs because it is slow. The dedicated **Public app 1024-message
-recovery** job in `.github/workflows/ci.yml` explicitly selects it in release mode without test-policy overrides,
+recovery** job in `.github/workflows/ci.yml` explicitly selects both journeys in release mode without test-policy overrides,
 uses the same conformance path classifier, and participates in **Required CI**. It uploads source provenance,
 expanded synthetic input and public observations, excluding participant databases and keys. It asserts successful
 recovery, not a particular failure count. A run that skips this job is not recovery evidence.
@@ -126,7 +130,7 @@ Run the large regression explicitly:
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
 CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false \
 cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
-  public_app_1024_message_backlog_recovers_completely -- --ignored --exact --test-threads=1 --nocapture
+  public_app_1024_message_backlog -- --ignored --test-threads=1 --nocapture
 ```
 
 Release mode without policy-override features is the production-policy verification command. Workspace debug or
