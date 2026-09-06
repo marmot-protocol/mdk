@@ -313,6 +313,17 @@ bookkeeping fixed that adapter defect in MDK #1465, and the exact seed-0 catalog
 engine change. An explicit ignored test replays the catalog through the isolated-process adapter, whose validation
 binds every restart action id to a matching durable `restarted` lifecycle event.
 
+### Public app journey contracts
+
+`tests/public_app_families.rs` covers deterministic replay, prefix stability, seeded workload variation and full
+app capability preflight for send/leave, membership re-entry, offline recovery and admin handoff. The admin family
+requires a delegated profile edit between every grant and revocation, with reopen on both sides across the catalog.
+Explicit socket canaries execute through MarmotAppRuntime and per-participant SQLCipher databases. Their terminal
+oracle mutation checks reject loss, duplicate messages, wrong membership count, wrong profile, wrong admin set and
+divergent epochs. The public group checkpoint also rejects a same-size wrong roster and an epoch below the logical
+mutation lower bound while accepting equal extra maintenance epochs. Unsupported adapters fail capability preflight.
+These checks establish public behavior, not engine-private equivalence or exhaustive asynchronous schedules.
+
 ## Current Gaps
 
 - The shrinkable `HarnessIntent` strategy remains intentionally limited to send/leave. Invites and group-profile

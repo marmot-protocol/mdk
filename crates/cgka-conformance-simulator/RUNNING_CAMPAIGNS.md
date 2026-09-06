@@ -29,6 +29,11 @@ engine-capable exact control when the claim requires those facts.
 
 ## Before the first run
 
+The public journey families `public-app-send-leave/v1`, `public-app-membership-reentry/v1`,
+`public-app-offline-recovery/v1` and `public-app-admin-handoff/v1` select the full app adapter directly.
+Their bounded six-case catalogs and strict canary commands are documented in
+[`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md). A registered or preflight-compatible case is not an executed pass.
+
 Run commands from the repository root. The workspace pins its Rust toolchain; use `--locked` for CI-like runs. Cargo
 launches supply the simulator's required stack size. When invoking a built binary directly, set
 `RUST_MIN_STACK=4194304`.

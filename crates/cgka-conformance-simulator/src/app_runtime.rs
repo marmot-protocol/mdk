@@ -821,6 +821,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::TransportDelivery,
                 SubjectCapability::EventObservation,
                 SubjectCapability::AssertionEvaluation,
+                SubjectCapability::PublicGroupStateObservation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,
                 SubjectCapability::OutboundPublication,
@@ -1173,6 +1174,28 @@ impl ConvergenceSubject for AppRuntimeHarness {
     ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
         use crate::ScenarioPredicateV2;
         let (matched, actual) = match predicate {
+            ScenarioPredicateV2::PublicGroupState {
+                clients,
+                members,
+                admins,
+                name,
+                description,
+                minimum_epoch,
+            } => {
+                let states = clients
+                    .iter()
+                    .map(|client| Ok((client.clone(), self.layered_observation(client)?.protocol)))
+                    .collect::<Result<BTreeMap<_, _>, SubjectError>>()?;
+                let matched = public_group_states_match(
+                    &states.values().cloned().collect::<Vec<_>>(),
+                    members,
+                    admins,
+                    name,
+                    description,
+                    *minimum_epoch,
+                );
+                (matched, serde_json::json!(states))
+            }
             ScenarioPredicateV2::ClientState {
                 client,
                 epoch,
@@ -1451,6 +1474,31 @@ async fn compensate_admin_changes(
         }
     }
     app_error(original)
+}
+
+fn public_group_states_match(
+    states: &[AppRuntimeProtocolProjectionV1],
+    members: &[String],
+    admins: &[String],
+    name: &str,
+    description: &str,
+    minimum_epoch: u64,
+) -> bool {
+    let mut members = members.to_vec();
+    let mut admins = admins.to_vec();
+    members.sort();
+    admins.sort();
+    states.first().is_some_and(|first| {
+        first.epoch >= minimum_epoch
+            && states.iter().all(|state| {
+                state.epoch == first.epoch
+                    && state.member_count == members.len()
+                    && state.member_identities == members
+                    && state.admin_identities == admins
+                    && state.group_name == name
+                    && state.group_description == description
+            })
+    })
 }
 
 fn app_for_root(
@@ -1740,6 +1788,42 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_group_checkpoint_allows_maintenance_epochs_but_rejects_semantic_drift() {
+        let members = vec!["alice".into(), "bob".into()];
+        let admins = vec!["alice".into()];
+        let state = public_protocol_projection(
+            7,
+            members.clone(),
+            admins.clone(),
+            "name".into(),
+            "description".into(),
+            2,
+        );
+        let states = vec![state.clone(), state];
+        let matches = |states: &[AppRuntimeProtocolProjectionV1]| {
+            public_group_states_match(states, &members, &admins, "name", "description", 3)
+        };
+        assert!(matches(&states)); // Additional epochs do not change the requested state.
+        assert!(!matches(&[]));
+        for mutation in 0..7 {
+            let mut wrong = states.clone();
+            match mutation {
+                0 => wrong[1].member_identities[1] = "carol".into(), // Same count, wrong person.
+                1 => wrong[1].admin_identities[0] = "bob".into(),
+                2 => wrong[1].group_name.push_str("-stale"),
+                3 => wrong[1].group_description.clear(),
+                4 => wrong[1].member_count = 3,
+                5 => wrong[1].epoch += 1, // Must agree at the same checkpoint.
+                _ => wrong.iter_mut().for_each(|state| state.epoch = 2),
+            }
+            assert!(
+                !matches(&wrong),
+                "mutation {mutation} escaped the public oracle"
+            );
+        }
+    }
 
     #[test]
     fn public_commitment_preserves_a_reported_zero_member_count() {

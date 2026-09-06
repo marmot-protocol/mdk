@@ -13,7 +13,7 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     intentionally changing these workloads. Shared by engine regressions and public app journeys.
 
 - **File:** `public_app_families.rs`
-  - **Owns:** Seeded public send/leave, membership re-entry and small offline recovery family contracts,
+  - **Owns:** Seeded public send/leave, membership re-entry, admin handoff and small offline recovery family contracts,
     capability preflight, interaction coverage, and explicit real-socket strict oracle canaries.
 
 - **File:** `app_runtime_journeys.rs`

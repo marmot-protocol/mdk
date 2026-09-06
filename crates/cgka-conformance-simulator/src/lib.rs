@@ -199,8 +199,9 @@ pub use scenario_ir::{
     ScenarioActionScheduleV2, compile_scenario, preflight_compiled_scenario, stable_action_id,
 };
 pub use stateful_generator::{
-    PUBLIC_APP_JOURNEY_GENERATOR_VERSION, PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY,
-    PUBLIC_APP_OFFLINE_RECOVERY_FAMILY, PUBLIC_APP_SEND_LEAVE_FAMILY, STATEFUL_CHAT_JOURNEY_FAMILY,
+    PUBLIC_APP_ADMIN_HANDOFF_FAMILY, PUBLIC_APP_JOURNEY_GENERATOR_VERSION,
+    PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY, PUBLIC_APP_OFFLINE_RECOVERY_FAMILY,
+    PUBLIC_APP_SEND_LEAVE_FAMILY, STATEFUL_CHAT_JOURNEY_FAMILY,
     STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION, generate_public_app_journey_case,
     generate_stateful_chat_journey_case, generate_stateful_chat_journey_family,
 };

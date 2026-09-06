@@ -672,8 +672,9 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### Public app journey families
 
-`public-app-send-leave/v1`, `public-app-membership-reentry/v1`, and `public-app-offline-recovery/v1`
-use `generate_public_app_journey_case` (generator version `2`) and the shared stateful journey model.
+`public-app-send-leave/v1`, `public-app-membership-reentry/v1`, `public-app-offline-recovery/v1`,
+and `public-app-admin-handoff/v1`
+use `generate_public_app_journey_case` (generator version `3`) and the shared stateful journey model.
 They default to `AppRuntimeHarness`: public Marmot app operations, real local Nostr relay sockets, and separate
 SQLCipher databases. Existing engine families and private oracles are unchanged.
 
@@ -685,7 +686,13 @@ SQLCipher databases. Existing engine families and private oracles are unchanged.
   removed participant before the fresh invitation. The returning member sends after each admission.
 - **Offline recovery:** indices modulo 3 select 4/8/12 offline messages with 1/2/3 interleaved profile changes;
   indices 3 through 5 modulo 6 repeat the offline/reconnect cycle. Bob remains offline for each entire batch.
-- **Shared oracle:** bounded public epoch/member-count assertions after transitions, visible payload-count
+- **Admin handoff:** seed chooses a non-founder who is granted admin rights, edits the group profile, then loses
+  admin rights while retaining membership and messaging. Even/odd indices run one/two grant-revoke cycles;
+  indices 0/1 modulo 4 reopen the delegate before exercising the grant, while 2/3 reopen after revocation.
+  The final profile must match the delegate's edit and the final admin set must contain only the founder.
+- **Shared oracle:** bounded checkpoints require all online members to agree on epoch, exact roster identities,
+  admin identities and expected profile, with an epoch lower bound covering the requested mutations. Automatic app
+  maintenance may advance beyond that lower bound. Visible payload-count
   checkpoints, exact terminal payload multisets for all four participants, expected active profile/admin state,
   fresh sends by every survivor, and history persistence across reopen followed by another send. These are serialized
   recovery journeys, not crash races or a proof of engine-private quiescence. Real relay timing is not seed-controlled.

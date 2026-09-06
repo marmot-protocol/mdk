@@ -2,17 +2,19 @@
 //! capability checks stay in the ordinary test suite.
 
 use cgka_conformance_simulator::{
-    AppRuntimeHarness, ConvergenceSubject, GeneratedSubjectKind,
+    AppRuntimeHarness, ConvergenceSubject, GeneratedSubjectKind, PUBLIC_APP_ADMIN_HANDOFF_FAMILY,
     PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY, PUBLIC_APP_OFFLINE_RECOVERY_FAMILY,
     PUBLIC_APP_SEND_LEAVE_FAMILY, ScenarioAssertionV2, ScenarioPredicateV2, ScenarioStep,
-    ScenarioStepStatus, TraceExpectation, compare_trace_expectations, compile_scenario,
-    generate_family_case, preflight_compiled_scenario, run_scenario_report_with_subject,
+    ScenarioStepStatus, SubjectCapability, TraceExpectation, compare_trace_expectations,
+    compile_scenario, generate_family_case, preflight_compiled_scenario,
+    run_scenario_report_with_subject,
 };
 
-const FAMILIES: [&str; 3] = [
+const FAMILIES: [&str; 4] = [
     PUBLIC_APP_SEND_LEAVE_FAMILY,
     PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY,
     PUBLIC_APP_OFFLINE_RECOVERY_FAMILY,
+    PUBLIC_APP_ADMIN_HANDOFF_FAMILY,
 ];
 
 #[tokio::test(flavor = "multi_thread")]
@@ -20,6 +22,18 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
     let mut subject = AppRuntimeHarness::new(&[]).await.unwrap();
     let descriptor = subject.descriptor();
     subject.shutdown().await;
+    let mut without_public_state = descriptor.clone();
+    without_public_state
+        .capabilities
+        .remove(&SubjectCapability::PublicGroupStateObservation);
+    let public_case = generate_family_case(FAMILIES[0], 7, 0).unwrap();
+    assert!(
+        preflight_compiled_scenario(
+            &compile_scenario(&public_case.scenario).unwrap(),
+            &without_public_state
+        )
+        .is_err()
+    );
     for family in FAMILIES {
         let generate = |seed, count| {
             (0..count)
@@ -40,7 +54,7 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
         );
         for case in long {
             assert_eq!(case.subject, GeneratedSubjectKind::AppRuntime);
-            assert_eq!(case.generator_version, "2");
+            assert_eq!(case.generator_version, "3");
             preflight_compiled_scenario(&compile_scenario(&case.scenario).unwrap(), &descriptor)
                 .unwrap();
             for client in &case.scenario.clients {
@@ -70,6 +84,52 @@ async fn public_catalog_is_replayable_and_preflights_without_private_capabilitie
 }
 
 #[test]
+fn public_group_checkpoints_reject_invalid_rosters_before_execution() {
+    for mutation in 0..5 {
+        let mut case = generate_family_case(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 7, 0).unwrap();
+        let predicate = case
+            .scenario
+            .steps
+            .iter_mut()
+            .find_map(|step| match step {
+                ScenarioStep::Assert {
+                    assertion: ScenarioAssertionV2::Eventually { predicate, .. },
+                } if matches!(predicate, ScenarioPredicateV2::PublicGroupState { .. }) => {
+                    Some(predicate)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let ScenarioPredicateV2::PublicGroupState {
+            clients,
+            members,
+            admins,
+            ..
+        } = predicate
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => clients.clear(),
+            1 => members.push("unknown-client".into()),
+            2 => members.push(members[0].clone()),
+            3 => {
+                members.retain(|member| member != "bob");
+            }
+            _ => {
+                clients.retain(|client| client != "alice");
+                members.retain(|member| member != "alice");
+                assert_eq!(admins, &["alice"]);
+            }
+        }
+        assert!(
+            compile_scenario(&case.scenario).is_err(),
+            "invalid public checkpoint {mutation} compiled"
+        );
+    }
+}
+
+#[test]
 fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
     for family in FAMILIES {
         for index in 0..6 {
@@ -90,6 +150,7 @@ fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
                             | ScenarioStep::RemoveMembers { .. }
                             | ScenarioStep::InviteMembers { .. }
                             | ScenarioStep::ReconnectClient { .. }
+                            | ScenarioStep::UpdateAdminPolicy { .. }
                     )
                 })
                 .map(|(i, _)| i)
@@ -104,7 +165,7 @@ fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
                             s,
                             ScenarioStep::Assert {
                                 assertion: ScenarioAssertionV2::Eventually {
-                                    predicate: ScenarioPredicateV2::ClientState { .. },
+                                    predicate: ScenarioPredicateV2::PublicGroupState { .. },
                                     ..
                                 }
                             }
@@ -134,6 +195,34 @@ fn public_catalog_guarantees_transitions_and_checkpoint_interactions() {
                         count("update_group_profile"),
                         (1 + index as usize % 3) * (1 + index as usize / 3)
                     );
+                }
+                PUBLIC_APP_ADMIN_HANDOFF_FAMILY => {
+                    assert_eq!(count("update_admin_policy"), 2 * (1 + index as usize % 2));
+                    assert_eq!(count("update_group_profile"), 1 + index as usize % 2);
+                    let mut delegated = None;
+                    let mut did_edit = false;
+                    for step in steps {
+                        match step {
+                            ScenarioStep::UpdateAdminPolicy { admins, .. } if admins.len() == 2 => {
+                                delegated = admins.iter().find(|client| *client != "alice");
+                                did_edit = false;
+                            }
+                            ScenarioStep::UpdateGroupProfile { client, .. } => {
+                                assert_eq!(Some(client), delegated);
+                                did_edit = true;
+                            }
+                            ScenarioStep::UpdateAdminPolicy { admins, .. } => {
+                                assert_eq!(admins, &["alice"]);
+                                assert!(
+                                    did_edit,
+                                    "delegated permission must be exercised before revocation"
+                                );
+                                delegated = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!(delegated.is_none());
                 }
                 _ => unreachable!(),
             }
@@ -202,9 +291,17 @@ async fn strict_canary(family: &str) {
         report.oracle
     );
     let trace = report.observed_trace.unwrap();
+    let mut wrong_admins = trace.clone();
+    wrong_admins
+        .admin_policies
+        .last_mut()
+        .unwrap()
+        .admins
+        .push("unexpected-admin".into());
+    assert!(!compare_trace_expectations(None, &case.expected_outcomes, &wrong_admins).is_empty());
     // Prove the public oracle rejects loss, duplicates, wrong profile and a
     // wrong member count instead of merely declaring coverage.
-    for mutation in 0..4 {
+    for mutation in 0..5 {
         let mut changed = trace.clone();
         let observation = changed
             .observations
@@ -219,7 +316,8 @@ async fn strict_canary(family: &str) {
                 .received_payloads
                 .push(observation.received_payloads[0].clone()),
             2 => observation.member_count += 1,
-            _ => observation.group_name.push_str("-wrong"),
+            3 => observation.group_name.push_str("-wrong"),
+            _ => observation.epoch += 1,
         }
         assert!(!compare_trace_expectations(None, &case.expected_outcomes, &changed).is_empty());
     }
@@ -241,4 +339,10 @@ async fn public_membership_reentry_strict_canary() {
 #[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
 async fn public_offline_recovery_strict_canary() {
     strict_canary(FAMILIES[2]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
+async fn public_admin_handoff_strict_canary() {
+    strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY).await;
 }
