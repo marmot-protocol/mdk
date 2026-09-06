@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-09-06
+updated: 2026-09-07
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -22,13 +22,18 @@ host receipt bookkeeping may use the trait's delete-only default. A backend
 that advertises possession or suppresses delivery must atomically revoke those
 receipts or persist the evidence needed to revoke them after restart.
 
-SQLCipher atomically deletes the raw row, removes its reconciliation inventory
-and persisted seen entry, and records the id and owning group in
+For app-owned databases, SQLCipher atomically deletes the raw row, removes its
+reconciliation inventory and persisted seen entry, and records the id and owning group in
 `cgka_released_transport_receipts`. Ordinary message deletion does not create
 replay work. The journal retains no payload or secret, cascades when the group
 is deleted, and refuses a new release before deleting bytes when 8,192 pending
 entries already exist. It never evicts outstanding replay evidence to admit a
-new journal entry.
+new journal entry. App ownership means a durable `account_state` row, established
+by MarmotApp before engine hydration. The check shares the release transaction
+and does not require an existing receipt: the app may hold only an unsaved
+in-memory seen entry. A standalone SQLite engine database without app ownership
+uses ordinary deletion and accumulates no journal or app backfill work, so the
+journal bound is not a lifetime limit on standalone engine releases.
 
 The app consumes this evidence on account open and before receipt checkpoints,
 reconciliation, duplicate/echo shortcuts, and after engine ingest. Consumption

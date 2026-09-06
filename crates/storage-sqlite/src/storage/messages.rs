@@ -266,6 +266,18 @@ impl MessageStorage for SqliteAccountStorage {
     fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
         let release = || {
             let conn = self.lock()?;
+            // App ownership is durable before engine hydration. It must not
+            // depend on individual receipts: the app's active seen ring may
+            // not have checkpointed yet, and inventory writes are best-effort.
+            // A standalone engine has no app consumer and needs only deletion.
+            if !conn
+                .query_row_cached("SELECT EXISTS(SELECT 1 FROM account_state)", [], |row| {
+                    row.get::<_, bool>(0)
+                })
+                .storage()?
+            {
+                return delete_message_on_connection(&conn, &record.id);
+            }
             // Bound journal metadata even if a host never consumes it. At the
             // bound, fail before deleting bytes; never evict replay evidence.
             let recorded = conn
@@ -995,11 +1007,60 @@ mod tests {
     use rusqlite::params;
 
     #[test]
+    fn released_transport_receipt_journal_does_not_limit_standalone_engine_lifetime() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        // Exercise more distinct releases than the app journal can retain.
+        // This database has no app owner and consequently no journal consumer.
+        store
+            .with_transaction(|storage| -> StorageResult<()> {
+                for id in 0..=super::RELEASED_TRANSPORT_RECEIPT_CAPACITY {
+                    let mut record =
+                        sample_message(MessageId::new(id.to_be_bytes().to_vec()), gid(1), 0);
+                    record.state = MessageState::PeelDeferred;
+                    storage.put_message(&record)?;
+                    storage.release_message_for_replay(&record)?;
+                    assert!(matches!(
+                        storage.get_message(&record.id),
+                        Err(StorageError::NotFound)
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn released_transport_receipt_journal_tracks_app_without_persisted_receipts() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut record = sample_message(mid(1), gid(1), 0);
+        record.state = MessageState::PeelDeferred;
+        store.put_message(&record).unwrap();
+        // Neither receipt table has ever been populated. Ownership alone must
+        // preserve the evidence needed by an app with unsaved seen entries.
+        store.release_message_for_replay(&record).unwrap();
+        assert_eq!(
+            store.consume_released_transport_receipts().unwrap(),
+            vec![record.id]
+        );
+    }
+
+    #[test]
     fn released_transport_receipts_survive_reopen_and_retire_both_receipt_stores() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("release.db");
         let key = crate::SqlCipherKey::new("synthetic release regression").unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
         record.state = MessageState::PeelDeferred;
@@ -1070,6 +1131,7 @@ mod tests {
     #[test]
     fn released_transport_receipt_transaction_rolls_back_with_raw_bytes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(mid(1), gid(1), 0);
         record.state = MessageState::PeelDeferred;
@@ -1111,6 +1173,7 @@ mod tests {
     #[test]
     fn released_transport_receipt_capacity_never_drops_replay_evidence_or_raw_bytes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        store.ensure_account_projection("app-owner").unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store
             .with_transaction(|storage| -> StorageResult<()> {
