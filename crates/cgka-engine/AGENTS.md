@@ -515,6 +515,17 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   announced once — it durably flips its record to `EpochInvalidated`, so a later pass no longer sees it as previously
   applied. That half of the hole predates announce-once. Both repairs flip forward only; `GroupStateRevalidated` has no
   account-layer consumer and neither reconciler un-marks a supersession.
+- **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`
+  therefore runs both before an advance past E and immediately after a replayed proposal enters the store at E
+  (`openmls_projection::process_openmls_messages_inner`, the `ProposalMessage` arm, under the same
+  `retain_replayed_anchors` gate as the post-merge retain). A rival at E may name its proposals *by reference* — the
+  SelfRemove auto-commit shape, where every peer that sees one `Leave` commits the same `ProposalRef` — and once the
+  branch this device adopted merges, that proposal record is `Processed`, which `record_state_is_canonicalization_input`
+  excludes, so the seeder never re-supplies it. The anchor is the only surviving copy. Capture it before the proposal
+  arrives and the rewind restores a proposal store the rival cannot resolve: OpenMLS answers
+  `InvalidCommit(MissingProposal)`, the rival never becomes a candidate, and the device keeps whichever branch arrived
+  first while reporting `Settled`. Tests: `tests/distributed_convergence.rs::by_reference_rival_that_wins_the_tiebreak_displaces_the_adopted_branch`
+  and its losing-direction control.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

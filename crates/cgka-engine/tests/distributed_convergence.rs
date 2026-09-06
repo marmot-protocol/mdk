@@ -9976,3 +9976,182 @@ async fn join_epoch_is_anchored_so_a_rival_forking_there_adjudicates() {
     assert!(members.iter().any(|member| member.id == eve.self_id()));
     assert!(!members.iter().any(|member| member.id == david.self_id()));
 }
+
+/// A rival that consumes its proposal **by reference** must adjudicate against
+/// the retained anchor at the fork epoch, exactly like one whose proposals are
+/// inline.
+///
+/// The SelfRemove auto-commit is the production shape: the leaver sends a
+/// `Leave` proposal and every peer that sees it auto-commits the *same*
+/// `ProposalRef`, so two rivals at one epoch reference one proposal. On a
+/// device that already applied one of them that proposal record is
+/// `Processed`, and the rewind base for the rival is the retained anchor at
+/// the fork epoch — which must therefore carry the proposal store as it stood
+/// when the device *left* that epoch. An anchor captured before the proposal
+/// arrived restores a store without it, OpenMLS cannot resolve the rival's
+/// `ProposalRef`, and the pass finds no candidate at all: the device keeps
+/// whichever branch arrived first and reports `Settled`.
+async fn assert_by_reference_rival_adjudicates(first_label: &[u8], second_label: &[u8]) {
+    let (mut first, _first_storage) = build_client(first_label);
+    let (mut second, _second_storage) = build_client(second_label);
+    let (mut leaver, _leaver_storage) = build_client(b"bob");
+    let (mut observer, observer_storage) = build_client(b"dave");
+
+    let leaver_kp = leaver.fresh_key_package().await.unwrap();
+    let second_kp = second.fresh_key_package().await.unwrap();
+    let observer_kp = observer.fresh_key_package().await.unwrap();
+    let (group_id, create) = first
+        .create_group(CreateGroupRequest {
+            name: "by-reference-rival".into(),
+            description: String::new(),
+            members: vec![leaver_kp, second_kp, observer_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    first.confirm_published(pending).await.unwrap();
+    leaver
+        .join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    second
+        .join_welcome(welcome_for(&welcomes, second_label))
+        .await
+        .unwrap();
+    observer
+        .join_welcome(welcome_for(&welcomes, b"dave"))
+        .await
+        .unwrap();
+
+    // One SelfRemove proposal, auto-committed by reference on both peers.
+    let leave = route(
+        proposal(
+            leaver
+                .send(SendIntent::Leave {
+                    group_id: group_id.clone(),
+                })
+                .await
+                .unwrap(),
+        ),
+        &group_id,
+    );
+    first.ingest(leave.clone()).await.unwrap();
+    second.ingest(leave.clone()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    first.advance_convergence(&group_id).await.unwrap();
+    second.advance_convergence(&group_id).await.unwrap();
+    let first_auto = first
+        .drain_auto_publish()
+        .into_iter()
+        .next()
+        .expect("the first peer auto-commits the self-remove");
+    let second_auto = second
+        .drain_auto_publish()
+        .into_iter()
+        .next()
+        .expect("the second peer auto-commits the same self-remove");
+    let first_commit = route(first_auto.msg, &group_id);
+    let rival = route(second_auto.msg, &group_id);
+    first.confirm_published(first_auto.pending).await.unwrap();
+    second.confirm_published(second_auto.pending).await.unwrap();
+
+    // The observer takes the proposal and the first commit: it advances to
+    // epoch 2, anchors epoch 1, and marks the proposal `Processed`. Both are
+    // buffered rather than ingested because the observer is a remaining member
+    // too, so ingesting the `Leave` would stage a third rival for the same
+    // `ProposalRef` and change the shape under test.
+    for message in [leave.clone(), first_commit.clone()] {
+        observer
+            .buffer_openmls_convergence_message_at(&group_id, message, 500)
+            .unwrap();
+    }
+    observer
+        .converge_stored_openmls_messages_at(&group_id, 500_000)
+        .unwrap();
+    assert_eq!(observer.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&observer_storage, &leave, MessageState::Processed);
+    assert_message_state(&observer_storage, &first_commit, MessageState::Processed);
+    assert!(
+        observer_storage
+            .list_group_snapshots(&group_id)
+            .unwrap()
+            .contains(&"openmls-retained-anchor-1".to_string()),
+        "the fork epoch must be anchored"
+    );
+
+    // Now the by-reference rival forks from that anchored epoch. Route it
+    // through the production seam so it crosses `commit_should_enter_convergence`.
+    assert!(matches!(
+        observer.ingest(rival.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let result = observer
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .expect("the by-reference rival is adjudicated");
+    assert_eq!(result.errors, Vec::new());
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(!observer_storage.get_group(&group_id).unwrap().unrecoverable);
+
+    // Adjudicated, not merely error-free: the deterministic tiebreak decides
+    // which branch the observer holds, and the loser is parked reconsiderable.
+    if committer_wins(&second.self_id(), &first.self_id()) {
+        assert_eq!(result.accepted_commits, vec![content_hex(&rival)]);
+        assert_message_state(&observer_storage, &rival, MessageState::Processed);
+        assert_message_state(
+            &observer_storage,
+            &first_commit,
+            MessageState::ConvergenceDeferred,
+        );
+    } else {
+        // The rival must lose branch *selection* — not lose because the pass
+        // could not build its candidate state at all, which is what an anchor
+        // missing the by-reference proposal produces.
+        assert_eq!(result.accepted_commits, vec![content_hex(&first_commit)]);
+        assert!(
+            result.deferred_messages.iter().any(|deferred| {
+                deferred.message_id == content_hex(&rival)
+                    && deferred.reason == DeferredMessageReason::NonSelectedEligibleBranch
+            }),
+            "the rival is an eligible candidate that lost, got {:?}",
+            result.deferred_messages
+        );
+        assert_message_state(&observer_storage, &first_commit, MessageState::Processed);
+        assert_message_state(&observer_storage, &rival, MessageState::ConvergenceDeferred);
+    }
+    assert_message_state(&observer_storage, &leave, MessageState::Processed);
+    assert_eq!(observer.epoch(&group_id).unwrap(), EpochId(2));
+    assert!(
+        !observer
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == leaver.self_id()),
+        "both branches remove the leaver, whichever one wins"
+    );
+}
+
+/// The rival wins the tiebreak, so the observer must withdraw the branch it
+/// already adopted and re-apply the group's history over the rival's.
+#[tokio::test]
+async fn by_reference_rival_that_wins_the_tiebreak_displaces_the_adopted_branch() {
+    assert_by_reference_rival_adjudicates(b"alice", b"carol").await;
+}
+
+/// The other direction: the incumbent wins the tiebreak, so the by-reference
+/// rival must still be classified *eligible* — `NonSelectedEligibleBranch`,
+/// "this branch lost selection", never `MissingCandidateParent`, "the pass
+/// could not evaluate this". Measured, so it is not assumed: this direction
+/// already held before the anchor fix, so it pins the classification rather
+/// than reproducing the bug. Keep it — selection must follow the ordering
+/// rule, and a regression that flipped the loser to unevaluable would be
+/// invisible in the winning direction alone.
+#[tokio::test]
+async fn by_reference_rival_that_loses_the_tiebreak_leaves_the_adopted_branch() {
+    assert_by_reference_rival_adjudicates(b"carol", b"alice").await;
+}
