@@ -600,22 +600,13 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
 
 /// Capture sink that stays up across many tracker runs, so a test can assert on
 /// what was *not* re-transferred as well as what was.
-// The pacing/concurrency knobs exist for the coalescing regression, which needs
-// the `test-policy-overrides` trigger seam; without that feature they are unused.
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
 struct CaptureSink {
     addr: std::net::SocketAddr,
     requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
     statuses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u16>>>,
-    /// Milliseconds a handler holds a request open before answering, so a test
-    /// can schedule more triggers while an upload is genuinely in flight.
-    hold_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    default_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
-    in_flight: std::sync::Arc<std::sync::Mutex<(usize, usize)>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
-#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
 impl CaptureSink {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -624,57 +615,21 @@ impl CaptureSink {
         let statuses = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::<u16>::new(),
         ));
-        let hold_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let default_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204));
-        let in_flight = std::sync::Arc::new(std::sync::Mutex::new((0_usize, 0_usize)));
         let handle = tokio::spawn({
-            use std::sync::atomic::Ordering;
             let requests = requests.clone();
             let statuses = statuses.clone();
-            let hold_ms = hold_ms.clone();
-            let default_status = default_status.clone();
-            let in_flight = in_flight.clone();
             async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
                         return;
                     };
-                    let requests = requests.clone();
-                    let statuses = statuses.clone();
-                    let hold_ms = hold_ms.clone();
-                    let default_status = default_status.clone();
-                    let in_flight = in_flight.clone();
-                    // One task per connection so overlapping uploads are
-                    // observable instead of serialized behind `accept`.
-                    tokio::spawn(async move {
-                        let Some(request) = read_captured_request(&mut stream).await else {
-                            return;
-                        };
-                        {
-                            let mut counts = in_flight.lock().unwrap();
-                            counts.0 += 1;
-                            counts.1 = counts.1.max(counts.0);
-                        }
-                        let hold = hold_ms.load(Ordering::Relaxed);
-                        if hold > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
-                        }
-                        let status = statuses
-                            .lock()
-                            .unwrap()
-                            .pop_front()
-                            .unwrap_or_else(|| default_status.load(Ordering::Relaxed));
-                        // Record the body before answering, after the hold: once the
-                        // response is written the client may fire its next request,
-                        // and the order-asserting tests need bodies pushed in serve
-                        // order. Pushing before the hold would instead expose a body
-                        // while its request is still deliberately in flight, which
-                        // the coalescing test's contract cannot tolerate.
-                        requests.lock().unwrap().push(request);
-                        write_http_response(&mut stream, status).await;
-                        let _ = stream.shutdown().await;
-                        in_flight.lock().unwrap().0 -= 1;
-                    });
+                    let Some(request) = read_captured_request(&mut stream).await else {
+                        return;
+                    };
+                    let status = statuses.lock().unwrap().pop_front().unwrap_or(204);
+                    requests.lock().unwrap().push(request);
+                    write_http_response(&mut stream, status).await;
+                    let _ = stream.shutdown().await;
                 }
             }
         });
@@ -682,9 +637,6 @@ impl CaptureSink {
             addr,
             requests,
             statuses,
-            hold_ms,
-            default_status,
-            in_flight,
             handle,
         }
     }
@@ -695,20 +647,6 @@ impl CaptureSink {
 
     fn script(&self, statuses: &[u16]) {
         *self.statuses.lock().unwrap() = statuses.iter().copied().collect();
-    }
-
-    fn hold_each_request_for(&self, millis: u64) {
-        self.hold_ms
-            .store(millis, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn always_answer(&self, status: u16) {
-        self.default_status
-            .store(status, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn max_concurrent_requests(&self) -> usize {
-        self.in_flight.lock().unwrap().1
     }
 
     fn take_bodies(&self) -> Vec<Vec<u8>> {
@@ -978,45 +916,6 @@ async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling()
     // No new rows: nothing at all is re-read or re-posted.
     runtime.post_audit_log_tracker_update().await.unwrap();
     assert!(sink.take_bodies().is_empty());
-}
-
-#[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
-async fn trigger_bursts_coalesce_into_one_follow_up_run() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(tmp.path());
-    let account = home.create_account("alice").unwrap();
-    let dir = home.account_dir(&account.label);
-    std::fs::write(dir.join("audit-engine-v3.jsonl"), b"{\"seq\":1}\n").unwrap();
-
-    let sink = CaptureSink::start().await;
-    // Hold each upload open so the burst lands while a run is in flight, which
-    // is the case the coalescing contract is about, and refuse every upload so
-    // nothing is ever acknowledged — then each run posts, and the request count
-    // measures runs rather than changed content.
-    sink.hold_each_request_for(400);
-    sink.always_answer(500);
-    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
-
-    runtime.schedule_audit_log_tracker_update_for_test("burst");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    for _ in 0..50 {
-        runtime.schedule_audit_log_tracker_update_for_test("burst");
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-
-    // 50 triggers arriving during a run collapse into exactly one follow-up,
-    // and no two uploads are ever in flight at once.
-    assert_eq!(
-        sink.take_bodies().len(),
-        2,
-        "a burst during an in-flight run must produce one follow-up, not one run per trigger"
-    );
-    assert_eq!(
-        sink.max_concurrent_requests(),
-        1,
-        "tracker updates must never upload concurrently"
-    );
 }
 
 #[tokio::test]

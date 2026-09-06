@@ -41,7 +41,8 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
-const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// Allow the fixed 30-second batch window plus local HTTP processing.
+const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const AUDIT_TRACKER_NON_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn mock_relay() -> (MockRelay, String) {
@@ -3471,14 +3472,14 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             .await
     });
 
-    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
-        .await
-        .expect("audit tracker should receive background upload")
-        .unwrap();
     timeout(AUDIT_TRACKER_NON_BLOCKING_TIMEOUT, send)
         .await
         .expect("send should finish before tracker response is released")
         .unwrap()
+        .unwrap();
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive background upload")
         .unwrap();
 
     assert_eq!(captured.method, "POST");
@@ -3536,14 +3537,14 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
             .await
     });
 
-    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
-        .await
-        .expect("audit tracker should receive welcome-triggered upload")
-        .unwrap();
     timeout(AUDIT_TRACKER_NON_BLOCKING_TIMEOUT, create)
         .await
         .expect("create_group should finish before tracker response is released")
         .unwrap()
+        .unwrap();
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
+        .await
+        .expect("audit tracker should receive welcome-triggered upload")
         .unwrap();
 
     assert_eq!(captured.method, "POST");
@@ -3603,7 +3604,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     })
     .await;
 
-    let captured = timeout(Duration::from_secs(5), rx)
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
         .await
         .expect("audit tracker should receive inbound-triggered upload")
         .unwrap();
@@ -3703,7 +3704,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
 
     // Wait, across uploads, for the one carrying the armed row. Earlier uploads
     // (e.g. the welcome-join schedule) are drained and ignored.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + AUDIT_TRACKER_REQUEST_TIMEOUT;
     let mut carried_armed_row = false;
     while Instant::now() < deadline {
         match timeout(

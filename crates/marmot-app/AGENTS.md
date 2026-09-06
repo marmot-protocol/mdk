@@ -51,8 +51,14 @@ App runtime bridge for the first real Marmot app surfaces.
   never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
   Checkpoint only complete immutable upload snapshots after successful upload.
   Defer an unfinished trailing JSONL row and preserve it for a later upload; an HTTP length limit alone is insufficient.
-  Do not add a trigger path that bypasses the size-1 coalescing queue in `runtime/audit_tracker.rs`, and do not let one
-  oversized or failing file block the files behind it. Retention/deletion of sealed segments is mdk#1014, not this
+  Automatic triggers use a fixed 30-second window and the size-1 coalescing queue in `runtime/audit_tracker.rs`.
+  Later triggers cannot postpone that window or shorten a failure cooldown. Manual upload APIs remain immediate.
+  An incomplete snapshot retries after 30 seconds, then backs off up to five minutes while idle; fresh activity
+  restores its 30-second window. Automatic failures retry after 60 seconds, doubling up to five minutes; authentication failures wait at least five
+  minutes, and Retry-After can extend the delay up to one day. Stop automatic passes on endpoint-wide failures
+  (authentication, rate limits, server/transport failures); file-specific failures and oversized files must not block
+  the files behind them. Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
+  Retention/deletion of sealed segments is mdk#1014, not this
   contract.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
   prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed

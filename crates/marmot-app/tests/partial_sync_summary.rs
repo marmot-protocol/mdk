@@ -513,7 +513,9 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
         1,
         "the test must exercise the injected mid-batch failure",
     );
-    tokio::time::timeout(Duration::from_secs(10), tracker_request)
+    // The partial summary schedules the normal 30-second automatic batch.
+    // Keep this a real HTTP assertion; manual upload would bypass the contract.
+    tokio::time::timeout(Duration::from_secs(45), tracker_request)
         .await
         .expect("partial summary must schedule the audit tracker")
         .expect("audit tracker observation channel");
