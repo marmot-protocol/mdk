@@ -65,7 +65,7 @@ Prerequisites:
 | --- | --- | --- |
 | Supported floor | Hermes Agent `0.19.0` (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) | Plugin install, discovery, explicit media methods, and standalone sender work. Hermes has no generic outbound-media capability contract, so the plugin does not claim one. |
 | Current candidate | `7166071fcaadb36df26f6d753dda97da6b5d699e` | Same compatibility surface as the floor, tested from source. |
-| Outbound-media API candidate | `672367f44245a8b4e5e0233eae0b205d409e4286` from Hermes PR 36817 | The plugin feature-detects `MediaKind` and declares image, document, video, and voice routing through `MEDIA_KINDS`. |
+| Outbound-media API candidate | `672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc` from Hermes PR 36817 | The plugin feature-detects `MediaKind` and declares image, document, video, and voice routing through `MEDIA_KINDS`. |
 
 Inbound and outbound capabilities are reported separately by
 `adapter.media_capability_status()`. Inbound attachments use bounded local

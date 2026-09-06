@@ -1,8 +1,72 @@
 manifest_version: 1
 name: marmot
+label: Marmot
+kind: platform
 version: 0.1.0
 description: Marmot group-chat platform adapter backed by the local wn-agent control socket
 author: marmot-protocol
+requires_env: []
+optional_env:
+  - name: MARMOT_HOME
+    description: "wn-agent home directory; required unless MARMOT_AGENT_SOCKET is set"
+    password: false
+  - name: MARMOT_AGENT_SOCKET
+    description: "Unix socket for wn-agent; defaults to $MARMOT_HOME/dev/wn-agent.sock"
+    password: false
+  - name: MARMOT_AGENT_AUTH_TOKEN
+    description: "Bearer token for a token-gated wn-agent control socket"
+    password: true
+  - name: MARMOT_AGENT_AUTH_TOKEN_FILE
+    description: "Path to a bearer token file for a token-gated wn-agent control socket"
+    password: false
+  - name: MARMOT_ACCOUNT_ID_HEX
+    description: "Agent account pubkey/account id hex; required when wn-agent has more than one account"
+    password: false
+  - name: MARMOT_GROUP_ID_HEX
+    description: "Optional Marmot group id filter for inbound messages"
+    password: false
+  - name: MARMOT_QUIC_CANDIDATES
+    description: "Comma-separated quic:// preview broker candidates for live Marmot previews"
+    password: false
+  - name: MARMOT_HOME_CHANNEL
+    description: "Default Marmot group id for Hermes cron/home delivery"
+    password: false
+  - name: MARMOT_DEBOUNCE_MS
+    description: "Optional inbound debounce window in ms; coalesces rapid same-sender/group messages into one turn (0 or absent = disabled)"
+    password: false
+  - name: MARMOT_GROUP_ACTIVATION
+    description: "Multi-party group reply policy: mention (default) or always"
+    password: false
+  - name: MARMOT_MENTION_PATTERNS
+    description: "Comma-separated trigger phrases; the configured agent name is always included when set"
+    password: false
+  - name: MARMOT_AGENT_NAME
+    description: "Agent display name used as an extra mention trigger in multi-party groups and as the default Nostr profile name during onboarding"
+    password: false
+  - name: MARMOT_WELCOMER_ALLOWLIST
+    description: "Comma-separated hex account ids mirrored into wn-agent's welcomer allowlist on connect (also MARMOT_DM_ALLOW_FROM)"
+    password: false
+  - name: MARMOT_ALLOWED_USERS
+    description: "Comma-separated hex Marmot account ids allowed to message Hermes; loaded from $HERMES_HOME/.env at gateway startup"
+    password: false
+  - name: MARMOT_ALLOW_ALL_USERS
+    description: "When true, accept Marmot messages from any sender; loaded from $HERMES_HOME/.env at gateway startup"
+    password: false
+  - name: MARMOT_MEDIA_LOCAL_ROOTS
+    description: "Comma-separated local directories allowed for outbound media sends; defaults to $MARMOT_HOME/dev/inbound-media"
+    password: false
+  - name: MARMOT_INBOUND_MEDIA_DIR
+    description: "Directory where inbound media is re-staged before agent tools read it; defaults to $MARMOT_HOME/dev/inbound-media"
+    password: false
+  - name: MARMOT_OUTBOUND_MEDIA_DIR
+    description: "Connector-approved directory for short-lived outbound media staging; defaults to $MARMOT_HOME/dev/outbound-media"
+    password: false
+  - name: MARMOT_PROFILE_NAME_ONBOARDING
+    description: "Enable the one-time public Nostr profile-name consent flow (true/false)"
+    password: false
+  - name: MARMOT_PROFILE_ONBOARDING_STATE
+    description: "Path to the profile onboarding state file; defaults to $MARMOT_HOME/dev/profile-onboarding.json"
+    password: false
 license: MIT
 homepage: https://github.com/marmot-protocol/mdk/tree/master/integrations/hermes/marmot
 tags:
@@ -10,106 +74,33 @@ tags:
   - nostr
   - messaging
   - privacy
-entry_point: adapter:register
 api_version: 1
 config_schema:
   socket_path:
     type: string
     default: ~/.local/share/whitenoise/agent-control.sock
     description: Unix socket exposed by wn-agent serve --enable-agent-control
-  account:
+  home:
     type: string
     default: ""
-    description: Optional exact account pubkey; empty requires exactly one local account
-  group_id:
+    description: wn-agent home directory used to derive the default control socket
+  account_id_hex:
+    type: string
+    default: ""
+    description: Optional exact account pubkey; empty requires exactly one local signing account
+  group_id_hex:
     type: string
     default: ""
     description: Optional Marmot home group ID
-  download_dir:
-    type: string
-    default: ~/.hermes/marmot-downloads
-    description: Sandboxed directory for inbound media downloads
-  media_staging_dir:
-    type: string
-    default: ~/.hermes/marmot-media-outbox
-    description: Sandboxed directory for outbound media staging
-  register_tools:
-    type: boolean
-    default: false
-    description: Register explicit Marmot history, reaction, and delete tools
-  reaction_tools_allowed:
-    type: boolean
-    default: false
-    description: Allow durable reaction writes when register_tools is enabled
-  delete_tool_allowed:
-    type: boolean
-    default: false
-    description: Allow durable message deletion when register_tools is enabled
-  recipient_public_keys:
+  home_channel:
     type: string
     default: ""
-    description: Optional comma-separated gift-wrap recipient pubkeys for direct replies
-  public_read_relays:
-    type: string
-    default: ""
-    description: Optional comma-separated public Nostr read relays
-  media_servers:
-    type: string
-    default: ""
-    description: Optional comma-separated Blossom upload servers
-  auto_streaming_mode:
-    type: string
-    default: off
-    description: Streaming reply mode (off, progress_only, draft, chunked)
-  lost_stream_policy:
-    type: string
-    default: resume
-    description: Lost-stream recovery policy (resume or finalize_recovery)
-  allow_private_live_streaming:
-    type: boolean
-    default: false
-    description: Permit partial live-stream publication for private Marmot messages
-  welcome_enabled:
-    type: boolean
-    default: false
-    description: Enable exact-membership group welcome replies
-  welcome_message:
-    type: string
-    default: ""
-    description: Welcome text published for newly joined groups
-  welcome_allowlist:
-    type: string
-    default: ""
-    description: Optional comma-separated group IDs eligible for welcomes
-  welcome_recipients:
-    type: string
-    default: ""
-    description: Optional comma-separated welcome recipient pubkeys
-  welcome_media_files:
-    type: string
-    default: ""
-    description: Optional comma-separated welcome attachment paths
-  welcome_media_alt:
-    type: string
-    default: ""
-    description: Alt text used for configured welcome media
-  welcome_update_name:
-    type: string
-    default: ""
-    description: Optional group name update applied after joining
-  welcome_update_description:
-    type: string
-    default: ""
-    description: Optional group description update applied after joining
-  welcome_update_admins:
-    type: string
-    default: ""
-    description: Optional comma-separated admin pubkeys applied after joining
+    description: Default Marmot group ID for Hermes home and cron delivery
 hermes:
   minimum_version: 0.19.0
-  floor_source_ref: 7b9a9e7783d24b62a36c27de9c00ee25339f3b4a
+  floor_source_ref: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
   current_source_ref: 7166071fcaadb36df26f6d753dda97da6b5d699e
-  outbound_media_api_candidate_ref: 672367f44245a8b4e5e0233eae0b205d409e4286
+  outbound_media_api_candidate_ref: 672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc
 companion:
   binary: wn-agent
   minimum_version: 0.9.18

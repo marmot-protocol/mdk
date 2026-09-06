@@ -9,6 +9,7 @@ on:
       - scripts/hermes_marmot_dev_setup.sh
       - scripts/hermes_marmot_verify_persisted_config.sh
       - integrations/hermes/marmot/**
+      - integrations/hermes/tests/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
       - scripts/install-codex-marmot.sh
@@ -261,7 +262,7 @@ jobs:
             hermes_ref: 7166071fcaadb36df26f6d753dda97da6b5d699e
           - cohort: media-api-candidate
             install_mode: source
-            hermes_ref: 672367f44245a8b4e5e0233eae0b205d409e4286
+            hermes_ref: 672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc
 
     steps:
       - name: Check out repository
