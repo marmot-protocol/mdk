@@ -41,7 +41,7 @@
 //! Lifetime rule: free every subscription handle before freeing the
 //! `MarmotClient` that created it.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -51,6 +51,7 @@ use marmot_uniffi::subscriptions::{
     GroupStateSubscription, MessagesSubscription, NotificationsSubscription,
     TimelineMessagesSubscription, UserSearchSubscription,
 };
+use marmot_uniffi::{MarmotKitError, OnboardingSubscription};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -69,6 +70,7 @@ use crate::types::event::MarmotEvent;
 use crate::types::group::MarmotAppGroupRecord;
 use crate::types::message::{MarmotAppMessageRecordList, MarmotMessageUpdate};
 use crate::types::notification::MarmotNotificationUpdate;
+use crate::types::onboarding::MarmotOnboardingSnapshot;
 use crate::types::timeline::{MarmotTimelinePage, MarmotTimelineSubscriptionUpdate};
 use crate::{MarmotClient, block_on_handle, client_ref, ffi_guard, preflight_out_ptr, write_out};
 
@@ -100,6 +102,7 @@ unsafe impl Send for MarmotChatListRow {}
 unsafe impl Send for MarmotMessageUpdate {}
 unsafe impl Send for MarmotAgentStreamUpdate {}
 unsafe impl Send for MarmotUserSearchUpdate {}
+unsafe impl Send for MarmotOnboardingSnapshot {}
 
 /// Shared body of every subscription handle: the runtime that drives it
 /// and the slot holding an installed callback task.
@@ -1157,11 +1160,6 @@ pub unsafe extern "C" fn marmot_search_users(
     })
 }
 
-use crate::types::onboarding::MarmotOnboardingSnapshot;
-use marmot_uniffi::{MarmotKitError, OnboardingSubscription};
-use std::ffi::c_char;
-// Snapshot pointers exclusively own their allocations and are moved together.
-unsafe impl Send for MarmotOnboardingSnapshot {}
 c_subscription! {
     /// A current onboarding snapshot followed by durable progress updates.
     MarmotOnboardingSubscription(OnboardingSubscription),
