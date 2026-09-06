@@ -962,7 +962,11 @@ async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling()
     runtime.post_audit_log_tracker_update().await.unwrap();
 
     let bodies = sink.take_bodies();
-    assert_eq!(bodies.len(), 3, "two sealed segments plus the active file");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "two sealed segments; empty active file is not uploaded"
+    );
     for body in &bodies {
         assert!(
             (body.len() as u64) < 64 * 1024 * 1024,
@@ -1013,4 +1017,132 @@ async fn trigger_bursts_coalesce_into_one_follow_up_run() {
         1,
         "tracker updates must never upload concurrently"
     );
+}
+
+#[tokio::test]
+async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let path = home.account_dir(&account.label).join("audit-active.jsonl");
+    std::fs::write(&path, b"{\"seq\":1}\n{\"seq\":2").unwrap();
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(sink.take_bodies(), vec![b"{\"seq\":1}\n".to_vec()]);
+    let checkpoint: Value = serde_json::from_slice(
+        &std::fs::read(checkpoint_path(&home, &account.label)).unwrap_or_else(|_| b"{}".to_vec()),
+    )
+    .unwrap();
+    assert!(checkpoint["files"]["audit-active.jsonl"].is_null());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"}\n")
+        .unwrap();
+    let next = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(next.uploaded.len(), 1);
+    let bodies = sink.take_bodies();
+    assert_eq!(bodies, vec![b"{\"seq\":1}\n{\"seq\":2}\n".to_vec()]);
+    for line in std::str::from_utf8(&bodies[0]).unwrap().lines() {
+        serde_json::from_str::<Value>(line).unwrap();
+    }
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unfinished_first_row_is_deferred_until_complete() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let path = home.account_dir(&account.label).join("audit-active.jsonl");
+    std::fs::write(&path, b"{\"seq\":1}").unwrap();
+    let sink = CaptureSink::start().await;
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    for _ in 0..2 {
+        assert!(
+            runtime
+                .post_audit_log_tracker_update()
+                .await
+                .unwrap()
+                .uploaded
+                .is_empty()
+        );
+    }
+    assert!(sink.take_bodies().is_empty());
+    assert!(!checkpoint_path(&home, &account.label).exists());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    assert_eq!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .len(),
+        1
+    );
+    assert_eq!(sink.take_bodies(), vec![b"{\"seq\":1}\n".to_vec()]);
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+    assert!(sink.take_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn custom_json_acknowledgment_is_checkpointed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    std::fs::write(
+        home.account_dir(&account.label).join("audit-active.jsonl"),
+        b"{\"seq\":1}\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/ingest", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let body = r#"{"ok":true}"#;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_captured_request(&mut stream).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let runtime = tracker_runtime(tmp.path(), &endpoint);
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert!(
+        runtime
+            .post_audit_log_tracker_update()
+            .await
+            .unwrap()
+            .uploaded
+            .is_empty()
+    );
+    server.await.unwrap();
 }

@@ -232,9 +232,13 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         let mut checkpoint_changed =
             checkpoint.retain_present(account_files.iter().map(|file| file.file_name.as_str()));
         for (file_index, file) in account_files.iter().enumerate() {
+            if file.size_bytes == 0 {
+                continue;
+            }
             // An acknowledged file is never re-read or re-posted. Sealed
-            // segments are immutable, so a single 200 is a durable
-            // acknowledgment of their whole content; the active file changes on
+            // segments normally stop growing; the metadata check also covers a
+            // recorder appending after failed rotation compensation. A successful
+            // complete snapshot acknowledges their whole content; the active file changes on
             // every append and therefore re-transfers in full each trigger.
             // That residual is accepted by design and is bounded by the
             // recorder's segment threshold — a byte-offset acknowledgment
@@ -283,15 +287,23 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
                 );
                 continue;
             }
-            match app
-                .post_audit_log_file_with_tracker_config(&file.path, &config)
-                .await
-            {
-                Ok(result) => {
-                    checkpoint.acknowledge(file, result.bytes_sent, AuditUploadOutcome::Uploaded);
-                    checkpoint_changed = true;
-                    uploaded.push(result);
+            match app.post_audit_log_snapshot(&file.path, &config).await {
+                Ok(Some(receipt)) => {
+                    if receipt.complete
+                        && receipt.observed_bytes == file.size_bytes
+                        && receipt.modified_at_ms == file.modified_at_ms
+                    {
+                        checkpoint.acknowledge(
+                            file,
+                            receipt.result.bytes_sent,
+                            AuditUploadOutcome::Uploaded,
+                        );
+                        checkpoint_changed = true;
+                    }
+                    uploaded.push(receipt.result);
                 }
+                // No complete row yet: no request, checkpoint, or failure warning.
+                Ok(None) => {}
                 Err(_err) => {
                     // Unacknowledged: left out of the checkpoint so the next
                     // trigger retries it.
