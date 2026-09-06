@@ -5957,7 +5957,7 @@ impl AccountManager {
                         "import_relay_list_status",
                         self.app.resolve_account_relay_list_status_for_account_id(
                             &account.account_id_hex,
-                            bootstrap.bootstrap_relays.clone(),
+                            directory_discovery_relays_for_setup(request),
                         ),
                     )
                     .await

@@ -7919,8 +7919,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        2,
-        "cold shared relays must use one relay-list batch and one KeyPackage batch"
+        3,
+        "cold shared outboxes need one discovery batch, one outbox batch, and one KeyPackage batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -7929,10 +7929,21 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[1].queries.len(), 1);
-    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[1].queries[0].authors.len(), 8);
-    assert_eq!(requests[1].queries[0].limit, 8 * 12);
+    assert_eq!(
+        requests[1].endpoints,
+        vec![TransportEndpoint("wss://shared.example".into())]
+    );
+    assert_eq!(requests[1].queries.len(), 2);
+    assert!(
+        requests[1]
+            .queries
+            .iter()
+            .all(|query| query.authors.len() == 8)
+    );
+    assert_eq!(requests[2].queries.len(), 1);
+    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    assert_eq!(requests[2].queries[0].authors.len(), 8);
+    assert_eq!(requests[2].queries[0].limit, 8 * 12);
     drop(requests);
 
     for account in &accounts {
@@ -7949,8 +7960,49 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        2,
+        3,
         "fresh prewarm entries must eliminate create-time relay requests"
+    );
+}
+
+#[tokio::test]
+async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_NIP65_RELAY_LIST {
+            event.tags = vec![vec![
+                "r".into(),
+                "wss://directory.example".into(),
+                "write".into(),
+            ]];
+        }
+    }
+    let members = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+    app.prewarm_group_member_key_packages(&members)
+        .await
+        .unwrap();
+    let requests = fetcher.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the completed discovery query already covered the advertised outbox"
+    );
+    assert_eq!(requests[0].queries.len(), 2);
+    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    assert_eq!(
+        app.resolve_member_key_packages(&members)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        2,
+        "fresh prewarm must not repeat either query"
     );
 }
 
@@ -7982,8 +8034,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        4,
-        "relay-list and KeyPackage batches must each fall back per member"
+        6,
+        "discovery, outbox, and KeyPackage batches must each fall back per member"
     );
 }
 

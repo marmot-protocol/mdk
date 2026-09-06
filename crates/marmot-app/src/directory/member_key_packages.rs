@@ -22,10 +22,10 @@ use transport_nostr_adapter::{
 
 use crate::key_package_records::{
     fresh_or_cached_key_package, fresh_relay_list_status_from_records,
-    latest_fresh_key_package_from_records, validated_cached_key_package,
+    latest_fresh_key_package_from_records, merge_relay_list_status, validated_cached_key_package,
 };
 use crate::relay_plane::DirectoryEventQuery;
-use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp, push_unique_strings};
+use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
 
 /// Maximum authors placed in one Nostr directory filter.
 pub(crate) const MEMBER_RESOLUTION_AUTHORS_PER_QUERY: usize = 32;
@@ -175,38 +175,8 @@ struct MemberTarget {
     account_id_hex: String,
     local_label: Option<String>,
     relay_lists: AccountRelayListStatus,
-}
-
-/// Merge relay-list observations without allowing stale discovery to clobber
-/// newer cached state.
-///
-/// Each list is replaced only by a strictly newer `created_at`; ties retain the
-/// current value. Timestamp-less (`created_at == 0`) state may fill an empty
-/// timestamp-less slot, which supports setup-derived and fixture-built state
-/// without overriding a timestamped directory event.
-fn merge_member_relay_lists(
-    mut current: AccountRelayListStatus,
-    candidate: AccountRelayListStatus,
-) -> AccountRelayListStatus {
-    if candidate.nip65.created_at > current.nip65.created_at
-        || (candidate.nip65.created_at == 0
-            && current.nip65.created_at == 0
-            && current.nip65.relays.is_empty()
-            && !candidate.nip65.relays.is_empty())
-    {
-        current.nip65 = candidate.nip65;
-    }
-    if candidate.inbox.created_at > current.inbox.created_at
-        || (candidate.inbox.created_at == 0
-            && current.inbox.created_at == 0
-            && current.inbox.relays.is_empty()
-            && !candidate.inbox.relays.is_empty())
-    {
-        current.inbox = candidate.inbox;
-    }
-    push_unique_strings(&mut current.bootstrap_relays, candidate.bootstrap_relays);
-    current.refresh();
-    current
+    cached_relay_lists: AccountRelayListStatus,
+    relay_records: Vec<crate::relay_plane::DirectoryRelayEventRecord>,
 }
 
 #[allow(dead_code)]
@@ -313,7 +283,9 @@ impl MarmotApp {
             targets.push(MemberTarget {
                 account_id_hex,
                 local_label: local.map(|account| account.label),
-                relay_lists,
+                relay_lists: relay_lists.clone(),
+                cached_relay_lists: relay_lists,
+                relay_records: Vec::new(),
             });
         }
 
@@ -321,6 +293,7 @@ impl MarmotApp {
             .map(|_| None)
             .collect::<Vec<Option<Result<KeyPackage, AppError>>>>();
         let mut unresolved = Vec::new();
+        let mut fresh_prewarmed_routes = HashSet::new();
         let mut reused_members = 0usize;
         for (index, target) in targets.iter_mut().enumerate() {
             if let Some(label) = &target.local_label
@@ -349,12 +322,30 @@ impl MarmotApp {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&target.account_id_hex);
             if let Some(mut fetched) = prefetched {
-                target.relay_lists = merge_member_relay_lists(
+                target.relay_lists = merge_relay_list_status(
                     target.relay_lists.clone(),
                     fetched.relay_lists.clone(),
                 );
+                target.cached_relay_lists = target.relay_lists.clone();
                 fetched.relay_lists = target.relay_lists.clone();
                 if let Ok(key_package) = self.accept_prefetched_key_package(purpose, fetched) {
+                    if !target.relay_lists.nip65.relays.is_empty()
+                        && !self
+                            .retain_safe_discovered_endpoints(
+                                target
+                                    .relay_lists
+                                    .inbox
+                                    .relays
+                                    .iter()
+                                    .cloned()
+                                    .map(TransportEndpoint)
+                                    .collect(),
+                                "member prewarm inbox readiness",
+                            )
+                            .is_empty()
+                    {
+                        fresh_prewarmed_routes.insert(index);
+                    }
                     outcomes[index] = Some(Ok(key_package));
                     reused_members += 1;
                     continue;
@@ -363,25 +354,11 @@ impl MarmotApp {
             unresolved.push(index);
         }
 
-        let relay_list_unresolved = targets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, target)| {
-                let safe_inbox = self.retain_safe_discovered_endpoints(
-                    target
-                        .relay_lists
-                        .inbox
-                        .relays
-                        .iter()
-                        .cloned()
-                        .map(TransportEndpoint)
-                        .collect(),
-                    "member invite inbox discovery",
-                );
-                (safe_inbox.is_empty()
-                    || (outcomes[index].is_none() && target.relay_lists.nip65.relays.is_empty()))
-                .then_some(index)
-            })
+        // Durable projections have unknown observation age and need a bounded
+        // refresh. Process-local prewarm entries have an enforced TTL and were
+        // already resolved through the outbox path during composition.
+        let relay_list_unresolved = (0..targets.len())
+            .filter(|index| !fresh_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
         if !relay_list_unresolved.is_empty() {
             for (index, error) in self
@@ -534,7 +511,7 @@ impl MarmotApp {
                 .map(|endpoint| endpoint.0.clone())
                 .collect();
         }
-        merge_member_relay_lists(target.relay_lists.clone(), status)
+        merge_relay_list_status(target.cached_relay_lists.clone(), status)
     }
 
     async fn resolve_missing_relay_lists(
@@ -578,14 +555,14 @@ impl MarmotApp {
             .map(move |(indices, endpoints, queries)| {
                 let app = app.clone();
                 async move {
-                    let records = app
+                    let outcome = app
                         .relay_plane
-                        .fetch_directory_events(endpoints.clone(), queries)
+                        .fetch_directory_events_with_completion(endpoints.clone(), queries)
                         .await
                         .map_err(|error| {
                             AppError::RelayDirectory(format!("fetch relay lists: {error}"))
                         });
-                    (indices, endpoints, records)
+                    (indices, endpoints, outcome)
                 }
             });
         let batches = stream::iter(requests)
@@ -594,21 +571,37 @@ impl MarmotApp {
             .await;
 
         let mut failures = Vec::new();
+        let mut completed_discovery = HashSet::new();
         for (indices, endpoints, result) in batches {
             match result {
-                Ok(records) => {
+                Ok(outcome) => {
                     for index in indices {
+                        if outcome.complete {
+                            completed_discovery.insert(index);
+                        }
                         let account_id = &targets[index].account_id_hex;
-                        let account_records = records
+                        let account_records = outcome
+                            .records
                             .iter()
                             .filter(|record| record.event.pubkey == *account_id)
                             .cloned()
                             .collect::<Vec<_>>();
+                        targets[index].relay_records.extend(account_records);
+                        let relay_records = targets[index].relay_records.clone();
                         targets[index].relay_lists = self.relay_lists_from_records(
                             &targets[index],
-                            account_records,
+                            relay_records,
                             &endpoints,
                         );
+                        if !outcome.complete && targets[index].relay_lists.inbox.relays.is_empty() {
+                            failures.push((
+                                index,
+                                AppError::RelayDirectory(
+                                    "relay-list absence was not authoritatively established"
+                                        .to_owned(),
+                                ),
+                            ));
+                        }
                     }
                 }
                 Err(_) => {
@@ -634,28 +627,44 @@ impl MarmotApp {
                                     )
                                 })
                                 .collect::<Vec<_>>();
-                            let records = app
+                            let outcome = app
                                 .relay_plane
-                                .fetch_directory_events(endpoints.clone(), queries)
+                                .fetch_directory_events_with_completion(endpoints.clone(), queries)
                                 .await
                                 .map_err(|error| {
                                     AppError::RelayDirectory(format!("fetch relay lists: {error}"))
                                 });
-                            (index, endpoints, records)
+                            (index, endpoints, outcome)
                         }
                     });
                     let results = stream::iter(work)
                         .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
                         .collect::<Vec<_>>()
                         .await;
-                    for (index, endpoints, records) in results {
-                        match records {
-                            Ok(records) => {
+                    for (index, endpoints, outcome) in results {
+                        match outcome {
+                            Ok(outcome) => {
+                                if outcome.complete {
+                                    completed_discovery.insert(index);
+                                }
+                                targets[index].relay_records.extend(outcome.records);
+                                let relay_records = targets[index].relay_records.clone();
                                 targets[index].relay_lists = self.relay_lists_from_records(
                                     &targets[index],
-                                    records,
+                                    relay_records,
                                     &endpoints,
                                 );
+                                if !outcome.complete
+                                    && targets[index].relay_lists.inbox.relays.is_empty()
+                                {
+                                    failures.push((
+                                        index,
+                                        AppError::RelayDirectory(
+                                            "relay-list absence was not authoritatively established"
+                                                .to_owned(),
+                                        ),
+                                    ));
+                                }
                             }
                             Err(error) => failures.push((index, error)),
                         }
@@ -664,65 +673,169 @@ impl MarmotApp {
             }
         }
 
-        // NIP-65 write relays are the target account's outboxes. Reconcile a
-        // current kind-10050 from those outboxes even when the discovery relay
-        // already returned an older inbox list. Keep this set operation bounded
-        // and preserve positive first-hop metadata if an outbox is unavailable;
-        // only an unconfirmed empty result becomes a typed relay error.
-        let second_hop_specs = needs_discovery
-            .into_iter()
-            .filter_map(|index| {
-                let endpoints = self.retain_safe_discovered_endpoints(
-                    targets[index]
-                        .relay_lists
-                        .nip65
-                        .relays
-                        .iter()
-                        .cloned()
-                        .map(TransportEndpoint)
-                        .collect(),
-                    "member inbox outbox discovery",
-                );
-                (!endpoints.is_empty()).then_some((
-                    index,
-                    targets[index].account_id_hex.clone(),
-                    endpoints,
-                ))
-            })
-            .collect::<Vec<_>>();
+        // Group targets by the same safe outbox set so each relay receives one
+        // bounded multi-author request. This keeps prewarm pure: persistence
+        // happens only after the whole member-resolution pass succeeds.
+        let mut by_outboxes = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
+        for index in needs_discovery {
+            let outbox_endpoints = self.retain_safe_discovered_endpoints(
+                targets[index]
+                    .relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "member inbox outbox discovery",
+            );
+            // A completed first-hop query already covered both relay-list kinds
+            // on these endpoints. Only genuinely new outboxes need another hop;
+            // incomplete reads remain eligible for the bounded retry.
+            let outbox_endpoints = outbox_endpoints
+                .into_iter()
+                .filter(|endpoint| {
+                    !completed_discovery.contains(&index) || !endpoints.contains(endpoint)
+                })
+                .collect::<Vec<_>>();
+            if !outbox_endpoints.is_empty() {
+                by_outboxes.entry(outbox_endpoints).or_default().push(index);
+            }
+        }
+        let mut second_hop_specs = Vec::new();
+        for (endpoints, indices) in by_outboxes {
+            for chunk in indices.chunks(MEMBER_RESOLUTION_AUTHORS_PER_QUERY) {
+                let indices = chunk.to_vec();
+                let authors = indices
+                    .iter()
+                    .map(|index| targets[*index].account_id_hex.clone())
+                    .collect::<Vec<_>>();
+                let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
+                    .into_iter()
+                    .map(|kind| {
+                        DirectoryEventQuery::new(
+                            kind,
+                            authors.clone(),
+                            authors.len() * RELAY_LIST_EVENTS_PER_AUTHOR,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                second_hop_specs.push((indices, endpoints.clone(), queries));
+            }
+        }
         let app = self.clone();
+        let account_ids = targets
+            .iter()
+            .map(|target| target.account_id_hex.clone())
+            .collect::<Vec<_>>();
         let work = second_hop_specs
             .into_iter()
-            .map(move |(index, account_id, endpoints)| {
+            .map(move |(indices, endpoints, queries)| {
                 let app = app.clone();
+                let authors = indices
+                    .iter()
+                    .map(|index| account_ids[*index].clone())
+                    .collect::<Vec<_>>();
                 async move {
-                    let result = app
-                        .fetch_account_relay_list_status_for_account_id(&account_id, endpoints)
-                        .await;
-                    (index, result)
+                    let outcome = app
+                        .relay_plane
+                        .fetch_directory_events_with_completion(endpoints.clone(), queries.clone())
+                        .await
+                        .map_err(|error| {
+                            AppError::RelayDirectory(format!("fetch outbox relay lists: {error}"))
+                        });
+                    if outcome.is_ok() || indices.len() == 1 {
+                        return vec![(indices, endpoints, outcome)];
+                    }
+                    // Keep the same bounded single-author fallback on the
+                    // advertised outbox as on discovery relays. A rejected
+                    // multi-author query is not evidence of missing metadata.
+                    stream::iter(indices.into_iter().enumerate().map(|(offset, index)| {
+                        let app = app.clone();
+                        let endpoints = endpoints.clone();
+                        let queries = queries
+                            .iter()
+                            .map(|query| {
+                                DirectoryEventQuery::new(
+                                    query.kind,
+                                    vec![authors[offset].clone()],
+                                    RELAY_LIST_EVENTS_PER_AUTHOR,
+                                )
+                            })
+                            .collect();
+                        async move {
+                            let outcome = app
+                                .relay_plane
+                                .fetch_directory_events_with_completion(endpoints.clone(), queries)
+                                .await
+                                .map_err(|error| {
+                                    AppError::RelayDirectory(format!(
+                                        "fetch outbox relay lists: {error}"
+                                    ))
+                                });
+                            (vec![index], endpoints, outcome)
+                        }
+                    }))
+                    .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await
                 }
             });
         let second_hop_results = stream::iter(work)
             .buffered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
-        for (index, result) in second_hop_results {
+        for (indices, endpoints, result) in second_hop_results.into_iter().flatten() {
             match result {
-                Ok(status) => {
-                    targets[index].relay_lists =
-                        merge_member_relay_lists(targets[index].relay_lists.clone(), status);
-                    failures.retain(|(failed_index, _)| *failed_index != index);
-                }
-                Err(error) if targets[index].relay_lists.inbox.relays.is_empty() => {
-                    if !failures
-                        .iter()
-                        .any(|(failed_index, _)| *failed_index == index)
-                    {
-                        failures.push((index, error));
+                Ok(outcome) => {
+                    for index in indices {
+                        let account_id = &targets[index].account_id_hex;
+                        let records = outcome
+                            .records
+                            .iter()
+                            .filter(|record| record.event.pubkey == *account_id)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        targets[index].relay_records.extend(records);
+                        let relay_records = targets[index].relay_records.clone();
+                        targets[index].relay_lists = self.relay_lists_from_records(
+                            &targets[index],
+                            relay_records,
+                            &endpoints,
+                        );
+                        if outcome.complete || !targets[index].relay_lists.inbox.relays.is_empty() {
+                            failures.retain(|(failed_index, _)| *failed_index != index);
+                        } else if !failures
+                            .iter()
+                            .any(|(failed_index, _)| *failed_index == index)
+                        {
+                            failures.push((
+                                index,
+                                AppError::RelayDirectory(
+                                    "relay-list absence was not authoritatively established"
+                                        .to_owned(),
+                                ),
+                            ));
+                        }
                     }
                 }
                 Err(_) => {
-                    failures.retain(|(failed_index, _)| *failed_index != index);
+                    for index in indices {
+                        if targets[index].relay_lists.inbox.relays.is_empty()
+                            && !failures
+                                .iter()
+                                .any(|(failed_index, _)| *failed_index == index)
+                        {
+                            failures.push((
+                                index,
+                                AppError::RelayDirectory(
+                                    "fetch outbox relay lists failed".to_owned(),
+                                ),
+                            ));
+                        } else if !targets[index].relay_lists.inbox.relays.is_empty() {
+                            failures.retain(|(failed_index, _)| *failed_index != index);
+                        }
+                    }
                 }
             }
         }

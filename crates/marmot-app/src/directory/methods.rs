@@ -36,7 +36,8 @@ use crate::ids::{
 };
 use crate::key_package_records::{
     fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
-    latest_fresh_key_package_from_records, publish_endpoints_from_bootstrap, relay_list_queries,
+    latest_fresh_key_package_from_records, merge_relay_list_status,
+    publish_endpoints_from_bootstrap, relay_list_queries,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
@@ -156,9 +157,29 @@ impl MarmotApp {
         account_id_hex: &str,
         discovery_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
-        let first_hop = self
-            .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
-            .await?;
+        let public_key =
+            PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
+        let account_id_hex = public_key.to_hex();
+        let discovery_relays = self.directory_source_relays(&discovery_relays);
+        let freshness = self.directory_freshness();
+        let cached = {
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
+        };
+        let first = self
+            .relay_plane
+            .fetch_directory_events_with_completion(
+                discovery_relays.clone(),
+                relay_list_queries(account_id_hex.clone()),
+            )
+            .await
+            .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let mut records = first.records;
+        let first_observed =
+            fresh_relay_list_status_from_records(&account_id_hex, records.clone(), freshness).value;
+        let first_hop = merge_relay_list_status(cached.clone(), first_observed);
         let outbox_relays = self.retain_safe_discovered_endpoints(
             first_hop
                 .nip65
@@ -169,17 +190,47 @@ impl MarmotApp {
                 .collect(),
             "account inbox outbox discovery",
         );
-        if outbox_relays.is_empty() {
-            return Ok(first_hop);
+        let mut complete = first.complete;
+        if !outbox_relays.is_empty() {
+            let second = self
+                .relay_plane
+                .fetch_directory_events_with_completion(
+                    outbox_relays,
+                    relay_list_queries(account_id_hex.clone()),
+                )
+                .await
+                .map_err(|e| AppError::RelayDirectory(format!("fetch outbox relay lists: {e}")))?;
+            complete &= second.complete;
+            records.extend(second.records);
         }
-        match self
-            .fetch_account_relay_list_status_for_account_id(account_id_hex, outbox_relays)
-            .await
+
+        let observed =
+            fresh_relay_list_status_from_records(&account_id_hex, records, freshness).value;
+        let mut status = merge_relay_list_status(cached, observed);
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = discovery_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
         {
-            Ok(status) => Ok(status),
-            Err(_) if !first_hop.inbox.relays.is_empty() => Ok(first_hop),
-            Err(error) => Err(error),
+            let app = self.clone();
+            let account_id = account_id_hex.clone();
+            let remembered = status.clone();
+            blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
+                .await?;
         }
+
+        let explicit_empty = (status.nip65.created_at > 0 && status.nip65.relays.is_empty())
+            || (status.inbox.created_at > 0 && status.inbox.relays.is_empty());
+        let uncertain_absence =
+            !complete && (status.nip65.relays.is_empty() || status.inbox.relays.is_empty());
+        if explicit_empty || uncertain_absence {
+            return Err(AppError::RelayDirectory(
+                "relay-list absence was not authoritatively established".to_owned(),
+            ));
+        }
+        Ok(status)
     }
 
     pub async fn fetch_current_account_relay_list_status_for_account_id(

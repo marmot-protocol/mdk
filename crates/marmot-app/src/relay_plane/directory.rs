@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::TransportEndpoint;
-use nostr_sdk::prelude::{Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayUrl};
+use nostr_sdk::prelude::{
+    Client as NostrSdkClient, Event, Filter, Kind, PublicKey, RelayMessage, RelayNotification,
+    RelayStatus, RelayUrl, SubscribeAutoCloseOptions, SubscribeOptions, SubscriptionId,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
@@ -112,6 +115,12 @@ pub(crate) struct DirectorySubscriptionSyncSummary {
     pub(crate) subscriptions_removed: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirectoryFetchOutcome {
+    pub(crate) records: Vec<DirectoryRelayEventRecord>,
+    pub(crate) complete: bool,
+}
+
 type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
 
 #[async_trait]
@@ -120,6 +129,18 @@ pub(crate) trait DirectoryRelayFetcher: Send + Sync {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String>;
+
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<DirectoryFetchOutcome, String> {
+        self.fetch_directory_events(request)
+            .await
+            .map(|records| DirectoryFetchOutcome {
+                records,
+                complete: true,
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -230,6 +251,27 @@ impl DirectoryRelayPlane {
 
         rx.await
             .map_err(|_| "directory fetch owner dropped before completing".to_owned())?
+    }
+
+    pub(crate) async fn fetch_events_with_completion(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<DirectoryFetchOutcome, String> {
+        let fetcher = self.fetcher.clone();
+        let result = tokio::spawn(async move {
+            fetcher
+                .fetch_directory_events_with_completion(request)
+                .await
+        })
+        .await
+        .map_err(|_| "directory fetch task failed".to_owned())?;
+        let mut state = self.state.lock().await;
+        if result.is_ok() {
+            state.completed_fetches += 1;
+        } else {
+            state.failed_fetches += 1;
+        }
+        result
     }
 
     pub(crate) async fn stats(&self) -> DirectoryRelayStats {
@@ -490,6 +532,161 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         }
         Ok(records)
     }
+
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<DirectoryFetchOutcome, String> {
+        let relay_urls = parsed_directory_relay_urls(&request.endpoints)?;
+        let mut tasks = JoinSet::new();
+        for relay_url in relay_urls.iter().cloned() {
+            let client = self.client.clone();
+            let queries = request.queries.clone();
+            tasks.spawn(async move { strict_fetch_endpoint(client, relay_url, queries).await });
+        }
+
+        let mut outcome = DirectoryFetchOutcome {
+            records: Vec::new(),
+            complete: true,
+        };
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(endpoint) => {
+                    outcome.complete &= endpoint.complete;
+                    outcome.records.extend(endpoint.records);
+                }
+                Err(_) => outcome.complete = false,
+            }
+        }
+        if relay_urls.is_empty() {
+            outcome.complete = false;
+        }
+        Ok(outcome)
+    }
+}
+
+async fn strict_fetch_endpoint(
+    client: NostrSdkClient,
+    relay_url: RelayUrl,
+    queries: Vec<DirectoryEventQuery>,
+) -> DirectoryFetchOutcome {
+    let endpoint = TransportEndpoint(relay_url.to_string());
+    if client.relay(&relay_url).await.is_err() && client.add_relay(relay_url.clone()).await.is_err()
+    {
+        return DirectoryFetchOutcome::default();
+    }
+    if !matches!(
+        timeout(
+            DIRECTORY_RELAY_CONNECT_WAIT,
+            client.connect_relay(relay_url.clone()),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return DirectoryFetchOutcome::default();
+    }
+    let Ok(relay) = client.relay(relay_url).await else {
+        return DirectoryFetchOutcome::default();
+    };
+    let mut filters = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let Ok(kind) = u16::try_from(query.kind).map(Kind::from) else {
+            return DirectoryFetchOutcome::default();
+        };
+        let Ok(public_keys) = query
+            .authors
+            .iter()
+            .map(|author| PublicKey::parse(author))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return DirectoryFetchOutcome::default();
+        };
+        filters.push(
+            Filter::new()
+                .authors(public_keys)
+                .kind(kind)
+                .limit(query.limit),
+        );
+    }
+
+    let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
+    let subscription_id = SubscriptionId::generate();
+    let mut notifications = relay.notifications();
+    if relay
+        .subscribe_with_id(
+            subscription_id.clone(),
+            filters,
+            SubscribeOptions::default().close_on(Some(
+                SubscribeAutoCloseOptions::default()
+                    .timeout(Some(DIRECTORY_RELAY_FETCH_WAIT))
+                    .idle_timeout(Some(DIRECTORY_RELAY_FETCH_WAIT)),
+            )),
+        )
+        .await
+        .is_err()
+    {
+        return DirectoryFetchOutcome::default();
+    }
+
+    let mut records = Vec::new();
+    let mut seen_event_ids = HashSet::new();
+    let complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
+        loop {
+            let received = match notifications.recv().await {
+                Ok(RelayNotification::Event {
+                    subscription_id: received_id,
+                    event,
+                }) if received_id == subscription_id => Some(*event),
+                Ok(RelayNotification::Message {
+                    message:
+                        RelayMessage::Event {
+                            subscription_id: received_id,
+                            event,
+                        },
+                }) if received_id.as_ref() == &subscription_id => Some(event.into_owned()),
+                Ok(RelayNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(received_id),
+                }) if received_id.as_ref() == &subscription_id => break true,
+                Ok(RelayNotification::Message {
+                    message:
+                        RelayMessage::Closed {
+                            subscription_id: received_id,
+                            ..
+                        },
+                }) if received_id.as_ref() == &subscription_id => break false,
+                Ok(RelayNotification::AuthenticationFailed | RelayNotification::Shutdown) => {
+                    break false;
+                }
+                Ok(RelayNotification::RelayStatus {
+                    status:
+                        RelayStatus::Disconnected | RelayStatus::Terminated | RelayStatus::Banned,
+                }) => {
+                    break false;
+                }
+                Err(_) => break false,
+                _ => None,
+            };
+            if let Some(event) = received
+                && let Some(event) = queries
+                    .iter()
+                    .find_map(|query| validated_directory_event(&event, query))
+                && seen_event_ids.insert(event.id.clone())
+            {
+                if records.len() < max_records {
+                    records.push(DirectoryRelayEventRecord {
+                        endpoints: vec![endpoint.clone()],
+                        event,
+                    });
+                } else {
+                    break false;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let _ = relay.unsubscribe(&subscription_id).await;
+    DirectoryFetchOutcome { records, complete }
 }
 
 fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
