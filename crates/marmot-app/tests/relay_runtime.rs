@@ -25,11 +25,11 @@ use marmot_app::{
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
+use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, QueryPolicy, WritePolicy};
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
-    Timestamp as NostrTimestamp,
+    Alphabet, Client as NostrSdkClient, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag,
+    TagKind, Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,6 +188,34 @@ impl WritePolicy for RejectKeyPackagesWhileArmed {
             {
                 PolicyResult::Reject("injected key package rejection".into())
             } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RejectMultiAuthorQueries {
+    rejected: Arc<AtomicUsize>,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl QueryPolicy for RejectMultiAuthorQueries {
+    fn admit_query<'a>(
+        &'a self,
+        query: &'a Filter,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if query
+                .authors
+                .as_ref()
+                .is_some_and(|authors| authors.len() > 1)
+            {
+                self.rejected.fetch_add(1, Ordering::SeqCst);
+                PolicyResult::Reject("multi-author queries unsupported".into())
+            } else {
+                self.accepted.fetch_add(1, Ordering::SeqCst);
                 PolicyResult::Accept
             }
         })
@@ -1058,7 +1086,25 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     });
 
     use nostr::prelude::ToBech32;
-    let secret = nostr::Keys::generate().secret_key().to_bech32().unwrap();
+    let keys = nostr::Keys::generate();
+    let secret = keys.secret_key().to_bech32().unwrap();
+    let relay_client =
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    for (kind, tag) in [
+        (10002, vec!["r".to_owned(), url.clone(), "write".to_owned()]),
+        (10050, vec!["relay".to_owned(), url.clone()]),
+    ] {
+        let event = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            kind,
+            vec![tag],
+            String::new(),
+        );
+        relay_client
+            .publish_event(&[endpoint(&url)], &event, 1)
+            .await
+            .unwrap();
+    }
     let imported = timeout(
         Duration::from_secs(40),
         runtime.create_or_import_account(AccountSetupRequest {
@@ -1075,15 +1121,15 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     .expect("import must not hang on a stalled discovery endpoint")
     .expect("import should succeed without the advisory preflight");
     assert!(imported.account.local_signing);
-    assert_eq!(
+    assert!(
         runtime
             .shared_services()
             .relay_plane()
             .relay_health()
             .await
-            .directory_failed_fetches,
-        0,
-        "a stalled peer must not fail a directory fetch that has one connected relay"
+            .directory_failed_fetches
+            > 0,
+        "partial reads must remain visible even when known metadata permits login"
     );
     assert_eq!(
         runtime
@@ -8056,6 +8102,120 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
     assert_eq!(missing_from_seed_b.bootstrap_relays, vec![seed_b_url]);
 }
 
+// Investigation-only regression: metadata is split across discovery and the
+// identity's advertised outbox, with a third relay owning Welcome delivery.
+async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale_first_hop: bool) {
+    use nostr::prelude::ToBech32;
+
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(publisher_dir.path());
+    let keys = Keys::generate();
+    home.import_account("publisher", &keys.secret_key().to_secret_hex())
+        .unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    let created_at = test_unix_now_seconds().saturating_sub(60);
+    if stale_first_hop {
+        publish_nostr_event_at(
+            &home,
+            "publisher",
+            &discovery_url,
+            10050,
+            vec![vec!["relay".into(), discovery_url.clone()]],
+            String::new(),
+            created_at.saturating_sub(60),
+        )
+        .await;
+    }
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &outbox_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+
+    let app_dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        app_dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = if external_signer {
+        runtime
+            .login_external_signer(
+                keys.public_key().to_hex(),
+                TestExternalAccountSigner { keys },
+                request,
+            )
+            .await
+    } else {
+        runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                ..request
+            })
+            .await
+    };
+    runtime.shutdown().await;
+    let result = result.expect("existing account setup must resolve its advertised inbox");
+    assert_eq!(result.relay_lists.nip65.relays, vec![outbox_url]);
+    assert_eq!(
+        result.relay_lists.inbox.relays,
+        vec![inbox_url],
+        "login must discover kind 10050 on the advertised outbox and preserve its inbox instead of publishing defaults"
+    );
+    assert_eq!(
+        result.relay_lists.inbox.created_at, created_at,
+        "login must preserve the existing inbox advertisement timestamp"
+    );
+}
+
+#[tokio::test]
+async fn import_preserves_inbox_metadata_only_on_discovered_outbox() {
+    existing_login_preserves_outbox_only_inbox(false, false).await;
+}
+
+#[tokio::test]
+async fn external_signer_preserves_inbox_metadata_only_on_discovered_outbox() {
+    existing_login_preserves_outbox_only_inbox(true, false).await;
+}
+
+#[tokio::test]
+async fn import_stale_first_hop_inbox_does_not_mask_newer_outbox_inbox() {
+    existing_login_preserves_outbox_only_inbox(false, true).await;
+}
+
+#[tokio::test]
+async fn external_signer_stale_first_hop_inbox_does_not_mask_newer_outbox_inbox() {
+    existing_login_preserves_outbox_only_inbox(true, true).await;
+}
+
 #[tokio::test]
 async fn relay_list_empty_fetch_keeps_cached_lists() {
     let dir = tempfile::tempdir().unwrap();
@@ -10896,6 +11056,410 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     runtime.shutdown().await;
 }
 
+/// mdk#1703: the recipient's KeyPackage may be found on discovery while its
+/// current inbox declaration lives only on the advertised outbox. The resolved
+/// third-relay route must survive restart and deliver one Welcome.
+#[tokio::test]
+async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol_keys = Keys::generate();
+    let carol_nsec = carol_keys.secret_key().to_bech32().unwrap();
+    let carol = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec.clone())),
+            ..setup
+        })
+        .await
+        .unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let home = AccountHome::open(dir.path());
+    let created_at = test_unix_now_seconds();
+    publish_nostr_event_at(
+        &home,
+        &carol.account.label,
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        &carol.account.label,
+        &outbox_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+
+    runtime
+        .sign_out(
+            &carol_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
+            default_relays: vec![endpoint(&discovery_url)],
+            bootstrap_relays: vec![endpoint(&discovery_url)],
+            discovery_relays: vec![endpoint(&discovery_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .expect("reactivation must resolve kind 10050 from the advertised outbox");
+
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "outbox persisted invite route",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    app.resolve_member_key_packages(&[carol_id.as_str()])
+        .await
+        .expect("KeyPackage and outbox-hosted inbox route should resolve before restart");
+    assert!(
+        app.directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&inbox_url))
+    );
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    assert!(
+        app.directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&inbox_url)),
+        "the outbox-resolved inbox route must survive process restart"
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let mut restarted_events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut restarted_events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &carol_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+    assert_eq!(members.len(), 3);
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == carol_id)
+            .count(),
+        1,
+        "the persisted outbox-resolved route must deliver exactly one Welcome"
+    );
+    runtime.shutdown().await;
+}
+
+async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool) {
+    use nostr::prelude::ToBech32;
+
+    let sender_dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    // R is receiver setup infrastructure, never a sender discovery source.
+    // This keeps the missing-D case free of setup-created kind 10050 on D.
+    let (_receiver_setup, receiver_setup_url) = mock_relay().await;
+    let config = || MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let receiver =
+        MarmotApp::with_relay_and_config(receiver_dir.path(), receiver_setup_url.clone(), config());
+    let receiver_runtime = MarmotAppRuntime::new(receiver.clone());
+    let carol_keys = Keys::generate();
+    let carol_nsec = carol_keys.secret_key().to_bech32().unwrap();
+    let carol = receiver_runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec.clone())),
+            default_relays: vec![endpoint(&receiver_setup_url)],
+            bootstrap_relays: vec![endpoint(&receiver_setup_url)],
+            discovery_relays: vec![endpoint(&receiver_setup_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let carol_id = carol.account.account_id_hex.clone();
+    let carol_label = carol.account.label.clone();
+
+    // Publish metadata newer than the receiver's initial R-only setup.
+    sleep(Duration::from_secs(1)).await;
+    let created_at = test_unix_now_seconds();
+    let receiver_home = AccountHome::open(receiver_dir.path());
+    publish_nostr_event_at(
+        &receiver_home,
+        &carol_label,
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    if stale_discovery {
+        publish_nostr_event_at(
+            &receiver_home,
+            &carol_label,
+            &discovery_url,
+            10050,
+            vec![vec!["relay".into(), receiver_setup_url]],
+            String::new(),
+            created_at.saturating_sub(60),
+        )
+        .await;
+    }
+    publish_nostr_event_at(
+        &receiver_home,
+        &carol_label,
+        &outbox_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    receiver_runtime
+        .sign_out(
+            &carol_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    receiver_runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
+            default_relays: vec![endpoint(&discovery_url)],
+            bootstrap_relays: vec![endpoint(&discovery_url)],
+            discovery_relays: vec![endpoint(&discovery_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    // Reuse the receiver-owned private MLS material and republish its public
+    // KeyPackage to the now-known W route; no lost-device recovery assumption.
+    receiver_runtime
+        .publish_key_package(&carol_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .account_relay_list_status(&carol_label)
+            .unwrap()
+            .inbox
+            .relays,
+        vec![inbox_url.clone()]
+    );
+
+    let sender =
+        MarmotApp::with_relay_and_config(sender_dir.path(), discovery_url.clone(), config());
+    let sender_runtime = MarmotAppRuntime::new(sender.clone());
+    let sender_setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice =
+        create_network_ready_identity(&sender_runtime, sender_setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&sender_runtime, sender_setup).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let group_id = sender_runtime
+        .create_group(
+            &alice_id,
+            "independent outbox invitation",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        sender
+            .directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_none_or(|entry| entry.relay_lists.inbox.relays.is_empty()),
+        "sender must not inherit the receiver's already-resolved inbox cache"
+    );
+    sender
+        .resolve_member_key_packages(&[carol_id.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(
+        sender
+            .directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .unwrap()
+            .relay_lists
+            .inbox
+            .relays,
+        vec![inbox_url.clone()],
+        "fresh sender must resolve D -> W -> I before invitation"
+    );
+    sender_runtime.shutdown().await;
+    receiver_runtime.shutdown().await;
+    drop(sender_runtime);
+    drop(receiver_runtime);
+    drop(sender);
+    drop(receiver);
+    drop(receiver_home);
+
+    let sender =
+        MarmotApp::with_relay_and_config(sender_dir.path(), discovery_url.clone(), config());
+    let receiver =
+        MarmotApp::with_relay_and_config(receiver_dir.path(), discovery_url.clone(), config());
+    assert_eq!(
+        sender
+            .directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .unwrap()
+            .relay_lists
+            .inbox
+            .relays,
+        vec![inbox_url.clone()]
+    );
+    assert_eq!(
+        receiver
+            .account_relay_list_status(&carol_label)
+            .unwrap()
+            .inbox
+            .relays,
+        vec![inbox_url]
+    );
+    let sender_runtime = MarmotAppRuntime::new(sender.clone());
+    let receiver_runtime = MarmotAppRuntime::new(receiver.clone());
+    let mut receiver_events = receiver_runtime.subscribe();
+    receiver_runtime.reconcile_accounts().await.unwrap();
+    sender_runtime.reconcile_accounts().await.unwrap();
+    sender_runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut receiver_events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+            if account_id_hex == &carol_id && joined_group == &group_id)
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = receiver
+        .group(&carol_label, &group_id_hex)
+        .unwrap()
+        .unwrap();
+    assert!(pending.pending_confirmation && !pending.archived);
+    assert!(pending.via_welcome_message_id_hex.is_some());
+    assert_eq!(
+        pending.welcomer_account_id_hex.as_deref(),
+        Some(alice_id.as_str())
+    );
+    let members = sender_runtime
+        .group_members(&alice_id, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == carol_id)
+            .count(),
+        1
+    );
+    sender_runtime.shutdown().await;
+    receiver_runtime.shutdown().await;
+    drop(sender_runtime);
+    drop(receiver_runtime);
+    drop(sender);
+    drop(receiver);
+    // The invite must still be visible in the persisted projection after a
+    // second receiver restart, without an accept action or another Welcome.
+    let reopened = MarmotApp::with_relay_and_config(receiver_dir.path(), discovery_url, config());
+    let still_pending = reopened
+        .group(&carol_label, &group_id_hex)
+        .unwrap()
+        .unwrap();
+    assert!(still_pending.pending_confirmation && !still_pending.archived);
+    assert_eq!(
+        still_pending.via_welcome_message_id_hex,
+        pending.via_welcome_message_id_hex
+    );
+}
+
+#[tokio::test]
+async fn independent_sender_outbox_only_inbox_invite_survives_restart() {
+    independent_sender_outbox_invite_survives_restart(false).await;
+}
+
+#[tokio::test]
+async fn independent_sender_stale_discovery_inbox_invite_survives_restart() {
+    independent_sender_outbox_invite_survives_restart(true).await;
+}
+
 /// mdk#352 review follow-up: the welcome re-delivery surface is reachable end
 /// to end through the runtime worker. A create whose welcome delivered leaves
 /// nothing pending, and re-delivering an unknown welcome id is a clean error
@@ -11158,4 +11722,505 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
     }
 
     runtime.shutdown().await;
+}
+
+#[derive(Clone, Debug)]
+struct CountUncertainSetupRelayListPublications(Arc<AtomicUsize>);
+
+impl WritePolicy for CountUncertainSetupRelayListPublications {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind == Kind::from(10002) || event.kind == Kind::from(10050) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
+async fn assert_required_discovery_failure_does_not_publish_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
+    let bootstrap = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    bootstrap.run().await.unwrap();
+    let bootstrap_url = bootstrap.url().await.to_string();
+
+    // D accepts TCP but never completes the websocket handshake or discovery.
+    // B completes an empty query. Retrying B alone cannot settle what D knows.
+    let discovery = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let discovery_url = format!("ws://{}", discovery.local_addr().unwrap());
+    let held_discovery = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = discovery.accept().await {
+            held.push(socket);
+        }
+    });
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        bootstrap_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&bootstrap_url)],
+        bootstrap_relays: vec![endpoint(&bootstrap_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = timeout(Duration::from_secs(40), async {
+        if external_signer {
+            runtime
+                .login_external_signer(
+                    keys.public_key().to_hex(),
+                    TestExternalAccountSigner { keys },
+                    request,
+                )
+                .await
+        } else {
+            runtime
+                .create_or_import_account(AccountSetupRequest {
+                    import_nsec: Some(zeroize::Zeroizing::new(
+                        keys.secret_key().to_bech32().unwrap(),
+                    )),
+                    ..request
+                })
+                .await
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    held_discovery.abort();
+    let _ = held_discovery.await;
+
+    let result = result.expect("uncertain discovery must retain the bounded setup deadline");
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        0,
+        "an incomplete required discovery read must not publish replacement relay lists"
+    );
+    assert!(
+        result.is_err(),
+        "an uncached existing identity cannot become network-ready from unconfirmed absence"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_required_discovery_failure_does_not_publish_defaults() {
+    assert_required_discovery_failure_does_not_publish_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_required_discovery_failure_does_not_publish_defaults() {
+    assert_required_discovery_failure_does_not_publish_defaults(true).await;
+}
+
+async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
+    let discovery = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    discovery.run().await.unwrap();
+    let discovery_url = discovery.url().await.to_string();
+    let healthy = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    healthy.run().await.unwrap();
+    let healthy_url = healthy.url().await.to_string();
+    // W1 reaches EOSE with no inbox declaration. W2 never completes its
+    // handshake: W1's absence cannot establish what W2 may hold.
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_url = format!("ws://{}", unavailable.local_addr().unwrap());
+    let held_outbox = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = unavailable.accept().await {
+            held.push(socket);
+        }
+    });
+    let keys = Keys::generate();
+    let publisher =
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    publisher
+        .publish_event(
+            &[endpoint(&discovery_url)],
+            &NostrTransportEvent::new_unsigned(
+                keys.public_key().to_hex(),
+                10002,
+                vec![
+                    vec!["r".into(), healthy_url.clone(), "write".into()],
+                    vec!["r".into(), unavailable_url, "write".into()],
+                ],
+                String::new(),
+            ),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(publications.swap(0, Ordering::SeqCst), 1);
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    ));
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&healthy_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = timeout(Duration::from_secs(40), async {
+        if external_signer {
+            runtime
+                .login_external_signer(
+                    keys.public_key().to_hex(),
+                    TestExternalAccountSigner { keys },
+                    request,
+                )
+                .await
+        } else {
+            runtime
+                .create_or_import_account(AccountSetupRequest {
+                    import_nsec: Some(zeroize::Zeroizing::new(
+                        keys.secret_key().to_bech32().unwrap(),
+                    )),
+                    ..request
+                })
+                .await
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    held_outbox.abort();
+    let _ = held_outbox.await;
+    assert!(matches!(
+        result.expect("partial outbox discovery must remain bounded"),
+        Err(AppError::RelayDirectory(_))
+    ));
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        0,
+        "a healthy-empty outbox must not authorize overwriting an unavailable sibling's metadata"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_partial_outbox_failure_does_not_publish_defaults() {
+    partial_outbox_failure_does_not_publish_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_partial_outbox_failure_does_not_publish_defaults() {
+    partial_outbox_failure_does_not_publish_defaults(true).await;
+}
+
+async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empty_outbox: bool) {
+    use nostr::prelude::ToBech32;
+
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(publisher_dir.path());
+    let keys = Keys::generate();
+    home.import_account("publisher", &keys.secret_key().to_secret_hex())
+        .unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    let created_at = test_unix_now_seconds().saturating_sub(60);
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &discovery_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &outbox_url,
+        10050,
+        if empty_outbox {
+            Vec::new()
+        } else {
+            vec![vec!["relay".into(), outbox_url.clone()]]
+        },
+        String::new(),
+        created_at.saturating_sub(60),
+    )
+    .await;
+
+    let app_dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        app_dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = if external_signer {
+        runtime
+            .login_external_signer(
+                keys.public_key().to_hex(),
+                TestExternalAccountSigner { keys },
+                request,
+            )
+            .await
+    } else {
+        runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                ..request
+            })
+            .await
+    };
+    runtime.shutdown().await;
+    let result = result.expect("existing account setup must resolve its advertised inbox");
+    assert_eq!(result.relay_lists.nip65.relays, vec![outbox_url]);
+    assert_eq!(
+        result.relay_lists.inbox.relays,
+        vec![inbox_url],
+        "an older outbox record, including explicit empty, must not replace the newer discovery inbox"
+    );
+    assert_eq!(
+        result.relay_lists.inbox.created_at, created_at,
+        "login must preserve the existing inbox advertisement timestamp"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_newer_discovery_inbox_survives_older_outbox() {
+    newer_discovery_inbox_survives_older_outbox(false, false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_newer_discovery_inbox_survives_older_empty_outbox() {
+    newer_discovery_inbox_survives_older_outbox(false, true).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_newer_discovery_inbox_survives_older_outbox() {
+    newer_discovery_inbox_survives_older_outbox(true, false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_newer_discovery_inbox_survives_older_empty_outbox() {
+    newer_discovery_inbox_survives_older_outbox(true, true).await;
+}
+
+async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    // A read-only NIP-65 declaration also must not be rewritten write-enabled.
+    for (empty_kind, read_only) in [(10002, false), (10050, false), (10002, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let publications = Arc::new(AtomicUsize::new(0));
+        let relay = LocalRelay::new(RelayBuilder::default().write_policy(
+            CountUncertainSetupRelayListPublications(publications.clone()),
+        ));
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let keys = Keys::generate();
+        let publisher =
+            NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+        for kind in [10002, 10050] {
+            let tags = if kind == 10002 && read_only {
+                vec![vec!["r".into(), url.clone(), "read".into()]]
+            } else if kind == empty_kind {
+                Vec::new()
+            } else if kind == 10002 {
+                vec![vec!["r".into(), url.clone(), "write".into()]]
+            } else {
+                vec![vec!["relay".into(), url.clone()]]
+            };
+            publisher
+                .publish_event(
+                    &[endpoint(&url)],
+                    &NostrTransportEvent::new_unsigned(
+                        keys.public_key().to_hex(),
+                        kind,
+                        tags,
+                        String::new(),
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(publications.swap(0, Ordering::SeqCst), 2);
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+            dir.path(),
+            url.clone(),
+            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        ));
+        let request = AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            discovery_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        };
+        let result = timeout(Duration::from_secs(30), async {
+            if external_signer {
+                runtime
+                    .login_external_signer(
+                        keys.public_key().to_hex(),
+                        TestExternalAccountSigner { keys },
+                        request,
+                    )
+                    .await
+            } else {
+                runtime
+                    .create_or_import_account(AccountSetupRequest {
+                        import_nsec: Some(zeroize::Zeroizing::new(
+                            keys.secret_key().to_bech32().unwrap(),
+                        )),
+                        ..request
+                    })
+                    .await
+            }
+        })
+        .await
+        .expect("explicit-empty setup must remain bounded");
+        runtime.shutdown().await;
+        assert!(
+            matches!(result, Err(AppError::MissingRelayLists(_))),
+            "an intentionally empty relay list cannot become network-ready using app defaults"
+        );
+        assert_eq!(
+            publications.load(Ordering::SeqCst),
+            0,
+            "login must not replace a signed empty kind {empty_kind} list"
+        );
+    }
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_preserves_explicit_empty_metadata() {
+    explicit_empty_outbox_metadata_never_publishes_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_preserves_explicit_empty_metadata() {
+    explicit_empty_outbox_metadata_never_publishes_defaults(true).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
+    use nostr::prelude::ToBech32;
+
+    let discovery_policy = RejectMultiAuthorQueries::default();
+    let discovery = LocalRelay::new(RelayBuilder::default().query_policy(discovery_policy.clone()));
+    discovery.run().await.unwrap();
+    let discovery_url = discovery.url().await.to_string();
+    let query_policy = RejectMultiAuthorQueries::default();
+    let outbox = LocalRelay::new(RelayBuilder::default().query_policy(query_policy.clone()));
+    outbox.run().await.unwrap();
+    let outbox_url = outbox.url().await.to_string();
+
+    let mut member_dirs = Vec::new();
+    let mut member_ids = Vec::new();
+    for _ in 0..2 {
+        let member_dir = tempfile::tempdir().unwrap();
+        let keys = Keys::generate();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+            member_dir.path(),
+            outbox_url.clone(),
+            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        ));
+        let setup = runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                default_relays: vec![endpoint(&outbox_url)],
+                bootstrap_relays: vec![endpoint(&outbox_url)],
+                discovery_relays: vec![endpoint(&outbox_url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("member setup must publish relay metadata and a KeyPackage");
+        runtime.shutdown().await;
+
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build())
+            .publish_event(
+                &[endpoint(&discovery_url)],
+                &NostrTransportEvent::new_unsigned(
+                    keys.public_key().to_hex(),
+                    KIND_NIP65_RELAY_LIST,
+                    vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+                    String::new(),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        member_ids.push(setup.account.account_id_hex);
+        member_dirs.push(member_dir);
+    }
+
+    let reader_dir = tempfile::tempdir().unwrap();
+    discovery_policy.accepted.store(0, Ordering::SeqCst);
+    discovery_policy.rejected.store(0, Ordering::SeqCst);
+    query_policy.accepted.store(0, Ordering::SeqCst);
+    query_policy.rejected.store(0, Ordering::SeqCst);
+    let reader = MarmotApp::with_relay_and_config(
+        reader_dir.path(),
+        discovery_url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let member_refs = member_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let summary = reader
+        .prewarm_group_member_key_packages(&member_refs)
+        .await
+        .expect("CLOSED multi-author batches must fall back to routable single-author reads");
+
+    assert_eq!(summary.network_resolved_members, 2);
+    assert_eq!(discovery_policy.rejected.load(Ordering::SeqCst), 1);
+    assert_eq!(discovery_policy.accepted.load(Ordering::SeqCst), 4);
+    assert!(
+        query_policy.rejected.load(Ordering::SeqCst) >= 2,
+        "the real relay must reject both a relay-list and KeyPackage multi-author query"
+    );
+    assert!(
+        query_policy.accepted.load(Ordering::SeqCst) >= 6,
+        "the resolver must issue accepted single-author fallbacks for both members"
+    );
 }

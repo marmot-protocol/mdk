@@ -297,12 +297,16 @@ pub(crate) struct ScriptedPushRelayClient {
 }
 
 #[derive(Default)]
-struct MemberResolutionDirectoryFetcher {
+pub(crate) struct MemberResolutionDirectoryFetcher {
     requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    events_by_endpoint:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
+    reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
+    incomplete_endpoint: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -335,7 +339,18 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let events = self.events.lock().unwrap().clone();
+        let endpoint_events = self.events_by_endpoint.lock().unwrap();
+        let events = if endpoint_events.is_empty() {
+            self.events.lock().unwrap().clone()
+        } else {
+            request
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint_events.get(&endpoint.0))
+                .flatten()
+                .cloned()
+                .collect()
+        };
         Ok(events
             .into_iter()
             .filter(|event| {
@@ -349,6 +364,34 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 event,
             })
             .collect())
+    }
+
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: crate::relay_plane::DirectoryFetchRequest,
+    ) -> Result<crate::relay_plane::DirectoryFetchOutcome, String> {
+        if self
+            .reject_multi_author_incomplete
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request.queries.iter().any(|query| query.authors.len() > 1)
+        {
+            self.requests.lock().unwrap().push(request);
+            return Ok(crate::relay_plane::DirectoryFetchOutcome::default());
+        }
+        let complete = !self
+            .incomplete_endpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|incomplete| {
+                request
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.0 == *incomplete)
+            });
+        self.fetch_directory_events(request)
+            .await
+            .map(|records| crate::relay_plane::DirectoryFetchOutcome { records, complete })
     }
 }
 
@@ -7440,7 +7483,7 @@ fn member_resolution_key_package_event(
     .unwrap()
 }
 
-async fn member_resolution_fixture(
+pub(crate) async fn member_resolution_fixture(
     count: usize,
     split_relays: bool,
 ) -> (
@@ -7495,6 +7538,318 @@ async fn member_resolution_fixture(
     }
     app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(relay, fetcher.clone());
     (directory, app, accounts, fetcher)
+}
+
+#[tokio::test]
+/// Relay-list resolution follows the target account's NIP-65 write relay for
+/// kind 10050 instead of treating a successful first-hop miss as absence.
+async fn member_inbox_is_resolved_on_discovered_outbox() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    let events = fetcher.events.lock().unwrap().clone();
+    let mut first_hop = events
+        .iter()
+        .filter(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .cloned()
+        .collect::<Vec<_>>();
+    first_hop.push(NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec![
+            "r".into(),
+            "wss://outbox.example".into(),
+            "write".into(),
+        ]],
+        String::new(),
+    ));
+    let outbox_events = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                KIND_MARMOT_KEY_PACKAGE | KIND_MARMOT_INBOX_RELAY_LIST
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    fetcher.events_by_endpoint.lock().unwrap().extend([
+        ("wss://directory.example".to_owned(), first_hop.clone()),
+        ("wss://shared.example".to_owned(), first_hop),
+        ("wss://outbox.example".to_owned(), outbox_events),
+    ]);
+
+    let resolution = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await;
+    assert!(
+        resolution.is_ok(),
+        "member preflight must follow the advertised outbox: {resolution:?}; requests={:?}",
+        fetcher.requests.lock().unwrap()
+    );
+
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.0 == "wss://outbox.example")
+            && request.queries.iter().any(|query| {
+                query.kind == KIND_MARMOT_INBOX_RELAY_LIST && query.authors.contains(&account_id)
+            })
+    }));
+    assert!(
+        app.directory_entry_for_account_id(&account_id)
+            .unwrap()
+            .is_some_and(|entry| entry
+                .relay_lists
+                .inbox
+                .relays
+                .iter()
+                .any(|relay| relay == "wss://shared.example"))
+    );
+}
+
+#[tokio::test]
+async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    let outboxes = (0..17)
+        .map(|index| format!("wss://outbox-{index}.example"))
+        .collect::<Vec<_>>();
+    let nip65_tags = outboxes
+        .iter()
+        .map(|relay| vec!["r".into(), relay.clone(), "write".into()])
+        .collect::<Vec<_>>();
+    let inbox = "wss://usable-inbox.example";
+    *fetcher.events.lock().unwrap() = vec![
+        NostrTransportEvent::new_unsigned(
+            account_id.clone(),
+            KIND_NIP65_RELAY_LIST,
+            nip65_tags,
+            String::new(),
+        ),
+        NostrTransportEvent::new_unsigned(
+            account_id.clone(),
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            vec![vec!["relay".into(), inbox.into()]],
+            String::new(),
+        ),
+    ];
+
+    let status = app
+        .resolve_account_relay_list_status_for_account_id(
+            &account_id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .expect("the outbox route cap must not discard complete first-hop metadata");
+
+    assert_eq!(status.nip65.relays, outboxes);
+    assert_eq!(status.inbox.relays, vec![inbox]);
+    let cached = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .expect("observed relay metadata must remain durable");
+    assert_eq!(cached.relay_lists.inbox.relays, vec![inbox]);
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        1,
+        "the oversized discovered route must fail closed before a second dial"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    let outbox = "wss://cached-outbox.example";
+    let mut entry = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .unwrap_or_else(|| app.empty_directory_record(&account_id));
+    entry.relay_lists.nip65.created_at = 1;
+    entry.relay_lists.nip65.relays = vec![outbox.into()];
+    entry.relay_lists.refresh();
+    app.save_directory_entry(&entry).unwrap();
+    fetcher.events_by_endpoint.lock().unwrap().extend([
+        ("wss://directory.example".to_owned(), Vec::new()),
+        (outbox.to_owned(), Vec::new()),
+    ]);
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("an empty outbox cannot prove absence after discovery failed");
+
+    assert!(
+        matches!(error, AppError::RelayDirectory(_)),
+        "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
+    );
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.0 == outbox)
+    }));
+}
+
+#[tokio::test]
+async fn directory_relay_persistence_preserves_newer_signed_empty_lists() {
+    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let id = &accounts[0].account_id_hex;
+    let mut older = AccountRelayListStatus::empty();
+    older.nip65.created_at = 10;
+    older.nip65.relays = vec!["wss://old-outbox.example".into()];
+    older.inbox.created_at = 10;
+    older.inbox.relays = vec!["wss://old-inbox.example".into()];
+    older.refresh();
+    let mut empty = AccountRelayListStatus::empty();
+    empty.nip65.created_at = 20;
+    empty.inbox.created_at = 20;
+    empty.refresh();
+    app.remember_directory_relay_lists(id, &older).unwrap();
+    app.remember_directory_relay_lists(id, &empty).unwrap();
+    app.remember_directory_relay_lists(id, &older).unwrap();
+    let persisted = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert_eq!(persisted.relay_lists.nip65.created_at, 20);
+    assert_eq!(persisted.relay_lists.inbox.created_at, 20);
+    assert!(persisted.relay_lists.nip65.relays.is_empty());
+    assert!(persisted.relay_lists.inbox.relays.is_empty());
+}
+
+#[tokio::test]
+async fn account_outbox_route_cap_without_inbox_remains_unknown() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let id = &accounts[0].account_id_hex;
+    *fetcher.events.lock().unwrap() = vec![NostrTransportEvent::new_unsigned(
+        id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        (0..17)
+            .map(|index| {
+                vec![
+                    "r".into(),
+                    format!("wss://outbox-{index}.example"),
+                    "write".into(),
+                ]
+            })
+            .collect(),
+        String::new(),
+    )];
+    let error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::RelayDirectory(_)));
+    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert_eq!(cached.relay_lists.nip65.relays.len(), 17);
+    assert!(cached.relay_lists.inbox.relays.is_empty());
+    assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let id = &accounts[0].account_id_hex;
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.tags.clear();
+        }
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+    let error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::RelayDirectory(_)));
+    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert!(cached.relay_lists.inbox.created_at > 0);
+    assert!(cached.relay_lists.inbox.relays.is_empty());
+    assert_eq!(fetcher.requests.lock().unwrap().len(), 2);
+
+    // The same signed empty declaration becomes actionable only when the
+    // outbox also completes; retaining it in the cache must not mask retries.
+    *fetcher.incomplete_endpoint.lock().unwrap() = None;
+    let error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Inbox])
+    );
+}
+
+#[tokio::test]
+async fn account_read_only_nip65_returns_typed_missing_write_routes() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let id = &accounts[0].account_id_hex;
+    *fetcher.events.lock().unwrap() = vec![
+        NostrTransportEvent::new_unsigned(
+            id.clone(),
+            KIND_NIP65_RELAY_LIST,
+            vec![vec![
+                "r".into(),
+                "wss://read-only.example".into(),
+                "read".into(),
+            ]],
+            String::new(),
+        ),
+        NostrTransportEvent::new_unsigned(
+            id.clone(),
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            vec![vec!["relay".into(), "wss://inbox.example".into()]],
+            String::new(),
+        ),
+    ];
+    let error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Nip65])
+    );
+    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert!(cached.relay_lists.nip65.relays.is_empty());
+    assert_eq!(
+        cached.relay_lists.nip65.read_relays,
+        vec!["wss://read-only.example"]
+    );
+}
+
+#[tokio::test]
+async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let id = &accounts[0].account_id_hex;
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.created_at = u64::MAX;
+        }
+    }
+    let account_error = app
+        .resolve_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint("wss://directory.example".into())],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(account_error, AppError::RelayDirectory(_)));
+    let member_error = app
+        .resolve_member_key_packages(&[id.as_str()])
+        .await
+        .unwrap_err();
+    assert!(matches!(member_error, AppError::RelayDirectory(_)));
 }
 
 #[tokio::test]
@@ -7837,8 +8192,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        2,
-        "cold shared relays must use one relay-list batch and one KeyPackage batch"
+        3,
+        "cold shared outboxes need one discovery batch, one outbox batch, and one KeyPackage batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -7847,10 +8202,21 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[1].queries.len(), 1);
-    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[1].queries[0].authors.len(), 8);
-    assert_eq!(requests[1].queries[0].limit, 8 * 12);
+    assert_eq!(
+        requests[1].endpoints,
+        vec![TransportEndpoint("wss://shared.example".into())]
+    );
+    assert_eq!(requests[1].queries.len(), 2);
+    assert!(
+        requests[1]
+            .queries
+            .iter()
+            .all(|query| query.authors.len() == 8)
+    );
+    assert_eq!(requests[2].queries.len(), 1);
+    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    assert_eq!(requests[2].queries[0].authors.len(), 8);
+    assert_eq!(requests[2].queries[0].limit, 8 * 12);
     drop(requests);
 
     for account in &accounts {
@@ -7867,8 +8233,49 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        2,
+        3,
         "fresh prewarm entries must eliminate create-time relay requests"
+    );
+}
+
+#[tokio::test]
+async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_NIP65_RELAY_LIST {
+            event.tags = vec![vec![
+                "r".into(),
+                "wss://directory.example".into(),
+                "write".into(),
+            ]];
+        }
+    }
+    let members = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+    app.prewarm_group_member_key_packages(&members)
+        .await
+        .unwrap();
+    let requests = fetcher.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the completed discovery query already covered the advertised outbox"
+    );
+    assert_eq!(requests[0].queries.len(), 2);
+    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    assert_eq!(
+        app.resolve_member_key_packages(&members)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        2,
+        "fresh prewarm must not repeat either query"
     );
 }
 
@@ -7900,8 +8307,41 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
+        6,
+        "discovery, outbox, and KeyPackage batches must each fall back per member"
+    );
+}
+
+#[tokio::test]
+async fn member_key_package_set_falls_back_when_multi_author_queries_are_incomplete() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    fetcher
+        .reject_multi_author_incomplete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let members = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+
+    let summary = app
+        .prewarm_group_member_key_packages(&members)
+        .await
+        .expect("CLOSED-shaped incomplete batches must retry per author");
+
+    assert_eq!(summary.network_resolved_members, 2);
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.queries.iter().any(|query| query.authors.len() == 2))
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
+            .count(),
         4,
-        "relay-list and KeyPackage batches must each fall back per member"
+        "both relay-list hops must retry each member after an incomplete batch"
     );
 }
 

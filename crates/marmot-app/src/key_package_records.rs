@@ -28,12 +28,39 @@ use crate::{
     push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 
+pub(crate) fn merge_relay_list_status(
+    mut current: AccountRelayListStatus,
+    candidate: AccountRelayListStatus,
+) -> AccountRelayListStatus {
+    if candidate.nip65.created_at > current.nip65.created_at
+        || (candidate.nip65.created_at == 0
+            && current.nip65.created_at == 0
+            && current.nip65.relays.is_empty()
+            && !candidate.nip65.relays.is_empty())
+    {
+        current.nip65 = candidate.nip65;
+    }
+    if candidate.inbox.created_at > current.inbox.created_at
+        || (candidate.inbox.created_at == 0
+            && current.inbox.created_at == 0
+            && current.inbox.relays.is_empty()
+            && !candidate.inbox.relays.is_empty())
+    {
+        current.inbox = candidate.inbox;
+    }
+    push_unique_strings(&mut current.bootstrap_relays, candidate.bootstrap_relays);
+    current.refresh();
+    current
+}
+
 pub(crate) fn relay_list_status_from_records(
     account_id_hex: &str,
     mut records: Vec<RelayEventRecord>,
 ) -> AccountRelayListStatus {
     sort_directory_records(&mut records);
     let mut status = AccountRelayListStatus::empty();
+    let mut seen_nip65 = false;
+    let mut seen_inbox = false;
     for record in records {
         if record.event.pubkey != account_id_hex {
             continue;
@@ -42,8 +69,17 @@ pub(crate) fn relay_list_status_from_records(
             continue;
         };
         match record.event.kind {
-            KIND_NIP65_RELAY_LIST => status.nip65 = state,
-            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox = state,
+            KIND_NIP65_RELAY_LIST if !seen_nip65 || state.created_at > status.nip65.created_at => {
+                status.nip65 = state;
+                seen_nip65 = true;
+            }
+            KIND_MARMOT_INBOX_RELAY_LIST
+                if !seen_inbox || state.created_at > status.inbox.created_at =>
+            {
+                status.inbox = state;
+                seen_inbox = true;
+            }
+            KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST => {}
             _ => continue,
         }
         push_unique_strings(
@@ -600,6 +636,45 @@ mod merge_tests {
             record("", "", false, true),
         ]);
         assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn relay_list_ties_choose_lexically_lower_event_id_in_any_input_order() {
+        let account_id = "11".repeat(32);
+        let make = |id: &str, kind: u64, relay: &str| RelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://source.example".to_owned())],
+            event: NostrTransportEvent {
+                id: id.repeat(64),
+                pubkey: account_id.clone(),
+                created_at: 42,
+                kind,
+                tags: vec![if kind == KIND_NIP65_RELAY_LIST {
+                    vec!["r".to_owned(), relay.to_owned(), "write".to_owned()]
+                } else {
+                    vec!["relay".to_owned(), relay.to_owned()]
+                }],
+                content: String::new(),
+                sig: None,
+            },
+        };
+        let lower_nip65 = make("0", KIND_NIP65_RELAY_LIST, "wss://lower-outbox.example");
+        let higher_nip65 = make("f", KIND_NIP65_RELAY_LIST, "wss://higher-outbox.example");
+        let lower_inbox = make(
+            "0",
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            "wss://lower-inbox.example",
+        );
+        let higher_inbox = make(
+            "f",
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            "wss://higher-inbox.example",
+        );
+        let input = vec![higher_inbox, lower_nip65, higher_nip65, lower_inbox];
+        for records in [input.clone(), input.into_iter().rev().collect()] {
+            let status = relay_list_status_from_records(&account_id, records);
+            assert_eq!(status.nip65.relays, vec!["wss://lower-outbox.example"]);
+            assert_eq!(status.inbox.relays, vec!["wss://lower-inbox.example"]);
+        }
     }
 
     #[test]

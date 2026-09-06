@@ -43,8 +43,8 @@ pub use telemetry::{
 };
 
 pub(crate) use directory::{
-    DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
-    DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
+    DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryRelayEventRecord,
+    DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
     DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::RelaySafetyPolicy;
@@ -918,6 +918,21 @@ impl MarmotRelayPlane {
         self.inner
             .directory
             .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
+            .await
+    }
+
+    pub(crate) async fn fetch_directory_events_with_completion(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        queries: Vec<DirectoryEventQuery>,
+    ) -> Result<DirectoryFetchOutcome, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "directory fetch")?;
+        self.inner
+            .directory
+            .fetch_events_with_completion(DirectoryFetchRequest::new(endpoints, queries)?)
             .await
     }
 
