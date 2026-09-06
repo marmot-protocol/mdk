@@ -7,8 +7,8 @@ use cgka_traits::engine::GroupEvent;
 use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome, InputRejectionCategory};
 use cgka_traits::message::{
-    DeferredPeelLifecycle, MessageRecord, MessageState, OwnApplicationConvergenceStamp,
-    StoredMessagePayload,
+    DeferredMessageMetadata, DeferredPeelLifecycle, MessageRecord, MessageState,
+    OwnApplicationConvergenceStamp, StoredMessagePayload,
 };
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -649,7 +649,7 @@ impl<S: StorageProvider> Engine<S> {
     /// to be persisted by a later scheduler tick.
     pub(super) fn normalize_deferred_peel_lifecycles(
         &self,
-        records: &mut [MessageRecord],
+        records: &mut [DeferredMessageMetadata],
         now: crate::convergence_clock::ConvergenceTime,
         limit: usize,
     ) -> Result<bool, EngineError> {
@@ -665,7 +665,11 @@ impl<S: StorageProvider> Engine<S> {
             record.deferred_peel = Some(lifecycle);
             if changed {
                 if persisted < limit {
-                    self.storage.put_message(record)?;
+                    // Load only this bounded normalization slice, preserving
+                    // payloads and all unrelated row fields on the rewrite.
+                    let mut stored = self.storage.get_message(&record.id)?;
+                    stored.deferred_peel = record.deferred_peel.clone();
+                    self.storage.put_message(&stored)?;
                     persisted += 1;
                 } else {
                     normalization_pending = true;

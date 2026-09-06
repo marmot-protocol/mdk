@@ -28,7 +28,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
-use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+use cgka_traits::message::{
+    DeferredMessageMetadata, MessageRecord, MessageState, StoredMessagePayload,
+};
 use cgka_traits::storage::{
     DeferredPeelGeneration, QueuedOutboundIntent, StorageError, StorageProvider,
 };
@@ -1702,14 +1704,9 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let now = self.convergence_now();
-        // State-filtered listing: this sweep runs on every drain and the
-        // backlog is usually empty, so let the backend's index find the
-        // `PeelDeferred` rows instead of decoding the whole retained window.
-        let mut deferred = self.storage.list_messages_in_states(
-            group_id,
-            &[MessageState::PeelDeferred],
-            EpochId(0),
-        )?;
+        // Prepare from metadata; payload reads belong only to selected rows.
+        // State filtering also avoids touching unrelated retained history.
+        let mut deferred = self.storage.list_deferred_message_metadata(group_id)?;
         if execution.exhausted() {
             self.note_foreground_deferred_phase(
                 sweep_started,
@@ -1758,13 +1755,14 @@ impl<S: StorageProvider> Engine<S> {
             .collect::<Vec<_>>();
         if !due.is_empty() {
             let mut released = 0usize;
-            for record in &due {
+            for metadata in &due {
                 if execution.exhausted() {
                     break;
                 }
                 execution.consume_row();
+                let record = self.storage.get_message(&metadata.id)?;
                 self.release_deferred_peel_row(
-                    record,
+                    &record,
                     InboundResourceLimit::TransportDeferredResidenceBudget,
                     crate::message_disposition::MessageDisposition::ResidenceBudgetRefused,
                 )?;
@@ -1799,7 +1797,7 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        // The full row list is in hand: refresh the flood-cap count, then stop
+        // The complete metadata list is in hand: refresh exact usage, then stop
         // before the context work when there is nothing to sweep. Describing
         // this group's peel context reads storage, so an empty backlog must not
         // pay for it on every drain.
@@ -2000,7 +1998,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut attempted = 0usize;
         let mut timed_out = false;
         let mut contexts_invalidated = false;
-        for record in unattempted.into_iter().take(row_limit) {
+        for metadata in unattempted.into_iter().take(row_limit) {
             if execution.exhausted() {
                 timed_out = true;
                 break;
@@ -2018,6 +2016,7 @@ impl<S: StorageProvider> Engine<S> {
                 contexts_invalidated = true;
                 break;
             }
+            let record = self.storage.get_message(&metadata.id)?;
             let lifecycle = record
                 .deferred_peel
                 .as_ref()
@@ -2089,7 +2088,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         let remaining = self
             .storage
-            .list_messages_in_states(group_id, &[MessageState::PeelDeferred], EpochId(0))?
+            .list_deferred_message_metadata(group_id)?
             .into_iter()
             .filter(|record| {
                 record.deferred_peel.as_ref().is_none_or(|lifecycle| {
@@ -2404,12 +2403,8 @@ impl<S: StorageProvider> Engine<S> {
         }
         let now = self.convergence_now();
         // Match the sweep's indexed state filter. Readiness must inspect all
-        // deferred rows, but unrelated processed history need not be loaded.
-        let mut deferred = self.storage.list_messages_in_states(
-            group_id,
-            &[MessageState::PeelDeferred],
-            EpochId(0),
-        )?;
+        // deferred metadata, but neither payloads nor processed history are needed.
+        let mut deferred = self.storage.list_deferred_message_metadata(group_id)?;
         let normalization_pending = self.normalize_deferred_peel_lifecycles(
             &mut deferred,
             now,
@@ -2593,10 +2588,14 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Refresh one group's cached usage from a durable row enumeration. This
     /// also reconciles the account total when it has already been initialized.
-    fn refresh_peel_deferred_group_usage(&mut self, group_id: &GroupId, records: &[MessageRecord]) {
+    fn refresh_peel_deferred_group_usage(
+        &mut self,
+        group_id: &GroupId,
+        records: &[DeferredMessageMetadata],
+    ) {
         let rows = records.len();
         let bytes = records.iter().fold(0_usize, |sum, record| {
-            sum.saturating_add(record.payload.len())
+            sum.saturating_add(record.payload_len)
         });
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
         let previous_bytes = state.deferred_bytes;
@@ -2604,7 +2603,7 @@ impl<S: StorageProvider> Engine<S> {
         state.deferred_bytes = bytes;
         state.deferred_payload_bytes_by_id = records
             .iter()
-            .map(|record| (record.id.clone(), record.payload.len()))
+            .map(|record| (record.id.clone(), record.payload_len))
             .collect();
         // Incremental deferral already charges a group that started retaining
         // rows after the account-wide reconstruction. Always reconcile the

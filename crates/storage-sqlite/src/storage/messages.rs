@@ -6,7 +6,9 @@ use crate::{
     message_state_from_i64, message_state_to_i64, serialize,
 };
 use cgka_traits::engine::GroupEvent;
-use cgka_traits::message::{DeferredPeelLifecycle, MessageRecord, MessageState};
+use cgka_traits::message::{
+    DeferredMessageMetadata, DeferredPeelLifecycle, MessageRecord, MessageState,
+};
 use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -273,6 +275,81 @@ impl MessageStorage for SqliteAccountStorage {
         .storage()
     }
 
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DeferredMessageMetadata>> {
+        let conn = self.lock()?;
+        // length(BLOB) reads its size without copying it into Rust. Legacy
+        // format 1 has no independent metadata, so only those rows need the
+        // record blob; they promote through the existing bounded migration.
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, group_id, epoch, storage_format,
+                    CASE WHEN storage_format = 1 THEN record END,
+                    CASE WHEN typeof(payload) = 'blob' THEN length(payload) END,
+                    deferred_peel
+             FROM cgka_messages WHERE group_id = ?1 AND state = ?2 AND epoch >= 0
+             ORDER BY insert_order",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map(
+                params![
+                    group_id.as_slice(),
+                    message_state_to_i64(MessageState::PeelDeferred)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                    ))
+                },
+            )
+            .storage()?;
+        rows.map(|row| {
+            let (id, group_id, epoch, format, record, payload_len, lifecycle) = row.storage()?;
+            match format {
+                1 => {
+                    let record = record.ok_or_else(|| {
+                        StorageError::Serialization(
+                            "legacy message row is missing its record blob".into(),
+                        )
+                    })?;
+                    Ok(DeferredMessageMetadata::from(deserialize::<MessageRecord>(
+                        &record,
+                    )?))
+                }
+                NORMALIZED_MESSAGE_STORAGE_FORMAT => Ok(DeferredMessageMetadata {
+                    id: MessageId::new(id),
+                    group_id: GroupId::new(group_id),
+                    epoch: EpochId(i64_to_u64(epoch)?),
+                    payload_len: usize::try_from(payload_len.ok_or_else(|| {
+                        StorageError::Serialization(
+                            "normalized message row is missing its payload blob".into(),
+                        )
+                    })?)
+                    .map_err(|_| {
+                        StorageError::Serialization("invalid deferred payload length".into())
+                    })?,
+                    deferred_peel: lifecycle
+                        .as_deref()
+                        .map(deserialize::<DeferredPeelLifecycle>)
+                        .transpose()?,
+                }),
+                version => Err(StorageError::Serialization(format!(
+                    "unsupported message storage format {version}"
+                ))),
+            }
+        })
+        .collect()
+    }
+
     fn list_messages_in_states(
         &self,
         group_id: &GroupId,
@@ -522,8 +599,13 @@ impl MessageStorage for SqliteAccountStorage {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FULL_MESSAGE_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 fn message_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageColumns> {
-    Ok((
+    let columns: MessageColumns = (
         row.get(0)?,
         row.get(1)?,
         row.get(2)?,
@@ -532,7 +614,16 @@ fn message_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageColumns> 
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
-    ))
+    );
+    #[cfg(test)]
+    FULL_MESSAGE_READS.with(|stats| {
+        let (rows, bytes) = stats.get();
+        stats.set((
+            rows + 1,
+            bytes + columns.5.as_ref().map_or(0, Vec::len) + columns.6.as_ref().map_or(0, Vec::len),
+        ));
+    });
+    Ok(columns)
 }
 
 fn decode_message_columns(columns: MessageColumns) -> StorageResult<MessageRecord> {
@@ -804,6 +895,185 @@ mod tests {
         GroupStorage, MessageStorage, StorageError, StorageProvider, StorageResult,
     };
     use cgka_traits::types::{EpochId, MemberId};
+
+    #[test]
+    fn deferred_metadata_does_not_read_normalized_payloads() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut expected = Vec::new();
+        for id in [9, 2, 7] {
+            let mut message = sample_message(mid(id), gid(1), u64::from(id));
+            message.state = MessageState::PeelDeferred;
+            message.payload = vec![id; 16 * 1024];
+            expected.push(cgka_traits::message::DeferredMessageMetadata::from(
+                message.clone(),
+            ));
+            store.put_message(&message).unwrap();
+        }
+        store
+            .put_message(&sample_message(mid(3), gid(1), 0))
+            .unwrap();
+        super::FULL_MESSAGE_READS.with(|stats| stats.set((0, 0)));
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::FULL_MESSAGE_READS.with(|stats| stats.get()),
+            (0, 0),
+            "scheduler metadata must not materialize normalized message payloads"
+        );
+    }
+
+    #[test]
+    fn deferred_metadata_preserves_legacy_and_normalized_rows_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let key = crate::SqlCipherKey::new("synthetic metadata regression").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
+        let mut expected = Vec::new();
+        for (index, id) in [9, 2, 7].into_iter().enumerate() {
+            let mut message = sample_message(mid(id), gid(1), u64::from(id));
+            message.state = MessageState::PeelDeferred;
+            message.payload = vec![id; 1024 + index];
+            message.deferred_peel = Some(DeferredPeelLifecycle {
+                first_observed_wall_ms: 10_000,
+                wall_high_water_ms: 10_400,
+                clock_instance_id: 7,
+                residence_deadline_monotonic_ms: 2_000,
+                residence_deadline_wall_ms: 11_000,
+                distinct_context_attempts: index as u32,
+                last_context_fingerprint: Some([id; 32]),
+            });
+            if index == 1 {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            message.id.as_slice(),
+                            message.group_id.as_slice(),
+                            message.epoch.0 as i64,
+                            super::message_state_to_i64(message.state),
+                            serialize(&message).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            } else {
+                store.put_message(&message).unwrap();
+            }
+            expected.push(cgka_traits::message::DeferredMessageMetadata::from(message));
+        }
+        let mut unrelated = sample_message(mid(4), gid(2), 0);
+        unrelated.state = MessageState::PeelDeferred;
+        store.put_message(&unrelated).unwrap();
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        store.promote_legacy_message_rows(2).unwrap();
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        store
+            .update_message_state(&mid(2), MessageState::Processed)
+            .unwrap();
+        expected.remove(1);
+        assert_eq!(
+            store.list_deferred_message_metadata(&gid(1)).unwrap(),
+            expected
+        );
+        store.close().unwrap();
+    }
+
+    /// Compare full-row preparation with metadata preparation in the same
+    /// encrypted database. Logical bytes exclude SQLite pages and cache effects.
+    #[test]
+    #[ignore = "explicit encrypted-storage preparation benchmark"]
+    fn deferred_metadata_file_backed_benchmark() {
+        for processed in [0, 4096] {
+            for deferred in [0, 64, 512, 2048] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("preparation.db");
+                let key = crate::SqlCipherKey::new("synthetic preparation benchmark").unwrap();
+                let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+                store
+                    .with_transaction(|tx| {
+                        for index in 0..processed + deferred {
+                            let mut message = sample_message(
+                                cgka_traits::MessageId::new((index as u64).to_be_bytes().to_vec()),
+                                gid(1),
+                                (index % 17) as u64,
+                            );
+                            message.state = if index < processed {
+                                MessageState::Processed
+                            } else {
+                                MessageState::PeelDeferred
+                            };
+                            message.payload = vec![0x71; 4096];
+                            if index >= processed {
+                                message.deferred_peel = Some(DeferredPeelLifecycle {
+                                    first_observed_wall_ms: 10_000,
+                                    wall_high_water_ms: 10_400,
+                                    clock_instance_id: 7,
+                                    residence_deadline_monotonic_ms: 2_000,
+                                    residence_deadline_wall_ms: 11_000,
+                                    distinct_context_attempts: 3,
+                                    last_context_fingerprint: Some([0xA5; 32]),
+                                });
+                            }
+                            tx.put_message(&message)?;
+                        }
+                        Ok::<_, StorageError>(())
+                    })
+                    .unwrap();
+                let mut timings = [std::time::Duration::ZERO; 2];
+                let mut full_reads = [(0, 0); 2];
+                for repetition in 0..12 {
+                    for mode in [repetition % 2, 1 - repetition % 2] {
+                        super::FULL_MESSAGE_READS.with(|stats| stats.set((0, 0)));
+                        let start = std::time::Instant::now();
+                        let count = if mode == 0 {
+                            store
+                                .list_messages_in_states(
+                                    &gid(1),
+                                    &[MessageState::PeelDeferred],
+                                    EpochId(0),
+                                )
+                                .unwrap()
+                                .len()
+                        } else {
+                            store.list_deferred_message_metadata(&gid(1)).unwrap().len()
+                        };
+                        assert_eq!(count, deferred);
+                        if repetition >= 2 {
+                            timings[mode] += start.elapsed();
+                            full_reads[mode] = super::FULL_MESSAGE_READS.with(|stats| stats.get());
+                        }
+                    }
+                }
+                eprintln!(
+                    "deferred_preparation processed={processed} deferred={deferred} payload_bytes=4096 epochs=17 samples=10 full_avg_us={} metadata_avg_us={} full_rows={} full_blob_bytes={} metadata_full_rows={} metadata_full_blob_bytes={}",
+                    timings[0].as_micros() / 10,
+                    timings[1].as_micros() / 10,
+                    full_reads[0].0,
+                    full_reads[0].1,
+                    full_reads[1].0,
+                    full_reads[1].1
+                );
+                store.close().unwrap();
+                assert_ne!(&std::fs::read(&path).unwrap()[..16], b"SQLite format 3\0");
+            }
+        }
+    }
 
     fn application_event(message_id: cgka_traits::MessageId) -> GroupEvent {
         GroupEvent::MessageReceived {
