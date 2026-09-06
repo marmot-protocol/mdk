@@ -143,7 +143,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 
 - **Module:** `conformance_snapshot.rs` (feature `test-conformance-snapshot`)
   - **Owns:** privacy-safe exact canonical-state (live MLS state or authenticated terminal disband tombstone) and
-    aggregate pending-work projections consumed only by the conformance simulator. Terminal equality excludes
+    aggregate pending-work projections consumed only by the conformance simulator. Structural progress includes
+    completed distinct-context attempts on retained raw rows, so bounded retry work is visible even when row counts
+    are unchanged. Terminal equality excludes
     device-local authorship metadata. These diagnostics never feed protocol selection or production telemetry.
 
 - **Module:** `distributed_convergence.rs`
@@ -378,6 +380,14 @@ clears only once every retained row has tried the final context fingerprint. Unc
 advance commits and prune the only epoch state that decrypts later raw application rows. Live ingest retains its
 immediate drain behavior; application routing still depends on captured branch contexts. The Current-profile saved
 368-message regression and its natural-order control live in the simulator's `tests/offline_catchup_regression.rs`.
+
+**Background recovery responsiveness.** One background advance shares a 64-row allowance and a cooperative
+500-ms budget across its reprocessing loop. Return pending at complete operation boundaries; do not cancel a
+snapshot guard or advance a partially tried generation. Foreground send budgets retain their separate semantics.
+Historical anchor peel contexts are materialized lazily once per bounded sweep and dropped with it; they preserve
+snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
+when canonical/candidate context is invalidated; never persist this secret-bearing cache or extend epoch retention.
+Tests: `tests/deferred_peel_lifecycle.rs` covers budget yield, restart and eventual completion.
 
 **Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
 not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical

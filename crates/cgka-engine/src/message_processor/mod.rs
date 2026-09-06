@@ -138,6 +138,10 @@ pub const MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP: usize = 256;
 /// events are never blocked behind irrelevant history.
 pub(crate) const MAX_DEFERRED_ROWS_PER_SWEEP: usize = 64;
 
+/// Cooperative budget for one background convergence call. Stop only between
+/// complete row/MLS operations; never cancel a live snapshot rollback guard.
+pub const BACKGROUND_CONVERGENCE_BUDGET_MS: u64 = 500;
+
 /// Maximum deferred-history work admitted to one foreground outbound
 /// preflight (mdk#1176). The time bound is cooperative for synchronous storage
 /// and MLS operations already in progress; asynchronous peel waits receive
@@ -377,7 +381,10 @@ impl ForegroundPeelBudget {
 
 enum DeferredPeelExecution<'a> {
     Foreground(&'a mut ForegroundPeelBudget),
-    Background,
+    Background {
+        deadline: Option<Instant>,
+        rows_remaining: usize,
+    },
 }
 
 impl DeferredPeelExecution<'_> {
@@ -396,24 +403,35 @@ impl DeferredPeelExecution<'_> {
     fn row_limit(&self) -> usize {
         match self {
             Self::Foreground(budget) => budget.rows_remaining,
-            Self::Background => MAX_DEFERRED_ROWS_PER_SWEEP,
+            Self::Background { rows_remaining, .. } => *rows_remaining,
         }
     }
 
     fn exhausted(&self) -> bool {
-        matches!(self, Self::Foreground(budget) if budget.exhausted())
+        match self {
+            Self::Foreground(budget) => budget.exhausted(),
+            Self::Background {
+                deadline,
+                rows_remaining,
+            } => {
+                *rows_remaining == 0 || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            }
+        }
     }
 
     fn consume_row(&mut self) {
-        if let Self::Foreground(budget) = self {
-            budget.consume_row();
+        match self {
+            Self::Foreground(budget) => budget.consume_row(),
+            Self::Background { rows_remaining, .. } => {
+                *rows_remaining = rows_remaining.saturating_sub(1)
+            }
         }
     }
 
     fn remaining(&self) -> Option<Duration> {
         match self {
             Self::Foreground(budget) => budget.remaining(),
-            Self::Background => None,
+            Self::Background { .. } => None,
         }
     }
 }
@@ -1234,7 +1252,12 @@ impl<S: StorageProvider> Engine<S> {
             self.advance_convergence_inputs_with_execution(
                 group_id,
                 now_ms,
-                DeferredPeelExecution::Background,
+                DeferredPeelExecution::Background {
+                    deadline: Some(
+                        Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)
+                    ),
+                    rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+                },
             )
             .await?,
             AdvanceConvergenceStatus::Settled
@@ -1261,13 +1284,19 @@ impl<S: StorageProvider> Engine<S> {
             .get(group_id)
             .is_some_and(|state| state.yield_for_transport_redelivery);
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
+            if matches!(execution, DeferredPeelExecution::Background { .. })
+                && execution.exhausted()
+            {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(AdvanceConvergenceStatus::Pending);
+            }
             // A background quantum must return to transport admission after
             // advancing the epoch. Capacity-refused input is still owned by
             // the transport: sweeping the admitted suffix all the way to its
             // tip can prune the context needed by that missing prefix before
             // the caller gets another opportunity to redeliver it.
             if yield_for_transport_redelivery
-                && matches!(execution, DeferredPeelExecution::Background)
+                && matches!(execution, DeferredPeelExecution::Background { .. })
                 && self.storage.get_group(group_id)?.epoch != initial_epoch
             {
                 self.schedule_pending_convergence_group(group_id);
@@ -1309,7 +1338,12 @@ impl<S: StorageProvider> Engine<S> {
                 execution.finish_phase();
                 let peel = peel?;
                 if peel.status == DeferredPeelWorkStatus::BudgetExhausted {
-                    return Ok(AdvanceConvergenceStatus::ForegroundBudgetExhausted);
+                    self.schedule_pending_convergence_group(group_id);
+                    return Ok(if record_outbound_phases {
+                        AdvanceConvergenceStatus::ForegroundBudgetExhausted
+                    } else {
+                        AdvanceConvergenceStatus::Pending
+                    });
                 }
                 let fairness_slot_available =
                     self.storage
@@ -1332,7 +1366,12 @@ impl<S: StorageProvider> Engine<S> {
             let peel = peel?;
             match peel.status {
                 DeferredPeelWorkStatus::BudgetExhausted => {
-                    return Ok(AdvanceConvergenceStatus::ForegroundBudgetExhausted);
+                    self.schedule_pending_convergence_group(group_id);
+                    return Ok(if record_outbound_phases {
+                        AdvanceConvergenceStatus::ForegroundBudgetExhausted
+                    } else {
+                        AdvanceConvergenceStatus::Pending
+                    });
                 }
                 DeferredPeelWorkStatus::Pending => continue,
                 DeferredPeelWorkStatus::Complete => {
@@ -1562,7 +1601,10 @@ impl<S: StorageProvider> Engine<S> {
     /// [`Self::retry_deferred_peels_with_execution`] with the stricter
     /// 250 ms/four-attempt budget (mdk#1176).
     pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
-        let mut execution = DeferredPeelExecution::Background;
+        let mut execution = DeferredPeelExecution::Background {
+            deadline: None,
+            rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+        };
         Ok(self
             .retry_deferred_peels_with_execution(group_id, &mut execution)
             .await?
@@ -1578,7 +1620,7 @@ impl<S: StorageProvider> Engine<S> {
         self.engine_metrics.note_deferred_peel_sweep();
         let foreground_budget_ms = match execution {
             DeferredPeelExecution::Foreground(budget) => Some(budget.budget_ms),
-            DeferredPeelExecution::Background => None,
+            DeferredPeelExecution::Background { .. } => None,
         };
         // A quarantined group has no epoch_manager entry, so the Stable gate
         // below would fall through and re-ingest its retained rows against
@@ -1911,7 +1953,9 @@ impl<S: StorageProvider> Engine<S> {
             cache_hit = candidate_cache_hit,
             "deferred-peel candidate cache lookup"
         );
-        let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel);
+        let past_contexts = crate::message_processor::ingest::PastPeelContextCache::default();
+        let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
+            .with_past_contexts(&past_contexts);
 
         let mut progressed = 0usize;
         let mut terminal = 0usize;

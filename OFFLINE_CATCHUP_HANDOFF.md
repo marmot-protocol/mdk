@@ -1,10 +1,82 @@
 # Offline catch-up: work-in-progress checkpoint
 
-**Small app projection defect fixed; 1,024-message public recovery remains unresolved.**
+**Projection and background recovery responsiveness fixed locally; the strict 1,024-message public gate now passes twice.**
 
 Working branch: `codex/fix-offline-catchup-continued`.
 Base: `565bbb2f36c5f8a7d4715c225f0067358de7aca7` from `codex/fix-offline-catchup`.
 The original checkout `/Volumes/Worktrees/codex/69d9/mdk` was preserved. Its uncommitted prototype was copied here before further work. The signed checkpoint commit is `77356248bddddf13e3498a68fec2513d7b458b72`; no push has been made.
+
+## Background recovery fix after checkpoint (2026-09-06)
+
+This checkpoint captures the fixes after signed checkpoint `775e6459`. Background advance now shares a 64-row
+allowance across all reprocessing sweeps and a cooperative 500-ms deadline. It yields only after complete
+operations, reschedules remaining work, and retains the durable generation barrier before epoch settlement.
+Foreground preflight semantics, key retention, raw backlog limits and app query deadlines are unchanged.
+
+Historical peel contexts are now materialized lazily once per bounded sweep, preserving snapshot provenance and
+historical retention policy. Live group storage is restored before awaiting the peeler; owned contexts are dropped
+when the sweep ends. Canonical/candidate invalidation stops the sweep. This avoids repeating the same SQL snapshot
+and restore work for every opaque message. No SQLCipher library or storage durability change is involved.
+
+The production-policy public gate passes twice in 213.53 and 215.27 seconds. Both runs recover every original
+payload by repair pass 11 (zero-based), agree at epoch 22, pass fresh traffic from all four members, and retain the
+complete recipient timeline after restart. Terminal observations contain 1,047 timeline events per participant,
+including workload, setup and follow-up events. Close reports have no errors; no native crash occurred. The six
+basic public journeys pass in 108.49 seconds; the small offline canary passes in 84.43 seconds. The large test
+remains an explicit slow gate; skipping it is not evidence of recovery. The input, repair/reopen allowance and
+success assertions were not weakened.
+
+A stricter engine cross-check exposed a harness false stall: eight bounded slices completed 512 distinct-context
+attempts (1,086 to 1,598) without changing raw-row count or epoch. The conformance-only structural snapshot and
+local drain guard now include that durable attempt aggregate. A new guard regression permits this progress while
+still rejecting an identical state; all twelve neighboring guard tests pass. All four original engine regressions
+(368 and 1,024 messages, natural and reverse history) pass in 166.13 seconds, retaining exact state, payload,
+decryptability and no-pending-work assertions. The new background execution constant is registered on the required
+ledger surfaces; the ledger gate and all five protocol-decision tests pass.
+
+Three engine regressions cover cross-sweep work limits with restart, elapsed-time yielding with eventual completion,
+and historical materialization cost for 1 versus 32 opaque rows. The full engine suite passed 530 tests before the
+final conformance-only observation addition; afterward all 28 deferred-peel tests and three conformance snapshot
+unit tests passed. The evidence report records exact commands and verification boundaries.
+
+Limits: the 500-ms budget is cooperative, not cancellation of a synchronous MLS/storage operation. Two local
+app runs do not establish device performance, arbitrary backlog sizes or broad real-relay coverage. Public
+send/leave epoch-oracle investigation and publication/invite fault campaigns remain separate follow-ups.
+There is no new general SQLCipher production fix: the earlier finding was unsafe diagnostic teardown, described
+below. No push or full workspace CI run has been performed for this change.
+
+Evidence, commands, logs, source patches, binary hashes and public observation checkpoints:
+`target/background-recovery-20260906/REPORT.md`. The following sections preserve the pre-fix investigation.
+
+## Worker timeout investigation after projection checkpoint (2026-09-06)
+
+Signed checkpoint `775e6459` captures the projection fix, public family expansion and regressions together;
+its signature is verified locally and it has not been pushed. Investigation source is unchanged from that commit;
+temporary aggregate timing hooks were archived and removed after building a frozen diagnostic executable.
+
+A sampled 1,024-message public rerun reproduces the member-query timeout at repair pass 1 (263.93 seconds).
+The final recipient snapshot has 196/1,024 messages at epoch 7; peers are complete at epoch 22. No captured
+background storage errors, teardown errors or native crash. Ten three-second process samples identify the busy
+path as engine convergence -> deferred peeling -> historical snapshot fallback. Each message can repeatedly
+save live group state, restore a past snapshot, load/derive its peel context, try decryption and restore live state.
+The samples show substantial SQL snapshot/WAL commit work, not evidence of a SQLCipher crash or lock deadlock.
+`retry_on_busy` is also the normal wrapper name; its presence does not prove busy retries.
+
+The 64-row limit applies to a sweep; background advance can chain 16 sweeps with no elapsed-time budget. A
+separate temporary timing probe has measured a single advance call at 11.624 seconds, followed by 149 ms of app
+projection. That already exceeds the 10-second member-query deadline. The worker cannot serve commands inside
+that call. Biased timer-before-command priority may compound the delay, but it is not necessary to explain a
+single overlong call. The final timing run fails at repair pass 3 (248.35 seconds), with Bob at 576/1,024
+messages and epoch 13. A query timeout at elapsed 237.865 seconds falls inside an 11.331-second engine call
+(start 227.179, end 238.510); app projection follows in 181 ms. This directly confirms a query can expire while
+engine recovery still owns the worker. No captured background storage errors, close errors or native crash.
+
+Next controlled fix: reuse historical contexts within a bounded sweep instead of reconstructing them for each
+message, preserving snapshot provenance, retention decisions and context invalidation. Also bound the complete
+background work call with safe durable stopping points. Keep the durable generation barrier and existing epoch
+retention; do not abort inside a rollback guard, weaken database durability, increase the query timeout, or relax
+the regression oracle. Investigate broader command fairness separately if delay persists after bounded work.
+Evidence, source/binary provenance and exact sample counts: `target/worker-timeout-20260906/REPORT.md`.
 
 ## Four-message app projection fix (2026-09-06)
 

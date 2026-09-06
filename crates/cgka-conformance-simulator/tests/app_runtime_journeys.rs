@@ -469,7 +469,7 @@ journey_test!(public_app_05_restart_and_continue_messaging, Restart);
 journey_test!(public_app_06_small_offline_backlog, Offline);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known unresolved public recovery failure; explicit slow gate, see APP_PATH_COVERAGE.md"]
+#[ignore = "explicit slow recovery gate; see APP_PATH_COVERAGE.md"]
 async fn public_app_1024_message_backlog_recovers_completely() {
     check(Journey::LargeBacklog).await;
 }

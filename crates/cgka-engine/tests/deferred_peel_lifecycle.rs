@@ -213,6 +213,7 @@ struct NotifyEpochGatePeeler {
 struct CancellableEpochSealedPeeler {
     blocked: Arc<AtomicBool>,
     blocked_attempts: Arc<AtomicU64>,
+    delay_ms: Arc<AtomicU64>,
 }
 
 impl CancellableEpochSealedPeeler {
@@ -220,6 +221,7 @@ impl CancellableEpochSealedPeeler {
         Self {
             blocked: Arc::new(AtomicBool::new(false)),
             blocked_attempts: Arc::new(AtomicU64::new(0)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -247,6 +249,10 @@ impl TransportPeeler for CancellableEpochSealedPeeler {
         if self.blocked.load(Ordering::SeqCst) {
             self.blocked_attempts.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;
+        }
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         EpochSealedPeeler.peel_group_message(msg, ctx).await
     }
@@ -2402,5 +2408,144 @@ async fn deferred_peel_self_evicted_row_stays_failed_not_swept_processed() {
         MessageState::Failed,
         "a row we were evicted on must stay Failed after the deferred-peel \
          sweep, not be swept into canonicalization as Processed"
+    );
+}
+
+/// The public background advance used to multiply the 64-row sweep allowance
+/// by its outer reprocessing loop. One call must now return with a durable
+/// partial generation, and restart must be able to finish every retained row.
+#[tokio::test]
+async fn background_advance_bounds_work_across_sweeps_and_resumes_after_restart() {
+    let (mut engine, storage, group_id, _peer) = contested_rival_app_backlog(192).await;
+    engine.advance_convergence(&group_id).await.unwrap();
+    let remaining = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len();
+    assert!(
+        (128..192).contains(&remaining),
+        "one background call must process at most 64 rows and make progress: {remaining}"
+    );
+    assert!(
+        storage
+            .deferred_peel_generation(&group_id)
+            .unwrap()
+            .is_some()
+    );
+    drop(engine);
+    let mut restarted =
+        build_epoch_sealed_client_with_storage(b"candidate-cache-incumbent", storage.clone());
+    restarted.hydrate_all_stored_groups().unwrap();
+    for _ in 0..12 {
+        restarted.advance_convergence(&group_id).await.unwrap();
+        if storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+    }
+    panic!("bounded calls must eventually finish the durable backlog after restart");
+}
+
+/// A slow but finite peeler must finish its current row and then give control
+/// back to the host, rather than using the whole 64-row allowance past deadline.
+#[tokio::test]
+async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
+    let peeler = CancellableEpochSealedPeeler::new();
+    let (mut engine, storage, group_id, _peer) =
+        contested_rival_app_backlog_with_peeler(64, peeler.clone()).await;
+    peeler.delay_ms.store(40, Ordering::SeqCst);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine.advance_convergence(&group_id),
+    )
+    .await
+    .expect("background call should stop cooperatively")
+    .unwrap();
+    let remaining = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len();
+    assert!(
+        (1..64).contains(&remaining),
+        "elapsed budget must return with partial durable progress: {remaining}"
+    );
+    peeler.delay_ms.store(0, Ordering::SeqCst);
+    for _ in 0..8 {
+        engine.advance_convergence(&group_id).await.unwrap();
+        if storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+    }
+    panic!("budget yield must not abandon remaining rows");
+}
+
+/// Opaque future messages all try the same retained past anchor. Snapshot
+/// materialization must be proportional to anchors in the sweep, not rows.
+#[tokio::test]
+async fn historical_peel_context_materialization_is_amortized_within_a_sweep() {
+    use cgka_traits::storage::{GroupStorage, StorageProvider};
+    let mut write_counts = Vec::new();
+    for backlog in [1, 32] {
+        let (mut alice, mut carol, storage, peeler, group_id, commit2, _commit3) =
+            carol_behind_two_epochs().await;
+        carol.ingest(commit2).await.unwrap();
+        assert_eq!(storage.get_group(&group_id).unwrap().epoch, EpochId(2));
+        let template = send_app(&mut alice, &group_id, "future opaque workload").await;
+        let mut ids = Vec::new();
+        for index in 0..backlog {
+            let wrapped = TransportMessage {
+                id: MessageId::new(format!("past-cache-{index}").into_bytes()),
+                ..template.clone()
+            };
+            ids.push((wrapped.id.clone(), 0));
+            assert!(matches!(
+                carol.ingest(wrapped).await.unwrap(),
+                IngestOutcome::TransportDeferred { .. }
+            ));
+        }
+        for (id, attempts) in &mut ids {
+            *attempts = peeler.attempts_for(id);
+        }
+        let mut snapshots_before = storage.list_group_snapshots(&group_id).unwrap();
+        snapshots_before.sort();
+        let before = storage.mls_write_generation().unwrap();
+        carol.retry_deferred_peels(&group_id).await.unwrap();
+        let writes = storage.mls_write_generation().unwrap() - before;
+        assert!(
+            writes > 0,
+            "the sweep must actually materialize a historical anchor"
+        );
+        for (id, attempts) in ids {
+            assert!(
+                peeler.attempts_for(&id) >= attempts + 2,
+                "each row must try live and historical contexts"
+            );
+        }
+        assert_eq!(storage.get_group(&group_id).unwrap().epoch, EpochId(2));
+        let mut snapshots_after = storage.list_group_snapshots(&group_id).unwrap();
+        snapshots_after.sort();
+        assert_eq!(
+            snapshots_after, snapshots_before,
+            "temporary restore guards must be released"
+        );
+        assert_eq!(
+            storage
+                .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+                .unwrap()
+                .len(),
+            backlog
+        );
+        write_counts.push(writes);
+    }
+    assert_eq!(
+        write_counts[0], write_counts[1],
+        "32 failed peels must materialize the same anchor only once, like one failed peel"
     );
 }

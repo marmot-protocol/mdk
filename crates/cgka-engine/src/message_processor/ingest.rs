@@ -36,6 +36,8 @@ use openmls::prelude::{
     ProtocolMessage, QueuedProposal, Sender, ValidationError,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// What a deferred-peel sweep offers the ingest seam for one retained row.
@@ -52,6 +54,20 @@ use tls_codec::{Deserialize as _, Serialize as _};
 pub(crate) struct DeferredPeelSweep<'a> {
     drain: ConvergenceDrain,
     branch_contexts: &'a [CandidateBranchPeelContext],
+    past_contexts: Option<&'a PastPeelContextCache>,
+}
+
+/// Secret-bearing, single-group cache owned by one bounded sweep, never persisted.
+/// The caller stops the sweep if canonical context changes. Inactive snapshots
+/// are cached as None; failures are not cached and can be retried normally.
+#[derive(Default)]
+pub(super) struct PastPeelContextCache {
+    contexts: Mutex<HashMap<String, Option<Arc<PastPeelContext>>>>,
+}
+
+struct PastPeelContext {
+    context: cgka_traits::group_context::GroupContextSnapshot,
+    message_retention_seconds: Option<u64>,
 }
 
 impl<'a> DeferredPeelSweep<'a> {
@@ -59,13 +75,20 @@ impl<'a> DeferredPeelSweep<'a> {
     pub(crate) const LIVE: Self = Self {
         drain: ConvergenceDrain::Now,
         branch_contexts: &[],
+        past_contexts: None,
     };
 
     pub(crate) fn over_branches(peel: &'a CandidateBranchPeel) -> Self {
         Self {
             drain: ConvergenceDrain::DeferredToCaller,
             branch_contexts: &peel.contexts,
+            past_contexts: None,
         }
+    }
+
+    pub(super) fn with_past_contexts(mut self, contexts: &'a PastPeelContextCache) -> Self {
+        self.past_contexts = Some(contexts);
+        self
     }
 
     fn branch_contexts(&self) -> &'a [CandidateBranchPeelContext] {
@@ -477,7 +500,7 @@ impl<S: StorageProvider> Engine<S> {
                         msg,
                         &group_id,
                         current_epoch,
-                        sweep.branch_contexts(),
+                        sweep,
                     )
                     .await
                 {
@@ -607,7 +630,7 @@ impl<S: StorageProvider> Engine<S> {
                         msg,
                         &group_id,
                         current_epoch,
-                        sweep.branch_contexts(),
+                        sweep,
                     )
                     .await
                 {
@@ -2478,16 +2501,17 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// Branch contexts come first because they need no storage access at all —
     /// they are owned values whose exporter secret was derived while the
-    /// candidate state was materialized — whereas each anchor attempt rolls the
-    /// group back and forward again.
+    /// candidate state was materialized. A bounded sweep lazily materializes
+    /// each historical anchor once, restores live state, and reuses the owned
+    /// context until that sweep ends. Live ingest has no cross-message cache.
     async fn try_peel_group_message_from_recovery_contexts(
         &self,
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
-        branch_contexts: &[CandidateBranchPeelContext],
+        sweep: DeferredPeelSweep<'_>,
     ) -> Result<Option<PastPeelRecovery>, EngineError> {
-        for (index, branch) in branch_contexts.iter().enumerate() {
+        for (index, branch) in sweep.branch_contexts().iter().enumerate() {
             match self.peeler.peel_group_message(msg, &branch.context).await {
                 Ok(peeled) => {
                     return Ok(Some(PastPeelRecovery {
@@ -2503,8 +2527,13 @@ impl<S: StorageProvider> Engine<S> {
                 Err(err) => return Err(EngineError::Peeler(err)),
             }
         }
-        self.try_peel_group_message_from_available_snapshots(msg, group_id, current_epoch)
-            .await
+        self.try_peel_group_message_from_available_snapshots(
+            msg,
+            group_id,
+            current_epoch,
+            sweep.past_contexts,
+        )
+        .await
     }
 
     async fn try_peel_group_message_from_available_snapshots(
@@ -2512,8 +2541,8 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         group_id: &GroupId,
         current_epoch: EpochId,
+        cache: Option<&PastPeelContextCache>,
     ) -> Result<Option<PastPeelRecovery>, EngineError> {
-        use crate::snapshot_guard::SnapshotRollbackGuard;
         let snapshots = self.available_past_peel_snapshots(group_id)?;
         let mut attempt_count = 0_u64;
         for (source_epoch, snapshot_name) in snapshots {
@@ -2521,48 +2550,11 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             }
             attempt_count = attempt_count.saturating_add(1);
-            // Privacy: do not embed `group_id` or `msg.id` as hex in the
-            // snapshot name. Storage error messages and any future
-            // tracing on snapshot names would otherwise leak routing /
-            // dedup-key material that observability.md explicitly
-            // forbids.
-            let mut hasher = Sha256::new();
-            hasher.update(b"cgka-engine-peel-restore/v1");
-            hasher.update(group_id.as_slice());
-            hasher.update(current_epoch.0.to_be_bytes());
-            hasher.update(msg.id.as_slice());
-            let snapshot_digest = hasher.finalize();
-            let restore_snapshot = format!(
-                "peel-restore-{}-{}",
-                current_epoch.0,
-                hex::encode(&snapshot_digest[..8])
-            );
-            // RAII guard: rollback + release on any unwind path
-            // (panic, early error, async cancel) so the live group
-            // state never leaks past this scope as the past-snapshot
-            // state.
-            let guard = SnapshotRollbackGuard::create_group_state(
-                &self.storage,
-                group_id.clone(),
-                restore_snapshot,
-            )?;
-            let (ctx, message_retention_seconds) =
-                match self.context_from_group_snapshot(group_id, &snapshot_name) {
-                    Ok(Some(context)) => context,
-                    Ok(None) => {
-                        // Evicted-era snapshot: no exporter secret exists for
-                        // it. Restore live state and try the next snapshot.
-                        guard.commit()?;
-                        continue;
-                    }
-                    Err(err) => {
-                        // Drop on `guard` rolls back to live + releases.
-                        guard.commit()?;
-                        return Err(err);
-                    }
-                };
-            let peeled = self.peeler.peel_group_message(msg, &ctx).await;
-            guard.commit()?;
+            let context = self.past_peel_context(group_id, &snapshot_name, cache)?;
+            let Some(context) = context else {
+                continue;
+            };
+            let peeled = self.peeler.peel_group_message(msg, &context.context).await;
             match peeled {
                 Ok(peeled) => {
                     return Ok(Some(PastPeelRecovery {
@@ -2570,7 +2562,7 @@ impl<S: StorageProvider> Engine<S> {
                         source_epoch,
                         source: PeelRecoverySource::RetainedAnchor {
                             snapshot_name,
-                            message_retention_seconds,
+                            message_retention_seconds: context.message_retention_seconds,
                         },
                         attempt_count,
                     }));
@@ -2580,6 +2572,51 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(None)
+    }
+
+    fn past_peel_context(
+        &self,
+        group_id: &GroupId,
+        snapshot_name: &str,
+        cache: Option<&PastPeelContextCache>,
+    ) -> Result<Option<Arc<PastPeelContext>>, EngineError> {
+        if let Some(cache) = cache {
+            let contexts = cache
+                .contexts
+                .lock()
+                .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))?;
+            if let Some(context) = contexts.get(snapshot_name) {
+                return Ok(context.clone());
+            }
+        }
+        // Restore live state before calling an async peeler. Contexts own only
+        // the exporter material and authenticated retention policy they need.
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-peel-restore/v2");
+        hasher.update(group_id.as_slice());
+        hasher.update(snapshot_name.as_bytes());
+        let restore_snapshot = format!("peel-restore-{}", hex::encode(&hasher.finalize()[..8]));
+        let guard = SnapshotRollbackGuard::create_group_state(
+            &self.storage,
+            group_id.clone(),
+            restore_snapshot,
+        )?;
+        let context = self.context_from_group_snapshot(group_id, snapshot_name);
+        guard.commit()?;
+        let context = context?.map(|(context, message_retention_seconds)| {
+            Arc::new(PastPeelContext {
+                context,
+                message_retention_seconds,
+            })
+        });
+        if let Some(cache) = cache {
+            cache
+                .contexts
+                .lock()
+                .map_err(|_| EngineError::Backend("past peel cache poisoned".into()))?
+                .insert(snapshot_name.to_owned(), context.clone());
+        }
+        Ok(context)
     }
 
     fn has_retained_anchor_snapshot(

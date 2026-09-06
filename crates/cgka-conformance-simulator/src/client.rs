@@ -165,6 +165,7 @@ impl ScriptedConvergenceDrain {
             current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
             lifecycle: cgka_traits::engine_state::GroupLifecycleState::Stable,
             pending_work,
+            deferred_peel_completed_context_attempts: 0,
             pass_generation: Some(self.generation),
             pass_phase: Some(ConvergencePassPhase::Resolving),
             earliest_next_wake_monotonic_ms: None,
@@ -339,7 +340,8 @@ fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
 
 /// Rejects only an exact full-slice repeat of scheduled structural state.
 ///
-/// A durable pass-generation change counts as progress. More complex cycles
+/// A durable pass-generation or retained-row context-attempt change counts as
+/// progress. More complex cycles
 /// remain the scenario fixed-point driver's responsibility; this local guard
 /// exists to catch a scheduler that repeatedly re-arms the same state without
 /// turning the per-tick work bound into a convergence deadline.
@@ -374,6 +376,7 @@ fn convergence_drain_progress_key(
         current_epoch: snapshot.current_epoch,
         lifecycle: snapshot.lifecycle,
         pending_work,
+        deferred_peel_completed_context_attempts: snapshot.deferred_peel_completed_context_attempts,
         pass_generation: snapshot.pass_generation,
         pass_phase: snapshot.pass_phase,
         terminal_unrecoverable: snapshot.terminal_unrecoverable,
@@ -386,6 +389,7 @@ struct ConvergenceDrainProgressKey {
     current_epoch: u64,
     lifecycle: cgka_traits::engine_state::GroupLifecycleState,
     pending_work: cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot,
+    deferred_peel_completed_context_attempts: u64,
     pass_generation: Option<u64>,
     pass_phase: Option<ConvergencePassPhase>,
     terminal_unrecoverable: bool,
@@ -525,6 +529,31 @@ mod tests {
         .expect("a later pass generation is structural progress");
     }
 
+    /// Trying more rows under the current context is durable progress even
+    /// when all of them remain opaque and the backlog count is unchanged.
+    #[test]
+    fn completed_deferred_context_attempts_count_as_convergence_drain_progress() {
+        let mut previous = structural_progress(7);
+        previous.pending_work.stored_transport_deferred_messages = 1_024;
+        previous.deferred_peel_completed_context_attempts = 1_086;
+        let mut current = previous.clone();
+        current.deferred_peel_completed_context_attempts = 1_598;
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &previous,
+            &current,
+        )
+        .expect("512 completed distinct-context attempts are useful work");
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &current,
+            &current,
+        )
+        .expect_err("retained rows without new attempts still cannot spin");
+    }
+
     /// Twelve retained-history rounds can span an eight- plus four-pass slice.
     #[test]
     fn large_retained_history_can_continue_in_a_later_bounded_slice() {
@@ -662,6 +691,7 @@ mod tests {
             current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
             lifecycle: GroupLifecycleState::Stable,
             pending_work: ConformancePendingWorkSnapshot::default(),
+            deferred_peel_completed_context_attempts: 0,
             pass_generation: Some(pass_generation),
             pass_phase: Some(ConvergencePassPhase::Resolving),
             earliest_next_wake_monotonic_ms: None,

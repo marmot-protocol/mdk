@@ -55,6 +55,8 @@ Git commit; require a clean build and retain the exact source revision plus comm
     overrides the environment. File-backed `restart()` drops all engine/storage handles, reopens the encrypted database,
     and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
     `GroupEvolution`.
+    The per-tick no-progress guard includes durable deferred-row context attempts; an unchanged backlog count alone
+    does not mean a bounded sweep stalled. Identical durable state still fails the guard.
 
 - **Module:** `src/cross_route_scenario.rs`
   - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The

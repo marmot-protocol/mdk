@@ -10,7 +10,7 @@ In-process multi-client simulator for the CGKA engine.
   evidence, and add high-value workload families.
 - [`SCENARIO_IR.md`](SCENARIO_IR.md): canonical scenario and authoring contracts.
 - [`SCENARIOS.md`](SCENARIOS.md): fixed and generated scenario registry.
-- [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md): basic public-runtime acceptance tests and the unresolved large
+- [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md): basic public-runtime acceptance tests and the large
   offline catch-up gate.
 - [`AGENTS.md`](AGENTS.md): agent-facing code map and safe operating workflow.
 

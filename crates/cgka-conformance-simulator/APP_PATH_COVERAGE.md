@@ -1,6 +1,6 @@
 # Public app-path acceptance coverage
 
-## Large offline catch-up remains unresolved
+## Large offline catch-up regression
 
 `public_app_1024_message_backlog_recovers_completely` in
 [`tests/app_runtime_journeys.rs`](tests/app_runtime_journeys.rs) is the maintained public regression.
@@ -17,10 +17,18 @@ reopens after six unchanged transitions. A 900-second watchdog bounds the whole 
 every participant's exact payload multiset, then fresh bidirectional messaging and recipient restart persistence.
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.
 
-The test is explicitly ignored because it is slow and known unresolved. It asserts **successful recovery**, not a
-particular failure count, and is not a `should_panic` test. An ordinary green suite with this test skipped does not
-close the defect. Remove the ignore only after the bounded public recovery contract passes reliably and its runtime
-is assigned an appropriate CI lane.
+The test remains explicitly ignored because it is slow and needs an appropriate CI lane. It asserts **successful
+recovery**, not a particular failure count, and is not a `should_panic` test. An ordinary green suite with this test
+skipped is not recovery evidence; run the explicit gate.
+
+On September 6, the worker-responsiveness fix passed this unchanged recovery contract twice. Background engine
+advance now shares a 64-row allowance and a cooperative 500-ms budget across sweeps; historical peel contexts
+are materialized once per sweep and released afterward. All 1,024 original payloads recovered, all four participants
+agreed at epoch 22, fresh messaging passed, and the recipient retained the complete timeline after restart.
+Both runs closed cleanly. The small offline canary and all six basic public journeys also passed. Evidence and
+executable provenance: `target/background-recovery-20260906/`. These are local production-policy runs over a
+loopback relay and encrypted databases, not device or broad real-relay campaign validation. The budget is
+cooperative between complete operations; one synchronous operation can exceed it.
 
 The cap-only experiment on base `565bbb2f36c5f8a7d4715c225f0067358de7aca7`, with the raw-row cap changed from
 512 to 2,048, passed the 368/1,024 reversed engine regressions but recovered only 320/1,024 messages in the public

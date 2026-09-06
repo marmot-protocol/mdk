@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-08-24
+updated: 2026-09-06
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -38,6 +38,10 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 
 - **Distributed convergence** — deterministic branch selection for unordered transport input, including the durable
   frozen-pass boundary, in [`../distributed-convergence.md`](../distributed-convergence.md)
+- **Bounded offline recovery** — background deferred peeling shares a row/time budget and reuses historical
+  contexts within each sweep. The local public app regression recovers all 1,024 backlog messages, exchanges fresh
+  traffic and preserves the timeline after restart; see
+  [`APP_PATH_COVERAGE.md`](../../../crates/cgka-conformance-simulator/APP_PATH_COVERAGE.md) for scope and evidence.
 
 **In PR / design:**
 

@@ -47,7 +47,13 @@ async fn check_history(order: ScenarioRelayOrderV2, overflow: bool) {
         report
             .step_log
             .iter()
-            .all(|step| matches!(step.status, ScenarioStepStatus::Completed))
+            .all(|step| matches!(step.status, ScenarioStepStatus::Completed)),
+        "incomplete steps: {:?}",
+        report
+            .step_log
+            .iter()
+            .filter(|step| !matches!(step.status, ScenarioStepStatus::Completed))
+            .collect::<Vec<_>>()
     );
     assert!(report.oracle.weak_oracle_warnings.is_empty());
     assert!(
