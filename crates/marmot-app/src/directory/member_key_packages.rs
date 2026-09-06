@@ -663,6 +663,69 @@ impl MarmotApp {
                 }
             }
         }
+
+        // NIP-65 write relays are the target account's outboxes. Reconcile a
+        // current kind-10050 from those outboxes even when the discovery relay
+        // already returned an older inbox list. Keep this set operation bounded
+        // and preserve positive first-hop metadata if an outbox is unavailable;
+        // only an unconfirmed empty result becomes a typed relay error.
+        let second_hop_specs = needs_discovery
+            .into_iter()
+            .filter_map(|index| {
+                let endpoints = self.retain_safe_discovered_endpoints(
+                    targets[index]
+                        .relay_lists
+                        .nip65
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "member inbox outbox discovery",
+                );
+                (!endpoints.is_empty()).then_some((
+                    index,
+                    targets[index].account_id_hex.clone(),
+                    endpoints,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let app = self.clone();
+        let work = second_hop_specs
+            .into_iter()
+            .map(move |(index, account_id, endpoints)| {
+                let app = app.clone();
+                async move {
+                    let result = app
+                        .fetch_account_relay_list_status_for_account_id(&account_id, endpoints)
+                        .await;
+                    (index, result)
+                }
+            });
+        let second_hop_results = stream::iter(work)
+            .buffered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (index, result) in second_hop_results {
+            match result {
+                Ok(status) => {
+                    targets[index].relay_lists =
+                        merge_member_relay_lists(targets[index].relay_lists.clone(), status);
+                    failures.retain(|(failed_index, _)| *failed_index != index);
+                }
+                Err(error) if targets[index].relay_lists.inbox.relays.is_empty() => {
+                    if !failures
+                        .iter()
+                        .any(|(failed_index, _)| *failed_index == index)
+                    {
+                        failures.push((index, error));
+                    }
+                }
+                Err(_) => {
+                    failures.retain(|(failed_index, _)| *failed_index != index);
+                }
+            }
+        }
         failures
     }
 

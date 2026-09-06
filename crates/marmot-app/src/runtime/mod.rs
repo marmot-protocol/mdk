@@ -5759,7 +5759,7 @@ impl AccountManager {
     ) -> Option<AccountRelayListStatus> {
         let status = match self
             .app
-            .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
+            .resolve_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
             .await
         {
             Ok(status) => status,
@@ -5955,7 +5955,7 @@ impl AccountManager {
                         &self.shared.app_performance_telemetry(),
                         ACCOUNT_SETUP_ADVISORY_WAIT,
                         "import_relay_list_status",
-                        self.app.fetch_account_relay_list_status_for_account_id(
+                        self.app.resolve_account_relay_list_status_for_account_id(
                             &account.account_id_hex,
                             bootstrap.bootstrap_relays.clone(),
                         ),
@@ -6018,7 +6018,7 @@ impl AccountManager {
                 return Err(AppError::MissingDefaultRelays);
             }
             self.app
-                .fetch_account_relay_list_status_for_account_id(
+                .resolve_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     bootstrap_relays,
                 )

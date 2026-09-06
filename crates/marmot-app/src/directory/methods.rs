@@ -142,6 +142,46 @@ impl MarmotApp {
         Ok(status)
     }
 
+    /// Resolve an account's relay metadata through its advertised NIP-65
+    /// write relays before treating a kind-10050 inbox list as absent.
+    ///
+    /// The explicit fetch API above intentionally remains a one-hop diagnostic
+    /// primitive. Production account setup uses this target-aware wrapper so a
+    /// discovery relay (`D`) can point at an outbox (`W`) that owns the current
+    /// inbox declaration. If the second hop fails, already-observed positive
+    /// inbox metadata remains usable; an empty first hop is not promoted into
+    /// authoritative absence.
+    pub(crate) async fn resolve_account_relay_list_status_for_account_id(
+        &self,
+        account_id_hex: &str,
+        discovery_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let first_hop = self
+            .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
+            .await?;
+        let outbox_relays = self.retain_safe_discovered_endpoints(
+            first_hop
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "account inbox outbox discovery",
+        );
+        if outbox_relays.is_empty() {
+            return Ok(first_hop);
+        }
+        match self
+            .fetch_account_relay_list_status_for_account_id(account_id_hex, outbox_relays)
+            .await
+        {
+            Ok(status) => Ok(status),
+            Err(_) if !first_hop.inbox.relays.is_empty() => Ok(first_hop),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn fetch_current_account_relay_list_status_for_account_id(
         &self,
         account_id_hex: &str,

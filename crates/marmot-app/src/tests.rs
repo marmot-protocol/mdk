@@ -300,6 +300,8 @@ pub(crate) struct ScriptedPushRelayClient {
 struct MemberResolutionDirectoryFetcher {
     requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    events_by_endpoint:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
@@ -335,7 +337,18 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let events = self.events.lock().unwrap().clone();
+        let endpoint_events = self.events_by_endpoint.lock().unwrap();
+        let events = if endpoint_events.is_empty() {
+            self.events.lock().unwrap().clone()
+        } else {
+            request
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint_events.get(&endpoint.0))
+                .flatten()
+                .cloned()
+                .collect()
+        };
         Ok(events
             .into_iter()
             .filter(|event| {
@@ -7495,6 +7508,75 @@ async fn member_resolution_fixture(
     }
     app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(relay, fetcher.clone());
     (directory, app, accounts, fetcher)
+}
+
+#[tokio::test]
+/// Relay-list resolution follows the target account's NIP-65 write relay for
+/// kind 10050 instead of treating a successful first-hop miss as absence.
+async fn member_inbox_is_resolved_on_discovered_outbox() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    let events = fetcher.events.lock().unwrap().clone();
+    let mut first_hop = events
+        .iter()
+        .filter(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .cloned()
+        .collect::<Vec<_>>();
+    first_hop.push(NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec![
+            "r".into(),
+            "wss://outbox.example".into(),
+            "write".into(),
+        ]],
+        String::new(),
+    ));
+    let outbox_events = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                KIND_MARMOT_KEY_PACKAGE | KIND_MARMOT_INBOX_RELAY_LIST
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    fetcher.events_by_endpoint.lock().unwrap().extend([
+        ("wss://directory.example".to_owned(), first_hop.clone()),
+        ("wss://shared.example".to_owned(), first_hop),
+        ("wss://outbox.example".to_owned(), outbox_events),
+    ]);
+
+    let resolution = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await;
+    assert!(
+        resolution.is_ok(),
+        "member preflight must follow the advertised outbox: {resolution:?}; requests={:?}",
+        fetcher.requests.lock().unwrap()
+    );
+
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.0 == "wss://outbox.example")
+            && request.queries.iter().any(|query| {
+                query.kind == KIND_MARMOT_INBOX_RELAY_LIST && query.authors.contains(&account_id)
+            })
+    }));
+    assert!(
+        app.directory_entry_for_account_id(&account_id)
+            .unwrap()
+            .is_some_and(|entry| entry
+                .relay_lists
+                .inbox
+                .relays
+                .iter()
+                .any(|relay| relay == "wss://shared.example"))
+    );
 }
 
 #[tokio::test]
