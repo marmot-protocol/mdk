@@ -145,6 +145,7 @@ typedef enum MarmotOnboardingStep {
   MARMOT_ONBOARDING_STEP_RELAYS,
   MARMOT_ONBOARDING_STEP_INBOX_RELAYS,
   MARMOT_ONBOARDING_STEP_KEY_PACKAGE,
+  MARMOT_ONBOARDING_STEP_SINGLE_DEVICE,
 } MarmotOnboardingStep;
 
 typedef enum MarmotOnboardingStatus {
@@ -176,6 +177,9 @@ typedef enum MarmotOnboardingIssue {
   MARMOT_ONBOARDING_ISSUE_RECORD_CHANGED,
   MARMOT_ONBOARDING_ISSUE_INTERRUPTED,
   MARMOT_ONBOARDING_ISSUE_TOO_MANY_RELAYS,
+  MARMOT_ONBOARDING_ISSUE_MULTI_DEVICE_UNSUPPORTED,
+  MARMOT_ONBOARDING_ISSUE_OTHER_INSTALLATION_POSSIBLE,
+  MARMOT_ONBOARDING_ISSUE_DISCOVERY_INCOMPLETE,
 } MarmotOnboardingIssue;
 
 typedef enum MarmotOnboardingAction {
@@ -189,7 +193,15 @@ typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_CANCEL_REPAIR,
   MARMOT_ONBOARDING_ACTION_RECONNECT_SIGNER,
   MARMOT_ONBOARDING_ACTION_EDIT_DISCOVERY_RELAYS,
+  MARMOT_ONBOARDING_ACTION_CONTINUE_ANYWAY,
+  MARMOT_ONBOARDING_ACTION_CANCEL_ONBOARDING,
 } MarmotOnboardingAction;
+
+typedef enum MarmotOnboardingDeviceDiscovery {
+  MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
+  MARMOT_ONBOARDING_DEVICE_DISCOVERY_OTHER_INSTALLATION_POSSIBLE,
+  MARMOT_ONBOARDING_DEVICE_DISCOVERY_UNKNOWN,
+} MarmotOnboardingDeviceDiscovery;
 
 /**
  * Which relay list is missing from an incomplete account relay setup.
@@ -891,6 +903,26 @@ typedef struct MarmotOnboardingRepairProposal {
   struct MarmotStringList *follows;
 } MarmotOnboardingRepairProposal;
 
+typedef struct MarmotOnboardingDevicePackage {
+  char *slot_id;
+  char *key_package_ref_hex;
+  char *event_id_hex;
+  uint64_t published_at;
+  uint64_t expires_at;
+} MarmotOnboardingDevicePackage;
+
+typedef struct MarmotOnboardingSingleDeviceNotice {
+  enum MarmotOnboardingDeviceDiscovery discovery;
+  struct MarmotOnboardingDevicePackage *other_packages;
+  uintptr_t other_packages_len;
+  bool discovery_complete;
+  bool has_acknowledged_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t acknowledged_at;
+} MarmotOnboardingSingleDeviceNotice;
+
 typedef struct MarmotOnboardingSnapshot {
   char *account_id_hex;
   uint64_t revision;
@@ -898,6 +930,7 @@ typedef struct MarmotOnboardingSnapshot {
   struct MarmotOnboardingStepState *steps;
   uintptr_t steps_len;
   struct MarmotOnboardingRepairProposal *proposal;
+  struct MarmotOnboardingSingleDeviceNotice *single_device_notice;
 } MarmotOnboardingSnapshot;
 
 /**
@@ -3867,6 +3900,20 @@ MarmotStatus marmot_set_onboarding_discovery_relays(const struct MarmotClient *c
                                                     const char *const *discovery_relays,
                                                     uintptr_t discovery_relays_len,
                                                     struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Acknowledge the displayed one-device notice and resume setup.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_onboarding_single_device(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         uint64_t revision,
+                                                         struct MarmotOnboardingSnapshot **out);
 
 /**
  * List every account known to this device. Free the result with

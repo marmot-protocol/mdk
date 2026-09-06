@@ -21,6 +21,8 @@ status: overview
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
+It requires single-device acknowledgment before KeyPackage publication and offers
+advisory detection of packages that may belong to another installation.
 Account onboarding gates normal worker commands until required checks and
 KeyPackage publication complete. Host apps still need to adopt the identity-only
 entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).

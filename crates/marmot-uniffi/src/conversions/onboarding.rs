@@ -8,6 +8,7 @@ pub enum OnboardingStepFfi {
     Relays,
     InboxRelays,
     KeyPackage,
+    SingleDevice,
 }
 impl From<marmot_app::OnboardingStep> for OnboardingStepFfi {
     fn from(value: marmot_app::OnboardingStep) -> Self {
@@ -17,6 +18,7 @@ impl From<marmot_app::OnboardingStep> for OnboardingStepFfi {
             marmot_app::OnboardingStep::Relays => Self::Relays,
             marmot_app::OnboardingStep::InboxRelays => Self::InboxRelays,
             marmot_app::OnboardingStep::KeyPackage => Self::KeyPackage,
+            marmot_app::OnboardingStep::SingleDevice => Self::SingleDevice,
         }
     }
 }
@@ -28,6 +30,7 @@ impl From<OnboardingStepFfi> for marmot_app::OnboardingStep {
             OnboardingStepFfi::Relays => Self::Relays,
             OnboardingStepFfi::InboxRelays => Self::InboxRelays,
             OnboardingStepFfi::KeyPackage => Self::KeyPackage,
+            OnboardingStepFfi::SingleDevice => Self::SingleDevice,
         }
     }
 }
@@ -87,6 +90,9 @@ pub enum OnboardingIssueFfi {
     RecordChanged,
     Interrupted,
     TooManyRelays,
+    MultiDeviceUnsupported,
+    OtherInstallationPossible,
+    DiscoveryIncomplete,
 }
 impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
     fn from(value: marmot_app::OnboardingIssue) -> Self {
@@ -109,6 +115,11 @@ impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
             marmot_app::OnboardingIssue::RecordChanged => Self::RecordChanged,
             marmot_app::OnboardingIssue::Interrupted => Self::Interrupted,
             marmot_app::OnboardingIssue::TooManyRelays => Self::TooManyRelays,
+            marmot_app::OnboardingIssue::MultiDeviceUnsupported => Self::MultiDeviceUnsupported,
+            marmot_app::OnboardingIssue::OtherInstallationPossible => {
+                Self::OtherInstallationPossible
+            }
+            marmot_app::OnboardingIssue::DiscoveryIncomplete => Self::DiscoveryIncomplete,
         }
     }
 }
@@ -133,6 +144,9 @@ impl From<OnboardingIssueFfi> for marmot_app::OnboardingIssue {
             OnboardingIssueFfi::RecordChanged => Self::RecordChanged,
             OnboardingIssueFfi::Interrupted => Self::Interrupted,
             OnboardingIssueFfi::TooManyRelays => Self::TooManyRelays,
+            OnboardingIssueFfi::MultiDeviceUnsupported => Self::MultiDeviceUnsupported,
+            OnboardingIssueFfi::OtherInstallationPossible => Self::OtherInstallationPossible,
+            OnboardingIssueFfi::DiscoveryIncomplete => Self::DiscoveryIncomplete,
         }
     }
 }
@@ -148,6 +162,8 @@ pub enum OnboardingActionFfi {
     CancelRepair,
     ReconnectSigner,
     EditDiscoveryRelays,
+    ContinueAnyway,
+    CancelOnboarding,
 }
 impl From<marmot_app::OnboardingAction> for OnboardingActionFfi {
     fn from(value: marmot_app::OnboardingAction) -> Self {
@@ -162,6 +178,8 @@ impl From<marmot_app::OnboardingAction> for OnboardingActionFfi {
             marmot_app::OnboardingAction::CancelRepair => Self::CancelRepair,
             marmot_app::OnboardingAction::EditDiscoveryRelays => Self::EditDiscoveryRelays,
             marmot_app::OnboardingAction::ReconnectSigner => Self::ReconnectSigner,
+            marmot_app::OnboardingAction::ContinueAnyway => Self::ContinueAnyway,
+            marmot_app::OnboardingAction::CancelOnboarding => Self::CancelOnboarding,
         }
     }
 }
@@ -178,6 +196,8 @@ impl From<OnboardingActionFfi> for marmot_app::OnboardingAction {
             OnboardingActionFfi::CancelRepair => Self::CancelRepair,
             OnboardingActionFfi::EditDiscoveryRelays => Self::EditDiscoveryRelays,
             OnboardingActionFfi::ReconnectSigner => Self::ReconnectSigner,
+            OnboardingActionFfi::ContinueAnyway => Self::ContinueAnyway,
+            OnboardingActionFfi::CancelOnboarding => Self::CancelOnboarding,
         }
     }
 }
@@ -243,6 +263,7 @@ pub struct OnboardingSnapshotFfi {
     pub ready: bool,
     pub steps: Vec<OnboardingStepStateFfi>,
     pub proposal: Option<OnboardingRepairProposalFfi>,
+    pub single_device_notice: Option<OnboardingSingleDeviceNoticeFfi>,
 }
 impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
     fn from(value: marmot_app::OnboardingSnapshot) -> Self {
@@ -251,6 +272,7 @@ impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
             revision: value.revision,
             ready: value.ready,
             steps: value.steps.into_iter().map(Into::into).collect(),
+            single_device_notice: value.single_device_notice.map(Into::into),
             proposal: value.proposal.map(Into::into),
         }
     }
@@ -273,6 +295,60 @@ impl From<OnboardingOptionsFfi> for marmot_app::OnboardingOptions {
         Self {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingDeviceDiscoveryFfi {
+    NoneFound,
+    OtherInstallationPossible,
+    Unknown,
+}
+impl From<marmot_app::OnboardingDeviceDiscovery> for OnboardingDeviceDiscoveryFfi {
+    fn from(value: marmot_app::OnboardingDeviceDiscovery) -> Self {
+        match value {
+            marmot_app::OnboardingDeviceDiscovery::NoneFound => Self::NoneFound,
+            marmot_app::OnboardingDeviceDiscovery::OtherInstallationPossible => {
+                Self::OtherInstallationPossible
+            }
+            marmot_app::OnboardingDeviceDiscovery::Unknown => Self::Unknown,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingDevicePackageFfi {
+    pub slot_id: String,
+    pub key_package_ref_hex: String,
+    pub event_id_hex: String,
+    pub published_at: u64,
+    pub expires_at: u64,
+}
+impl From<marmot_app::OnboardingDevicePackage> for OnboardingDevicePackageFfi {
+    fn from(value: marmot_app::OnboardingDevicePackage) -> Self {
+        Self {
+            slot_id: value.slot_id,
+            key_package_ref_hex: value.key_package_ref_hex,
+            event_id_hex: value.event_id_hex,
+            published_at: value.published_at,
+            expires_at: value.expires_at,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingSingleDeviceNoticeFfi {
+    pub discovery: OnboardingDeviceDiscoveryFfi,
+    pub other_packages: Vec<OnboardingDevicePackageFfi>,
+    pub discovery_complete: bool,
+    pub acknowledged_at: Option<u64>,
+}
+impl From<marmot_app::OnboardingSingleDeviceNotice> for OnboardingSingleDeviceNoticeFfi {
+    fn from(value: marmot_app::OnboardingSingleDeviceNotice) -> Self {
+        Self {
+            discovery: value.discovery.into(),
+            other_packages: value.other_packages.into_iter().map(Into::into).collect(),
+            discovery_complete: value.discovery_complete,
+            acknowledged_at: value.acknowledged_at,
         }
     }
 }

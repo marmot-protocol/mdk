@@ -83,8 +83,9 @@ pub use conversions::{
     TransportFanoutStatusFfi,
 };
 pub use conversions::{
-    OnboardingActionFfi, OnboardingFindingFfi, OnboardingIssueFfi, OnboardingOptionsFfi,
-    OnboardingRepairProposalFfi, OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi,
+    OnboardingActionFfi, OnboardingDeviceDiscoveryFfi, OnboardingDevicePackageFfi,
+    OnboardingFindingFfi, OnboardingIssueFfi, OnboardingOptionsFfi, OnboardingRepairProposalFfi,
+    OnboardingSingleDeviceNoticeFfi, OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi,
     OnboardingStepStateFfi,
 };
 

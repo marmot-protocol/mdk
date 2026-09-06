@@ -124,11 +124,12 @@ Imported identities can use the durable preflight API instead of `login`:
    same `default_relays` as new-account creation and a separate set of trusted
    `discovery_relays`. These methods return a persisted account and snapshot
    before fetching or publishing Nostr records.
-2. Display the five snapshot steps (profile, follows, general relays, inbox
-   relays, KeyPackage). Subscribe with `subscribe_onboarding`, read its initial
+2. Display the snapshot steps in their returned order (profile, follows, general
+   relays, inbox relays, single-device notice, KeyPackage). Use step identities,
+   not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial
    `snapshot`, and drive `next` concurrently with `run_onboarding`.
 3. Localize the typed status, findings, and actions. A healthy account advances
-   automatically. `NeedsInput` offers a repair or, for profile/follows, an
+   automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
 4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
@@ -145,6 +146,41 @@ Imported identities can use the durable preflight API instead of `login`:
    commands reject unfinished onboarding; the workflow alone can publish its
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
+
+The `SingleDevice` step always pauses before initial KeyPackage publication.
+Display a general notice that White Noise does not yet support synchronized
+multi-device use and recommends one device. The snapshot's `single_device_notice`
+adds evidence with `OtherInstallationPossible`, `NoneFound`, or `Unknown` discovery.
+When another installation is possible, explain that invitations may reach only
+one installation and conversations will not automatically appear on both.
+Reinstallation or cleared local state can produce the same evidence; do not
+claim to have identified a physical device or a particular app.
+
+Offer **Cancel** and **Continue anyway**. `CancelOnboarding` means leave the
+onboarding view without acknowledging; the account remains persisted and gated.
+It does not call sign-out, delete packages, or remove an account. For Continue
+anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
+MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
+The acknowledgment survives publication failure, cancellation, and restart.
+An explicit retry of `SingleDevice`, or a new sign-in after signing out a completed
+account, requires a new acknowledgment. Ordinary setup retries preserve it.
+
+Detection reads verified kind-30443 records through the validated relay routes
+without starting an account worker. It compares the newest record per slot with
+the local stable slot and durably owned private packages, including retained
+rotation material. `other_packages` includes original publication and expiration
+timestamps. No short recency cutoff excludes an otherwise usable package:
+republication retains the original event timestamp, so it is not last-active time.
+No public device identifier is introduced, and continuing never deletes another
+installation's packages.
+
+`discovery_complete` describes only the bounded queries to the selected sources;
+it is false for failed, malformed, future-dated, or potentially truncated results.
+Positive evidence can accompany incomplete discovery. `Unknown` means discovery
+was inconclusive; `NoneFound` means none were found on those sources. Neither is
+an assurance that multi-device use is safe. Both still require the general notice.
+Completed pre-notice checkpoints remain ready; incomplete checkpoints acquire
+the notice before KeyPackage publication when upgraded.
 
 Snapshots are complete states, not deltas. A slow subscriber may miss
 intermediate states but receives the latest persisted state. Cancellation can

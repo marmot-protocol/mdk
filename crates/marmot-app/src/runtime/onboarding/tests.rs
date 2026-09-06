@@ -246,7 +246,10 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
             .unwrap()
     );
     assert_eq!(network.attempts.lock().unwrap()[1], expected);
-    assert!(c.snapshot.steps[4].status == OnboardingStatus::Pending && !c.snapshot.ready);
+    assert!(
+        c.snapshot.steps[OnboardingStep::KeyPackage.index()].status == OnboardingStatus::Pending
+            && !c.snapshot.ready
+    );
     second.shutdown_and_close().await.unwrap();
 }
 #[tokio::test]
@@ -403,6 +406,7 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
         OnboardingStep::Follows,
         OnboardingStep::Relays,
         OnboardingStep::InboxRelays,
+        OnboardingStep::SingleDevice,
         OnboardingStep::KeyPackage,
     ] {
         c.set(step, OnboardingStatus::Passed, Vec::new());
@@ -468,5 +472,118 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert!(json.get("picture").is_none());
     assert_eq!(json["custom"], true);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_without_publishing()
+{
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    manager
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    let notice = c.snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
+    assert!(notice.discovery_complete);
+    assert_eq!(c.snapshot.steps[4].status, OnboardingStatus::NeedsInput);
+    assert!(
+        c.snapshot.steps[4]
+            .actions
+            .contains(&OnboardingAction::CancelOnboarding)
+    );
+    network.fail_reads.store(true, Ordering::SeqCst);
+    manager
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    let notice = c.snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(notice.discovery, OnboardingDeviceDiscovery::Unknown);
+    assert!(!notice.discovery_complete);
+    network.fail_reads.store(false, Ordering::SeqCst);
+    network.events.lock().unwrap().push(signed(
+        &keys,
+        30443,
+        vec![vec!["d".into(), "foreign".into()]],
+        "malformed",
+        unix_now_seconds(),
+    ));
+    manager
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.snapshot.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::Unknown
+    );
+    assert!(
+        c.snapshot.steps[4]
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::Malformed)
+    );
+    network.events.lock().unwrap().clear();
+    network.events.lock().unwrap().push(signed(
+        &keys,
+        30443,
+        vec![vec!["d".into(), "future".into()]],
+        "ignored",
+        unix_now_seconds() + 600,
+    ));
+    manager
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.snapshot.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::Unknown
+    );
+    assert!(
+        c.snapshot.steps[4]
+            .findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::FutureDated)
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserves_completed_accounts()
+ {
+    let (_directory, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.version = 1;
+    c.snapshot.steps.remove(4);
+    c.records.remove(4);
+    for step in &mut c.snapshot.steps {
+        step.status = OnboardingStatus::Passed;
+    }
+    c.snapshot.steps[4].status = OnboardingStatus::Checking;
+    manager
+        .app
+        .account_home()
+        .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
+        .unwrap();
+    let upgraded = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    assert_eq!(upgraded.version, ONBOARDING_VERSION);
+    assert_eq!(
+        upgraded.snapshot.steps[4].step,
+        OnboardingStep::SingleDevice
+    );
+    assert_eq!(upgraded.snapshot.steps[5].status, OnboardingStatus::Pending);
+    assert!(!manager.onboarding_worker_allowed(&id).unwrap());
+    c.snapshot.ready = true;
+    c.snapshot.steps[4].status = OnboardingStatus::Passed;
+    manager
+        .app
+        .account_home()
+        .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
+        .unwrap();
+    assert!(manager.onboarding_snapshot(&id).unwrap().unwrap().ready);
+    assert!(manager.onboarding_worker_allowed(&id).unwrap());
     runtime.shutdown_and_close().await.unwrap();
 }

@@ -24,6 +24,19 @@ impl OnboardingSubscription {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Record Continue anyway for the displayed notice, then resume setup.
+    pub async fn acknowledge_onboarding_single_device(
+        &self,
+        account_ref: String,
+        revision: u64,
+    ) -> Result<OnboardingSnapshotFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .accounts()
+            .acknowledge_onboarding_single_device(&account_ref, revision)
+            .await?
+            .into())
+    }
     /// Persist the identity and return before any network preflight or publication.
     pub async fn begin_onboarding(
         &self,

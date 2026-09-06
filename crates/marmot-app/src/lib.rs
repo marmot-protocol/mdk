@@ -83,9 +83,10 @@ mod drafts;
 mod error;
 mod external_signer;
 pub use runtime::{
-    OnboardingAction, OnboardingFinding, OnboardingIssue, OnboardingOptions,
-    OnboardingRepairProposal, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
-    OnboardingStepState, OnboardingSubscription,
+    OnboardingAction, OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding,
+    OnboardingIssue, OnboardingOptions, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
+    OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
+    OnboardingSubscription,
 };
 mod groups;
 mod ids;

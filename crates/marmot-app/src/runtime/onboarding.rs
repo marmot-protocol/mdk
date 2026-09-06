@@ -6,7 +6,10 @@ use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEn
 use nostr::{EventBuilder, Kind, PublicKey, Tag, Timestamp};
 use transport_nostr_peeler::NostrTransportEvent;
 
-const ONBOARDING_VERSION: u32 = 1;
+mod single_device;
+
+const ONBOARDING_VERSION: u32 = 2;
+const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
 const CHECK_WAIT: Duration = Duration::from_secs(15);
 const CHECK_MAX_AGE: u64 = 300;
@@ -18,6 +21,7 @@ pub enum OnboardingStep {
     Relays,
     InboxRelays,
     KeyPackage,
+    SingleDevice,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OnboardingStatus {
@@ -49,6 +53,9 @@ pub enum OnboardingIssue {
     RecordChanged,
     Interrupted,
     TooManyRelays,
+    MultiDeviceUnsupported,
+    OtherInstallationPossible,
+    DiscoveryIncomplete,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OnboardingAction {
@@ -62,6 +69,31 @@ pub enum OnboardingAction {
     CancelRepair,
     ReconnectSigner,
     EditDiscoveryRelays,
+    ContinueAnyway,
+    CancelOnboarding,
+}
+/// Evidence from the queried relays, never a claim that multi-device use is safe.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingDeviceDiscovery {
+    NoneFound,
+    OtherInstallationPossible,
+    Unknown,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingDevicePackage {
+    pub slot_id: String,
+    pub key_package_ref_hex: String,
+    pub event_id_hex: String,
+    /// Original event timestamp, not a last-active timestamp.
+    pub published_at: u64,
+    pub expires_at: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingSingleDeviceNotice {
+    pub discovery: OnboardingDeviceDiscovery,
+    pub other_packages: Vec<OnboardingDevicePackage>,
+    pub discovery_complete: bool,
+    pub acknowledged_at: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingFinding {
@@ -95,6 +127,8 @@ pub struct OnboardingSnapshot {
     pub ready: bool,
     pub steps: Vec<OnboardingStepState>,
     pub proposal: Option<OnboardingRepairProposal>,
+    #[serde(default)]
+    pub single_device_notice: Option<OnboardingSingleDeviceNotice>,
 }
 /// Hosts pass the same default relay set used by account creation. Discovery
 /// relays are independent indexers and are never implicitly published.
@@ -113,6 +147,8 @@ struct OnboardingCheckpoint {
     // a retry republishes precisely the same event once signed.
     approved: bool,
     signed_repair: Option<NostrTransportEvent>,
+    #[serde(default)]
+    single_device_acknowledged: bool,
 }
 
 pub struct OnboardingSubscription {
@@ -132,7 +168,8 @@ impl OnboardingStep {
             Self::Follows => 1,
             Self::Relays => 2,
             Self::InboxRelays => 3,
-            Self::KeyPackage => 4,
+            Self::SingleDevice => 4,
+            Self::KeyPackage => 5,
         }
     }
     fn kind(self) -> u64 {
@@ -141,7 +178,7 @@ impl OnboardingStep {
             Self::Follows => 3,
             Self::Relays => 10002,
             Self::InboxRelays => 10050,
-            Self::KeyPackage => 30443,
+            Self::KeyPackage | Self::SingleDevice => 30443,
         }
     }
     fn optional(self) -> bool {
@@ -158,6 +195,7 @@ impl OnboardingCheckpoint {
             OnboardingStep::Follows,
             OnboardingStep::Relays,
             OnboardingStep::InboxRelays,
+            OnboardingStep::SingleDevice,
             OnboardingStep::KeyPackage,
         ]
         .into_iter()
@@ -177,11 +215,13 @@ impl OnboardingCheckpoint {
                 ready: false,
                 steps,
                 proposal: None,
+                single_device_notice: None,
             },
             options,
-            records: vec![None; 5],
+            records: vec![None; STEP_COUNT],
             approved: false,
             signed_repair: None,
+            single_device_acknowledged: false,
         }
     }
     fn set(
@@ -191,6 +231,12 @@ impl OnboardingCheckpoint {
         findings: Vec<OnboardingFinding>,
     ) {
         let actions = match status {
+            OnboardingStatus::NeedsInput if step == OnboardingStep::SingleDevice => vec![
+                OnboardingAction::ContinueAnyway,
+                OnboardingAction::CancelOnboarding,
+                OnboardingAction::Retry,
+                OnboardingAction::EditDiscoveryRelays,
+            ],
             OnboardingStatus::NeedsInput | OnboardingStatus::RetryableFailure => {
                 let mut actions = vec![
                     OnboardingAction::Retry,
@@ -266,12 +312,50 @@ impl AccountManager {
         let Some(bytes) = self.app.account_home().account_onboarding(account_ref)? else {
             return Ok(None);
         };
-        let checkpoint: OnboardingCheckpoint = serde_json::from_slice(&bytes)?;
+        let mut checkpoint: OnboardingCheckpoint = serde_json::from_slice(&bytes)?;
         let account = self.resolve(account_ref)?;
+        // Upgrade the pre-notice checkpoint without activating an unfinished
+        // account. Completed accounts are not retroactively gated; a new sign-in
+        // resets every step and requires the notice then.
+        if checkpoint.version == 1
+            && checkpoint.snapshot.steps.len() == 5
+            && checkpoint.records.len() == 5
+            && checkpoint.snapshot.steps.iter().map(|s| s.step).eq([
+                OnboardingStep::Profile,
+                OnboardingStep::Follows,
+                OnboardingStep::Relays,
+                OnboardingStep::InboxRelays,
+                OnboardingStep::KeyPackage,
+            ])
+        {
+            checkpoint.snapshot.steps.insert(
+                4,
+                OnboardingStepState {
+                    step: OnboardingStep::SingleDevice,
+                    status: if checkpoint.snapshot.ready {
+                        OnboardingStatus::Skipped
+                    } else {
+                        OnboardingStatus::Pending
+                    },
+                    findings: Vec::new(),
+                    actions: Vec::new(),
+                    checked_at: None,
+                },
+            );
+            checkpoint.records.insert(4, None);
+            if !checkpoint.snapshot.ready {
+                checkpoint.set(
+                    OnboardingStep::KeyPackage,
+                    OnboardingStatus::Pending,
+                    Vec::new(),
+                );
+            }
+            checkpoint.version = ONBOARDING_VERSION;
+        }
         if checkpoint.version != ONBOARDING_VERSION
             || checkpoint.snapshot.account_id_hex != account.account_id_hex
-            || checkpoint.snapshot.steps.len() != 5
-            || checkpoint.records.len() != 5
+            || checkpoint.snapshot.steps.len() != STEP_COUNT
+            || checkpoint.records.len() != STEP_COUNT
         {
             return Err(onboarding_error());
         }
@@ -369,7 +453,7 @@ impl AccountManager {
         Ok(checkpoint.is_none_or(|c| {
             c.snapshot.ready
                 || matches!(
-                    c.snapshot.steps[4].status,
+                    c.snapshot.steps[OnboardingStep::KeyPackage.index()].status,
                     OnboardingStatus::Checking
                         | OnboardingStatus::WaitingForSigner
                         | OnboardingStatus::Passed
@@ -399,7 +483,9 @@ impl AccountManager {
     ) -> Result<OnboardingSnapshot, AppError> {
         if let Some(mut existing) = self.onboarding_checkpoint(&account.label)? {
             if account.signed_out && existing.snapshot.ready {
-                for index in 0..5 {
+                existing.single_device_acknowledged = false;
+                existing.snapshot.single_device_notice = None;
+                for index in 0..STEP_COUNT {
                     let step = existing.snapshot.steps[index].step;
                     existing.set(step, OnboardingStatus::Pending, Vec::new());
                 }
@@ -424,21 +510,28 @@ impl AccountManager {
         let transaction = self.onboarding_transaction(&id);
         let _transaction = transaction.lock().await;
         let _workers = self.worker_transactions.lock().await;
-        let account = match self.app.account_home().account(&id) {
-            Ok(account) if account.local_signing => self
-                .app
-                .account_home()
-                .import_account_idempotent(&account.label, &nsec)?,
+        let snapshot = match self.app.account_home().account(&id) {
+            Ok(account) if account.local_signing => {
+                // Reset a completed checkpoint before import clears signed_out.
+                // A crash between the two writes must leave the account gated.
+                let snapshot = self.initialize_onboarding(&account, options)?;
+                self.app
+                    .account_home()
+                    .import_account_idempotent(&account.label, &nsec)?;
+                snapshot
+            }
             Ok(_) => return Err(onboarding_error()),
-            Err(AccountHomeError::UnknownAccount(_)) => self
-                .app
-                .account_home()
-                .import_nostr_account_for_onboarding(&nsec)?
-                .account()
-                .clone(),
+            Err(AccountHomeError::UnknownAccount(_)) => {
+                let account = self
+                    .app
+                    .account_home()
+                    .import_nostr_account_for_onboarding(&nsec)?
+                    .account()
+                    .clone();
+                self.initialize_onboarding(&account, options)?
+            }
             Err(error) => return Err(error.into()),
         };
-        let snapshot = self.initialize_onboarding(&account, options)?;
         self.reconcile_locked().await?;
         Ok(snapshot)
     }
@@ -463,12 +556,25 @@ impl AccountManager {
         let transaction = self.onboarding_transaction(&id);
         let _transaction = transaction.lock().await;
         let _workers = self.worker_transactions.lock().await;
-        let account = self
-            .app
-            .account_home()
-            .add_external_signer_account(&public_key)?;
-        // Gate the account before registering a signer can make it runnable.
-        let snapshot = self.initialize_onboarding(&account, options)?;
+        // Existing identities must be gated before promotion can clear their
+        // signed-out state, and before signer registration makes them runnable.
+        let snapshot = match self.app.account_home().account(&id) {
+            Ok(account) => {
+                let snapshot = self.initialize_onboarding(&account, options)?;
+                self.app
+                    .account_home()
+                    .add_external_signer_account(&public_key)?;
+                snapshot
+            }
+            Err(AccountHomeError::UnknownAccount(_)) => {
+                let account = self
+                    .app
+                    .account_home()
+                    .add_external_signer_account(&public_key)?;
+                self.initialize_onboarding(&account, options)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         self.reconcile_locked().await?;
         drop(_workers);
         self.app.register_external_signer(&id, signer).await?;
@@ -522,7 +628,7 @@ impl AccountManager {
         } else if c.snapshot.proposal.is_some() {
             return Ok(());
         }
-        for index in 0..5 {
+        for index in 0..STEP_COUNT {
             let step = c.snapshot.steps[index].step;
             match c.snapshot.steps[index].status {
                 OnboardingStatus::Passed | OnboardingStatus::Skipped => continue,
@@ -533,7 +639,13 @@ impl AccountManager {
             }
             c.set(step, OnboardingStatus::Checking, Vec::new());
             self.save_onboarding(c)?;
-            if step == OnboardingStep::KeyPackage {
+            if step == OnboardingStep::SingleDevice {
+                if c.single_device_acknowledged {
+                    c.set(step, OnboardingStatus::Passed, Vec::new());
+                } else {
+                    self.check_onboarding_single_device(c).await?;
+                }
+            } else if step == OnboardingStep::KeyPackage {
                 let account = self.resolve(&c.snapshot.account_id_hex)?;
                 if account.external_signing
                     && !self.app.has_external_signer(&account.account_id_hex)
@@ -633,7 +745,11 @@ impl AccountManager {
         } else {
             c.snapshot.proposal = None;
             // Rechecking earlier prerequisites invalidates publication readiness.
-            for index in step.index()..5 {
+            if step == OnboardingStep::SingleDevice {
+                c.single_device_acknowledged = false;
+                c.snapshot.single_device_notice = None;
+            }
+            for index in step.index()..STEP_COUNT {
                 let next = c.snapshot.steps[index].step;
                 c.set(next, OnboardingStatus::Pending, Vec::new());
             }
@@ -665,7 +781,7 @@ impl AccountManager {
         self.validate_onboarding_options(&options)?;
         c.options = options;
         c.snapshot.proposal = None;
-        for index in 0..5 {
+        for index in 0..STEP_COUNT {
             if c.snapshot.steps[index].status != OnboardingStatus::Skipped {
                 let step = c.snapshot.steps[index].step;
                 c.set(step, OnboardingStatus::Pending, Vec::new());
@@ -784,6 +900,10 @@ impl AccountManager {
             match result {
                 Ok((_, Ok(events))) => {
                     completed += 1;
+                    // A full bounded page may omit another installation's slot.
+                    if kind == 30443 && events.len() >= 32 {
+                        failures.push(finding(OnboardingIssue::DiscoveryIncomplete));
+                    }
                     records.extend(events.into_iter().map(|r| r.event));
                 }
                 Ok((endpoint, Err(error))) => {
@@ -805,9 +925,13 @@ impl AccountManager {
         // Enforce the event boundary even for injected fetchers. Never let an
         // older valid event hide a newer signed but malformed declaration.
         records.retain(|event| {
-            event.kind == kind
+            let valid = event.kind == kind
                 && event.pubkey == account_id
-                && event.to_verified_nostr_event().is_ok()
+                && event.to_verified_nostr_event().is_ok();
+            if kind == 30443 && !valid {
+                failures.push(finding(OnboardingIssue::Malformed));
+            }
+            valid
         });
         records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         records.dedup_by(|a, b| a.id == b.id);

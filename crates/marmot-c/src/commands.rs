@@ -510,6 +510,8 @@ macro_rules! c_cmd {
 c_cmd! {
     /// Retry onboarding against explicitly selected discovery relays.
     async fn marmot_set_onboarding_discovery_relays(account_ref: str, discovery_relays/discovery_relays_len: str_arr) -> rec(MarmotOnboardingSnapshot) = set_onboarding_discovery_relays;
+    /// Acknowledge the displayed one-device notice and resume setup.
+    async fn marmot_acknowledge_onboarding_single_device(account_ref: str, revision: val u64) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device;
     /// List every account known to this device. Free the result with
     /// `marmot_account_summary_list_free`.
     sync fn marmot_list_accounts() -> rec(MarmotAccountSummaryList) = list_accounts;
