@@ -1747,6 +1747,85 @@ mod tests {
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
     }
 
+    /// A fresh explicit fetch and the SDK notification can legitimately carry
+    /// the same id. Cache misses do not identify which path owns delivery.
+    #[tokio::test]
+    async fn reconciliation_first_sighting_overlap_has_the_fetched_event_id() {
+        use nostr_relay_builder::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
+        let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(16),
+        });
+        let event = EventBuilder::new(Kind::MlsGroupMessage, "below-floor probe")
+            .tags([Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                ["c3".repeat(32)],
+            )])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        database.save_event(&event).await.unwrap();
+        let relay = LocalRelay::new(RelayBuilder::default().database(database));
+        relay.run().await.unwrap();
+        let endpoint = relay.url().await;
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let mut notifications = sdk.client.notifications();
+        sdk.client.add_relay(endpoint.clone()).await.unwrap();
+        sdk.client.connect().await;
+        let subscription = NostrSubscription::Group {
+            account_id: MemberId::new(vec![0xa1; 32]),
+            group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
+            transport_group_id: vec![0xc3; 32],
+            endpoints: vec![TransportEndpoint(endpoint.to_string())],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let (_, fetched) = sdk
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].event.id, event.id.to_hex());
+        let announced_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let RelayPoolNotification::Event { event, .. } =
+                    notifications.recv().await.unwrap()
+                {
+                    break event.id;
+                }
+            }
+        })
+        .await
+        .expect("explicit first fetch emits an SDK first-sighting notification");
+        assert_eq!(
+            announced_id, event.id,
+            "the overlap must be this exact fetched object"
+        );
+        assert!(
+            sdk.client
+                .database()
+                .event_by_id(&event.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the default cache remembers the id without retaining its bytes"
+        );
+        let inventory = [NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at: event.created_at.as_secs(),
+        }];
+        let (_, after_admission) = sdk
+            .reconcile_subscription(subscription, &inventory, 0, u64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            after_admission.is_empty(),
+            "durable admission ends explicit redelivery"
+        );
+        sdk.client.shutdown().await;
+        relay.shutdown();
+    }
+
     #[tokio::test]
     async fn reconciliation_redelivers_seen_but_unretained_events_with_default_sdk_cache() {
         use nostr_relay_builder::LocalRelay;

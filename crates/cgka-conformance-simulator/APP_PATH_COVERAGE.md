@@ -24,9 +24,11 @@ reopens after six unchanged transitions. A 900-second watchdog bounds the whole 
 every participant's exact payload multiset, then fresh bidirectional messaging and recipient restart persistence.
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.
 
-The test remains explicitly ignored because it is slow and needs an appropriate CI lane. It asserts **successful
-recovery**, not a particular failure count, and is not a `should_panic` test. An ordinary green suite with this test
-skipped is not recovery evidence; run the explicit gate.
+The test remains ignored in ordinary crate runs because it is slow. The dedicated **Public app 1024-message
+recovery** job in `.github/workflows/ci.yml` explicitly selects it in release mode without test-policy overrides,
+uses the same conformance path classifier, and participates in **Required CI**. It uploads source provenance,
+expanded synthetic input and public observations, excluding participant databases and keys. It asserts successful
+recovery, not a particular failure count. A run that skips this job is not recovery evidence.
 
 On September 6, the worker-responsiveness fix passed this unchanged recovery contract twice. Background engine
 advance now shares a 64-row allowance and a cooperative 500-ms budget across sweeps; historical peel contexts
@@ -40,8 +42,10 @@ cooperative between complete operations; one synchronous operation can exceed it
 The cap-only experiment on base `565bbb2f36c5f8a7d4715c225f0067358de7aca7`, with the raw-row cap changed from
 512 to 2,048, passed the 368/1,024 reversed engine regressions but recovered only 320/1,024 messages in the public
 app run. This was bounded incomplete recovery, not proof of permanent loss. The broader WIP checkout also had
-incomplete public runs. See [`OFFLINE_CATCHUP_HANDOFF.md`](../../OFFLINE_CATCHUP_HANDOFF.md) for preserved changes,
-previous results, and the diagnostic SQLCipher shutdown correction. No general production SQLCipher fix is claimed.
+incomplete public runs. Investigation history and checkpoint provenance are retained in
+[PR #1711](https://github.com/marmot-protocol/mdk/pull/1711). The earlier native SQLCipher crash occurred during
+unsafe diagnostic process exit while workers were writing. Maintained tests stop and join runtimes before asserting;
+no general production SQLCipher fix is claimed.
 
 ## First basic public journeys
 
@@ -70,7 +74,7 @@ and call the original scenario covered.
 
 The later consolidation applies the 2,048-row mitigation to the broader WIP checkout. Evidence for this combination
 is under `target/app-hardening-20260906/`; the earlier `target/app-path-20260906/` results below used the 512-row cap.
-The original and cap-only worktrees were preserved and their changes reconciled in the root handoff.
+The original and cap-only worktrees were preserved; PR #1711 records their consolidation.
 
 ### Inventory existing generated families before expanding execution
 
@@ -99,7 +103,7 @@ tool; it is not an exhaustive enumeration of every arm in every family.
 
 ### Maintained acceptance tests
 
-The first local release execution on the broader WIP checkout passed all six basic tests in 107.86 seconds. The
+Historical result, before the recovery fix: the first local release execution on the broader WIP checkout passed all six basic tests in 107.86 seconds. The
 explicit large test failed in 361.79 seconds: 826/1,024 messages, 198 missing, recipient epoch 17 versus peers' 22,
 after 30 repair passes and two recovery restarts. There were no unexpected/duplicate messages and no native crash.
 Repeated public `scheduled convergence failed: storage_backend` errors are recorded for later investigation; their
@@ -116,7 +120,7 @@ cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_j
   --test-threads=1 --nocapture
 ```
 
-Run the unresolved large regression explicitly:
+Run the large regression explicitly:
 
 ```sh
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
@@ -127,8 +131,8 @@ cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_j
 
 Release mode without policy-override features is the production-policy verification command. Workspace debug or
 feature-unified CI runs are supplementary evidence. The six basic tests are ordinary tests, included by the existing
-simulator smoke filter; the ignored large test requires the explicit command above. These statements describe test
-selection, not observed remote CI results.
+simulator smoke filter; the dedicated public recovery CI job runs the ignored large test with the command above.
+These statements describe test selection; inspect the job at the revision under review for its observed result.
 
 Each test writes a fresh owner-only subdirectory containing input metadata, public checkpoint observations and a
 terminal result. The large input is pinned by the source fixture SHA-256. Preserve the source revision plus dirty
@@ -137,8 +141,9 @@ private observations. Failures retain their artifact directory even when the env
 Participant databases are closed and removed normally; this maintained test does not leak runtimes or retain secret
 database snapshots. All runtime shutdown work happens before the final test assertion; there is no `process::exit`.
 
-Local run results for this work are recorded in the root handoff and the ignored evidence directory. The defect stays
-open until the large public assertion passes; smaller passing cases only establish their own listed contracts.
+The large public assertion passes at the acceptance checkpoint recorded below. Historical incomplete runs above
+explain the regression's provenance; they are not the current acceptance status. Smaller cases establish only their
+own contracts. Every subsequent revision must pass the dedicated large recovery job.
 
 
 ## Seeded public companion families
@@ -207,7 +212,32 @@ budget or reach fresh-message/persistence checks.
 
 **Current large-backlog acceptance status:** passing at `fe395e8c`. The bounded background recovery fix
 resolved this worker timeout. The post-cleanup run passed all seven public journeys (330.50 seconds), including
-all 1,024 original messages, fresh traffic and recipient persistence after restart. See
-[`OFFLINE_CATCHUP_HANDOFF.md`](../../OFFLINE_CATCHUP_HANDOFF.md#verification-and-reproduction) for the exact
-release-policy commands and artifact directories. These local results do not imply that the full GitHub CI
-matrix passes; its separate failures are tracked in PR #1711.
+all 1,024 original messages, fresh traffic and recipient persistence after restart. The release-policy commands are maintained above; PR #1711 records local artifact provenance. Full GitHub CI
+subsequently passed at `be004e3d`, before the dedicated large public recovery job was introduced; that CI result
+must not be represented as execution of the newly added job.
+
+
+## Recovery implementation boundaries
+
+The durable deferred-generation barrier covers uncontested catch-up as well as competing branches: all admitted
+raw rows must try the current context before recovered commits can prune it. Background host calls share 64 rows
+and a cooperative 500-ms deadline; explicit-time engine calls share the row bound without consulting elapsed real
+time. Partial work survives cancellation and restart. Historical peel contexts are materialized once per sweep,
+and live storage is restored before awaiting the peeler; secret retention policy is unchanged.
+
+Each released application event projects using its own authenticated content identity. Effect batches do not carry
+a reliable content-to-envelope timestamp mapping, so their optional skew diagnostic is skipped rather than adding
+fallible per-message storage reads. This does not change message timestamps, ordering or persisted projections.
+
+SDK repair owns fetched event bytes even when the SDK remembers only an id. Its overlap with a first-sighting
+notification is expected; exact-id SDK and app projection regressions check the overlap and idempotence separately.
+The raw row cap is 2,048 with unchanged byte ceilings and 32-context retry bound; the cap alone was insufficient.
+
+The public send/leave exact-epoch expectation is not passing coverage in parent PR #1711. Its semantic public-state
+correction belongs to stacked [PR #1713](https://github.com/marmot-protocol/mdk/pull/1713), which must supply its own
+validation. Publication failures, partial relay fanout and invite retry scenarios remain subsequent work.
+
+Readiness now uses the storage backend's state-filtered query, excluding unrelated processed history. Follow-up
+[#1715](https://github.com/marmot-protocol/mdk/issues/1715) covers payload-free readiness queries, preparation cost
+and repeated zero-attempt wake pressure. [#1716](https://github.com/marmot-protocol/mdk/issues/1716) covers fairness
+when the bounded SDK reconciliation cursor map evicts active routes.

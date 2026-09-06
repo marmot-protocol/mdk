@@ -2491,6 +2491,43 @@ async fn background_advance_yields_on_elapsed_budget_without_abandoning_rows() {
     panic!("budget yield must not abandon remaining rows");
 }
 
+/// Explicit-time callers must finish the same row slice even when peels take
+/// longer than the production wall budget. The next slice remains row-bounded.
+#[tokio::test]
+async fn explicit_time_advance_ignores_wall_budget_but_keeps_row_bound() {
+    let peeler = CancellableEpochSealedPeeler::new();
+    let (mut engine, storage, group_id, _peer) =
+        contested_rival_app_backlog_with_peeler(96, peeler.clone()).await;
+    peeler.delay_ms.store(10, Ordering::SeqCst);
+    engine
+        .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let remaining = storage
+        .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+        .unwrap()
+        .len();
+    assert_eq!(
+        remaining, 32,
+        "elapsed wall time must not change the 64-row slice"
+    );
+    peeler.delay_ms.store(0, Ordering::SeqCst);
+    for _ in 0..8 {
+        engine
+            .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+            .await
+            .unwrap();
+        if storage
+            .list_messages_in_states(&group_id, &[MessageState::PeelDeferred], EpochId(0))
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+    }
+    panic!("deterministic slices must finish retained work");
+}
+
 /// Opaque future messages all try the same retained past anchor. Snapshot
 /// materialization must be proportional to anchors in the sweep, not rows.
 #[tokio::test]

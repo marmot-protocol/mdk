@@ -381,13 +381,16 @@ advance commits and prune the only epoch state that decrypts later raw applicati
 immediate drain behavior; application routing still depends on captured branch contexts. The Current-profile saved
 368-message regression and its natural-order control live in the simulator's `tests/offline_catchup_regression.rs`.
 
-**Background recovery responsiveness.** One background advance shares a 64-row allowance and a cooperative
-500-ms budget across its reprocessing loop. Return pending at complete operation boundaries; do not cancel a
+**Background recovery responsiveness.** One host background advance shares a 64-row allowance and a cooperative
+500-ms budget across its reprocessing loop. Explicit-time engine entry points keep the row allowance without an
+elapsed wall deadline; queued outbound foreground preflight keeps its existing budget. Return pending at complete operation boundaries; do not cancel a
 snapshot guard or advance a partially tried generation. Foreground send budgets retain their separate semantics.
 Historical anchor peel contexts are materialized lazily once per bounded sweep and dropped with it; they preserve
 snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
 when canonical/candidate context is invalidated; never persist this secret-bearing cache or extend epoch retention.
-Tests: `tests/deferred_peel_lifecycle.rs` covers budget yield, restart and eventual completion.
+Tests: `tests/deferred_peel_lifecycle.rs` covers host budget yield, explicit-time row determinism, restart and eventual
+completion. Readiness queries all deferred rows using the storage state filter; never hide unattempted rows by
+limiting readiness to an already-attempted prefix.
 
 **Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
 not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical

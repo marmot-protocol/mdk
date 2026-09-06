@@ -398,6 +398,9 @@ async fn cold_restart_reconciles_backlog_below_since_floor() {
     let delivered_after_boot2 = inbound_events_delivered(&app_bob_boot2).await;
     // A newly fetched below-floor event may arrive both through the SDK's
     // first-sighting notification and the explicit reconciliation result.
+    // The SDK regression `reconciliation_first_sighting_overlap_has_the_fetched_event_id`
+    // pins the overlapping id; `inbound_effects_project_every_released_message`
+    // proves repeated effects do not duplicate application messages.
     // These are delivery attempts; the durable route inventory below proves
     // that the object was admitted and will not be downloaded next boot.
     assert!(
@@ -596,7 +599,8 @@ async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
     // + 1                         — route reconciliation discovers the
     //                               below-floor probe.
     // The explicit below-floor fetch can also produce an SDK first-sighting
-    // notification. Allow that one overlapping delivery attempt; boot 3 still
+    // notification (its exact identity is pinned by the SDK first-sighting
+    // overlap regression). Allow that one overlapping delivery attempt; boot 3 still
     // requires the exact floored count, proving durable no-redownload behavior.
     let expected_healed = legitimate_delivery_count + BACKFILL_THRESHOLD + 1;
 

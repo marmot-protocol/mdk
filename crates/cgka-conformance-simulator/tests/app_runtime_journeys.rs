@@ -425,7 +425,7 @@ async fn check(journey: Journey) {
         save(artifacts.path(), "terminal.json", &observations).unwrap();
     }
     // Close every runtime before asserting. Never exit the process while a
-    // SQLCipher worker may still be writing (see OFFLINE_CATCHUP_HANDOFF.md).
+    // SQLCipher worker may still be writing (see APP_PATH_COVERAGE.md).
     let mut close_errors = Vec::new();
     for client in &clients {
         if let Err(error) = subject.set_online(client, false).await {

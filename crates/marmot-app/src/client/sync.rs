@@ -4,8 +4,6 @@ use std::time::{Duration, Instant};
 use cgka_traits::GroupId;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::IngestOutcome;
-use cgka_traits::message::StoredMessagePayload;
-use cgka_traits::storage::{MessageStorage, StorageError};
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
     TransportReconciliationItem, TransportReconciliationRoute, clamp_to_max_future_skew,
@@ -451,25 +449,6 @@ impl StagedSyncError {
     fn new(source: AppError, stage: SyncFailureStage) -> Self {
         Self { source, stage }
     }
-}
-
-// Canonical message ids differ from relay envelope ids. The retained wire row
-// keeps its own outer timestamp, including for events released by a later ingest.
-fn stored_event_outer_transport_at(
-    storage: &impl MessageStorage,
-    event: &cgka_traits::engine::GroupEvent,
-) -> Result<Option<u64>, AppError> {
-    let cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } = event else {
-        return Ok(None);
-    };
-    let record = match storage.get_message(message_id) {
-        Ok(record) => record,
-        Err(StorageError::NotFound) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let payload = StoredMessagePayload::decode(&record.payload)
-        .map_err(|_| StorageError::Backend("decode retained message timestamp failed".into()))?;
-    Ok(payload.as_openmls_wire().map(|message| message.timestamp.0))
 }
 
 impl AppClient {
@@ -1356,7 +1335,6 @@ impl AppClient {
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
-                None,
             )
             .await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
@@ -2327,7 +2305,6 @@ impl AppClient {
                 summary,
                 &source_message_id_hex,
                 source_received_at,
-                Some(outer_transport_at),
             )
             .await
         {
@@ -3666,7 +3643,6 @@ impl AppClient {
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
-                None,
             )
             .await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
@@ -4106,7 +4082,6 @@ impl AppClient {
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
-        outer_transport_at: Option<u64>,
     ) -> Result<bool, AppError> {
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
@@ -4125,14 +4100,11 @@ impl AppClient {
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         for event in &effects.events {
             let event_source = event_source_message_id_hex(event, source_message_id_hex);
-            let event_outer_transport_at = if outer_transport_at.is_some() {
-                stored_event_outer_transport_at(
-                    &self.app.account_storage(&self.state.label)?,
-                    event,
-                )?
-            } else {
-                None
-            };
+            // Effects identify authenticated content, not its enclosing relay
+            // event. Even a single event can have been released by a later
+            // envelope. Skip the optional skew diagnostic without an explicit
+            // origin mapping; never read fallible storage just to emit a warning.
+            let event_outer_transport_at = None;
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
                     local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
@@ -4816,68 +4788,6 @@ mod tests {
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
 
-    #[tokio::test]
-    async fn released_messages_use_their_own_retained_outer_timestamps() {
-        use cgka_traits::engine::GroupEvent;
-        use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-        use cgka_traits::storage::MessageStorage;
-        use cgka_traits::transport::{
-            Timestamp, TransportEnvelope, TransportMessage, TransportSource,
-        };
-        use cgka_traits::{EpochId, MemberId, MessageId};
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://batch-projection.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = app.client("alice").await.unwrap();
-        let group_id = client
-            .create_group("timestamp provenance", &[])
-            .await
-            .unwrap();
-        let storage = app.account_storage("alice").unwrap();
-        for (content_id, timestamp) in [(1, 100), (2, 900)] {
-            let message_id = MessageId::new(vec![content_id; 32]);
-            let message = TransportMessage {
-                id: message_id.clone(),
-                payload: vec![],
-                timestamp: Timestamp(timestamp),
-                causal_deps: vec![],
-                source: TransportSource("test".into()),
-                envelope: TransportEnvelope::GroupMessage {
-                    transport_group_id: vec![3; 32],
-                },
-            };
-            storage
-                .put_message(&MessageRecord {
-                    id: message_id.clone(),
-                    group_id: group_id.clone(),
-                    epoch: EpochId(1),
-                    state: MessageState::Processed,
-                    payload: StoredMessagePayload::openmls_wire(message)
-                        .encode()
-                        .unwrap(),
-                    deferred_peel: None,
-                })
-                .unwrap();
-            let event = GroupEvent::MessageReceived {
-                group_id: group_id.clone(),
-                message_id,
-                sender: MemberId::new(vec![4; 32]),
-                epoch: EpochId(1),
-                payload: vec![],
-                retention: None,
-            };
-            // Both events can be released by an envelope with a third, outer
-            // id and timestamp. Neither inherits that enclosing envelope time.
-            assert_eq!(
-                super::stored_event_outer_transport_at(&storage, &event).unwrap(),
-                Some(timestamp)
-            );
-        }
-    }
-
     /// A commit or retry can release several retained messages in one effects batch.
     /// Each row needs its own source identity, including when no relay envelope
     /// triggered the batch. Replay must remain idempotent across observation seams.
@@ -4948,18 +4858,38 @@ mod tests {
                 client.observe_send_applied_effects(&effects).await.unwrap();
             }
             ReleasedBatchObservation::Inbound => {
-                // One incoming envelope can release other previously buffered messages.
-                client
-                    .observe_account_device_effects(
-                        &effects,
-                        &app.display_names_by_id().unwrap(),
-                        &mut SyncSummary::default(),
-                        &sources["released message 2"],
-                        unix_now_seconds(),
-                        Some(unix_now_seconds()),
-                    )
-                    .await
+                // Timestamp diagnostics must not read an unrelated retained row.
+                // Corruption there must not prevent these authenticated effects
+                // from projecting, including every later event in the batch.
+                use cgka_traits::storage::MessageStorage;
+                let storage = app.account_storage("alice").unwrap();
+                let id = &effects
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                            Some(message_id.clone())
+                        }
+                        _ => None,
+                    })
                     .unwrap();
+                let mut record = storage.get_message(id).unwrap();
+                record.payload = vec![0xff];
+                storage.put_message(&record).unwrap();
+                // Simulate the explicit fetch and SDK notification overlap.
+                // Both observations carry the same authenticated event identities.
+                for _ in 0..2 {
+                    client
+                        .observe_account_device_effects(
+                            &effects,
+                            &app.display_names_by_id().unwrap(),
+                            &mut SyncSummary::default(),
+                            &sources["released message 2"],
+                            unix_now_seconds(),
+                        )
+                        .await
+                        .unwrap();
+                }
             }
         }
         let timeline = app

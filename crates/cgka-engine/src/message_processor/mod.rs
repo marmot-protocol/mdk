@@ -782,10 +782,34 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group_id)
     }
 
+    pub(crate) async fn advance_convergence_and_drain_queued(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Vec<SendResult>, EngineError> {
+        self.converge_and_drain_with_deadline(
+            group_id,
+            self.convergence_now_ms(),
+            Some(Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)),
+        )
+        .await
+    }
+
+    /// Explicit-time drain: background work has a deterministic row allowance.
+    /// Queued outbound preflight retains its separate foreground budget.
     pub async fn converge_and_drain_queued_outbound_intents(
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
+    ) -> Result<Vec<SendResult>, EngineError> {
+        self.converge_and_drain_with_deadline(group_id, now_ms, None)
+            .await
+    }
+
+    async fn converge_and_drain_with_deadline(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+        deadline: Option<Instant>,
     ) -> Result<Vec<SendResult>, EngineError> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(Vec::new());
@@ -796,7 +820,7 @@ impl<S: StorageProvider> Engine<S> {
             self.advance_before_queued_outbound_intents(group_id, now_ms)
                 .await?
         } else {
-            self.advance_convergence_inputs_until_settled(group_id, now_ms)
+            self.advance_convergence_inputs_with_deadline(group_id, now_ms, deadline)
                 .await?
         };
         if !settled {
@@ -1234,28 +1258,42 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         }
         let now_ms = self.convergence_now_ms();
-        self.advance_convergence_inputs_until_settled(group_id, now_ms)
-            .await
+        self.advance_convergence_inputs_with_deadline(
+            group_id,
+            now_ms,
+            Some(Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)),
+        )
+        .await
     }
 
     /// Drive stored OpenMLS inputs to stability at an explicit monotonic time.
     ///
     /// This lower-level form is used by deterministic harnesses. Hosts should
     /// normally call [`Self::advance_convergence_inputs`] so the engine owns
-    /// the convergence clock.
+    /// the convergence clock and applies its cooperative wall-time budget.
+    /// This form shares the same row allowance but never consults elapsed real
+    /// time: `false` leaves durable work for a later deterministic tick.
     pub async fn advance_convergence_inputs_until_settled(
         &mut self,
         group_id: &GroupId,
         now_ms: u64,
+    ) -> Result<bool, EngineError> {
+        self.advance_convergence_inputs_with_deadline(group_id, now_ms, None)
+            .await
+    }
+
+    async fn advance_convergence_inputs_with_deadline(
+        &mut self,
+        group_id: &GroupId,
+        now_ms: u64,
+        deadline: Option<Instant>,
     ) -> Result<bool, EngineError> {
         Ok(matches!(
             self.advance_convergence_inputs_with_execution(
                 group_id,
                 now_ms,
                 DeferredPeelExecution::Background {
-                    deadline: Some(
-                        Instant::now() + Duration::from_millis(BACKGROUND_CONVERGENCE_BUDGET_MS)
-                    ),
+                    deadline,
                     rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
                 },
             )
@@ -2365,12 +2403,13 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(None);
         }
         let now = self.convergence_now();
-        let mut deferred = self
-            .storage
-            .list_messages(group_id, EpochId(0))?
-            .into_iter()
-            .filter(|record| record.state == MessageState::PeelDeferred)
-            .collect::<Vec<_>>();
+        // Match the sweep's indexed state filter. Readiness must inspect all
+        // deferred rows, but unrelated processed history need not be loaded.
+        let mut deferred = self.storage.list_messages_in_states(
+            group_id,
+            &[MessageState::PeelDeferred],
+            EpochId(0),
+        )?;
         let normalization_pending = self.normalize_deferred_peel_lifecycles(
             &mut deferred,
             now,
@@ -2380,6 +2419,8 @@ impl<S: StorageProvider> Engine<S> {
         // the new epoch or candidate graph. Their next wake is retry work,
         // not residence expiry. Derive readiness from the durable per-row
         // fingerprint so cancellation and reopen preserve the same decision.
+        // The app clamps ready wakes to 10 ms and backs off errors. Successful
+        // zero-row slices remain ready; they must not wait for residence expiry.
         if !deferred.is_empty() {
             let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
             if deferred.iter().any(|record| {
@@ -3110,6 +3151,82 @@ pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
 #[cfg(test)]
 mod deferred_peel_accounting_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn zero_budget_advance_preserves_row_and_rearms_recovery() {
+        use cgka_traits::engine::{CgkaEngine, CreateGroupRequest};
+        use cgka_traits::message::{MessageRecord, StoredMessagePayload};
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportSource};
+        let mut engine = crate::distributed_convergence::tests::test_engine();
+        let (group_id, created) = engine
+            .create_group(CreateGroupRequest {
+                name: "zero-budget recovery".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        if let SendResult::GroupCreated { pending, .. } = created {
+            engine.confirm_published(pending).await.unwrap();
+        }
+        let id = MessageId::new(vec![0x71; 32]);
+        let record = MessageRecord {
+            id: id.clone(),
+            group_id: group_id.clone(),
+            epoch: EpochId(0),
+            state: MessageState::PeelDeferred,
+            payload: StoredMessagePayload::raw_transport(TransportMessage {
+                id: id.clone(),
+                payload: vec![0x42],
+                timestamp: Timestamp(1),
+                causal_deps: vec![],
+                source: TransportSource("test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![0x31; 32],
+                },
+            })
+            .encode()
+            .unwrap(),
+            deferred_peel: None,
+        };
+        engine.storage.put_message(&record).unwrap();
+        let status = engine
+            .advance_convergence_inputs_with_execution(
+                &group_id,
+                0,
+                DeferredPeelExecution::Background {
+                    deadline: Some(Instant::now()),
+                    rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(status, AdvanceConvergenceStatus::Pending));
+        assert_eq!(engine.storage.get_message(&id).unwrap(), record);
+        assert!(
+            engine
+                .drain_pending_convergence_groups()
+                .contains(&group_id)
+        );
+        assert_eq!(
+            engine.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            engine
+                .storage
+                .get_message(&id)
+                .unwrap()
+                .deferred_peel
+                .unwrap()
+                .distinct_context_attempts,
+            0
+        );
+    }
 
     #[test]
     fn capacity_check_does_not_consume_slot_before_persist() {
