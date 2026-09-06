@@ -12540,6 +12540,52 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
     drop(directory);
 }
 
+#[tokio::test]
+async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() {
+    let (directory, _relay, _app, first, keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    first.shutdown_and_close().await.unwrap();
+    let external_directory = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(
+        external_directory.path(),
+        url.clone(),
+    ));
+    runtime
+        .accounts()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            TestExternalAccountSigner { keys },
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url],
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert!(!snapshot.ready);
+    assert_eq!(
+        snapshot.steps[4].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
+
+    // The host has already attached this signer. An explicit sign-in after
+    // reversible cancellation must be able to use it without registration.
+    assert!(runtime.sign_in_account(&id).await.unwrap().running);
+    assert!(runtime.publish_key_package(&id).await.unwrap() > 0);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[derive(Debug)]
 struct OnboardingPaymentRequired;
 impl nostr_relay_builder::prelude::QueryPolicy for OnboardingPaymentRequired {

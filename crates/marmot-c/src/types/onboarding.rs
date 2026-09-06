@@ -93,6 +93,10 @@ mod tests {
     fn onboarding_step_input_rejects_invalid_discriminants() {
         assert!(MarmotOnboardingStep::from_c(u32::MAX).is_err());
         assert_eq!(
+            MarmotOnboardingStep::from_c(4).unwrap().to_ffi(),
+            OnboardingStepFfi::SingleDevice
+        );
+        assert_eq!(
             MarmotOnboardingStep::from_c(5).unwrap().to_ffi(),
             OnboardingStepFfi::KeyPackage
         );

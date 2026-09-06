@@ -65,6 +65,113 @@ impl DirectoryRelayFetcher for Network {
 }
 
 #[tokio::test]
+async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_package_validity() {
+    let (directory, first, network, _keys, id) = fixture().await;
+    let manager = first.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
+    c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+    c.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
+        discovery: OnboardingDeviceDiscovery::OtherInstallationPossible,
+        other_packages: vec![OnboardingDevicePackage {
+            slot_id: "foreign".into(),
+            key_package_ref_hex: Some("ref".into()),
+            event_id_hex: "event".into(),
+            published_at: 1,
+            expires_at: Some(2),
+            usable: true,
+        }],
+        discovery_complete: true,
+        acknowledged_at: None,
+    });
+    let mut old = serde_json::to_value(&c).unwrap();
+    for index in 0..2 {
+        old["snapshot"]["steps"][index]["actions"] = serde_json::json!([]);
+    }
+    old["snapshot"]["single_device_notice"]["other_packages"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("usable");
+    manager
+        .app
+        .account_home()
+        .set_account_onboarding(&id, &serde_json::to_vec(&old).unwrap())
+        .unwrap();
+    first.shutdown_and_close().await.unwrap();
+    let reopened = runtime(directory.path(), network);
+    let manager = reopened.accounts();
+    let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    assert!(!snapshot.single_device_notice.unwrap().other_packages[0].usable);
+    for step in &snapshot.steps[..2] {
+        assert!(step.actions.contains(&OnboardingAction::Retry));
+    }
+    let retried = manager
+        .retry_onboarding_step(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.steps[OnboardingStep::Follows.index()].status,
+        OnboardingStatus::Skipped
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_evidence() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_storage(&id)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "owned-slot".into(),
+        ))
+        .unwrap();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for published_at in [
+        unix_now_seconds(),
+        unix_now_seconds() + FUTURE_CLOCK_SKEW + 1,
+    ] {
+        *network.events.lock().unwrap() = vec![signed(
+            &keys,
+            30443,
+            vec![vec!["d".into(), "owned-slot".into()]],
+            "malformed",
+            published_at,
+        )];
+        manager
+            .check_onboarding_single_device(&mut c)
+            .await
+            .unwrap();
+        let notice = c.snapshot.single_device_notice.as_ref().unwrap();
+        assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
+        assert!(notice.discovery_complete && notice.other_packages.is_empty());
+        network.events.lock().unwrap().push(signed(
+            &keys,
+            30443,
+            vec![vec!["d".into(), "foreign-slot".into()]],
+            "malformed",
+            published_at,
+        ));
+        manager
+            .check_onboarding_single_device(&mut c)
+            .await
+            .unwrap();
+        let notice = c.snapshot.single_device_notice.as_ref().unwrap();
+        assert_eq!(
+            notice.discovery,
+            OnboardingDeviceDiscovery::OtherInstallationPossible
+        );
+        assert_eq!(notice.other_packages.len(), 1);
+        assert!(!notice.other_packages[0].usable);
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());

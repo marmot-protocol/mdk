@@ -37,7 +37,8 @@ impl AccountManager {
             .account_home()
             .set_account_signed_out(&account.label, true)?;
         self.reconcile_locked().await?;
-        self.app.forget_external_signer(&account.account_id_hex);
+        // Cancellation is reversible, like sign-out. Keep the host's signer
+        // attached so explicit sign-in can reuse it; removal owns detachment.
         // Keep the setup phase and private KeyPackage journal intact so a later
         // legacy sign-in can resume it. Only relinquish interactive ownership.
         if let Some(setup) = setup.filter(|s| s.kind == AccountSetupKind::InteractiveIdentity) {

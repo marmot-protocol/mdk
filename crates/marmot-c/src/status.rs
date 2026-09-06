@@ -198,6 +198,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn onboarding_status_codes_preserve_the_master_group_removed_value() {
+        assert_eq!(MarmotStatus::GroupRemoved as i32, 63);
+        assert_eq!(MarmotStatus::OnboardingActionUnavailable as i32, 64);
+        assert_eq!(MarmotStatus::OnboardingRequired as i32, 65);
+    }
+
+    #[test]
     fn every_runtime_error_variant_maps_to_a_distinct_status() {
         let _guard = crate::memory::audit::test_lock();
         let variants: Vec<MarmotKitError> = vec![

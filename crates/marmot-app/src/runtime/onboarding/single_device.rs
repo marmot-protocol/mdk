@@ -44,9 +44,8 @@ impl AccountManager {
             if !seen_slots.insert(slot.clone()) {
                 continue;
             }
-            let future = event.created_at > now + FUTURE_CLOCK_SKEW;
-            if future {
-                findings.push(finding(OnboardingIssue::FutureDated));
+            if slots.contains(&slot) {
+                continue;
             }
             let event_id_hex = event.id.clone();
             let published_at = event.created_at;
@@ -59,12 +58,16 @@ impl AccountManager {
             let metadata = parsed
                 .as_ref()
                 .and_then(|f| crate::key_package_metadata(&f.key_package).ok());
+            let reference = metadata.as_ref().map(|m| m.key_package_ref_hex.clone());
+            if reference.as_ref().is_some_and(|r| refs.contains(r)) {
+                continue;
+            }
+            let future = published_at > now + FUTURE_CLOCK_SKEW;
+            if future {
+                findings.push(finding(OnboardingIssue::FutureDated));
+            }
             if metadata.is_none() {
                 findings.push(finding(OnboardingIssue::Malformed));
-            }
-            let reference = metadata.as_ref().map(|m| m.key_package_ref_hex.clone());
-            if slots.contains(&slot) || reference.as_ref().is_some_and(|r| refs.contains(r)) {
-                continue;
             }
             // A verified account-authored foreign slot is evidence even when
             // its payload is unusable. Package validity is a separate property.

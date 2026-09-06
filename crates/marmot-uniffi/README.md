@@ -159,7 +159,9 @@ claim to have identified a physical device or a particular app.
 Offer **Cancel** and **Continue anyway**. For Cancel, call
 `cancel_onboarding(account_ref)`: it signs the identity out, retains local data and
 completed repairs, and archives the checkpoint to remove the active gate. A later
-sign-in can use either the legacy or interactive entry point. Cancellation is
+sign-in can use either the legacy or interactive entry point. The registered
+external-signer callback remains attached for explicit sign-in within this runtime;
+a process restart still requires the host to register it again. Cancellation is
 idempotent; if interrupted with `cancellation_pending`, call it again to finish.
 Normal onboarding mutations are blocked during that interval. Cancellation is
 not offered while an approved repair is unfinished and cannot discard that repair.
@@ -170,7 +172,8 @@ and restart. Rechecking an earlier prerequisite, changing discovery sources,
 approving another repair, explicitly retrying `SingleDevice`, or signing in again
 after signing out a completed account invalidates it and requires a fresh notice.
 Retries preserve optional steps the user skipped unless that skipped step is the
-explicit retry target.
+explicit retry target. Older checkpoints refresh their derived retry hints on
+read, and package records without a `usable` field default to `false`.
 
 Detection reads verified kind-30443 records through the validated relay routes
 without starting an account worker. It compares the newest record per slot with

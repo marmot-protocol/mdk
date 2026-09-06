@@ -91,6 +91,7 @@ pub struct OnboardingDevicePackage {
     /// Original event timestamp, not a last-active timestamp.
     pub published_at: u64,
     pub expires_at: Option<u64>,
+    #[serde(default)]
     pub usable: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -400,6 +401,20 @@ impl AccountManager {
         for (index, step) in checkpoint.snapshot.steps.iter().enumerate() {
             if step.step.index() != index {
                 return Err(onboarding_error());
+            }
+        }
+        // Older checkpoints did not offer rechecks of finished steps. Refresh
+        // these derived hints before exposing or validating the snapshot, while
+        // retaining the offered-action contract and cancellation's sole exit.
+        if !checkpoint.snapshot.cancellation_pending {
+            for step in &mut checkpoint.snapshot.steps {
+                if matches!(
+                    step.status,
+                    OnboardingStatus::Passed | OnboardingStatus::Skipped
+                ) && !step.actions.contains(&OnboardingAction::Retry)
+                {
+                    step.actions.push(OnboardingAction::Retry);
+                }
             }
         }
         Ok(Some(checkpoint))
