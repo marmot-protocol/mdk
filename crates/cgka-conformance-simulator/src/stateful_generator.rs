@@ -19,6 +19,11 @@ use crate::{
 pub const STATEFUL_CHAT_JOURNEY_FAMILY: &str = "chat-journey/v1";
 pub const STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION: &str = "2";
 
+pub const PUBLIC_APP_SEND_LEAVE_FAMILY: &str = "public-app-send-leave/v1";
+pub const PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY: &str = "public-app-membership-reentry/v1";
+pub const PUBLIC_APP_OFFLINE_RECOVERY_FAMILY: &str = "public-app-offline-recovery/v1";
+pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "2";
+
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +75,7 @@ impl JourneyAction {
 }
 
 struct JourneyModel {
+    public_app: bool,
     profile: JourneyProfile,
     case_index: u64,
     epoch: u64,
@@ -105,6 +111,7 @@ impl JourneyModel {
             ),
         };
         let mut model = Self {
+            public_app: false,
             profile,
             case_index,
             epoch: 1,
@@ -278,13 +285,20 @@ impl JourneyModel {
                     payload: payload.clone(),
                 });
                 self.steps.push(accept_all_outbound(&sender));
-                for recipient in self.members.iter().filter(|client| **client != sender) {
+                for recipient in self
+                    .members
+                    .iter()
+                    .filter(|client| self.public_app || **client != sender)
+                {
                     self.received_payloads
                         .get_mut(recipient)
                         .expect("all clients have a delivery ledger")
                         .push(payload.clone());
                 }
                 self.deliver_to_online();
+                if self.public_app {
+                    self.public_delivered_payload_checkpoint(&payload);
+                }
             }
             JourneyAction::UpdateProfile { actor } => {
                 debug_assert!(self.admins.contains(&actor));
@@ -362,16 +376,22 @@ impl JourneyModel {
             }
             JourneyAction::Reconnect => self.reconnect_bob(),
             JourneyAction::Restart { client } => {
-                debug_assert!(self.members.contains(&client));
+                debug_assert!(self.public_app || self.members.contains(&client));
                 debug_assert!(self.online.contains(&client));
                 self.steps.push(ScenarioStep::RestartClient {
                     client: client.clone(),
                 });
-                self.received_payloads
-                    .get_mut(&client)
-                    .expect("all clients have a delivery ledger")
-                    .clear();
+                if !self.public_app {
+                    self.received_payloads
+                        .get_mut(&client)
+                        .expect("all clients have a delivery ledger")
+                        .clear();
+                }
                 self.deliver_to_online();
+                if self.public_app {
+                    self.public_state_checkpoint();
+                    self.public_payload_checkpoint();
+                }
             }
         }
     }
@@ -402,6 +422,9 @@ impl JourneyModel {
         self.confirm_publication(client, pending);
         self.epoch = self.epoch.saturating_add(1);
         self.deliver_to_online();
+        if self.public_app {
+            self.public_state_checkpoint();
+        }
     }
 
     fn deliver_to_online(&mut self) {
@@ -424,6 +447,10 @@ impl JourneyModel {
         self.steps.push(ScenarioStep::Tick {
             clients: vec!["bob".into()],
         });
+        if self.public_app {
+            self.public_state_checkpoint();
+            self.public_payload_checkpoint();
+        }
     }
 
     fn finish(mut self, seed: u64) -> GeneratedScenarioCase {
@@ -518,6 +545,225 @@ impl JourneyModel {
             expected_outcomes: self.expected,
         }
     }
+
+    fn new_public(case_index: u64) -> Self {
+        let mut model = Self::new(case_index, JourneyProfile::OfflineRetainedHistory);
+        model.public_app = true;
+        model.public_state_checkpoint();
+        model
+    }
+
+    fn eventually(&mut self, predicate: crate::ScenarioPredicateV2) {
+        self.steps.push(ScenarioStep::Assert {
+            assertion: crate::ScenarioAssertionV2::Eventually {
+                predicate,
+                max_iterations: 30,
+            },
+        });
+    }
+
+    fn public_state_checkpoint(&mut self) {
+        for client in self
+            .members
+            .intersection(&self.online)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.eventually(crate::ScenarioPredicateV2::ClientState {
+                client,
+                epoch: Some(self.epoch),
+                member_count: Some(self.members.len()),
+            });
+        }
+    }
+
+    fn public_delivered_payload_checkpoint(&mut self, payload: &str) {
+        // Generated payloads are unique. Only current online members can have
+        // received this send; full history checks belong at persistence boundaries.
+        for client in self
+            .members
+            .intersection(&self.online)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.eventually(crate::ScenarioPredicateV2::PayloadCount {
+                client,
+                payload: payload.to_owned(),
+                count: 1,
+            });
+        }
+    }
+
+    fn public_payload_checkpoint(&mut self) {
+        // Public history includes the sender's accepted message and survives
+        // reopen. The engine event ledger deliberately has different semantics.
+        for client in self.online.iter().cloned().collect::<Vec<_>>() {
+            for payload in self.received_payloads[&client].clone() {
+                self.eventually(crate::ScenarioPredicateV2::PayloadCount {
+                    client: client.clone(),
+                    payload,
+                    count: 1,
+                });
+            }
+        }
+    }
+
+    fn public_leave(&mut self, client: &str) {
+        assert!(self.public_app && self.members.contains(client) && !self.admins.contains(client));
+        self.steps.push(ScenarioStep::Leave {
+            client: client.into(),
+        });
+        self.members.remove(client);
+        self.non_members.insert(client.into());
+        self.epoch += 1;
+        self.deliver_to_online();
+        // A leave publishes a request; the remaining administrator must apply
+        // it before we count later traffic as outside the departed membership.
+        self.public_state_checkpoint();
+    }
+
+    fn finish_public(mut self, family: &str, seed: u64) -> GeneratedScenarioCase {
+        self.public_state_checkpoint();
+        self.public_payload_checkpoint();
+        let active = self.members.iter().cloned().collect::<Vec<_>>();
+        self.steps.push(ScenarioStep::ObserveAdminPolicy {
+            clients: active.clone(),
+        });
+        self.steps.push(ScenarioStep::Observe {
+            clients: client_labels(),
+        });
+        self.expected.push(TraceExpectation::ClientsConverged {
+            clients: active.clone(),
+            epoch: Some(self.epoch),
+            member_count: Some(active.len()),
+        });
+        for client in &active {
+            self.expected.extend([
+                TraceExpectation::ClientState {
+                    client: client.clone(),
+                    epoch: self.epoch,
+                    member_count: active.len(),
+                    received_payloads: None,
+                    added_members: None,
+                    removed_members: None,
+                },
+                TraceExpectation::GroupProfile {
+                    client: client.clone(),
+                    name: self.group_name.clone(),
+                    description: self.group_description.clone(),
+                },
+                TraceExpectation::AdminPolicy {
+                    client: client.clone(),
+                    admins: self.admins.iter().cloned().collect(),
+                },
+            ]);
+        }
+        // Include departed clients: duplicate, missing and post-departure
+        // messages all fail the exact public history contract.
+        for (client, payloads) in self.received_payloads {
+            self.expected
+                .push(TraceExpectation::ApplicationPayloadMultiset { client, payloads });
+        }
+        GeneratedScenarioCase {
+            family_name: family.into(),
+            generator_version: PUBLIC_APP_JOURNEY_GENERATOR_VERSION.into(),
+            seed,
+            case_index: self.case_index,
+            workload_profile: None,
+            subject: GeneratedSubjectKind::AppRuntime,
+            scenario: ScenarioSpec {
+                name: format!("{family}/case-{}", self.case_index),
+                spec_version: "3".into(),
+                clients: client_labels(),
+                topology: single_relay_topology(),
+                steps: self.steps,
+            },
+            expected_outcomes: self.expected,
+        }
+    }
+}
+
+/// Public companions share the symbolic action model, but own an explicit
+/// projection/persistence oracle. Seeds choose traffic and actors; the index
+/// rotates required lifecycle interactions. Socket scheduling is not seeded.
+pub fn generate_public_app_journey_case(
+    family: &str,
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4150_505f_4a4f_5552 ^ case_index.rotate_left(23));
+    let mut model = JourneyModel::new_public(case_index);
+    let victim = CLIENTS[1 + rng.gen_range(0..3)].to_owned();
+    model.apply(JourneyAction::Send {
+        sender: victim.clone(),
+    });
+    match family {
+        PUBLIC_APP_SEND_LEAVE_FAMILY => {
+            if case_index.is_multiple_of(2) {
+                model.apply(JourneyAction::Restart {
+                    client: victim.clone(),
+                });
+            }
+            model.public_leave(&victim);
+            model.apply(JourneyAction::UpdateProfile {
+                actor: "alice".into(),
+            });
+        }
+        PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY => {
+            for _ in 0..1 + case_index % 2 {
+                model.apply(JourneyAction::Remove {
+                    member: victim.clone(),
+                });
+                model.apply(JourneyAction::Send {
+                    sender: "alice".into(),
+                });
+                if (case_index / 2).is_multiple_of(2) {
+                    model.apply(JourneyAction::Restart {
+                        client: victim.clone(),
+                    });
+                }
+                model.apply(JourneyAction::Invite {
+                    invitee: victim.clone(),
+                });
+                model.apply(JourneyAction::Send {
+                    sender: victim.clone(),
+                });
+            }
+            model.apply(JourneyAction::UpdateProfile {
+                actor: "alice".into(),
+            });
+        }
+        PUBLIC_APP_OFFLINE_RECOVERY_FAMILY => {
+            for _ in 0..1 + case_index / 3 % 2 {
+                model.apply(JourneyAction::SetOffline);
+                for index in 0..[4, 8, 12][case_index as usize % 3] {
+                    if index % 4 == 2 {
+                        model.apply(JourneyAction::UpdateProfile {
+                            actor: "alice".into(),
+                        });
+                    }
+                    let action = model.choose_kind(&mut rng, JourneyActionKind::Send);
+                    model.apply(action);
+                }
+                model.apply(JourneyAction::Reconnect);
+                model.apply(JourneyAction::Send {
+                    sender: "bob".into(),
+                });
+            }
+        }
+        _ => panic!("unregistered public app journey family: {family}"),
+    }
+    // Every current member must actually send and receive after the transition,
+    // and a recipient's complete history must survive an orderly reopen.
+    for sender in model.members.iter().cloned().collect::<Vec<_>>() {
+        model.apply(JourneyAction::Send { sender });
+    }
+    let restart = model.choose_kind(&mut rng, JourneyActionKind::Restart);
+    model.apply(restart);
+    model.apply(JourneyAction::Send {
+        sender: "alice".into(),
+    });
+    model.finish_public(family, seed)
 }
 
 /// Generate deterministic, product-shaped canonical scenarios.
@@ -646,5 +892,58 @@ fn single_relay_topology() -> ScenarioTopologyV2 {
             implementation_version: "memory/v1".into(),
             policy_version: "retain-all/v1".into(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn public_send_checks_only_new_payload_but_restart_checks_full_history() {
+        let mut model = JourneyModel::new_public(0);
+        for _ in 0..2 {
+            model.apply(JourneyAction::Send {
+                sender: "alice".into(),
+            });
+        }
+        model.steps.clear();
+        model.apply(JourneyAction::Send {
+            sender: "alice".into(),
+        });
+        let payloads = model.received_payloads["alice"].clone();
+        let assertions = model
+            .steps
+            .iter()
+            .filter(|step| matches!(step, ScenarioStep::Assert { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(assertions.len(), model.members.len());
+        for step in assertions {
+            assert!(matches!(step, ScenarioStep::Assert {
+                assertion: crate::ScenarioAssertionV2::Eventually {
+                    predicate: crate::ScenarioPredicateV2::PayloadCount { payload, count: 1, .. }, ..
+                }
+            } if payload == &payloads[2]));
+        }
+        model.steps.clear();
+        model.apply(JourneyAction::Restart {
+            client: "bob".into(),
+        });
+        let checks = model
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    ScenarioStep::Assert {
+                        assertion: crate::ScenarioAssertionV2::Eventually {
+                            predicate: crate::ScenarioPredicateV2::PayloadCount { .. },
+                            ..
+                        }
+                    }
+                )
+            })
+            .count();
+        assert_eq!(checks, model.members.len() * payloads.len());
     }
 }

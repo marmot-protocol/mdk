@@ -55,6 +55,8 @@ Git commit; require a clean build and retain the exact source revision plus comm
     overrides the environment. File-backed `restart()` drops all engine/storage handles, reopens the encrypted database,
     and hydrates it. `tick().await` drains pending inbound for one client. `confirm(pending).await` finishes a
     `GroupEvolution`.
+    The per-tick no-progress guard includes durable deferred-row context attempts; an unchanged backlog count alone
+    does not mean a bounded sweep stalled. Identical durable state still fails the guard.
 
 - **Module:** `src/cross_route_scenario.rs`
   - **Role:** One canonical four-party route-assurance scenario plus its strict public process-report oracle. The
@@ -87,7 +89,9 @@ Git commit; require a clean build and retain the exact source revision plus comm
   - **Role:** Serializable active application-message probe results. A
     `ProbeBidirectionalDecryptability` scenario step sends one logical event per named client, drains every attached
     client, and records each directed sender-to-recipient edge by exact logical event id and recipient ledger
-    disposition. This is a mutating probe, not a passive observation.
+    disposition. A queued send becomes published only when the authenticated sender ledger proves publication;
+    up to eight transport rounds deliver messages released during convergence. Unpublished or undelivered probes
+    still fail. This is a mutating probe, not a passive observation.
 
 - **Module:** `cgka_engine::convergence`
   - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for

@@ -49,6 +49,20 @@ const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
 /// The durable cursor starts the next pass after the last attempted route.
 const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 
+// One ingest or convergence pass can release several previously retained events.
+// Their durable identities belong to the events, not to the triggering envelope.
+fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback: &str) -> String {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+            hex::encode(message_id.as_slice())
+        }
+        cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
+            hex::encode(via_welcome.as_slice())
+        }
+        _ => fallback.to_owned(),
+    }
+}
+
 enum TransportReconciliationWork {
     Inbox(Vec<cgka_traits::TransportEndpoint>),
     Group(cgka_traits::TransportGroupSubscription),
@@ -1158,15 +1172,7 @@ impl AppClient {
             // durable engine outbox key is stable and unique. Use that key as
             // the synthetic source so a crash can replay several pending
             // events in one drain without colliding on an empty source id.
-            let source_message_id_hex = match event {
-                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
-                    hex::encode(message_id.as_slice())
-                }
-                cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
-                    hex::encode(via_welcome.as_slice())
-                }
-                _ => String::new(),
-            };
+            let source_message_id_hex = event_source_message_id_hex(event, "");
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
                     local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
@@ -1329,7 +1335,6 @@ impl AppClient {
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
-                None,
             )
             .await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
@@ -1552,6 +1557,20 @@ impl AppClient {
             silence_budget: self.epoch_backfill_eose_wait(),
             execution_quantum,
         };
+        // Unfloored REQs do not re-emit SDK-cached events through the ordinary
+        // notification path. Reconcile the current history window as well as
+        // the older startup gap, in bounded account-scoped batches. Durable
+        // ingestion shrinks the next difference; refused ids remain eligible.
+        // This does not satisfy the EOSE gate or clear overflow markers.
+        self.reconcile_transport_history(unix_now_seconds())
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::Unknown,
+                )
+            })?;
         self.drain_sdk_relay(counts, completion).await
     }
 
@@ -2286,7 +2305,6 @@ impl AppClient {
                 summary,
                 &source_message_id_hex,
                 source_received_at,
-                Some(outer_transport_at),
             )
             .await
         {
@@ -3625,7 +3643,6 @@ impl AppClient {
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
-                None,
             )
             .await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
@@ -4067,7 +4084,6 @@ impl AppClient {
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
-        outer_transport_at: Option<u64>,
     ) -> Result<bool, AppError> {
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
@@ -4085,6 +4101,12 @@ impl AppClient {
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         for event in &effects.events {
+            let event_source = event_source_message_id_hex(event, source_message_id_hex);
+            // Effects identify authenticated content, not its enclosing relay
+            // event. Even a single event can have been released by a later
+            // envelope. Skip the optional skew diagnostic without an explicit
+            // origin mapping; never read fallible storage just to emit a warning.
+            let event_outer_transport_at = None;
             let batch_start_frontier = event_group_id(event)
                 .and_then(|group_id| {
                     local_group_deletion_frontiers.get(&hex::encode(group_id.as_slice()))
@@ -4094,7 +4116,7 @@ impl AppClient {
                 Some(frontier) => self.local_deleted_group_event_crosses_frontier(
                     event,
                     frontier,
-                    source_message_id_hex,
+                    &event_source,
                     source_received_at,
                 )?,
                 None => false,
@@ -4121,9 +4143,9 @@ impl AppClient {
                 summary,
                 event,
                 group_projection.as_ref(),
-                source_message_id_hex,
+                &event_source,
                 source_received_at,
-                outer_transport_at,
+                event_outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
             ) && let Some(gossip_message_id) =
                 self.project_received_message(message, group_metadata.as_ref(), summary)?
@@ -4141,7 +4163,7 @@ impl AppClient {
                 event,
                 previous_group.as_ref(),
                 updated_group.as_ref(),
-                source_message_id_hex,
+                &event_source,
             );
             routes_dirty |=
                 self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
@@ -4767,6 +4789,159 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+
+    /// A commit or retry can release several retained messages in one effects batch.
+    /// Each row needs its own source identity, including when no relay envelope
+    /// triggered the batch. Replay must remain idempotent across observation seams.
+    enum ReleasedBatchObservation {
+        Scheduled,
+        Send,
+        Inbound,
+    }
+
+    async fn assert_released_message_batch_projects(observation: ReleasedBatchObservation) {
+        use crate::messages::{AppMessageIntent, build_inner_event};
+        use crate::{TimelineMessageQuery, unix_now_seconds};
+        use cgka_traits::MemberId;
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://batch-projection.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("batch projection", &[]).await.unwrap();
+        let mut effects = marmot_account::AccountDeviceEffects::default();
+        let mut sources = HashMap::new();
+        for index in 0..3 {
+            let payload = crate::messages::encode_inner_event(
+                &build_inner_event(
+                    &AppMessageIntent::Chat {
+                        content: format!("released message {index}"),
+                    },
+                    &account.account_id_hex,
+                    unix_now_seconds(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let sent = client
+                .runtime
+                .send(cgka_traits::engine::SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload: payload.clone(),
+                })
+                .await
+                .unwrap();
+            assert!(sent.failures.is_empty());
+            sources.insert(
+                format!("released message {index}"),
+                hex::encode(sent.reports[0].message_id.as_slice()),
+            );
+            effects
+                .events
+                .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                    group_id: group_id.clone(),
+                    message_id: sent.reports[0].message_id.clone(),
+                    sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                    epoch: client.runtime.group_record(&group_id).unwrap().epoch,
+                    payload,
+                    retention: None,
+                });
+        }
+        match observation {
+            ReleasedBatchObservation::Scheduled => {
+                client
+                    .observe_scheduled_convergence_effects(&group_id, &effects)
+                    .await
+                    .unwrap();
+            }
+            ReleasedBatchObservation::Send => {
+                client.observe_send_applied_effects(&effects).await.unwrap();
+            }
+            ReleasedBatchObservation::Inbound => {
+                // Timestamp diagnostics must not read an unrelated retained row.
+                // Corruption there must not prevent these authenticated effects
+                // from projecting, including every later event in the batch.
+                use cgka_traits::storage::MessageStorage;
+                let storage = app.account_storage("alice").unwrap();
+                let id = &effects
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                            Some(message_id.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let mut record = storage.get_message(id).unwrap();
+                record.payload = vec![0xff];
+                storage.put_message(&record).unwrap();
+                // Simulate the explicit fetch and SDK notification overlap.
+                // Both observations carry the same authenticated event identities.
+                for _ in 0..2 {
+                    client
+                        .observe_account_device_effects(
+                            &effects,
+                            &app.display_names_by_id().unwrap(),
+                            &mut SyncSummary::default(),
+                            &sources["released message 2"],
+                            unix_now_seconds(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let timeline = app
+            .timeline_messages_with_query(
+                "alice",
+                TimelineMessageQuery {
+                    group_id_hex: Some(hex::encode(group_id.as_slice())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(timeline.messages.len(), 3);
+        for message in &timeline.messages {
+            assert_eq!(
+                message.source_message_id_hex.as_ref(),
+                sources.get(&message.plaintext)
+            );
+        }
+        let messages = app.messages("alice").unwrap();
+        assert_eq!(messages.len(), 3);
+        for index in 0..3 {
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.plaintext == format!("released message {index}"))
+            );
+        }
+        // Reopen uses the drained-event seam. Its stable identities must agree
+        // with live projection, so the same durable events cannot create duplicates.
+        client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        assert_eq!(app.messages("alice").unwrap(), messages);
+    }
+
+    #[tokio::test]
+    async fn scheduled_convergence_projects_every_released_message() {
+        assert_released_message_batch_projects(ReleasedBatchObservation::Scheduled).await;
+    }
+
+    #[tokio::test]
+    async fn send_applied_effects_project_every_released_message() {
+        assert_released_message_batch_projects(ReleasedBatchObservation::Send).await;
+    }
+
+    #[tokio::test]
+    async fn inbound_effects_project_every_released_message() {
+        assert_released_message_batch_projects(ReleasedBatchObservation::Inbound).await;
+    }
 
     fn armed_backfill(group_id: &cgka_traits::GroupId, stalled_epoch: u64) -> PendingEpochBackfill {
         let mut pending = PendingEpochBackfill::new();

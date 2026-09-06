@@ -36,6 +36,7 @@ fn adopted_v1_policy_identity_and_values_are_pinned() {
         ("E10.max_candidate_branch_peel_contexts", 8),
         ("E11.foreground_deferred_peel_budget_ms", 250),
         ("E12.max_foreground_deferred_rows", 4),
+        ("E13.background_convergence_budget_ms", 500),
     ];
     for (id, value) in expected {
         assert_eq!(snapshot.values[id], value, "{id}");

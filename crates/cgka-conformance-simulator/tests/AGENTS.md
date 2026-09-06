@@ -7,6 +7,21 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 ## Files
 
+- **File:** `support/offline_catchup.rs`
+  - **Owns:** Compact reconstruction of the exact checkpoint 368/1,024-message inputs. Pinned SHA-256 values
+    cover serialized metadata, actions and expected outcomes; compare against checkpoint `9282a643` before
+    intentionally changing these workloads. Shared by engine regressions and public app journeys.
+
+- **File:** `public_app_families.rs`
+  - **Owns:** Seeded public send/leave, membership re-entry and small offline recovery family contracts,
+    capability preflight, interaction coverage, and explicit real-socket strict oracle canaries.
+
+- **File:** `app_runtime_journeys.rs`
+  - **Owns:** Basic public app acceptance journeys and the explicit slow 1,024-message public catch-up gate,
+    also selected by the dedicated required public recovery CI job with production policy.
+    Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
+    persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
+
 - **File:** `agent_text_stream_vectors.rs`
   - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
     encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the

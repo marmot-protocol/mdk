@@ -1122,10 +1122,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(unrecoverable_result(epoch));
         }
 
-        // A contested deferred-peel generation buffers recovered evidence
+        // A deferred-peel generation buffers recovered evidence
         // durably but must not adjudicate a prefix. The sweep clears this
         // barrier only after every retained raw row has a definitive result
-        // under the final context fingerprint (mdk#1176).
+        // under the final context fingerprint (mdk#1176). Uncontested catch-up
+        // needs the same barrier so commit replay cannot prune epoch material
+        // before the raw application backlog has been peeled.
         if self
             .storage
             .deferred_peel_generation(group_id)
