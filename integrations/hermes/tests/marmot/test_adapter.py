@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 from contextlib import suppress
 import enum
 import importlib.util
@@ -15,6 +16,8 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
+TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="mdk-hermes-spool-suite-")
+atexit.register(TEST_SPOOL_ROOT.cleanup)
 
 
 def wire_event(event):
@@ -110,6 +113,15 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         reply_to_mode: str = "first"
         gateway_restart_notification: bool = True
         extra: dict = field(default_factory=dict)
+        _inbound_spool_test_path: str = field(init=False, repr=False)
+
+        def __post_init__(self):
+            # Unit adapters directly invoke inbound hooks without connect(). Give
+            # each instance a private spool so tests exercise the real durability
+            # boundary without touching the operator's default Marmot home.
+            self._inbound_spool_test_path = str(
+                Path(tempfile.mkdtemp(dir=TEST_SPOOL_ROOT.name)) / "inbound.sqlite3"
+            )
 
     class BasePlatformAdapter:
         def __init__(self, config, platform):
@@ -3845,12 +3857,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         release_blocker.set()
         await adapter._inbound_queue.join()
+        # Connector replay finds the durable deferred batch and admits its
+        # representative directly; it must not rebuild an in-memory debounce
+        # timer or duplicate either source id.
         await adapter._handle_control_event(wire_event(event))
         await adapter._handle_control_event(wire_event(sibling))
-        timer = adapter._debounce_tasks[key]
-        timer.cancel()
-        await asyncio.gather(timer, return_exceptions=True)
-        await adapter._flush_debounced(key)
         await adapter._inbound_queue.join()
 
         self.assertEqual(len(adapter.events), 1)
@@ -6525,6 +6536,89 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await queue.join()
+
+
+class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter_module = load_adapter_module()
+        self.config_cls = sys.modules["gateway.config"].PlatformConfig
+
+    def make_event(self, *, message_id="33", text="durable", mentions_self=True):
+        return wire_event(
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": message_id * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": text,
+                "mentions_self": mentions_self,
+            }
+        )
+
+    def make_adapter(self, *, extra=None):
+        merged = {"account_id_hex": "11" * 32, "profile_name_onboarding": False}
+        merged.update(extra or {})
+        return self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra=merged), client=object()
+        )
+
+    async def test_journal_commit_precedes_queue_admission(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        message_id = "33" * 32
+        observed = []
+        original_enqueue = adapter._inbound_queue.enqueue
+
+        def checked_enqueue(key, factory):
+            observed.append(adapter._inbound_spool.get(message_id).state)
+            return original_enqueue(key, factory)
+
+        adapter._inbound_queue.enqueue = checked_enqueue
+        await adapter._handle_control_event(self.make_event())
+        await adapter._inbound_queue.join()
+        self.assertEqual(["claimed"], observed)
+        record = adapter._inbound_spool.get(message_id)
+        self.assertEqual("handed", record.state)
+        self.assertEqual("durable", record.event["text"])
+        adapter._inbound_spool.close()
+
+    async def test_queue_full_stays_pending_then_retries_without_connector_replay(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._inbound_queue = self.adapter_module.KeyedAsyncQueue(max_depth_per_key=1)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocker():
+            started.set()
+            await release.wait()
+
+        adapter._inbound_queue.enqueue("22" * 32, blocker)
+        await started.wait()
+        await adapter._handle_control_event(self.make_event())
+        deferred = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("pending", deferred.state)
+        self.assertEqual("queue_full", deferred.disposition)
+        attempts = deferred.attempts
+        release.set()
+        await adapter._inbound_queue.join()
+        await asyncio.sleep(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S[0] + 0.02)
+        adapter._admit_due_spooled()
+        await adapter._inbound_queue.join()
+        delivered = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("handed", delivered.state)
+        self.assertEqual(attempts, delivered.attempts)
+        self.assertEqual([item.text for item in adapter.events], ["durable"])
+        adapter._inbound_spool.close()
+
+    async def test_mention_policy_skip_is_explicit_terminal_disposition(self):
+        adapter = self.make_adapter(extra={"group_activation": "mention"})
+        await adapter._handle_control_event(self.make_event(mentions_self=False))
+        await adapter._inbound_queue.join()
+        record = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("intentionally_skipped", record.state)
+        self.assertEqual("mention_policy_skip", record.disposition)
+        self.assertEqual([], adapter.events)
+        adapter._inbound_spool.close()
 
 
 if __name__ == "__main__":
