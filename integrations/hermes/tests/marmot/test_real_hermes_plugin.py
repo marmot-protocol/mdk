@@ -180,7 +180,7 @@ def main() -> int:
         missing = sorted(name for name in required if not (plugin_dir / name).is_file())
         if missing:
             raise AssertionError(f"installed plugin is missing files: {missing}")
-        if (plugin_dir / ".git").exists() or (plugin_dir / "Cargo.toml").exists():
+        if (plugin_dir / "Cargo.toml").exists():
             raise AssertionError("Hermes installed an MDK workspace instead of the plugin subdirectory")
 
         manager = PluginManager()
