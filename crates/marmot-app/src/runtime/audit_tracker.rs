@@ -184,6 +184,9 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         return Ok(AuditLogTrackerUpdateResult {
             enabled: false,
             uploaded: Vec::new(),
+            failed_files: 0,
+            incomplete_files: 0,
+            oversized_files: 0,
             skipped_reason: Some("audit logging disabled".to_owned()),
         });
     }
@@ -192,6 +195,9 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
+            failed_files: 0,
+            incomplete_files: 0,
+            oversized_files: 0,
             skipped_reason: Some("audit log tracker endpoint missing".to_owned()),
         });
     }
@@ -199,6 +205,9 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
+            failed_files: 0,
+            incomplete_files: 0,
+            oversized_files: 0,
             skipped_reason: Some("audit log tracker authorization token missing".to_owned()),
         });
     }
@@ -206,6 +215,9 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
+            failed_files: 0,
+            incomplete_files: 0,
+            oversized_files: 0,
             skipped_reason: Some("audit log tracker not configured".to_owned()),
         });
     }
@@ -215,12 +227,16 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
         return Ok(AuditLogTrackerUpdateResult {
             enabled: true,
             uploaded: Vec::new(),
+            failed_files: 0,
+            incomplete_files: 0,
+            oversized_files: 0,
             skipped_reason: Some("audit log files missing".to_owned()),
         });
     }
 
     let mut uploaded = Vec::new();
     let mut failed = 0_usize;
+    let mut incomplete = 0_u64;
     let mut acknowledged = 0_usize;
     let mut too_large_recorded = 0_usize;
     let mut too_large_known = 0_usize;
@@ -229,11 +245,20 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
     for account_files in group_by_account(files) {
         let account_ref = account_files[0].account_ref.clone();
         let mut checkpoint = app.audit_upload_checkpoint(&account_ref);
-        let mut checkpoint_changed =
+        let mut checkpoint_changed = checkpoint.bind_destination(
+            &config
+                .resolved_endpoint(app.service_endpoints())
+                .expect("validated endpoint"),
+        );
+        checkpoint_changed |=
             checkpoint.retain_present(account_files.iter().map(|file| file.file_name.as_str()));
         for (file_index, file) in account_files.iter().enumerate() {
+            // A freshly rolled, empty active file contains no evidence to send.
+            if file.size_bytes == 0 {
+                continue;
+            }
             // An acknowledged file is never re-read or re-posted. Sealed
-            // segments are immutable, so a single 200 is a durable
+            // segments are immutable, so an accepted complete snapshot is an
             // acknowledgment of their whole content; the active file changes on
             // every append and therefore re-transfers in full each trigger.
             // That residual is accepted by design and is bounded by the
@@ -283,16 +308,25 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
                 );
                 continue;
             }
-            match app
-                .post_audit_log_file_with_tracker_config(&file.path, &config)
-                .await
-            {
-                Ok(result) => {
-                    checkpoint.acknowledge(file, result.bytes_sent, AuditUploadOutcome::Uploaded);
-                    checkpoint_changed = true;
-                    uploaded.push(result);
+            match app.post_audit_log_snapshot(&file.path, &config).await {
+                Ok(receipt) => {
+                    if !receipt.complete {
+                        incomplete += 1;
+                    }
+                    if receipt.complete
+                        && receipt.observed_bytes == file.size_bytes
+                        && receipt.modified_at_ms == file.modified_at_ms
+                    {
+                        checkpoint.acknowledge(
+                            file,
+                            receipt.result.bytes_sent,
+                            AuditUploadOutcome::Uploaded,
+                        );
+                        checkpoint_changed = true;
+                    }
+                    uploaded.push(receipt.result);
                 }
-                Err(_err) => {
+                Err(err) => {
                     // Unacknowledged: left out of the checkpoint so the next
                     // trigger retries it.
                     failed += 1;
@@ -300,6 +334,8 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
                         target: "marmot_app::audit_log",
                         method = "post_audit_log_tracker_update",
                         file_index,
+                        error_kind = err.kind(),
+                        http_status = err.status(),
                         "failed to post forensic audit log file to tracker"
                     );
                 }
@@ -321,7 +357,7 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
     // Only a newly recorded over-ceiling file warrants a warning: one already
     // in the checkpoint has been reported, and re-warning every trigger is the
     // noise this contract removes. Counts only — no file names or paths.
-    if failed > 0 || too_large_recorded > 0 {
+    if failed > 0 || incomplete > 0 || too_large_recorded > 0 {
         tracing::warn!(
             target: "marmot_app::audit_log",
             method = "post_audit_log_tracker_update",
@@ -330,6 +366,7 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
             too_large_recorded,
             too_large_known,
             failed,
+            incomplete,
             "completed forensic audit log tracker update with file upload failures"
         );
     } else {
@@ -345,6 +382,9 @@ pub(crate) async fn post_audit_log_tracker_update_for_app(
     Ok(AuditLogTrackerUpdateResult {
         enabled: true,
         uploaded,
+        failed_files: failed as u64,
+        incomplete_files: incomplete,
+        oversized_files: (too_large_recorded + too_large_known) as u64,
         skipped_reason: None,
     })
 }

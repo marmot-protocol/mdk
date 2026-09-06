@@ -1614,3 +1614,130 @@ fn segments_plus_active_file_concatenate_to_the_unrotated_log() {
     );
     assert_eq!(normalize_run(&rotated_bytes), normalize_run(&plain_bytes));
 }
+
+#[test]
+fn segment_retry_recovers_without_restart_after_backoff() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.fail_next_segment_reopen();
+    record_until_roll_attempted(&recorder, &path);
+    let before = fs::read(&path).unwrap();
+    let mut inner = recorder.inner.lock().unwrap();
+    let deadline = inner
+        .segment_retry_after
+        .expect("failed rotation schedules retry");
+    recorder.try_roll_segment(&mut inner, deadline - Duration::from_secs(1));
+    assert!(
+        segment_paths(&path).is_empty(),
+        "backoff must suppress repeated scans"
+    );
+    recorder.try_roll_segment(&mut inner, deadline);
+    assert!(inner.segment_retry_after.is_none());
+    drop(inner);
+    let segments = segment_paths(&path);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(fs::read(&segments[0]).unwrap(), before);
+    assert!(fs::read(&path).unwrap().is_empty());
+}
+
+#[test]
+fn every_later_segment_has_fresh_source_context_and_continuous_sequence() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SourceContext {
+            source: AuditSourceContext {
+                account_label: Some("test account".into()),
+                ..Default::default()
+            },
+        },
+    ));
+    record_until_segment_rolls(&recorder, &path, 0);
+    record_until_segment_rolls(&recorder, &path, 1);
+    let mut paths = segment_paths(&path);
+    paths.push(path);
+    let mut all: Vec<AuditEvent> = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let rows: Vec<AuditEvent> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if index > 0 {
+            let AuditEventKind::SourceContext { source } = &rows[0].kind else {
+                panic!("segment must start with source metadata")
+            };
+            assert_eq!(source.account_label.as_deref(), Some("test account"));
+        }
+        all.extend(rows);
+    }
+    assert!(all.windows(2).all(|rows| rows[1].seq == rows[0].seq + 1
+        && rows[1].recorder_session_id == rows[0].recorder_session_id));
+    assert_eq!(
+        all.iter()
+            .filter(|row| matches!(row.kind, AuditEventKind::RecorderStarted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_flush_does_not_seal_or_discard_buffered_rows() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut inner = recorder.inner.lock().unwrap();
+    inner.writer = BufWriter::new(File::open(&path).unwrap());
+    inner
+        .writer
+        .write_all(b"buffered but unwritable\n")
+        .unwrap();
+    assert!(recorder.roll_into_segment(&mut inner).is_err());
+    assert_eq!(inner.writer.buffer(), b"buffered but unwritable\n");
+    assert_eq!(inner.health.flush_failures, 1);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(segment_paths(&path).is_empty());
+}
+
+#[test]
+fn failed_compensation_keeps_a_tracked_writer_and_can_recover() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".into()).unwrap();
+    recorder.fail_next_segment_reopen();
+    recorder.fail_segment_restore.store(true, Ordering::Relaxed);
+    let mut inner = recorder.inner.lock().unwrap();
+    assert!(recorder.roll_into_segment(&mut inner).is_err());
+    assert_ne!(inner.writer_path, path);
+    assert!(inner.writer_path.exists());
+    assert!(!path.exists());
+    assert!(JsonlRecorder::write_record(
+        &mut inner,
+        AuditRecord::new(
+            None,
+            AuditEventKind::SendEntry {
+                intent_kind: "app_message".into()
+            }
+        )
+    ));
+    recorder.roll_into_segment(&mut inner).unwrap();
+    assert_eq!(inner.writer_path, path);
+    assert!(path.exists());
+    drop(inner);
+    let all: Vec<AuditEvent> = segment_paths(&path)
+        .iter()
+        .flat_map(|p| {
+            fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<AuditEvent>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].seq, all[0].seq + 1);
+}

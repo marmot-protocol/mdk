@@ -942,6 +942,9 @@ async fn audit_log_binding_posts_tracker_update() {
     assert_eq!(result.uploaded.len(), 1);
     assert_eq!(result.uploaded[0].status, 204);
     assert_eq!(result.uploaded[0].bytes_sent, audit_body.len() as u64);
+    assert_eq!(result.failed_files, 0);
+    assert_eq!(result.incomplete_files, 0);
+    assert_eq!(result.oversized_files, 0);
     let captured = rx.await.expect("captured upload");
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/api/v1/audit-logs/");
