@@ -1914,20 +1914,49 @@ impl ConvergenceSubject for EngineHarnessSubject {
         // without advancing clocks or acknowledging held publications. The
         // finite bound remains a failed probe if delivery has not completed.
         const MAX_PROBE_DELIVERY_ROUNDS: usize = 8;
+        let mut recipient_ledgers = BTreeMap::new();
         for _ in 0..MAX_PROBE_DELIVERY_ROUNDS {
             self.bus.deliver_all();
             self.tick(&all_clients).await?;
-            if self.bus.queued_len() == 0 {
+            for recipient in labels {
+                recipient_ledgers.insert(
+                    recipient.clone(),
+                    self.client_mut(recipient)?.scenario_input_ledger(),
+                );
+            }
+            // An empty bus is not completion: bounded maintenance can still
+            // own a queued send or an already-ingested deferred probe. Stop
+            // early only once every exact, authenticated probe has arrived.
+            let complete = sends
+                .iter()
+                .all(|(sender, (payload, (status, logical_id)))| {
+                    let published = matches!(status, DecryptabilityProbeSendStatus::Published)
+                        || (matches!(status, DecryptabilityProbeSendStatus::Queued)
+                            && self
+                                .attributed_probe_ledger(
+                                    sender,
+                                    logical_id,
+                                    &recipient_ledgers[sender],
+                                )
+                                .is_some_and(|entry| entry.published > 0));
+                    published
+                        && labels
+                            .iter()
+                            .filter(|recipient| *recipient != sender)
+                            .all(|recipient| {
+                                self.attributed_probe_ledger(
+                                    sender,
+                                    logical_id,
+                                    &recipient_ledgers[recipient],
+                                )
+                                .is_some_and(|entry| {
+                                    entry.payload == *payload && entry.delivered > 0
+                                })
+                            })
+                });
+            if complete && self.bus.queued_len() == 0 {
                 break;
             }
-        }
-
-        let mut recipient_ledgers = BTreeMap::new();
-        for recipient in labels {
-            recipient_ledgers.insert(
-                recipient.clone(),
-                self.client_mut(recipient)?.scenario_input_ledger(),
-            );
         }
 
         for (sender, (_, (status, logical_id))) in &mut sends {

@@ -87,8 +87,9 @@ async fn check_history(order: ScenarioRelayOrderV2, overflow: bool) {
     assert!(report.oracle.weak_oracle_warnings.is_empty());
     assert!(
         report.oracle.missing_observed_behaviors.is_empty(),
-        "{:?}",
-        report.oracle.missing_observed_behaviors
+        "missing evidence: {:?}; expectation failures: {:#?}",
+        report.oracle.missing_observed_behaviors,
+        report.expectation_failures
     );
     assert!(
         report.invariant_failures.is_empty(),
