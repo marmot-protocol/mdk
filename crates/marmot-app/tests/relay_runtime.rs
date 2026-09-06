@@ -3084,6 +3084,107 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
 
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
+async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(100),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "scheduled reads",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob_id && joined == &group_id)
+    })
+    .await;
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut group_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_scheduled_convergence_barrier(barrier.clone());
+
+    // A real inbound commit arms the scheduled pass. Its work cannot finish
+    // until every public read below has completed; no sleep creates the window.
+    let rename = runtime.update_group_profile(
+        &alice_id,
+        &group_id,
+        Some("recovered profile".to_owned()),
+        None,
+    );
+    let read_during_recovery = async {
+        timeout(Duration::from_secs(10), barrier.wait())
+            .await
+            .expect("inbound commit must reach scheduled convergence");
+        for account_id in [&alice_id, &bob_id] {
+            let members = timeout(
+                Duration::from_secs(2),
+                runtime.group_members(account_id, &group_id),
+            )
+            .await
+            .expect("member reads must not wait for scheduled recovery")
+            .unwrap();
+            let mut member_ids = members
+                .into_iter()
+                .map(|member| member.member_id_hex)
+                .collect::<Vec<_>>();
+            member_ids.sort();
+            let mut expected = vec![alice_id.clone(), bob_id.clone()];
+            expected.sort();
+            assert_eq!(member_ids, expected);
+            let roster = timeout(
+                Duration::from_secs(2),
+                runtime.group_roster(account_id, &group_id),
+            )
+            .await
+            .expect("roster reads must not wait for scheduled recovery")
+            .unwrap();
+            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+            assert_eq!(roster.self_membership, SelfMembership::Member);
+            assert_eq!(roster.members.len(), 2);
+        }
+        timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("scheduled recovery must remain held throughout the reads");
+    };
+    let (renamed, ()) = tokio::join!(rename, read_during_recovery);
+    renamed.unwrap();
+    wait_for_group_state_update(&mut group_state, |group| {
+        group.profile.name == "recovered profile"
+    })
+    .await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
 async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     // Regression: the account worker must answer read commands as soon as the
     // session is hydrated, WITHOUT blocking on the initial relay catch-up. On

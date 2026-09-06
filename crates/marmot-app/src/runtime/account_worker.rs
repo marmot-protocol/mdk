@@ -1052,106 +1052,131 @@ async fn run_app_runtime_account_worker(
             }
             _ = scheduled_convergence.timer.as_mut() => {
                 let groups = scheduled_convergence.take_ready();
-                match client.sync_runtime_groups().await {
-                    Ok(()) => {
-                        let mut remaining = groups.len();
-                        for group_id in groups {
-                            // Each group's convergence pass is a long blocking
-                            // stretch of synchronous engine + SQLite work with
-                            // no await inside it, so `JoinHandle::abort` cannot
-                            // land there: without this check the shutdown budget
-                            // is spent running the whole batch to completion.
-                            // The group boundary is the only cut point where no
-                            // snapshot guard is live, so it is also the only one
-                            // that cannot leave a group half-rolled-back.
-                            // Undispatched groups need no hand-off — their
-                            // convergence inputs are durable, so the next
-                            // runtime rediscovers them at catch-up.
-                            if lifecycle.is_stopping() {
-                                tracing::debug!(
-                                    target: "marmot_app::runtime",
-                                    method = "scheduled_convergence",
-                                    skipped_groups = remaining,
-                                    "shutdown requested; leaving remaining convergence passes for the next runtime",
-                                );
-                                break;
-                            }
-                            remaining -= 1;
-                            match client.advance_convergence_after_runtime_sync(&group_id).await {
-                                Ok(summary) => {
-                                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-                                    match client.convergence_schedule_state(&group_id) {
-                                        Ok(state) => scheduled_convergence
-                                            .schedule_after_pass(&group_id, state),
+                // Recovery owns the live client, but member/roster reads can
+                // use the last committed snapshot while its relay I/O waits.
+                // Mutations and reads behind them retain worker FIFO order.
+                let read_snapshot = capture_group_read_snapshot(
+                    &client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    "runtime scheduled convergence snapshot failed",
+                );
+                serve_snapshot_reads_until(
+                    read_snapshot,
+                    async {
+                        #[cfg(any(test, feature = "test-policy-overrides"))]
+                        if let Some(barrier) = shared.take_next_scheduled_convergence_barrier() {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                        match client.sync_runtime_groups().await {
+                            Ok(()) => {
+                                let mut remaining = groups.len();
+                                for group_id in groups {
+                                    // Each group's convergence pass is a long blocking
+                                    // stretch of synchronous engine + SQLite work with
+                                    // no await inside it, so `JoinHandle::abort` cannot
+                                    // land there: without this check the shutdown budget
+                                    // is spent running the whole batch to completion.
+                                    // The group boundary is the only cut point where no
+                                    // snapshot guard is live, so it is also the only one
+                                    // that cannot leave a group half-rolled-back.
+                                    // Undispatched groups need no hand-off — their
+                                    // convergence inputs are durable, so the next
+                                    // runtime rediscovers them at catch-up.
+                                    if lifecycle.is_stopping() {
+                                        tracing::debug!(
+                                            target: "marmot_app::runtime",
+                                            method = "scheduled_convergence",
+                                            skipped_groups = remaining,
+                                            "shutdown requested; leaving remaining convergence passes for the next runtime",
+                                        );
+                                        break;
+                                    }
+                                    remaining -= 1;
+                                    match client.advance_convergence_after_runtime_sync(&group_id).await {
+                                        Ok(summary) => {
+                                            publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                            match client.convergence_schedule_state(&group_id) {
+                                                Ok(state) => scheduled_convergence
+                                                    .schedule_after_pass(&group_id, state),
+                                                Err(err) => {
+                                                    scheduled_convergence
+                                                        .schedule_retry_groups([group_id.clone()]);
+                                                    publish_app_runtime_account_error(
+                                                        &events,
+                                                        &account_id_hex,
+                                                        &account_label,
+                                                        account_error_message(
+                                                            "convergence schedule state failed",
+                                                            &err,
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            schedule_pending_convergence_groups(
+                                                &mut scheduled_convergence,
+                                                &mut client,
+                                            );
+                                            let _ = run_pending_epoch_backfill_reporting_arm(
+                                                &mut client,
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                &shared,
+                                                EpochBackfillExecutionSeam::Maintenance,
+                                            )
+                                            .await;
+                                            if sync_summary_triggers_audit_tracker_update(&summary) {
+                                                shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                                            }
+                                        }
                                         Err(err) => {
-                                            scheduled_convergence
-                                                .schedule_retry_groups([group_id.clone()]);
+                                            let mut retry_groups = client.take_pending_convergence_groups();
+                                            retry_groups.push(group_id.clone());
+                                            scheduled_convergence.schedule_retry_groups(retry_groups);
                                             publish_app_runtime_account_error(
                                                 &events,
                                                 &account_id_hex,
                                                 &account_label,
-                                                account_error_message(
-                                                    "convergence schedule state failed",
-                                                    &err,
-                                                ),
+                                                account_error_message("scheduled convergence failed", &err),
                                             );
                                         }
                                     }
-                                    schedule_pending_convergence_groups(
-                                        &mut scheduled_convergence,
-                                        &mut client,
-                                    );
-                                    let _ = run_pending_epoch_backfill_reporting_arm(
-                                        &mut client,
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        &shared,
-                                        EpochBackfillExecutionSeam::Maintenance,
-                                    )
-                                    .await;
-                                    if sync_summary_triggers_audit_tracker_update(&summary) {
-                                        shared.schedule_audit_log_tracker_update("scheduled_convergence");
-                                    }
                                 }
-                                Err(err) => {
-                                    let mut retry_groups = client.take_pending_convergence_groups();
-                                    retry_groups.push(group_id.clone());
-                                    scheduled_convergence.schedule_retry_groups(retry_groups);
+                            }
+                            Err(err) => {
+                                let account_inactive = err.is_account_not_active();
+                                scheduled_convergence.schedule_retry_groups(groups);
+                                publish_app_runtime_account_error(
+                                    &events,
+                                    &account_id_hex,
+                                    &account_label,
+                                    account_error_message("scheduled convergence sync failed", &err),
+                                );
+                                if account_inactive
+                                    && let Err(activation_error) = client.prepare_transport().await
+                                {
                                     publish_app_runtime_account_error(
                                         &events,
                                         &account_id_hex,
                                         &account_label,
-                                        account_error_message("scheduled convergence failed", &err),
+                                        account_error_message(
+                                            "scheduled convergence transport reactivation failed",
+                                            &activation_error,
+                                        ),
                                     );
                                 }
                             }
                         }
-                    }
-                    Err(err) => {
-                        let account_inactive = err.is_account_not_active();
-                        scheduled_convergence.schedule_retry_groups(groups);
-                        publish_app_runtime_account_error(
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            account_error_message("scheduled convergence sync failed", &err),
-                        );
-                        if account_inactive
-                            && let Err(activation_error) = client.prepare_transport().await
-                        {
-                            publish_app_runtime_account_error(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message(
-                                    "scheduled convergence transport reactivation failed",
-                                    &activation_error,
-                                ),
-                            );
-                        }
-                    }
-                }
+                    },
+                    &mut commands,
+                    &mut pending,
+                    &app,
+                    &account_label,
+                )
+                .await;
             }
             command = async {
                 match pending.pop_front() {
