@@ -695,6 +695,13 @@ async fn run_app_runtime_account_worker(
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let startup_sync_result = {
         let mut initial_sync = std::pin::pin!(async {
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            if let Some(barrier) = shared.take_next_startup_sync_barrier() {
+                // First acknowledge entry, then hold sync until the test has
+                // exercised the command loop below.
+                barrier.wait().await;
+                barrier.wait().await;
+            }
             let summary = client
                 .sync_with_stage_telemetry(&startup_stage_telemetry)
                 .await?;

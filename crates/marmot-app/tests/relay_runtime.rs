@@ -3072,6 +3072,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
 }
 
 #[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
 async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     // Regression: the account worker must answer read commands as soon as the
     // session is hydrated, WITHOUT blocking on the initial relay catch-up. On
@@ -3093,11 +3094,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
-    // Alice creates a group with Bob. Waiting for Bob's GroupJoined guarantees
-    // Bob received the welcome over the relay (an inbound delivery), so his
-    // persisted transport cursor is advanced to ~now: his next worker startup
-    // re-subscribes from there and the catch-up genuinely has to wait
-    // (SDK_FIRST_SYNC_WAIT / drain) rather than short-circuiting.
+    // Establish a real group over the relay before restarting Bob's worker.
     let group_id = runtime
         .create_group(&alice_id, "fast reads", std::slice::from_ref(&bob_id), None)
         .await
@@ -3111,33 +3108,24 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     })
     .await;
 
-    // `AccountSync` is recorded only when a worker's catch-up sync COMPLETES.
-    let account_sync_attempts = || {
-        runtime
-            .shared_services()
-            .app_performance_telemetry()
-            .snapshot()
-            .account_sync
-            .attempts
-    };
-    let before_restart = account_sync_attempts();
+    // Finish the existing workers' startup before arming the one-shot gate.
+    // A global sync counter includes Alice and detached post-create work, and
+    // a relay drain duration does not establish ordering across task polls.
+    runtime.catch_up_accounts().await.unwrap();
+    let startup_sync_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup_sync_barrier.clone());
 
-    // Foreground-resume analog: tear down and rebuild Bob's worker.
-    runtime.restart_account(&bob_id).await.unwrap();
-
-    // Deterministic discriminator: in the fixed code `restart_account` returns
-    // once the worker is hydrated and command-ready, BEFORE the background
-    // catch-up completes — so no new `AccountSync` has been recorded yet. (The
-    // catch-up has a >=250ms drain floor, so it cannot have finished in the
-    // synchronous gap between `restart_account` returning and this read.) In the
-    // pre-fix code, `restart_account`/`reconcile` blocked on the startup sync,
-    // so a new `AccountSync` would already be recorded here. No `.await` runs
-    // between `restart_account` and this read.
-    assert_eq!(
-        account_sync_attempts(),
-        before_restart,
-        "restart must become command-ready before the initial catch-up completes",
-    );
+    // Foreground-resume analog: Bob must become command-ready while his
+    // initial sync is unable to finish, regardless of scheduler timing.
+    timeout(Duration::from_secs(5), runtime.restart_account(&bob_id))
+        .await
+        .expect("restart must not wait for initial catch-up")
+        .unwrap();
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("restarted worker must reach initial sync");
 
     // The bounded chat-list companion read uses the same snapshot during the
     // detached catch-up, so batching does not reintroduce a readiness wait.
@@ -3159,16 +3147,8 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         !member_ids_page[0].admin_ids_hex.contains(&bob_id),
         "invited member must not be reported as an admin"
     );
-    assert_eq!(
-        account_sync_attempts(),
-        before_restart,
-        "member-id page must complete before the initial catch-up finishes",
-    );
-
-    // The combined roster read is answered with a session-consistent group
-    // record, member list, and MLS state while (or right after) catch-up runs.
-    // During the catch-up window it comes from the post-hydration snapshot;
-    // afterwards it comes from the live session. Either way it must not block.
+    // The combined roster read must also use the post-hydration snapshot
+    // while the startup sync is held behind the barrier.
     let roster = timeout(
         Duration::from_secs(2),
         runtime.group_roster(&bob_id, &group_id),
@@ -3205,19 +3185,15 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         "snapshot/live read must report the full roster",
     );
 
-    // The catch-up is not dropped — it still runs in the background and records
-    // its completion.
-    let catch_up_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if account_sync_attempts() > before_restart {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < catch_up_deadline,
-            "background catch-up must still complete after readiness",
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    // Release Bob's initial sync and await the real catch-up result so the
+    // test also proves this work is not dropped.
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("initial sync must remain at the release barrier during reads");
+    timeout(Duration::from_secs(5), runtime.catch_up_accounts())
+        .await
+        .expect("background catch-up must complete after release")
+        .unwrap();
 
     runtime.shutdown().await;
 }

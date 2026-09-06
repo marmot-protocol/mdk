@@ -230,6 +230,8 @@ pub struct RuntimeSharedServices {
     /// scheduler timing. Consulted only with the `test-policy-overrides`
     /// feature; always `None` in production.
     create_group_catch_up_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    next_startup_sync_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
@@ -308,6 +310,8 @@ impl Default for RuntimeSharedServices {
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -334,6 +338,8 @@ impl RuntimeSharedServices {
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -360,6 +366,20 @@ impl RuntimeSharedServices {
 
     fn create_group_catch_up_barrier(&self) -> Option<Arc<tokio::sync::Notify>> {
         self.create_group_catch_up_barrier.lock().unwrap().clone()
+    }
+
+    /// Test-only hook: rendezvous once when the next worker reaches initial
+    /// sync, then again to release it after read assertions. Consumed once so
+    /// later restarts cannot inherit it.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub fn set_next_startup_sync_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.next_startup_sync_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    fn take_next_startup_sync_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.next_startup_sync_barrier.lock().unwrap().take()
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
