@@ -23,6 +23,14 @@ reaction content of at most 64 Unicode scalar values. Adds are idempotent;
 removal can target exact content or clear all active own reactions atomically;
 processing-status reaction policy remains a separate host concern.
 
+The model-callable `marmot_status` tool exposes the plugin's passive readiness
+probe on a supported Hermes operator surface. It reports staged booleans for
+plugin discovery, enablement, configuration, `wn-agent` reachability,
+authentication, account selection, home-group resolution, and media capability.
+It never returns account or group identifiers. `state: ready` is the only fully
+ready result; `gateway_inactive` means no live Marmot adapter is available to
+probe in that Hermes process.
+
 For live previews, the plugin retries `stream_begin` with one stable v2 request
 id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must

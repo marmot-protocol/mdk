@@ -983,6 +983,8 @@ class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ready["authenticated"])
         self.assertTrue(ready["account_selected"])
         self.assertTrue(ready["home_resolved"])
+        self.assertNotIn("account_id_hex", ready)
+        self.assertNotIn("group_id_hex", ready)
         self.assertEqual(client.group_lookup, ("11" * 32, "22" * 32))
 
     async def test_probe_distinguishes_unreachable_and_account_unselected(self):
@@ -6201,7 +6203,7 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_marmot_history_and_reactions_as_platform_tools(self):
+    def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -6217,6 +6219,11 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module.register(ctx)
 
         self.assertEqual([platform["name"] for platform in ctx.platforms], ["marmot"])
+        status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
+        self.assertEqual(status["toolset"], "platform")
+        self.assertEqual(status["schema"]["properties"], {})
+        self.assertIs(status["handler"], self.adapter_module._marmot_status_tool)
+        self.assertTrue(status["is_async"])
         history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
@@ -6227,6 +6234,41 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
         self.assertIs(reaction["handler"], self.adapter_module._marmot_reaction_tool)
         self.assertTrue(reaction["is_async"])
+
+    async def test_marmot_status_reports_live_readiness_without_identifiers(self):
+        class FakeClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+
+        class FakeAdapter:
+            config = config_cls(
+                enabled=True,
+                extra={
+                    "socket_path": "/tmp/passive-probe.sock",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                },
+            )
+            client = FakeClient()
+
+        live_adapter = FakeAdapter()
+        self.adapter_module._remember_live_adapter(live_adapter)
+        result = json.loads(await self.adapter_module._marmot_status_tool({}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "ready")
+        self.assertTrue(result["wn_agent_reachable"])
+        self.assertNotIn("11" * 32, json.dumps(result))
+        self.assertNotIn("22" * 32, json.dumps(result))
 
     async def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []

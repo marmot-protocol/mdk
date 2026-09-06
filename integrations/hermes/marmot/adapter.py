@@ -3390,7 +3390,6 @@ async def probe_readiness(
         status["state"] = "account_unselected"
         return status
     status["account_selected"] = True
-    status["account_id_hex"] = selected
 
     group_id = adapter.group_id_hex
     home_channel = getattr(config, "home_channel", None)
@@ -3414,7 +3413,6 @@ async def probe_readiness(
         status["error_code"] = getattr(exc, "code", "group_lookup_failed")
         return status
     status["home_resolved"] = True
-    status["group_id_hex"] = group_id
     status["state"] = "ready"
     return status
 
@@ -3495,6 +3493,44 @@ async def _standalone_send(
     if result.success:
         return {"success": True, "message_id": result.message_id}
     return {"error": result.error or "Marmot send failed"}
+
+
+async def _marmot_status_tool(args: Dict[str, Any]) -> str:
+    """Expose the passive staged readiness probe on Hermes's platform tool surface."""
+
+    del args
+    adapter = _live_adapter()
+    if adapter is None:
+        return json.dumps(
+            {
+                "ok": False,
+                "state": "gateway_inactive",
+                "plugin_discovered": True,
+                "enabled": False,
+                "config_valid": False,
+                "wn_agent_reachable": False,
+                "authenticated": False,
+                "account_selected": False,
+                "home_resolved": False,
+                "media": media_capability_status(),
+            },
+            sort_keys=True,
+        )
+
+    try:
+        status = await probe_readiness(adapter.config, client=adapter.client)
+    except Exception as exc:
+        logger.debug("Marmot readiness probe failed", exc_info=True)
+        return json.dumps(
+            {
+                "ok": False,
+                "state": "probe_failed",
+                "error_code": type(exc).__name__,
+                "media": media_capability_status(),
+            },
+            sort_keys=True,
+        )
+    return json.dumps({"ok": status.get("state") == "ready", **status}, sort_keys=True)
 
 
 async def _delete_marmot_message_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
@@ -3634,14 +3670,27 @@ def register(ctx):
         platform_hint=(
             "You are chatting through Marmot, an end-to-end encrypted group "
             "messaging protocol. Chat ids are Marmot group ids and user ids "
-            "are Marmot account pubkeys. Use marmot_history with the current "
-            "chat id for exact durable message ids or older transcript pages, "
-            "and marmot_reaction to add or remove durable message reactions."
+            "are Marmot account pubkeys. Use marmot_status for passive, staged "
+            "connector readiness without exposing identifiers. Use "
+            "marmot_history with the current chat id for exact durable message "
+            "ids or older transcript pages, and marmot_reaction to add or remove "
+            "durable message reactions."
         ),
         emoji="",
     )
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool):
+        register_tool(
+            name="marmot_status",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
+            handler=_marmot_status_tool,
+            is_async=True,
+        )
         register_tool(
             name="delete_marmot_message",
             toolset="platform",
