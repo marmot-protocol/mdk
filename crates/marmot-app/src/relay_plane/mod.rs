@@ -936,6 +936,22 @@ impl MarmotRelayPlane {
             .await
     }
 
+    pub(crate) async fn inspect_directory_events(
+        &self,
+        endpoint: TransportEndpoint,
+        query: DirectoryEventQuery,
+        signer: Option<Arc<dyn nostr::NostrSigner>>,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(vec![endpoint], "onboarding inspection")?;
+        self.inner
+            .directory
+            .inspect_events(DirectoryFetchRequest::new(endpoints, vec![query])?, signer)
+            .await
+    }
+
     /// Narrow discovered relay endpoints to the safe ones, dropping the rest.
     ///
     /// Unlike the fail-closed sanitize on the dial path, this is for endpoints

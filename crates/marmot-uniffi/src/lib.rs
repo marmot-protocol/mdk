@@ -46,6 +46,7 @@ pub use secret_store::SecretStore;
 
 uniffi::setup_scaffolding!();
 
+pub use commands::OnboardingSubscription;
 pub use commands::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,
     PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
@@ -80,6 +81,11 @@ pub use conversions::{
     TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
     TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
     TransportFanoutStatusFfi,
+};
+pub use conversions::{
+    OnboardingActionFfi, OnboardingFindingFfi, OnboardingIssueFfi, OnboardingOptionsFfi,
+    OnboardingRepairProposalFfi, OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi,
+    OnboardingStepStateFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's

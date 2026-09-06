@@ -1,0 +1,278 @@
+//! Typed onboarding contract for Swift and Kotlin.
+use super::UserProfileMetadataFfi;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingStepFfi {
+    Profile,
+    Follows,
+    Relays,
+    InboxRelays,
+    KeyPackage,
+}
+impl From<marmot_app::OnboardingStep> for OnboardingStepFfi {
+    fn from(value: marmot_app::OnboardingStep) -> Self {
+        match value {
+            marmot_app::OnboardingStep::Profile => Self::Profile,
+            marmot_app::OnboardingStep::Follows => Self::Follows,
+            marmot_app::OnboardingStep::Relays => Self::Relays,
+            marmot_app::OnboardingStep::InboxRelays => Self::InboxRelays,
+            marmot_app::OnboardingStep::KeyPackage => Self::KeyPackage,
+        }
+    }
+}
+impl From<OnboardingStepFfi> for marmot_app::OnboardingStep {
+    fn from(value: OnboardingStepFfi) -> Self {
+        match value {
+            OnboardingStepFfi::Profile => Self::Profile,
+            OnboardingStepFfi::Follows => Self::Follows,
+            OnboardingStepFfi::Relays => Self::Relays,
+            OnboardingStepFfi::InboxRelays => Self::InboxRelays,
+            OnboardingStepFfi::KeyPackage => Self::KeyPackage,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingStatusFfi {
+    Pending,
+    Checking,
+    Passed,
+    NeedsInput,
+    RetryableFailure,
+    WaitingForSigner,
+    Skipped,
+}
+impl From<marmot_app::OnboardingStatus> for OnboardingStatusFfi {
+    fn from(value: marmot_app::OnboardingStatus) -> Self {
+        match value {
+            marmot_app::OnboardingStatus::Pending => Self::Pending,
+            marmot_app::OnboardingStatus::Checking => Self::Checking,
+            marmot_app::OnboardingStatus::Passed => Self::Passed,
+            marmot_app::OnboardingStatus::NeedsInput => Self::NeedsInput,
+            marmot_app::OnboardingStatus::RetryableFailure => Self::RetryableFailure,
+            marmot_app::OnboardingStatus::WaitingForSigner => Self::WaitingForSigner,
+            marmot_app::OnboardingStatus::Skipped => Self::Skipped,
+        }
+    }
+}
+impl From<OnboardingStatusFfi> for marmot_app::OnboardingStatus {
+    fn from(value: OnboardingStatusFfi) -> Self {
+        match value {
+            OnboardingStatusFfi::Pending => Self::Pending,
+            OnboardingStatusFfi::Checking => Self::Checking,
+            OnboardingStatusFfi::Passed => Self::Passed,
+            OnboardingStatusFfi::NeedsInput => Self::NeedsInput,
+            OnboardingStatusFfi::RetryableFailure => Self::RetryableFailure,
+            OnboardingStatusFfi::WaitingForSigner => Self::WaitingForSigner,
+            OnboardingStatusFfi::Skipped => Self::Skipped,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingIssueFfi {
+    Missing,
+    Malformed,
+    FutureDated,
+    InvalidRelay,
+    RetiredRelay,
+    UnsafeRelay,
+    Unreachable,
+    TimedOut,
+    AuthenticationRequired,
+    PaymentRequired,
+    AccessRestricted,
+    NoUsableRoute,
+    PublicationFailed,
+    SignerUnavailable,
+    SignerRejected,
+    RecordChanged,
+    Interrupted,
+    TooManyRelays,
+}
+impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
+    fn from(value: marmot_app::OnboardingIssue) -> Self {
+        match value {
+            marmot_app::OnboardingIssue::Missing => Self::Missing,
+            marmot_app::OnboardingIssue::Malformed => Self::Malformed,
+            marmot_app::OnboardingIssue::FutureDated => Self::FutureDated,
+            marmot_app::OnboardingIssue::InvalidRelay => Self::InvalidRelay,
+            marmot_app::OnboardingIssue::RetiredRelay => Self::RetiredRelay,
+            marmot_app::OnboardingIssue::UnsafeRelay => Self::UnsafeRelay,
+            marmot_app::OnboardingIssue::Unreachable => Self::Unreachable,
+            marmot_app::OnboardingIssue::TimedOut => Self::TimedOut,
+            marmot_app::OnboardingIssue::AuthenticationRequired => Self::AuthenticationRequired,
+            marmot_app::OnboardingIssue::PaymentRequired => Self::PaymentRequired,
+            marmot_app::OnboardingIssue::AccessRestricted => Self::AccessRestricted,
+            marmot_app::OnboardingIssue::NoUsableRoute => Self::NoUsableRoute,
+            marmot_app::OnboardingIssue::PublicationFailed => Self::PublicationFailed,
+            marmot_app::OnboardingIssue::SignerUnavailable => Self::SignerUnavailable,
+            marmot_app::OnboardingIssue::SignerRejected => Self::SignerRejected,
+            marmot_app::OnboardingIssue::RecordChanged => Self::RecordChanged,
+            marmot_app::OnboardingIssue::Interrupted => Self::Interrupted,
+            marmot_app::OnboardingIssue::TooManyRelays => Self::TooManyRelays,
+        }
+    }
+}
+impl From<OnboardingIssueFfi> for marmot_app::OnboardingIssue {
+    fn from(value: OnboardingIssueFfi) -> Self {
+        match value {
+            OnboardingIssueFfi::Missing => Self::Missing,
+            OnboardingIssueFfi::Malformed => Self::Malformed,
+            OnboardingIssueFfi::FutureDated => Self::FutureDated,
+            OnboardingIssueFfi::InvalidRelay => Self::InvalidRelay,
+            OnboardingIssueFfi::RetiredRelay => Self::RetiredRelay,
+            OnboardingIssueFfi::UnsafeRelay => Self::UnsafeRelay,
+            OnboardingIssueFfi::Unreachable => Self::Unreachable,
+            OnboardingIssueFfi::TimedOut => Self::TimedOut,
+            OnboardingIssueFfi::AuthenticationRequired => Self::AuthenticationRequired,
+            OnboardingIssueFfi::PaymentRequired => Self::PaymentRequired,
+            OnboardingIssueFfi::AccessRestricted => Self::AccessRestricted,
+            OnboardingIssueFfi::NoUsableRoute => Self::NoUsableRoute,
+            OnboardingIssueFfi::PublicationFailed => Self::PublicationFailed,
+            OnboardingIssueFfi::SignerUnavailable => Self::SignerUnavailable,
+            OnboardingIssueFfi::SignerRejected => Self::SignerRejected,
+            OnboardingIssueFfi::RecordChanged => Self::RecordChanged,
+            OnboardingIssueFfi::Interrupted => Self::Interrupted,
+            OnboardingIssueFfi::TooManyRelays => Self::TooManyRelays,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingActionFfi {
+    Retry,
+    ContinueWithout,
+    UseRecommendedRelays,
+    EditRelays,
+    EditProfile,
+    EditFollows,
+    ApproveRepair,
+    CancelRepair,
+    ReconnectSigner,
+    EditDiscoveryRelays,
+}
+impl From<marmot_app::OnboardingAction> for OnboardingActionFfi {
+    fn from(value: marmot_app::OnboardingAction) -> Self {
+        match value {
+            marmot_app::OnboardingAction::Retry => Self::Retry,
+            marmot_app::OnboardingAction::ContinueWithout => Self::ContinueWithout,
+            marmot_app::OnboardingAction::UseRecommendedRelays => Self::UseRecommendedRelays,
+            marmot_app::OnboardingAction::EditRelays => Self::EditRelays,
+            marmot_app::OnboardingAction::EditProfile => Self::EditProfile,
+            marmot_app::OnboardingAction::EditFollows => Self::EditFollows,
+            marmot_app::OnboardingAction::ApproveRepair => Self::ApproveRepair,
+            marmot_app::OnboardingAction::CancelRepair => Self::CancelRepair,
+            marmot_app::OnboardingAction::EditDiscoveryRelays => Self::EditDiscoveryRelays,
+            marmot_app::OnboardingAction::ReconnectSigner => Self::ReconnectSigner,
+        }
+    }
+}
+impl From<OnboardingActionFfi> for marmot_app::OnboardingAction {
+    fn from(value: OnboardingActionFfi) -> Self {
+        match value {
+            OnboardingActionFfi::Retry => Self::Retry,
+            OnboardingActionFfi::ContinueWithout => Self::ContinueWithout,
+            OnboardingActionFfi::UseRecommendedRelays => Self::UseRecommendedRelays,
+            OnboardingActionFfi::EditRelays => Self::EditRelays,
+            OnboardingActionFfi::EditProfile => Self::EditProfile,
+            OnboardingActionFfi::EditFollows => Self::EditFollows,
+            OnboardingActionFfi::ApproveRepair => Self::ApproveRepair,
+            OnboardingActionFfi::CancelRepair => Self::CancelRepair,
+            OnboardingActionFfi::EditDiscoveryRelays => Self::EditDiscoveryRelays,
+            OnboardingActionFfi::ReconnectSigner => Self::ReconnectSigner,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingFindingFfi {
+    pub issue: OnboardingIssueFfi,
+    pub endpoint: Option<String>,
+}
+impl From<marmot_app::OnboardingFinding> for OnboardingFindingFfi {
+    fn from(value: marmot_app::OnboardingFinding) -> Self {
+        Self {
+            issue: value.issue.into(),
+            endpoint: value.endpoint,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingStepStateFfi {
+    pub step: OnboardingStepFfi,
+    pub status: OnboardingStatusFfi,
+    pub findings: Vec<OnboardingFindingFfi>,
+    pub actions: Vec<OnboardingActionFfi>,
+    pub checked_at: Option<u64>,
+}
+impl From<marmot_app::OnboardingStepState> for OnboardingStepStateFfi {
+    fn from(value: marmot_app::OnboardingStepState) -> Self {
+        Self {
+            step: value.step.into(),
+            status: value.status.into(),
+            findings: value.findings.into_iter().map(Into::into).collect(),
+            actions: value.actions.into_iter().map(Into::into).collect(),
+            checked_at: value.checked_at,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingRepairProposalFfi {
+    pub step: OnboardingStepFfi,
+    pub revision: u64,
+    pub previous_event_id: Option<String>,
+    pub read_relays: Vec<String>,
+    pub write_relays: Vec<String>,
+    pub profile: Option<UserProfileMetadataFfi>,
+    pub follows: Option<Vec<String>>,
+}
+impl From<marmot_app::OnboardingRepairProposal> for OnboardingRepairProposalFfi {
+    fn from(value: marmot_app::OnboardingRepairProposal) -> Self {
+        Self {
+            step: value.step.into(),
+            revision: value.revision,
+            previous_event_id: value.previous_event_id,
+            read_relays: value.read_relays,
+            write_relays: value.write_relays,
+            profile: value.profile.map(Into::into),
+            follows: value.follows,
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingSnapshotFfi {
+    pub account_id_hex: String,
+    pub revision: u64,
+    pub ready: bool,
+    pub steps: Vec<OnboardingStepStateFfi>,
+    pub proposal: Option<OnboardingRepairProposalFfi>,
+}
+impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
+    fn from(value: marmot_app::OnboardingSnapshot) -> Self {
+        Self {
+            account_id_hex: value.account_id_hex,
+            revision: value.revision,
+            ready: value.ready,
+            steps: value.steps.into_iter().map(Into::into).collect(),
+            proposal: value.proposal.map(Into::into),
+        }
+    }
+}
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct OnboardingOptionsFfi {
+    pub default_relays: Vec<String>,
+    pub discovery_relays: Vec<String>,
+}
+impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
+    fn from(value: marmot_app::OnboardingOptions) -> Self {
+        Self {
+            default_relays: value.default_relays,
+            discovery_relays: value.discovery_relays,
+        }
+    }
+}
+impl From<OnboardingOptionsFfi> for marmot_app::OnboardingOptions {
+    fn from(value: OnboardingOptionsFfi) -> Self {
+        Self {
+            default_relays: value.default_relays,
+            discovery_relays: value.discovery_relays,
+        }
+    }
+}

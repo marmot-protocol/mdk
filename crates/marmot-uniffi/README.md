@@ -114,3 +114,64 @@ The output directories are ignored because generated bindings and packaged nativ
 Regenerate them from this crate before vendoring into an app repository.
 
 See [`AGENTS.md`](AGENTS.md) for scope, invariants, and verification commands.
+
+## Interactive account onboarding
+
+Imported identities can use the durable preflight API instead of `login`:
+
+1. Call `begin_onboarding(nsec, options)` or
+   `begin_external_signer_onboarding(public_key, signer, options)`. Supply the
+   same `default_relays` as new-account creation and a separate set of trusted
+   `discovery_relays`. These methods return a persisted account and snapshot
+   before fetching or publishing Nostr records.
+2. Display the five snapshot steps (profile, follows, general relays, inbox
+   relays, KeyPackage). Subscribe with `subscribe_onboarding`, read its initial
+   `snapshot`, and drive `next` concurrently with `run_onboarding`.
+3. Localize the typed status, findings, and actions. A healthy account advances
+   automatically. `NeedsInput` offers a repair or, for profile/follows, an
+   explicit `continue_onboarding_without`. Empty follow lists are valid.
+4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
+   `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
+   a proposal. Profile fields left unset preserve their current values; an
+   explicit empty string clears a field. Display the proposed edits, then pass the returned
+   snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
+   `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
+   a proposal until approval has been recorded.
+5. `retry_onboarding_step` retries a failure; `set_onboarding_discovery_relays`
+   retries with explicitly chosen discovery sources without publishing them.
+   After process restart, read `onboarding_snapshot`, register the external
+   signer again if applicable, and run/resume or retry the indicated step.
+6. Enter the normal app only when `snapshot.ready` is true. Normal worker
+   commands reject unfinished onboarding; the workflow alone can publish its
+   initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
+   interactive workflow is complete.
+
+Snapshots are complete states, not deltas. A slow subscriber may miss
+intermediate states but receives the latest persisted state. Cancellation can
+leave a step `Checking`; `run_onboarding` resumes it. Once a repair is approved,
+a retry resumes that repair before other checks. It cannot be cancelled as if
+nothing had been published: a relay may already have accepted it. Signed bytes
+are retained before the first send and replayed unchanged on retry.
+
+Discovery reads require a completed relay query. Failed/partial empty discovery
+is distinct from absence and never offers automatic replacement. Fresh signed
+records remain available for inspection even when their contents are malformed;
+a newer malformed record does not silently fall back to an older valid one.
+Repairs re-fetch the source before signing and reject a changed record. Nostr
+has no conditional replace operation, so simultaneous edits after this check
+remain subject to its normal replaceable-event ordering.
+
+Relay checks include syntax, local safety/retirement policy, read/write roles,
+and bounded queries through the relevant routes. Inbox queries filter for the
+account's recipient tag and use an isolated account-bound signer. They retain no
+inbox payloads. Read permission and KeyPackage publication are checked separately;
+these checks do not guarantee future availability or every relay's acceptance of
+future third-party inbox messages. Incomplete workflows recheck reachability
+older than five minutes. Completed onboarding is retained and reruns when a
+signed-out account enters the identity-only flow again.
+
+The existing `login` and generated-account APIs remain compatible. Apps must
+adopt the new identity-only APIs and screen to enable this experience. Legacy
+accounts without an onboarding checkpoint are not retroactively blocked. C
+consumers have equivalent methods and subscriptions; external-signer entry
+points retain the C API's existing callback-vtable limitation.

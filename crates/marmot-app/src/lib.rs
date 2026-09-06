@@ -82,6 +82,11 @@ mod directory;
 mod drafts;
 mod error;
 mod external_signer;
+pub use runtime::{
+    OnboardingAction, OnboardingFinding, OnboardingIssue, OnboardingOptions,
+    OnboardingRepairProposal, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
+    OnboardingStepState, OnboardingSubscription,
+};
 mod groups;
 mod ids;
 mod key_package_records;

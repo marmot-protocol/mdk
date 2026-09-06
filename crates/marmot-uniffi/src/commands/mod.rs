@@ -8,6 +8,8 @@
 //! attached to the same methods, so the generated bindings are unaffected.
 
 mod account;
+mod onboarding;
+pub use onboarding::OnboardingSubscription;
 mod agent_stream;
 mod audit;
 mod chat_list;

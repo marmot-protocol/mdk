@@ -1156,3 +1156,64 @@ pub unsafe extern "C" fn marmot_search_users(
         }
     })
 }
+
+use crate::types::onboarding::MarmotOnboardingSnapshot;
+use marmot_uniffi::{MarmotKitError, OnboardingSubscription};
+use std::ffi::c_char;
+// Snapshot pointers exclusively own their allocations and are moved together.
+unsafe impl Send for MarmotOnboardingSnapshot {}
+c_subscription! {
+    /// A current onboarding snapshot followed by durable progress updates.
+    MarmotOnboardingSubscription(OnboardingSubscription),
+    item MarmotOnboardingSnapshot from marmot_uniffi::OnboardingSnapshotFfi,
+    item_free "marmot_onboarding_snapshot_free",
+    callback MarmotOnboardingCallback,
+    read next,
+    next marmot_onboarding_subscription_next,
+    set_callback marmot_onboarding_subscription_set_callback,
+    clear_callback marmot_onboarding_subscription_clear_callback,
+    free marmot_onboarding_subscription_free
+}
+/// Subscribe to durable onboarding state for an account.
+///
+/// # Safety
+/// Client and account_ref must be valid; out_sub must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_subscribe_onboarding(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out_sub: *mut *mut MarmotOnboardingSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        match client.marmot.subscribe_onboarding(account_ref) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotOnboardingSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
+}
+/// Return the initial snapshot. Free with marmot_onboarding_snapshot_free.
+///
+/// # Safety
+/// Sub must be live and out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_onboarding_subscription_snapshot(
+    sub: *const MarmotOnboardingSubscription,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        unsafe { deliver(Ok::<_, MarmotKitError>(sub.inner.snapshot()), out) }
+    })
+}

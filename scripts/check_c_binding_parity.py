@@ -30,6 +30,7 @@ C_SRC = REPO / "crates" / "marmot-c" / "src"
 # Commands deliberately absent from the C ABI, each with the reason it is
 # not drift. Removing an entry here is how you turn it back into a gap.
 DELIBERATELY_UNEXPORTED = {
+    "begin_external_signer_onboarding": ("Same host-implemented signer trait as register_external_signer."),
     "register_external_signer": (
         "Takes a host-implemented ExternalAccountSignerFfi trait. A C mapping "
         "needs a callback vtable (function pointers + user_data) invoked from "

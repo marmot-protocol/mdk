@@ -62,6 +62,8 @@ mod agent_stream_watch;
 mod audit_tracker;
 mod commands;
 mod event_routing;
+mod onboarding;
+pub use onboarding::*;
 mod subscriptions;
 
 // Re-export the public surface so `crate::runtime::Item` and the
@@ -182,6 +184,8 @@ pub struct AccountManager {
     tearing_down: Arc<StdMutex<HashSet<String>>>,
     worker_transactions: Arc<Mutex<()>>,
     generated_setup_local_transaction: Arc<Mutex<()>>,
+    onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
+    onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
@@ -3981,6 +3985,13 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<AccountSetupReadiness, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        if let Some(onboarding) = self.accounts.onboarding_snapshot(account_ref)? {
+            return Ok(if onboarding.ready {
+                AccountSetupReadiness::NetworkReady
+            } else {
+                AccountSetupReadiness::Initializing
+            });
+        }
         if self
             .accounts
             .app
@@ -4702,6 +4713,8 @@ impl AccountManager {
             tearing_down: Arc::new(StdMutex::new(HashSet::new())),
             worker_transactions: Arc::new(Mutex::new(())),
             generated_setup_local_transaction: Arc::new(Mutex::new(())),
+            onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
+            onboarding_updates: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
@@ -4830,6 +4843,10 @@ impl AccountManager {
             // account live, and a live external-signer account still needs its
             // signer to reconcile.
             self.app.forget_external_signer(&account.account_id_hex);
+            self.onboarding_updates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&account.account_id_hex);
             Ok(())
         }
         .await;
@@ -5002,6 +5019,16 @@ impl AccountManager {
                                 && !account.signed_out
                                 && self.app.has_external_signer(&account.account_id_hex)))
                 })
+                .collect::<Vec<_>>();
+            let accounts = accounts
+                .into_iter()
+                .map(|account| {
+                    self.onboarding_worker_allowed(&account.label)
+                        .map(|allowed| allowed.then_some(account))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -5338,6 +5365,15 @@ impl AccountManager {
         account_ref: &str,
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
+        self.require_onboarding_complete(account_ref)?;
+        self.worker_commands_for_setup(account_ref).await
+    }
+
+    async fn worker_commands_for_setup(
+        &self,
+        account_ref: &str,
+    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+        self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
@@ -5384,6 +5420,7 @@ impl AccountManager {
         } else {
             self.create_nostr_account_from_setup(&request)?
         };
+        self.require_onboarding_complete(&account.label)?;
         let reactivating_existing = account.signed_out;
         let recent_relay_lists =
             if imports_private_key || reactivating_existing || !account.local_signing {
@@ -5595,6 +5632,9 @@ impl AccountManager {
         let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
         if signer_public_key.to_hex() != account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
+        }
+        if let Ok(account) = self.app.account_home().account(&account_id_hex) {
+            self.require_onboarding_complete(&account.label)?;
         }
         let existing_account = self.app.account_home().account(&account_id_hex).ok();
         let created_account = existing_account.is_none();
@@ -6355,6 +6395,10 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        self.onboarding_updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let generated_setup_tasks = {
             let mut tasks = self
                 .generated_setup_tasks

@@ -1498,6 +1498,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::NotificationsDisabled
         | AppError::AccountSetupRecoveryRequired
         | AppError::AccountSetupRetryRequired
+        | AppError::OnboardingActionUnavailable
+        | AppError::OnboardingRequired
         | AppError::AccountSetupResetNotApplicable
         | AppError::AccountSetupKeyPackageRecoveryAvailable
         | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,

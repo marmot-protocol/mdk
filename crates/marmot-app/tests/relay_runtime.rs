@@ -12224,3 +12224,388 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
         "the resolver must issue accepted single-author fallbacks for both members"
     );
 }
+
+// Interactive onboarding must be tested against real EOSE and publication
+// acknowledgements, not only directory-cache fixtures.
+async fn onboarding_fixture() -> (
+    tempfile::TempDir,
+    MockRelay,
+    MarmotApp,
+    MarmotAppRuntime,
+    Keys,
+    String,
+    String,
+) {
+    use nostr::prelude::ToBech32;
+    let directory = tempfile::tempdir().unwrap();
+    let (relay, app, url) = mock_app(&directory).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let keys = Keys::generate();
+    let id = keys.public_key().to_hex();
+    let snapshot = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!snapshot.ready);
+    (directory, relay, app, runtime, keys, id, url)
+}
+async fn seed_onboarding_records(home: &AccountHome, id: &str, url: &str) {
+    let at = NostrTimestamp::now().as_secs() - 10;
+    publish_nostr_event_at(
+        home,
+        id,
+        url,
+        0,
+        vec![],
+        "{\"name\":\"Alice\",\"custom\":{\"keep\":true}}".into(),
+        at,
+    )
+    .await;
+    publish_nostr_event_at(
+        home,
+        id,
+        url,
+        3,
+        vec![],
+        "legacy relay preferences".into(),
+        at,
+    )
+    .await;
+    publish_account_relay_lists_at(home, id, url, url, at).await;
+}
+#[tokio::test]
+async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
+    let (directory, _relay, app, runtime, _keys, id, url) = onboarding_fixture().await;
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(
+        !runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .find(|a| a.account_id_hex == id)
+            .unwrap()
+            .running
+    );
+    assert!(
+        app.fetch_current_account_relay_list_status_for_account_id(&id, vec![endpoint(&url)], None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut subscription = runtime.accounts().subscribe_onboarding(&id).unwrap();
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        snapshot.steps[0].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+    assert_eq!(
+        snapshot.steps[0].findings[0].issue,
+        marmot_app::OnboardingIssue::Missing
+    );
+    assert!(subscription.recv().await.unwrap().revision > subscription.snapshot.revision);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = AccountHome::open(directory.path())
+            .account_dir(&id)
+            .join("onboarding.json");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+    let reopened = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url));
+    assert_eq!(
+        reopened.accounts().onboarding_snapshot(&id).unwrap(),
+        Some(snapshot)
+    );
+    reopened.reconcile_accounts().await.unwrap();
+    assert!(!reopened.accounts().managed_accounts().unwrap()[0].running);
+    reopened.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_valid_account_completes_all_checks_and_publishes_key_package() {
+    let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert!(snapshot.ready, "{snapshot:?}");
+    assert!(
+        snapshot
+            .steps
+            .iter()
+            .all(|s| s.status == marmot_app::OnboardingStatus::Passed)
+    );
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        marmot_app::AccountSetupReadiness::NetworkReady
+    );
+    assert!(
+        AccountHome::open(directory.path())
+            .account_setup_state(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !runtime
+            .accounts()
+            .account_key_packages(&id, vec![endpoint(&url)])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags() {
+    use marmot_app::OnboardingStep;
+    let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let tags = vec![
+        vec!["r".into(), "not a relay".into()],
+        vec!["client".into(), "preserve-me".into()],
+    ];
+    publish_nostr_event_at(
+        &AccountHome::open(directory.path()),
+        &id,
+        &url,
+        10002,
+        tags,
+        "preserve content".into(),
+        NostrTimestamp::now().as_secs() - 5,
+    )
+    .await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        snapshot.steps[2].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+    assert!(!snapshot.ready);
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, proposal.revision - 1)
+            .await,
+        Err(AppError::OnboardingActionUnavailable)
+    ));
+    let snapshot = runtime
+        .accounts()
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    assert!(snapshot.ready, "{snapshot:?}");
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    let events = client
+        .fetch_events_from(
+            [url],
+            nostr::Filter::new()
+                .author(nostr::PublicKey::parse(&id).unwrap())
+                .kind(Kind::RelayList),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    let event = events.first().unwrap();
+    assert_eq!(event.content, "preserve content");
+    assert!(
+        event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["client", "preserve-me"])
+    );
+    client.shutdown().await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_stale_repair_detects_a_new_remote_record() {
+    use marmot_app::OnboardingStep;
+    let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    publish_nostr_event_at(
+        &AccountHome::open(directory.path()),
+        &id,
+        &url,
+        10002,
+        vec![],
+        String::new(),
+        NostrTimestamp::now().as_secs() - 5,
+    )
+    .await;
+    runtime.accounts().run_onboarding(&id).await.unwrap();
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    publish_account_relay_lists_at(
+        &AccountHome::open(directory.path()),
+        &id,
+        &url,
+        &url,
+        NostrTimestamp::now().as_secs(),
+    )
+    .await;
+    let snapshot = runtime
+        .accounts()
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    assert!(!snapshot.ready);
+    assert!(snapshot.proposal.is_none());
+    assert_eq!(
+        snapshot.steps[2].findings[0].issue,
+        marmot_app::OnboardingIssue::RecordChanged
+    );
+    assert!(
+        runtime
+            .accounts()
+            .retry_onboarding_step(&id, OnboardingStep::Relays)
+            .await
+            .unwrap()
+            .ready
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
+    let (directory, _relay, _app, runtime, keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    runtime.shutdown_and_close().await.unwrap();
+    let external_directory = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(
+        external_directory.path(),
+        url.clone(),
+    ));
+    let snapshot = runtime
+        .accounts()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            TestExternalAccountSigner { keys },
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!snapshot.ready);
+    assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert!(snapshot.ready, "{snapshot:?}");
+    runtime.shutdown_and_close().await.unwrap();
+    drop(directory);
+}
+
+#[derive(Debug)]
+struct OnboardingPaymentRequired;
+impl nostr_relay_builder::prelude::QueryPolicy for OnboardingPaymentRequired {
+    fn admit_query<'a>(
+        &'a self,
+        _: &'a nostr::Filter,
+        _: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async { PolicyResult::Reject("payment-required: subscription needed".into()) })
+    }
+}
+#[tokio::test]
+async fn onboarding_access_restricted_query_is_not_a_missing_record() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(OnboardingPaymentRequired));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), url.clone()));
+    let keys = Keys::generate();
+    let snapshot = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url],
+            },
+        )
+        .await
+        .unwrap();
+    let result = runtime
+        .accounts()
+        .run_onboarding(&snapshot.account_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.steps[0].status,
+        marmot_app::OnboardingStatus::RetryableFailure
+    );
+    assert_eq!(
+        result.steps[0].findings[0].issue,
+        marmot_app::OnboardingIssue::AccessRestricted
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry() {
+    use nostr::prelude::ToBech32;
+    let directory = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(true));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(directory.path(), url.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let id = keys.public_key().to_hex();
+    runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert!(!snapshot.ready);
+    assert_eq!(
+        snapshot.steps[4].status,
+        marmot_app::OnboardingStatus::RetryableFailure
+    );
+    assert!(matches!(
+        runtime.accounts().publish_key_package(&id).await,
+        Err(AppError::OnboardingRequired)
+    ));
+    assert!(
+        AccountHome::open(directory.path())
+            .account_setup_state(&id)
+            .unwrap()
+            .is_some()
+    );
+    rejecting.store(false, Ordering::SeqCst);
+    let snapshot = runtime
+        .accounts()
+        .retry_onboarding_step(&id, marmot_app::OnboardingStep::KeyPackage)
+        .await
+        .unwrap();
+    assert!(snapshot.ready, "{snapshot:?}");
+    runtime.shutdown_and_close().await.unwrap();
+}
