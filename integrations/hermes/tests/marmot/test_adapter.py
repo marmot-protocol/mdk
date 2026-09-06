@@ -5655,7 +5655,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 object(),
                 "22" * 32,
                 " one caption ",
-                media_files=["first.png", "second.jpg"],
+                media_files=["first.png", ("second.jpg", False)],
             )
             blank_response = await self.adapter_module._standalone_send(
                 object(),
@@ -5673,6 +5673,23 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response["attachment_outcomes"]), 2)
         self.assertIsNone(fake_adapter.batches[1][2])
         self.assertTrue(blank_response["success"])
+
+    async def test_standalone_media_files_reject_empty_sequence_records(self):
+        with unittest.mock.patch.object(
+            self.adapter_module,
+            "MarmotPlatformAdapter",
+        ) as adapter_cls:
+            for media_file in ((), []):
+                with self.subTest(media_file=media_file):
+                    response = await self.adapter_module._standalone_send(
+                        object(),
+                        "22" * 32,
+                        "caption",
+                        media_files=[media_file],
+                    )
+                    self.assertEqual(response, {"error": "Marmot media file path required"})
+
+        adapter_cls.assert_not_called()
 
     async def test_outbound_media_outside_allowlist_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:

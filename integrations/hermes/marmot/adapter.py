@@ -3506,11 +3506,17 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
 ):
-    adapter = MarmotPlatformAdapter(pconfig)
     if media_files:
         attachments = []
         for media_file in media_files:
-            media_path = media_file[0] if isinstance(media_file, (tuple, list)) else media_file
+            if isinstance(media_file, (tuple, list)):
+                if not media_file:
+                    return {"error": "Marmot media file path required"}
+                media_path = media_file[0]
+            else:
+                media_path = media_file
+            if media_path is None or not str(media_path).strip():
+                return {"error": "Marmot media file path required"}
             path = Path(str(media_path)).expanduser()
             attachments.append(
                 {
@@ -3519,6 +3525,7 @@ async def _standalone_send(
                     "file_name": path.name,
                 }
             )
+        adapter = MarmotPlatformAdapter(pconfig)
         caption = str(message or "")
         result = await adapter._send_media_batch(
             str(chat_id),
@@ -3537,6 +3544,7 @@ async def _standalone_send(
             "message_ids": message_ids,
             "attachment_outcomes": list(raw_response.get("attachment_outcomes") or ()),
         }
+    adapter = MarmotPlatformAdapter(pconfig)
     result = await adapter.send(str(chat_id), str(message or ""))
     if result.success:
         return {"success": True, "message_id": result.message_id}
