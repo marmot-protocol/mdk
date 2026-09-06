@@ -34,6 +34,11 @@ uses the same conformance path classifier, and participates in **Required CI**. 
 expanded synthetic input and public observations, excluding participant databases and keys. It asserts successful
 recovery, not a particular failure count. A run that skips this job is not recovery evidence.
 
+Set `MDK_BACKLOG_TRACE=1` to include aggregate engine preparation, retry-slice and transport-release diagnostics
+on stderr. The required recovery job enables this to distinguish slow preparation with zero attempts from
+retry progress or resource release. These traces contain counts, durations and fixed outcome labels; participant
+databases and keys remain excluded from uploaded evidence.
+
 On September 6, the worker-responsiveness fix passed this unchanged recovery contract twice. Background engine
 advance now shares a 64-row allowance and a cooperative 500-ms budget across sweeps; historical peel contexts
 are materialized once per sweep and released afterward. All 1,024 original payloads recovered, all four participants

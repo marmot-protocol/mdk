@@ -44,6 +44,7 @@ tempfile.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 # Byte-level conformance vectors for the agent text stream QUIC feature pin
 # the transport crates' key derivation, AAD, and broker control bytes.
 transport-quic-stream.workspace = true

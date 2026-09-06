@@ -412,6 +412,13 @@ async fn large_backlog(
 }
 
 async fn check(journey: Journey) {
+    if std::env::var_os("MDK_BACKLOG_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("cgka_engine::message_processor=info,marmot_app::relay_plane=info")
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let label = format!("{journey:?}").to_lowercase();
     let mut builder = tempfile::Builder::new();
     let prefix = format!("app-journey-{label}-");

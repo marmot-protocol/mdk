@@ -1625,6 +1625,17 @@ impl<S: StorageProvider> Engine<S> {
         backlog: usize,
         outcome: crate::engine_metrics::DeferredPeelMetricOutcome,
     ) {
+        tracing::info!(
+            target: "cgka_engine::message_processor",
+            method = "retry_deferred_peels",
+            phase = "slice_complete",
+            foreground = budget_ms.is_some(),
+            rows_attempted = rows_attempted as u64,
+            backlog = backlog as u64,
+            duration_ms = started.elapsed().as_millis() as u64,
+            outcome = ?outcome,
+            "deferred-peel slice outcome"
+        );
         if let Some(budget_ms) = budget_ms {
             self.engine_metrics.note_outbound_deferred_peel(
                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -1707,6 +1718,15 @@ impl<S: StorageProvider> Engine<S> {
         // Prepare from metadata; payload reads belong only to selected rows.
         // State filtering also avoids touching unrelated retained history.
         let mut deferred = self.storage.list_deferred_message_metadata(group_id)?;
+        tracing::info!(
+            target: "cgka_engine::message_processor",
+            method = "retry_deferred_peels",
+            phase = "metadata_loaded",
+            backlog = deferred.len() as u64,
+            duration_ms = sweep_started.elapsed().as_millis() as u64,
+            budget_exhausted = execution.exhausted(),
+            "deferred-peel preparation"
+        );
         if execution.exhausted() {
             self.note_foreground_deferred_phase(
                 sweep_started,
@@ -1826,6 +1846,15 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+        tracing::info!(
+            target: "cgka_engine::message_processor",
+            method = "retry_deferred_peels",
+            phase = "fingerprint_loaded",
+            backlog = total as u64,
+            duration_ms = sweep_started.elapsed().as_millis() as u64,
+            budget_exhausted = execution.exhausted(),
+            "deferred-peel preparation"
+        );
         let unattempted = deferred
             .iter()
             .filter(|record| {
@@ -1992,6 +2021,7 @@ impl<S: StorageProvider> Engine<S> {
         let past_contexts = crate::message_processor::ingest::PastPeelContextCache::default();
         let sweep = crate::message_processor::ingest::DeferredPeelSweep::over_branches(&peel)
             .with_past_contexts(&past_contexts);
+        let preparation_ms = sweep_started.elapsed().as_millis() as u64;
 
         let mut progressed = 0usize;
         let mut terminal = 0usize;
@@ -2163,6 +2193,8 @@ impl<S: StorageProvider> Engine<S> {
             candidate_cache_hit,
             queue_depth,
             sweep_duration_ms = duration_ms,
+            preparation_ms,
+            timed_out,
             budget_exhausted = status == DeferredPeelWorkStatus::BudgetExhausted,
             contexts_invalidated,
             "deferred-peel retry sweep"
