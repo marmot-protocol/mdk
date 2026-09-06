@@ -7,8 +7,8 @@ pub enum OnboardingStepFfi {
     Follows,
     Relays,
     InboxRelays,
-    KeyPackage,
     SingleDevice,
+    KeyPackage,
 }
 impl From<marmot_app::OnboardingStep> for OnboardingStepFfi {
     fn from(value: marmot_app::OnboardingStep) -> Self {
@@ -264,6 +264,7 @@ pub struct OnboardingSnapshotFfi {
     pub steps: Vec<OnboardingStepStateFfi>,
     pub proposal: Option<OnboardingRepairProposalFfi>,
     pub single_device_notice: Option<OnboardingSingleDeviceNoticeFfi>,
+    pub cancellation_pending: bool,
 }
 impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
     fn from(value: marmot_app::OnboardingSnapshot) -> Self {
@@ -273,6 +274,7 @@ impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
             ready: value.ready,
             steps: value.steps.into_iter().map(Into::into).collect(),
             single_device_notice: value.single_device_notice.map(Into::into),
+            cancellation_pending: value.cancellation_pending,
             proposal: value.proposal.map(Into::into),
         }
     }
@@ -319,10 +321,11 @@ impl From<marmot_app::OnboardingDeviceDiscovery> for OnboardingDeviceDiscoveryFf
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OnboardingDevicePackageFfi {
     pub slot_id: String,
-    pub key_package_ref_hex: String,
+    pub key_package_ref_hex: Option<String>,
     pub event_id_hex: String,
     pub published_at: u64,
-    pub expires_at: u64,
+    pub expires_at: Option<u64>,
+    pub usable: bool,
 }
 impl From<marmot_app::OnboardingDevicePackage> for OnboardingDevicePackageFfi {
     fn from(value: marmot_app::OnboardingDevicePackage) -> Self {
@@ -332,6 +335,7 @@ impl From<marmot_app::OnboardingDevicePackage> for OnboardingDevicePackageFfi {
             event_id_hex: value.event_id_hex,
             published_at: value.published_at,
             expires_at: value.expires_at,
+            usable: value.usable,
         }
     }
 }

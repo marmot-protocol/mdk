@@ -44,42 +44,43 @@ impl AccountManager {
             if !seen_slots.insert(slot.clone()) {
                 continue;
             }
-            if event.created_at > now + CHECK_MAX_AGE {
+            let future = event.created_at > now + FUTURE_CLOCK_SKEW;
+            if future {
                 findings.push(finding(OnboardingIssue::FutureDated));
-                continue;
             }
-            let Ok(fetched) =
+            let event_id_hex = event.id.clone();
+            let published_at = event.created_at;
+            let parsed =
                 crate::key_package_records::key_package_from_record(DirectoryRelayEventRecord {
                     endpoints: Vec::new(),
                     event,
                 })
-            else {
+                .ok();
+            let metadata = parsed
+                .as_ref()
+                .and_then(|f| crate::key_package_metadata(&f.key_package).ok());
+            if metadata.is_none() {
                 findings.push(finding(OnboardingIssue::Malformed));
-                continue;
-            };
-            let metadata = crate::key_package_metadata(&fetched.key_package)
-                .map_err(|_| onboarding_error())?;
-            if metadata.not_after <= now {
+            }
+            let reference = metadata.as_ref().map(|m| m.key_package_ref_hex.clone());
+            if slots.contains(&slot) || reference.as_ref().is_some_and(|r| refs.contains(r)) {
                 continue;
             }
-            if metadata.not_before > now + CHECK_MAX_AGE {
-                findings.push(finding(OnboardingIssue::FutureDated));
-                continue;
-            }
-            // A stable local slot survives rotation and expiry of the old
-            // private bundle. A matching reference also recognizes relay echoes
-            // of locally owned material advertised under a different event/slot.
-            if slots.contains(&slot) || refs.contains(&fetched.key_package_ref_hex) {
-                continue;
-            }
+            // A verified account-authored foreign slot is evidence even when
+            // its payload is unusable. Package validity is a separate property.
             packages.push(OnboardingDevicePackage {
                 slot_id: slot,
-                key_package_ref_hex: fetched.key_package_ref_hex,
-                event_id_hex: fetched.key_package_event_id,
-                published_at: fetched.created_at,
-                expires_at: metadata.not_after,
+                key_package_ref_hex: reference,
+                event_id_hex,
+                published_at,
+                expires_at: metadata.as_ref().map(|m| m.not_after),
+                usable: !future
+                    && metadata
+                        .as_ref()
+                        .is_some_and(|m| m.not_before <= now && m.not_after > now),
             });
         }
+        // Missing any selected source remains inconclusive even if others reached EOSE.
         let discovery_complete = completed > 0 && findings.is_empty();
         let discovery = if !packages.is_empty() {
             findings.push(finding(OnboardingIssue::OtherInstallationPossible));

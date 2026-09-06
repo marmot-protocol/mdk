@@ -508,10 +508,6 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
-    /// Retry onboarding against explicitly selected discovery relays.
-    async fn marmot_set_onboarding_discovery_relays(account_ref: str, discovery_relays/discovery_relays_len: str_arr) -> rec(MarmotOnboardingSnapshot) = set_onboarding_discovery_relays;
-    /// Acknowledge the displayed one-device notice and resume setup.
-    async fn marmot_acknowledge_onboarding_single_device(account_ref: str, revision: val u64) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device;
     /// List every account known to this device. Free the result with
     /// `marmot_account_summary_list_free`.
     sync fn marmot_list_accounts() -> rec(MarmotAccountSummaryList) = list_accounts;
@@ -533,6 +529,14 @@ c_cmd! {
     /// `delete_key_packages` is true, relay-published KeyPackages get
     /// NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
     async fn marmot_sign_out(account_ref: str, delete_key_packages: flag) -> rec(MarmotSignOutOutcome) = sign_out;
+
+    /// Retry onboarding against explicitly selected discovery relays.
+    async fn marmot_set_onboarding_discovery_relays(account_ref: str, discovery_relays/discovery_relays_len: str_arr) -> rec(MarmotOnboardingSnapshot) = set_onboarding_discovery_relays;
+    /// Acknowledge the displayed one-device notice and resume setup.
+    async fn marmot_acknowledge_onboarding_single_device(account_ref: str, revision: val u64) -> rec(MarmotOnboardingSnapshot) = acknowledge_onboarding_single_device;
+    /// Cancel unfinished onboarding, retaining the signed-out identity and private state.
+    /// An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+    async fn marmot_cancel_onboarding(account_ref: str) -> unit = cancel_onboarding;
 
     /// Create a brand-new Nostr identity, store its secret in the account
     /// secret store, and publish initial relay lists + key package. Free with
@@ -2245,7 +2249,7 @@ where
 }
 
 use crate::types::onboarding::{MarmotOnboardingSnapshot, MarmotOnboardingStep};
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2278,7 +2282,8 @@ pub unsafe extern "C" fn marmot_begin_onboarding(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Read the persisted onboarding snapshot. Writes NULL with MARMOT_STATUS_OK when no checkpoint exists.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2295,7 +2300,7 @@ pub unsafe extern "C" fn marmot_onboarding_snapshot(
         unsafe { deliver_opt(client.marmot.onboarding_snapshot(account_ref), out) }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Resume pending checks until user input or a retry is needed. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2317,7 +2322,8 @@ pub unsafe extern "C" fn marmot_run_onboarding(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Retry an offered step; earlier checks invalidate downstream readiness. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2341,7 +2347,8 @@ pub unsafe extern "C" fn marmot_retry_onboarding_step(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Explicitly skip an optional profile or follows step when offered. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2365,7 +2372,8 @@ pub unsafe extern "C" fn marmot_continue_onboarding_without(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Prepare the configured default relay proposal without publishing. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2393,7 +2401,8 @@ pub unsafe extern "C" fn marmot_propose_onboarding_recommended_relays(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Prepare a relay proposal without publishing; inbox proposals require an empty write list. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2428,7 +2437,7 @@ pub unsafe extern "C" fn marmot_propose_onboarding_relays(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2457,7 +2466,7 @@ pub unsafe extern "C" fn marmot_propose_onboarding_profile(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Prepare a follow-list replacement without publishing; an empty list is valid. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2486,7 +2495,7 @@ pub unsafe extern "C" fn marmot_propose_onboarding_follows(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Approve the proposal at the current snapshot revision and resume publication; stale revisions are rejected. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
@@ -2513,7 +2522,7 @@ pub unsafe extern "C" fn marmot_approve_onboarding_repair(
         }
     })
 }
-/// Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+/// Dismiss an unapproved repair proposal; an approved repair must be resumed. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.

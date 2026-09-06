@@ -18,6 +18,17 @@ use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
+/// Stable errors for a bounded, isolated relay inspection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectoryInspectionError {
+    Unreachable,
+    TimedOut,
+    AuthenticationRequired,
+    PaymentRequired,
+    Restricted,
+    InvalidRequest,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirectoryRelayConnectOutcome {
     Connected,
@@ -151,8 +162,8 @@ pub(crate) trait DirectoryRelayFetcher: Send + Sync {
         &self,
         _request: DirectoryFetchRequest,
         _signer: Option<Arc<dyn nostr::NostrSigner>>,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        Err("inspection unavailable".into())
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        Err(DirectoryInspectionError::Unreachable)
     }
 }
 
@@ -224,7 +235,7 @@ impl DirectoryRelayPlane {
         &self,
         request: DirectoryFetchRequest,
         signer: Option<Arc<dyn nostr::NostrSigner>>,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         self.fetcher.inspect_directory_events(request, signer).await
     }
     pub(crate) fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
@@ -598,30 +609,34 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         &self,
         request: DirectoryFetchRequest,
         signer: Option<Arc<dyn nostr::NostrSigner>>,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+    ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
+        use DirectoryInspectionError::*;
         use nostr_sdk::prelude::ReqExitPolicy;
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
-        let scoped = signer
-            .map(|signer| ScopedInspectionClient(NostrSdkClient::builder().signer(signer).build()));
-        let client = scoped.as_ref().map_or(&self.client, |scoped| &scoped.0);
-        let urls = parsed_directory_relay_urls(&request.endpoints)?;
+        let builder = NostrSdkClient::builder();
+        let client = ScopedInspectionClient(match signer {
+            Some(signer) => builder.signer(signer).build(),
+            None => builder.build(),
+        });
+        let client = &client.0;
+        let urls = parsed_directory_relay_urls(&request.endpoints).map_err(|_| InvalidRequest)?;
         if urls.len() != 1 {
-            return Err("inspection requires one relay".into());
+            return Err(InvalidRequest);
         }
         let url = urls[0].clone();
         client
             .add_relay(url.clone())
             .await
-            .map_err(|_| "unreachable")?;
+            .map_err(|_| Unreachable)?;
         timeout(
             DIRECTORY_RELAY_CONNECT_WAIT,
             client.connect_relay(url.clone()),
         )
         .await
-        .map_err(|_| "timeout")?
-        .map_err(|_| "unreachable")?;
-        let relay = client.relay(url).await.map_err(|_| "unreachable")?;
+        .map_err(|_| TimedOut)?
+        .map_err(|_| Unreachable)?;
+        let relay = client.relay(url).await.map_err(|_| Unreachable)?;
         let mut records = Vec::new();
         for query in request.queries {
             let keys = query
@@ -629,8 +644,8 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .iter()
                 .map(|key| PublicKey::parse(key))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "invalid author")?;
-            let kind = u16::try_from(query.kind).map_err(|_| "invalid kind")?;
+                .map_err(|_| InvalidRequest)?;
+            let kind = u16::try_from(query.kind).map_err(|_| InvalidRequest)?;
             let filter = if query.kind == 1059 {
                 Filter::new().pubkeys(keys)
             } else {
@@ -648,22 +663,21 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .map_err(|error| {
                     use nostr_sdk::pool::relay::Error;
                     match error {
-                        Error::Timeout => "timeout",
-                        Error::AuthenticationFailed => "auth-required",
+                        Error::Timeout => TimedOut,
+                        Error::AuthenticationFailed => AuthenticationRequired,
                         Error::RelayMessage(message) if message.starts_with("auth-required:") => {
-                            "auth-required"
+                            AuthenticationRequired
                         }
                         Error::RelayMessage(message)
                             if message.starts_with("payment-required:") =>
                         {
-                            "payment-required"
+                            PaymentRequired
                         }
                         Error::RelayMessage(_)
                         | Error::ReadDisabled
-                        | Error::ConnectionRejected { .. } => "restricted",
-                        _ => "unreachable",
+                        | Error::ConnectionRejected { .. } => Restricted,
+                        _ => Unreachable,
                     }
-                    .to_owned()
                 })?;
             if query.kind == 1059 {
                 continue;
@@ -885,6 +899,28 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn signerless_inspection_never_retains_relays_in_the_shared_client() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        for (author, succeeds) in [(author, true), ("invalid-author".into(), false)] {
+            let result = fetcher
+                .inspect_directory_events(
+                    DirectoryFetchRequest::new(
+                        vec![endpoint.clone()],
+                        vec![DirectoryEventQuery::new(0, vec![author], 1)],
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .await;
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(fetcher.client.relays().await.is_empty());
+        }
+    }
 
     #[test]
     fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {

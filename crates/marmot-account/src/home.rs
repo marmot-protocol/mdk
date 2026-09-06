@@ -662,6 +662,44 @@ impl AccountHome {
         }
     }
 
+    /// Retain the last cancelled checkpoint while removing its active gate.
+    /// The caller must first durably sign out and retain any setup journal.
+    pub fn archive_account_onboarding(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.signed_out {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let directory = self.account_dir(&account.label);
+        match fs::rename(
+            directory.join("onboarding.json"),
+            directory.join("onboarding-cancelled.json"),
+        ) {
+            Ok(()) => {
+                fs::File::open(directory)?.sync_all()?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Read the retained cancellation record for an explicit onboarding restart.
+    pub fn cancelled_account_onboarding(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<Option<Vec<u8>>> {
+        let account = self.account(account_ref)?;
+        match fs::read(
+            self.account_dir(&account.label)
+                .join("onboarding-cancelled.json"),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Remove an explicitly-authorized legacy incomplete setup while retaining
     /// the matching account-id-keyed credential for the immediate retry.
     pub fn reset_incomplete_setup_preserving_credential(

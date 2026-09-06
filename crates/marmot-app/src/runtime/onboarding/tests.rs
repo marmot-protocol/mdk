@@ -11,6 +11,8 @@ struct Network {
     events: StdMutex<Vec<NostrTransportEvent>>,
     attempts: StdMutex<Vec<NostrTransportEvent>>,
     fail_reads: AtomicBool,
+    return_off_filter_events: AtomicBool,
+    fail_index_only: AtomicBool,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
@@ -21,7 +23,13 @@ impl DirectoryRelayFetcher for Network {
         &self,
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        if self.fail_reads.load(Ordering::SeqCst) {
+        if self.fail_reads.load(Ordering::SeqCst)
+            || (self.fail_index_only.load(Ordering::SeqCst)
+                && request
+                    .endpoints
+                    .iter()
+                    .any(|e| e.0.contains("index.example")))
+        {
             return Err("timeout".into());
         }
         Ok(self
@@ -30,6 +38,9 @@ impl DirectoryRelayFetcher for Network {
             .unwrap()
             .iter()
             .filter(|event| {
+                if self.return_off_filter_events.load(Ordering::SeqCst) {
+                    return true;
+                }
                 request
                     .queries
                     .iter()
@@ -46,9 +57,285 @@ impl DirectoryRelayFetcher for Network {
         &self,
         request: DirectoryFetchRequest,
         _signer: Option<Arc<dyn nostr::NostrSigner>>,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        self.fetch_directory_events(request).await
+    ) -> Result<Vec<DirectoryRelayEventRecord>, crate::relay_plane::DirectoryInspectionError> {
+        self.fetch_directory_events(request)
+            .await
+            .map_err(|_| crate::relay_plane::DirectoryInspectionError::TimedOut)
     }
+}
+
+#[tokio::test]
+async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(directory.path(), network);
+    let keys = nostr::Keys::generate();
+    let secret = keys.secret_key().to_bech32().unwrap();
+    let account = runtime
+        .accounts()
+        .app
+        .account_home()
+        .import_nostr_account_idempotent(&secret)
+        .unwrap()
+        .account()
+        .clone();
+    assert!(
+        runtime
+            .accounts()
+            .begin_onboarding(Zeroizing::new(secret), options())
+            .await
+            .is_err()
+    );
+    assert_eq!(runtime.accounts().resolve(&account.label).unwrap(), account);
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&account.label)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime
+            .accounts()
+            .app
+            .account_home()
+            .account_setup_state(&account.label)
+            .unwrap()
+            .unwrap()
+            .kind,
+        AccountSetupKind::ImportedIdentity
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_legacy_import_rejects_before_reactivating_the_identity() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let home = runtime.accounts().app.account_home();
+    let before = home.set_account_signed_out(&id, true).unwrap();
+    let checkpoint = home.account_onboarding(&id).unwrap();
+    let result = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(Zeroizing::new(keys.secret_key().to_bech32().unwrap())),
+            ..AccountSetupRequest::default()
+        })
+        .await;
+    assert!(matches!(result, Err(AppError::OnboardingRequired)));
+    assert_eq!(home.account(&id).unwrap(), before);
+    assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_evidence() {
+    let (_directory, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let pending = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    assert!(
+        manager
+            .retry_onboarding_step(&id, OnboardingStep::Follows)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.onboarding_snapshot(&id).unwrap().unwrap(), pending);
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
+    c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+    c.set(
+        OnboardingStep::SingleDevice,
+        OnboardingStatus::Passed,
+        vec![finding(OnboardingIssue::OtherInstallationPossible)],
+    );
+    c.single_device_acknowledged = true;
+    c.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
+        discovery: OnboardingDeviceDiscovery::OtherInstallationPossible,
+        other_packages: vec![],
+        discovery_complete: false,
+        acknowledged_at: Some(1),
+    });
+    manager.save_onboarding(&mut c).unwrap();
+    let retried = manager
+        .retry_onboarding_step(&id, OnboardingStep::Profile)
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.steps[OnboardingStep::Follows.index()].status,
+        OnboardingStatus::Skipped
+    );
+    assert_eq!(
+        retried.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::Pending
+    );
+    assert!(retried.single_device_notice.is_none());
+    assert!(
+        !manager
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .single_device_acknowledged
+    );
+    // Changing sources invalidates even an already acknowledged notice.
+    manager.save_onboarding(&mut c).unwrap();
+    let changed = manager
+        .set_onboarding_discovery_relays(&id, vec!["wss://alternate.example".into()])
+        .await
+        .unwrap();
+    assert!(changed.single_device_notice.is_none());
+    assert_eq!(
+        changed.steps[OnboardingStep::Follows.index()].status,
+        OnboardingStatus::Skipped
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results() {
+    let (_directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.options
+        .discovery_relays
+        .push("wss://healthy.example".into());
+    network
+        .events
+        .lock()
+        .unwrap()
+        .push(signed(&keys, 0, vec![], "{}", unix_now_seconds()));
+    network.fail_index_only.store(true, Ordering::SeqCst);
+    let (status, findings, _) = manager
+        .check_onboarding_step(&c, OnboardingStep::Profile)
+        .await;
+    assert_eq!(status, OnboardingStatus::Passed);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.issue == OnboardingIssue::DiscoveryIncomplete)
+    );
+    network.fail_index_only.store(false, Ordering::SeqCst);
+    network.events.lock().unwrap().clear();
+    network.events.lock().unwrap().push(signed(
+        &nostr::Keys::generate(),
+        30443,
+        vec![vec!["d".into(), "foreign-author".into()]],
+        "noise",
+        unix_now_seconds(),
+    ));
+    network
+        .return_off_filter_events
+        .store(true, Ordering::SeqCst);
+    manager
+        .check_onboarding_single_device(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.snapshot.single_device_notice.unwrap().discovery,
+        OnboardingDeviceDiscovery::NoneFound
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_cancellation_retries_local_intent_and_allows_explicit_restart() {
+    let (directory, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    // Simulate interruption after the cancellation intent, before sign-out.
+    c.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut c).unwrap();
+    assert!(manager.run_onboarding(&id).await.is_err());
+    manager.cancel_onboarding(&id).await.unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(manager.require_onboarding_complete(&id).is_ok());
+    assert!(
+        manager
+            .app
+            .account_home()
+            .cancelled_account_onboarding(&id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+    let reopened = super::tests::runtime(directory.path(), network);
+    let resumed = reopened
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert!(!resumed.cancellation_pending && !resumed.ready);
+    assert!(!reopened.accounts().managed_accounts().unwrap()[0].running);
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for step in c.snapshot.steps.clone() {
+        c.set(step.step, OnboardingStatus::Passed, vec![]);
+    }
+    manager.save_onboarding(&mut c).unwrap();
+    let account = manager.resolve(&id).unwrap();
+    manager
+        .app
+        .account_home()
+        .begin_account_setup_with(
+            &account,
+            false,
+            AccountSetupKind::ImportedIdentity,
+            AccountSetupPhase::KeyPackagePublicationStarted,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::Publishing
+    );
+    for cleanup_pending in [false, true] {
+        c.setup_cleanup_pending = cleanup_pending;
+        manager.save_onboarding(&mut c).unwrap();
+        assert!(
+            manager
+                .begin_onboarding(
+                    Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                    options(),
+                )
+                .await
+                .is_err()
+        );
+        assert!(manager.run_onboarding(&id).await.unwrap().ready);
+        assert_eq!(
+            runtime.account_setup_readiness(&id).unwrap(),
+            AccountSetupReadiness::Publishing
+        );
+    }
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_setup_state(&id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        AccountSetupPhase::KeyPackagePublicationStarted
+    );
+    manager
+        .app
+        .account_home()
+        .complete_account_setup(&id)
+        .unwrap();
+    let _storage = manager.app.account_storage(&id).unwrap();
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        AccountSetupReadiness::RecoveryRequired
+    );
+    runtime.shutdown_and_close().await.unwrap();
 }
 #[async_trait]
 impl NostrRelayClient for Network {
@@ -236,6 +523,7 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
         .unwrap()
         .unwrap();
     assert!(c.approved);
+    assert!(second.accounts().cancel_onboarding(&id).await.is_err());
     assert_eq!(c.signed_repair, Some(expected.clone()));
     network.zero_acks.store(false, Ordering::SeqCst);
     assert!(
@@ -362,7 +650,8 @@ async fn corrupt_or_future_checkpoint_fails_closed() {
         .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
         .unwrap();
     assert!(manager.onboarding_snapshot(&id).is_err());
-    assert!(manager.reconcile().await.is_err());
+    assert!(manager.reconcile().await.is_ok());
+    assert!(!manager.managed_accounts().unwrap()[0].running);
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -411,6 +700,12 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
     ] {
         c.set(step, OnboardingStatus::Passed, Vec::new());
     }
+    c.setup_cleanup_pending = true;
+    manager
+        .app
+        .account_home()
+        .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
+        .unwrap();
     manager.save_onboarding(&mut c).unwrap();
     assert!(
         manager
@@ -422,7 +717,7 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
     );
     assert_eq!(
         runtime.account_setup_readiness(&id).unwrap(),
-        AccountSetupReadiness::NetworkReady
+        AccountSetupReadiness::Publishing
     );
     assert!(manager.run_onboarding(&id).await.unwrap().ready);
     assert!(
@@ -488,9 +783,12 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     let notice = c.snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
     assert!(notice.discovery_complete);
-    assert_eq!(c.snapshot.steps[4].status, OnboardingStatus::NeedsInput);
+    assert_eq!(
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
+        OnboardingStatus::NeedsInput
+    );
     assert!(
-        c.snapshot.steps[4]
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()]
             .actions
             .contains(&OnboardingAction::CancelOnboarding)
     );
@@ -516,10 +814,10 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
         .unwrap();
     assert_eq!(
         c.snapshot.single_device_notice.as_ref().unwrap().discovery,
-        OnboardingDeviceDiscovery::Unknown
+        OnboardingDeviceDiscovery::OtherInstallationPossible
     );
     assert!(
-        c.snapshot.steps[4]
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()]
             .findings
             .iter()
             .any(|f| f.issue == OnboardingIssue::Malformed)
@@ -538,10 +836,10 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
         .unwrap();
     assert_eq!(
         c.snapshot.single_device_notice.as_ref().unwrap().discovery,
-        OnboardingDeviceDiscovery::Unknown
+        OnboardingDeviceDiscovery::OtherInstallationPossible
     );
     assert!(
-        c.snapshot.steps[4]
+        c.snapshot.steps[OnboardingStep::SingleDevice.index()]
             .findings
             .iter()
             .any(|f| f.issue == OnboardingIssue::FutureDated)

@@ -144,8 +144,8 @@ typedef enum MarmotOnboardingStep {
   MARMOT_ONBOARDING_STEP_FOLLOWS,
   MARMOT_ONBOARDING_STEP_RELAYS,
   MARMOT_ONBOARDING_STEP_INBOX_RELAYS,
-  MARMOT_ONBOARDING_STEP_KEY_PACKAGE,
   MARMOT_ONBOARDING_STEP_SINGLE_DEVICE,
+  MARMOT_ONBOARDING_STEP_KEY_PACKAGE,
 } MarmotOnboardingStep;
 
 typedef enum MarmotOnboardingStatus {
@@ -847,92 +847,6 @@ typedef struct MarmotSecretStore {
   MarmotSecretStoreDestroyFn destroy;
 } MarmotSecretStore;
 
-typedef struct MarmotOnboardingFinding {
-  enum MarmotOnboardingIssue issue;
-  char *endpoint;
-} MarmotOnboardingFinding;
-
-typedef struct MarmotOnboardingStepState {
-  enum MarmotOnboardingStep step;
-  enum MarmotOnboardingStatus status;
-  struct MarmotOnboardingFinding *findings;
-  uintptr_t findings_len;
-  enum MarmotOnboardingAction *actions;
-  uintptr_t actions_len;
-  bool has_checked_at;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t checked_at;
-} MarmotOnboardingStepState;
-
-/**
- * Nostr user profile metadata. All fields nullable. Used both as a
- * return value (owned; free the root) and as a borrowed input to
- * `marmot_publish_user_profile` (caller-owned; never freed by the
- * library).
- */
-typedef struct MarmotUserProfileMetadata {
-  char *name;
-  char *display_name;
-  char *about;
-  char *picture;
-  char *banner;
-  char *nip05;
-  char *lud16;
-} MarmotUserProfileMetadata;
-
-/**
- * Owned list of strings (relay lists, admin ids, …). Free with
- * `marmot_string_list_free`.
- */
-typedef struct MarmotStringList {
-  char **items;
-  uintptr_t len;
-} MarmotStringList;
-
-typedef struct MarmotOnboardingRepairProposal {
-  enum MarmotOnboardingStep step;
-  uint64_t revision;
-  char *previous_event_id;
-  char **read_relays;
-  uintptr_t read_relays_len;
-  char **write_relays;
-  uintptr_t write_relays_len;
-  struct MarmotUserProfileMetadata *profile;
-  struct MarmotStringList *follows;
-} MarmotOnboardingRepairProposal;
-
-typedef struct MarmotOnboardingDevicePackage {
-  char *slot_id;
-  char *key_package_ref_hex;
-  char *event_id_hex;
-  uint64_t published_at;
-  uint64_t expires_at;
-} MarmotOnboardingDevicePackage;
-
-typedef struct MarmotOnboardingSingleDeviceNotice {
-  enum MarmotOnboardingDeviceDiscovery discovery;
-  struct MarmotOnboardingDevicePackage *other_packages;
-  uintptr_t other_packages_len;
-  bool discovery_complete;
-  bool has_acknowledged_at;
-  /**
-   *Only meaningful when the matching `has_` flag is set.
-   */
-  uint64_t acknowledged_at;
-} MarmotOnboardingSingleDeviceNotice;
-
-typedef struct MarmotOnboardingSnapshot {
-  char *account_id_hex;
-  uint64_t revision;
-  bool ready;
-  struct MarmotOnboardingStepState *steps;
-  uintptr_t steps_len;
-  struct MarmotOnboardingRepairProposal *proposal;
-  struct MarmotOnboardingSingleDeviceNotice *single_device_notice;
-} MarmotOnboardingSnapshot;
-
 /**
  * One signed-in (or signed-out but known) account.
  */
@@ -1045,6 +959,98 @@ typedef struct MarmotSignOutOutcome {
   uintptr_t key_package_failures_len;
   struct MarmotLocalCleanupReport local_cleanup;
 } MarmotSignOutOutcome;
+
+typedef struct MarmotOnboardingFinding {
+  enum MarmotOnboardingIssue issue;
+  char *endpoint;
+} MarmotOnboardingFinding;
+
+typedef struct MarmotOnboardingStepState {
+  enum MarmotOnboardingStep step;
+  enum MarmotOnboardingStatus status;
+  struct MarmotOnboardingFinding *findings;
+  uintptr_t findings_len;
+  enum MarmotOnboardingAction *actions;
+  uintptr_t actions_len;
+  bool has_checked_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t checked_at;
+} MarmotOnboardingStepState;
+
+/**
+ * Nostr user profile metadata. All fields nullable. Used both as a
+ * return value (owned; free the root) and as a borrowed input to
+ * `marmot_publish_user_profile` (caller-owned; never freed by the
+ * library).
+ */
+typedef struct MarmotUserProfileMetadata {
+  char *name;
+  char *display_name;
+  char *about;
+  char *picture;
+  char *banner;
+  char *nip05;
+  char *lud16;
+} MarmotUserProfileMetadata;
+
+/**
+ * Owned list of strings (relay lists, admin ids, …). Free with
+ * `marmot_string_list_free`.
+ */
+typedef struct MarmotStringList {
+  char **items;
+  uintptr_t len;
+} MarmotStringList;
+
+typedef struct MarmotOnboardingRepairProposal {
+  enum MarmotOnboardingStep step;
+  uint64_t revision;
+  char *previous_event_id;
+  char **read_relays;
+  uintptr_t read_relays_len;
+  char **write_relays;
+  uintptr_t write_relays_len;
+  struct MarmotUserProfileMetadata *profile;
+  struct MarmotStringList *follows;
+} MarmotOnboardingRepairProposal;
+
+typedef struct MarmotOnboardingDevicePackage {
+  char *slot_id;
+  char *key_package_ref_hex;
+  char *event_id_hex;
+  uint64_t published_at;
+  bool has_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t expires_at;
+  bool usable;
+} MarmotOnboardingDevicePackage;
+
+typedef struct MarmotOnboardingSingleDeviceNotice {
+  enum MarmotOnboardingDeviceDiscovery discovery;
+  struct MarmotOnboardingDevicePackage *other_packages;
+  uintptr_t other_packages_len;
+  bool discovery_complete;
+  bool has_acknowledged_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t acknowledged_at;
+} MarmotOnboardingSingleDeviceNotice;
+
+typedef struct MarmotOnboardingSnapshot {
+  char *account_id_hex;
+  uint64_t revision;
+  bool ready;
+  struct MarmotOnboardingStepState *steps;
+  uintptr_t steps_len;
+  struct MarmotOnboardingRepairProposal *proposal;
+  struct MarmotOnboardingSingleDeviceNotice *single_device_notice;
+  bool cancellation_pending;
+} MarmotOnboardingSnapshot;
 
 /**
  * One published (or locally known) MLS KeyPackage.
@@ -3887,35 +3893,6 @@ void marmot_string_free(char *s);
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
 
 /**
- * Retry onboarding against explicitly selected discovery relays.
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_set_onboarding_discovery_relays(const struct MarmotClient *client,
-                                                    const char *account_ref,
-                                                    const char *const *discovery_relays,
-                                                    uintptr_t discovery_relays_len,
-                                                    struct MarmotOnboardingSnapshot **out);
-
-/**
- * Acknowledge the displayed one-device notice and resume setup.
- *
- * # Safety
- * `client` must be a live handle; string arguments must be valid
- * NUL-terminated strings (nullable ones may be NULL); array
- * arguments must hold their stated length (or be NULL with
- * length 0); out-pointers must be valid.
- */
-MarmotStatus marmot_acknowledge_onboarding_single_device(const struct MarmotClient *client,
-                                                         const char *account_ref,
-                                                         uint64_t revision,
-                                                         struct MarmotOnboardingSnapshot **out);
-
-/**
  * List every account known to this device. Free the result with
  * `marmot_account_summary_list_free`.
  *
@@ -3983,6 +3960,47 @@ MarmotStatus marmot_sign_out(const struct MarmotClient *client,
                              const char *account_ref,
                              uint8_t delete_key_packages,
                              struct MarmotSignOutOutcome **out);
+
+/**
+ * Retry onboarding against explicitly selected discovery relays.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_onboarding_discovery_relays(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    const char *const *discovery_relays,
+                                                    uintptr_t discovery_relays_len,
+                                                    struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Acknowledge the displayed one-device notice and resume setup.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_onboarding_single_device(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         uint64_t revision,
+                                                         struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Cancel unfinished onboarding, retaining the signed-out identity and private state.
+ * An approved unfinished repair must be resumed first; cancellation performs no relay deletion.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cancel_onboarding(const struct MarmotClient *client, const char *account_ref);
 
 /**
  * Create a brand-new Nostr identity, store its secret in the account
@@ -6393,7 +6411,7 @@ MarmotStatus marmot_record_host_performance(const struct MarmotClient *client,
                                             uint32_t outcome);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Import an identity and persist its onboarding gate without publishing. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6407,7 +6425,8 @@ MarmotStatus marmot_begin_onboarding(const struct MarmotClient *client,
                                      struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Read the persisted onboarding snapshot. Writes NULL with MARMOT_STATUS_OK when no checkpoint exists.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6417,7 +6436,7 @@ MarmotStatus marmot_onboarding_snapshot(const struct MarmotClient *client,
                                         struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Resume pending checks until user input or a retry is needed. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6427,7 +6446,8 @@ MarmotStatus marmot_run_onboarding(const struct MarmotClient *client,
                                    struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Retry an offered step; earlier checks invalidate downstream readiness. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6438,7 +6458,8 @@ MarmotStatus marmot_retry_onboarding_step(const struct MarmotClient *client,
                                           struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Explicitly skip an optional profile or follows step when offered. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6449,7 +6470,8 @@ MarmotStatus marmot_continue_onboarding_without(const struct MarmotClient *clien
                                                 struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Prepare the configured default relay proposal without publishing. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6460,7 +6482,8 @@ MarmotStatus marmot_propose_onboarding_recommended_relays(const struct MarmotCli
                                                           struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Prepare a relay proposal without publishing; inbox proposals require an empty write list. `step` is a MarmotOnboardingStep discriminant; out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6475,7 +6498,7 @@ MarmotStatus marmot_propose_onboarding_relays(const struct MarmotClient *client,
                                               struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6486,7 +6509,7 @@ MarmotStatus marmot_propose_onboarding_profile(const struct MarmotClient *client
                                                struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Prepare a follow-list replacement without publishing; an empty list is valid. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6498,7 +6521,7 @@ MarmotStatus marmot_propose_onboarding_follows(const struct MarmotClient *client
                                                struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Approve the proposal at the current snapshot revision and resume publication; stale revisions are rejected. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
@@ -6509,7 +6532,7 @@ MarmotStatus marmot_approve_onboarding_repair(const struct MarmotClient *client,
                                               struct MarmotOnboardingSnapshot **out);
 
 /**
- * Onboarding operation. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ * Dismiss an unapproved repair proposal; an approved repair must be resumed. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.

@@ -3985,12 +3985,12 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<AccountSetupReadiness, AppError> {
         let account = self.accounts.resolve(account_ref)?;
-        if let Some(onboarding) = self.accounts.onboarding_snapshot(account_ref)? {
-            return Ok(if onboarding.ready {
-                AccountSetupReadiness::NetworkReady
-            } else {
-                AccountSetupReadiness::Initializing
-            });
+        if self
+            .accounts
+            .onboarding_snapshot(account_ref)?
+            .is_some_and(|s| !s.ready)
+        {
+            return Ok(AccountSetupReadiness::Initializing);
         }
         if self
             .accounts
@@ -5022,13 +5022,17 @@ impl AccountManager {
                 .collect::<Vec<_>>();
             let accounts = accounts
                 .into_iter()
-                .map(|account| {
-                    self.onboarding_worker_allowed(&account.label)
-                        .map(|allowed| allowed.then_some(account))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
+                .filter(
+                    |account| match self.onboarding_worker_allowed(&account.label) {
+                        Ok(allowed) => allowed,
+                        Err(error) => {
+                            tracing::warn!(target: "marmot_app::runtime", method = "reconcile",
+                                error_kind = error.privacy_safe_kind(),
+                                "gated one account with an unreadable onboarding checkpoint");
+                            false
+                        }
+                    },
+                )
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -5365,8 +5369,9 @@ impl AccountManager {
         account_ref: &str,
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
-        self.require_onboarding_complete(account_ref)?;
-        self.worker_commands_for_setup(account_ref).await
+        let account = self.resolve(account_ref)?;
+        self.require_onboarding_complete_for(&account)?;
+        self.worker_commands_for_account(account).await
     }
 
     async fn worker_commands_for_setup(
@@ -5375,6 +5380,12 @@ impl AccountManager {
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
+        self.worker_commands_for_account(account).await
+    }
+    async fn worker_commands_for_account(
+        &self,
+        account: AccountSummary,
+    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
@@ -5413,6 +5424,16 @@ impl AccountManager {
             .map(|value| value.as_str())
             .or(request.identity.as_deref());
         let (mut account, private_key_import) = if let Some(identity) = identity_key {
+            let account_id = if crate::is_nostr_secret(identity) {
+                AccountHome::account_id_for_secret(identity)?
+            } else {
+                AccountHome::account_id_for_public_key(identity)?
+            };
+            match self.app.account_home().account(&account_id) {
+                Ok(account) => self.require_onboarding_complete(&account.label)?,
+                Err(AccountHomeError::UnknownAccount(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
             match self.signed_out_account_for_identity(identity)? {
                 Some(account) => (account, None),
                 None => self.create_nostr_account_from_setup(&request)?,
@@ -5420,7 +5441,6 @@ impl AccountManager {
         } else {
             self.create_nostr_account_from_setup(&request)?
         };
-        self.require_onboarding_complete(&account.label)?;
         let reactivating_existing = account.signed_out;
         let recent_relay_lists =
             if imports_private_key || reactivating_existing || !account.local_signing {
@@ -5633,10 +5653,10 @@ impl AccountManager {
         if signer_public_key.to_hex() != account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
-        if let Ok(account) = self.app.account_home().account(&account_id_hex) {
+        let existing_account = self.app.account_home().account(&account_id_hex).ok();
+        if let Some(account) = existing_account.as_ref() {
             self.require_onboarding_complete(&account.label)?;
         }
-        let existing_account = self.app.account_home().account(&account_id_hex).ok();
         let created_account = existing_account.is_none();
         // add_external_signer_account below promotes a pre-existing tracked
         // (public) account to external_signing, so a later setup failure must

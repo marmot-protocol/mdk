@@ -24,6 +24,16 @@ impl OnboardingSubscription {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Cancel unfinished onboarding, retaining the signed-out identity and private state.
+    /// Approved unfinished repairs must be resumed before cancellation.
+    pub async fn cancel_onboarding(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .accounts()
+            .cancel_onboarding(&account_ref)
+            .await?)
+    }
+
     /// Record Continue anyway for the displayed notice, then resume setup.
     pub async fn acknowledge_onboarding_single_device(
         &self,

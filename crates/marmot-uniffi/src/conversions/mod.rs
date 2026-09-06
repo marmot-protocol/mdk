@@ -11,8 +11,6 @@
 //! `crate::conversions::*`.
 
 mod account;
-mod onboarding;
-pub use onboarding::*;
 mod agent_stream;
 mod audit;
 mod chat_list;
@@ -25,6 +23,7 @@ mod maintenance;
 mod media;
 mod message;
 mod notification;
+mod onboarding;
 mod push;
 mod relay;
 mod telemetry;
@@ -47,6 +46,7 @@ pub use maintenance::*;
 pub use media::*;
 pub use message::*;
 pub use notification::*;
+pub use onboarding::*;
 pub use push::*;
 pub use relay::*;
 pub use telemetry::*;

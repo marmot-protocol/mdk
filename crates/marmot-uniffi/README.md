@@ -138,7 +138,7 @@ Imported identities can use the durable preflight API instead of `login`:
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
    `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
    a proposal until approval has been recorded.
-5. `retry_onboarding_step` retries a failure; `set_onboarding_discovery_relays`
+5. `retry_onboarding_step` requires an offered `Retry` action; `set_onboarding_discovery_relays`
    retries with explicitly chosen discovery sources without publishing them.
    After process restart, read `onboarding_snapshot`, register the external
    signer again if applicable, and run/resume or retry the indicated step.
@@ -156,20 +156,30 @@ one installation and conversations will not automatically appear on both.
 Reinstallation or cleared local state can produce the same evidence; do not
 claim to have identified a physical device or a particular app.
 
-Offer **Cancel** and **Continue anyway**. `CancelOnboarding` means leave the
-onboarding view without acknowledging; the account remains persisted and gated.
-It does not call sign-out, delete packages, or remove an account. For Continue
-anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
+Offer **Cancel** and **Continue anyway**. For Cancel, call
+`cancel_onboarding(account_ref)`: it signs the identity out, retains local data and
+completed repairs, and archives the checkpoint to remove the active gate. A later
+sign-in can use either the legacy or interactive entry point. Cancellation is
+idempotent; if interrupted with `cancellation_pending`, call it again to finish.
+Normal onboarding mutations are blocked during that interval. Cancellation is
+not offered while an approved repair is unfinished and cannot discard that repair.
+For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
 MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
-The acknowledgment survives publication failure, cancellation, and restart.
-An explicit retry of `SingleDevice`, or a new sign-in after signing out a completed
-account, requires a new acknowledgment. Ordinary setup retries preserve it.
+The acknowledgment survives KeyPackage publication failure, task interruption,
+and restart. Rechecking an earlier prerequisite, changing discovery sources,
+approving another repair, explicitly retrying `SingleDevice`, or signing in again
+after signing out a completed account invalidates it and requires a fresh notice.
+Retries preserve optional steps the user skipped unless that skipped step is the
+explicit retry target.
 
 Detection reads verified kind-30443 records through the validated relay routes
 without starting an account worker. It compares the newest record per slot with
 the local stable slot and durably owned private packages, including retained
-rotation material. `other_packages` includes original publication and expiration
-timestamps. No short recency cutoff excludes an otherwise usable package:
+rotation material. `other_packages` retains signed foreign-slot evidence even
+when the payload is malformed or expired. `usable` describes package validity;
+the reference and expiration are optional when validation cannot extract them.
+The publication timestamp comes from the verified event. No recency cutoff
+excludes a foreign slot:
 republication retains the original event timestamp, so it is not last-active time.
 No public device identifier is introduced, and continuing never deletes another
 installation's packages.
@@ -183,14 +193,18 @@ Completed pre-notice checkpoints remain ready; incomplete checkpoints acquire
 the notice before KeyPackage publication when upgraded.
 
 Snapshots are complete states, not deltas. A slow subscriber may miss
-intermediate states but receives the latest persisted state. Cancellation can
-leave a step `Checking`; `run_onboarding` resumes it. Once a repair is approved,
+intermediate states but receives the latest persisted state. Interrupting an
+async check can leave a step `Checking`; `run_onboarding` resumes it. Once a repair is approved,
 a retry resumes that repair before other checks. It cannot be cancelled as if
 nothing had been published: a relay may already have accepted it. Signed bytes
 are retained before the first send and replayed unchanged on retry.
 
 Discovery reads require a completed relay query. Failed/partial empty discovery
-is distinct from absence and never offers automatic replacement. Fresh signed
+is distinct from absence and never offers automatic replacement. A valid record
+from a partially successful lookup may pass while retaining `DiscoveryIncomplete`
+and source failures in its findings; a passed step is not necessarily warning-free.
+Off-filter records are ignored. Single-device discovery remains incomplete if
+any selected source fails, even when another source returns an empty result. Fresh signed
 records remain available for inspection even when their contents are malformed;
 a newer malformed record does not silently fall back to an older valid one.
 Repairs re-fetch the source before signing and reject a changed record. Nostr
@@ -208,6 +222,12 @@ signed-out account enters the identity-only flow again.
 
 The existing `login` and generated-account APIs remain compatible. Apps must
 adopt the new identity-only APIs and screen to enable this experience. Legacy
-accounts without an onboarding checkpoint are not retroactively blocked. C
+accounts without an onboarding checkpoint are not retroactively blocked. Active
+legacy accounts and accounts with unfinished legacy setup are not silently
+enrolled: finish or resume their existing setup first. Signed-out legacy accounts
+without pending setup can explicitly opt in. Completed checkpoints defer to normal
+setup/recovery readiness. Corrupt or newer-version checkpoints gate only their own
+account; they must be restored or opened with a compatible runtime, not silently
+discarded because they may contain approved publication intent. C
 consumers have equivalent methods and subscriptions; external-signer entry
 points retain the C API's existing callback-vtable limitation.

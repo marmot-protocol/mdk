@@ -12962,3 +12962,162 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
     );
     runtime.shutdown_and_close().await.unwrap();
 }
+
+#[tokio::test]
+async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_exit() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let secret = keys.secret_key().to_bech32().unwrap();
+    let request = || AccountSetupRequest {
+        import_nsec: Some(zeroize::Zeroizing::new(secret.clone())),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let old = runtime
+        .create_or_import_account(request())
+        .await
+        .unwrap()
+        .account;
+    let options = || marmot_app::OnboardingOptions {
+        default_relays: vec![url.clone()],
+        discovery_relays: vec![url.clone()],
+    };
+    assert!(
+        runtime
+            .accounts()
+            .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&old.label)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .any(|a| a.account_id_hex == old.account_id_hex && a.running)
+    );
+    let bad = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(Keys::generate().secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    AccountHome::open(dir.path())
+        .set_account_onboarding(&bad.account_id_hex, b"{")
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = runtime.accounts().managed_accounts().unwrap();
+    assert!(
+        managed
+            .iter()
+            .any(|a| a.account_id_hex == old.account_id_hex && a.running)
+    );
+    assert!(
+        managed
+            .iter()
+            .any(|a| a.account_id_hex == bad.account_id_hex && !a.running)
+    );
+    assert!(runtime.publish_key_package(&old.label).await.unwrap() > 0);
+    runtime
+        .sign_out(
+            &old.label,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .cancel_onboarding(&old.label)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&old.label)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        AccountHome::open(dir.path())
+            .account(&old.label)
+            .unwrap()
+            .signed_out
+    );
+    assert!(
+        runtime
+            .create_or_import_account(request())
+            .await
+            .unwrap()
+            .key_package_bytes
+            .is_some()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let secret = Keys::generate().secret_key().to_bech32().unwrap();
+    let snapshot = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(secret.clone()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .cancel_onboarding(&snapshot.account_id_hex)
+        .await
+        .unwrap();
+    let outcome = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(secret)),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.account.account_id_hex, snapshot.account_id_hex);
+    assert!(outcome.key_package_bytes.is_some());
+    assert_eq!(
+        runtime
+            .account_setup_readiness(&outcome.account.label)
+            .unwrap(),
+        marmot_app::AccountSetupReadiness::NetworkReady
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}

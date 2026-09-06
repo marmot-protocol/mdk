@@ -3,7 +3,7 @@ use super::account::MarmotUserProfileMetadata;
 use super::common::MarmotStringList;
 use crate::macros::{c_enum, c_mirror};
 use marmot_uniffi::conversions::*;
-c_enum! { MarmotOnboardingStep from OnboardingStepFfi {  Profile, Follows, Relays, InboxRelays, KeyPackage, SingleDevice  } }
+c_enum! { MarmotOnboardingStep from OnboardingStepFfi {  Profile, Follows, Relays, InboxRelays, SingleDevice, KeyPackage  } }
 impl MarmotOnboardingStep {
     pub(crate) fn to_ffi(self) -> OnboardingStepFfi {
         match self {
@@ -22,10 +22,10 @@ c_enum! { MarmotOnboardingAction from OnboardingActionFfi {  Retry, ContinueWith
 c_mirror! { MarmotOnboardingFinding from OnboardingFindingFfi { copy issue: MarmotOnboardingIssue, opt_str endpoint, } }
 c_mirror! { MarmotOnboardingStepState from OnboardingStepStateFfi { copy step: MarmotOnboardingStep, copy status: MarmotOnboardingStatus, vec findings/findings_len: MarmotOnboardingFinding, vec actions/actions_len: MarmotOnboardingAction, opt_copy has_checked_at/checked_at: u64, } }
 c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, } }
-c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, } }
+c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
 
 c_enum! { MarmotOnboardingDeviceDiscovery from OnboardingDeviceDiscoveryFfi { NoneFound, OtherInstallationPossible, Unknown } }
-c_mirror! { MarmotOnboardingDevicePackage from OnboardingDevicePackageFfi { str slot_id, str key_package_ref_hex, str event_id_hex, copy published_at: u64, copy expires_at: u64, } }
+c_mirror! { MarmotOnboardingDevicePackage from OnboardingDevicePackageFfi { str slot_id, opt_str key_package_ref_hex, str event_id_hex, copy published_at: u64, opt_copy has_expires_at/expires_at: u64, copy usable: bool, } }
 c_mirror! { MarmotOnboardingSingleDeviceNotice from OnboardingSingleDeviceNoticeFfi { copy discovery: MarmotOnboardingDeviceDiscovery, vec other_packages/other_packages_len: MarmotOnboardingDevicePackage, copy discovery_complete: bool, opt_copy has_acknowledged_at/acknowledged_at: u64, } }
 
 #[cfg(all(test, feature = "alloc-audit"))]
@@ -40,6 +40,7 @@ mod tests {
             account_id_hex: "account".into(),
             revision: 4,
             ready: false,
+            cancellation_pending: false,
             steps: vec![OnboardingStepStateFfi {
                 step: OnboardingStepFfi::Follows,
                 status: OnboardingStatusFfi::NeedsInput,
@@ -54,10 +55,11 @@ mod tests {
                 discovery: OnboardingDeviceDiscoveryFfi::OtherInstallationPossible,
                 other_packages: vec![OnboardingDevicePackageFfi {
                     slot_id: "slot".into(),
-                    key_package_ref_hex: "ref".into(),
+                    key_package_ref_hex: Some("ref".into()),
                     event_id_hex: "event".into(),
                     published_at: 40,
-                    expires_at: 90,
+                    expires_at: Some(90),
+                    usable: true,
                 }],
                 discovery_complete: false,
                 acknowledged_at: Some(42),
@@ -91,7 +93,7 @@ mod tests {
     fn onboarding_step_input_rejects_invalid_discriminants() {
         assert!(MarmotOnboardingStep::from_c(u32::MAX).is_err());
         assert_eq!(
-            MarmotOnboardingStep::from_c(4).unwrap().to_ffi(),
+            MarmotOnboardingStep::from_c(5).unwrap().to_ffi(),
             OnboardingStepFfi::KeyPackage
         );
     }
