@@ -7,6 +7,11 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 
 ## Files
 
+- **File:** `app_runtime_journeys.rs`
+  - **Owns:** Basic public app acceptance journeys and the explicit unresolved 1,024-message public catch-up gate.
+    Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
+    persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
+
 - **File:** `agent_text_stream_vectors.rs`
   - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
     encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the

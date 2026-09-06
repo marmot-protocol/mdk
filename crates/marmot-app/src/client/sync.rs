@@ -1552,6 +1552,20 @@ impl AppClient {
             silence_budget: self.epoch_backfill_eose_wait(),
             execution_quantum,
         };
+        // Unfloored REQs do not re-emit SDK-cached events through the ordinary
+        // notification path. Reconcile the current history window as well as
+        // the older startup gap, in bounded account-scoped batches. Durable
+        // ingestion shrinks the next difference; refused ids remain eligible.
+        // This does not satisfy the EOSE gate or clear overflow markers.
+        self.reconcile_transport_history(unix_now_seconds())
+            .await
+            .map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::Unknown,
+                )
+            })?;
         self.drain_sdk_relay(counts, completion).await
     }
 

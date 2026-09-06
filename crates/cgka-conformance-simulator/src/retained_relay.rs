@@ -653,7 +653,7 @@ impl ConvergenceSubject for RetainedRelaySubject {
 
                 let refused = self
                     .engine
-                    .tick_observing_capacity_refusals(std::slice::from_ref(client))
+                    .tick_observing_capacity_refusals(std::slice::from_ref(client), true)
                     .await?
                     .get(client)
                     .copied();

@@ -2028,9 +2028,31 @@ impl HarnessClient {
     /// Drain the bus mailbox into the engine and simulate due convergence
     /// timer work. Returns ingest outcomes for each message in order.
     pub async fn tick(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
+        self.tick_with_transport_redelivery(false).await
+    }
+
+    /// A retained transport owns capacity-refused inputs and retries them on
+    /// its next turn. Do not spend that turn repeatedly advancing the engine
+    /// before the transport can offer the missing history again.
+    pub(crate) async fn tick_with_transport_redelivery(
+        &mut self,
+        redelivery_available: bool,
+    ) -> Vec<Result<IngestOutcome, EngineError>> {
         let mut outcomes = self.tick_ingest_only().await;
+        let needs_redelivery = redelivery_available
+            && outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    Ok(IngestOutcome::ResourceRefused {
+                        resource:
+                            cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+                        ..
+                    })
+                )
+            });
         if let Some(gid) = self.default_group.clone() {
             let now_ms = self.harness_convergence_now_ms();
+            let initial_epoch = self.engine().epoch(&gid).ok();
             // The legacy harness shortcut represents both sides of a timer
             // boundary in one tick. Give newly peeled inputs an explicit
             // pre-cutoff admission point before the far-future settlement
@@ -2045,6 +2067,11 @@ impl HarnessClient {
                 outcomes.push(Err(EngineError::Backend(format!(
                     "prepare buffered group: {e}"
                 ))));
+                return outcomes;
+            }
+            if needs_redelivery && self.engine().epoch(&gid).ok() != initial_epoch {
+                self.capture_engine_events();
+                self.drain_auto_publish().await;
                 return outcomes;
             }
             match self
@@ -2062,7 +2089,9 @@ impl HarnessClient {
             }
             self.capture_engine_events();
         }
-        self.drive_due_convergence(&mut outcomes).await;
+        if !needs_redelivery {
+            self.drive_due_convergence(&mut outcomes).await;
+        }
         self.drain_auto_publish().await;
         outcomes
     }

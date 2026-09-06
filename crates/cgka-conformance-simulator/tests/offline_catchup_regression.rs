@@ -9,11 +9,17 @@ use cgka_traits::group::ProtocolProfile;
 // creation acknowledges Welcomes without the Legacy pending-create filter.
 // The fixture preserves full payload multiplicity, exact state, decryptability,
 // and no-pending-work assertions. It contains synthetic scenario data only.
-async fn check_history(order: ScenarioRelayOrderV2) {
-    let mut input = resolve_scenario_input_bytes(include_bytes!(
-        "../vectors/generated-inputs/offline-catchup-reverse-history-368.generated-input.json"
-    ))
-    .expect("saved regression input");
+async fn check_history(order: ScenarioRelayOrderV2, overflow: bool) {
+    let bytes: &[u8] = if overflow {
+        include_bytes!(
+            "../vectors/generated-inputs/offline-catchup-reverse-history-1024.generated-input.json"
+        )
+    } else {
+        include_bytes!(
+            "../vectors/generated-inputs/offline-catchup-reverse-history-368.generated-input.json"
+        )
+    };
+    let mut input = resolve_scenario_input_bytes(bytes).expect("saved regression input");
     for step in &mut input.scenario.steps {
         if let ScenarioStep::ConfigureRelay {
             order: selected, ..
@@ -44,7 +50,11 @@ async fn check_history(order: ScenarioRelayOrderV2) {
             .all(|step| matches!(step.status, ScenarioStepStatus::Completed))
     );
     assert!(report.oracle.weak_oracle_warnings.is_empty());
-    assert!(report.oracle.missing_observed_behaviors.is_empty());
+    assert!(
+        report.oracle.missing_observed_behaviors.is_empty(),
+        "{:?}",
+        report.oracle.missing_observed_behaviors
+    );
     assert!(
         report.invariant_failures.is_empty(),
         "{:?}",
@@ -59,10 +69,20 @@ async fn check_history(order: ScenarioRelayOrderV2) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_reverse_history_delivers_every_retained_message() {
-    check_history(ScenarioRelayOrderV2::Reverse).await;
+    check_history(ScenarioRelayOrderV2::Reverse, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_natural_history_control_delivers_every_retained_message() {
-    check_history(ScenarioRelayOrderV2::Natural).await;
+    check_history(ScenarioRelayOrderV2::Natural, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_reverse_overflow_history_delivers_every_retained_message() {
+    check_history(ScenarioRelayOrderV2::Reverse, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_natural_overflow_history_control_delivers_every_retained_message() {
+    check_history(ScenarioRelayOrderV2::Natural, true).await;
 }

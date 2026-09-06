@@ -70,7 +70,7 @@ pub const MAX_DEFERRED_PEEL_RESIDENCE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// the durable store without bound. At the cap, new undecryptable input is
 /// dropped unpersisted (transport redelivery is the recovery path once the
 /// backlog drains).
-pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 512;
+pub const MAX_PEEL_DEFERRED_ROWS_PER_GROUP: usize = 2048;
 
 /// Maximum encoded `PeelDeferred` payload bytes retained for one group.
 ///
@@ -189,6 +189,10 @@ pub(crate) struct DeferredPeelGroupState {
     /// per rejected message; this suppresses the repeats until the backlog
     /// drops back below the cap and re-arms.
     cap_rejection_audited: bool,
+    /// Scheduling hint after an unretained capacity refusal. While this
+    /// backlog drains, background work returns to transport between epochs.
+    /// This neither owns the refused input nor gates convergence on its return.
+    yield_for_transport_redelivery: bool,
     /// Candidate branch contexts for one exact process-local generation.
     ///
     /// These contexts contain exporter-derived secret material. The cache is
@@ -1251,7 +1255,24 @@ impl<S: StorageProvider> Engine<S> {
         // Already-quarantined groups keep their pre-existing semantics
         // (`ensure_hydrated` no-ops; converge reports the blocked run).
         self.ensure_hydrated(group_id)?;
+        let initial_epoch = self.storage.get_group(group_id)?.epoch;
+        let yield_for_transport_redelivery = self
+            .deferred_peel
+            .get(group_id)
+            .is_some_and(|state| state.yield_for_transport_redelivery);
         for _ in 0..MAX_CONVERGENCE_REPROCESSING_PASSES {
+            // A background quantum must return to transport admission after
+            // advancing the epoch. Capacity-refused input is still owned by
+            // the transport: sweeping the admitted suffix all the way to its
+            // tip can prune the context needed by that missing prefix before
+            // the caller gets another opportunity to redeliver it.
+            if yield_for_transport_redelivery
+                && matches!(execution, DeferredPeelExecution::Background)
+                && self.storage.get_group(group_id)?.epoch != initial_epoch
+            {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(AdvanceConvergenceStatus::Pending);
+            }
             let peel_generation_active = self.storage.deferred_peel_generation(group_id)?.is_some();
             if self.has_unresolved_convergence_inputs(group_id)? && !peel_generation_active {
                 let convergence_started = Instant::now();
@@ -1705,6 +1726,9 @@ impl<S: StorageProvider> Engine<S> {
         let total = deferred.len();
         self.refresh_peel_deferred_group_usage(group_id, &deferred);
         if total == 0 {
+            if let Some(state) = self.deferred_peel.get_mut(group_id) {
+                state.yield_for_transport_redelivery = false;
+            }
             self.invalidate_deferred_peel_candidate_cache(group_id);
             if self.storage.deferred_peel_generation(group_id)?.is_some() {
                 self.storage.delete_deferred_peel_generation(group_id)?;
@@ -2308,6 +2332,21 @@ impl<S: StorageProvider> Engine<S> {
             now,
             MAX_DEFERRED_ROWS_PER_SWEEP,
         )?;
+        // A background advance may yield with raw rows that have never tried
+        // the new epoch or candidate graph. Their next wake is retry work,
+        // not residence expiry. Derive readiness from the durable per-row
+        // fingerprint so cancellation and reopen preserve the same decision.
+        if !deferred.is_empty() {
+            let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+            if deferred.iter().any(|record| {
+                record
+                    .deferred_peel
+                    .as_ref()
+                    .is_none_or(|lifecycle| lifecycle.last_context_fingerprint != Some(fingerprint))
+            }) {
+                return Ok(Some(0));
+            }
+        }
         let mut earliest = None;
         for record in deferred {
             let deadline = record
@@ -2566,6 +2605,10 @@ impl<S: StorageProvider> Engine<S> {
         message_id: &MessageId,
     ) -> IngestOutcome {
         self.retryable_unpersisted_ingest_id = Some(message_id.clone());
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .yield_for_transport_redelivery = true;
         if self.should_audit_peel_deferred_cap_rejection(group_id) {
             self.audit_group(
                 group_id,

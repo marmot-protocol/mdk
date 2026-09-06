@@ -1120,6 +1120,41 @@ async fn foreground_send_budget_queues_47_and_64_row_notify_gated_backlogs() {
     }
 }
 
+#[tokio::test]
+async fn deferred_peel_scheduler_wakes_for_new_context_before_residence_expiry() {
+    let (_alice, mut carol, _storage, _peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs().await;
+    assert!(matches!(
+        carol.ingest(commit3).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(0)
+    );
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert!(
+        carol
+            .deferred_peel_cutoff_delay_ms(&group_id)
+            .unwrap()
+            .is_some_and(|delay| delay > 0),
+        "unchanged context sleeps until expiry rather than spinning"
+    );
+    carol.ingest(commit2).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(0),
+        "the newly available decryption context needs an immediate scheduler wake"
+    );
+    carol.advance_convergence_inputs(&group_id).await.unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        None
+    );
+}
+
 /// The core #339 fix: a deferred row is not re-peeled while the
 /// (epoch, snapshot-set) peel context is unchanged — after one unproductive
 /// full cycle over the backlog, whole sweeps are skipped.
@@ -1339,7 +1374,9 @@ async fn deferred_peel_restart_resumes_first_uncompleted_row_not_numeric_offset(
             IngestOutcome::TransportDeferred { .. }
         ));
     }
-    carol.set_foreground_deferred_peel_budget(25, 4);
+    // The notify gate determines the cancellation point. Leave enough wall
+    // time for enumeration even when other file-backed tests are running.
+    carol.set_foreground_deferred_peel_budget(5_000, 4);
     peeler.block_on_attempt(4);
     assert!(matches!(
         carol
@@ -1673,9 +1710,14 @@ async fn deferred_peel_residence_survives_restart_and_backward_clock() {
     );
     assert_eq!(
         carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
-        Some(1_000)
+        Some(0)
     );
     carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol.deferred_peel_cutoff_delay_ms(&group_id).unwrap(),
+        Some(1_000),
+        "after its first context attempt, the original residence budget is unchanged"
+    );
     let before_restart = carol_storage.get_message(&stuck_app.id).unwrap();
     let lifecycle = before_restart
         .deferred_peel

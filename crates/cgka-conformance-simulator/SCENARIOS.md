@@ -939,12 +939,16 @@ resource error instead of spinning.
 eight-round `seed=9101`, `case_index=11` regression from mdk#1671. The latter requires a selected path that spans
 several epochs to leave every intermediate retained anchor available to the next frozen convergence generation.
 
-`tests/offline_catchup_regression.rs` replays a fixed 368-message reduction of generator 1, seed 17001, case 19,
-retaining all 16 commit rounds. Both tests explicitly use `ProtocolProfile::Current` and encrypted file-backed storage.
-Reverse history previously stranded 125 messages after group state converged; changing only relay order to natural
-passed. The saved synthetic input retains full payload multiplicity, exact state, fresh decryption probes, and
-no-pending-work checks. Its Current founding acknowledgement omits the Legacy pending-create filter and expectation.
-Run it with `cargo test --release -p cgka-conformance-simulator --test offline_catchup_regression`.
+`tests/offline_catchup_regression.rs` replays a fixed 368-message reduction and the original 1,024-message workload
+from generator 1, seed 17001, case 19, retaining all 16 commit rounds. Each uses `ProtocolProfile::Current` and
+encrypted file-backed storage, with reverse history and a natural-order control. The smaller reverse case previously
+stranded 125 messages after state converged because commit replay ran before the retained peel generation completed.
+The larger case also exercises capacity refusal: background engine work yields after epoch advancement and the
+retained-relay scheduler retries refused history before draining further epochs. The input and full payload
+multiplicity, exact state, fresh decryption probes, and no-pending-work assertions remain unchanged. Current founding
+acknowledgement omits only the Legacy pending-create filter and expectation.
+Run with `cargo test --release --locked -p cgka-conformance-simulator --test offline_catchup_regression`.
+This engine-and-retained-relay regression does not establish app queue, SDK delivery, or relay pagination behavior.
 
 ### General Simulator Integrity Checks
 
@@ -1014,6 +1018,23 @@ These tests keep the simulator machinery honest.
   recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across
   candidate orderings.
+
+## Public app-path acceptance journeys
+
+`tests/app_runtime_journeys.rs` starts the public-runtime companion coverage with creation/bidirectional messaging,
+profile edits, late join, removal, reopen/continued messaging, and a 12-message offline catch-up. Each uses a real
+local Nostr relay, encrypted participant databases, exact public payload multisets, shared public state, fresh
+messaging, and recipient restart persistence. These are ordinary smoke tests.
+
+The same file maintains `public_app_1024_message_backlog_recovers_completely`, an explicitly ignored, unresolved
+full-recovery regression using all sends and 16 profile updates from the saved 1,024-message input. It uses native
+relay order and public app operations, not the engine fixture's forced reverse schedule or private oracles. Skipping
+it is not a passing catch-up result. Commands, limits, and remaining coverage gaps are in
+[`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
+
+`cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
+capabilities before spending runtime budget. Its first bounded selection covers twelve families and records
+unsupported cases explicitly; it does not create new families, remove assertions, or count preflight as a pass.
 
 ## Byte Fixtures
 

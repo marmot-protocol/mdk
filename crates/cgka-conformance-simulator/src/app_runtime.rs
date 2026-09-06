@@ -72,6 +72,10 @@ pub struct AppRuntimeLocalDiagnosticsV1 {
     pub database_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_kind: Option<String>,
+    /// Bounded public runtime errors; command success does not imply that
+    /// independently scheduled account work also succeeded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +99,7 @@ struct Participant {
     retryable_failures: u64,
     terminal_failures: u64,
     last_error_kind: Option<String>,
+    background_errors: Vec<String>,
     runtime_events_observed: usize,
     cached_members: BTreeMap<String, Vec<String>>,
     cached_epochs: BTreeMap<String, u64>,
@@ -185,6 +190,7 @@ impl AppRuntimeHarness {
                     retryable_failures: 0,
                     terminal_failures: 0,
                     last_error_kind: None,
+                    background_errors: Vec::new(),
                     runtime_events_observed: 0,
                     cached_members: BTreeMap::new(),
                     cached_epochs: BTreeMap::new(),
@@ -531,7 +537,12 @@ impl AppRuntimeHarness {
                 .runtime()?
                 .group_members(&participant.account_id, &group_id)
                 .await
-                .map_err(app_error)?;
+                .map_err(|error| {
+                    record_failure(participant, &error);
+                    let mut error = app_error(error);
+                    error.message = format!("reading group members: {}", error.message);
+                    error
+                })?;
             participant.cached_members.insert(
                 group_label.clone(),
                 members
@@ -543,7 +554,12 @@ impl AppRuntimeHarness {
                 .runtime()?
                 .group_mls_state(&participant.account_id, &group_id)
                 .await
-                .map_err(app_error)?;
+                .map_err(|error| {
+                    record_failure(participant, &error);
+                    let mut error = app_error(error);
+                    error.message = format!("reading group MLS state: {}", error.message);
+                    error
+                })?;
             participant
                 .cached_epochs
                 .insert(group_label.clone(), state.epoch);
@@ -713,6 +729,7 @@ impl AppRuntimeHarness {
                 database_encrypted: status.projections.account.encrypted,
                 database_bytes,
                 last_error_kind: participant.last_error_kind.clone(),
+                background_errors: participant.background_errors.clone(),
             },
         })
     }
@@ -1364,7 +1381,18 @@ fn drain_runtime_events(participant: &mut Participant) {
     let Some(events) = participant.events.as_mut() else {
         return;
     };
-    while events.try_recv().is_ok() {
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        };
+        if let MarmotAppEvent::AccountError(error) = event {
+            if participant.background_errors.len() == 8 {
+                participant.background_errors.remove(0);
+            }
+            participant.background_errors.push(error.message);
+        }
         participant.runtime_events_observed = participant.runtime_events_observed.saturating_add(1);
     }
 }

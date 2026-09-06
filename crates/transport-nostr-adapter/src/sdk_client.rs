@@ -61,17 +61,26 @@ const SDK_RELAY_BATCH_MAX_IN_FLIGHT: usize = 4;
 /// slow route cannot consume the whole account startup quantum.
 const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(2);
 const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_millis(500);
-/// Fetch and materialize only this deterministic prefix of a remote-only set.
-/// Durable app ingestion adds those ids to the next comparison, which makes a
-/// large first-run difference converge across bounded passes.
+/// Fetch a bounded rotating portion of the remote-only set. Durable admission
+/// removes accepted ids; rotation reaches dependencies beyond refused ids.
 const SDK_RECONCILIATION_REPLAY_BATCH: usize = 128;
 /// Must match the storage inventory ceiling. The relay applies the same limit,
 /// bounding the dry-run result even on first boot with an empty inventory.
 const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384;
+const SDK_RECONCILIATION_CURSOR_LIMIT: usize = 256;
 
-fn bounded_reconciliation_remote_ids(remote: &HashSet<EventId>) -> Vec<EventId> {
+fn bounded_reconciliation_remote_ids(
+    remote: &HashSet<EventId>,
+    after: Option<EventId>,
+) -> Vec<EventId> {
     let mut ids = remote.iter().copied().collect::<Vec<_>>();
     ids.sort_unstable();
+    if let Some(after) = after
+        && !ids.is_empty()
+    {
+        let start = ids.partition_point(|id| *id <= after) % ids.len();
+        ids.rotate_left(start);
+    }
     ids.truncate(SDK_RECONCILIATION_REPLAY_BATCH);
     ids
 }
@@ -149,6 +158,9 @@ pub struct NostrSdkRelayClient {
     /// Relays that explicitly rejected NIP-77 are skipped for the rest of this
     /// process. Transient connection failures are never cached here.
     reconciliation_unsupported_relays: Arc<RwLock<HashSet<RelayUrl>>>,
+    /// Advisory fairness cursors survive subscription rebuilds. Forgetting an
+    /// entry repeats a batch; it never acknowledges delivery or relay coverage.
+    reconciliation_replay_cursors: Arc<Mutex<HashMap<(MemberId, String), EventId>>>,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -234,6 +246,7 @@ impl NostrSdkRelayClient {
             #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             reconciliation_unsupported_relays: Arc::new(RwLock::new(HashSet::new())),
+            reconciliation_replay_cursors: Arc::new(Mutex::new(HashMap::new())),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -242,10 +255,9 @@ impl NostrSdkRelayClient {
         &self.client
     }
 
-    /// Reconcile the content-addressed event set in one route's gap below the
-    /// ordinary subscription floor. NIP-77 compares event ids, so a
-    /// late-published event is discoverable regardless of its authored
-    /// timestamp without replaying current MLS traffic through a second path.
+    /// Reconcile one route's event set against durable account admission.
+    /// NIP-77 compares event ids, including SDK-seen events that the account
+    /// could not retain. Replay is bounded independently of the set difference.
     pub async fn reconcile_subscription(
         &self,
         subscription: NostrSubscription,
@@ -254,10 +266,9 @@ impl NostrSdkRelayClient {
         reconcile_until: u64,
     ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
         let mut plan = Self::plan_subscription(&subscription)?;
-        // The ordinary subscription owns its inclusive timestamp window. The
-        // correctness pass compares only the older gap, avoiding a second,
-        // unordered delivery path for current MLS traffic while still finding
-        // events that a fixed `since` floor can never see.
+        // Startup compares the gap below the subscription floor; explicit
+        // backfill also compares its current window so upstream SDK dedup
+        // cannot hide previously refused events from the account.
         plan.filter = plan
             .filter
             .since(NostrTimestamp::from_secs(reconcile_since))
@@ -331,9 +342,32 @@ impl NostrSdkRelayClient {
         // Compare without SDK-managed downloads: its download path returns
         // only after every 100-id REQ/EOSE batch, so an outer timeout discards
         // all useful progress. Instead, deterministically request a bounded
-        // prefix and let durable app ingestion shrink the next dry-run diff.
+        // rotating batch so even a completely refused batch cannot starve
+        // later dependencies; durable app ingestion shrinks the next diff.
         let remote_item_count = output.val.remote.len();
-        let remote_ids = bounded_reconciliation_remote_ids(&output.val.remote);
+        let remote_ids = {
+            let key = (plan.account_id.clone(), subscription_id.clone());
+            let mut cursors = self.reconciliation_replay_cursors.lock().await;
+            let ids =
+                bounded_reconciliation_remote_ids(&output.val.remote, cursors.get(&key).copied());
+            if let Some(last) = ids.last().copied() {
+                // Bound advisory state even across retired accounts/routes.
+                // Subscription rebuilds must not reset an active repair to
+                // the same refused prefix on every pass.
+                if cursors.len() >= SDK_RECONCILIATION_CURSOR_LIMIT
+                    && !cursors.contains_key(&key)
+                    && let Some(retired) = cursors.keys().next().cloned()
+                {
+                    cursors.remove(&retired);
+                }
+                // Advance before I/O so a cancelled or unavailable batch
+                // cannot starve a later dependency. Refused ids recur on wrap.
+                cursors.insert(key, last);
+            } else {
+                cursors.remove(&key);
+            }
+            ids
+        };
         let mut sdk_events = Vec::new();
         let mut missing_ids = Vec::new();
         for event_id in remote_ids {
@@ -354,39 +388,35 @@ impl NostrSdkRelayClient {
                 None => missing_ids.push(event_id),
             }
         }
-        let fetched_items = if missing_ids.is_empty() {
-            0
-        } else {
+        if !missing_ids.is_empty() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                0
-            } else {
-                // Fresh events also produce the SDK's ordinary pool
-                // notification, which is already routed through the account
-                // delivery queue. Count that bounded fetch here but do not
-                // explicitly enqueue it a second time. Cache hits above emit
-                // no pool notification and therefore use the account-scoped
-                // materialization path below.
-                self.client
+            if !remaining.is_zero() {
+                // A seen id need not have cached event bytes: the default SDK
+                // database retains ids only. Even a successful explicit fetch
+                // can therefore emit no ordinary Event notification. Own every
+                // fetched result here; the account's durable seen index absorbs
+                // any concurrent first-sighting notification.
+                let fetched = self
+                    .client
                     .fetch_events_from(endpoints, Filter::new().ids(missing_ids), remaining)
                     .await
                     .map_err(|_| {
                         TransportAdapterError::Subscription(
                             "fetch reconciled event batch failed".to_owned(),
                         )
-                    })?
-                    .len()
+                    })?;
+                sdk_events.extend(fetched);
             }
-        };
+        }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
         // stored-event catch-up instead of HashSet iteration order.
         sdk_events.sort_unstable_by_key(|event| (event.created_at, event.id));
         let mut remote_events = Vec::with_capacity(sdk_events.len());
+        // The network deadline bounds acquisition, not delivery of the
+        // already-owned bounded batch. A fetch may finish at its timeout;
+        // discarding those results would lose them behind SDK dedup again.
         for event in sdk_events {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
             remote_events.push(NostrRelayEvent {
                 endpoint: TransportEndpoint(replay_endpoint.to_string()),
                 subscription_id: Some(subscription_id.clone()),
@@ -401,7 +431,7 @@ impl NostrSdkRelayClient {
             relays_succeeded: output.success.len(),
             relays_failed: output.failed.len().saturating_add(unsupported_count),
             remote_items: remote_item_count,
-            received_items: remote_events.len().saturating_add(fetched_items),
+            received_items: remote_events.len(),
         };
         Ok((summary, remote_events))
     }
@@ -1717,6 +1747,144 @@ mod tests {
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
     }
 
+    #[tokio::test]
+    async fn reconciliation_redelivers_seen_but_unretained_events_with_default_sdk_cache() {
+        use nostr_relay_builder::LocalRelay;
+
+        let database = nostr_sdk::prelude::MemoryDatabase::with_opts(
+            nostr_sdk::prelude::MemoryDatabaseOptions {
+                events: true,
+                max_events: Some(1024),
+            },
+        );
+        let mut published = Vec::new();
+        for index in 0..SDK_RECONCILIATION_REPLAY_BATCH + 9 {
+            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("synthetic-{index}"))
+                .tags([Tag::custom(
+                    TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                    ["c3".repeat(32)],
+                )])
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            nostr_sdk::prelude::NostrDatabase::save_event(&database, &event)
+                .await
+                .unwrap();
+            published.push(event);
+        }
+        let unrelated = EventBuilder::new(Kind::MlsGroupMessage, "unrelated group")
+            .tags([Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                ["d4".repeat(32)],
+            )])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        nostr_sdk::prelude::NostrDatabase::save_event(&database, &unrelated)
+            .await
+            .unwrap();
+        let relay =
+            LocalRelay::new(nostr_relay_builder::RelayBuilder::default().database(database));
+        relay.run().await.unwrap();
+        let endpoint = relay.url().await;
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        sdk.client.add_relay(endpoint.clone()).await.unwrap();
+        sdk.client.connect().await;
+        let subscription = NostrSubscription::Group {
+            account_id: MemberId::new(vec![0xa1; 32]),
+            group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
+            transport_group_id: vec![0xc3; 32],
+            endpoints: vec![TransportEndpoint(endpoint.to_string())],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        // First see every event, but acknowledge none to the account inventory.
+        let filter = NostrSdkRelayClient::plan_subscription(&subscription)
+            .unwrap()
+            .filter;
+        let seen = sdk
+            .client
+            .fetch_events(
+                filter.limit(SDK_RECONCILIATION_SET_LIMIT),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen.len(), published.len());
+        assert!(
+            sdk.client
+                .database()
+                .event_by_id(&published[0].id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut notifications = sdk.client.notifications();
+        let (_, first) = sdk
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), SDK_RECONCILIATION_REPLAY_BATCH);
+        while let Ok(notification) = notifications.try_recv() {
+            assert!(
+                !matches!(notification, nostr_sdk::RelayPoolNotification::Event { .. }),
+                "already-seen events must be owned by explicit replay, not first-seen notifications"
+            );
+        }
+        assert!(
+            first
+                .windows(2)
+                .all(|pair| (pair[0].event.created_at, &pair[0].event.id)
+                    <= (pair[1].event.created_at, &pair[1].event.id))
+        );
+        // Refusing an entire batch must still expose the remaining history,
+        // including a dependency that was outside the first bounded batch.
+        let (_, rotated) = sdk
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(rotated.len(), SDK_RECONCILIATION_REPLAY_BATCH);
+        let reached = first
+            .iter()
+            .chain(rotated.iter())
+            .map(|event| event.event.id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(reached.len(), published.len());
+        // Refuse one event again; only the accepted batch enters durable inventory.
+        let inventory = first[1..]
+            .iter()
+            .map(|event| NostrReconciliationItem {
+                event_id: EventId::from_hex(&event.event.id).unwrap().to_bytes(),
+                created_at: event.event.created_at,
+            })
+            .collect::<Vec<_>>();
+        let (_, second) = sdk
+            .reconcile_subscription(subscription, &inventory, 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 10);
+        assert!(
+            second
+                .iter()
+                .any(|event| event.event.id == first[0].event.id)
+        );
+        let mut delivered = first[1..]
+            .iter()
+            .chain(second.iter())
+            .map(|event| event.event.id.clone())
+            .collect::<Vec<_>>();
+        delivered.sort();
+        let mut expected = published
+            .iter()
+            .map(|event| event.id.to_hex())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            delivered, expected,
+            "every retained route event is delivered exactly once after admission"
+        );
+        sdk.client.shutdown().await;
+        relay.shutdown();
+    }
+
     #[test]
     fn reconciliation_remote_batch_is_bounded_and_deterministic() {
         let remote = (0..SDK_RECONCILIATION_REPLAY_BATCH + 5)
@@ -1728,7 +1896,7 @@ mod tests {
             })
             .collect::<HashSet<_>>();
 
-        let selected = bounded_reconciliation_remote_ids(&remote);
+        let selected = bounded_reconciliation_remote_ids(&remote, None);
         assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
         assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(

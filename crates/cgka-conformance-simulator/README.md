@@ -10,12 +10,15 @@ In-process multi-client simulator for the CGKA engine.
   evidence, and add high-value workload families.
 - [`SCENARIO_IR.md`](SCENARIO_IR.md): canonical scenario and authoring contracts.
 - [`SCENARIOS.md`](SCENARIOS.md): fixed and generated scenario registry.
+- [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md): basic public-runtime acceptance tests and the unresolved large
+  offline catch-up gate.
 - [`AGENTS.md`](AGENTS.md): agent-facing code map and safe operating workflow.
 
 The engine crate proves local engine rules. This crate asks the bigger question: if several clients run that engine and
 the network behaves badly, do they still end up with the same group state?
 
-The simulator does not open real relay connections. Its fast engine adapter runs `Engine<SqliteAccountStorage>` clients
+The fast engine adapters do not open real relay connections. The public app-runtime adapter uses a real local Nostr
+relay, production app operations and separate encrypted participant databases. The fast engine adapter runs `Engine<SqliteAccountStorage>` clients
 against a deterministic in-memory `TransportBus`; its retained-relay adapter persists independent per-relay histories
 and drives engine mailboxes through explicit queries, cursors, EOSE, full backfill, and set reconciliation. In-memory
 SQLite remains the default. Report runs select storage explicitly with

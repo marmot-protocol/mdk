@@ -1311,6 +1311,7 @@ impl EngineHarnessSubject {
     pub(crate) async fn tick_observing_capacity_refusals(
         &mut self,
         clients: &[String],
+        redelivery_available: bool,
     ) -> Result<BTreeMap<String, usize>, SubjectError> {
         let mut capacity_refused = BTreeMap::new();
         for label in clients {
@@ -1320,7 +1321,10 @@ impl EngineHarnessSubject {
             let pending_replay = (self.replay_capture_target_tick == Some(recipient_tick))
                 .then(|| self.prepare_byte_replay(label))
                 .flatten();
-            let outcomes = self.client_mut(label)?.tick().await;
+            let outcomes = self
+                .client_mut(label)?
+                .tick_with_transport_redelivery(redelivery_available)
+                .await;
             let refused_count = inbound
                 .iter()
                 .zip(&outcomes)
@@ -1535,7 +1539,7 @@ impl ConvergenceSubject for EngineHarnessSubject {
     }
 
     async fn tick(&mut self, clients: &[String]) -> Result<(), SubjectError> {
-        self.tick_observing_capacity_refusals(clients)
+        self.tick_observing_capacity_refusals(clients, false)
             .await
             .map(|_| ())
     }
