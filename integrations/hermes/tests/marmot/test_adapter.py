@@ -4928,6 +4928,32 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(image_path.exists())
             self.assertEqual(fake_client.media_sends[0][3], "look")
 
+    async def test_outbound_send_document_rejects_allowed_root_leaf_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = Path(tmpdir) / "allowed"
+            media_dir.mkdir()
+            target = media_dir / "secret.bin"
+            target.write_bytes(b"secret")
+            link = media_dir / "link.bin"
+            link.symlink_to(target)
+            client = unittest.mock.AsyncMock()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(media_dir)],
+                    }
+                ),
+                client=client,
+            )
+
+            result = await adapter.send_document("22" * 32, str(link))
+
+            self.assertTrue(link.is_symlink())
+            self.assertFalse(result.success)
+            self.assertIn("not a readable file", result.error or "")
+            client.send_media.assert_not_awaited()
+
     async def test_outbound_send_multiple_images_routes_one_ordered_batch_to_send_media(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             media_dir = Path(tmpdir) / "dev" / "inbound-media"

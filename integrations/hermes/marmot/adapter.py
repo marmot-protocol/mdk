@@ -811,9 +811,14 @@ def open_outbound_media_source(
     pinned_roots: list[tuple[Path, int]],
 ) -> tuple[Path, int, os.stat_result]:
     """Open one approved source and pin the inode used by later staging."""
-    resolved = source.expanduser().resolve()
-    if not resolved.is_file():
+    expanded = source.expanduser()
+    if expanded.is_symlink():
         raise AgentControlError("Marmot media path is not a readable file")
+    try:
+        resolved_parent = expanded.parent.resolve(strict=True)
+    except OSError:
+        raise AgentControlError("Marmot media path is not a readable file") from None
+    resolved = resolved_parent / expanded.name
     approved_root = next(
         ((root, directory_fd) for root, directory_fd in pinned_roots if resolved.is_relative_to(root)),
         None,
@@ -836,6 +841,8 @@ def open_outbound_media_source(
             os.close(directory_fd)
             directory_fd = child_fd
         source_fd = os.open(relative.name, source_flags, dir_fd=directory_fd)
+    except OSError:
+        raise AgentControlError("Marmot media path is not a readable file") from None
     finally:
         os.close(directory_fd)
     try:
