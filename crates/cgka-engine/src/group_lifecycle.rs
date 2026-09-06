@@ -1606,7 +1606,8 @@ fn leaf_capabilities_as_marmot(
     supported_app_components: &cgka_traits::app_components::AppComponentSet,
     protocol_profile: ProtocolProfile,
 ) -> GroupCapabilities {
-    let mut out = GroupCapabilities::default();
+    let mut out =
+        crate::capabilities::with_implicit_default_capabilities(GroupCapabilities::default());
     for (_f, req) in registry.iter() {
         out.insert(req.requires);
     }
