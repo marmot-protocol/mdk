@@ -293,6 +293,18 @@ impl MarmotApp {
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
+        // AccountHome's public-key lookup addresses canonical on-disk labels.
+        // Older/custom-label accounts need an identity index as well, otherwise
+        // npub/hex references unnecessarily depend on relay KeyPackages.
+        let local_labels = if member_refs.is_empty() {
+            HashMap::new()
+        } else {
+            self.account_home()
+                .accounts()?
+                .into_iter()
+                .map(|account| (account.account_id_hex, account.label))
+                .collect::<HashMap<_, _>>()
+        };
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for member_ref in member_refs {
@@ -310,9 +322,12 @@ impl MarmotApp {
                 .directory_entry_for_account_id(&account_id_hex)?
                 .map(|entry| entry.relay_lists)
                 .unwrap_or_else(AccountRelayListStatus::empty);
+            let local_label = local
+                .map(|account| account.label)
+                .or_else(|| local_labels.get(&account_id_hex).cloned());
             targets.push(MemberTarget {
                 account_id_hex,
-                local_label: local.map(|account| account.label),
+                local_label,
                 relay_lists,
             });
         }

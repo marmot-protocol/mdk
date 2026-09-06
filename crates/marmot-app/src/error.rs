@@ -59,6 +59,9 @@ pub enum AppError {
     /// presentation, while Display remains identity-free for safe diagnostics.
     #[error("member has no valid Marmot inbox relay")]
     MissingMemberInboxRoute(String),
+    /// The creator is already an MLS member and cannot be added again.
+    #[error("group members must not include the creator")]
+    GroupCreateIncludesCreator,
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -257,6 +260,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
+            Self::GroupCreateIncludesCreator => "group_create_includes_creator",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",

@@ -1,6 +1,7 @@
 //! Local Marmot agent connector daemon.
 
 mod account;
+mod agent_created_groups;
 mod allowlist;
 mod bootstrap;
 mod connection;
@@ -212,6 +213,7 @@ impl AgentConnectorConfig {
 pub struct AgentConnector {
     pub(crate) account_home: AccountHome,
     pub(crate) allowlists: AllowlistStore,
+    pub(crate) agent_created_groups: agent_created_groups::AgentCreatedGroupsStore,
     pub(crate) dev_allow_any_invites: bool,
     pub(crate) debug_controls: bool,
     pub(crate) auth_token: Option<String>,
@@ -263,6 +265,7 @@ impl AgentConnector {
         Ok(Self {
             account_home,
             allowlists,
+            agent_created_groups: agent_created_groups::AgentCreatedGroupsStore::new(&config.home),
             dev_allow_any_invites: config.dev_allow_any_invites,
             debug_controls: config.debug_controls,
             auth_token: config.auth_token,

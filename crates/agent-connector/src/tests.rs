@@ -6469,3 +6469,527 @@ async fn bench_idle_reconciliation_scaling() {
     invite_worker.abort();
     connector.runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let alternate = MockRelay::run().await.unwrap();
+    let alternate_url = alternate.url().await.to_string();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let member_refs = [
+        peer.label.clone(),
+        peer.account_id_hex.clone(),
+        marmot_app::npub_for_account_id(&peer.account_id_hex).unwrap(),
+    ];
+    for (index, member_ref) in member_refs.into_iter().enumerate() {
+        let relays = (index == 1).then(|| vec![alternate_url.clone()]);
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "create-group",
+            AgentControlRequest::GroupCreate {
+                account_id_hex: agent.account_id_hex.to_uppercase(),
+                name: "Agent group".into(),
+                members: vec![member_ref],
+                description: Some("Created through the control socket".into()),
+                relays,
+            },
+        )
+        .await;
+        assert_eq!(response.id.as_deref(), Some("create-group"));
+        let AgentControlResponse::GroupCreated {
+            group_id_hex,
+            pending_welcome_count,
+            agent_created,
+        } = response.payload
+        else {
+            panic!("expected group_created, got {:?}", response.payload);
+        };
+        assert!(
+            crate::agent_created_groups::AgentCreatedGroupsStore::new(dir.path())
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        assert!(
+            !connector
+                .allowlists
+                .contains(&agent.account_id_hex, &peer.account_id_hex)
+                .unwrap()
+        );
+        assert_eq!(hex::decode(&group_id_hex).unwrap().len(), 16);
+        assert_eq!(pending_welcome_count, Some(0));
+        assert!(agent_created);
+        let groups = connector.app.groups(&agent.label).unwrap();
+        let group = groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .unwrap();
+        assert_eq!(group.profile.name, "Agent group");
+        assert_eq!(
+            group.profile.description,
+            "Created through the control socket"
+        );
+        assert_eq!(
+            group.nostr_routing.relays,
+            vec![if index == 1 {
+                alternate_url.clone()
+            } else {
+                relay_url.clone()
+            }]
+        );
+        let info = connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap();
+        assert!(matches!(
+            info,
+            AgentControlResponse::GroupInfo {
+                member_count: 2,
+                agent_created: true,
+                ..
+            }
+        ));
+    }
+    // A group created outside the control op has no activation provenance.
+    let other = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "External group",
+            std::slice::from_ref(&peer.label),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &hex::encode(other.as_slice()))
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            agent_created: false,
+            ..
+        }
+    ));
+    // Persistence failure must not disguise a canonical create as a retryable
+    // failure or enable activation without a durable provenance record.
+    std::fs::rename(
+        &connector.agent_created_groups.dir,
+        dir.path().join("saved-provenance"),
+    )
+    .unwrap();
+    std::fs::write(&connector.agent_created_groups.dir, b"blocked directory").unwrap();
+    let response = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Untracked group".into(),
+            vec![peer.label.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let AgentControlResponse::GroupCreated {
+        group_id_hex,
+        agent_created: false,
+        ..
+    } = response
+    else {
+        panic!("expected canonical create with unavailable provenance");
+    };
+    assert!(
+        connector
+            .app
+            .groups(&agent.label)
+            .unwrap()
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+    );
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec!["wss://relay.example.com".into()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let cases = [
+        (
+            "not-hex".into(),
+            "Group".into(),
+            vec![],
+            None,
+            None,
+            "invalid_hex",
+        ),
+        (
+            "11".repeat(32),
+            "Group".into(),
+            vec![],
+            None,
+            None,
+            "account_home_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            " ".into(),
+            vec![],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "é".repeat(129),
+            vec![],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![" ".into()],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            Some("x".repeat(4097)),
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec!["invalid-member".into()],
+            None,
+            None,
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec![]),
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec!["https://relay.example.com".into()]),
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec!["wss://192.168.1.1".into()]),
+            "app_error",
+        ),
+    ];
+    for (account_id_hex, name, members, description, relays, expected_code) in cases {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "invalid-create",
+            AgentControlRequest::GroupCreate {
+                account_id_hex,
+                name,
+                members,
+                description,
+                relays,
+            },
+        )
+        .await;
+        let AgentControlResponse::Error {
+            code,
+            message,
+            retryable,
+        } = response.payload
+        else {
+            panic!("expected error");
+        };
+        assert_eq!(code, expected_code);
+        assert!(!retryable);
+        assert!(!message.contains(&agent.account_id_hex));
+        assert!(connector.app.groups(&agent.label).unwrap().is_empty());
+    }
+    connector.runtime.shutdown().await;
+}
+
+#[test]
+fn agent_created_groups_store_round_trip_is_private_and_account_scoped() {
+    use crate::agent_created_groups::AgentCreatedGroupsStore;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentCreatedGroupsStore::new(dir.path());
+    let account = "ab".repeat(32);
+    let other_account = "cd".repeat(32);
+    let group = "ef".repeat(16);
+    assert!(!store.contains(&account, &group).unwrap());
+    store
+        .add(&account.to_uppercase(), &group.to_uppercase())
+        .unwrap();
+    store.add(&account, &group).unwrap();
+    // MLS group ids are variable length, not Nostr routing handles.
+    store.add(&account, "123456").unwrap();
+    let reopened = AgentCreatedGroupsStore::new(dir.path());
+    assert!(reopened.contains(&account, &group).unwrap());
+    assert!(reopened.contains(&account, "123456").unwrap());
+    assert!(!reopened.contains(&other_account, &group).unwrap());
+    let path = store.dir.join(format!("{account}.json"));
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["group_ids_hex"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::metadata(&store.dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1);
+    assert!(store.add("../escape", &group).is_err());
+    // A relocated record cannot activate a different account or redirect writes.
+    let other_path = store.dir.join(format!("{other_account}.json"));
+    std::fs::copy(&path, &other_path).unwrap();
+    assert!(!store.contains(&other_account, &group).unwrap());
+    std::fs::write(&path, b"invalid json").unwrap();
+    assert!(!store.contains(&account, &group).unwrap());
+    store.add(&account, &group).unwrap();
+    assert!(reopened.contains(&account, &group).unwrap());
+}
+
+#[test]
+fn agent_created_groups_store_removal_is_durable_and_scoped() {
+    use crate::agent_created_groups::AgentCreatedGroupsStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentCreatedGroupsStore::new(dir.path());
+    let account = "ab".repeat(32);
+    let other_account = "cd".repeat(32);
+    let group = "ef".repeat(16);
+    store.remove(&account, &group).unwrap();
+    assert!(!store.dir.exists(), "missing records need no write");
+    store.add(&account, &group).unwrap();
+    store.add(&account, "123456").unwrap();
+    store.add(&other_account, &group).unwrap();
+    store
+        .remove(&account.to_uppercase(), &group.to_uppercase())
+        .unwrap();
+    store.remove(&account, &group).unwrap();
+    let reopened = AgentCreatedGroupsStore::new(dir.path());
+    assert!(!reopened.contains(&account, &group).unwrap());
+    assert!(reopened.contains(&account, "123456").unwrap());
+    assert!(reopened.contains(&other_account, &group).unwrap());
+    let path = store.dir.join(format!("{account}.json"));
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_leaves_group_and_removes_activation_provenance() {
+    connector_leave_group_case(false).await;
+}
+
+#[tokio::test]
+async fn connector_leave_acknowledges_success_when_provenance_cleanup_fails() {
+    connector_leave_group_case(true).await;
+}
+
+async fn connector_leave_group_case(block_cleanup: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let AgentControlResponse::GroupCreated { group_id_hex, .. } = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Leave test".into(),
+            vec![peer.label.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected created group")
+    };
+    let listener = bind_connector_socket(&socket).unwrap();
+    let missing = "ab".repeat(16);
+    connector
+        .agent_created_groups
+        .add(&agent.account_id_hex, &missing)
+        .unwrap();
+    for (account, group, expected_code) in [
+        (
+            agent.account_id_hex.clone(),
+            "not-hex".into(),
+            "invalid_hex",
+        ),
+        ("not-hex".into(), group_id_hex.clone(), "invalid_hex"),
+        (agent.account_id_hex.clone(), missing.clone(), "app_error"),
+    ] {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "leave-invalid",
+            AgentControlRequest::GroupLeave {
+                account_id_hex: account,
+                group_id_hex: group,
+            },
+        )
+        .await;
+        let AgentControlResponse::Error {
+            code, retryable, ..
+        } = response.payload
+        else {
+            panic!("expected leave error");
+        };
+        assert_eq!(code, expected_code);
+        assert!(!retryable);
+        assert!(
+            connector
+                .agent_created_groups
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        assert!(
+            connector
+                .agent_created_groups
+                .contains(&agent.account_id_hex, &missing)
+                .unwrap()
+        );
+    }
+    let admin_error = connector
+        .leave_group_response(&agent.account_id_hex, &group_id_hex)
+        .await
+        .unwrap_err();
+    assert_eq!(admin_error.code(), "app_error");
+    assert!(!admin_error.retryable());
+    assert!(
+        connector
+            .agent_created_groups
+            .contains(&agent.account_id_hex, &group_id_hex)
+            .unwrap()
+    );
+    let group_id = GroupId::new(hex::decode(&group_id_hex).unwrap());
+    connector
+        .runtime
+        .promote_admin(&agent.label, &group_id, &peer.account_id_hex)
+        .await
+        .unwrap();
+    connector
+        .runtime
+        .self_demote_admin(&agent.label, &group_id)
+        .await
+        .unwrap();
+    // A directory at the atomic-write staging path reliably fails writes,
+    // including when tests run as root, without damaging the durable record.
+    let blocked_temp = connector
+        .agent_created_groups
+        .dir
+        .join(format!(".{}.json.tmp", agent.account_id_hex));
+    if block_cleanup {
+        std::fs::create_dir(&blocked_temp).unwrap();
+    }
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "leave-1",
+        AgentControlRequest::GroupLeave {
+            account_id_hex: agent.account_id_hex.to_uppercase(),
+            group_id_hex: group_id_hex.to_uppercase(),
+        },
+    )
+    .await;
+    assert_eq!(response.id.as_deref(), Some("leave-1"));
+    assert_eq!(response.payload, AgentControlResponse::Ack);
+    let reopened = crate::agent_created_groups::AgentCreatedGroupsStore::new(dir.path());
+    if block_cleanup {
+        assert!(
+            reopened
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        std::fs::remove_dir(&blocked_temp).unwrap();
+        // Repair only the idempotent metadata operation, never repeat the leave.
+        reopened
+            .remove(&agent.account_id_hex, &group_id_hex)
+            .unwrap();
+        reopened
+            .remove(&agent.account_id_hex, &group_id_hex)
+            .unwrap();
+    }
+    assert!(
+        !reopened
+            .contains(&agent.account_id_hex, &group_id_hex)
+            .unwrap()
+    );
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            agent_created: false,
+            ..
+        }
+    ));
+    assert!(reopened.contains(&agent.account_id_hex, &missing).unwrap());
+    connector.runtime.shutdown().await;
+}

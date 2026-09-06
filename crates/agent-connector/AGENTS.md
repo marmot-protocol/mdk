@@ -26,7 +26,7 @@ several files in the same crate); methods shared across those files are `pub(cra
   here as `pub(crate)`.
 - `src/connection.rs` — `AgentConnector::handle_connection`, peer authorization, the `error_response` projection, and
   the `AgentControlRequest` → handler dispatch.
-- `src/account.rs` — account list/create, profile publishing, `local_account_for_account_id`, and welcomer-allowlist
+- `src/account.rs` — account list/create, group creation, profile publishing, `local_account_for_account_id`, and welcomer-allowlist
   list/add/remove handlers.
 - `src/messaging.rs` — final-message sends, agent activity/operation/group-system event handlers, and debug send
   recording/inject helpers.

@@ -1,4 +1,4 @@
-//! Account listing/creation, profile publishing, and welcomer-allowlist operations.
+//! Account and group membership, profile publishing, and welcomer-allowlist operations.
 
 use agent_control::{AgentControlAccount, AgentControlProfileLookupStatus, AgentControlResponse};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
@@ -42,6 +42,98 @@ impl AgentConnector {
                 local_signing: account.local_signing,
             },
         })
+    }
+
+    pub(crate) async fn create_group_response(
+        &self,
+        account_id_hex: &str,
+        name: String,
+        members: Vec<String>,
+        description: Option<String>,
+        relays: Option<Vec<String>>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
+        let account = self.local_account_for_account_id(&account_id_hex)?;
+        crate::validation::validate_group_create(&name, &members, description.as_deref())?;
+        let group_id = self
+            .runtime
+            .create_group_with_options(
+                &account.label,
+                &name,
+                &members,
+                marmot_app::AppCreateGroupOptions {
+                    description: description.unwrap_or_default(),
+                    relays,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        // Provenance is activation metadata only; it never changes sender authorization.
+        // Preserve the canonical create result on persistence failure so clients
+        // do not create a duplicate. False disables automatic activation until repaired.
+        let agent_created = match self
+            .agent_created_groups
+            .add(&account_id_hex, &group_id_hex)
+        {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "create_group_response",
+                    error_code = "agent_created_groups_write_failed",
+                    "group created but activation provenance could not be persisted"
+                );
+                false
+            }
+        };
+        // Creation is already canonical. A failed status read must not invite
+        // a retry of the non-idempotent create operation.
+        let pending_welcome_count = self
+            .runtime
+            .pending_welcome_deliveries(&account.label)
+            .await
+            .ok()
+            .map(|pending| {
+                pending
+                    .iter()
+                    .filter(|delivery| delivery.group_id_hex == group_id_hex)
+                    .count()
+            });
+        Ok(AgentControlResponse::GroupCreated {
+            group_id_hex,
+            pending_welcome_count,
+            agent_created,
+        })
+    }
+
+    pub(crate) async fn leave_group_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let account = self.local_account_for_account_id(&account_id_hex)?;
+        let group_id = cgka_traits::GroupId::new(hex::decode(&group_id_hex)?);
+        // Runtime errors (including failed publication) use the existing App
+        // projections. Never remove provenance or acknowledge a failed leave.
+        self.runtime.leave_group(&account.label, &group_id).await?;
+        // Leave is already canonical. Metadata cleanup must not turn success
+        // into an error that invites a duplicate LeaveAlreadyRequested retry.
+        if self
+            .agent_created_groups
+            .remove(&account_id_hex, &group_id_hex)
+            .is_err()
+        {
+            tracing::warn!(
+                target: "agent_connector",
+                method = "leave_group_response",
+                error_code = "agent_created_groups_cleanup_failed",
+                "group left but activation provenance cleanup failed"
+            );
+        }
+        Ok(AgentControlResponse::Ack)
     }
 
     pub(crate) async fn publish_profile_response(

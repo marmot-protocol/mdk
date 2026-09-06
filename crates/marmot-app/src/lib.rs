@@ -5883,10 +5883,24 @@ impl MarmotApp {
                 .all(|component_id| metadata.app_components.contains(component_id))
     }
 
-    fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
+    fn new_nostr_routing(&self, relays: Option<Vec<String>>) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
-        let relays = self.relay_urls.clone();
+        let relays = relay_plane::RelaySafetyPolicy::with_allow_loopback(
+            self.config.allow_loopback_relay_endpoints,
+        )
+        .sanitize_endpoints(
+            relays
+                .unwrap_or_else(|| self.relay_urls.clone())
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "group create",
+        )
+        .map_err(AppError::InvalidNostrRouting)?
+        .into_iter()
+        .map(|endpoint| endpoint.0)
+        .collect();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
     }
 }

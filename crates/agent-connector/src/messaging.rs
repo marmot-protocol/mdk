@@ -343,11 +343,15 @@ impl AgentConnector {
             .group_mls_state(&account.label, &group_id)
             .await?;
         let member_count = u32::try_from(state.member_count).unwrap_or(u32::MAX);
+        let agent_created = self
+            .agent_created_groups
+            .contains(&account.account_id_hex, &group_id_hex)?;
         Ok(AgentControlResponse::GroupInfo {
             account_id_hex: account.account_id_hex,
             group_id_hex: hex::encode(group_id.as_slice()),
             member_count,
             is_direct: state.member_count == 2,
+            agent_created,
             subject: None,
         })
     }

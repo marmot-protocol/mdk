@@ -117,6 +117,8 @@ impl std::fmt::Debug for AppInitialGroupImage {
 /// requirement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppCreateGroupOptions {
+    /// Initial group routing relays. Omitted uses the app configuration.
+    pub relays: Option<Vec<String>>,
     pub description: String,
     pub initial_image: Option<AppInitialGroupImage>,
     pub disappearing_message_secs: u64,

@@ -301,6 +301,24 @@ pub enum AgentControlRequest {
         text: String,
         data: Option<Value>,
     },
+    /// Create a locally canonical group; Welcome publication may still be pending.
+    /// Retrying this operation can create another group.
+    GroupCreate {
+        account_id_hex: String,
+        name: String,
+        /// Local account references or public-key references accepted by MarmotApp.
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// Initial group routing relays; omitted uses the connector configuration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relays: Option<Vec<String>>,
+    },
+    /// Leave a group using the account runtime; returns Ack after success.
+    GroupLeave {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
@@ -484,9 +502,26 @@ pub enum AgentControlResponse {
         account_id_hex: String,
         policy: AgentControlInvitePolicy,
     },
+    GroupCreated {
+        group_id_hex: String,
+        /// Whether this account's connector recorded creating the group. Defaults
+        /// to false when provenance is unavailable. Activation metadata only;
+        /// this grants no sender or approval authorization.
+        #[serde(default)]
+        agent_created: bool,
+        /// Snapshot of undelivered Welcomes for this group. Omitted when the
+        /// status query failed; zero does not imply recipients accepted invites.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_welcome_count: Option<usize>,
+    },
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
+        /// Whether this account's connector recorded creating the group. Defaults
+        /// to false when provenance is unavailable. Activation metadata only;
+        /// this grants no sender or approval authorization.
+        #[serde(default)]
+        agent_created: bool,
         member_count: u32,
         /// True when the group has exactly two members (the agent + one peer),
         /// i.e. an effective direct conversation where the agent always replies.
@@ -938,6 +973,107 @@ mod tests {
         MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame, read_envelope, read_frame,
         write_frame,
     };
+
+    #[test]
+    fn group_create_frames_round_trip_with_optional_fields() {
+        for optional in [false, true] {
+            let request = AgentControlEnvelope::request(
+                Some("create-1".into()),
+                AgentControlRequest::GroupCreate {
+                    account_id_hex: "11".repeat(32),
+                    name: "Team".into(),
+                    members: vec!["alice".into(), "22".repeat(32)],
+                    description: optional.then(|| "Project chat".into()),
+                    relays: optional.then(|| vec!["wss://relay.example.com".into()]),
+                },
+            );
+            let encoded = encode_frame(&request).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "group_create");
+            assert_eq!(
+                json["marmot_agent_control"],
+                crate::AGENT_CONTROL_PROTOCOL_V2
+            );
+            assert_eq!(json.get("description").is_some(), optional);
+            assert_eq!(json.get("relays").is_some(), optional);
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+        for count in [None, Some(0), Some(2)] {
+            let response = AgentControlEnvelope::new(
+                Some("create-1".into()),
+                AgentControlResponse::GroupCreated {
+                    group_id_hex: "ab".repeat(16),
+                    agent_created: true,
+                    pending_welcome_count: count,
+                },
+            );
+            let encoded = encode_frame(&response).unwrap();
+            let json: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "group_created");
+            assert_eq!(json.get("pending_welcome_count").is_some(), count.is_some());
+            assert_eq!(
+                decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn group_leave_request_round_trips() {
+        let request = AgentControlEnvelope::new(
+            Some("leave-1".into()),
+            AgentControlRequest::GroupLeave {
+                account_id_hex: "ab".repeat(32),
+                group_id_hex: "cd".repeat(16),
+            },
+        );
+        let encoded = encode_frame(&request).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_leave");
+        assert_eq!(
+            decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn group_activation_metadata_round_trips_and_defaults_to_false() {
+        for agent_created in [false, true] {
+            for body in [
+                AgentControlResponse::GroupCreated {
+                    group_id_hex: "ab".repeat(16),
+                    agent_created,
+                    pending_welcome_count: None,
+                },
+                AgentControlResponse::GroupInfo {
+                    account_id_hex: "11".repeat(32),
+                    group_id_hex: "ab".repeat(16),
+                    agent_created,
+                    member_count: 3,
+                    is_direct: false,
+                    subject: None,
+                },
+            ] {
+                let response = AgentControlEnvelope::new(Some("group-1".into()), body);
+                let encoded = encode_frame(&response).unwrap();
+                let mut json: Value = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(json["agent_created"], agent_created);
+                assert_eq!(
+                    decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+                    response
+                );
+
+                json.as_object_mut().unwrap().remove("agent_created");
+                let legacy = serde_json::to_vec(&json).unwrap();
+                let decoded = decode_envelope::<AgentControlResponse>(&legacy).unwrap();
+                let restored: Value = serde_json::to_value(decoded).unwrap();
+                assert_eq!(restored["agent_created"], false);
+            }
+        }
+    }
 
     #[test]
     fn invite_policy_accepts_cli_aliases_without_changing_canonical_wire_values() {

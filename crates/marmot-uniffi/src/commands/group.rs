@@ -88,6 +88,7 @@ impl From<CreateGroupOptionsFfi> for marmot_app::AppCreateGroupOptions {
             description: options.description.unwrap_or_default(),
             initial_image: options.initial_image.map(Into::into),
             disappearing_message_secs: options.disappearing_message_secs,
+            ..Default::default()
         }
     }
 }
