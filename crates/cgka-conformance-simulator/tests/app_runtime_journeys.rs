@@ -13,9 +13,8 @@ use sha2::{Digest, Sha256};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const SETTLEMENT: Duration = Duration::from_secs(60);
-const BACKLOG_INPUT: &[u8] = include_bytes!(
-    "../vectors/generated-inputs/offline-catchup-reverse-history-1024.generated-input.json"
-);
+#[path = "support/offline_catchup.rs"]
+mod offline_catchup;
 
 #[derive(Clone, Copy, Debug)]
 enum Journey {
@@ -250,7 +249,7 @@ async fn large_backlog(
     clients: &[String],
     out: &Path,
 ) -> TestResult {
-    let input = resolve_scenario_input_bytes(BACKLOG_INPUT)?;
+    let input = resolve_scenario_input_bytes(&offline_catchup::bytes(1024))?;
     let online = clients
         .iter()
         .filter(|c| c.as_str() != "bob")
@@ -393,6 +392,11 @@ async fn check(journey: Journey) {
         _ => &["alice", "bob"],
     };
     let clients = labels.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+    let backlog_source =
+        matches!(journey, Journey::LargeBacklog).then(|| offline_catchup::bytes(1024));
+    if let Some(bytes) = &backlog_source {
+        fs_private::write_private(&artifacts.path().join("backlog-input.json"), bytes).unwrap();
+    }
     save(
         artifacts.path(),
         "input.json",
@@ -401,7 +405,7 @@ async fn check(journey: Journey) {
             "adapter": "marmot_app_runtime", "storage": "sqlcipher_per_participant",
             "relay_order": "native local Nostr relay", "debug_assertions": cfg!(debug_assertions),
             "settlement_policy": "default production policy; no test override requested",
-            "backlog_source_sha256": format!("{:x}", Sha256::digest(BACKLOG_INPUT)),
+            "backlog_source_sha256": backlog_source.as_ref().map(|bytes| format!("{:x}", Sha256::digest(bytes))),
         }),
     )
     .unwrap();

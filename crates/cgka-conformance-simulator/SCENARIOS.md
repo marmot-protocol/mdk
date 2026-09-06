@@ -971,7 +971,13 @@ stranded 125 messages after state converged because commit replay ran before the
 The larger case also exercises capacity refusal: background engine work yields after epoch advancement and the
 retained-relay scheduler retries refused history before draining further epochs. The input and full payload
 multiplicity, exact state, fresh decryption probes, and no-pending-work assertions remain unchanged. Current founding
-acknowledgement omits only the Legacy pending-create filter and expectation.
+acknowledgement omits only the Legacy pending-create filter and expectation. The shared test builder in
+`tests/support/offline_catchup.rs` reproduces both checkpoint inputs exactly, with hashes over the complete
+serialized metadata, actions and expected outcomes. The expanded JSON is retained in checkpoint `9282a643`;
+the large public app journey also writes `backlog-input.json` alongside its run evidence. Set
+`MDK_OFFLINE_REGRESSION_ARTIFACTS` to retain expanded inputs and full engine reports in fresh private directories.
+The active decryptability probe drains bounded transport turns for messages published during convergence and
+requires publication evidence plus exact recipient delivery. Queued admission alone remains a failed probe.
 Run with `cargo test --release --locked -p cgka-conformance-simulator --test offline_catchup_regression`.
 This engine-and-retained-relay regression does not establish app queue, SDK delivery, or relay pagination behavior.
 
@@ -1051,8 +1057,8 @@ profile edits, late join, removal, reopen/continued messaging, and a 12-message 
 local Nostr relay, encrypted participant databases, exact public payload multisets, shared public state, fresh
 messaging, and recipient restart persistence. These are ordinary smoke tests.
 
-The same file maintains `public_app_1024_message_backlog_recovers_completely`, an explicitly ignored, unresolved
-full-recovery regression using all sends and 16 profile updates from the saved 1,024-message input. It uses native
+The same file maintains `public_app_1024_message_backlog_recovers_completely`, an explicitly ignored slow
+full-recovery regression using all sends and 16 profile updates from the pinned 1,024-message input. It uses native
 relay order and public app operations, not the engine fixture's forced reverse schedule or private oracles. Skipping
 it is not a passing catch-up result. Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).

@@ -7,7 +7,14 @@
 It requires all 1,024 original payloads exactly once, shared public group state, fresh messages from every member,
 and complete recipient history after restart. Reaching the repair budget is a failure, never success.
 
-This is a public workload companion to the saved 1,024-message engine input. It preserves all original sends and
+The engine and app tests share `tests/support/offline_catchup.rs`, a compact reconstruction of the checkpoint
+inputs with hashes over every action and expected outcome. Before removing the expanded JSON, parsed equality
+was verified against both original fixtures. The originals remain in checkpoint `9282a643`; the large public
+journey writes the expanded `backlog-input.json` into each run's artifacts. A changed generator fails the hash
+check before execution. The recorded source hash now covers the compact serialized input, rather than the old
+pretty-printed file bytes.
+
+This is a public workload companion to the pinned 1,024-message engine input. It preserves all original sends and
 16 profile-update rounds, with a founding recipient offline throughout. The real local Nostr relay chooses query
 order; this does **not** reproduce the engine fixture's forced reverse delivery. Initial group creation uses public
 app acknowledgement semantics. Private MLS assertions and simulated relay steps are not presented as app coverage.

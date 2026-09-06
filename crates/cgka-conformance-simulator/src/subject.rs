@@ -1908,9 +1908,19 @@ impl ConvergenceSubject for EngineHarnessSubject {
             sends.insert(sender.clone(), (payload, status));
         }
 
-        self.bus.deliver_all();
         let all_clients = self.clients.keys().cloned().collect::<Vec<_>>();
-        self.tick(&all_clients).await?;
+        // A valid send may queue behind convergence and publish during tick.
+        // Drain the resulting transport turns before observing recipients,
+        // without advancing clocks or acknowledging held publications. The
+        // finite bound remains a failed probe if delivery has not completed.
+        const MAX_PROBE_DELIVERY_ROUNDS: usize = 8;
+        for _ in 0..MAX_PROBE_DELIVERY_ROUNDS {
+            self.bus.deliver_all();
+            self.tick(&all_clients).await?;
+            if self.bus.queued_len() == 0 {
+                break;
+            }
+        }
 
         let mut recipient_ledgers = BTreeMap::new();
         for recipient in labels {
@@ -1918,6 +1928,16 @@ impl ConvergenceSubject for EngineHarnessSubject {
                 recipient.clone(),
                 self.client_mut(recipient)?.scenario_input_ledger(),
             );
+        }
+
+        for (sender, (_, (status, logical_id))) in &mut sends {
+            if matches!(status, DecryptabilityProbeSendStatus::Queued)
+                && self
+                    .attributed_probe_ledger(sender, logical_id, &recipient_ledgers[sender])
+                    .is_some_and(|entry| entry.published > 0)
+            {
+                *status = DecryptabilityProbeSendStatus::Published;
+            }
         }
 
         let mut probes = Vec::with_capacity(labels.len() * (labels.len() - 1));
@@ -2324,6 +2344,92 @@ mod tests {
         ConformanceCanonicalStateSnapshot, QuiescenceOutboundPolicy, QuiescencePolicy,
         QuiescenceStatus, drive_subject_to_quiescence,
     };
+
+    #[tokio::test]
+    async fn decryptability_probe_observes_queued_publication_and_delivery() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+        let pending = subject
+            .client_mut("alice")
+            .unwrap()
+            .update_group_data("updated")
+            .await;
+        subject.client_mut("alice").unwrap().confirm(pending).await;
+        subject.bus.deliver_all();
+        assert!(
+            subject
+                .client_mut("bob")
+                .unwrap()
+                .tick_ingest_only()
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let probe = subject
+            .probe_bidirectional_decryptability(&labels, 77)
+            .await
+            .unwrap();
+        let ledger = subject.client_mut("bob").unwrap().scenario_input_ledger();
+        let sent = ledger
+            .iter()
+            .find(|entry| entry.payload == "cgka-decryptability-probe/v1/77/bob")
+            .unwrap();
+        assert_eq!(
+            sent.send_queued, 1,
+            "the probe must exercise queued admission"
+        );
+        assert!(
+            probe.succeeded(),
+            "queued probe must publish and reach its peer: {probe:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decryptability_probe_rejects_queued_but_unpublished_messages() {
+        let labels = vec!["alice".to_owned(), "bob".to_owned()];
+        let mut subject = EngineHarnessSubject::new(
+            &labels,
+            ProtocolProfile::Current,
+            HarnessStorageMode::InMemorySqlite,
+        )
+        .unwrap();
+        create_current_group_and_join(&mut subject, "alice", &labels[1..]).await;
+        // Hold Alice's state-change acknowledgement: accepting a queued probe
+        // must not be mistaken for publishing it while that change is pending.
+        let _pending = subject
+            .client_mut("alice")
+            .unwrap()
+            .update_group_data("unconfirmed")
+            .await;
+        let probe = subject
+            .probe_bidirectional_decryptability(&labels, 78)
+            .await
+            .unwrap();
+        let ledger = subject.client_mut("alice").unwrap().scenario_input_ledger();
+        let sent = ledger
+            .iter()
+            .find(|entry| entry.payload == "cgka-decryptability-probe/v1/78/alice")
+            .unwrap();
+        assert_eq!(sent.send_queued, 1);
+        assert_eq!(sent.published, 0);
+        assert!(
+            !probe.succeeded(),
+            "unpublished probe cannot establish reachability"
+        );
+        assert!(
+            probe
+                .failed_edges()
+                .iter()
+                .any(|edge| edge.sender == "alice")
+        );
+    }
 
     fn account_topology(
         labels: &[String],

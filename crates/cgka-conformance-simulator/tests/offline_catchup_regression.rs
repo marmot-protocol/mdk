@@ -4,22 +4,25 @@ use cgka_conformance_simulator::{
 };
 use cgka_traits::group::ProtocolProfile;
 
+#[path = "support/offline_catchup.rs"]
+mod offline_catchup;
+
+#[test]
+fn compact_inputs_match_checkpoint_hashes() {
+    for count in [368, 1024] {
+        resolve_scenario_input_bytes(&offline_catchup::bytes(count))
+            .expect("pinned regression input");
+    }
+}
+
 // Reduced from offline-catchup-pressure/v1, generator 1, seed 17001, case 19:
 // retain all 16 commit rounds and the first 368 messages. Current founding
 // creation acknowledges Welcomes without the Legacy pending-create filter.
 // The fixture preserves full payload multiplicity, exact state, decryptability,
 // and no-pending-work assertions. It contains synthetic scenario data only.
 async fn check_history(order: ScenarioRelayOrderV2, overflow: bool) {
-    let bytes: &[u8] = if overflow {
-        include_bytes!(
-            "../vectors/generated-inputs/offline-catchup-reverse-history-1024.generated-input.json"
-        )
-    } else {
-        include_bytes!(
-            "../vectors/generated-inputs/offline-catchup-reverse-history-368.generated-input.json"
-        )
-    };
-    let mut input = resolve_scenario_input_bytes(bytes).expect("saved regression input");
+    let bytes = offline_catchup::bytes(if overflow { 1024 } else { 368 });
+    let mut input = resolve_scenario_input_bytes(&bytes).expect("pinned regression input");
     for step in &mut input.scenario.steps {
         if let ScenarioStep::ConfigureRelay {
             order: selected, ..
@@ -28,6 +31,24 @@ async fn check_history(order: ScenarioRelayOrderV2, overflow: bool) {
             *selected = order;
         }
     }
+    let artifacts = std::env::var_os("MDK_OFFLINE_REGRESSION_ARTIFACTS").map(|root| {
+        let root = std::path::PathBuf::from(root);
+        fs_private::create_dir_all_private(&root).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix("offline-history-")
+            .tempdir_in(root)
+            .unwrap()
+            .keep();
+        let mut expanded: cgka_conformance_simulator::GeneratedScenarioInputV1 =
+            serde_json::from_slice(&bytes).unwrap();
+        expanded.case.scenario = input.scenario.clone();
+        fs_private::write_private(
+            &path.join("input.json"),
+            &serde_json::to_vec_pretty(&expanded).unwrap(),
+        )
+        .unwrap();
+        path
+    });
     let mut subject = RetainedRelaySubject::new(
         &input.scenario.clients,
         &input.scenario.topology,
@@ -43,6 +64,14 @@ async fn check_history(order: ScenarioRelayOrderV2, overflow: bool) {
     )
     .await
     .expect("scenario executes");
+    if let Some(path) = artifacts {
+        fs_private::write_private(
+            &path.join("report.json"),
+            &serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        eprintln!("engine history evidence: {}", path.display());
+    }
     assert!(
         report
             .step_log

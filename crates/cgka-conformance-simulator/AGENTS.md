@@ -89,7 +89,9 @@ Git commit; require a clean build and retain the exact source revision plus comm
   - **Role:** Serializable active application-message probe results. A
     `ProbeBidirectionalDecryptability` scenario step sends one logical event per named client, drains every attached
     client, and records each directed sender-to-recipient edge by exact logical event id and recipient ledger
-    disposition. This is a mutating probe, not a passive observation.
+    disposition. A queued send becomes published only when the authenticated sender ledger proves publication;
+    up to eight transport rounds deliver messages released during convergence. Unpublished or undelivered probes
+    still fail. This is a mutating probe, not a passive observation.
 
 - **Module:** `cgka_engine::convergence`
   - **Role:** Candidate-state graph scoring rules for the distributed convergence design, re-exported by this crate for
