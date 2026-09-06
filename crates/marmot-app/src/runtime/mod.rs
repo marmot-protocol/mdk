@@ -200,6 +200,9 @@ struct GeneratedSetupTasks {
 }
 
 const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
+// Existing-account discovery includes two relay-list hops and an advisory
+// profile read, each bounded by connection and fetch budgets (5s + 3s).
+const ACCOUNT_DIRECTORY_PREFLIGHT_WAIT: Duration = Duration::from_secs(26);
 const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
@@ -5392,7 +5395,7 @@ impl AccountManager {
                 // reactivation, exactly like the external-signer login path.
                 bounded_advisory_step(
                     &self.shared.app_performance_telemetry(),
-                    ACCOUNT_SETUP_ADVISORY_WAIT,
+                    ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                     "import_directory_preflight",
                     self.preflight_existing_account_directory(
                         &account.account_id_hex,
@@ -5640,7 +5643,7 @@ impl AccountManager {
         // so a stalled indexer must not hold the whole login hostage.
         let recent_relay_lists = bounded_advisory_step(
             &self.shared.app_performance_telemetry(),
-            ACCOUNT_SETUP_ADVISORY_WAIT,
+            ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
             "login_directory_preflight",
             self.preflight_existing_account_directory(
                 &account.account_id_hex,
@@ -5706,7 +5709,7 @@ impl AccountManager {
             None
         };
 
-        // Advisory refresh, same bound as the preflight above.
+        // Single-hop advisory refresh keeps the shorter profile-refresh bound.
         let _ = bounded_advisory_step(
             &self.shared.app_performance_telemetry(),
             ACCOUNT_SETUP_ADVISORY_WAIT,
@@ -5953,7 +5956,7 @@ impl AccountManager {
                 } else {
                     match bounded_advisory_step(
                         &self.shared.app_performance_telemetry(),
-                        ACCOUNT_SETUP_ADVISORY_WAIT,
+                        ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
                         self.app.resolve_account_relay_list_status_for_account_id(
                             &account.account_id_hex,
@@ -5970,10 +5973,18 @@ impl AccountManager {
                                 error_kind = error.privacy_safe_kind(),
                                 "import relay-list discovery failed; refusing to publish defaults"
                             );
-                            return self.complete_cached_relay_list_status(&account.label);
+                            return self
+                                .complete_cached_relay_list_status(&account.label)
+                                .or(Err(error));
                         }
                         None => {
-                            return self.complete_cached_relay_list_status(&account.label);
+                            return self
+                                .complete_cached_relay_list_status(&account.label)
+                                .map_err(|_| {
+                                    AppError::RelayDirectory(
+                                        "relay-list discovery timed out".to_owned(),
+                                    )
+                                });
                         }
                     }
                 };

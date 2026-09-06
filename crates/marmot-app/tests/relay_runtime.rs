@@ -25,11 +25,11 @@ use marmot_app::{
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
+use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, QueryPolicy, WritePolicy};
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
-    Timestamp as NostrTimestamp,
+    Alphabet, Client as NostrSdkClient, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag,
+    TagKind, Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,6 +188,34 @@ impl WritePolicy for RejectKeyPackagesWhileArmed {
             {
                 PolicyResult::Reject("injected key package rejection".into())
             } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RejectMultiAuthorQueries {
+    rejected: Arc<AtomicUsize>,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl QueryPolicy for RejectMultiAuthorQueries {
+    fn admit_query<'a>(
+        &'a self,
+        query: &'a Filter,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if query
+                .authors
+                .as_ref()
+                .is_some_and(|authors| authors.len() > 1)
+            {
+                self.rejected.fetch_add(1, Ordering::SeqCst);
+                PolicyResult::Reject("multi-author queries unsupported".into())
+            } else {
+                self.accepted.fetch_add(1, Ordering::SeqCst);
                 PolicyResult::Accept
             }
         })
@@ -1093,15 +1121,15 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     .expect("import must not hang on a stalled discovery endpoint")
     .expect("import should succeed without the advisory preflight");
     assert!(imported.account.local_signing);
-    assert_eq!(
+    assert!(
         runtime
             .shared_services()
             .relay_plane()
             .relay_health()
             .await
-            .directory_failed_fetches,
-        0,
-        "a stalled peer must not fail a directory fetch that has one connected relay"
+            .directory_failed_fetches
+            > 0,
+        "partial reads must remain visible even when known metadata permits login"
     );
     assert_eq!(
         runtime
@@ -11885,7 +11913,8 @@ async fn outbox_acceptance_external_signer_newer_discovery_inbox_survives_older_
 async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer: bool) {
     use nostr::prelude::ToBech32;
 
-    for empty_kind in [10002, 10050] {
+    // A read-only NIP-65 declaration also must not be rewritten write-enabled.
+    for (empty_kind, read_only) in [(10002, false), (10050, false), (10002, true)] {
         let dir = tempfile::tempdir().unwrap();
         let publications = Arc::new(AtomicUsize::new(0));
         let relay = LocalRelay::new(RelayBuilder::default().write_policy(
@@ -11897,7 +11926,9 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
         let publisher =
             NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
         for kind in [10002, 10050] {
-            let tags = if kind == empty_kind {
+            let tags = if kind == 10002 && read_only {
+                vec![vec!["r".into(), url.clone(), "read".into()]]
+            } else if kind == empty_kind {
                 Vec::new()
             } else if kind == 10002 {
                 vec![vec!["r".into(), url.clone(), "write".into()]]
@@ -11956,7 +11987,7 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
         .expect("explicit-empty setup must remain bounded");
         runtime.shutdown().await;
         assert!(
-            result.is_err(),
+            matches!(result, Err(AppError::MissingRelayLists(_))),
             "an intentionally empty relay list cannot become network-ready using app defaults"
         );
         assert_eq!(
@@ -11975,4 +12006,89 @@ async fn outbox_acceptance_import_preserves_explicit_empty_metadata() {
 #[tokio::test]
 async fn outbox_acceptance_external_signer_preserves_explicit_empty_metadata() {
     explicit_empty_outbox_metadata_never_publishes_defaults(true).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
+    use nostr::prelude::ToBech32;
+
+    let discovery_policy = RejectMultiAuthorQueries::default();
+    let discovery = LocalRelay::new(RelayBuilder::default().query_policy(discovery_policy.clone()));
+    discovery.run().await.unwrap();
+    let discovery_url = discovery.url().await.to_string();
+    let query_policy = RejectMultiAuthorQueries::default();
+    let outbox = LocalRelay::new(RelayBuilder::default().query_policy(query_policy.clone()));
+    outbox.run().await.unwrap();
+    let outbox_url = outbox.url().await.to_string();
+
+    let mut member_dirs = Vec::new();
+    let mut member_ids = Vec::new();
+    for _ in 0..2 {
+        let member_dir = tempfile::tempdir().unwrap();
+        let keys = Keys::generate();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+            member_dir.path(),
+            outbox_url.clone(),
+            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        ));
+        let setup = runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                default_relays: vec![endpoint(&outbox_url)],
+                bootstrap_relays: vec![endpoint(&outbox_url)],
+                discovery_relays: vec![endpoint(&outbox_url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("member setup must publish relay metadata and a KeyPackage");
+        runtime.shutdown().await;
+
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build())
+            .publish_event(
+                &[endpoint(&discovery_url)],
+                &NostrTransportEvent::new_unsigned(
+                    keys.public_key().to_hex(),
+                    KIND_NIP65_RELAY_LIST,
+                    vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+                    String::new(),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        member_ids.push(setup.account.account_id_hex);
+        member_dirs.push(member_dir);
+    }
+
+    let reader_dir = tempfile::tempdir().unwrap();
+    discovery_policy.accepted.store(0, Ordering::SeqCst);
+    discovery_policy.rejected.store(0, Ordering::SeqCst);
+    query_policy.accepted.store(0, Ordering::SeqCst);
+    query_policy.rejected.store(0, Ordering::SeqCst);
+    let reader = MarmotApp::with_relay_and_config(
+        reader_dir.path(),
+        discovery_url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let member_refs = member_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let summary = reader
+        .prewarm_group_member_key_packages(&member_refs)
+        .await
+        .expect("CLOSED multi-author batches must fall back to routable single-author reads");
+
+    assert_eq!(summary.network_resolved_members, 2);
+    assert_eq!(discovery_policy.rejected.load(Ordering::SeqCst), 1);
+    assert_eq!(discovery_policy.accepted.load(Ordering::SeqCst), 4);
+    assert!(
+        query_policy.rejected.load(Ordering::SeqCst) >= 2,
+        "the real relay must reject both a relay-list and KeyPackage multi-author query"
+    );
+    assert!(
+        query_policy.accepted.load(Ordering::SeqCst) >= 6,
+        "the resolver must issue accepted single-author fallbacks for both members"
+    );
 }

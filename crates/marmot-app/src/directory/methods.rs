@@ -99,34 +99,16 @@ impl MarmotApp {
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
-        let observed_nip65 = records.iter().any(|record| {
-            record.event.pubkey == account_id_hex
-                && record.event.kind == KIND_NIP65_RELAY_LIST
-                && freshness.accepts(record)
-        });
-        let observed_inbox = records.iter().any(|record| {
-            record.event.pubkey == account_id_hex
-                && record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST
-                && freshness.accepts(record)
-        });
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
-        let mut status = selection.value;
-        if !observed_nip65 || !observed_inbox {
+        let cached = {
             let app = self.clone();
             let account_id = account_id_hex.clone();
-            let cached = blocking_app_task(move || {
-                app.account_relay_list_status_for_account_id(&account_id)
-            })
-            .await?;
-            if !observed_nip65 {
-                status.nip65 = cached.nip65;
-            }
-            if !observed_inbox {
-                status.inbox = cached.inbox;
-            }
-            push_unique_strings(&mut status.bootstrap_relays, cached.bootstrap_relays);
-            status.refresh();
-        }
+            blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
+                .await?
+        };
+        // The one-hop diagnostic and target-aware resolver share the same
+        // per-kind anti-clobber rule; observing an older record is not freshness.
+        let mut status = merge_relay_list_status(cached, selection.value);
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = bootstrap_relays
                 .iter()
@@ -192,40 +174,52 @@ impl MarmotApp {
         );
         let mut complete = first.complete;
         if !outbox_relays.is_empty() {
-            let second = self
+            match self
                 .relay_plane
                 .fetch_directory_events_with_completion(
                     outbox_relays,
                     relay_list_queries(account_id_hex.clone()),
                 )
                 .await
-                .map_err(|e| AppError::RelayDirectory(format!("fetch outbox relay lists: {e}")))?;
-            complete &= second.complete;
-            records.extend(second.records);
+            {
+                Ok(second) => {
+                    complete &= second.complete;
+                    records.extend(second.records);
+                }
+                Err(_) => complete = false,
+            }
         }
 
-        let observed =
-            fresh_relay_list_status_from_records(&account_id_hex, records, freshness).value;
-        let mut status = merge_relay_list_status(cached, observed);
-        if status.bootstrap_relays.is_empty() {
-            status.bootstrap_relays = discovery_relays
-                .iter()
-                .map(|endpoint| endpoint.0.clone())
-                .collect();
-        }
-        {
+        let observed = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
+        // A rejected future-dated declaration is not evidence of absence.
+        complete &= !observed.rejected_future;
+        let mut status = merge_relay_list_status(cached, observed.value);
+        // Persist signed observations (including explicit-empty lists) and
+        // valid cached metadata even when discovery was incomplete. Do not
+        // durably turn the caller's discovery fallback into claimed account
+        // metadata merely because a lookup failed.
+        if status.nip65.created_at > 0 || status.inbox.created_at > 0 {
             let app = self.clone();
             let account_id = account_id_hex.clone();
             let remembered = status.clone();
             blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
                 .await?;
         }
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = discovery_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
 
         let explicit_empty = (status.nip65.created_at > 0 && status.nip65.relays.is_empty())
             || (status.inbox.created_at > 0 && status.inbox.relays.is_empty());
         let uncertain_absence =
             !complete && (status.nip65.relays.is_empty() || status.inbox.relays.is_empty());
-        if explicit_empty || uncertain_absence {
+        if explicit_empty {
+            return Err(AppError::MissingRelayLists(status.missing.clone()));
+        }
+        if uncertain_absence {
             return Err(AppError::RelayDirectory(
                 "relay-list absence was not authoritatively established".to_owned(),
             ));
@@ -1102,7 +1096,7 @@ impl MarmotApp {
             .directory_entry_for_account_id(account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
         entry.account_id_hex = account_id_hex.to_owned();
-        entry.relay_lists = relay_lists.clone();
+        entry.relay_lists = merge_relay_list_status(entry.relay_lists, relay_lists.clone());
         self.save_directory_entry(&entry)
     }
 
@@ -1114,7 +1108,7 @@ impl MarmotApp {
             .directory_entry_for_account_id(&fetched.account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(&fetched.account_id_hex));
         entry.account_id_hex = fetched.account_id_hex.clone();
-        entry.relay_lists = fetched.relay_lists.clone();
+        entry.relay_lists = merge_relay_list_status(entry.relay_lists, fetched.relay_lists.clone());
         entry.key_package = Some(DirectoryKeyPackage {
             key_package_id: fetched.key_package_id.clone(),
             key_package_ref_hex: fetched.key_package_ref_hex.clone(),

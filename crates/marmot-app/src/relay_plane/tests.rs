@@ -1092,6 +1092,65 @@ async fn directory_fetches_coalesce_identical_inflight_requests() {
 }
 
 #[tokio::test]
+async fn directory_completion_coalesces_and_survives_waiter_cancellation() {
+    let fetcher = Arc::new(BlockingDirectoryFetcher {
+        fetch_count: AtomicUsize::new(0),
+        started: Notify::new(),
+        release: Notify::new(),
+        events: Vec::new(),
+    });
+    let plane = relay_plane_with_directory_fetcher(
+        Arc::new(RecordingRelayClient::default()),
+        fetcher.clone(),
+    );
+    let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+    let queries = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+    let first_plane = plane.clone();
+    let first_endpoints = endpoints.clone();
+    let first_queries = queries.clone();
+    let first = tokio::spawn(async move {
+        first_plane
+            .fetch_directory_events_with_completion(first_endpoints, first_queries)
+            .await
+    });
+    let second_plane = plane.clone();
+    let second = tokio::spawn(async move {
+        second_plane
+            .fetch_directory_events_with_completion(endpoints, queries)
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if plane.relay_health().await.directory_coalesced_waiters == 1
+                && fetcher.fetch_count.load(Ordering::SeqCst) == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(plane.relay_health().await.directory_inflight_fetches, 1);
+    first.abort();
+    let _ = first.await;
+    fetcher.release.notify_one();
+    let outcome = timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        !outcome.complete,
+        "a legacy fetcher must not claim authoritative completion"
+    );
+    let health = plane.relay_health().await;
+    assert_eq!(health.directory_inflight_fetches, 0);
+    assert_eq!(health.directory_failed_fetches, 1);
+    assert_eq!(health.directory_completed_fetches, 0);
+}
+
+#[tokio::test]
 async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
     let relay = Arc::new(RecordingRelayClient::default());
     let event = DirectoryRelayEventRecord {
