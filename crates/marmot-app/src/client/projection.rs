@@ -210,11 +210,7 @@ impl AppClient {
                 change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
                 ..
             }
-        ) || self
-            .runtime
-            .group_record(group_id)
-            .ok()
-            .is_some_and(|group| group.removed || group.disbanded.is_some());
+        ) || super::group_is_terminal(&self.runtime, group_id);
         if terminal {
             return Ok(Some(self.routing.replace_group_routes(
                 group_id,
@@ -314,12 +310,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<TransportGroupSubscription>, AppError> {
-        if self
-            .runtime
-            .group_record(group_id)
-            .map_err(AppError::from)
-            .is_ok_and(|group| group.removed || group.disbanded.is_some())
-        {
+        if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(Vec::new());
         }
         let routing = self.nostr_routing_for_group(group_id)?;
@@ -525,6 +516,19 @@ impl AppClient {
     /// pipeline; eager clients call it before returning from open.
     pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
         if self.reconcile_live_engine_groups()? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        // Route seeding at open reads persisted group state, which carries no
+        // departure marker; the engine record does. This is the first point on
+        // either open path where that record is readable, and on an eager open
+        // it still precedes the first subscription, so a group this device has
+        // left is never re-subscribed. Only the routing table changes unless a
+        // prior route retired, which is the one case that persists.
+        //
+        // A quarantined group is the deliberate exception: `ensure_group_live`
+        // makes its record unreadable, so its route survives this seam and is
+        // reconciled on the next hydration that admits the group.
+        if self.refresh_group_routes()?.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
         self.reconcile_disband_drafts();
@@ -1096,6 +1100,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
+        AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {

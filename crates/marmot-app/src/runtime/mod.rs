@@ -57,7 +57,7 @@ use crate::{
     default_profile_pseudonym, unix_now_seconds,
 };
 
-mod account_worker;
+pub(crate) mod account_worker;
 mod agent_stream_watch;
 mod audit_tracker;
 mod commands;

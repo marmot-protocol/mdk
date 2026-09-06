@@ -45,6 +45,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   explicit development opt-in now permits loopback endpoints only.
 - Engine failures now retain the same stable CLI JSON error code whether they
   reach the app boundary directly or through account/session wrappers.
+- Sending to a group this device was removed from now fails with the stable
+  JSON error code `group_removed` (carrying `group_id`) instead of the
+  catch-all `command_failed`, and fails before any local message row is
+  recorded. MarmotKit reports it as `GroupRemoved`
+  (`MARMOT_STATUS_GROUP_REMOVED`).
 
 ## [0.9.17] - 2026-09-02
 

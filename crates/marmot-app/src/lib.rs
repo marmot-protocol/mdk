@@ -3725,6 +3725,11 @@ impl MarmotApp {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
+            // Live MLS state is deleted on disband, so the app-owned tombstone
+            // is the only readable terminal marker here: at a deferred open
+            // (mdk#1161) every engine group record answers `GroupNotHydrated`.
+            // Departures are reconciled against the engine record instead, in
+            // `reconcile_hydrated_account_state`.
             if disbanded_group_ids.contains(&hex::encode(group_id.as_slice())) {
                 continue;
             }
