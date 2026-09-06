@@ -3322,6 +3322,96 @@ def validate_config(config) -> bool:
     )
 
 
+async def probe_readiness(
+    config: PlatformConfig,
+    *,
+    client: Optional[MarmotAgentControlClient] = None,
+) -> Dict[str, Any]:
+    """Return passive, non-secret readiness stages for operator diagnostics."""
+
+    status: Dict[str, Any] = {
+        "state": "discovered",
+        "plugin_discovered": True,
+        "enabled": bool(getattr(config, "enabled", False)),
+        "config_valid": False,
+        "wn_agent_reachable": False,
+        "authenticated": False,
+        "account_selected": False,
+        "home_resolved": False,
+        "media": media_capability_status(),
+    }
+    if not status["enabled"]:
+        status["state"] = "disabled"
+        return status
+    if not validate_config(config):
+        status["state"] = "invalid_config"
+        return status
+    status["config_valid"] = True
+
+    adapter = MarmotPlatformAdapter(config, client=client)
+    try:
+        response = await adapter.client.account_list()
+    except AgentControlError as exc:
+        status["state"] = "wn_agent_unreachable"
+        status["error_code"] = exc.code
+        return status
+    except OSError:
+        status["state"] = "wn_agent_unreachable"
+        status["error_code"] = "connect_failed"
+        return status
+    status["wn_agent_reachable"] = True
+
+    accounts = list(response.get("accounts") or [])
+    signing_accounts = [account for account in accounts if account.get("local_signing")]
+    if not signing_accounts:
+        status["state"] = "not_authenticated"
+        return status
+    status["authenticated"] = True
+
+    selected = adapter.account_id_hex
+    if selected:
+        known = {
+            _normalize_hex(account.get("account_id_hex"), "account_id_hex")
+            for account in signing_accounts
+        }
+        if selected not in known:
+            status["state"] = "account_unavailable"
+            return status
+    elif len(signing_accounts) == 1:
+        selected = _normalize_hex(signing_accounts[0].get("account_id_hex"), "account_id_hex")
+    else:
+        status["state"] = "account_unselected"
+        return status
+    status["account_selected"] = True
+    status["account_id_hex"] = selected
+
+    group_id = adapter.group_id_hex
+    home_channel = getattr(config, "home_channel", None)
+    if not group_id and home_channel is not None:
+        home_platform = str(getattr(home_channel, "platform", "") or "").strip().lower()
+        home_chat_id = str(getattr(home_channel, "chat_id", "") or "").strip()
+        if home_platform in {"", "marmot"} and home_chat_id:
+            if home_chat_id.lower().startswith("marmot:"):
+                home_chat_id = home_chat_id.split(":", 1)[1].strip()
+            try:
+                group_id = _normalize_hex(home_chat_id, "group_id_hex")
+            except AgentControlError:
+                group_id = None
+    if not group_id:
+        status["state"] = "home_unresolved"
+        return status
+    try:
+        await adapter.client.group_info(selected, group_id)
+    except (AgentControlError, OSError) as exc:
+        status["state"] = "home_unresolved"
+        status["error_code"] = getattr(exc, "code", "group_lookup_failed")
+        return status
+    status["home_resolved"] = True
+    status["group_id_hex"] = group_id
+    status["state"] = "ready"
+    return status
+
+
 def _env_enablement() -> Optional[Dict[str, Any]]:
     socket = os.getenv("MARMOT_AGENT_SOCKET", "").strip()
     home = os.getenv("MARMOT_HOME", "").strip()

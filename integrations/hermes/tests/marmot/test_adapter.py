@@ -3,6 +3,7 @@ from contextlib import suppress
 import enum
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -905,6 +906,90 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(request_ids), 12)
         self.assertTrue(all(response["type"] == "account_list" for response in responses))
+
+
+class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_distinguishes_disabled_invalid_and_ready(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+
+        disabled = await adapter.probe_readiness(platform_config(enabled=False))
+        self.assertEqual(disabled["state"], "disabled")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"MARMOT_AGENT_SOCKET": "", "MARMOT_HOME": ""},
+            clear=False,
+        ):
+            invalid = await adapter.probe_readiness(platform_config(enabled=True))
+        self.assertEqual(invalid["state"], "invalid_config")
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                self.group_lookup = (account_id_hex, group_id_hex)
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        client = ReadyClient()
+        config = platform_config(
+            enabled=True,
+            extra={
+                "socket_path": "/tmp/passive-probe.sock",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+            },
+        )
+        ready = await adapter.probe_readiness(config, client=client)
+        self.assertEqual(ready["state"], "ready")
+        self.assertTrue(ready["wn_agent_reachable"])
+        self.assertTrue(ready["authenticated"])
+        self.assertTrue(ready["account_selected"])
+        self.assertTrue(ready["home_resolved"])
+        self.assertEqual(client.group_lookup, ("11" * 32, "22" * 32))
+
+    async def test_probe_distinguishes_unreachable_and_account_unselected(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+        config = platform_config(
+            enabled=True,
+            extra={"socket_path": "/tmp/passive-probe.sock"},
+        )
+
+        class UnreachableClient:
+            async def account_list(self):
+                raise adapter.AgentControlError(
+                    "wn-agent unavailable",
+                    code="connect_failed",
+                    retryable=True,
+                )
+
+        unreachable = await adapter.probe_readiness(
+            config,
+            client=UnreachableClient(),
+        )
+        self.assertEqual(unreachable["state"], "wn_agent_unreachable")
+
+        class AmbiguousClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True},
+                        {"account_id_hex": "22" * 32, "local_signing": True},
+                    ]
+                }
+
+        ambiguous = await adapter.probe_readiness(
+            config,
+            client=AmbiguousClient(),
+        )
+        self.assertEqual(ambiguous["state"], "account_unselected")
+        self.assertFalse(ambiguous["home_resolved"])
 
 
 class MediaCapabilityContractTests(unittest.TestCase):
