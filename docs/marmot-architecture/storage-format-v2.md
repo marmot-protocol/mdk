@@ -41,6 +41,12 @@ receipts and durable backfill. Neither case relies on delivery of the engine's
 in-memory `TransportObjectResourceRefused` event. Exact-ID replay still passes
 through the ordinary authentication and engine deduplication paths.
 
+This prevents future release/receipt mismatches. It cannot reconstruct releases
+that happened before this journal existed; bounded repair of historical receipt
+claims is tracked in [#1724](https://github.com/marmot-protocol/mdk/issues/1724).
+Missing historical wrapper markers alone do not prove a release, so migration
+0060 does not clear existing receipt history indiscriminately.
+
 ## Versioning model
 
 There is no database-wide `format_version` independent of schema migrations.
