@@ -123,12 +123,13 @@ The default trait implementation remains compatible with other backends.
 Run the opt-in paired benchmark against encrypted temporary files:
 
 ```sh
-CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p storage-sqlite \
+MDK_DEFERRED_PREPARATION_BENCHMARK_OUT=target/deferred-preparation.json \
+  CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p storage-sqlite \
   --lib deferred_metadata_file_backed_benchmark -- --ignored --nocapture
 ```
 
 It generates 0/4,096 processed rows and 0/64/512/2,048 deferred rows with 4 KiB payloads, varies
-row epochs over 17 values, includes persisted lifecycle fields, alternates query order, and reports ten warmed samples after two warmups.
+row epochs over 17 values, includes persisted lifecycle fields, alternates query order, and writes ten warmed samples after two warmups to the requested private JSON file.
 Reported blob bytes count full-record values materialized in Rust; they exclude SQLite pages,
 metadata values, and filesystem cache effects. This measures storage enumeration, not retained
 MLS context construction or scheduler wake pressure. No timing threshold is asserted.

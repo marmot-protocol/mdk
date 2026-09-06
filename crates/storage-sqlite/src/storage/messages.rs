@@ -998,6 +998,7 @@ mod tests {
     #[test]
     #[ignore = "explicit encrypted-storage preparation benchmark"]
     fn deferred_metadata_file_backed_benchmark() {
+        let mut measurements = Vec::new();
         for processed in [0, 4096] {
             for deferred in [0, 64, 512, 2048] {
                 let dir = tempfile::tempdir().unwrap();
@@ -1060,18 +1061,25 @@ mod tests {
                         }
                     }
                 }
-                eprintln!(
-                    "deferred_preparation processed={processed} deferred={deferred} payload_bytes=4096 epochs=17 samples=10 full_avg_us={} metadata_avg_us={} full_rows={} full_blob_bytes={} metadata_full_rows={} metadata_full_blob_bytes={}",
-                    timings[0].as_micros() / 10,
-                    timings[1].as_micros() / 10,
-                    full_reads[0].0,
-                    full_reads[0].1,
-                    full_reads[1].0,
-                    full_reads[1].1
-                );
+                measurements.push(serde_json::json!({
+                    "processed": processed, "deferred": deferred,
+                    "payload_bytes": 4096, "epochs": 17, "samples": 10,
+                    "full_avg_us": timings[0].as_micros() / 10,
+                    "metadata_avg_us": timings[1].as_micros() / 10,
+                    "full_rows": full_reads[0].0, "full_blob_bytes": full_reads[0].1,
+                    "metadata_full_rows": full_reads[1].0,
+                    "metadata_full_blob_bytes": full_reads[1].1,
+                }));
                 store.close().unwrap();
                 assert_ne!(&std::fs::read(&path).unwrap()[..16], b"SQLite format 3\0");
             }
+        }
+        if let Some(path) = std::env::var_os("MDK_DEFERRED_PREPARATION_BENCHMARK_OUT") {
+            fs_private::write_private(
+                std::path::Path::new(&path),
+                &serde_json::to_vec_pretty(&measurements).unwrap(),
+            )
+            .unwrap();
         }
     }
 
