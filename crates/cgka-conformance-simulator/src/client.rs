@@ -271,6 +271,9 @@ pub(crate) fn merge_engine_metrics(
     target.deferred_peel_sweeps = target
         .deferred_peel_sweeps
         .saturating_add(source.deferred_peel_sweeps);
+    target.deferred_lineage_classifications = target
+        .deferred_lineage_classifications
+        .saturating_add(source.deferred_lineage_classifications);
     target.deferred_peel_candidate_enumerations = target
         .deferred_peel_candidate_enumerations
         .saturating_add(source.deferred_peel_candidate_enumerations);
@@ -437,6 +440,7 @@ mod tests {
             foreground_deferred_errors: 43,
             foreground_deferred_budget_overrun_ms: histogram(44, 45, 46),
             deferred_peel_sweeps: 47,
+            deferred_lineage_classifications: 69,
             deferred_peel_candidate_enumerations: 48,
             deferred_peel_candidate_contexts: 49,
             deferred_peel_candidate_context_depth: histogram(50, 51, 52),
