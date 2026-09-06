@@ -1060,7 +1060,11 @@ messaging, and recipient restart persistence. These are ordinary smoke tests.
 The same file maintains `public_app_1024_message_backlog_recovers_completely`, an explicitly ignored slow
 full-recovery regression using all sends and 16 profile updates from the pinned 1,024-message input. It uses native
 relay order and public app operations, not the engine fixture's forced reverse schedule or private oracles. Skipping
-it is not a passing catch-up result. Commands, limits, and remaining coverage gaps are in
+it is not a passing catch-up result. Its companion
+`public_app_1024_message_backlog_with_extra_epochs_recovers_completely` prepends two public profile updates
+while the recipient is offline, pinning the workload that exposed released transport objects being suppressed
+by app deduplication (#1721). Both run in the required public recovery CI job.
+Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 
 `cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action

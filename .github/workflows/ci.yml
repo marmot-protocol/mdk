@@ -576,11 +576,11 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
           MDK_APP_JOURNEY_ARTIFACTS: ${{ github.workspace }}/target/public-app-catchup-evidence
         # Keep this separate from workspace test-policy feature unification.
-        # The journey owns a 900-second watchdog and closes every runtime.
+        # Both journeys own a 900-second watchdog and close every runtime.
         run: >-
           cargo test --release --locked -p cgka-conformance-simulator
-          --test app_runtime_journeys public_app_1024_message_backlog_recovers_completely
-          -- --ignored --exact --test-threads=1 --nocapture
+          --test app_runtime_journeys public_app_1024_message_backlog
+          -- --ignored --test-threads=1 --nocapture
 
       - name: Upload public recovery evidence
         if: always()
