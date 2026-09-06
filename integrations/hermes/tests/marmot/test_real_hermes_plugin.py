@@ -2,9 +2,9 @@
 """Exercise the Marmot plugin through a real Hermes source checkout.
 
 The caller supplies a Hermes source tree and an MDK checkout. The test installs
-from a pinned local Git revision through Hermes's public plugin command, enables
-the plugin, discovers it through PluginManager, and verifies that only the
-plugin subdirectory was installed.
+from a pinned local Git revision through Hermes's public plugin command, proves
+the user plugin is discovered but disabled by default, enables it through the
+public command, and verifies that only the plugin subdirectory was installed.
 """
 
 from __future__ import annotations
@@ -209,7 +209,7 @@ def main() -> int:
         )
         if supports_subdirectories and "ref" in install_parameters:
             identifier = f"file://{mdk_source}#integrations/hermes/marmot"
-            cmd_install(identifier, force=False, enable=True, ref=resolved_ref)
+            cmd_install(identifier, force=False, enable=False, ref=resolved_ref)
             source_install_mode = "monorepo"
         elif supports_subdirectories:
             # Hermes 0.19.0 supports local monorepo subdirectories but has no
@@ -219,7 +219,7 @@ def main() -> int:
             cmd_install(
                 f"file://{pinned_source}#integrations/hermes/marmot",
                 force=False,
-                enable=True,
+                enable=False,
             )
             source_install_mode = "monorepo"
         else:
@@ -227,7 +227,7 @@ def main() -> int:
             # independently of whether they expose --ref. Avoid passing a URL
             # fragment through to git clone as a literal path.
             plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
-            cmd_install(f"file://{plugin_source}", force=False, enable=True)
+            cmd_install(f"file://{plugin_source}", force=False, enable=False)
             source_install_mode = "plugin-only"
 
         if (
@@ -255,12 +255,26 @@ def main() -> int:
 
         manager = PluginManager()
         manager.discover_and_load(force=True)
-        if "marmot" not in manager._plugin_platform_names:
-            raise AssertionError("real Hermes discovery did not register the Marmot platform")
-
         loaded = manager._plugins.get("marmot")
         if loaded is None or loaded.manifest.version != "0.1.0":
-            raise AssertionError("real Hermes discovery did not load the expected manifest")
+            raise AssertionError("real Hermes discovery did not find the expected manifest")
+        if loaded.enabled:
+            raise AssertionError("fresh user plugin install was unexpectedly enabled")
+        if "marmot" in manager._plugin_platform_names:
+            raise AssertionError("disabled Marmot plugin registered its platform")
+
+        cmd_enable = plugins_cmd_module.cmd_enable
+        enable_kwargs = {}
+        if "allow_tool_override" in inspect.signature(cmd_enable).parameters:
+            enable_kwargs["allow_tool_override"] = False
+        cmd_enable("marmot", **enable_kwargs)
+        manager.discover_and_load(force=True)
+
+        loaded = manager._plugins.get("marmot")
+        if loaded is None or not loaded.enabled:
+            raise AssertionError("real Hermes enable operation did not activate the plugin")
+        if "marmot" not in manager._plugin_platform_names:
+            raise AssertionError("real Hermes discovery did not register the enabled Marmot platform")
 
         adapter_file = (plugin_dir / "adapter.py").resolve()
         adapter_module = next(
