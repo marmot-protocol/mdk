@@ -103,8 +103,9 @@ may already have reached the relay, so only accepted publications are correlated
 | `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
 | `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1734, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
+| `11_manual_self_update_advances_every_member` (ignored with production timing) | A manual SelfUpdate advances every member; ordinary test-policy builds zero maintenance windows, while production timing requires an explicit run |
 | `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
-
+| `12_strict_leave_is_applied_by_survivors_promptly` | Ordinary 30-second regression: the worker arms the pending SelfRemove deadline and survivors promptly apply a voluntary departure |
 
 On 2026-09-06 the four default race, group, and removal journeys passed locally in debug mode in about 80 seconds
 total, the default leave journey passed in about two minutes, and the strict variants failed only on the documented
