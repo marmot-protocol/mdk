@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use marmot_account::MaintenanceTiming;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
@@ -97,6 +98,12 @@ pub struct MarmotAppConfig {
     /// lets integration tests hold the precise post-cutoff/pre-scheduler state
     /// without changing protocol timing in normal builds.
     pub dev_scheduled_convergence_delay_ms: Option<u64>,
+    /// Dev/test override for own-leaf maintenance scheduling: the quiet window,
+    /// post-join and manual contention jitter, end-of-stored-events timeout,
+    /// and post-EOSE grace. `None` (the default) keeps the production windows.
+    /// Honored only with `test-policy-overrides`; normal debug and release
+    /// builds ignore it so hosts cannot shorten the anti-contention delays.
+    pub dev_maintenance_timing: Option<MaintenanceTiming>,
     /// Dev/test-only delay applied before each startup hydration-pipeline
     /// batch (mdk#1161). `None` (the default) adds no delay. Honored only
     /// with `test-policy-overrides`; this lets integration tests hold groups
@@ -226,6 +233,7 @@ impl Default for MarmotAppConfig {
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
             dev_scheduled_convergence_delay_ms: None,
+            dev_maintenance_timing: None,
             dev_startup_hydration_batch_delay_ms: None,
             dev_force_group_read_snapshot_failure: false,
             dev_fail_invite_welcome_intent: false,
@@ -323,6 +331,14 @@ impl MarmotAppConfig {
     /// worker's scheduled convergence pass. Normal builds ignore this field.
     pub fn with_dev_scheduled_convergence_delay_ms(mut self, ms: u64) -> Self {
         self.dev_scheduled_convergence_delay_ms = Some(ms);
+        self
+    }
+
+    /// Test-only override for own-leaf maintenance scheduling windows, for
+    /// harnesses that drive maintenance sweeps explicitly. Normal builds
+    /// ignore this field and keep the production quiet window and jitter.
+    pub fn with_dev_maintenance_timing(mut self, timing: MaintenanceTiming) -> Self {
+        self.dev_maintenance_timing = Some(timing);
         self
     }
 

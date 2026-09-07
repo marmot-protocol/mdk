@@ -66,6 +66,64 @@ const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// connectivity does not leave a user send behind the ambiguity backoff.
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
 
+/// Local scheduling windows for own-leaf maintenance rotations.
+///
+/// These are anti-contention and catch-up delays, not protocol policy. A
+/// rotation waits until the group has been free of valid state-bearing input
+/// for `quiet`, then a sampled delay of up to `contention_jitter_max` spreads
+/// simultaneous rotations apart so freshly joined devices do not all commit in
+/// the same second. Production always runs the defaults. Test harnesses that
+/// drive [`AccountDeviceRuntime::run_due_maintenance`] explicitly may shorten
+/// them through [`AccountDeviceRuntime::with_maintenance_timing`]. Periodic
+/// rotation scheduling, its 24 to 36 day cadence and 15 minute jitter, is not
+/// covered by this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceTiming {
+    /// Minimum time a group must stay free of valid commits and proposals
+    /// before an obligation may rotate.
+    pub quiet: Duration,
+    /// Upper bound of the sampled post-quiet delay for post-join and manual
+    /// rotations. Persisted deadlines have whole-second granularity.
+    pub contention_jitter_max: Duration,
+    /// How long a post-join obligation waits for the retained-history
+    /// subscription's end-of-stored-events marker before giving up on it.
+    pub eose_timeout: Duration,
+    /// Grace after end-of-stored-events, or its timeout, before the quiet
+    /// window starts.
+    pub post_eose_grace: Duration,
+}
+
+impl MaintenanceTiming {
+    /// Every window zero: a manual or post-join rotation publishes within a
+    /// few consecutive maintenance sweeps. For harnesses that call
+    /// `run_due_maintenance` directly, never for production runtimes.
+    pub const fn immediate() -> Self {
+        Self {
+            quiet: Duration::ZERO,
+            contention_jitter_max: Duration::ZERO,
+            eose_timeout: Duration::ZERO,
+            post_eose_grace: Duration::ZERO,
+        }
+    }
+
+    fn contention_jitter_max_ms(self) -> u64 {
+        u64::try_from(self.contention_jitter_max.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Default for MaintenanceTiming {
+    fn default() -> Self {
+        Self {
+            quiet: Duration::from_secs(MAINTENANCE_QUIET_SECS),
+            contention_jitter_max: Duration::from_millis(
+                cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
+            ),
+            eose_timeout: Duration::from_secs(MAINTENANCE_EOSE_TIMEOUT_SECS),
+            post_eose_grace: Duration::from_secs(MAINTENANCE_POST_EOSE_GRACE_SECS),
+        }
+    }
+}
+
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. Completion order therefore cannot reorder reports or select a
 /// different caller-visible error.
@@ -270,6 +328,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     wall_clock: Arc<dyn WallClock>,
     monotonic_clock: Arc<dyn MonotonicClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
+    maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Exact Welcome events whose relay-only publish phase currently runs
@@ -298,6 +357,7 @@ where
             wall_clock: Arc::new(SystemWallClock),
             monotonic_clock: Arc::new(SystemMonotonicClock::default()),
             maintenance_random: Arc::new(OsMaintenanceRandom),
+            maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
@@ -323,6 +383,17 @@ where
         self.monotonic_clock = monotonic_clock;
         self.maintenance_random = maintenance_random;
         self
+    }
+
+    /// Replace the maintenance scheduling windows. Production runtimes keep
+    /// [`MaintenanceTiming::default`]; this exists for test harnesses only.
+    pub fn with_maintenance_timing(mut self, timing: MaintenanceTiming) -> Self {
+        self.maintenance_timing = timing;
+        self
+    }
+
+    pub fn maintenance_timing(&self) -> MaintenanceTiming {
+        self.maintenance_timing
     }
 
     pub fn session(&self) -> &AccountDeviceSession {
@@ -1181,10 +1252,9 @@ where
             grace_until: None,
             quiet_since: Some(now),
             own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
-            sampled_jitter_ms: self.maintenance_random.sample_inclusive(
-                0,
-                cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
-            ),
+            sampled_jitter_ms: self
+                .maintenance_random
+                .sample_inclusive(0, self.maintenance_timing.contention_jitter_max_ms()),
             not_before: None,
             attempt_count: 0,
             semantic_rearm_count: 0,
@@ -1206,7 +1276,8 @@ where
                 && obligation.eose_deadline_at.is_none()
             {
                 obligation.eose_deadline_at = Some(Timestamp(
-                    now.0.saturating_add(MAINTENANCE_EOSE_TIMEOUT_SECS),
+                    now.0
+                        .saturating_add(self.maintenance_timing.eose_timeout.as_secs()),
                 ));
                 self.session.put_maintenance_obligation(&obligation)?;
             }
@@ -1225,7 +1296,8 @@ where
             {
                 obligation.phase = MaintenancePhase::Grace;
                 obligation.grace_until = Some(Timestamp(
-                    now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                    now.0
+                        .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                 ));
                 self.session.put_maintenance_obligation(&obligation)?;
             }
@@ -1441,7 +1513,8 @@ where
                     {
                         obligation.phase = MaintenancePhase::EoseTimeout;
                         obligation.grace_until = Some(Timestamp(
-                            now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                            now.0
+                                .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                         ));
                     }
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
@@ -1468,11 +1541,12 @@ where
                         .get(&obligation.id)
                         .map(|started| {
                             self.monotonic_clock.elapsed().saturating_sub(*started)
-                                >= Duration::from_secs(MAINTENANCE_QUIET_SECS)
+                                >= self.maintenance_timing.quiet
                         })
                         .unwrap_or_else(|| {
                             obligation.quiet_since.is_some_and(|started| {
-                                now.0.saturating_sub(started.0) >= MAINTENANCE_QUIET_SECS
+                                now.0.saturating_sub(started.0)
+                                    >= self.maintenance_timing.quiet.as_secs()
                             })
                         });
                     if !quiet_long_enough {
@@ -1482,7 +1556,17 @@ where
                         )?;
                         continue;
                     }
-                    let jitter_secs = obligation.sampled_jitter_ms.saturating_add(999) / 1_000;
+                    // Periodic rotations keep their own wide spread; only the
+                    // contention jitter of post-join and manual rotations is
+                    // bounded by the configured window.
+                    let jitter_ms = if obligation.trigger == MaintenanceTrigger::Periodic {
+                        obligation.sampled_jitter_ms
+                    } else {
+                        obligation
+                            .sampled_jitter_ms
+                            .min(self.maintenance_timing.contention_jitter_max_ms())
+                    };
+                    let jitter_secs = jitter_ms.saturating_add(999) / 1_000;
                     obligation.phase = MaintenancePhase::Jitter;
                     obligation.not_before = Some(Timestamp(now.0.saturating_add(jitter_secs)));
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;

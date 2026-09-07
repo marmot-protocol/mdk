@@ -105,6 +105,7 @@ mod sqlcipher;
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
+pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
@@ -3655,8 +3656,11 @@ impl MarmotApp {
             signer: signer.clone(),
         };
         let routing = self.routing_for(&state)?;
-        let runtime =
+        let mut runtime =
             AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+        if let Some(timing) = dev_maintenance_timing(&self.config) {
+            runtime = runtime.with_maintenance_timing(timing);
+        }
         Ok(OpenAppAccount {
             runtime,
             session_guard,
@@ -5925,6 +5929,24 @@ pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -
         AppError::ExternalSignerRejected
     } else {
         AppError::from(error)
+    }
+}
+
+/// The maintenance scheduling override a runtime should apply, if any.
+/// Production always runs [`MaintenanceTiming::default`]: the knob is honored
+/// only in explicit `test-policy-overrides` builds, and a configured value in
+/// any other build is reported and ignored.
+fn dev_maintenance_timing(config: &MarmotAppConfig) -> Option<MaintenanceTiming> {
+    let timing = config.dev_maintenance_timing?;
+    if cfg!(feature = "test-policy-overrides") {
+        Some(timing)
+    } else {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "open_account",
+            "ignoring dev_maintenance_timing without test-policy-overrides; production maintenance windows required"
+        );
+        None
     }
 }
 

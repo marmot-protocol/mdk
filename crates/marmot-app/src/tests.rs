@@ -18853,3 +18853,44 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
         }
     });
 }
+
+#[test]
+fn dev_maintenance_timing_is_honored_only_in_test_policy_builds() {
+    assert_eq!(dev_maintenance_timing(&MarmotAppConfig::default()), None);
+    let configured =
+        MarmotAppConfig::default().with_dev_maintenance_timing(MaintenanceTiming::immediate());
+    let expected = if cfg!(feature = "test-policy-overrides") {
+        Some(MaintenanceTiming::immediate())
+    } else {
+        None
+    };
+    assert_eq!(
+        dev_maintenance_timing(&configured),
+        expected,
+        "production builds must keep the anti-contention maintenance windows"
+    );
+}
+
+#[tokio::test]
+async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example".to_owned(),
+        MarmotAppConfig::default().with_dev_maintenance_timing(MaintenanceTiming::immediate()),
+    );
+    let client = app.client("alice").await.unwrap();
+    let expected = if cfg!(feature = "test-policy-overrides") {
+        MaintenanceTiming::immediate()
+    } else {
+        MaintenanceTiming::default()
+    };
+    assert_eq!(
+        client.runtime.maintenance_timing(),
+        expected,
+        "the override must reach the runtime that schedules rotations only in test-policy builds"
+    );
+}

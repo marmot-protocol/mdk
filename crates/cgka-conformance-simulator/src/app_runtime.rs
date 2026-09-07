@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::{GroupId, TransportEndpoint};
+use marmot_account::MaintenanceTiming;
 use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime,
@@ -133,22 +134,40 @@ pub struct AppRuntimeHarness {
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
     relay_action_events: RelayActionEvents,
     settlement_quiescence_ms: Option<u64>,
+    maintenance_timing: Option<MaintenanceTiming>,
 }
 
 impl AppRuntimeHarness {
     pub async fn new(clients: &[String]) -> Result<Self, SubjectError> {
-        Self::new_with_settlement_quiescence(clients, None).await
+        Self::new_with_policy(clients, None, None).await
     }
 
     /// Build the retained-history regression harness with the protocol-pinned
     /// settlement window even when the workspace enables test-policy overrides.
     pub async fn new_with_pinned_settlement(clients: &[String]) -> Result<Self, SubjectError> {
-        Self::new_with_settlement_quiescence(clients, Some(1_000)).await
+        Self::new_with_policy(clients, Some(1_000), None).await
     }
 
-    async fn new_with_settlement_quiescence(
+    /// Build a harness whose participants run own-leaf maintenance with every
+    /// scheduling window set to zero, so a manual or post-join self-update
+    /// publishes within a few explicit [`Self::run_due_maintenance`] sweeps.
+    /// The protocol-pinned settlement window is kept. The override is honored
+    /// only when this crate is built with `test-policy-overrides`; in any other
+    /// build the runtimes keep production maintenance windows and report the
+    /// ignored knob through tracing.
+    pub async fn new_with_immediate_maintenance(clients: &[String]) -> Result<Self, SubjectError> {
+        Self::new_with_policy(clients, Some(1_000), Some(MaintenanceTiming::immediate())).await
+    }
+
+    /// Whether this build can honor maintenance timing overrides at all.
+    pub const fn honors_maintenance_timing_override() -> bool {
+        cfg!(feature = "test-policy-overrides")
+    }
+
+    async fn new_with_policy(
         clients: &[String],
         settlement_quiescence_ms: Option<u64>,
+        maintenance_timing: Option<MaintenanceTiming>,
     ) -> Result<Self, SubjectError> {
         let relay_control = RelayControl::new();
         let relay = LocalRelay::new(relay_control.relay_builder());
@@ -162,7 +181,12 @@ impl AppRuntimeHarness {
                 .tempdir()
                 .map_err(environment_error)?;
             fs_private::create_dir_all_private(root.path()).map_err(environment_error)?;
-            let app = app_for_root(root.path(), &relay_url, settlement_quiescence_ms);
+            let app = app_for_root(
+                root.path(),
+                &relay_url,
+                settlement_quiescence_ms,
+                maintenance_timing,
+            );
             let runtime = MarmotAppRuntime::new(app.clone());
             runtime.start().await.map_err(app_error)?;
             let setup = runtime
@@ -208,6 +232,7 @@ impl AppRuntimeHarness {
             accepted_publications: BTreeMap::new(),
             relay_action_events: BTreeMap::new(),
             settlement_quiescence_ms,
+            maintenance_timing,
         })
     }
 
@@ -411,13 +436,19 @@ impl AppRuntimeHarness {
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
         let relay_url = self.relay_url.clone();
         let settlement_quiescence_ms = self.settlement_quiescence_ms;
+        let maintenance_timing = self.maintenance_timing;
         let participant = self.participant_mut(client)?;
         if participant.online
             && let Some(runtime) = participant.runtime.take()
         {
             runtime.shutdown_and_close().await.map_err(app_error)?;
         }
-        participant.app = app_for_root(participant.root(), &relay_url, settlement_quiescence_ms);
+        participant.app = app_for_root(
+            participant.root(),
+            &relay_url,
+            settlement_quiescence_ms,
+            maintenance_timing,
+        );
         let runtime = MarmotAppRuntime::new(participant.app.clone());
         runtime.start().await.map_err(app_error)?;
         participant.events = Some(runtime.subscribe());
@@ -1422,10 +1453,18 @@ async fn compensate_admin_changes(
     app_error(original)
 }
 
-fn app_for_root(root: &Path, relay_url: &str, settlement_quiescence_ms: Option<u64>) -> MarmotApp {
+fn app_for_root(
+    root: &Path,
+    relay_url: &str,
+    settlement_quiescence_ms: Option<u64>,
+    maintenance_timing: Option<MaintenanceTiming>,
+) -> MarmotApp {
     let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
     if let Some(ms) = settlement_quiescence_ms {
         config = config.with_dev_settlement_quiescence_ms(ms);
+    }
+    if let Some(timing) = maintenance_timing {
+        config = config.with_dev_maintenance_timing(timing);
     }
     MarmotApp::with_relay_and_config(root, relay_url.to_owned(), config)
 }

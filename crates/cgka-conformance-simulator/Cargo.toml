@@ -12,7 +12,10 @@ description = "In-process multi-client simulator and fixtures for the CGKA engin
 conformance-slow = []
 # Full-engine A/B campaigns that disable only application-message witness
 # admission. This is a simulator experiment, not a supported wire policy.
-test-policy-overrides = ["cgka-engine/test-policy-overrides"]
+test-policy-overrides = [
+    "cgka-engine/test-policy-overrides",
+    "marmot-app/test-policy-overrides",
+]
 
 [dependencies]
 cgka-traits.workspace = true
