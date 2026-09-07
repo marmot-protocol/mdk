@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Non-JSON CLI and daemon human output now sanitizes untrusted remote text
+  with the existing TUI terminal-safety policy, so message bodies, group
+  profile fields, display names, stream previews, and related error text
+  cannot inject ANSI/OSC or Unicode format controls. Human-only `wn daemon
+  start` and `wnd` startup errors use the same helper. `--json` and IPC
+  serialization stay lossless.
+
 ## [0.9.18] - 2026-09-05
 
 ### Changed

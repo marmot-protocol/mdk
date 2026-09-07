@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::{
     CommandOutput, WnError, agent_text_stream_payload_value, display_name_for_sender,
-    error::SyncCommandError, npub_for_account_id,
+    error::SyncCommandError, npub_for_account_id, terminal_safe_text,
 };
 
 pub(crate) async fn sync_command(
@@ -61,8 +61,8 @@ fn sync_plain_with_empty(summary: &SyncSummary, empty: &str) -> String {
         lines.push(format!(
             "received group={} from={}: {}",
             hex::encode(message.group_id.as_slice()),
-            message.sender,
-            message.plaintext
+            terminal_safe_text(&message.sender),
+            terminal_safe_text(&message.plaintext)
         ));
     }
     if !summary.events.is_empty() {
@@ -267,5 +267,52 @@ mod tests {
         assert_eq!(rendered["projection_updates"], 0);
         assert_eq!(rendered["epoch_stall_escalations"], 1);
         assert_eq!(rendered["events"], 0);
+    }
+
+    #[test]
+    fn sync_plain_sanitizes_received_text_and_preserves_row_separators() {
+        let summary = SyncSummary {
+            messages: vec![
+                ReceivedMessage {
+                    message_id_hex: "11".repeat(32),
+                    source_message_id_hex: "22".repeat(32),
+                    sender: "alice\u{1b}[31m".to_owned(),
+                    sender_display_name: None,
+                    group_id: GroupId::new(vec![3; 16]),
+                    source_epoch: 1,
+                    retention: None,
+                    plaintext: "hi\u{1b}[2J\nbob".to_owned(),
+                    kind: 9,
+                    tags: Vec::new(),
+                    recorded_at: 1,
+                    received_at: 2,
+                },
+                ReceivedMessage {
+                    message_id_hex: "33".repeat(32),
+                    source_message_id_hex: "44".repeat(32),
+                    sender: "bob".to_owned(),
+                    sender_display_name: None,
+                    group_id: GroupId::new(vec![5; 16]),
+                    source_epoch: 1,
+                    retention: None,
+                    plaintext: "second".to_owned(),
+                    kind: 9,
+                    tags: Vec::new(),
+                    recorded_at: 3,
+                    received_at: 4,
+                },
+            ],
+            ..Default::default()
+        };
+        let plain = sync_plain(&summary);
+        assert_eq!(
+            plain,
+            format!(
+                "received group={} from=alice[31m: hi[2Jbob\nreceived group={} from=bob: second",
+                hex::encode([3u8; 16]),
+                hex::encode([5u8; 16])
+            )
+        );
+        assert_eq!(plain.matches('\n').count(), 1);
     }
 }

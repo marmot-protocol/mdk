@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::{
     CommandOutput, KeyPackageCommand, WnError, account_selector_or_default, ensure_local_signing,
     npub_for_account_id, parse_public_key, relay_endpoints, relay_lists_json, resolve_account,
+    terminal_safe_text,
 };
 
 pub(crate) async fn key_package_command(
@@ -158,7 +159,12 @@ pub(crate) async fn key_package_command_with_runtime(
                 plain: format!(
                     "fetched key package for {account_id} bytes={} relays={}",
                     fetched.key_package.bytes().len(),
-                    fetched.source_relays.join(",")
+                    fetched
+                        .source_relays
+                        .iter()
+                        .map(|relay| terminal_safe_text(relay))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ),
                 json: key_package_fetch_json(fetched),
             })

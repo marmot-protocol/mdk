@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::{
     CommandOutput, ProfileCommand, WnError, ensure_local_signing, npub_for_account_id,
-    resolve_account, unix_now_seconds, validate_relay_url,
+    resolve_account, terminal_safe_json_display, unix_now_seconds, validate_relay_url,
 };
 
 pub(crate) async fn profile_command(
@@ -35,8 +35,10 @@ pub(crate) async fn profile_command_with_runtime(
         ProfileCommand::Show => {
             let entry = app.directory_entry_for_account_id(&account.account_id_hex)?;
             Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&entry)
-                    .expect("JSON response serialization cannot fail"),
+                plain: terminal_safe_json_display(
+                    &serde_json::to_string_pretty(&entry)
+                        .expect("JSON response serialization cannot fail"),
+                ),
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
