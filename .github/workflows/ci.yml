@@ -189,6 +189,8 @@ jobs:
 
   rust-wasm-check:
     name: Rust WASM check
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -771,6 +773,7 @@ jobs:
       - rust-audit
       - terminal-harness-installers
       - rust-check
+      - rust-wasm-check
       - rust-clippy
       - c-smoke
       - ios-account-clippy
