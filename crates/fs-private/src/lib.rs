@@ -11,7 +11,9 @@
 
 use std::fs::OpenOptions;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Owner-only mode for files holding private data.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -717,6 +719,7 @@ fn resolve_platform_directory_aliases(
     Ok(Some(resolved))
 }
 
+#[cfg(unix)]
 fn io_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
@@ -857,17 +860,10 @@ fn set_handle_private(file: &std::fs::File) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn set_directory_handle_private(directory: &std::fs::File) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        directory.set_permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-        Ok(())
-    }
+    use std::os::unix::fs::PermissionsExt;
+    directory.set_permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
 }
 
 /// The workspace's one octal permission-mode parser.

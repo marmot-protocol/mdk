@@ -93,6 +93,12 @@ uploaded founding metadata and performs no media transfer; the older all-in-one 
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
 
+The workspace maintains a compile-only browser WASM boundary for `cgka-traits`, `cgka-engine`, and
+`transport-nostr-peeler` on `wasm32-unknown-unknown`. Required CI keeps those three libraries compiling with
+warnings denied, and `just wasm-check` provides the matching local gate. This is a portability boundary, not a
+browser-runtime acceptance claim: SQLCipher storage, `marmot-app`, UniFFI/C bindings, the CLI, and daemons remain
+outside its scope, and browser execution still requires downstream acceptance coverage.
+
 Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on
 every message surface, and custom kinds materialize as standalone timeline rows under a dedicated `CustomEvent`
