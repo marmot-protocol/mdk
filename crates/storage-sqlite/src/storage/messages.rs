@@ -615,9 +615,9 @@ impl MessageStorage for SqliteAccountStorage {
                 .storage()?;
                 conn.execute_cached(
                     "DELETE FROM cgka_ingress_dedup
-                     WHERE insert_order NOT IN (
+                     WHERE insert_order <= (
                         SELECT insert_order FROM cgka_ingress_dedup
-                        ORDER BY insert_order DESC LIMIT ?1
+                        ORDER BY insert_order DESC LIMIT 1 OFFSET ?1
                      )",
                     params![INGRESS_DEDUP_MARKER_CAPACITY],
                 )
@@ -1679,6 +1679,88 @@ mod tests {
         store.put_ingress_dedup_marker(&id).unwrap();
         store.put_ingress_dedup_marker(&id).unwrap();
         assert!(store.has_ingress_dedup_marker(&id).unwrap());
+    }
+
+    #[test]
+    fn ingress_prune_query_work() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use rusqlite::{StatementStatus, params};
+        use std::sync::Mutex;
+
+        static PRUNE_SQL: Mutex<String> = Mutex::new(String::new());
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            // Sparse keys catch incorrect cutoffs based on MAX(rowid) - capacity.
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+                 INSERT INTO cgka_ingress_dedup(insert_order, id)
+                 SELECT x*3, CAST(printf('%032x', x) AS BLOB) FROM n",
+                params![INGRESS_DEDUP_MARKER_CAPACITY],
+            )
+            .unwrap();
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_PROFILE,
+                Some(|event| {
+                    let TraceEvent::Profile(statement, _) = event else {
+                        return;
+                    };
+                    if statement
+                        .sql()
+                        .starts_with("DELETE FROM cgka_ingress_dedup")
+                    {
+                        *PRUNE_SQL.lock().unwrap() = statement.sql().into_owned();
+                    }
+                }),
+            );
+        }
+        let id = mid(42);
+        store.put_ingress_dedup_marker(&id).unwrap();
+        store.put_ingress_dedup_marker(&id).unwrap();
+        let conn = store.lock().unwrap();
+        conn.trace_v2(TraceEventCodes::empty(), None);
+        let bounds: (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), min(insert_order) FROM cgka_ingress_dedup",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bounds, (INGRESS_DEDUP_MARKER_CAPACITY, 6));
+        conn.execute(
+            "INSERT INTO cgka_ingress_dedup(id) VALUES (?1)",
+            params![mid(43).as_slice()],
+        )
+        .unwrap();
+        let production_sql = PRUNE_SQL.lock().unwrap().clone();
+        assert!(!production_sql.is_empty());
+        let legacy_sql = "DELETE FROM cgka_ingress_dedup WHERE insert_order NOT IN (
+            SELECT insert_order FROM cgka_ingress_dedup ORDER BY insert_order DESC LIMIT ?1)";
+        let mut measurements = Vec::new();
+        for sql in [legacy_sql, production_sql.as_str()] {
+            let mut statement = conn.prepare(sql).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                conn.execute_batch("SAVEPOINT bench").unwrap();
+                assert_eq!(
+                    statement
+                        .execute(params![INGRESS_DEDUP_MARKER_CAPACITY])
+                        .unwrap(),
+                    1
+                );
+                conn.execute_batch("ROLLBACK TO bench; RELEASE bench")
+                    .unwrap();
+            }
+            measurements.push((
+                statement.get_status(StatementStatus::VmStep) / 20,
+                start.elapsed() / 20,
+            ));
+        }
+        eprintln!(
+            "ingress prune capacity={INGRESS_DEDUP_MARKER_CAPACITY}: old={:?}, new={:?} (VM steps, elapsed)",
+            measurements[0], measurements[1]
+        );
+        assert!(measurements[0].0 > measurements[1].0 * 5);
     }
 
     #[test]

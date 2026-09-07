@@ -3726,3 +3726,109 @@ fn stored_account_group_component_debug_redacts_blossom_image_payload() {
     assert!(rendered.contains("marmot.group.blossom.image.v1"));
     assert!(rendered.contains("redacted"));
 }
+
+#[test]
+fn seen_event_pruning_edges() {
+    for capacity in [0, 1, 3, 8] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO seen_events(rowid, event_id, seen_at) VALUES
+                 (2, 'old', 1), (5, 'tie-first', 9), (11, 'tie-last', 9);",
+            )
+            .unwrap();
+        }
+        store
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    ..StoredAccountState::default()
+                },
+                capacity,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        let restored = store.load_account_projection_state("alice", 8).unwrap();
+        let expected = ["old", "tie-first", "tie-last"];
+        assert_eq!(
+            restored.seen_events,
+            expected[3_usize.saturating_sub(capacity)..]
+        );
+    }
+}
+
+#[test]
+fn seen_event_prune_query_work() {
+    use rusqlite::StatementStatus;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::Mutex;
+
+    static PRUNE_SQL: Mutex<String> = Mutex::new(String::new());
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            let TraceEvent::Profile(statement, _) = event else {
+                return;
+            };
+            if statement.sql().starts_with("DELETE FROM seen_events") {
+                *PRUNE_SQL.lock().unwrap() = statement.sql().into_owned();
+            }
+        }),
+    );
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                ..StoredAccountState::default()
+            },
+            0,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let conn = store.lock().unwrap();
+    conn.trace_v2(TraceEventCodes::empty(), None);
+    let production_sql = PRUNE_SQL.lock().unwrap().clone();
+    assert!(!production_sql.is_empty());
+    // Compare the old schema/query with the migrated schema and actual API SQL.
+    for capacity in [256, 4_096, 16_384] {
+        conn.execute_batch("DELETE FROM seen_events; DROP INDEX idx_seen_events_recency;")
+            .unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+             INSERT INTO seen_events(event_id, seen_at) SELECT printf('%064x', x), x/8 FROM n",
+            params![capacity],
+        )
+        .unwrap();
+        let legacy_sql = "DELETE FROM seen_events WHERE event_id NOT IN (
+            SELECT event_id FROM seen_events ORDER BY seen_at DESC, rowid DESC LIMIT ?1)";
+        let mut measurements = Vec::new();
+        for sql in [legacy_sql, production_sql.as_str()] {
+            if sql == production_sql {
+                conn.execute_batch("CREATE INDEX idx_seen_events_recency ON seen_events(seen_at);")
+                    .unwrap();
+            }
+            let mut statement = conn.prepare(sql).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                conn.execute_batch("SAVEPOINT bench").unwrap();
+                assert_eq!(statement.execute(params![capacity]).unwrap(), 1);
+                conn.execute_batch("ROLLBACK TO bench; RELEASE bench")
+                    .unwrap();
+            }
+            measurements.push((
+                statement.get_status(StatementStatus::VmStep) / 20,
+                start.elapsed() / 20,
+            ));
+            if sql == production_sql {
+                assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+            }
+        }
+        eprintln!(
+            "seen prune capacity={capacity}: old={:?}, new={:?} (VM steps, elapsed)",
+            measurements[0], measurements[1]
+        );
+        assert!(measurements[0].0 > measurements[1].0 * 5);
+    }
+}
