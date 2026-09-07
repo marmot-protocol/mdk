@@ -16178,7 +16178,7 @@ async fn accepted_projection_retries() {
             .unwrap();
         assert!(
             unfinalized,
-            "chat-list failure must roll back source finalization"
+            "injected failure must roll back source finalization: {trigger}"
         );
         client.take_pending_projection_updates();
         connection
