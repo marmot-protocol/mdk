@@ -1535,6 +1535,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         await self._inbound_queue.cancel_all()
         await self._cancel_all_streams("adapter disconnect")
         self._cancel_debounce_tasks()
+        # Debounce rows are hidden from due() while a live timer owns them. Make
+        # one final best-effort release while the spool is still open, then drop
+        # the process-local retry handles so they cannot leak across reconnects.
+        # Any release that still fails is recovered by the next spool open.
+        try:
+            self._retry_pending_debounce_releases()
+        except Exception:
+            logger.error("Marmot inbound debounce disconnect release failed", exc_info=True)
+        finally:
+            self._debounce_release_pending.clear()
         self._pending_ambient_context.clear()
         self._last_inbound_message_ids.clear()
         self._activation_cache.clear()
@@ -2795,7 +2805,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             except asyncio.TimeoutError:
                 pass
             self._inbound_spool_wakeup.clear()
-            self._retry_pending_debounce_releases()
+            try:
+                self._retry_pending_debounce_releases()
+            except Exception:
+                # The release helper normally contains storage failures, but an
+                # unexpected ordinary exception must not kill the sole retry
+                # task or let due() bypass rows still owned by debounce.
+                logger.error("Marmot inbound debounce retry failed", exc_info=True)
+                await asyncio.sleep(1.0)
+                continue
             try:
                 records = self._inbound_spool.due()
             except (InboundSpoolError, OSError, sqlite3.Error):
@@ -3255,7 +3273,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if not message_ids or not self._inbound_spool.is_open:
             return
         for message_id in message_ids:
-            self._debounce_release_pending.setdefault(message_id, reason)
+            # A row may be abandoned by more than one path before a failed
+            # compensating release succeeds. Preserve the latest diagnosis.
+            self._debounce_release_pending[message_id] = reason
         self._retry_pending_debounce_releases()
         self._inbound_spool_wakeup.set()
 

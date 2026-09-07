@@ -6772,11 +6772,158 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
             self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
+            self.assertEqual({}, adapter._debounce_release_pending)
             self.assertFalse(retry.done())
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
             adapter._inbound_spool.close()
+
+    async def test_post_commit_debounce_release_error_retries_idempotently_and_preserves_fifo(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 10}
+        )
+        original_enqueue = adapter._enqueue_debounced
+        original_release = adapter._inbound_spool.release_debounce
+        release_attempts = 0
+
+        def fail_after_buffering(event):
+            key = adapter._debounce_key(event)
+            adapter._debounce_pending.setdefault(key, []).append(event)
+            raise RuntimeError("synthetic timer registration failure")
+
+        def fail_after_commit_once(message_ids, *, reason):
+            nonlocal release_attempts
+            release_attempts += 1
+            changed = original_release(message_ids, reason=reason)
+            if release_attempts == 1:
+                raise self.adapter_module.InboundSpoolError(
+                    "synthetic post-commit release failure"
+                )
+            return changed
+
+        adapter._enqueue_debounced = fail_after_buffering
+        adapter._inbound_spool.release_debounce = fail_after_commit_once
+        with self.assertRaisesRegex(RuntimeError, "timer registration"):
+            await adapter._handle_control_event(
+                self.make_event(message_id="33", text="first")
+            )
+        for _ in range(100):
+            if adapter.events:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual([item.text for item in adapter.events], ["first"])
+        self.assertIn("33" * 32, adapter._debounce_release_pending)
+
+        # The first mutation committed before surfacing an error. Repeating the
+        # CAS release changes zero rows but still retires the process-local handle.
+        adapter._retry_pending_debounce_releases()
+        self.assertEqual({}, adapter._debounce_release_pending)
+
+        adapter._enqueue_debounced = original_enqueue
+        await adapter._handle_control_event(
+            self.make_event(message_id="55", text="second")
+        )
+        normalized_second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second")
+        )
+        key = adapter._debounce_key(normalized_second)
+        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
+        for _ in range(100):
+            if len(adapter.events) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(2, release_attempts)
+        self.assertEqual([item.text for item in adapter.events], ["first", "second"])
+        self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
+        adapter._inbound_spool.close()
+
+    async def test_disconnect_clears_failed_release_handles_and_reopen_recovers_row(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 60_000}
+        )
+        event = self.make_event(message_id="33", text="recover after reopen")
+        await adapter._handle_control_event(event)
+        original_release = adapter._inbound_spool.release_debounce
+
+        def fail_release(message_ids, *, reason):
+            raise self.adapter_module.InboundSpoolError("synthetic disconnect failure")
+
+        adapter._inbound_spool.release_debounce = fail_release
+        await adapter.disconnect()
+
+        self.assertEqual({}, adapter._debounce_release_pending)
+        self.assertEqual({}, adapter._debounce_pending)
+        self.assertFalse(adapter._inbound_spool.is_open)
+
+        adapter._inbound_spool.release_debounce = original_release
+        adapter._ensure_inbound_spool_open()
+        recovered = adapter._inbound_spool.get("33" * 32)
+        self.assertEqual("pending", recovered.state)
+        self.assertEqual("recovered_debounce_buffer", recovered.disposition)
+        adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        self.assertEqual([item.text for item in adapter.events], ["recover after reopen"])
+        adapter._inbound_spool.close()
+
+    async def test_retry_loop_survives_unexpected_debounce_release_exception(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event, debounce_buffered=True)
+        adapter._debounce_release_pending[message_id] = "debounce_enqueue_failed"
+        original_retry = adapter._retry_pending_debounce_releases
+        failed_once = asyncio.Event()
+
+        def flaky_retry():
+            if not failed_once.is_set():
+                failed_once.set()
+                raise ValueError("synthetic unexpected release failure")
+            return original_retry()
+
+        adapter._retry_pending_debounce_releases = flaky_retry
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            adapter._inbound_spool_wakeup.set()
+            await asyncio.wait_for(failed_once.wait(), timeout=1)
+            self.assertFalse(retry.done())
+            adapter._inbound_spool_wakeup.set()
+            for _ in range(250):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual([item.text for item in adapter.events], ["durable"])
+            self.assertEqual({}, adapter._debounce_release_pending)
+            self.assertFalse(retry.done())
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            adapter._inbound_spool.close()
+
+    async def test_debounce_release_reason_is_latest_reason_wins(self):
+        adapter = self.make_adapter(extra={"group_activation": "always"})
+        adapter._ensure_inbound_spool_open()
+        event = self.adapter_module._normalize_inbound_message_event(self.make_event())
+        message_id = event["message_id_hex"]
+        adapter._inbound_spool.record(event, debounce_buffered=True)
+        original_release = adapter._inbound_spool.release_debounce
+
+        def fail_release(message_ids, *, reason):
+            raise self.adapter_module.InboundSpoolError("synthetic release failure")
+
+        adapter._inbound_spool.release_debounce = fail_release
+        adapter._release_debounce_items([event], reason="older_reason")
+        adapter._release_debounce_items([event], reason="latest_reason")
+        self.assertEqual("latest_reason", adapter._debounce_release_pending[message_id])
+
+        adapter._inbound_spool.release_debounce = original_release
+        adapter._retry_pending_debounce_releases()
+        self.assertEqual({}, adapter._debounce_release_pending)
+        self.assertEqual("latest_reason", adapter._inbound_spool.get(message_id).disposition)
+        adapter._inbound_spool.close()
 
     async def test_retry_loop_survives_raw_sqlite_read_error(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
