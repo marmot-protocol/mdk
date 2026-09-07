@@ -5029,7 +5029,15 @@ mod tests {
             .observe_drained_session_events(&effects)
             .await
             .unwrap();
-        assert_eq!(app.messages("alice").unwrap(), messages);
+        let replayed = app.messages("alice").unwrap();
+        assert_eq!(replayed.len(), messages.len());
+        for (actual, mut expected) in replayed.into_iter().zip(messages) {
+            // Re-observation stamps a fresh local receipt time. Stable message
+            // identity, insertion order and contents must survive replay even
+            // when it crosses a wall-clock second boundary.
+            expected.received_at = actual.received_at;
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test]
