@@ -1809,8 +1809,8 @@ mod tests {
             "pending application order: old={:?}, new={:?} (VM steps, elapsed)",
             measurements[0], measurements[1]
         );
-        assert_eq!(measurements[1].0 < measurements[0].0, true);
-        assert_eq!(measurements[1].0 * 2 < measurements[0].0, true);
+        assert!(measurements[1].0 < measurements[0].0);
+        assert!(measurements[1].0 * 2 < measurements[0].0);
         assert_eq!(
             conn.prepare(indexed)
                 .unwrap()
