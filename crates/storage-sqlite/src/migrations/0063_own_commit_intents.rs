@@ -2,9 +2,9 @@ use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
-/// The intent behind each own commit this device stages, retained until the
-/// commit is confirmed or rolled back so a supersession by convergence can
-/// re-issue it against the canonical state (mdk#1734).
+/// The intent behind each own commit this device stages, retained through the
+/// rewind horizon so convergence can re-issue a superseded change against the
+/// canonical state (mdk#1734). Failed publication removes it immediately.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
