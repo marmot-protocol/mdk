@@ -2131,16 +2131,15 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
     .await;
 
     let publisher = Keys::generate();
-    let content = serde_json::json!({
+    let mut content = serde_json::json!({
         "name": "hostile",
         "website": "https://example.test",
         "bot": false,
         "custom_blob": "x".repeat(8000),
         "created_at": 42,
         "source_relays": ["wss://spoof.example"]
-    })
-    .to_string();
-    let signed = EventBuilder::new(Kind::Metadata, content)
+    });
+    let signed = EventBuilder::new(Kind::Metadata, content.to_string())
         .custom_created_at(NostrTimestamp::from_secs(1_700_000_867))
         .sign_with_keys(&publisher)
         .expect("sign hostile kind:0");
@@ -2176,28 +2175,37 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
         "provenance must stay endpoint-derived"
     );
 
-    let dir_refresh = tempfile::tempdir().unwrap();
-    AccountHome::open(dir_refresh.path())
-        .create_account("bob")
+    // A newer event makes refresh prove it fetched and filtered new content,
+    // rather than passing against the profile already cached by fetch.
+    content["name"] = serde_json::json!("refreshed");
+    content["bot"] = serde_json::json!(true);
+    let newer = EventBuilder::new(Kind::Metadata, content.to_string())
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_868))
+        .sign_with_keys(&publisher)
         .unwrap();
-    let refresh_app = MarmotApp::with_relay_and_config(
-        dir_refresh.path(),
-        url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
-    );
-    refresh_app
+    relay_client
+        .publish_event(
+            &[endpoint(&url)],
+            &NostrTransportEvent::from_nostr_event(&newer).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    fetch_app
         .refresh_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
         .await
         .unwrap();
-    let refreshed = refresh_app
+    let refreshed = fetch_app
         .directory_entry_for_account_id(&publisher_hex)
         .unwrap()
         .expect("refresh cached the inbound profile")
         .profile
         .expect("refreshed profile");
-    assert_eq!(refreshed.name.as_deref(), Some("hostile"));
-    assert_eq!(refreshed.extra, fetched.extra);
-    assert!(!refreshed.extra.contains_key("custom_blob"));
+    assert_eq!(refreshed.name.as_deref(), Some("refreshed"));
+    let mut expected_extra = fetched.extra;
+    expected_extra.insert("bot".into(), serde_json::json!(true));
+    assert_eq!(refreshed.extra, expected_extra);
+    assert_eq!(refreshed.created_at, 1_700_000_868);
 
     fetch_runtime.shutdown().await;
 }

@@ -10340,15 +10340,6 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
 #[test]
 fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
-    use crate::directory::records::{
-        MAX_EXTRA_PROFILE_FIELDS, MAX_EXTRA_PROFILE_KEY_BYTES, MAX_EXTRA_PROFILE_VALUE_BYTES,
-    };
-
-    const MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES: usize = 2
-        + MAX_EXTRA_PROFILE_FIELDS
-            * (MAX_EXTRA_PROFILE_KEY_BYTES + 1 + MAX_EXTRA_PROFILE_VALUE_BYTES)
-        + MAX_EXTRA_PROFILE_FIELDS.saturating_sub(1);
-
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -10396,9 +10387,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         assert!(!profile.extra.contains_key("custom_blob"));
         assert!(!profile.extra.contains_key("created_at"));
         assert!(!profile.extra.contains_key("source_relays"));
-        assert!(profile.extra.len() <= MAX_EXTRA_PROFILE_FIELDS);
-        let encoded = serde_json::to_vec(&profile.extra).unwrap();
-        assert!(encoded.len() <= MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES);
+        assert_eq!(profile.extra.len(), 3);
     };
 
     let cached = app

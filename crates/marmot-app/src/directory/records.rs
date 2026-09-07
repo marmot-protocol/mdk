@@ -316,6 +316,10 @@ pub(crate) fn upsert_newer_directory_entry(
     }
 }
 
+/// Parse incoming profile metadata and bound the fields retained on ingestion.
+/// The full event is parsed first; this is not a cap on transient parse memory.
+/// Previously cached rows are not rewritten here: their bounds take effect when
+/// a newer profile is ingested and replaces the cached metadata.
 pub(crate) fn profile_from_record(
     record: RelayEventRecord,
 ) -> Option<(String, UserProfileMetadata)> {
@@ -357,8 +361,10 @@ pub(crate) const MAX_EXTRA_PROFILE_VALUE_BYTES: usize = 4096;
 /// Counting `Write` sink that accepts compact JSON only while it fits `remaining`.
 ///
 /// The next write that would exceed the budget fails immediately without
-/// accepting a prefix or counting those bytes. Measurement never materializes a
-/// serialized attacker-sized copy.
+/// accepting a prefix or counting those bytes. This stops further serialization
+/// writes and avoids allocating another encoded copy. It does not bound the raw
+/// event or already-parsed JSON allocations, and the serializer may scan a whole
+/// string before emitting a write that exceeds the budget.
 struct BoundedJsonWriteBudget {
     remaining: usize,
 }
@@ -380,11 +386,13 @@ impl Write for BoundedJsonWriteBudget {
     }
 }
 
+/// Measure compact JSON against an inclusive encoded-byte budget without buffering it.
 fn compact_json_within_budget<T: Serialize + ?Sized>(value: &T, budget: usize) -> bool {
     let mut sink = BoundedJsonWriteBudget { remaining: budget };
     serde_json::to_writer(&mut sink, value).is_ok()
 }
 
+/// Retain bounded unknown entries whole; known and rejected fields use no quota.
 fn extra_profile_fields(content: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
     let Some(object) = content.as_object() else {
         return BTreeMap::new();
@@ -855,12 +863,6 @@ mod tests {
         "x".repeat(count)
     }
 
-    /// Braces, encoded keys, colons, values, and commas at maximum occupancy.
-    const MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES: usize = 2
-        + MAX_EXTRA_PROFILE_FIELDS
-            * (MAX_EXTRA_PROFILE_KEY_BYTES + 1 + MAX_EXTRA_PROFILE_VALUE_BYTES)
-        + MAX_EXTRA_PROFILE_FIELDS.saturating_sub(1);
-
     #[test]
     fn bounded_json_write_budget_rejects_the_write_that_would_exceed() {
         let mut sink = BoundedJsonWriteBudget { remaining: 4 };
@@ -1068,6 +1070,67 @@ mod tests {
     }
 
     #[test]
+    fn extra_profile_key_limits_include_escaping_and_multibyte_utf8() {
+        for key in [
+            ascii_xs(254),
+            "\"".repeat(127),
+            "\\".repeat(127),
+            "\n".repeat(127),
+            format!("{}aa", "\u{0001}".repeat(42)),
+            "é".repeat(127),
+            format!("{}aa", "🦦".repeat(63)),
+        ] {
+            let over = format!("{key}x");
+            assert_eq!(
+                serde_json::to_vec(&key).unwrap().len(),
+                MAX_EXTRA_PROFILE_KEY_BYTES
+            );
+            assert_eq!(
+                serde_json::to_vec(&over).unwrap().len(),
+                MAX_EXTRA_PROFILE_KEY_BYTES + 1
+            );
+            let profile = profile_from_content(serde_json::json!({
+                key.clone(): "kept", over.clone(): "dropped"
+            }));
+            assert_eq!(profile.extra.len(), 1);
+            assert_eq!(profile.extra.get(&key), Some(&serde_json::json!("kept")));
+            assert!(!profile.extra.contains_key(&over));
+        }
+    }
+
+    /// Saturate every budget, including JSON punctuation, rather than checking
+    /// a large ceiling against a map whose entries are all tiny.
+    #[test]
+    fn extra_profile_fields_saturate_the_exact_retained_json_ceiling() {
+        let mut content = serde_json::Map::new();
+        for index in 0..MAX_EXTRA_PROFILE_FIELDS {
+            let key = format!("{index:02}{}", ascii_xs(MAX_EXTRA_PROFILE_KEY_BYTES - 4));
+            let value = serde_json::json!(ascii_xs(MAX_EXTRA_PROFILE_VALUE_BYTES - 2));
+            assert_eq!(
+                serde_json::to_vec(&key).unwrap().len(),
+                MAX_EXTRA_PROFILE_KEY_BYTES
+            );
+            assert_eq!(
+                serde_json::to_vec(&value).unwrap().len(),
+                MAX_EXTRA_PROFILE_VALUE_BYTES
+            );
+            content.insert(key, value);
+        }
+        let profile = profile_from_content(serde_json::Value::Object(content.clone()));
+        assert_eq!(profile.extra.len(), MAX_EXTRA_PROFILE_FIELDS);
+        // Two braces, a colon per entry, and one fewer comma than entries.
+        let ceiling = 2
+            + MAX_EXTRA_PROFILE_FIELDS
+                * (MAX_EXTRA_PROFILE_KEY_BYTES + 1 + MAX_EXTRA_PROFILE_VALUE_BYTES)
+            + (MAX_EXTRA_PROFILE_FIELDS - 1);
+        assert_eq!(ceiling, 139_329);
+        assert_eq!(serde_json::to_vec(&profile.extra).unwrap().len(), ceiling);
+        content.insert("zz_overflow".into(), serde_json::json!("dropped"));
+        let overflow = profile_from_content(serde_json::Value::Object(content));
+        assert_eq!(overflow.extra, profile.extra);
+    }
+
+    #[test]
     fn extra_profile_fields_quota_skips_known_and_oversized_without_consuming_slots() {
         assert!(extra_profile_fields(&serde_json::json!({})).is_empty());
 
@@ -1077,8 +1140,6 @@ mod tests {
         }
         let at_limit_profile = profile_from_content(serde_json::Value::Object(at_limit.clone()));
         assert_eq!(at_limit_profile.extra.len(), MAX_EXTRA_PROFILE_FIELDS);
-        let encoded = serde_json::to_vec(&at_limit_profile.extra).unwrap();
-        assert!(encoded.len() <= MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES);
         let repeated = profile_from_content(serde_json::Value::Object(at_limit.clone()));
         assert_eq!(repeated.extra, at_limit_profile.extra);
 
@@ -1104,16 +1165,16 @@ mod tests {
                 Some(&serde_json::json!(index))
             );
         }
-        let encoded = serde_json::to_vec(&over_profile.extra).unwrap();
-        assert!(encoded.len() <= MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES);
         assert_eq!(
             profile_content_json(&over_profile)["name"],
             serde_json::json!("typed")
         );
     }
 
+    /// Tripwire against disabling serde_json's default parse recursion limit.
+    /// This fails before extra-field retention, independently of its budgets.
     #[test]
-    fn extra_profile_fields_do_not_enable_unbounded_json_recursion() {
+    fn profile_parse_preserves_the_json_recursion_limit() {
         let mut deep = String::from("null");
         for _ in 0..200 {
             deep = format!("[{deep}]");
