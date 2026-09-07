@@ -252,7 +252,10 @@ cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_j
 
 Release mode without policy-override features is the production-policy verification command. Workspace debug or
 feature-unified CI runs are supplementary evidence. The six basic tests are ordinary tests, included by the existing
-simulator smoke filter; the dedicated public recovery CI job runs the ignored large test with the command above.
+simulator smoke filter. The `Simulator Nightly` workflow runs both ignored 1,024-message recovery variants
+on master daily at 03:17 UTC, with production policy and retained JSON evidence. They do not block each PR;
+the smaller recovery journeys and strict regressions remain in PR CI. To run just the large recovery lane
+on demand, dispatch `simulator-nightly.yml` with `recovery_only=true` (and select the desired branch).
 These statements describe test selection; inspect the job at the revision under review for its observed result.
 
 Each test writes a fresh owner-only subdirectory containing input metadata, public checkpoint observations and a
