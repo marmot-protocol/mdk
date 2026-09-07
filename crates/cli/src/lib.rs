@@ -25,7 +25,10 @@ pub(crate) mod commands;
 pub mod daemon;
 mod error;
 mod secret;
+mod terminal;
 pub mod tui;
+
+pub(crate) use terminal::{terminal_safe_json_display, terminal_safe_text};
 
 pub use args::SecretStoreKind;
 pub(crate) use args::{
@@ -431,13 +434,14 @@ pub(crate) fn command_output_result(
             // logged by callers and must remain privacy-safe.
             stderr: format!(
                 "error: sync failed; completed prefix:\n{}\nerror: {}\n",
-                sync.partial_plain, sync.source
+                sync.partial_plain,
+                terminal_safe_text(&sync.source.to_string())
             ),
         },
         Err(err) => CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("error: {err}\n"),
+            stderr: format!("error: {}\n", terminal_safe_text(&err.to_string())),
         },
     }
 }
@@ -747,7 +751,7 @@ fn daemon_client_error_with_code(
     CliOutput {
         code: 1,
         stdout: String::new(),
-        stderr: format!("error: {err}\n"),
+        stderr: format!("error: {}\n", terminal_safe_text(&err.to_string())),
     }
 }
 
@@ -886,18 +890,26 @@ pub(crate) fn group_list_plain(groups: &[AppGroupRecord]) -> String {
         .join("\n")
 }
 
-fn group_plain(group: &AppGroupRecord) -> String {
+pub(crate) fn group_plain(group: &AppGroupRecord) -> String {
     let mut line = format!(
         "{} name={} endpoint={}",
-        group.group_id_hex, group.profile.name, group.endpoint
+        terminal_safe_text(&group.group_id_hex),
+        terminal_safe_text(&group.profile.name),
+        terminal_safe_text(&group.endpoint)
     );
     if group.avatar_url.present {
-        line.push_str(&format!(" avatar_url={}", group.avatar_url.url));
+        line.push_str(&format!(
+            " avatar_url={}",
+            terminal_safe_text(&group.avatar_url.url)
+        ));
         if let Some(dim) = &group.avatar_url.dim {
-            line.push_str(&format!(" avatar_dim={dim}"));
+            line.push_str(&format!(" avatar_dim={}", terminal_safe_text(dim)));
         }
         if let Some(thumbhash) = &group.avatar_url.thumbhash {
-            line.push_str(&format!(" avatar_thumbhash={thumbhash}"));
+            line.push_str(&format!(
+                " avatar_thumbhash={}",
+                terminal_safe_text(thumbhash)
+            ));
         }
     }
     line
@@ -2713,5 +2725,67 @@ mod tests {
             "missing subcommand must be ok:false, got: {value}"
         );
         assert_eq!(value["error"]["code"], "usage");
+    }
+
+    fn sample_group(name: &str) -> marmot_app::AppGroupRecord {
+        serde_json::from_value(json!({
+            "group_id_hex": "aa".repeat(16),
+            "endpoint": "wss://relay.example\u{1b}]8;;https://evil.example\u{7}",
+            "nostr_routing": {
+                "component_id": 1,
+                "component": "marmot.transport.nostr.routing.v1",
+                "nostr_group_id_hex": "bb".repeat(16),
+                "relays": ["wss://relay.example"],
+                "data_hex": ""
+            },
+            "profile": {
+                "component_id": 2,
+                "component": "marmot.group.profile.v1",
+                "name": name,
+                "description": "",
+                "data_hex": ""
+            },
+            "image": {
+                "component_id": 3,
+                "component": "marmot.group.blossom-image.v1",
+                "present": false,
+                "image_hash_hex": "",
+                "image_key_hex": "",
+                "image_nonce_hex": "",
+                "image_upload_key_hex": "",
+                "data_hex": ""
+            },
+            "admin_policy": {
+                "component_id": 4,
+                "component": "marmot.group.admin-policy.v1",
+                "admins": [],
+                "data_hex": ""
+            },
+            "avatar_url": {
+                "component_id": 5,
+                "component": "marmot.group.avatar-url.v1",
+                "present": true,
+                "url": "https://cdn.example/a\u{1b}[2J.png",
+                "dim": "64x64\u{7}",
+                "thumbhash": "thumb\u{202e}",
+                "data_hex": ""
+            }
+        }))
+        .expect("sample group")
+    }
+
+    #[test]
+    fn group_plain_sanitizes_profile_and_avatar_fields() {
+        let group = sample_group("ops\u{1b}]52;c;YXR0YWNr\u{7}\nforged");
+        let listed = crate::group_list_plain(&[group]);
+        assert_eq!(
+            listed,
+            format!(
+                "{} name=ops]52;c;YXR0YWNrforged endpoint=wss://relay.example]8;;https://evil.example avatar_url=https://cdn.example/a[2J.png avatar_dim=64x64 avatar_thumbhash=thumb",
+                "aa".repeat(16)
+            )
+        );
+        assert!(!listed.contains('\n'));
+        assert!(!listed.contains('\u{1b}'));
     }
 }

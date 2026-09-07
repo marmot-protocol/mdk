@@ -121,6 +121,66 @@ async fn run_server_validates_relays_before_creating_runtime_artifacts() {
     );
 }
 
+const HOSTILE_INVALID_RELAY: &str = "not-a-relay\u{1b}]52;c;YXR0YWNr\u{7}\u{202e}";
+const SANITIZED_INVALID_RELAY: &str = "not-a-relay]52;c;YXR0YWNr";
+
+#[test]
+fn daemon_error_sanitizes_human_message_and_keeps_json_lossless() {
+    let message = format!("invalid relay URL: {HOSTILE_INVALID_RELAY}");
+    let plain = daemon_error(false, "invalid_relay_url", message.clone());
+    assert_eq!(plain.code, 1);
+    assert!(plain.stdout.is_empty());
+    assert_eq!(
+        plain.stderr,
+        format!("error: invalid relay URL: {SANITIZED_INVALID_RELAY}\n")
+    );
+    assert!(!plain.stderr.contains('\u{1b}'));
+    assert!(!plain.stderr.contains('\u{7}'));
+    assert!(!plain.stderr.contains('\u{202e}'));
+
+    let json = daemon_error(true, "invalid_relay_url", message.clone());
+    assert_eq!(json.code, 1);
+    assert!(json.stderr.is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(json.stdout.trim()).expect("daemon_error JSON");
+    assert_eq!(value["ok"], false);
+    assert_eq!(
+        value["error"],
+        serde_json::json!({
+            "code": "invalid_relay_url",
+            "message": message,
+        })
+    );
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains(HOSTILE_INVALID_RELAY)
+    );
+}
+
+#[tokio::test]
+async fn wnd_startup_sanitizes_hostile_invalid_relay_errors() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = run_server_from([
+        "wnd",
+        "--home",
+        home.path().to_str().expect("home utf8"),
+        "--discovery-relays",
+        HOSTILE_INVALID_RELAY,
+    ])
+    .await;
+    assert_eq!(output.code, 1);
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        format!("wnd: invalid relay URL: {SANITIZED_INVALID_RELAY}\n")
+    );
+    assert!(!output.stderr.contains('\u{1b}'));
+    assert!(!output.stderr.contains('\u{7}'));
+    assert!(!output.stderr.contains('\u{202e}'));
+}
+
 #[test]
 #[cfg(unix)]
 fn daemon_pid_and_log_writers_create_private_files() {
@@ -1780,6 +1840,134 @@ fn timeline_stream_plain_output_is_human_readable() {
         stream_result_plain(&projection),
         "timeline projection updated group=aa changes=1 chat_list_trigger=NewLastMessage"
     );
+}
+
+#[test]
+fn stream_plain_output_sanitizes_hostile_remote_fields() {
+    let message = serde_json::json!({
+        "type": "message",
+        "message": {
+            "group_id": "aa\u{1b}[H",
+            "from": "alice\u{9b}31m",
+            "plaintext": "hi\u{1b}[2J\nbob"
+        }
+    });
+    assert_eq!(
+        stream_result_plain(&message),
+        "message group=aa[H from=alice31m: hi[2Jbob"
+    );
+
+    let reaction = serde_json::json!({
+        "type": "reaction",
+        "message": {
+            "group_id": "aa",
+            "from": "bob",
+            "plaintext": "+\u{1b}]52;c;YXR0YWNr\u{7}"
+        }
+    });
+    assert_eq!(
+        stream_result_plain(&reaction),
+        "reaction group=aa from=bob: +]52;c;YXR0YWNr"
+    );
+
+    let preview = serde_json::json!({
+        "type": "stream_preview",
+        "stream_preview": {
+            "stream_id": "s\u{1b}1",
+            "status": "run\u{7}ning",
+            "text": "part\u{9b}ial"
+        }
+    });
+    assert_eq!(
+        stream_result_plain(&preview),
+        "stream preview s1 [running]: partial"
+    );
+
+    let delta = serde_json::json!({
+        "type": "agent_stream_delta",
+        "agent_stream_delta": {
+            "stream_id": "s1",
+            "seq": 3,
+            "text": "chunk\u{202e}text"
+        }
+    });
+    assert_eq!(
+        stream_result_plain(&delta),
+        "agent stream delta s1 #3: chunktext"
+    );
+
+    let page = serde_json::json!({
+        "type": "initial_timeline_page",
+        "has_more_before": true,
+        "has_more_after": false,
+        "messages": [
+            {
+                "kind": 9,
+                "group_id": "aa\r",
+                "from": "alice",
+                "plaintext": "hello\nworld",
+                "deleted": false
+            },
+            {
+                "kind": 1210,
+                "group_id": "aa",
+                "from": "bob",
+                "plaintext": "fallback",
+                "group_system": { "summary": "bob\u{1b}[2J renamed" },
+                "deleted": false
+            }
+        ]
+    });
+    assert_eq!(
+        stream_result_plain(&page),
+        "initial timeline page has_more_before=true has_more_after=false\ngroup=aa from=alice: helloworld\ngroup=aa from=bob: bob[2J renamed"
+    );
+
+    let updated = serde_json::json!({
+        "type": "timeline_updated",
+        "has_more_before": false,
+        "has_more_after": true,
+        "messages": []
+    });
+    assert_eq!(
+        stream_result_plain(&updated),
+        "timeline updated has_more_before=false has_more_after=true: no timeline messages"
+    );
+
+    let notification = serde_json::json!({
+        "type": "notification",
+        "notification": {
+            "trigger": "NewMessage",
+            "group_id_hex": "aa",
+            "preview_text": "hi\u{1b}]8;;https://evil.example\u{7}",
+            "sender": {
+                "display_name": "Ali\u{202e}ce",
+                "account_id_hex": "bb"
+            }
+        }
+    });
+    assert_eq!(
+        stream_result_plain(&notification),
+        "notification NewMessage group=aa from=Alice: hi]8;;https://evil.example"
+    );
+
+    let fallback = serde_json::json!({
+        "type": "unknown_event",
+        "text": "ok"
+    });
+    let rendered = stream_result_plain(&fallback);
+    let serialized = fallback.to_string();
+    assert_eq!(rendered, crate::terminal_safe_json_display(&serialized));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
+        fallback
+    );
+
+    let error = DaemonStreamError {
+        code: "command_failed".to_owned(),
+        message: "boom\u{1b}[2J".to_owned(),
+    };
+    assert_eq!(crate::terminal_safe_text(&error.message), "boom[2J");
 }
 
 #[test]
