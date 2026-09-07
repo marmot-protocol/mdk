@@ -85,7 +85,11 @@ fn select_reconciliation_remote_ids(
     let ids = bounded_reconciliation_remote_ids(remote, after);
     // Selection is advisory, including cancellation or fetch failure. Refused
     // IDs recur on wrap; only durable ingestion changes the admitted inventory.
-    progress.save_cursor(ids.last().map(|id| id.to_bytes()))?;
+    // Empty comparisons also occur when all relays fail negotiation. Preserve
+    // progress so the next successful comparison does not restart at a refused prefix.
+    if let Some(last) = ids.last() {
+        progress.save_cursor(Some(last.to_bytes()))?;
+    }
     Ok(ids)
 }
 
@@ -1745,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_reaches_tail_for_257_cycling_owned_routes() {
+    fn reconciliation_reaches_tail_for_257_owned_routes_after_empty_comparisons() {
         let remote = (0..SDK_RECONCILIATION_REPLAY_BATCH + 1)
             .map(|index| {
                 let mut bytes = [0; 32];
@@ -1754,6 +1758,8 @@ mod tests {
             })
             .collect::<HashSet<_>>();
         let dependency = *remote.iter().max().unwrap();
+        // 257 tracks #1716's former shared-cache boundary. This tests selection;
+        // encrypted persistence and account isolation are storage-layer tests.
         let routes = (0..257)
             .map(|_| TestReconciliationProgress::default())
             .collect::<Vec<_>>();
@@ -1761,6 +1767,13 @@ mod tests {
             let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
             assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
             assert!(!selected.contains(&dependency));
+            let cursor = route.load_cursor().unwrap();
+            assert!(
+                select_reconciliation_remote_ids(&HashSet::new(), route)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(route.load_cursor().unwrap(), cursor);
         }
         // Every batch is refused; nothing shrinks the remote-only set. Routes
         // above the former shared cache cap must nevertheless reach the tail.
@@ -1777,9 +1790,15 @@ mod tests {
                 "refused prefix recurs on wrap"
             );
         }
-        select_reconciliation_remote_ids(&HashSet::new(), &routes[0]).unwrap();
-        assert_eq!(routes[0].load_cursor().unwrap(), None);
-        assert!(routes[1].load_cursor().unwrap().is_some());
+        // Even a saved cursor above a changed remote set wraps without clearing.
+        let lower = HashSet::from([*remote.iter().min().unwrap()]);
+        routes[0].save_cursor(Some([0xff; 32])).unwrap();
+        assert_eq!(
+            select_reconciliation_remote_ids(&lower, &routes[0])
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Build a kind-445 group event DTO pre-signed by a fresh ephemeral key,

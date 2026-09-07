@@ -207,18 +207,20 @@ impl SqliteAccountStorage {
         cursor: Option<[u8; 32]>,
     ) -> StorageResult<()> {
         let (kind, id) = route.storage_key();
-        let changed = self
-            .lock()?
-            .execute_cached(
-                "UPDATE transport_reconciliation_route_state SET replay_after = ?3
-             WHERE route_kind = ?1 AND route_id = ?2",
-                params![kind, id, cursor.as_ref().map(|id| id.as_slice())],
-            )
-            .storage()?;
-        if changed == 0 {
-            return Err(StorageError::NotFound);
-        }
-        Ok(())
+        retry_on_busy(|| {
+            let changed = self
+                .lock()?
+                .execute_cached(
+                    "UPDATE transport_reconciliation_route_state SET replay_after = ?3
+                 WHERE route_kind = ?1 AND route_id = ?2",
+                    params![kind, id, cursor.as_ref().map(|id| id.as_slice())],
+                )
+                .storage()?;
+            if changed == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
+        })
     }
 
     pub fn transport_reconciliation_inventory(
@@ -355,6 +357,68 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_cursor_retries_observed_writer_contention() {
+        use std::cell::Cell;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        thread_local! {
+            static BUSY_OBSERVED: Cell<Option<mpsc::Sender<()>>> = const { Cell::new(None) };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-contention.db");
+        let key = crate::SqlCipherKey::new("synthetic replay contention").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .transport_reconciliation_inventory(&TransportReconciliationRoute::Inbox, 100)
+            .unwrap();
+        let blocker = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        blocker
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let (busy_tx, busy_rx) = mpsc::channel();
+        let writer = store.clone();
+        let worker = std::thread::spawn(move || {
+            BUSY_OBSERVED.set(Some(busy_tx));
+            writer
+                .lock()
+                .unwrap()
+                .busy_handler(Some(|_| {
+                    BUSY_OBSERVED.with(|signal| {
+                        if let Some(signal) = signal.take() {
+                            let _ = signal.send(());
+                        }
+                    });
+                    // Force this attempt to return SQLITE_BUSY. Only the outer
+                    // retry can succeed after the blocker is released.
+                    false
+                }))
+                .unwrap();
+            writer.advance_transport_reconciliation_replay_cursor(
+                &TransportReconciliationRoute::Inbox,
+                Some([7; 32]),
+            )
+        });
+        // Release only after SQLite reports real contention, without a sleep.
+        let observed = busy_rx.recv_timeout(Duration::from_secs(5));
+        let released = blocker.lock().unwrap().execute_batch("ROLLBACK");
+        let result = worker.join();
+        released.unwrap();
+        observed.unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(
+            store
+                .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
+                .unwrap(),
+            Some([7; 32])
+        );
+        store.close().unwrap();
+        blocker.close().unwrap();
+    }
 
     #[test]
     fn retired_route_cannot_be_resurrected_by_late_replay_progress() {
