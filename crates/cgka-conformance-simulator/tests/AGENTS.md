@@ -22,6 +22,12 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.
 
+- **File:** `app_runtime_interaction_journeys.rs`
+  - **Owns:** Public app interaction journeys that the serialized generated families do not reach: two groups on
+    one device with a removal and reopen, two admins editing different profile fields at the same instant, a
+    concurrent invite plus rename, a member removed while its device is closed, a voluntary leave with three
+    remaining auto-committers, and the explicit slow manual self-update. Same harness and evidence layout as `app_runtime_journeys.rs`; see `../APP_PATH_COVERAGE.md`.
+
 - **File:** `agent_text_stream_vectors.rs`
   - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
     encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the

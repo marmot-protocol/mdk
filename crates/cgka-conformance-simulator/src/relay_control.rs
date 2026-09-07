@@ -244,6 +244,52 @@ impl RelayControl {
         }
     }
 
+    /// Like [`Self::wait_for_action_events`], but admitted events beyond the
+    /// expected count are tolerated and the admitted count is returned. Use it
+    /// for concurrently issued commands: convergence may legitimately publish
+    /// recovery commits inside the window, and a rejected command may have
+    /// reached the relay before failing, so an exact count is not a meaningful
+    /// correlation there. The accepted publications must still all appear.
+    pub async fn wait_for_at_least_action_events(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+    ) -> Result<usize, RelayControlError> {
+        let RelayActionExpectation {
+            include_welcomes,
+            expected_publications,
+            expected_event_ids,
+            timeout,
+        } = expectation;
+        let expected_event_ids = expected_event_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let recorded = self
+                .record_action_events(action_events, action_id, before, include_welcomes)
+                .await?;
+            let observed_event_ids = action_events
+                .get(action_id)
+                .into_iter()
+                .flatten()
+                .map(|event| event.event.id.to_hex())
+                .collect::<BTreeSet<_>>();
+            if recorded >= expected_publications
+                && expected_event_ids.is_subset(&observed_event_ids)
+            {
+                return Ok(recorded);
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayControlError {
+                    code: "relay_action_publication_timeout",
+                    message: "the action's expected retained relay publications were not admitted before the deadline",
+                });
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn set_action_event_visibility(
         &self,
         action_events: &RelayActionEvents,

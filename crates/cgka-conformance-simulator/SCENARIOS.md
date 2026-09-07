@@ -1063,6 +1063,16 @@ relay order and public app operations, not the engine fixture's forced reverse s
 it is not a passing catch-up result. Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 
+`tests/app_runtime_interaction_journeys.rs` adds interaction journeys the serialized public families cannot express:
+two groups on one device (traffic, a removal, and a reopen must not leak across groups, and the second invitation of the
+same member exercises a fresh KeyPackage), two admins saving different profile fields at the same instant, an invite
+racing a rename, a member removed while its device is closed (it must learn the removal from relay history, keep
+its pre-removal history exactly, and have its own sends refused), and a voluntary leave from a four-member group, where
+the remaining devices must apply the removal and still exchange decryptable traffic (the strict form requires them to
+do so within 30 seconds and stays ignored while the worker only reaches the auto-commit through unrelated commits). `AppRuntimeHarness::race_mutations` issues the
+concurrent commands; the oracle is that members settle on one public state and that no edit reported as saved is lost.
+The manual self-update journey is explicitly ignored because the protocol's quiet window and jitter run on real time.
+
 `cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
 capabilities before spending runtime budget. Its first bounded selection covers twelve families and records
 unsupported cases explicitly; it does not create new families, remove assertions, or count preflight as a pass.

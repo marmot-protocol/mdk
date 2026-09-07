@@ -87,6 +87,55 @@ pub struct AppRuntimeObservationV1 {
     pub local: AppRuntimeLocalDiagnosticsV1,
 }
 
+/// One public group mutation issued at the same instant as its siblings by
+/// [`AppRuntimeHarness::race_mutations`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConcurrentMutation<'a> {
+    UpdateGroupProfile {
+        client: &'a str,
+        name: Option<&'a str>,
+        description: Option<&'a str>,
+    },
+    InviteMembers {
+        inviter: &'a str,
+        invitees: &'a [String],
+    },
+}
+
+impl ConcurrentMutation<'_> {
+    pub fn client(&self) -> &str {
+        match self {
+            Self::UpdateGroupProfile { client, .. } => client,
+            Self::InviteMembers { inviter, .. } => inviter,
+        }
+    }
+}
+
+/// Public result of one concurrently issued mutation. `accepted` means the
+/// runtime reported the command as saved to its caller; a rejected command
+/// carries only a privacy-safe error classification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrentMutationOutcome {
+    pub client: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+}
+
+/// Everything [`AppRuntimeHarness::race_mutations`] learned at the command
+/// boundary. Relay events admitted beyond the accepted commands' own
+/// publications are counted, not rejected: they are how convergence recovery
+/// or a rejected command's early publication become visible to a scenario.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrentMutationReport {
+    pub outcomes: Vec<ConcurrentMutationOutcome>,
+    /// Retained relay events the accepted commands reported publishing.
+    pub expected_publications: usize,
+    /// Retained relay events admitted after the race started, once every
+    /// accepted publication had appeared.
+    pub admitted_publications: usize,
+}
+
 struct Participant {
     root: TempDir,
     app: MarmotApp,
@@ -213,6 +262,13 @@ impl AppRuntimeHarness {
 
     async fn relay_publication_cursor(&self) -> usize {
         self.relay_control.publication_cursor().await
+    }
+
+    /// Number of events the shared relay has admitted so far. A scenario can
+    /// difference two readings to prove that a command reached the relay at
+    /// all, independently of any participant's projection.
+    pub async fn relay_admitted_events(&self) -> usize {
+        self.relay_publication_cursor().await
     }
 
     async fn set_all_maintenance_paused(&self, paused: bool) -> Result<(), SubjectError> {
@@ -475,6 +531,143 @@ impl AppRuntimeHarness {
             }
             participant.online = false;
         }
+    }
+
+    /// Advance every named online participant's durable maintenance state once
+    /// through the public runtime, publishing work whose safety windows have
+    /// elapsed. Scenarios poll this instead of waiting for the worker's own
+    /// fifteen-second timer; deadlines and jitter still run on real time.
+    pub async fn run_due_maintenance(&mut self, clients: &[String]) -> Result<(), SubjectError> {
+        for label in clients {
+            let participant = self.participant_mut(label)?;
+            if !participant.online {
+                continue;
+            }
+            let account_id = participant.account_id.clone();
+            if let Err(error) = participant
+                .runtime()?
+                .run_due_maintenance(&account_id)
+                .await
+            {
+                record_failure(participant, &error);
+                return Err(app_error(error));
+            }
+        }
+        self.refresh_cached_members(clients).await
+    }
+
+    /// Issue several mutations from different participants at the same instant
+    /// against the active scenario group, then wait until the shared relay has
+    /// admitted every accepted publication. Each participant commits against
+    /// its own current epoch, so accepted siblings may compete for one epoch;
+    /// the caller asserts the public outcome. Convergence may publish recovery
+    /// commits inside the window and a rejected command may have reached the
+    /// relay before failing, so additional admitted events are reported rather
+    /// than treated as a correlation failure.
+    pub async fn race_mutations(
+        &mut self,
+        action_id: &str,
+        mutations: &[ConcurrentMutation<'_>],
+    ) -> Result<ConcurrentMutationReport, SubjectError> {
+        if mutations.is_empty() {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "empty_concurrent_mutation_set",
+                "a concurrent mutation set needs at least one mutation",
+            ));
+        }
+        let group_id = self.active_group()?;
+        let before = self.relay_publication_cursor().await;
+        let include_welcomes = mutations
+            .iter()
+            .any(|mutation| matches!(mutation, ConcurrentMutation::InviteMembers { .. }));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, mutation) in mutations.iter().enumerate() {
+            let participant = self.participant(mutation.client())?;
+            let runtime = participant.runtime()?.clone();
+            let account_id = participant.account_id.clone();
+            let group_id = group_id.clone();
+            match mutation {
+                ConcurrentMutation::UpdateGroupProfile {
+                    name, description, ..
+                } => {
+                    let name = name.map(str::to_owned);
+                    let description = description.map(str::to_owned);
+                    tasks.spawn(async move {
+                        let result = runtime
+                            .update_group_profile(&account_id, &group_id, name, description)
+                            .await;
+                        (index, result)
+                    });
+                }
+                ConcurrentMutation::InviteMembers { invitees, .. } => {
+                    let invitees = self.account_ids(invitees)?;
+                    tasks.spawn(async move {
+                        let result = runtime
+                            .invite_members(&account_id, &group_id, &invitees)
+                            .await;
+                        (index, result)
+                    });
+                }
+            }
+        }
+        let mut results = (0..mutations.len()).map(|_| None).collect::<Vec<_>>();
+        while let Some(joined) = tasks.join_next().await {
+            let (index, result) = joined.map_err(|_| {
+                SubjectError::classified(
+                    SubjectFailureCategory::Environment,
+                    "concurrent_mutation_task_failed",
+                    "a concurrently issued app-runtime mutation did not complete",
+                )
+            })?;
+            results[index] = Some(result);
+        }
+        let mut outcomes = Vec::with_capacity(mutations.len());
+        let mut expected_publications = 0;
+        let mut expected_event_ids = Vec::new();
+        for (mutation, result) in mutations.iter().zip(results) {
+            let result = result.expect("every spawned mutation reports exactly once");
+            let client = mutation.client().to_owned();
+            outcomes.push(match result {
+                Ok(summary) => {
+                    expected_publications += summary.published;
+                    expected_event_ids.extend(summary.message_ids);
+                    ConcurrentMutationOutcome {
+                        client,
+                        accepted: true,
+                        error_kind: None,
+                    }
+                }
+                Err(error) => ConcurrentMutationOutcome {
+                    client,
+                    accepted: false,
+                    error_kind: Some(app_error_kind(&error).to_owned()),
+                },
+            });
+        }
+        let admitted_publications = self
+            .relay_control
+            .wait_for_at_least_action_events(
+                &mut self.relay_action_events,
+                action_id,
+                before,
+                RelayActionExpectation {
+                    include_welcomes,
+                    expected_publications,
+                    expected_event_ids: &expected_event_ids,
+                    timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
+                },
+            )
+            .await
+            .map_err(relay_control_error)?;
+        for outcome in outcomes.iter().filter(|outcome| outcome.accepted) {
+            self.record_accepted_publication(&outcome.client, action_id);
+        }
+        Ok(ConcurrentMutationReport {
+            outcomes,
+            expected_publications,
+            admitted_publications,
+        })
     }
 
     fn active_group(&self) -> Result<GroupId, SubjectError> {
@@ -1488,8 +1681,10 @@ pub(crate) async fn accept_group_invite_retrying_busy(
     Err(last_retryable)
 }
 
-fn record_failure(participant: &mut Participant, error: &AppError) {
-    let kind = match error {
+/// Privacy-safe classification of a public runtime error: a fixed label per
+/// variant family, never the variant's inner details.
+fn app_error_kind(error: &AppError) -> &'static str {
+    match error {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
@@ -1502,10 +1697,18 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "storage"
         }
+        AppError::UnknownGroup(_) => "unknown_group",
+        AppError::GroupRemoved(_) => "group_removed",
+        AppError::GroupDisbanding(_) => "group_disbanding",
+        AppError::GroupInviteNotPending => "group_invite_not_pending",
+        AppError::MissingKeyPackage(_) => "missing_key_package",
+        AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         _ => "app_runtime_operation",
     }
-    .to_owned();
-    participant.last_error_kind = Some(kind);
+}
+
+fn record_failure(participant: &mut Participant, error: &AppError) {
+    participant.last_error_kind = Some(app_error_kind(error).to_owned());
     if matches!(
         error,
         AppError::AccountSessionBusy
@@ -1598,7 +1801,10 @@ fn app_error(error: AppError) -> SubjectError {
     SubjectError::classified(
         category,
         "app_runtime_operation_failed",
-        "application runtime operation failed",
+        format!(
+            "application runtime operation failed: {}",
+            app_error_kind(&error)
+        ),
     )
 }
 
