@@ -267,17 +267,21 @@ fn build_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorag
     (engine, storage)
 }
 
-fn build_epoch_gate_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+fn build_epoch_gate_client(
+    id: &[u8],
+    clock: Option<ManualConvergenceClock>,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
-    let engine = EngineBuilder::new(storage.clone())
+    let mut builder = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
-        .peeler(Box::new(EpochGatePeeler))
-        .build()
-        .unwrap();
-    (engine, storage)
+        .peeler(Box::new(EpochGatePeeler));
+    if let Some(clock) = clock {
+        builder = builder.convergence_clock(Arc::new(clock));
+    }
+    (builder.build().unwrap(), storage)
 }
 
 fn build_client_with_storage(
@@ -8523,7 +8527,7 @@ async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
 #[tokio::test]
 async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
     let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol", None);
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
@@ -8636,7 +8640,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
 #[tokio::test]
 async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
     let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol", None);
     let (mut david, _david_storage) = build_client(b"david");
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -9715,7 +9719,11 @@ async fn forked_epoch_with_an_unreadable_witness(
 ) {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
-    let (mut carol, _carol_storage) = build_epoch_gate_client(b"carol");
+    // These lineage probes admit commits at 1_000 and must keep that
+    // generation collecting while they retry opaque input. Real elapsed time
+    // can cross the cutoff during fixture setup on a busy test runner.
+    let (mut carol, _carol_storage) =
+        build_epoch_gate_client(b"carol", Some(ManualConvergenceClock::new(1_000, 1_000)));
     let (mut david, _david_storage) = build_client(b"david");
     let (mut eve, _eve_storage) = build_client(b"eve");
 
