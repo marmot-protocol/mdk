@@ -3568,7 +3568,11 @@ async def _standalone_send(
     return {"error": result.error or "Marmot send failed"}
 
 
-async def _marmot_status_tool(args: Dict[str, Any]) -> str:
+async def _marmot_status_tool(
+    args: Dict[str, Any],
+    *,
+    effective_config: Optional[Callable[[PlatformConfig], PlatformConfig]] = None,
+) -> str:
     """Expose the passive staged readiness probe on Hermes's platform tool surface."""
 
     del args
@@ -3581,6 +3585,8 @@ async def _marmot_status_tool(args: Dict[str, Any]) -> str:
             config = loaded.platforms.get(Platform("marmot"))
             if config is None:
                 config = PlatformConfig(enabled=False)
+            if effective_config is not None:
+                config = effective_config(config)
             status = await probe_readiness(config)
         else:
             status = await probe_readiness(adapter.config, client=adapter.client)
@@ -3742,6 +3748,9 @@ def register(ctx):
     def enablement_seed():
         return _enablement_seed(plugin_settings)
 
+    async def status_handler(args):
+        return await _marmot_status_tool(args, effective_config=effective)
+
     async def standalone_sender(
         config,
         chat_id,
@@ -3794,7 +3803,7 @@ def register(ctx):
                 "additionalProperties": False,
                 "properties": {},
             },
-            handler=_marmot_status_tool,
+            handler=status_handler,
             is_async=True,
         )
         register_tool(

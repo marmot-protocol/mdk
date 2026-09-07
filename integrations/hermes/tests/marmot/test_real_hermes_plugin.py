@@ -243,6 +243,13 @@ def _exercise_settings_only_default_target(expected_group_id: str) -> None:
         captured.update(platform=platform.value, chat_id=chat_id, text=text)
         return {"success": True, "message_id": "default-target-probe"}
 
+    prepare_platforms = getattr(send_tool, "prepare_send_message_platforms", None)
+    if prepare_platforms is None:
+        print(
+            "skip: settings-only default target (Hermes host lacks plugin preparation hook)"
+        )
+        return
+
     with (
         mock.patch.object(send_tool, "prepare_send_message_platforms", return_value=None),
         mock.patch.object(send_tool, "_send_to_platform", side_effect=fake_send),
@@ -468,7 +475,10 @@ def main() -> int:
             "socket_path": str(home / "marmot-agent.sock"),
             "home_channel": settings_home,
         }
-        config_api.save_config(raw_config, strip_defaults=False)
+        save_kwargs = {}
+        if "strip_defaults" in inspect.signature(config_api.save_config).parameters:
+            save_kwargs["strip_defaults"] = False
+        config_api.save_config(raw_config, **save_kwargs)
         manager.discover_and_load(force=True)
         _exercise_settings_only_default_target(settings_home)
 
