@@ -27,13 +27,11 @@ const MAINTENANCE_PUBLICATION_BUDGET: Duration = Duration::from_secs(150);
 /// build whose wiring silently fell back to production windows fails here.
 const FAST_MAINTENANCE_PUBLICATION_BUDGET: Duration = Duration::from_secs(45);
 /// How long the survivors of a voluntary leave may take to apply it. The
-/// engine schedules the SelfRemove auto-commit within 50 ms of the proposal,
-/// so the strict form allows a generous 30 s. The default form allows three
-/// minutes because today the app worker only reaches that auto-commit when
-/// some other commit or timer runs convergence for the group; see
-/// APP_PATH_COVERAGE.md.
-const STRICT_LEAVE_APPLICATION_BUDGET: Duration = Duration::from_secs(30);
-const EVENTUAL_LEAVE_APPLICATION_BUDGET: Duration = Duration::from_secs(180);
+/// engine schedules the SelfRemove auto-commit within 50 ms of the proposal
+/// and the worker arms a wakeup for it, so the round trip over a real relay is
+/// a few seconds. Thirty seconds is generous while staying far below the 50 to
+/// 80 seconds the removal used to wait for an unrelated rotation (#1736).
+const LEAVE_APPLICATION_BUDGET: Duration = Duration::from_secs(30);
 
 type Timeline = BTreeMap<String, Vec<String>>;
 
@@ -43,7 +41,7 @@ enum Journey {
     ConcurrentProfileEdits { strict: bool },
     ConcurrentInviteAndRename { strict: bool },
     RemovedWhileOffline,
-    LeaveWithSeveralRemaining { strict: bool },
+    LeaveWithSeveralRemaining,
     ManualSelfUpdate,
 }
 
@@ -51,10 +49,7 @@ impl Journey {
     fn label(self) -> &'static str {
         match self {
             Self::TwoGroups => "two_groups",
-            Self::LeaveWithSeveralRemaining { strict: false } => "leave_with_several_remaining",
-            Self::LeaveWithSeveralRemaining { strict: true } => {
-                "leave_with_several_remaining_strict"
-            }
+            Self::LeaveWithSeveralRemaining => "leave_with_several_remaining",
             Self::ConcurrentProfileEdits { strict: false } => "concurrent_profile_edits",
             Self::ConcurrentProfileEdits { strict: true } => "concurrent_profile_edits_strict",
             Self::ConcurrentInviteAndRename { strict: false } => "concurrent_invite_and_rename",
@@ -715,13 +710,9 @@ async fn removed_while_offline(subject: &mut AppRuntimeHarness, out: &Path) -> T
 /// auto-commit the same `Leave` proposal by reference, so rival commits can
 /// race for one epoch on a real-world departure. The survivors must settle on
 /// one state and keep exchanging decryptable traffic in both directions, and
-/// the leaver's device must keep exactly its pre-departure history. The strict
-/// form also requires the survivors to apply the leave promptly.
-async fn leave_with_several_remaining(
-    subject: &mut AppRuntimeHarness,
-    out: &Path,
-    strict: bool,
-) -> TestResult {
+/// the leaver's device must keep exactly its pre-departure history, all within
+/// a budget far shorter than any maintenance rotation.
+async fn leave_with_several_remaining(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
     let clients = labels(&["alice", "bob", "carol", "david"]);
     create_group(
         subject,
@@ -747,13 +738,8 @@ async fn leave_with_several_remaining(
     // The survivors' runtimes learn the proposal from their live subscriptions;
     // the engine schedules the auto-commit within 50 ms. Poll slowly so the
     // harness itself is not what keeps the worker busy.
-    let budget = if strict {
-        STRICT_LEAVE_APPLICATION_BUDGET
-    } else {
-        EVENTUAL_LEAVE_APPLICATION_BUDGET
-    };
     let left_at = tokio::time::Instant::now();
-    let deadline = left_at + budget;
+    let deadline = left_at + LEAVE_APPLICATION_BUDGET;
     let mut rounds = 0_u32;
     let settled = loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -918,7 +904,7 @@ async fn check(journey: Journey) {
     };
     fs_private::create_dir_all_private(artifacts.path()).unwrap();
     let clients = match journey {
-        Journey::ConcurrentInviteAndRename { .. } | Journey::LeaveWithSeveralRemaining { .. } => {
+        Journey::ConcurrentInviteAndRename { .. } | Journey::LeaveWithSeveralRemaining => {
             labels(&["alice", "bob", "carol", "david"])
         }
         Journey::ManualSelfUpdate => labels(&["alice", "bob"]),
@@ -961,8 +947,8 @@ async fn check(journey: Journey) {
             Journey::RemovedWhileOffline => {
                 removed_while_offline(&mut subject, artifacts.path()).await
             }
-            Journey::LeaveWithSeveralRemaining { strict } => {
-                leave_with_several_remaining(&mut subject, artifacts.path(), strict).await
+            Journey::LeaveWithSeveralRemaining => {
+                leave_with_several_remaining(&mut subject, artifacts.path()).await
             }
             Journey::ManualSelfUpdate => manual_self_update(&mut subject, artifacts.path()).await,
         }
@@ -1026,7 +1012,7 @@ journey_test!(
 );
 journey_test!(
     public_app_12_leave_with_several_remaining_members_converges,
-    Journey::LeaveWithSeveralRemaining { strict: false }
+    Journey::LeaveWithSeveralRemaining
 );
 
 // The strict forms additionally require that an edit the runtime reported as
@@ -1043,15 +1029,6 @@ async fn public_app_08_strict_concurrent_admin_profile_edits_are_never_lost() {
 #[ignore = "known gap: a losing invite or rename is dropped after its caller was told it saved"]
 async fn public_app_09_strict_concurrent_invite_and_rename_are_never_lost() {
     check(Journey::ConcurrentInviteAndRename { strict: true }).await;
-}
-
-// The engine schedules a peer's SelfRemove auto-commit within 50 ms, but the
-// app worker's convergence schedule has no arm for it, so survivors apply a
-// leave only when some other commit or timer runs convergence for the group.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: survivors apply a voluntary leave only when another commit runs convergence"]
-async fn public_app_12_strict_leave_is_applied_by_survivors_promptly() {
-    check(Journey::LeaveWithSeveralRemaining { strict: true }).await;
 }
 
 // Built with `test-policy-overrides`, the harness zeroes the maintenance quiet

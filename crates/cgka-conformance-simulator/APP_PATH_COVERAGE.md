@@ -103,17 +103,17 @@ may already have reached the relay, so only accepted publications are correlated
 | `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
 | `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1734, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
-| `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
-| `12_strict_leave_is_applied_by_survivors_promptly` (ignored, #1736) | As above, but the survivors must apply the leave within 30 seconds |
+| `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within 30 seconds the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
 | `11_manual_self_update_advances_every_member` (ignored unless built with `test-policy-overrides`) | A manual self-update advances the shared epoch with no loss, then messaging and reopen persistence hold. The harness zeroes the maintenance quiet window and jitter in test-policy builds, where the rotation must land within 45 seconds, below the 60-second production quiet window, so a build whose override silently stopped applying fails rather than passing on production timing; `just simulator-fast-maintenance` runs it that way in the nightly lane. An ordinary build would wait out the real-time 60-second quiet window plus up to 30 seconds of jitter (passed locally in about 150 seconds on 2026-09-06), so it stays ignored there |
 
 On 2026-09-06 the four default race, group, and removal journeys passed locally in debug mode in about 80 seconds
 total, the default leave journey passed in about two minutes, and the strict variants failed only on the documented
 contracts below. The default concurrent journeys accept either race outcome. They fail when members do not settle, when neither edit
 is present in the settled state, or when fresh traffic or reopen persistence breaks. They do not prove that a same-epoch
-fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
-[#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
-and [#1736](https://github.com/marmot-protocol/mdk/issues/1736); the ignored strict journeys are their regressions.
+fork occurred on a given run; real socket timing is not seed-controlled. The two remaining gaps below are tracked in
+[#1734](https://github.com/marmot-protocol/mdk/issues/1734) and [#1735](https://github.com/marmot-protocol/mdk/issues/1735);
+the ignored strict journeys are their regressions. The leave latency gap
+([#1736](https://github.com/marmot-protocol/mdk/issues/1736)) is fixed and its 30-second contract is now the default journey.
 
 Run the default journeys the way the conformance CI job does, or serially with retained evidence:
 
@@ -143,19 +143,18 @@ evolutions are marked superseded and their intent is not re-issued or reported. 
 The strict journeys stay ignored until the runtime either re-issues a parked intent or reports the loss to the
 caller; the default journeys keep the convergence, delivery, and persistence contract green in the ordinary run.
 
-### Known gap: survivors apply a voluntary leave only when something else runs convergence (#1736)
+### Fixed: survivors apply a voluntary leave promptly (#1736)
 
 The engine schedules a peer's SelfRemove auto-commit 10 to 50 ms after the proposal and marks the group as one the
-app should feed through its convergence timer. The app worker's schedule state, however, is derived from open
+app should feed through its convergence timer. Until #1736 the app worker's schedule state was derived only from open
 convergence passes, unresolved convergence rows, queued outbound intents, pending fanouts, and deferred peels; a
-scheduled auto-commit is none of those, so the group reads `Idle` and no timer is armed. On 2026-09-06 four
-instrumented runs showed the proposal admitted by the relay immediately and the three survivors unchanged at epoch 1
-for 50 to 80 seconds, until their post-join rotations happened to run convergence and carried the removal with them
-(epoch 1 to 4 across three commits). The existing send-leave family canary shows the same shape: its post-leave
-checkpoint took 82 seconds. In a settled group with no rotation due, a departed member would stay on the roster and
-keep the current epoch secret until the next unrelated commit. The strict journey stays ignored until the worker
-arms a wakeup for scheduled auto-commits; the default journey allows three minutes so the eventual contract stays
-green. Neither run needed a manual `retry_group_convergence`.
+scheduled auto-commit is none of those, so the group read `Idle`, no timer was armed, and on 2026-09-06 four
+instrumented runs showed the three survivors unchanged for 50 to 80 seconds until their post-join rotations happened
+to run convergence and carried the removal with them. The worker now consults
+`scheduled_self_remove_auto_commit_delay_ms` (engine, session, and account mirrors) and arms `Ready` or `Collecting`
+for it; hydration rebuilds the schedule across a restart, and the leaver itself never reports one. Journey 12 now
+requires the survivors to apply the leave within 30 seconds, and a worker-level test in `marmot-app` commits a peer's
+leave without any manual `retry_group_convergence`.
 
 The invite-versus-rename race decides differently from run to run (#1735). When the invite won, the rename was dropped and
 the invitee joined normally. When the rename won (strict run, same day), `invite_members` had still returned

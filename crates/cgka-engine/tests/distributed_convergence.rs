@@ -10198,3 +10198,110 @@ async fn live_deferral_reclassifies_graph_after_a_retry_sweep_and_new_rival() {
         "live recovery evidence must use the current stored graph"
     );
 }
+
+/// A peer's SelfRemove proposal schedules an auto-commit that lives in
+/// in-memory engine state, not in any convergence input, so a runtime that
+/// derives its wakeups from passes and stored rows never fires for it. The
+/// scheduler query exposes the schedule until a convergence advance stages the
+/// commit, survives a restart through hydration, and stays `None` on the
+/// leaver, who must never commit its own removal (mdk#1736).
+#[tokio::test]
+async fn scheduled_self_remove_auto_commit_is_visible_to_the_scheduler_until_staged() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "scheduler-visible leave".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "nothing is scheduled before any leave"
+    );
+
+    let leave = route(
+        proposal(
+            bob.send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        ),
+        &group_id,
+    );
+    assert_eq!(
+        bob.scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "the leaver never schedules its own removal"
+    );
+    alice.ingest(leave).await.unwrap();
+    let delay = alice
+        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+        .unwrap()
+        .expect("a peer's leave schedules an auto-commit");
+    assert!(
+        delay <= 50,
+        "the auto-commit jitter is 10 to 50 ms, got {delay}"
+    );
+
+    // Restart before the schedule fires: hydration rebuilds it from the
+    // durable proposal, so the reopened runtime still has a wakeup to arm.
+    drop(alice);
+    let mut alice = build_client_with_storage(b"alice", alice_storage.clone());
+    alice.hydrate_all_stored_groups().unwrap();
+    assert!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap()
+            .is_some(),
+        "a restart must not lose the scheduled auto-commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        Some(0),
+        "a due schedule reads as ready"
+    );
+    alice.advance_convergence(&group_id).await.unwrap();
+    let staged = alice.drain_auto_publish();
+    assert_eq!(
+        staged.len(),
+        1,
+        "the due schedule stages exactly one SelfRemove commit"
+    );
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "a staged commit clears the schedule"
+    );
+}

@@ -205,6 +205,11 @@ until publication is confirmed.
 If publication fails, the engine clears the staged commit and re-derives Marmot metadata from the still-unmerged OpenMLS
 group. Auto-publish and explicit `send` paths now share the same publish-before-apply rule.
 
+The auto-commit is scheduled a few tens of milliseconds after the proposal and staged only by a later convergence
+advance. Because the schedule is neither an open pass nor a stored convergence input, a host scheduler MUST consult
+`scheduled_self_remove_auto_commit_delay_ms` and keep a wakeup armed while it reports a pending schedule; otherwise the
+departed member remains on the roster until an unrelated commit runs convergence.
+
 ## Outbound Intent Gating
 
 If a group has unresolved convergence input, `send(intent)` MUST store the intent durably and return

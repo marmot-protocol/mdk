@@ -13260,3 +13260,80 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
     );
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// A peer's voluntary leave must be applied by the remaining runtimes on their
+/// own. The engine schedules the SelfRemove auto-commit within 50 ms of the
+/// proposal; the account worker has to arm a wakeup for that schedule instead
+/// of waiting for an unrelated commit to run convergence (mdk#1736). No manual
+/// `retry_group_convergence` is allowed here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
+    let carol = create_network_ready_identity(&runtime, setup()).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "departures without manual retry",
+            &[bob_id.clone(), carol_id.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    for member in [&bob_id, &carol_id] {
+        wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                    if account_id_hex == member && joined == &group_id
+            )
+        })
+        .await;
+        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+            .await
+            .unwrap();
+    }
+
+    runtime.leave_group(&bob_id, &group_id).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let alice_members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+        let carol_members = runtime.group_members(&carol_id, &group_id).await.unwrap();
+        let gone = |members: &[marmot_app::AppGroupMemberRecord]| {
+            !members.iter().any(|member| member.member_id_hex == bob_id)
+        };
+        if gone(&alice_members) && gone(&carol_members) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the remaining runtimes did not apply bob's leave within 20 seconds \
+             (alice sees {} members, carol sees {})",
+            alice_members.len(),
+            carol_members.len()
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let alice_state = runtime.group_mls_state(&alice_id, &group_id).await.unwrap();
+    let carol_state = runtime.group_mls_state(&carol_id, &group_id).await.unwrap();
+    assert_eq!(
+        alice_state.epoch, carol_state.epoch,
+        "the survivors converge on the epoch that applied the leave"
+    );
+    runtime.shutdown().await;
+}

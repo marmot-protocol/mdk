@@ -526,6 +526,15 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   `InvalidCommit(MissingProposal)`, the rival never becomes a candidate, and the device keeps whichever branch arrived
   first while reporting `Settled`. Tests: `tests/distributed_convergence.rs::by_reference_rival_that_wins_the_tiebreak_displaces_the_adopted_branch`
   and its losing-direction control.
+- **A scheduled SelfRemove auto-commit is scheduler-visible state, not a convergence input.** A peer's `Leave`
+  schedules the auto-commit 10 to 50 ms out in `scheduled_self_remove_auto_commits` and hints
+  `pending_convergence_groups`, but no pass opens and no stored row changes, so a runtime that derives wakeups from
+  `prepare_convergence_cutoff_delay_ms`, unresolved rows, queued intents, fanouts, and deferred peels reads the group as
+  idle and the removal waits for an unrelated commit (mdk#1736). Runtimes must also consult
+  `scheduled_self_remove_auto_commit_delay_ms` (`Some(0)` when due, `None` when nothing is scheduled, the epoch is not
+  `Stable`, the group is quarantined or unhydrated, or this device is itself leaving) and keep a wakeup armed while it
+  is `Some`; only a convergence advance stages the commit. Test:
+  `tests/distributed_convergence.rs::scheduled_self_remove_auto_commit_is_visible_to_the_scheduler_until_staged`.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

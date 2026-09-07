@@ -1086,9 +1086,9 @@ its pre-removal history exactly, and have its own sends refused), and a voluntar
 The default forms run in the ordinary crate test and gate only what the product delivers today: members settle on one
 public state, at least one racing edit is present in that settled state (measured on the projection, never on the
 command's return value), fresh traffic flows in every direction, history survives reopen, and survivors apply a leave
-within three minutes. The strict forms are ignored regressions for three tracked gaps: an edit or invite the runtime
-reported as saved is never lost (#1734), an invitee the founders exclude holds no projection rather than a stranded
-parked-branch membership (#1735), and survivors apply a leave within 30 seconds (#1736). The manual self-update journey
+within 30 seconds (#1736). The strict forms are ignored regressions for two tracked gaps: an edit or invite the runtime
+reported as saved is never lost (#1734), and an invitee the founders exclude holds no projection rather than a stranded
+parked-branch membership (#1735). The manual self-update journey
 runs with zeroed maintenance windows when the crate is built with `test-policy-overrides`
 (`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter run
 on real time.

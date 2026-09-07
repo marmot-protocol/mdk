@@ -540,13 +540,23 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
     ) -> Result<ConvergenceScheduleState, AppError> {
         let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        // A peer's SelfRemove proposal schedules an auto-commit a few tens of
+        // milliseconds out, but that schedule is neither a pass nor a stored
+        // convergence input: without consulting it here the group reads
+        // `Idle`, nothing wakes the worker, and the departed member stays on
+        // the roster until some unrelated commit runs convergence (mdk#1736).
+        let auto_commit_delay = self
+            .runtime
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)?;
         match convergence_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
             Some(remaining_ms) => {
                 let remaining_ms = self
                     .runtime
                     .deferred_peel_cutoff_delay_ms(group_id)?
-                    .map_or(remaining_ms, |deferred| remaining_ms.min(deferred));
+                    .into_iter()
+                    .chain(auto_commit_delay)
+                    .fold(remaining_ms, u64::min);
                 if remaining_ms == 0 {
                     Ok(ConvergenceScheduleState::Ready)
                 } else {
@@ -554,6 +564,13 @@ impl AppClient {
                 }
             }
             None => {
+                if let Some(remaining_ms) = auto_commit_delay {
+                    return Ok(if remaining_ms == 0 {
+                        ConvergenceScheduleState::Ready
+                    } else {
+                        ConvergenceScheduleState::Collecting { remaining_ms }
+                    });
+                }
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)? {
