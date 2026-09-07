@@ -477,7 +477,7 @@ impl KeyPackageLifecycleState {
         self.consumed_key_package_refs
             .retain(|candidate| candidate.as_slice() != key_package_ref);
         if self.last_consumed_key_package_ref.as_deref() == Some(key_package_ref) {
-            self.last_consumed_key_package_ref = self.consumed_key_package_refs.last().cloned();
+            self.last_consumed_key_package_ref = None;
             self.last_consumed_at = None;
         }
     }
@@ -590,10 +590,15 @@ mod tests {
             vec![vec![1], vec![2]],
             "only the account sweep may clear older unswept evidence"
         );
-        lifecycle.clear_consumed_key_package_ref(&[1]);
-        assert_eq!(lifecycle.consumed_key_package_refs, vec![vec![2]]);
-        lifecycle.current_key_package_ref = None;
         lifecycle.clear_consumed_key_package_ref(&[2]);
+        assert_eq!(lifecycle.consumed_key_package_refs, vec![vec![1]]);
+        assert!(
+            lifecycle.last_consumed_key_package_ref.is_none(),
+            "clearing the legacy marker must not reassign it onto a remaining journal ref"
+        );
+        assert!(lifecycle.last_consumed_at.is_none());
+        lifecycle.current_key_package_ref = None;
+        lifecycle.clear_consumed_key_package_ref(&[1]);
         assert!(lifecycle.consumed_key_package_refs.is_empty());
         assert!(lifecycle.last_consumed_key_package_ref.is_none());
         assert!(lifecycle.last_consumed_at.is_none());
