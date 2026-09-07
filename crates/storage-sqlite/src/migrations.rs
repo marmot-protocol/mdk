@@ -122,8 +122,13 @@ mod migration_0060_released_transport_receipts;
 mod migration_0061_transport_reconciliation_replay_cursor;
 #[path = "migrations/0062_chat_list_preview_indexes.rs"]
 mod migration_0062_chat_list_preview_indexes;
-#[path = "migrations/0063_own_commit_intents.rs"]
-mod migration_0063_own_commit_intents;
+#[path = "migrations/0063_query_indexes.rs"]
+mod migration_0063_query_indexes;
+#[path = "migrations/0064_own_commit_intents.rs"]
+mod migration_0064_own_commit_intents;
+#[cfg(test)]
+#[path = "migrations/query_work_tests.rs"]
+mod query_work_tests;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -451,8 +456,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 63,
-        name: "0063_own_commit_intents",
-        apply: migration_0063_own_commit_intents::apply,
+        name: "0063_query_indexes",
+        apply: migration_0063_query_indexes::apply,
+    },
+    Migration {
+        version: 64,
+        name: "0064_own_commit_intents",
+        apply: migration_0064_own_commit_intents::apply,
     },
 ];
 
@@ -672,6 +682,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const CRASH_CHILD_ENV: &str = "MDK_STORAGE_TEST_CRASH_CHILD";
+
     const CRASH_DATABASE_ENV: &str = "MDK_STORAGE_TEST_CRASH_DATABASE";
     const CRASH_READY_FILE_ENV: &str = "MDK_STORAGE_TEST_CRASH_READY_FILE";
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
@@ -685,6 +696,75 @@ mod tests {
         let tx = conn.transaction().unwrap();
         migration_0062_chat_list_preview_indexes::apply(&tx).unwrap();
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn seen_recency_index_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..62]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO seen_events(rowid, event_id, seen_at) VALUES
+             (2, 'old', 1), (5, 'tie-first', 9), (11, 'tie-last', 9);",
+        )
+        .unwrap();
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+        let mut statement = conn
+            .prepare("SELECT event_id FROM seen_events ORDER BY seen_at DESC, rowid DESC")
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids, ["tie-last", "tie-first", "old"]);
+        assert_eq!(statement.get_status(rusqlite::StatementStatus::Sort), 0);
+    }
+
+    #[test]
+    fn master_query_indexes_upgrade_to_own_commit_intents_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master-to-own-intents.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..63]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO seen_events(event_id, seen_at) VALUES ('retained', 9);
+             INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 1, x'00');",
+        )
+        .unwrap();
+
+        run_all(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
+             VALUES (x'01', x'aa', 1, x'bb');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = keyed_connection(&path);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            applied_name(&conn, 63).unwrap().as_deref(),
+            Some("0063_query_indexes")
+        );
+        assert_eq!(
+            applied_name(&conn, 64).unwrap().as_deref(),
+            Some("0064_own_commit_intents")
+        );
+        let retained: String = conn
+            .query_row(
+                "SELECT event_id FROM seen_events INDEXED BY idx_seen_events_recency",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "retained");
+        let intent: Vec<u8> = conn
+            .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent, [0xbb]);
     }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
@@ -1049,7 +1129,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 63,
+                found: 64,
                 latest_supported: 46,
             }
         ));
@@ -1105,7 +1185,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 63,
+                found: 64,
                 latest_supported: 46,
             }
         ));
@@ -1409,7 +1489,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 63,
+                found: 64,
                 latest_supported: 46,
             }
         ));

@@ -155,14 +155,17 @@ impl SqliteAccountStorage {
             let inventory_since =
                 route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
             if created_at >= inventory_since {
-                tx.execute_cached(
-                    "INSERT OR IGNORE INTO transport_reconciliation_items (
+                let inserted = tx
+                    .execute_cached(
+                        "INSERT OR IGNORE INTO transport_reconciliation_items (
                          route_kind, route_id, event_id, created_at
                      ) VALUES (?1, ?2, ?3, ?4)",
-                    params![route_kind, route_id, item.event_id.as_slice(), created_at],
-                )
-                .storage()?;
-                compact_route_tx(&tx, route_kind, route_id)?;
+                        params![route_kind, route_id, item.event_id.as_slice(), created_at],
+                    )
+                    .storage()?;
+                if inserted != 0 {
+                    compact_route_tx(&tx, route_kind, route_id)?;
+                }
             }
             tx.commit().storage()?;
             Ok(())
@@ -545,6 +548,15 @@ mod tests {
             .unwrap();
         store
             .record_transport_reconciliation_item(&inbox, &later)
+            .unwrap();
+        store
+            .record_transport_reconciliation_item(
+                &group,
+                &TransportReconciliationItem {
+                    event_id: later.event_id,
+                    created_at: now + 1,
+                },
+            )
             .unwrap();
 
         assert_eq!(
