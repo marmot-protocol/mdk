@@ -3,7 +3,8 @@ use crate::connection::retry_on_busy;
 use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
 use cgka_traits::OutboundFanout;
 use cgka_traits::storage::{
-    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageResult,
+    OutboundFanoutStorage, OutboundIntentStorage, OwnCommitIntent, QueuedOutboundIntent,
+    StorageError, StorageResult,
 };
 use cgka_traits::types::{GroupId, MessageId};
 use rusqlite::{OptionalExtension, params};
@@ -81,6 +82,104 @@ impl OutboundIntentStorage for SqliteAccountStorage {
         };
         if changed == 0 {
             return Err(StorageError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn put_own_commit_intent(&self, record: &OwnCommitIntent) -> StorageResult<()> {
+        // Written inside the send path right after a commit is staged, and
+        // read only by supersession reconcilers, so a single autocommit upsert
+        // is safe to retry on transient lock contention.
+        let serialized = serialize(record)?;
+        let write = || {
+            let conn = self.lock()?;
+            conn.execute_cached(
+                "INSERT INTO cgka_own_commit_intents (commit_id, group_id, insert_order, record)
+                 VALUES (
+                    ?1,
+                    ?2,
+                    (SELECT COALESCE(MAX(insert_order), 0) + 1 FROM cgka_own_commit_intents),
+                    ?3
+                 )
+                 ON CONFLICT(commit_id) DO UPDATE SET
+                    group_id = excluded.group_id,
+                    record = excluded.record",
+                params![
+                    record.commit_id.as_slice(),
+                    record.group_id.as_slice(),
+                    serialized,
+                ],
+            )
+            .storage()?;
+            Ok(())
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            retry_on_busy(write)
+        }
+    }
+
+    fn own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<Option<OwnCommitIntent>> {
+        let conn = self.lock()?;
+        let record = conn
+            .query_row_cached(
+                "SELECT record FROM cgka_own_commit_intents WHERE commit_id = ?1",
+                params![commit_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .storage()?;
+        record.map(|record| deserialize(&record)).transpose()
+    }
+
+    fn list_own_commit_intents(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> StorageResult<Vec<OwnCommitIntent>> {
+        let conn = self.lock()?;
+        let records = match group_id {
+            Some(group_id) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT record FROM cgka_own_commit_intents
+                         WHERE group_id = ?1
+                         ORDER BY insert_order",
+                    )
+                    .storage()?;
+                stmt.query_map(params![group_id.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+                    .storage()?
+                    .collect::<Result<Vec<_>, _>>()
+                    .storage()?
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT record FROM cgka_own_commit_intents ORDER BY insert_order",
+                    )
+                    .storage()?;
+                stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .storage()?
+                    .collect::<Result<Vec<_>, _>>()
+                    .storage()?
+            }
+        };
+        records.iter().map(|record| deserialize(record)).collect()
+    }
+
+    fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
+        let delete = || {
+            self.lock()?
+                .execute_cached(
+                    "DELETE FROM cgka_own_commit_intents WHERE commit_id = ?1",
+                    params![commit_id.as_slice()],
+                )
+                .storage()
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            delete()?;
+        } else {
+            retry_on_busy(delete)?;
         }
         Ok(())
     }
@@ -363,6 +462,69 @@ mod tests {
             .map(|queued| queued.id)
             .collect();
         assert_eq!(ids, vec![mid(1)]);
+    }
+
+    #[test]
+    fn own_commit_intents_round_trip_and_list_in_insert_order() {
+        use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent};
+        use cgka_traits::types::{GroupId, MessageId};
+        use cgka_traits::{EpochId, SendIntent};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store.put_group(&sample_group(gid(2), 0, 0)).unwrap();
+        let record = |commit_id: MessageId, group_id: GroupId| OwnCommitIntent {
+            commit_id,
+            group_id: group_id.clone(),
+            source_epoch: EpochId(3),
+            intent: SendIntent::UpdateGroupData {
+                group_id,
+                name: Some("renamed".to_owned()),
+                description: None,
+            },
+            baseline: OwnCommitBaseline::GroupProfile {
+                name: "before".to_owned(),
+                description: "described".to_owned(),
+            },
+            reissue_attempts: 1,
+            created_at_ms: 42,
+        };
+        store
+            .put_own_commit_intent(&record(mid(3), gid(1)))
+            .unwrap();
+        store
+            .put_own_commit_intent(&record(mid(1), gid(1)))
+            .unwrap();
+        store
+            .put_own_commit_intent(&record(mid(2), gid(2)))
+            .unwrap();
+
+        assert_eq!(
+            store.own_commit_intent(&mid(1)).unwrap(),
+            Some(record(mid(1), gid(1))),
+            "every field must survive the round trip"
+        );
+        let ids = |group_id: Option<&GroupId>| {
+            store
+                .list_own_commit_intents(group_id)
+                .unwrap()
+                .into_iter()
+                .map(|intent| intent.commit_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(Some(&gid(1))), vec![mid(3), mid(1)]);
+        assert_eq!(ids(None), vec![mid(3), mid(1), mid(2)]);
+
+        store.delete_own_commit_intent(&mid(3)).unwrap();
+        store
+            .delete_own_commit_intent(&mid(3))
+            .expect("deleting a consumed record is idempotent");
+        assert_eq!(store.own_commit_intent(&mid(3)).unwrap(), None);
+        assert_eq!(ids(Some(&gid(1))), vec![mid(1)]);
+
+        // A record dies with its group.
+        store.delete_group(&gid(2)).unwrap();
+        assert_eq!(ids(None), vec![mid(1)]);
     }
 
     #[test]

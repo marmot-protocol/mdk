@@ -98,8 +98,7 @@ may already have reached the relay, so only accepted publications are correlated
 | Test suffix | Public contract |
 | --- | --- |
 | `07_two_groups_stay_isolated` | Work and pair groups on one device; the second invite of Bob needs a fresh KeyPackage; a non-member has no projection; a removal and a reopen leave the other group's exact history untouched |
-| `08_concurrent_admin_profile_edits_converge` | Two admins save name and description at the same instant; members settle on one state in which at least one edit is present (measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
-| `08_strict_concurrent_admin_profile_edits_are_never_lost` (ignored, #1734) | As above, and every edit the runtime reported as saved is present in the settled state |
+| `08_concurrent_admin_profile_edits_are_never_lost` | Two admins save name and description at the same instant; members settle on one state in which both edits are present, because the losing commit's edit is re-issued when the winner left its field untouched (#1734; measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
 | `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
 | `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1734, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
@@ -113,7 +112,9 @@ contracts below. The default concurrent journeys accept either race outcome. The
 is present in the settled state, or when fresh traffic or reopen persistence breaks. They do not prove that a same-epoch
 fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
 [#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
-and [#1736](https://github.com/marmot-protocol/mdk/issues/1736); the ignored strict journeys are their regressions.
+and [#1736](https://github.com/marmot-protocol/mdk/issues/1736); the ignored strict journeys are their regressions. The
+dropped-edit gap ([#1734](https://github.com/marmot-protocol/mdk/issues/1734)) is fixed for profile edits, and its
+never-lost contract is now the default journey 08; the strict journey 09 stays ignored for the invite half (#1735).
 
 Run the default journeys the way the conformance CI job does, or serially with retained evidence:
 
@@ -132,16 +133,23 @@ self-update journey; `just simulator-fast-maintenance` runs that journey with ze
 `app-runtime-journeys` test group in `.config/nextest.toml` runs at most two public journeys at a time, because each
 one starts a local relay and several SQLCipher runtimes and then waits on real settlement windows.
 
-### Known gap: a losing admin edit is dropped after its caller was told it saved (#1734)
+### Fixed: a losing admin edit is re-issued or reported, never silently dropped (#1734)
 
 The first run of the strict profile-edit journey (2026-09-06) showed both `update_group_profile` calls returning
 success, every member settling at the next epoch with Bob's description, and Alice's rename absent everywhere, with
-no error event on any device. This matches the account layer: when convergence parks an own commit, only a
-`SelfUpdate` evolution re-arms its maintenance obligation; `Invite`, `RemoveMembers`, and `UpdateAppComponents`
-evolutions are marked superseded and their intent is not re-issued or reported. The engine vectors
-(`group-data-fork-recovery/v1`) specify only that both clients converge, so the engine oracle cannot see this.
-The strict journeys stay ignored until the runtime either re-issues a parked intent or reports the loss to the
-caller; the default journeys keep the convergence, delivery, and persistence contract green in the ordinary run.
+no error event on any device. Until #1734 that matched the account layer: when convergence parked an own commit,
+only a `SelfUpdate` evolution re-armed its maintenance obligation; `Invite`, `RemoveMembers`, `UpdateGroupData`, and
+`UpdateAppComponents` evolutions were marked superseded and their intent was neither re-issued nor reported. The
+engine now retains the intent behind every own group evolution together with the authoring baseline
+(`cgka_own_commit_intents`, kept until the group has advanced past the rewind horizon), and when a pass withdraws
+that commit it decides per kind: a profile or component edit is re-queued when the winning branch left the edited
+field untouched and reported as a conflict when it changed it; a removal is re-queued for targets that are still
+members; an invite is reported as needing a fresh invitation (#1735 owns the invitee's side). Re-issue is bounded to
+two attempts. Every decision reaches the host as `MarmotAppEvent::GroupChangeSuperseded { kind, outcome, reason }`
+(UniFFI and C ABI mirrors), and `run_due_maintenance` re-derives a missed announcement from the stored disposition.
+Journey 08 now requires both edits in the settled state; `crates/marmot-app/tests/relay_runtime.rs` races two admins
+on a real relay for the re-issued and the conflict outcome, and `crates/cgka-engine/tests/distributed_convergence.rs`
+pins the field rule, the bounded re-issue, and the horizon garbage collection.
 
 ### Known gap: survivors apply a voluntary leave only when something else runs convergence (#1736)
 

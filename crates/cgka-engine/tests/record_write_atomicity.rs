@@ -461,6 +461,27 @@ impl OutboundIntentStorage for FaultStorage {
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
     }
+    fn put_own_commit_intent(
+        &self,
+        record: &cgka_traits::storage::OwnCommitIntent,
+    ) -> StorageResult<()> {
+        self.inner.put_own_commit_intent(record)
+    }
+    fn own_commit_intent(
+        &self,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.own_commit_intent(commit_id)
+    }
+    fn list_own_commit_intents(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> StorageResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.list_own_commit_intents(group_id)
+    }
+    fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_own_commit_intent(commit_id)
+    }
 }
 
 impl OutboundFanoutStorage for FaultStorage {

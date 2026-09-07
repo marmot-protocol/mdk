@@ -12,6 +12,7 @@ use cgka_session::{
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
+    SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -1354,7 +1355,8 @@ where
         // supersessions whose announcement never reached
         // `reconcile_superseded_maintenance`. This is the maintenance sweep, so
         // it is where a stranded evolution would otherwise do its damage.
-        self.reconcile_superseded_maintenance_from_state(now)?;
+        let superseded = self.reconcile_superseded_maintenance_from_state(now)?;
+        output.superseded_intents.extend(superseded);
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
         if self.key_package_has_pending_fanout()?
@@ -1951,7 +1953,8 @@ where
         output.absorb_session_effects(rollback_effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok(output)
     }
 
@@ -2290,7 +2293,8 @@ where
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok(output)
     }
 
@@ -2464,7 +2468,8 @@ where
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok((output, blocked_groups))
     }
 
@@ -2532,7 +2537,13 @@ where
         Ok(())
     }
 
-    fn reconcile_superseded_maintenance(&mut self, events: &[GroupEvent]) -> AccountResult<()> {
+    /// Retire the evolutions behind commits this batch announced as
+    /// superseded, and decide what becomes of the intent behind each own
+    /// commit (mdk#1734). Returns the per-commit decisions for the effects.
+    fn reconcile_superseded_maintenance(
+        &mut self,
+        events: &[GroupEvent],
+    ) -> AccountResult<Vec<SupersededIntentReport>> {
         let superseded = events
             .iter()
             .filter_map(|event| match event {
@@ -2545,10 +2556,11 @@ where
             })
             .collect::<Vec<_>>();
         if superseded.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let now = self.wall_clock.now();
+        let mut reports = Vec::new();
         for (group_id, invalidated_commit_id) in superseded {
             let evolutions = self.session.group_evolutions_for_group(&group_id)?;
             for evolution in evolutions.into_iter().filter(|evolution| {
@@ -2557,8 +2569,14 @@ where
             }) {
                 self.mark_evolution_superseded(evolution, now)?;
             }
+            if let Some(report) = self
+                .session
+                .reissue_superseded_own_commit(&invalidated_commit_id)?
+            {
+                reports.push(report);
+            }
         }
-        Ok(())
+        Ok(reports)
     }
 
     /// Re-derive a supersession whose `GroupStateInvalidated` announcement was
@@ -2596,7 +2614,10 @@ where
     /// here — and the event path never un-marks a superseded evolution, so
     /// neither does this. It is therefore a fixed point: a converged account
     /// writes nothing, and a flipped evolution is skipped on every later run.
-    fn reconcile_superseded_maintenance_from_state(&mut self, now: Timestamp) -> AccountResult<()> {
+    fn reconcile_superseded_maintenance_from_state(
+        &mut self,
+        now: Timestamp,
+    ) -> AccountResult<Vec<SupersededIntentReport>> {
         for evolution in self.session.group_evolutions()? {
             if evolution.phase == GroupEvolutionPhase::SupersededByConvergence {
                 continue;
@@ -2612,7 +2633,9 @@ where
             }
             self.mark_evolution_superseded(evolution, now)?;
         }
-        Ok(())
+        // Own commits carry their intent separately from evolutions; derive
+        // their supersession from the same stored dispositions (mdk#1734).
+        Ok(self.session.reissue_superseded_own_commits_from_state()?)
     }
 
     /// Retire an evolution that branch selection superseded, and settle the
@@ -4537,6 +4560,11 @@ pub struct AccountDeviceEffects {
     /// group so the caller can re-deliver the stored welcome via
     /// [`AccountDeviceRuntime::redeliver_welcome`] without re-committing.
     pub welcome_failures: Vec<WelcomeDeliveryFailure>,
+    /// Own commits that convergence superseded during this batch, with what
+    /// became of the intent behind each: re-queued for the next drain, or
+    /// dropped with a stated reason (mdk#1734). Hosts surface these to the
+    /// user; the original command already returned success.
+    pub superseded_intents: Vec<SupersededIntentReport>,
     pub pending: Vec<PendingResolution>,
     pub maintenance_disposition: SendMaintenanceDisposition,
 }
@@ -4591,6 +4619,8 @@ impl AccountDeviceEffects {
         self.published_app_messages
             .append(&mut other.published_app_messages);
         self.welcome_failures.append(&mut other.welcome_failures);
+        self.superseded_intents
+            .append(&mut other.superseded_intents);
         self.pending.append(&mut other.pending);
         if other.maintenance_disposition
             == SendMaintenanceDisposition::PostJoinRotationPendingRetryable

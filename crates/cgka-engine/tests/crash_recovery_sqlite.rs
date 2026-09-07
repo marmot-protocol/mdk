@@ -601,6 +601,7 @@ async fn run_child_case(database: &Path) {
                 payload: app_payload_for(&carol, b"queued across crash"),
             },
             created_at_ms: 2_100,
+            reissue_attempts: 0,
         })
         .expect("persist queued work");
     // Persist the independent outbound obligation before admitting the late

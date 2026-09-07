@@ -210,6 +210,18 @@ group. Auto-publish and explicit `send` paths now share the same publish-before-
 If a group has unresolved convergence input, `send(intent)` MUST store the intent durably and return
 `SendResult::Queued`.
 
+### Superseded own commits
+
+A confirmed group evolution can still lose a same-epoch race inside the rewind horizon. The engine MUST retain the
+intent behind every own `Invite`, `RemoveMembers`, `UpdateGroupData`, and `UpdateAppComponents` commit, with the
+authoring baseline of the fields it changed, until the group has advanced more than `max_rewind_commits` epochs past
+the commit's source epoch. When branch selection withdraws such a commit, the engine MUST decide the intent's fate
+from that record rather than replay the losing bytes: a profile or component edit is re-queued as an ordinary outbound
+intent only when the canonical state still holds the baseline for every field the edit changed, and is otherwise
+reported as a conflict; a removal is re-queued for targets that are still members; an invite is reported as requiring
+a fresh invitation. Re-issue is bounded (two attempts), and every decision is reported to the host so a change the
+caller was told had saved is never silently lost.
+
 `PendingPublish` and `Merging` are the two steps of resolving a publication this client staged, and neither exit is
 something the sender controls — a transport outcome, then the local merge that outcome authorizes. An
 application-message intent offered in one of those states MUST also be stored durably and returned as

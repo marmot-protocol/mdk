@@ -1012,9 +1012,12 @@ macro_rules! journey_test {
 }
 
 journey_test!(public_app_07_two_groups_stay_isolated, Journey::TwoGroups);
+// Strict since #1734: a losing profile edit is re-issued when the winning
+// commit left its field untouched, so an edit the runtime reported as saved
+// reaches the settled public state.
 journey_test!(
-    public_app_08_concurrent_admin_profile_edits_converge,
-    Journey::ConcurrentProfileEdits { strict: false }
+    public_app_08_concurrent_admin_profile_edits_are_never_lost,
+    Journey::ConcurrentProfileEdits { strict: true }
 );
 journey_test!(
     public_app_09_concurrent_invite_and_rename_converge,
@@ -1029,16 +1032,12 @@ journey_test!(
     Journey::LeaveWithSeveralRemaining { strict: false }
 );
 
-// The strict forms additionally require that an edit the runtime reported as
-// saved reaches the settled public state. Convergence currently parks the
-// losing committer's intent without re-issuing it, so they document a known
-// product gap rather than gating CI; see APP_PATH_COVERAGE.md.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: a losing admin edit is dropped after its caller was told it saved"]
-async fn public_app_08_strict_concurrent_admin_profile_edits_are_never_lost() {
-    check(Journey::ConcurrentProfileEdits { strict: true }).await;
-}
-
+// The strict form additionally requires that an invite or rename the runtime
+// reported as saved reaches the settled public state and that an excluded
+// invitee holds no projection. A losing rename is re-issued since #1734; a
+// losing invite still strands its invitee on a parked branch (#1735), so this
+// documents a known product gap rather than gating CI; see
+// APP_PATH_COVERAGE.md.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "known gap: a losing invite or rename is dropped after its caller was told it saved"]
 async fn public_app_09_strict_concurrent_invite_and_rename_are_never_lost() {

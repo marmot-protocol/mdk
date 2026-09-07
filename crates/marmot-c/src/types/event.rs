@@ -278,6 +278,22 @@ pub enum MarmotEvent {
         stalled_epoch: u64,
         arms: u32,
     },
+    /// A group change this device committed lost a same-epoch race and was
+    /// withdrawn by branch selection. `kind` names the change
+    /// (`group_profile`, `app_components`, `remove_members`, `invite`),
+    /// `outcome` what the runtime did about it (`reissued`, `conflict`,
+    /// `already_satisfied`, `reinvite_required`, `abandoned`, `not_member`),
+    /// and `reason` a stable explanation. Only `reissued` needs no user
+    /// action; every other outcome means the change did not land.
+    GroupChangeSuperseded {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+        group_id_hex: *mut c_char,
+        commit_id_hex: *mut c_char,
+        kind: *mut c_char,
+        outcome: *mut c_char,
+        reason: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -361,6 +377,23 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 stalled_epoch,
                 arms,
             },
+            F::GroupChangeSuperseded {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                commit_id_hex,
+                kind,
+                outcome,
+                reason,
+            } => Self::GroupChangeSuperseded {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+                group_id_hex: owned_c_string(group_id_hex),
+                commit_id_hex: owned_c_string(commit_id_hex),
+                kind: owned_c_string(kind),
+                outcome: owned_c_string(outcome),
+                reason: owned_c_string(reason),
+            },
         }
     }
 }
@@ -434,6 +467,23 @@ impl CFree for MarmotEvent {
                     free_c_string(*account_id_hex);
                     free_c_string(*account_label);
                     free_c_string(*group_id_hex);
+                }
+                Self::GroupChangeSuperseded {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    commit_id_hex,
+                    kind,
+                    outcome,
+                    reason,
+                } => {
+                    free_c_string(*account_id_hex);
+                    free_c_string(*account_label);
+                    free_c_string(*group_id_hex);
+                    free_c_string(*commit_id_hex);
+                    free_c_string(*kind);
+                    free_c_string(*outcome);
+                    free_c_string(*reason);
                 }
             }
         }

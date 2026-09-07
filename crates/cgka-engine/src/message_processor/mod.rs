@@ -644,7 +644,7 @@ impl<S: StorageProvider> Engine<S> {
             .should_queue_outbound_intent(&group_id, &intent)
             .await?
         {
-            return self.queue_outbound_intent(group_id, intent);
+            return self.queue_outbound_intent(group_id, intent, 0);
         }
 
         let prepare_started = Instant::now();
@@ -691,7 +691,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        self.queue_outbound_intent(group_id, intent)
+        self.queue_outbound_intent(group_id, intent, 0)
     }
 
     fn validate_send_acceptance(&mut self, intent: &SendIntent) -> Result<GroupId, EngineError> {
@@ -876,7 +876,9 @@ impl<S: StorageProvider> Engine<S> {
             self.engine_metrics
                 .note_queued_outbound_wait_ms(now_ms.saturating_sub(record.created_at_ms));
             let prepare_started = Instant::now();
-            let prepared = self.do_send_ready(record.intent.clone()).await;
+            let prepared = self
+                .do_send_ready_with_reissue_attempts(record.intent.clone(), record.reissue_attempts)
+                .await;
             self.engine_metrics.note_outbound_wire_prepare_ms(
                 prepare_started
                     .elapsed()
@@ -2951,10 +2953,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(queued.len())
     }
 
-    fn queue_outbound_intent(
+    pub(crate) fn queue_outbound_intent(
         &mut self,
         group_id: GroupId,
         intent: SendIntent,
+        reissue_attempts: u32,
     ) -> Result<SendResult, EngineError> {
         let queue_started = Instant::now();
         let created_at_ms = self.convergence_now_ms();
@@ -2981,6 +2984,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
                 intent,
                 created_at_ms,
+                reissue_attempts,
             })?;
         // The drain is what releases this row, so writing it and arming the
         // drain are one step — see `has_queued_outbound_intents`. `Stable` is

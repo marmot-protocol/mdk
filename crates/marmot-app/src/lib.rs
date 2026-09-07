@@ -102,6 +102,9 @@ mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
 
+pub use cgka_traits::engine::{
+    SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
@@ -1736,6 +1739,7 @@ impl MarmotApp {
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
+            pending_superseded_change_events: Vec::new(),
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),

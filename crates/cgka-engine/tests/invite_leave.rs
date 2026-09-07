@@ -1445,6 +1445,7 @@ fn queue_app_message_intent(
                 payload: app_payload_for(engine, b"queued before removal"),
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .expect("queue outbound intent");
     id

@@ -5933,12 +5933,23 @@ async fn app_runtime_message_subscription_kinds_filter_applies_to_live_updates()
 
 async fn wait_for_event<F>(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    matches_event: F,
+) -> MarmotAppEvent
+where
+    F: FnMut(&MarmotAppEvent) -> bool,
+{
+    wait_for_event_within(events, Duration::from_secs(5), matches_event).await
+}
+
+async fn wait_for_event_within<F>(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    budget: Duration,
     mut matches_event: F,
 ) -> MarmotAppEvent
 where
     F: FnMut(&MarmotAppEvent) -> bool,
 {
-    timeout(Duration::from_secs(5), async {
+    timeout(budget, async {
         loop {
             let event = events.recv().await.unwrap();
             if matches_event(&event) {
@@ -13390,4 +13401,254 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
         marmot_app::AccountSetupReadiness::NetworkReady
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Two admins commit different profile fields at the same instant. The loser's
+/// runtime already told its caller the edit saved, so once convergence parks
+/// that commit the intent must be re-issued against the canonical state and
+/// every member must end up with both fields; the runtime announces the
+/// re-issue as a `GroupChangeSuperseded` event (mdk#1734).
+async fn race_two_admin_profile_edits(
+    alice_edit: (Option<&str>, Option<&str>),
+    bob_edit: (Option<&str>, Option<&str>),
+) -> (
+    RaceFixture,
+    MarmotAppRuntime,
+    MarmotApp,
+    tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    GroupId,
+    Vec<(String, String)>,
+) {
+    // Both returned to the caller: dropping the account home mid-test makes
+    // every later account-home read fail with `account_home_unknown_account`,
+    // and dropping the relay handle stops the relay the loser still needs.
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGroupMessages::new();
+    let (relay, app, url) = group_message_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
+    let carol = create_network_ready_identity(&runtime, setup()).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "before",
+            &[bob_id.clone(), carol_id.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    // Both invitees join concurrently, in either order: waiting for one at a
+    // time would consume and drop the other's `GroupJoined`.
+    let mut awaiting_join: std::collections::HashSet<String> =
+        [bob_id.clone(), carol_id.clone()].into_iter().collect();
+    while !awaiting_join.is_empty() {
+        let joined_event = wait_for_event_within(&mut events, Duration::from_secs(20), |event| {
+            matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                    if awaiting_join.contains(account_id_hex) && joined == &group_id
+            )
+        })
+        .await;
+        if let MarmotAppEvent::GroupJoined { account_id_hex, .. } = joined_event {
+            awaiting_join.remove(&account_id_hex);
+        }
+    }
+    for member in [&bob_id, &carol_id] {
+        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+            .await
+            .unwrap();
+    }
+    runtime
+        .promote_admin(&alice_id, &group_id, &bob_id)
+        .await
+        .unwrap();
+    // Let the promotion settle everywhere before racing, so both commits fork
+    // from the same epoch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut epochs = Vec::new();
+        for id in [&alice_id, &bob_id, &carol_id] {
+            epochs.push(runtime.group_mls_state(id, &group_id).await.unwrap().epoch);
+        }
+        if epochs.iter().all(|epoch| *epoch == epochs[0]) && epochs[0] >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "members did not settle after the admin promotion: {epochs:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // A fresh subscription for the race itself: the settle loop above does not
+    // drain events, and a lagged receiver would drop the announcement.
+    let events = runtime.subscribe();
+    gate.arm(2);
+    let (alice_runtime, bob_runtime) = (runtime.clone(), runtime.clone());
+    let (alice_gid, bob_gid) = (group_id.clone(), group_id.clone());
+    let (alice_for, bob_for) = (alice_id.clone(), bob_id.clone());
+    let (alice_name, alice_description) = (
+        alice_edit.0.map(str::to_owned),
+        alice_edit.1.map(str::to_owned),
+    );
+    let (bob_name, bob_description) =
+        (bob_edit.0.map(str::to_owned), bob_edit.1.map(str::to_owned));
+    let alice_edit = tokio::spawn(async move {
+        alice_runtime
+            .update_group_profile(&alice_for, &alice_gid, alice_name, alice_description)
+            .await
+    });
+    let bob_edit = tokio::spawn(async move {
+        bob_runtime
+            .update_group_profile(&bob_for, &bob_gid, bob_name, bob_description)
+            .await
+    });
+    timeout(Duration::from_secs(10), gate.wait_for_blocked(2))
+        .await
+        .expect("both profile edits should overlap at commit publication");
+    gate.release();
+    alice_edit.await.unwrap().expect("alice's edit is accepted");
+    bob_edit.await.unwrap().expect("bob's edit is accepted");
+
+    let labels = vec![
+        (alice.account.label.clone(), alice_id),
+        (bob.account.label.clone(), bob_id),
+        (carol.account.label.clone(), carol_id),
+    ];
+    (
+        RaceFixture {
+            _dir: dir,
+            _relay: relay,
+        },
+        runtime,
+        app,
+        events,
+        group_id,
+        labels,
+    )
+}
+
+/// Keeps the account home and the local relay alive for the whole test.
+struct RaceFixture {
+    _dir: tempfile::TempDir,
+    _relay: LocalRelay,
+}
+
+async fn wait_for_profile_everywhere(
+    app: &MarmotApp,
+    labels: &[(String, String)],
+    group_id: &GroupId,
+    expected: (&str, &str),
+) {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let profiles = labels
+            .iter()
+            .map(|(label, _)| {
+                let group = app.group(label, &group_id_hex).unwrap().unwrap();
+                (group.profile.name, group.profile.description)
+            })
+            .collect::<Vec<_>>();
+        if profiles
+            .iter()
+            .all(|(name, description)| name == expected.0 && description == expected.1)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "members did not converge on the expected profile {expected:?}; got {profiles:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_profile_edit_on_a_different_field_is_reissued_and_announced() {
+    let (_fixture, runtime, app, mut events, group_id, labels) = race_two_admin_profile_edits(
+        (Some("alice renamed it"), None),
+        (None, Some("bob described it")),
+    )
+    .await;
+    // Whichever commit lost, its edit touched a field the winner left alone,
+    // so the loser announces the re-issue and both fields land on every device.
+    wait_for_event_within(&mut events, Duration::from_secs(30), |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupChangeSuperseded { group_id: changed, kind, outcome, .. }
+                if changed == &group_id
+                    && *kind == marmot_app::SupersededIntentKind::GroupProfile
+                    && *outcome == marmot_app::SupersededIntentOutcome::Reissued
+        )
+    })
+    .await;
+    wait_for_profile_everywhere(
+        &app,
+        &labels,
+        &group_id,
+        ("alice renamed it", "bob described it"),
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_profile_edit_on_the_same_field_is_reported_as_a_conflict() {
+    let (_fixture, runtime, app, mut events, group_id, labels) =
+        race_two_admin_profile_edits((Some("alice's name"), None), (Some("bob's name"), None))
+            .await;
+    // The loser learns of the race only when the winning commit reaches it and
+    // a convergence pass adjudicates, on real relay timing.
+    let conflict = wait_for_event_within(&mut events, Duration::from_secs(30), |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupChangeSuperseded { group_id: changed, kind, outcome, .. }
+                if changed == &group_id
+                    && *kind == marmot_app::SupersededIntentKind::GroupProfile
+                    && *outcome == marmot_app::SupersededIntentOutcome::Conflict
+        )
+    })
+    .await;
+    // The winner's name stands everywhere; the loser's is dropped, not replayed.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let winner_name = loop {
+        let names = labels
+            .iter()
+            .map(|(label, _)| {
+                app.group(label, &group_id_hex)
+                    .unwrap()
+                    .unwrap()
+                    .profile
+                    .name
+            })
+            .collect::<Vec<_>>();
+        if names.iter().all(|name| name == &names[0]) && names[0] != "before" {
+            break names[0].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "members did not converge on one name; got {names:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        winner_name == "alice's name" || winner_name == "bob's name",
+        "{winner_name}"
+    );
+    drop(conflict);
+    runtime.shutdown().await;
 }

@@ -28,6 +28,16 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
+        self.do_send_ready_with_reissue_attempts(intent, 0).await
+    }
+
+    /// `do_send_ready` for an intent that has already been re-queued
+    /// `reissue_attempts` times after losing same-epoch races (mdk#1734).
+    pub(crate) async fn do_send_ready_with_reissue_attempts(
+        &mut self,
+        intent: SendIntent,
+        reissue_attempts: u32,
+    ) -> Result<SendResult, EngineError> {
         let group_id = super::send_intent_group_id(&intent).clone();
         if self.storage.disband_tombstone(&group_id)?.is_some() {
             return Err(EngineError::InvalidTransition(
@@ -76,7 +86,14 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        match intent {
+        // Retain the intent behind every own group evolution until the commit
+        // is confirmed or rolled back, so a supersession can re-issue it
+        // (mdk#1734). The baseline is read before staging so it describes the
+        // state the caller was looking at.
+        let recording = self.own_commit_recording(&intent)?;
+        let retained_intent = recording.as_ref().map(|_| intent.clone());
+        let source_epoch = group.as_ref().map(|group| group.epoch).unwrap_or_default();
+        let result = match intent {
             SendIntent::AppMessage { group_id, payload } => {
                 self.do_send_app_message(group_id, payload).await
             }
@@ -108,7 +125,23 @@ impl<S: StorageProvider> Engine<S> {
                 self.do_enable_group_disbanding(group_id).await
             }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
+        };
+        if let (
+            Some((_, baseline)),
+            Some(retained_intent),
+            Ok(SendResult::GroupEvolution { msg, .. }),
+        ) = (recording, retained_intent, &result)
+        {
+            self.record_own_commit_intent(
+                msg.id.clone(),
+                group_id,
+                source_epoch,
+                retained_intent,
+                baseline,
+                reissue_attempts,
+            )?;
         }
+        result
     }
 
     async fn do_send_invite(

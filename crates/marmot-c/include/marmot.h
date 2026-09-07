@@ -3378,6 +3378,16 @@ typedef enum MarmotEvent_Tag {
    * between: the group cannot catch up; re-syncing is recommended.
    */
   MARMOT_EVENT_EPOCH_STALL_ESCALATED,
+  /**
+   * A group change this device committed lost a same-epoch race and was
+   * withdrawn by branch selection. `kind` names the change
+   * (`group_profile`, `app_components`, `remove_members`, `invite`),
+   * `outcome` what the runtime did about it (`reissued`, `conflict`,
+   * `already_satisfied`, `reinvite_required`, `abandoned`, `not_member`),
+   * and `reason` a stable explanation. Only `reissued` needs no user
+   * action; every other outcome means the change did not land.
+   */
+  MARMOT_EVENT_GROUP_CHANGE_SUPERSEDED,
 } MarmotEvent_Tag;
 
 typedef struct MarmotEvent_GroupJoined_Body {
@@ -3434,6 +3444,16 @@ typedef struct MarmotEvent_EpochStallEscalated_Body {
   uint32_t arms;
 } MarmotEvent_EpochStallEscalated_Body;
 
+typedef struct MarmotEvent_GroupChangeSuperseded_Body {
+  char *account_id_hex;
+  char *account_label;
+  char *group_id_hex;
+  char *commit_id_hex;
+  char *kind;
+  char *outcome;
+  char *reason;
+} MarmotEvent_GroupChangeSuperseded_Body;
+
 typedef struct MarmotEvent {
   MarmotEvent_Tag tag;
   union {
@@ -3446,6 +3466,7 @@ typedef struct MarmotEvent {
     MarmotEvent_AgentStreamActivity_Body AGENT_STREAM_ACTIVITY;
     MarmotEvent_WelcomeDeliveryPending_Body WELCOME_DELIVERY_PENDING;
     MarmotEvent_EpochStallEscalated_Body EPOCH_STALL_ESCALATED;
+    MarmotEvent_GroupChangeSuperseded_Body GROUP_CHANGE_SUPERSEDED;
   };
 } MarmotEvent;
 

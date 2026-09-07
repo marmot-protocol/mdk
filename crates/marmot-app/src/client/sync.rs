@@ -4247,6 +4247,7 @@ impl AppClient {
         source_message_id_hex: &str,
         source_received_at: u64,
     ) -> Result<bool, AppError> {
+        self.note_superseded_intent_reports(effects);
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
         // the local account leaving / being removed (or, for joins, returning).
