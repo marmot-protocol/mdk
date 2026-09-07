@@ -457,9 +457,14 @@ export function startMarmotInbound(
           index === representativeIndex ? queued : coalescedSubmission(queued.completion),
         );
       });
-      return Promise.resolve(lifecycle?.onAdopted())
-        .then(() => queued.completion)
-        .then(() => undefined);
+      const admission = Promise.resolve(lifecycle?.onAdopted());
+      // Stable uses the returned Promise to serialize this debounce key. Release
+      // that lane once the group queue adopts the batch; each submission keeps
+      // the real turn completion separately. Beta's lifecycle wrapper still
+      // needs this dispatch Promise to represent completion.
+      return lifecycle
+        ? admission.then(() => queued.completion).then(() => undefined)
+        : admission;
     };
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =
