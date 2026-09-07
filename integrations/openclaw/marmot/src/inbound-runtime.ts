@@ -399,7 +399,8 @@ export function startMarmotInbound(
         }
       });
       if (admission.outcome === "overloaded") {
-        return { admission: "overloaded", completion: Promise.resolve("overloaded") };
+        resolveCompletion("overloaded");
+        return { admission: "overloaded", completion };
       }
       return { admission: "admitted", completion };
     };
