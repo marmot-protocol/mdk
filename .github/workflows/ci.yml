@@ -428,6 +428,8 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run relay runtime tests serially
+        env:
+          RUST_BACKTRACE: "1"
         run: cargo test -p marmot-app --test relay_runtime --features test-policy-overrides --locked -- --test-threads=1
 
       - name: Run held peer-index upgrade lookup
