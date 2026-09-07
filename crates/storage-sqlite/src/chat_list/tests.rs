@@ -167,26 +167,38 @@ fn preview_query_work() {
     static PREVIEW_STEPS: AtomicUsize = AtomicUsize::new(0);
     static HIGH_WATER_STEPS: AtomicUsize = AtomicUsize::new(0);
 
-    for direction in ["received", "sent"] {
+    for direction in ["received", "sent", "pending-after"] {
         let store = setup_store();
+        if direction == "pending-after" {
+            store
+                .record_app_event(&chat("accepted-first", REMOTE, 0, "first"))
+                .unwrap();
+        }
         let mut seeded = 0;
         let mut baseline = 0;
         for count in [100, 1_000] {
             cgka_traits::StorageProvider::with_transaction(&store, |store| {
                 for index in seeded..count {
                     let mut event = chat(&format!("history-{index}"), REMOTE, index, "history");
-                    event.direction = direction.to_owned();
-                    if direction == "sent" {
+                    event.direction = if direction == "pending-after" {
+                        "sent"
+                    } else {
+                        direction
+                    }
+                    .to_owned();
+                    if direction != "received" {
                         event.source_message_id_hex = None;
                     }
                     store.record_app_event(&event)?;
                 }
-                store.record_app_event(&chat(
-                    &format!("accepted-{count}"),
-                    REMOTE,
-                    count,
-                    "latest",
-                ))?;
+                if direction != "pending-after" {
+                    store.record_app_event(&chat(
+                        &format!("accepted-{count}"),
+                        REMOTE,
+                        count,
+                        "latest",
+                    ))?;
+                }
                 Ok::<_, cgka_traits::StorageError>(())
             })
             .unwrap();
@@ -228,7 +240,11 @@ fn preview_query_work() {
                 .trace_v2(TraceEventCodes::empty(), None);
             assert_eq!(
                 row.last_message.unwrap().message_id_hex,
-                format!("accepted-{count}")
+                if direction == "pending-after" {
+                    format!("history-{}", count - 1)
+                } else {
+                    format!("accepted-{count}")
+                }
             );
             let steps = PREVIEW_STEPS.load(Ordering::Relaxed);
             eprintln!("direction={direction} count={count} preview_steps={steps}");
@@ -2006,6 +2022,28 @@ fn newer_pending_message_replaces_older_authenticated_preview() {
         preview.delivery_state,
         ChatListMessageDeliveryState::Pending
     );
+}
+
+#[test]
+fn pending_preview_clock_rollback() {
+    let store = setup_store();
+    let mut stale = chat("stale", LOCAL, 1_000, "stale pending");
+    stale.source_message_id_hex = None;
+    store.record_app_event(&stale).unwrap();
+    store
+        .record_app_event(&chat("accepted", REMOTE, 100, "accepted"))
+        .unwrap();
+    // Both sends are newer insertions, but the last insertion has an older clock.
+    for (id, at) in [("newer-clock", 50), ("newer-insertion", 40)] {
+        let mut pending = chat(id, LOCAL, at, "pending");
+        pending.source_message_id_hex = None;
+        store.record_app_event(&pending).unwrap();
+    }
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.last_message.unwrap().message_id_hex, "newer-clock");
 }
 
 #[test]

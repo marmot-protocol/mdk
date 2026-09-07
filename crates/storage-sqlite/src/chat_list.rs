@@ -1104,9 +1104,10 @@ fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     // CROSS JOIN keeps the ordered source index outside the timeline lookup.
     format!(
         "SELECT accepted_source.insert_order
-         FROM app_events AS accepted_source INDEXED BY idx_app_events_group_insert_order
+         FROM app_events AS accepted_source INDEXED BY idx_app_events_accepted_insert_order
          CROSS JOIN message_timeline AS accepted
          WHERE accepted_source.group_id_hex = {group_id_expression}
+           AND (accepted_source.direction != 'sent' OR accepted_source.source_message_id_hex IS NOT NULL)
            AND accepted.group_id_hex = accepted_source.group_id_hex
            AND accepted.message_id_hex = accepted_source.message_id_hex
            AND {accepted_activity_filter}
@@ -1135,8 +1136,9 @@ fn accepted_activity_insert_order_high_water_sql(group_id_expression: &str) -> S
 }
 
 /// Select at most one pending and one accepted/failed preview candidate.
-/// Pending rows are bounded by insertion order before timeline ordering, so
-/// retained stale sends cannot lengthen the preview index walk. Callers use
+/// Try the first ordered pending row before sorting the insertion-order range.
+/// If that row is stale, the range fallback preserves ordering even when receipt
+/// timestamps run backwards. Callers use
 /// NOT INDEXED on the outer table to force these rowid seeks instead of a
 /// preview-order index scan through rejected pending rows.
 pub(crate) fn chat_list_preview_eligibility_sql(
@@ -1149,7 +1151,26 @@ pub(crate) fn chat_list_preview_eligibility_sql(
     let preview_class = preview_rank_sql("candidate.");
     format!(
         "{column_prefix}rowid IN (
-            SELECT rowid FROM (
+            SELECT COALESCE((
+                SELECT newest.rowid
+                FROM (
+                    SELECT candidate.rowid, candidate.message_id_hex
+                    FROM message_timeline AS candidate INDEXED BY idx_message_timeline_chat_preview
+                    WHERE candidate.group_id_hex = {group_id_expression}
+                      AND ({preview_class}) = 2
+                      AND {activity_filter}
+                    ORDER BY candidate.timeline_order_class DESC,
+                             candidate.timeline_order_primary DESC,
+                             candidate.timeline_order_phase DESC,
+                             candidate.timeline_order_at DESC,
+                             candidate.message_id_hex DESC
+                    LIMIT 1
+                ) AS newest
+                CROSS JOIN app_events AS source
+                WHERE source.group_id_hex = {group_id_expression}
+                  AND source.message_id_hex = newest.message_id_hex
+                  AND source.insert_order >= {accepted_high_water}
+            ), (
                 SELECT candidate.rowid
                 FROM app_events AS source INDEXED BY idx_app_events_group_insert_order
                 CROSS JOIN message_timeline AS candidate
@@ -1163,7 +1184,7 @@ pub(crate) fn chat_list_preview_eligibility_sql(
                   AND {activity_filter}
                 ORDER BY {preview_order}
                 LIMIT 1
-            )
+            ))
             UNION ALL
             SELECT rowid FROM (
                 SELECT candidate.rowid

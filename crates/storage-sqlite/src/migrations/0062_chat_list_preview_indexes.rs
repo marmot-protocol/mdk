@@ -25,6 +25,9 @@ CREATE INDEX IF NOT EXISTS idx_message_timeline_chat_preview
 
 CREATE INDEX IF NOT EXISTS idx_app_events_group_insert_order
     ON app_events (group_id_hex, insert_order DESC);
+CREATE INDEX IF NOT EXISTS idx_app_events_accepted_insert_order
+    ON app_events (group_id_hex, insert_order DESC)
+    WHERE direction != 'sent' OR source_message_id_hex IS NOT NULL;
 "#,
     )
     .storage()
