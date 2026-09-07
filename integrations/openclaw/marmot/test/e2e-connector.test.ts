@@ -178,7 +178,7 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
                 readyCount += 1;
               }
             },
-            warn: () => {},
+            warn: (message: string) => stderr.push(`plugin: ${message}\n`),
           },
         };
 

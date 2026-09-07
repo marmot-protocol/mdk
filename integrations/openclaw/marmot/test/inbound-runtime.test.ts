@@ -196,6 +196,37 @@ describe("startMarmotInbound", () => {
     expect(dispatched[0]?.media).toEqual([mediaA, mediaB]);
   });
 
+  it("bounds a debounced burst and emits only aggregate pressure details", async () => {
+    const dispatched: MarmotInboundMessage[] = [];
+    const warnings: string[] = [];
+    const events = Array.from({ length: 33 }, (_, index) =>
+      inboundEvent("cc", (index + 1).toString(16).padStart(2, "0")),
+    );
+    const stop = startMarmotInbound(
+      {
+        config: {
+          channels: { marmot: { debounceMs: 25, profileNameOnboarding: false } },
+        },
+        logger: { info: () => undefined, warn: (message) => warnings.push(message) },
+      },
+      (message) => {
+        dispatched.push(message);
+      },
+      { clientFactory: () => inboundStubClient(events) },
+    );
+
+    await waitFor(() => warnings.some((message) => message.includes("inbound debounce overloaded")));
+    await waitFor(() => dispatched.length > 0);
+    stop();
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.text.split("\n")).toHaveLength(32);
+    expect(warnings).toContain(
+      "marmot: inbound debounce overloaded (reason=per_group_depth, active_groups=1, max_depth_per_group=32, max_tracked_groups=256)",
+    );
+    expect(warnings.join(" ")).not.toContain(events[32]!.message.message_id_hex);
+  });
+
   it("buffers every mutation type and attaches them to the next triggering message", async () => {
     const dispatched: MarmotInboundMessage[] = [];
     const api: InboundPluginApi = {

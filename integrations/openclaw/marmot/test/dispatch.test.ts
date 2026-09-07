@@ -203,6 +203,12 @@ describe("createMarmotInboundDispatcher", () => {
         agentId: "agent",
         payload: { text: "done" },
         replyToId: HEX32("dd"),
+        requiredCapabilities: {
+          text: true,
+          replyTo: true,
+          messageSendingHooks: true,
+          reconcileUnknownSend: true,
+        },
         ctxPayload: expect.objectContaining({
           reply: expect.objectContaining({ to: HEX32("cc") }),
         }),

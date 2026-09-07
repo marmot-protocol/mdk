@@ -78,11 +78,27 @@ export type MarmotAmbientEvent = MarmotMutationEvent | {
   detail?: string | null;
 };
 
+export type MarmotInboundAdmissionOutcome = "admitted" | "coalesced" | "overloaded";
+export type MarmotInboundCompletionOutcome =
+  | "dispatched"
+  | "not_dispatched"
+  | "onboarding_intercepted"
+  | "coalesced"
+  | "overloaded";
+
+/** Admission settles independently from completion so the subscription can keep reading. */
+export interface MarmotInboundSubmission {
+  admission: MarmotInboundAdmissionOutcome;
+  completion: Promise<MarmotInboundCompletionOutcome>;
+}
+
 export interface MarmotInboundBridgeOptions {
   accountIdHex?: string | null;
   groupIdHex?: string | null;
   onReady?: () => void | Promise<void>;
-  onMessage: (message: MarmotInboundMessage) => void | Promise<void>;
+  onMessage: (
+    message: MarmotInboundMessage,
+  ) => void | MarmotInboundSubmission | Promise<void | MarmotInboundSubmission>;
   /** The agent joined a group via a welcome (used to greet/onboard on join). */
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
   /** A durable mutation/group-state fact that must not trigger a turn. */
@@ -162,6 +178,8 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 
 export class MarmotInboundBridge {
   private readonly recent: RecentIds;
+  /** Queued/running reservations cannot be evicted by the bounded completed-id window. */
+  private readonly pending = new Set<string>();
 
   constructor(
     private readonly client: InboundSubscribeClient,
@@ -252,27 +270,63 @@ export class MarmotInboundBridge {
     if (event.type !== "inbound_message") {
       return;
     }
-    if (this.recent.has(event.message.message_id_hex)) {
+    const messageIdHex = event.message.message_id_hex;
+    if (this.recent.has(messageIdHex) || this.pending.has(messageIdHex)) {
       return;
     }
-    // Record before dispatching: wn-agent can re-emit the same message (e.g. a
-    // rapid catch-up just after subscribe), and an agent turn takes long enough
-    // that a record-after-dispatch would let the duplicate slip through and
-    // start a second, concurrent turn for the same message.
-    this.recent.add(event.message.message_id_hex);
-    await this.options.onMessage({
-      accountIdHex: event.account_id_hex,
-      groupIdHex: event.group_id_hex,
-      messageIdHex: event.message.message_id_hex,
-      senderAccountIdHex: event.message.sender.account_id_hex,
-      sender: event.message.sender,
-      text: event.message.text,
-      recordedAt: event.message.recorded_at,
-      mentionsSelf: event.mentions_self ?? false,
-      replyToMessageIdHex: event.reply_to?.message_id_hex ?? null,
-      replyTo: event.reply_to ?? null,
-      senderDisplayName: event.message.sender.display_name ?? null,
-      media: event.message.media ?? [],
-    });
+    // Reserve before submission: rapid replay must not start a duplicate while
+    // queue/debounce admission or the accepted turn is still pending. A typed
+    // overload releases the reservation without adding it to completed dedupe.
+    this.pending.add(messageIdHex);
+    let submitted: void | MarmotInboundSubmission | Promise<void | MarmotInboundSubmission>;
+    try {
+      submitted = this.options.onMessage({
+        accountIdHex: event.account_id_hex,
+        groupIdHex: event.group_id_hex,
+        messageIdHex,
+        senderAccountIdHex: event.message.sender.account_id_hex,
+        sender: event.message.sender,
+        text: event.message.text,
+        recordedAt: event.message.recorded_at,
+        mentionsSelf: event.mentions_self ?? false,
+        replyToMessageIdHex: event.reply_to?.message_id_hex ?? null,
+        replyTo: event.reply_to ?? null,
+        senderDisplayName: event.message.sender.display_name ?? null,
+        media: event.message.media ?? [],
+      });
+    } catch (error) {
+      this.pending.delete(messageIdHex);
+      throw error;
+    }
+    const observeSubmission = (submission: void | MarmotInboundSubmission): void => {
+      if (submission?.admission === "overloaded") {
+        this.pending.delete(messageIdHex);
+        return;
+      }
+      const completion = submission?.completion ?? Promise.resolve("dispatched" as const);
+      // Once admitted, retain the id even on an ambiguous dispatch failure:
+      // retrying accepted work could duplicate external tool side effects.
+      void completion.then(
+        () => {
+          this.pending.delete(messageIdHex);
+          this.recent.add(messageIdHex);
+        },
+        () => {
+          this.pending.delete(messageIdHex);
+          this.recent.add(messageIdHex);
+        },
+      );
+    };
+    if (submitted && typeof (submitted as Promise<unknown>).then === "function") {
+      void (submitted as Promise<void | MarmotInboundSubmission>)
+        .then(observeSubmission)
+        .catch((error: unknown) => {
+          // Submission failed before an explicit admission result, so replay is safe.
+          this.pending.delete(messageIdHex);
+          this.options.onError?.(error);
+        });
+    } else {
+      observeSubmission(await submitted);
+    }
   }
 }
