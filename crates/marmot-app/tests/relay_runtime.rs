@@ -2116,6 +2116,93 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
 }
 
 #[tokio::test]
+async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser() {
+    let dir_fetch = tempfile::tempdir().unwrap();
+    let (_relay, fetch_app, url) = mock_app(&dir_fetch).await;
+    let fetch_runtime = MarmotAppRuntime::new(fetch_app.clone());
+    let _fetch_account = create_network_ready_identity(
+        &fetch_runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+
+    let publisher = Keys::generate();
+    let content = serde_json::json!({
+        "name": "hostile",
+        "website": "https://example.test",
+        "bot": false,
+        "custom_blob": "x".repeat(8000),
+        "created_at": 42,
+        "source_relays": ["wss://spoof.example"]
+    })
+    .to_string();
+    let signed = EventBuilder::new(Kind::Metadata, content)
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_867))
+        .sign_with_keys(&publisher)
+        .expect("sign hostile kind:0");
+    let transport_event =
+        NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed kind:0");
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(&[endpoint(&url)], &transport_event, 1)
+        .await
+        .expect("publish hostile kind:0 from a separate publisher");
+
+    let publisher_hex = publisher.public_key().to_hex();
+    let fetched = fetch_app
+        .fetch_current_user_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
+        .await
+        .unwrap()
+        .expect("profile on relay");
+    assert_eq!(fetched.name.as_deref(), Some("hostile"));
+    assert_eq!(
+        fetched.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
+    assert!(!fetched.extra.contains_key("custom_blob"));
+    assert!(!fetched.extra.contains_key("created_at"));
+    assert!(!fetched.extra.contains_key("source_relays"));
+    assert_eq!(fetched.created_at, 1_700_000_867);
+    assert!(
+        fetched
+            .source_relays
+            .iter()
+            .all(|relay| !relay.contains("spoof")),
+        "provenance must stay endpoint-derived"
+    );
+
+    let dir_refresh = tempfile::tempdir().unwrap();
+    AccountHome::open(dir_refresh.path())
+        .create_account("bob")
+        .unwrap();
+    let refresh_app = MarmotApp::with_relay_and_config(
+        dir_refresh.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    refresh_app
+        .refresh_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let refreshed = refresh_app
+        .directory_entry_for_account_id(&publisher_hex)
+        .unwrap()
+        .expect("refresh cached the inbound profile")
+        .profile
+        .expect("refreshed profile");
+    assert_eq!(refreshed.name.as_deref(), Some("hostile"));
+    assert_eq!(refreshed.extra, fetched.extra);
+    assert!(!refreshed.extra.contains_key("custom_blob"));
+
+    fetch_runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_republish_key_package_resends_exact_current_event() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;

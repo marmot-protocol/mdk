@@ -10339,6 +10339,116 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 }
 
 #[test]
+fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
+    use crate::directory::records::{
+        MAX_EXTRA_PROFILE_FIELDS, MAX_EXTRA_PROFILE_KEY_BYTES, MAX_EXTRA_PROFILE_VALUE_BYTES,
+    };
+
+    const MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES: usize = 2
+        + MAX_EXTRA_PROFILE_FIELDS
+            * (MAX_EXTRA_PROFILE_KEY_BYTES + 1 + MAX_EXTRA_PROFILE_VALUE_BYTES)
+        + MAX_EXTRA_PROFILE_FIELDS.saturating_sub(1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let author = format!("{:064x}", 867);
+    let mut event = NostrTransportEvent::new_unsigned(
+        author.clone(),
+        KIND_NOSTR_METADATA,
+        Vec::new(),
+        serde_json::json!({
+            "name": "alice",
+            "banner": "https://example.test/banner.png",
+            "website": "https://example.test",
+            "bot": false,
+            "nested": {"ok": true, "tags": ["a"]},
+            "custom_blob": "x".repeat(8000),
+            "created_at": 42,
+            "source_relays": ["wss://spoof.example"]
+        })
+        .to_string(),
+    );
+    event.created_at = 1_700_000_867;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+        event,
+    })
+    .unwrap();
+
+    let assert_bounded_extra = |profile: &UserProfileMetadata| {
+        assert_eq!(profile.name.as_deref(), Some("alice"));
+        assert_eq!(
+            profile.banner.as_deref(),
+            Some("https://example.test/banner.png")
+        );
+        assert_eq!(profile.created_at, 1_700_000_867);
+        assert_eq!(
+            profile.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert_eq!(profile.extra.get("bot"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            profile.extra.get("nested"),
+            Some(&serde_json::json!({"ok": true, "tags": ["a"]}))
+        );
+        assert!(!profile.extra.contains_key("custom_blob"));
+        assert!(!profile.extra.contains_key("created_at"));
+        assert!(!profile.extra.contains_key("source_relays"));
+        assert!(profile.extra.len() <= MAX_EXTRA_PROFILE_FIELDS);
+        let encoded = serde_json::to_vec(&profile.extra).unwrap();
+        assert!(encoded.len() <= MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES);
+    };
+
+    let cached = app
+        .directory_entry_for_account_id(&author)
+        .unwrap()
+        .expect("ingested profile is cached");
+    let cached_profile = cached.profile.expect("cached profile");
+    assert_bounded_extra(&cached_profile);
+    assert_eq!(
+        cached_profile.source_relays,
+        vec!["wss://profiles.example".to_owned()]
+    );
+
+    let shared = app
+        .shared_storage()
+        .unwrap()
+        .public_directory_user(&author)
+        .unwrap()
+        .expect("shared directory row");
+    let shared_profile: UserProfileMetadata =
+        serde_json::from_str(shared.profile_json.as_ref().expect("profile_json")).unwrap();
+    assert_bounded_extra(&shared_profile);
+    assert_eq!(shared_profile.extra, cached_profile.extra);
+    assert!(
+        !shared
+            .profile_json
+            .as_ref()
+            .unwrap()
+            .contains("custom_blob")
+    );
+
+    drop(app);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let reopened = app
+        .directory_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.account_id_hex == author)
+        .expect("reopened directory_entries still lists the author")
+        .profile
+        .expect("reopened profile");
+    assert_bounded_extra(&reopened);
+    assert_eq!(reopened.extra, cached_profile.extra);
+    assert_eq!(
+        reopened.source_relays,
+        vec!["wss://profiles.example".to_owned()]
+    );
+}
+
+#[test]
 fn local_account_directory_refresh_still_promotes_follows() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

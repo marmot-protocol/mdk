@@ -1190,6 +1190,8 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::AccountRelayListStatus;
     use crate::ids::npub_for_account_id_lossy;
@@ -1495,6 +1497,123 @@ mod tests {
         assert!(
             cache.entry(&stranger.account_id_hex).unwrap().is_none(),
             "caching a search result must not promote them into directory_users"
+        );
+    }
+
+    /// Hostile kind:0 extensions on a relay-resolved stranger must inherit the
+    /// shared ingest bounds in both the streamed result and the un-promoted
+    /// search-graph cache. The stranger is still not promoted.
+    #[tokio::test]
+    async fn a_relay_resolved_search_profile_inherits_extra_field_bounds() {
+        use crate::directory::records::{
+            MAX_EXTRA_PROFILE_FIELDS, MAX_EXTRA_PROFILE_KEY_BYTES, MAX_EXTRA_PROFILE_VALUE_BYTES,
+        };
+
+        const MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES: usize = 2
+            + MAX_EXTRA_PROFILE_FIELDS
+                * (MAX_EXTRA_PROFILE_KEY_BYTES + 1 + MAX_EXTRA_PROFILE_VALUE_BYTES)
+            + MAX_EXTRA_PROFILE_FIELDS.saturating_sub(1);
+
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let endpoint = cgka_traits::TransportEndpoint(relay_url.clone());
+        let stranger_dir = tempfile::tempdir().unwrap();
+        let stranger_app = MarmotApp::with_relay(stranger_dir.path(), relay_url.clone());
+        let stranger_runtime = stranger_app.runtime();
+        let stranger = stranger_runtime
+            .create_identity(crate::AccountSetupRequest {
+                default_relays: vec![endpoint.clone()],
+                bootstrap_relays: vec![endpoint.clone()],
+                publish_missing_relay_lists: true,
+                ..crate::AccountSetupRequest::default()
+            })
+            .await
+            .expect("create the stranger's identity")
+            .account;
+        wait_for_network_ready(&stranger_runtime, &stranger.account_id_hex).await;
+        stranger_app
+            .publish_user_profile(
+                &stranger.account_id_hex,
+                UserProfileMetadata {
+                    name: Some("needle".to_owned()),
+                    extra: BTreeMap::from([
+                        (
+                            "website".to_owned(),
+                            serde_json::json!("https://example.test"),
+                        ),
+                        ("bot".to_owned(), serde_json::json!(false)),
+                        (
+                            "custom_blob".to_owned(),
+                            serde_json::json!("x".repeat(8000)),
+                        ),
+                    ]),
+                    ..UserProfileMetadata::default()
+                },
+                crate::AccountRelayListBootstrap::new(vec![endpoint.clone()], Vec::new()),
+            )
+            .await
+            .expect("publish the stranger's hostile profile");
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), relay_url);
+        let cache = app.directory_cache_for_account(&account).unwrap();
+        cache
+            .put(&UserDirectoryRecord {
+                follows: vec![stranger.account_id_hex.clone()],
+                ..record_named(&account.account_id_hex, "alice")
+            })
+            .unwrap();
+
+        let subscription = app
+            .search_users(params(&account.account_id_hex, "needle", (1, 1)))
+            .await
+            .unwrap();
+        let updates = drain(subscription).await;
+        let matched = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .find(|result| result.account_id_hex == stranger.account_id_hex)
+            .expect("the search must resolve the stranger from the relay");
+        let result_profile = matched.profile.as_ref().expect("search result profile");
+        assert_eq!(result_profile.name.as_deref(), Some("needle"));
+        assert_eq!(
+            result_profile.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert_eq!(
+            result_profile.extra.get("bot"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(!result_profile.extra.contains_key("custom_blob"));
+        assert!(result_profile.extra.len() <= MAX_EXTRA_PROFILE_FIELDS);
+        assert!(
+            serde_json::to_vec(&result_profile.extra).unwrap().len()
+                <= MAX_RETAINED_EXTRA_PROFILE_JSON_BYTES
+        );
+
+        let now = crate::unix_now_seconds() as i64;
+        let cached = cache
+            .search_record(&stranger.account_id_hex, now)
+            .unwrap()
+            .expect("the resolved profile must be cached for the next search");
+        let cached_profile = cached.profile.expect("un-promoted cached profile");
+        assert_eq!(cached_profile.extra, result_profile.extra);
+        assert!(!cached_profile.extra.contains_key("custom_blob"));
+        assert!(
+            cache.entry(&stranger.account_id_hex).unwrap().is_none(),
+            "caching a search result must not promote them into directory_users"
+        );
+        let plan = app.directory_sync_plan().unwrap();
+        let watched = plan
+            .batches
+            .iter()
+            .flat_map(|batch| batch.authors.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            !watched.contains(&stranger.account_id_hex),
+            "a search-resolved stranger must not enter live directory sync"
         );
     }
 
