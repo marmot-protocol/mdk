@@ -17295,7 +17295,13 @@ fn close_storage_waits_for_legacy_projection_import() {
             SqlcipherDatabaseKind::AccountProjection,
         )
         .unwrap();
-    drop(LegacyAccountProjectionDb::open(legacy_path, &legacy_key).unwrap());
+    let receipt = hex::encode([42_u8; 32]);
+    {
+        let mut legacy = LegacyAccountProjectionDb::open(legacy_path, &legacy_key).unwrap();
+        let mut state = legacy.load_state("legacy-racing").unwrap();
+        state.seen_events.push(receipt.clone());
+        legacy.save_state(&state).unwrap();
+    }
 
     let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
     let release = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -17307,7 +17313,12 @@ fn close_storage_waits_for_legacy_projection_import() {
     }));
 
     let migrating_app = app.clone();
-    let migration = std::thread::spawn(move || migrating_app.ensure_account_state("legacy-racing"));
+    // Exercise exactly the guarded import. The broader ensure_account_state
+    // performs another storage access after this guard drops; terminal close
+    // may legitimately win that later access and return StorageError::Closed.
+    let migration = std::thread::spawn(move || {
+        migrating_app.migrate_legacy_account_projection_if_needed("legacy-racing")
+    });
     entered.wait();
 
     let closing_app = app.clone();
@@ -17323,24 +17334,54 @@ fn close_storage_waits_for_legacy_projection_import() {
         closed_tx.send(()).unwrap();
         result
     });
-    started_rx
-        .recv()
-        .expect("the closing thread should reach close_storage");
-    assert!(
-        closed_rx
-            .recv_timeout(std::time::Duration::from_millis(250))
-            .is_err(),
-        "terminal close must wait for the legacy database import window",
+    // Do not assert while either thread is outstanding. Even a broken close
+    // must release the importer and join both SQLite users before unwinding.
+    let close_started = started_rx.recv();
+    let close_was_blocked = matches!(
+        closed_rx.recv_timeout(std::time::Duration::from_millis(250)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     );
-    assert!(matches!(
+    let lease_was_held = matches!(
         MarmotRootRuntimeLease::try_acquire(root),
         Err(AppError::RuntimeBusy)
-    ));
+    );
 
     release.wait();
-    migration.join().unwrap().unwrap();
-    closer.join().unwrap().unwrap();
+    let migration_result = migration.join();
+    let close_result = closer.join();
+    close_started.expect("the closing thread should reach close_storage");
+    assert!(
+        close_was_blocked,
+        "terminal close must wait for the legacy database import window",
+    );
+    assert!(lease_was_held, "the root lease must cover the import");
+    migration_result
+        .unwrap()
+        .expect("the guarded import must finish");
+    close_result
+        .unwrap()
+        .expect("close must finish after import");
+    assert!(app.storage_is_closed());
     drop(MarmotRootRuntimeLease::try_acquire(root).expect("root lease must be released"));
+
+    // Closing waits for the entire import, including its durable completion
+    // marker. Verify both the imported data and the marker after encrypted reopen.
+    let reopened =
+        MarmotApp::with_relays_and_account_home(root, Vec::new(), AccountHome::open(root));
+    let storage = reopened.account_storage("legacy-racing").unwrap();
+    assert!(
+        storage
+            .account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)
+            .unwrap()
+    );
+    assert_eq!(
+        storage
+            .load_account_projection_state("legacy-racing", MAX_SEEN_EVENT_IDS)
+            .unwrap()
+            .seen_events,
+        vec![receipt]
+    );
+    reopened.close_storage().unwrap();
 }
 
 /// Concurrent `close_storage` callers must serialize: no caller may return
