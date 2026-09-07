@@ -281,7 +281,6 @@ class AmbientContextStore:
         group_key = _digest(b"marmot-ambient-group-v1\0", group_id)
         try:
             with db:
-                acknowledged_at = time.time()
                 rows = db.execute(
                     "SELECT seq,event_key,observed_at FROM facts "
                     "WHERE group_key=? AND claim_owner=? AND claim_token=? ORDER BY seq",
@@ -290,7 +289,7 @@ class AmbientContextStore:
                 for row in rows:
                     db.execute(
                         "INSERT OR IGNORE INTO seen(group_key,event_key,observed_at) VALUES(?,?,?)",
-                        (group_key, row["event_key"], acknowledged_at),
+                        (group_key, row["event_key"], row["observed_at"]),
                     )
                 changed = db.execute(
                     "DELETE FROM facts WHERE group_key=? AND claim_owner=? AND claim_token=?",
@@ -386,26 +385,24 @@ class AmbientContextStore:
 
     def _enforce_all_bounds(self) -> None:
         db = self._require_db()
-        for table in ("facts", "seen"):
-            groups = db.execute(
-                f"SELECT group_key,count(*) FROM {table} GROUP BY group_key"
-            ).fetchall()
-            for row in groups:
-                group_key = row[0]
-                claimed_count = 0
-                if table == "facts":
-                    claimed_count = int(
-                        db.execute(
-                            "SELECT count(*) FROM facts "
-                            "WHERE group_key=? AND claim_token IS NOT NULL",
-                            (group_key,),
-                        ).fetchone()[0]
-                    )
-                self._delete_oldest(
-                    table,
-                    int(row[1]) - (self.max_events_per_group + claimed_count),
-                    group_key=group_key,
-                )
+        groups = db.execute(
+            "SELECT group_key,count(*) FROM ("
+            "SELECT group_key FROM facts UNION ALL SELECT group_key FROM seen) "
+            "GROUP BY group_key"
+        ).fetchall()
+        for row in groups:
+            group_key = row[0]
+            claimed_count = int(
+                db.execute(
+                    "SELECT count(*) FROM facts "
+                    "WHERE group_key=? AND claim_token IS NOT NULL",
+                    (group_key,),
+                ).fetchone()[0]
+            )
+            self._delete_oldest_any(
+                int(row[1]) - (self.max_events_per_group + claimed_count),
+                group_key=group_key,
+            )
 
         claimed_groups = int(
             db.execute(
@@ -439,46 +436,23 @@ class AmbientContextStore:
                 # pending-fact window and settles on acknowledge or release.
                 break
 
-    def _delete_oldest(
-        self,
-        table: str,
-        count: int,
-        *,
-        group_key: bytes | None = None,
-    ) -> int:
+    def _delete_oldest_any(self, count: int, *, group_key: bytes | None = None) -> int:
         if count <= 0:
             return 0
-        if table not in {"facts", "seen"}:
-            raise AmbientContextError("invalid ambient context table")
         db = self._require_db()
-        clauses = []
+        facts_group_clause = " AND group_key=?" if group_key is not None else ""
+        seen_group_clause = " WHERE group_key=?" if group_key is not None else ""
         params: list[object] = []
         if group_key is not None:
-            clauses.append("group_key=?")
-            params.append(group_key)
-        if table == "facts":
-            clauses.append("claim_token IS NULL")
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.extend((group_key, group_key))
         params.append(count)
-        rows = db.execute(
-            f"SELECT seq FROM {table}{where} ORDER BY observed_at,seq LIMIT ?",
-            tuple(params),
-        ).fetchall()
-        for row in rows:
-            db.execute(f"DELETE FROM {table} WHERE seq=?", (row["seq"],))
-        return len(rows)
-
-    def _delete_oldest_any(self, count: int) -> int:
-        if count <= 0:
-            return 0
-        db = self._require_db()
         rows = db.execute(
             "SELECT source,seq FROM ("
             "SELECT 'facts' AS source,seq,observed_at FROM facts "
-            "WHERE claim_token IS NULL UNION ALL "
-            "SELECT 'seen' AS source,seq,observed_at FROM seen) "
+            f"WHERE claim_token IS NULL{facts_group_clause} UNION ALL "
+            f"SELECT 'seen' AS source,seq,observed_at FROM seen{seen_group_clause}) "
             "ORDER BY observed_at,source,seq LIMIT ?",
-            (count,),
+            tuple(params),
         ).fetchall()
         for row in rows:
             table = "facts" if row["source"] == "facts" else "seen"

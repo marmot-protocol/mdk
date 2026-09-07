@@ -69,9 +69,9 @@ capabilities. Acknowledged event hashes remain only as bounded replay-dedupe
 tombstones. The private parent and database/lock/WAL files are checked and
 kept private; symlink files are refused. The file-mode fallback opens the
 already-validated regular file with `O_NOFOLLOW` and applies mode through the
-descriptor. Pending facts and replay tombstones have separate per-group windows
-and share deterministic aggregate group, event-count, logical-byte, and age
-bounds; oldest observed entries (and then oldest groups) are evicted first. A
+descriptor. Pending facts and replay tombstones share one per-group window and
+deterministic aggregate group, event-count, logical-byte, and age bounds;
+oldest observed entries (and then oldest groups) are evicted first. A
 live claim may temporarily add at most one already-bounded snapshot to the
 persisted limits; it is never evicted before the host outcome, and
 acknowledgement or release immediately restores the configured aggregate

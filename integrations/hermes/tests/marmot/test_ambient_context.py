@@ -168,7 +168,10 @@ os._exit(0)
 
             self.assertTrue(store.record(group_id, "second", "reaction_added"))
             self.assertEqual(store.acknowledge(group_id, claim.token), 1)
-            self.assertFalse(store.record(group_id, event_id, "message_deleted"))
+            self.assertEqual(
+                [fact.kind for fact in store.pending(group_id)],
+                ["reaction_added"],
+            )
             store.close()
 
     def test_open_reapplies_lower_configured_bounds(self):
@@ -204,6 +207,29 @@ os._exit(0)
             self.assertLessEqual(stats["groups"], 3)
             self.assertLessEqual(stats["events"], 3)
             self.assertLessEqual(stats["state_bytes"], 4096)
+            store.close()
+
+    def test_pending_and_tombstones_share_per_group_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(
+                Path(directory) / "private" / "ambient.sqlite3",
+                max_events_per_group=2,
+                max_events=10,
+            )
+            group_id = "22" * 32
+            for index in range(2):
+                store.record(group_id, f"seen-{index}", "message_deleted")
+                claim = store.claim(group_id)
+                self.assertEqual(store.acknowledge(group_id, claim.token), 1)
+
+            self.assertTrue(store.record(group_id, "pending-1", "message_edited"))
+            self.assertTrue(store.record(group_id, "pending-2", "reaction_added"))
+
+            self.assertEqual(
+                [fact.kind for fact in store.pending(group_id)],
+                ["message_edited", "reaction_added"],
+            )
+            self.assertEqual(store.stats()["events"], 2)
             store.close()
 
     def test_schema_v1_store_migrates_without_losing_pending_fact(self):
