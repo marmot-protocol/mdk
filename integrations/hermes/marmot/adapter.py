@@ -3096,6 +3096,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 spool_state = "handed"
             await self.handle_message(hermes_event)
+            if spool_message_id:
+                self._inbound_spool.transition(
+                    spool_message_id,
+                    "completed",
+                    "host_returned",
+                )
+                spool_state = "completed"
         except asyncio.CancelledError:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             if spool_message_id and spool_state == "claimed":
@@ -3123,11 +3130,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except Exception:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             if spool_message_id and spool_state == "claimed":
-                self._inbound_spool.defer(
-                    spool_message_id,
-                    delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
-                    reason="dispatch_failed_before_handoff",
-                )
+                record = self._inbound_spool.get(spool_message_id)
+                attempts = record.attempts if record is not None else 0
+                if attempts >= len(INBOUND_SPOOL_RETRY_BACKOFF_S):
+                    self._inbound_spool.transition(
+                        spool_message_id,
+                        "failed",
+                        "pre_handoff_retry_exhausted",
+                    )
+                    spool_state = "failed"
+                else:
+                    self._inbound_spool.defer(
+                        spool_message_id,
+                        delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[attempts],
+                        reason="dispatch_failed_before_handoff",
+                    )
             elif spool_message_id and spool_state == "handed":
                 self._inbound_spool.transition(
                     spool_message_id,

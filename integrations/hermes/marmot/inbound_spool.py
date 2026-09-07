@@ -463,12 +463,12 @@ class InboundSpool:
         db = self._require_db()
         cutoff = now - self.terminal_retention_s
         db.execute(
-            "DELETE FROM events WHERE state IN ('handed','completed','intentionally_skipped','unresolved','failed') "
+            "DELETE FROM events WHERE state IN ('completed','intentionally_skipped','unresolved','failed') "
             "AND changed_at<?",
             (cutoff,),
         )
         terminal = db.execute(
-            "SELECT message_id FROM events WHERE state IN ('handed','completed','intentionally_skipped','unresolved','failed') "
+            "SELECT message_id FROM events WHERE state IN ('completed','intentionally_skipped','unresolved','failed') "
             "ORDER BY changed_at DESC LIMIT -1 OFFSET ?",
             (self.max_terminal,),
         ).fetchall()

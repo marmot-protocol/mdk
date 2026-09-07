@@ -3903,11 +3903,51 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(retry, return_exceptions=True)
 
         self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
-        # An empty/queued host return is not a durable finality callback. Both
-        # source ids retain explicit handoff/coalescing dispositions until
-        # Phase 2 provides one.
-        self.assertEqual("handed", adapter._inbound_spool.get(first["message_id_hex"]).state)
-        self.assertEqual("coalesced", adapter._inbound_spool.get(second["message_id_hex"]).state)
+        self.assertEqual(
+            "completed",
+            adapter._inbound_spool.get(first["message_id_hex"]).state,
+        )
+        self.assertEqual(
+            "completed",
+            adapter._inbound_spool.get(second["message_id_hex"]).state,
+        )
+
+    async def test_pre_handoff_poison_dead_letters_and_unblocks_group_fifo(self):
+        first = {
+            "type": "inbound_message",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "message_id_hex": "33" * 32,
+            "sender_account_id_hex": "44" * 32,
+            "text": "poison",
+            "mentions_self": True,
+        }
+        second = dict(first, message_id_hex="55" * 32, text="later")
+        adapter = self._adapter(client=object())
+        adapter._ensure_inbound_spool_open()
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+
+        async def fail_before_handoff(_event):
+            raise ValueError("synthetic poison")
+
+        adapter._should_run_turn = fail_before_handoff
+        adapter._admit_due_spooled = lambda: None
+        for _ in range(len(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S) + 1):
+            claim = adapter._inbound_spool.claim(
+                first["message_id_hex"],
+                ignore_backoff=True,
+            )
+            await adapter._dispatch_inbound_message(
+                claim.event,
+                spool_message_id=claim.message_id,
+            )
+
+        failed = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("failed", failed.state)
+        self.assertEqual("pre_handoff_retry_exhausted", failed.disposition)
+        admitted = adapter._inbound_spool.claim(second["message_id_hex"])
+        self.assertEqual(second["message_id_hex"], admitted.message_id)
 
     # --- Behavior 3: stream_progress wire type --------------------------------
     async def test_stream_progress_sends_progress_wire_type(self):
@@ -6617,7 +6657,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await adapter._inbound_queue.join()
         self.assertEqual(["claimed"], observed)
         record = adapter._inbound_spool.get(message_id)
-        self.assertEqual("handed", record.state)
+        self.assertEqual("completed", record.state)
         self.assertEqual("durable", record.event["text"])
         adapter._inbound_spool.close()
 
@@ -6644,7 +6684,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter._admit_due_spooled()
         await adapter._inbound_queue.join()
         delivered = adapter._inbound_spool.get("33" * 32)
-        self.assertEqual("handed", delivered.state)
+        self.assertEqual("completed", delivered.state)
         self.assertEqual(attempts, delivered.attempts)
         self.assertEqual([item.text for item in adapter.events], ["durable"])
         adapter._inbound_spool.close()
@@ -6729,8 +6769,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
 
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
-        self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
-        self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
+        self.assertEqual("completed", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("completed", adapter._inbound_spool.get("55" * 32).state)
         adapter._inbound_spool.close()
 
     async def test_failed_debounce_release_retries_without_restart(self):
@@ -6771,7 +6811,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
-            self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
+            self.assertEqual("completed", adapter._inbound_spool.get("33" * 32).state)
             self.assertEqual({}, adapter._debounce_release_pending)
             self.assertFalse(retry.done())
         finally:
@@ -6836,8 +6876,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(2, release_attempts)
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
-        self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
-        self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
+        self.assertEqual("completed", adapter._inbound_spool.get("33" * 32).state)
+        self.assertEqual("completed", adapter._inbound_spool.get("55" * 32).state)
         adapter._inbound_spool.close()
 
     async def test_disconnect_survives_unexpected_release_exception_and_reopen_recovers_once(self):

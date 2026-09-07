@@ -206,6 +206,54 @@ class InboundSpoolTests(unittest.TestCase):
             self.assertEqual("pending", store.get(event(1)["message_id_hex"]).state)
             store.close()
 
+    def test_gc_never_evicts_live_handed_by_retention_or_count(self):
+        for kwargs in (
+            {"terminal_retention_s": 0},
+            {"max_terminal": 0},
+        ):
+            with self.subTest(**kwargs), tempfile.TemporaryDirectory() as tmp:
+                store = spool.InboundSpool(Path(tmp) / "spool.sqlite3", **kwargs)
+                store.open()
+                handed = event(1)
+                store.record(handed)
+                store.claim(handed["message_id_hex"])
+                store.transition(
+                    handed["message_id_hex"],
+                    "handed",
+                    "host_handoff_started",
+                )
+
+                store.record(event(2))
+
+                self.assertEqual("handed", store.get(handed["message_id_hex"]).state)
+                store.close()
+
+    def test_completed_debounce_batch_releases_pending_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(
+                Path(tmp) / "spool.sqlite3",
+                max_pending=2,
+            )
+            store.open()
+            first, second = event(1), event(2)
+            store.record(first, debounce_buffered=True)
+            store.record(second, debounce_buffered=True)
+            merged = dict(first, text="merged")
+            representative = store.form_batch(
+                [first["message_id_hex"], second["message_id_hex"]],
+                merged,
+            )
+            store.claim(representative)
+            store.transition(representative, "handed", "host_handoff_started")
+            store.transition(representative, "completed", "host_returned")
+
+            inserted, state = store.record(event(3))
+
+            self.assertEqual((True, "pending"), (inserted, state))
+            self.assertEqual("completed", store.get(first["message_id_hex"]).state)
+            self.assertEqual("completed", store.get(second["message_id_hex"]).state)
+            store.close()
+
     def test_transaction_mode_rolls_back_partial_batch_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")

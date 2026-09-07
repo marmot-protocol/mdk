@@ -39,10 +39,13 @@ newer-schema, unsafe-permission, or unwritable spool fails connection/intake
 closed and preserves the existing state for operator recovery.
 
 Hermes does not yet expose a typed durable turn-start or finality callback. The
-adapter therefore records `handed` immediately before calling the host. If the
-process dies after that boundary, the next owner marks the obligation
+adapter therefore records `handed` immediately before calling the host and
+`completed` after the host returns normally. If the process dies while the host
+call is in flight, the next owner marks the remaining `handed` obligation
 `unresolved` and does not replay it blindly into a possibly recovering Hermes
-turn. This slice closes the pre-handoff queue/debounce crash windows without
+turn. Pre-handoff dispatch failures use the bounded retry ladder and then move
+to `failed`, allowing later same-group work to proceed. This slice closes the
+queue/debounce crash windows without
 claiming exactly-once external tool effects, complete session lineage, or
 general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state
 counts only; payloads and identifiers are never logged.
