@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-06
+updated: 2026-09-07
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -80,6 +80,12 @@ idempotent Blossom upload, and canonical group creation are separate host-visibl
 uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
+
+The workspace maintains a compile-only browser WASM boundary for `cgka-traits`, `cgka-engine`, and
+`transport-nostr-peeler` on `wasm32-unknown-unknown`. Required CI keeps those three libraries compiling with
+warnings denied, and `just wasm-check` provides the matching local gate. This is a portability boundary, not a
+browser-runtime acceptance claim: SQLCipher storage, `marmot-app`, UniFFI/C bindings, the CLI, and daemons remain
+outside its scope, and browser execution still requires downstream acceptance coverage.
 
 Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on

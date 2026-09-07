@@ -210,6 +210,7 @@ jobs:
           rustc --version
           cargo --version
           clang --version
+          # Preflight the C toolchain before compiling ring for this target.
           clang --print-targets | grep wasm32
 
       - name: Cache Cargo artifacts
@@ -220,6 +221,7 @@ jobs:
       - name: Build browser WASM libraries
         env:
           CC_wasm32_unknown_unknown: clang
+          RUSTFLAGS: -D warnings
         run: |
           cargo build --locked --target wasm32-unknown-unknown \
             -p cgka-traits \

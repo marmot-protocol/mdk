@@ -908,7 +908,6 @@ dependencies = [
  "chacha20poly1305",
  "criterion",
  "futures",
- "getrandom 0.4.3",
  "gloo-timers",
  "hex",
  "insta",

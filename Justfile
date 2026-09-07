@@ -38,6 +38,12 @@ clippy-default:
 clippy-otlp:
     cargo clippy --workspace --all-targets --features {{otlp-features}} -- -D warnings
 
+# Compile the browser-capable library boundary. The target and a WASM-capable
+# C compiler must already be installed; override CC_wasm32_unknown_unknown
+# when the system clang does not advertise a wasm32 backend.
+wasm-check:
+    RUSTFLAGS='-D warnings' CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-clang}" cargo build --locked --target wasm32-unknown-unknown -p cgka-traits -p cgka-engine -p transport-nostr-peeler
+
 test: test-default test-otlp
 
 test-default:
