@@ -375,7 +375,15 @@ impl From<AppProjectionUpdate> for TimelineProjectionUpdateFfi {
                 // Storage emits the same rows in both compatibility messages
                 // and ordered upserts. Parse matching rows only once; preserve
                 // independent conversion for removals or differing records.
-                let change = source_changes.next();
+                // Removals have no corresponding compatibility message.
+                let change = loop {
+                    match source_changes.next() {
+                        Some(change @ TimelineMessageChange::Remove { .. }) => {
+                            changes.push(change.into());
+                        }
+                        change => break change,
+                    }
+                };
                 let matching = matches!(
                     &change,
                     Some(TimelineMessageChange::Upsert { message, .. }) if **message == record
@@ -500,6 +508,20 @@ mod tests {
         for (records, changes) in [
             (vec![first.clone()], vec![upsert(first.clone())]),
             (vec![first.clone()], vec![upsert(second.clone())]),
+            (
+                vec![first.clone()],
+                vec![remove.clone(), remove.clone(), upsert(first.clone())],
+            ),
+            (
+                vec![first.clone(), second.clone()],
+                vec![
+                    upsert(first.clone()),
+                    remove.clone(),
+                    upsert(second.clone()),
+                    remove.clone(),
+                ],
+            ),
+            (vec![first.clone()], vec![remove.clone(), remove.clone()]),
             (
                 vec![first.clone()],
                 vec![remove.clone(), upsert(second.clone())],
