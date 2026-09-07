@@ -607,10 +607,12 @@ struct CaptureSink {
     addr: std::net::SocketAddr,
     requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
     statuses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u16>>>,
-    /// Milliseconds a handler holds a request open before answering, so a test
+    /// Hold handlers until explicitly released, so a test
     /// can schedule more triggers while an upload is genuinely in flight.
-    hold_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    default_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    started: std::sync::Arc<tokio::sync::Notify>,
+    finished: std::sync::Arc<tokio::sync::Notify>,
     in_flight: std::sync::Arc<std::sync::Mutex<(usize, usize)>>,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -624,15 +626,19 @@ impl CaptureSink {
         let statuses = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::<u16>::new(),
         ));
-        let hold_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let default_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(204));
+        let hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
         let in_flight = std::sync::Arc::new(std::sync::Mutex::new((0_usize, 0_usize)));
         let handle = tokio::spawn({
             use std::sync::atomic::Ordering;
             let requests = requests.clone();
             let statuses = statuses.clone();
-            let hold_ms = hold_ms.clone();
-            let default_status = default_status.clone();
+            let hold = hold.clone();
+            let permits = permits.clone();
+            let started = started.clone();
+            let finished = finished.clone();
             let in_flight = in_flight.clone();
             async move {
                 loop {
@@ -641,8 +647,10 @@ impl CaptureSink {
                     };
                     let requests = requests.clone();
                     let statuses = statuses.clone();
-                    let hold_ms = hold_ms.clone();
-                    let default_status = default_status.clone();
+                    let hold = hold.clone();
+                    let permits = permits.clone();
+                    let started = started.clone();
+                    let finished = finished.clone();
                     let in_flight = in_flight.clone();
                     // One task per connection so overlapping uploads are
                     // observable instead of serialized behind `accept`.
@@ -655,15 +663,11 @@ impl CaptureSink {
                             counts.0 += 1;
                             counts.1 = counts.1.max(counts.0);
                         }
-                        let hold = hold_ms.load(Ordering::Relaxed);
-                        if hold > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+                        started.notify_one();
+                        if hold.load(Ordering::Relaxed) {
+                            permits.acquire().await.unwrap().forget();
                         }
-                        let status = statuses
-                            .lock()
-                            .unwrap()
-                            .pop_front()
-                            .unwrap_or_else(|| default_status.load(Ordering::Relaxed));
+                        let status = statuses.lock().unwrap().pop_front().unwrap_or(204);
                         // Record the body before answering, after the hold: once the
                         // response is written the client may fire its next request,
                         // and the order-asserting tests need bodies pushed in serve
@@ -674,6 +678,7 @@ impl CaptureSink {
                         write_http_response(&mut stream, status).await;
                         let _ = stream.shutdown().await;
                         in_flight.lock().unwrap().0 -= 1;
+                        finished.notify_one();
                     });
                 }
             }
@@ -682,8 +687,10 @@ impl CaptureSink {
             addr,
             requests,
             statuses,
-            hold_ms,
-            default_status,
+            hold,
+            permits,
+            started,
+            finished,
             in_flight,
             handle,
         }
@@ -697,14 +704,22 @@ impl CaptureSink {
         *self.statuses.lock().unwrap() = statuses.iter().copied().collect();
     }
 
-    fn hold_each_request_for(&self, millis: u64) {
-        self.hold_ms
-            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    fn hold_requests(&self) {
+        self.hold.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    async fn wait_started(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.started.notified())
+            .await
+            .unwrap();
+    }
+    async fn wait_finished(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.finished.notified())
+            .await
+            .unwrap();
     }
 
-    fn always_answer(&self, status: u16) {
-        self.default_status
-            .store(status, std::sync::atomic::Ordering::Relaxed);
+    fn release_one(&self) {
+        self.permits.add_permits(1);
     }
 
     fn max_concurrent_requests(&self) -> usize {
@@ -980,45 +995,6 @@ async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling()
     assert!(sink.take_bodies().is_empty());
 }
 
-#[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
-async fn trigger_bursts_coalesce_into_one_follow_up_run() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(tmp.path());
-    let account = home.create_account("alice").unwrap();
-    let dir = home.account_dir(&account.label);
-    std::fs::write(dir.join("audit-engine-v3.jsonl"), b"{\"seq\":1}\n").unwrap();
-
-    let sink = CaptureSink::start().await;
-    // Hold each upload open so the burst lands while a run is in flight, which
-    // is the case the coalescing contract is about, and refuse every upload so
-    // nothing is ever acknowledged — then each run posts, and the request count
-    // measures runs rather than changed content.
-    sink.hold_each_request_for(400);
-    sink.always_answer(500);
-    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
-
-    runtime.schedule_audit_log_tracker_update_for_test("burst");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    for _ in 0..50 {
-        runtime.schedule_audit_log_tracker_update_for_test("burst");
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-
-    // 50 triggers arriving during a run collapse into exactly one follow-up,
-    // and no two uploads are ever in flight at once.
-    assert_eq!(
-        sink.take_bodies().len(),
-        2,
-        "a burst during an in-flight run must produce one follow-up, not one run per trigger"
-    );
-    assert_eq!(
-        sink.max_concurrent_requests(),
-        1,
-        "tracker updates must never upload concurrently"
-    );
-}
-
 #[tokio::test]
 async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
     use std::io::Write;
@@ -1145,4 +1121,95 @@ async fn custom_json_acknowledgment_is_checkpointed() {
             .is_empty()
     );
     server.await.unwrap();
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn automatic_upload_burst_coalesces_over_real_http_without_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    home.create_account("alice").unwrap();
+    let first = home.account_dir("alice").join("audit-a.jsonl");
+    std::fs::write(&first, b"{\"seq\":1}\n").unwrap();
+    std::fs::write(
+        home.account_dir("alice").join("audit-b.jsonl"),
+        b"{\"seq\":2}\n",
+    )
+    .unwrap();
+    let sink = CaptureSink::start().await;
+    sink.hold_requests();
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    runtime.set_audit_log_batch_window_for_test(std::time::Duration::ZERO);
+    runtime.schedule_audit_log_tracker_update_for_test("first");
+    sink.wait_started().await;
+    // Grow the opened file while its immutable snapshot is held by the sink.
+    let grown = b"{\"seq\":1}\n{\"seq\":3}\n";
+    std::fs::write(&first, grown).unwrap();
+    for _ in 0..50 {
+        runtime.schedule_audit_log_tracker_update_for_test("burst");
+    }
+    for _ in 0..2 {
+        sink.release_one();
+        sink.wait_finished().await;
+        sink.wait_started().await;
+    }
+    sink.release_one();
+    sink.wait_finished().await;
+    runtime.shutdown().await;
+    assert_eq!(sink.max_concurrent_requests(), 1);
+    assert_eq!(
+        sink.take_bodies(),
+        vec![
+            b"{\"seq\":1}\n".to_vec(),
+            b"{\"seq\":2}\n".to_vec(),
+            grown.to_vec()
+        ]
+    );
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn file_growing_past_limit_does_not_stop_other_files_or_accounts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    for account in ["alice", "bob"] {
+        home.create_account(account).unwrap();
+    }
+    for name in ["audit-a.jsonl", "audit-b.jsonl", "audit-c.jsonl"] {
+        std::fs::write(home.account_dir("alice").join(name), b"{}\n").unwrap();
+    }
+    std::fs::write(
+        home.account_dir("bob").join("audit-a.jsonl"),
+        b"{\"bob\":1}\n",
+    )
+    .unwrap();
+    let sink = CaptureSink::start().await;
+    sink.hold_requests();
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+    runtime.set_audit_log_batch_window_for_test(std::time::Duration::ZERO);
+    runtime.schedule_audit_log_tracker_update_for_test("growth");
+    sink.wait_started().await;
+    // Enumeration has finished, but the second file has not been opened yet.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(home.account_dir("alice").join("audit-b.jsonl"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    for _ in 0..2 {
+        sink.release_one();
+        sink.wait_finished().await;
+        sink.wait_started().await;
+    }
+    sink.release_one();
+    sink.wait_finished().await;
+    runtime.shutdown().await;
+    assert_eq!(
+        sink.take_bodies(),
+        vec![
+            b"{}\n".to_vec(),
+            b"{}\n".to_vec(),
+            b"{\"bob\":1}\n".to_vec()
+        ]
+    );
 }

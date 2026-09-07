@@ -3377,6 +3377,7 @@ dependencies = [
  "futures",
  "hex",
  "hkdf 0.12.4",
+ "httpdate",
  "image",
  "keyring-core",
  "marmot-account",

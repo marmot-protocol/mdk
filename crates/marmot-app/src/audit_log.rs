@@ -82,6 +82,32 @@ pub(crate) struct AuditUploadReceipt {
     pub complete: bool,
 }
 
+pub(crate) enum AuditUploadAttempt {
+    Uploaded(AuditUploadReceipt),
+    Deferred,
+    FileFailure(AppError),
+    Rejected {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Retry-After accepts either delta seconds or an HTTP date. Bound untrusted
+/// deadlines to five minutes so one response cannot silence incident evidence for a day.
+fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    let delay = value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .map(|date| date.duration_since(now).unwrap_or_default())
+        })?;
+    Some(delay.min(Duration::from_secs(5 * 60)))
+}
+
 struct AuditUploadSnapshot {
     body: Vec<u8>,
     observed_bytes: u64,
@@ -506,10 +532,16 @@ impl MarmotApp {
         path: &str,
         config: &config::AuditLogTrackerConfig,
     ) -> Result<AuditLogUploadResult, AppError> {
-        self.post_audit_log_snapshot(path, config)
-            .await?
-            .map(|receipt| receipt.result)
-            .ok_or_else(|| AppError::AuditLogUpload("audit snapshot has no complete lines".into()))
+        match self.post_audit_log_snapshot(path, config).await? {
+            AuditUploadAttempt::Uploaded(receipt) => Ok(receipt.result),
+            AuditUploadAttempt::Deferred => Err(AppError::AuditLogUpload(
+                "audit snapshot has no complete lines".into(),
+            )),
+            AuditUploadAttempt::FileFailure(error) => Err(error),
+            AuditUploadAttempt::Rejected { status, .. } => Err(AppError::AuditLogUpload(format!(
+                "upload returned HTTP {status}"
+            ))),
+        }
     }
 
     /// An empty complete-line prefix is deferred without an HTTP request.
@@ -517,8 +549,11 @@ impl MarmotApp {
         &self,
         path: &str,
         config: &config::AuditLogTrackerConfig,
-    ) -> Result<Option<AuditUploadReceipt>, AppError> {
-        let path = self.validate_audit_log_path(path)?;
+    ) -> Result<AuditUploadAttempt, AppError> {
+        let path = match self.validate_audit_log_path(path) {
+            Ok(path) => path,
+            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
+        };
         let config = config
             .clone()
             .normalize()
@@ -532,10 +567,17 @@ impl MarmotApp {
                     config.authorization_bearer_token.as_deref(),
                 )
             })?;
-        let file = tokio::fs::File::open(&path).await?;
-        let snapshot = AuditUploadSnapshot::capture(file).await?;
+        let snapshot = match async {
+            let file = tokio::fs::File::open(&path).await?;
+            AuditUploadSnapshot::capture(file).await
+        }
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
+        };
         if snapshot.body.is_empty() {
-            return Ok(None);
+            return Ok(AuditUploadAttempt::Deferred);
         }
         let bytes_sent = snapshot.body.len() as u64;
         let mut request = AUDIT_LOG_UPLOAD_CLIENT
@@ -558,12 +600,18 @@ impl MarmotApp {
         let response = request.send().await.map_err(audit_log_reqwest_error)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(AppError::AuditLogUpload(format!(
-                "upload returned HTTP {}",
-                status.as_u16()
-            )));
+            return Ok(AuditUploadAttempt::Rejected {
+                status: status.as_u16(),
+                retry_after: audit_retry_after(
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    SystemTime::now(),
+                ),
+            });
         }
-        Ok(Some(AuditUploadReceipt {
+        Ok(AuditUploadAttempt::Uploaded(AuditUploadReceipt {
             observed_bytes: snapshot.observed_bytes,
             modified_at_ms: snapshot.modified_at_ms,
             complete: snapshot.complete,
@@ -845,6 +893,29 @@ impl MarmotApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_after_supports_seconds_dates_and_bounded_invalid_input() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(
+            audit_retry_after(Some("120"), now),
+            Some(Duration::from_secs(120))
+        );
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(180));
+        assert_eq!(
+            audit_retry_after(Some(&date), now),
+            Some(Duration::from_secs(180))
+        );
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(1));
+        assert_eq!(audit_retry_after(Some(&past), now), Some(Duration::ZERO));
+        assert_eq!(
+            audit_retry_after(Some("18446744073709551615"), now),
+            Some(Duration::from_secs(300))
+        );
+        for value in [None, Some("nonsense"), Some("-1")] {
+            assert_eq!(audit_retry_after(value, now), None);
+        }
+    }
+
     #[tokio::test]
     async fn upload_snapshot_excludes_unfinished_tail_and_recovers_it_later() {
         let dir = tempfile::tempdir().unwrap();

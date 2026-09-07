@@ -29,6 +29,7 @@ bytes.workspace = true
 fs-private.workspace = true
 futures.workspace = true
 hex.workspace = true
+httpdate.workspace = true
 hkdf.workspace = true
 image.workspace = true
 marmot-account.workspace = true
