@@ -18853,3 +18853,20 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
         }
     });
 }
+
+#[test]
+fn dev_maintenance_timing_is_honored_only_in_test_policy_builds() {
+    assert_eq!(dev_maintenance_timing(&MarmotAppConfig::default()), None);
+    let configured =
+        MarmotAppConfig::default().with_dev_maintenance_timing(MaintenanceTiming::immediate());
+    let expected = if cfg!(feature = "test-policy-overrides") {
+        Some(MaintenanceTiming::immediate())
+    } else {
+        None
+    };
+    assert_eq!(
+        dev_maintenance_timing(&configured),
+        expected,
+        "production builds must keep the anti-contention maintenance windows"
+    );
+}
