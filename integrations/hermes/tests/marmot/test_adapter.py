@@ -6840,7 +6840,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
         adapter._inbound_spool.close()
 
-    async def test_disconnect_clears_failed_release_handles_and_reopen_recovers_row(self):
+    async def test_disconnect_survives_unexpected_release_exception_and_reopen_recovers_once(self):
         adapter = self.make_adapter(
             extra={"group_activation": "always", "debounce_ms": 60_000}
         )
@@ -6849,13 +6849,15 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         original_release = adapter._inbound_spool.release_debounce
 
         def fail_release(message_ids, *, reason):
-            raise self.adapter_module.InboundSpoolError("synthetic disconnect failure")
+            raise ValueError("synthetic unexpected disconnect failure")
 
         adapter._inbound_spool.release_debounce = fail_release
         await adapter.disconnect()
 
         self.assertEqual({}, adapter._debounce_release_pending)
         self.assertEqual({}, adapter._debounce_pending)
+        self.assertEqual({}, adapter._debounce_tasks)
+        self.assertEqual(set(), adapter._pending_inbound_ids)
         self.assertFalse(adapter._inbound_spool.is_open)
 
         adapter._inbound_spool.release_debounce = original_release
@@ -6863,6 +6865,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         recovered = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("pending", recovered.state)
         self.assertEqual("recovered_debounce_buffer", recovered.disposition)
+        adapter._admit_due_spooled()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
         adapter._admit_due_spooled()
         await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
         self.assertEqual([item.text for item in adapter.events], ["recover after reopen"])

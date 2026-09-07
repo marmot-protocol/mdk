@@ -1534,7 +1534,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._inbound_spool_retry_task = None
         await self._inbound_queue.cancel_all()
         await self._cancel_all_streams("adapter disconnect")
-        self._cancel_debounce_tasks()
+        try:
+            self._cancel_debounce_tasks()
+        except Exception:
+            logger.error("Marmot inbound debounce cancellation failed", exc_info=True)
         # Debounce rows are hidden from due() while a live timer owns them. Make
         # one final best-effort release while the spool is still open, then drop
         # the process-local retry handles so they cannot leak across reconnects.
@@ -1554,14 +1557,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._mark_disconnected()
 
     def _cancel_debounce_tasks(self) -> None:
-        for task in self._debounce_tasks.values():
-            if not task.done():
-                task.cancel()
-        for items in self._debounce_pending.values():
-            self._release_debounce_items(items, reason="debounce_cancelled")
-        self._debounce_tasks.clear()
-        self._debounce_pending.clear()
-        self._pending_inbound_ids.clear()
+        try:
+            for task in self._debounce_tasks.values():
+                if not task.done():
+                    task.cancel()
+            for items in self._debounce_pending.values():
+                self._release_debounce_items(items, reason="debounce_cancelled")
+        finally:
+            self._debounce_tasks.clear()
+            self._debounce_pending.clear()
+            self._pending_inbound_ids.clear()
 
     async def send(
         self,
