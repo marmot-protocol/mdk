@@ -249,15 +249,18 @@ The investigation separated several causes:
   interval. Unrelated publications remain on the relay and are excluded only from that action's fault selectors.
 
 Repeated effect observation refreshes local `received_at`; projection replay tests compare stable identities,
-insertion order and all other message fields across that timestamp change. No native SQLCipher crash has been
-reproduced in these maintained runs; ordinary assertion failures and worker response timeouts are separate evidence.
+insertion order and all other message fields across that timestamp change. The large-recovery journeys have not
+reproduced a native SQLCipher crash. A separate concurrent storage-close test exited with SIGSEGV after a failed
+assertion in Linux CI; without a native trace, its origin is unproven. Keep that evidence separate from ordinary
+recovery assertion failures and worker response timeouts.
 
 
 ## Recovery implementation boundaries
 
 The durable deferred-generation barrier covers uncontested catch-up as well as competing branches: all admitted
-raw rows must try the current context before recovered commits can prune it. Background host calls share 64 rows
-and a cooperative 500-ms deadline; explicit-time engine calls share the row bound without consulting elapsed real
+raw rows must try the current context before recovered commits can prune it. Each background recovery slice shares
+64 rows and a cooperative 500-ms deadline; queued-intent foreground preflights retain their separate budgets.
+Explicit-time engine calls share the recovery row bound without consulting elapsed real
 time. Partial work survives cancellation and restart. Historical peel contexts are materialized once per sweep,
 and live storage is restored before awaiting the peeler; secret retention policy is unchanged.
 
