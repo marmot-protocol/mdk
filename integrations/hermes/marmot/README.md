@@ -66,14 +66,15 @@ The durable rows contain only SHA-256 routing/dedupe keys, an allowlisted fact
 kind, ordering, and expiry metadata. They contain no message text, rename text,
 account/group/message identifiers, pubkeys, relay URLs, tokens, or stream
 capabilities. Acknowledged event hashes remain only as bounded replay-dedupe
-tombstones. The private parent and database/lock/WAL files are permission
-checked and symlink files are refused; unsupported no-follow path chmod uses a
-descriptor opened with `O_NOFOLLOW`. Pending facts and replay tombstones have
-separate per-group windows and share deterministic aggregate group, event-count,
-logical-byte, and age bounds; oldest observed entries (and then oldest groups)
-are evicted first. A live claim may temporarily add at most one already-bounded
-snapshot to the persisted limits; it is never evicted before the host outcome,
-and acknowledgement or release immediately restores the configured aggregate
+tombstones. The private parent and database/lock/WAL files are checked and
+kept private; symlink files are refused. The file-mode fallback opens the
+already-validated regular file with `O_NOFOLLOW` and applies mode through the
+descriptor. Pending facts and replay tombstones have separate per-group windows
+and share deterministic aggregate group, event-count, logical-byte, and age
+bounds; oldest observed entries (and then oldest groups) are evicted first. A
+live claim may temporarily add at most one already-bounded snapshot to the
+persisted limits; it is never evicted before the host outcome, and
+acknowledgement or release immediately restores the configured aggregate
 limits.
 
 A connector reconnect in the same process and a clean adapter disconnect leave
