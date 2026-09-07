@@ -18908,14 +18908,25 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
 /// while the transport's frozen event is still in retry backoff.
 #[tokio::test]
 async fn due_peer_leave_preserves_the_outbound_fanout_retry_barrier() {
+    assert_peer_leave_behind_fanout(false).await;
+}
+
+#[tokio::test]
+async fn removed_device_retires_peer_leave_timer_after_input_only_convergence() {
+    assert_peer_leave_behind_fanout(true).await;
+}
+
+async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
+    let alice_account = home.create_account("alice").unwrap();
+    home.create_account("carol").unwrap();
     let bob = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
@@ -18925,13 +18936,30 @@ async fn due_peer_leave_preserves_the_outbound_fanout_retry_barrier() {
         .client_with_relay_plane("bob", &plane, None)
         .await
         .unwrap();
+    let mut carol = app
+        .client_with_relay_plane("carol", &plane, None)
+        .await
+        .unwrap();
+    alice.sync().await.unwrap();
     bob_client.sync().await.unwrap();
-    let group_id = alice
-        .create_group("leave behind backoff", &[&bob.account_id_hex])
+    let group_id = carol
+        .create_group(
+            "leave behind backoff",
+            &[&alice_account.account_id_hex, &bob.account_id_hex],
+        )
         .await
         .unwrap();
     assert!(
         bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+
+    assert!(
+        alice
             .sync()
             .await
             .unwrap()
@@ -19005,6 +19033,55 @@ async fn due_peer_leave_preserves_the_outbound_fanout_retry_barrier() {
         bob_client.runtime.group_record(&group_id).unwrap().epoch
     );
 
+    if remove_observer {
+        relay.allow_publishes();
+        carol
+            .remove_members(&group_id, &[&alice_account.account_id_hex])
+            .await
+            .unwrap();
+        relay.fail_publishes_as_unavailable();
+        alice.sync().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !alice.runtime.group_record(&group_id).unwrap().removed {
+            // The durable fanout blocks outbound work, so only convergence
+            // inputs run. They must still be allowed to realize our eviction.
+            alice.retry_group_convergence(&group_id).await.unwrap();
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            alice
+                .runtime
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "a removed device must retire a timer whose staging path can no longer run"
+        );
+        relay.allow_publishes();
+        for mut retained in alice
+            .runtime
+            .session()
+            .outbound_fanouts_for_group(&group_id)
+            .unwrap()
+        {
+            retained.wake_retryable_unavailable_targets();
+            alice
+                .runtime
+                .session()
+                .put_outbound_fanout(&retained)
+                .unwrap();
+        }
+        alice.retry_group_convergence(&group_id).await.unwrap();
+        assert!(
+            matches!(
+                alice.convergence_schedule_state(&group_id).unwrap(),
+                ConvergenceScheduleState::Idle
+            ),
+            "after fanout cleanup the worker must disarm instead of polling every 10 ms"
+        );
+        return;
+    }
+
     relay.allow_publishes();
     assert!(fanout.wake_retryable_unavailable_targets() > 0);
     alice
@@ -19021,7 +19098,7 @@ async fn due_peer_leave_preserves_the_outbound_fanout_retry_barrier() {
     );
     assert_eq!(
         alice.members(&group_id).unwrap().len(),
-        1,
+        2,
         "the due removal progresses once the actual fanout barrier clears"
     );
 }

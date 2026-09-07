@@ -1610,7 +1610,7 @@ impl<S: StorageProvider> Engine<S> {
     /// Milliseconds until the earliest scheduled SelfRemove auto-commit for
     /// this group is due: `Some(0)` once it is due, `None` when nothing is
     /// scheduled or the group cannot stage one right now (quarantined,
-    /// unhydrated, epoch not `Stable`, or this device is itself leaving).
+    /// unhydrated, removed, epoch not `Stable`, or this device is itself leaving).
     ///
     /// Runtime schedulers must keep a wakeup armed while this is `Some`, but
     /// only use this deadline when no active convergence pass or outbound
@@ -1636,12 +1636,24 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(None);
         }
         let now_ms = self.convergence_now_ms();
-        Ok(self
+        let delay = self
             .scheduled_self_remove_auto_commits
             .values()
             .filter(|scheduled| &scheduled.group_id == group_id)
             .map(|scheduled| scheduled.due_at_ms.saturating_sub(now_ms))
-            .min())
+            .min();
+        if delay.is_some()
+            && self
+                .stored_group_record(group_id)?
+                .is_none_or(|group| group.removed)
+        {
+            // Input-only convergence can realize our eviction while fanout
+            // blocks the outbound drain. Removed copies exit that drain before
+            // maintenance, so a stale timer would otherwise stay due forever.
+            self.drop_self_remove_auto_commit_schedules_for_group(group_id);
+            return Ok(None);
+        }
+        Ok(delay)
     }
 
     /// Whether durable queued outbound intents exist for this group. Runtime
@@ -2961,6 +2973,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<usize, EngineError> {
+        self.drop_self_remove_auto_commit_schedules_for_group(group_id);
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.storage.delete_deferred_peel_generation(group_id)?;
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
