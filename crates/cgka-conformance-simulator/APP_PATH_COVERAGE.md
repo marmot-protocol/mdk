@@ -87,6 +87,85 @@ multiple groups, duplicate/reordered retained history, partitions, competing com
 catalog. Capability-preflight failures must stay visible as coverage gaps; do not discard incompatible assertions
 and call the original scenario covered.
 
+## Interaction journeys
+
+`tests/app_runtime_interaction_journeys.rs` uses the same harness and evidence layout and covers interactions the
+serialized generated families cannot express. `AppRuntimeHarness::race_mutations` issues several public commands from
+different participants at the same instant, so each device commits against its own current epoch; a rejected command
+may already have reached the relay, so only accepted publications are correlated strictly in that case.
+`AppRuntimeHarness::run_due_maintenance` drives the maintenance sweep instead of the worker's fifteen-second timer.
+
+| Test suffix | Public contract |
+| --- | --- |
+| `07_two_groups_stay_isolated` | Work and pair groups on one device; the second invite of Bob needs a fresh KeyPackage; a non-member has no projection; a removal and a reopen leave the other group's exact history untouched |
+| `08_concurrent_admin_profile_edits_converge` | Two admins save name and description at the same instant; members settle on one state in which at least one edit is present (measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
+| `08_strict_concurrent_admin_profile_edits_are_never_lost` (ignored, #1734) | As above, and every edit the runtime reported as saved is present in the settled state |
+| `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
+| `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1734, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
+| `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
+| `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
+| `12_strict_leave_is_applied_by_survivors_promptly` (ignored, #1736) | As above, but the survivors must apply the leave within 30 seconds |
+| `11_manual_self_update_advances_every_member` (ignored) | A manual self-update advances the shared epoch with no loss; waits out the real-time 60-second quiet window plus up to 30 seconds of jitter (passed locally in about 150 seconds on 2026-09-06) |
+
+On 2026-09-06 the four default race, group, and removal journeys passed locally in debug mode in about 80 seconds
+total, the default leave journey passed in about two minutes, and the strict variants failed only on the documented
+contracts below. The default concurrent journeys accept either race outcome. They fail when members do not settle, when neither edit
+is present in the settled state, or when fresh traffic or reopen persistence breaks. They do not prove that a same-epoch
+fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
+[#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
+and [#1736](https://github.com/marmot-protocol/mdk/issues/1736); the ignored strict journeys are their regressions.
+
+Run the default journeys the way the conformance CI job does, or serially with retained evidence:
+
+```sh
+cargo nextest run -p cgka-conformance-simulator --locked --profile ci --test app_runtime_interaction_journeys
+```
+
+```sh
+MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-interaction-evidence" \
+cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_interaction_journeys -- \
+  --test-threads=1 --nocapture
+```
+
+Add `--include-ignored` to also run the strict regressions and the manual self-update journey. Under nextest the
+`app-runtime-journeys` test group in `.config/nextest.toml` runs at most two public journeys at a time, because each
+one starts a local relay and several SQLCipher runtimes and then waits on real settlement windows.
+
+### Known gap: a losing admin edit is dropped after its caller was told it saved (#1734)
+
+The first run of the strict profile-edit journey (2026-09-06) showed both `update_group_profile` calls returning
+success, every member settling at the next epoch with Bob's description, and Alice's rename absent everywhere, with
+no error event on any device. This matches the account layer: when convergence parks an own commit, only a
+`SelfUpdate` evolution re-arms its maintenance obligation; `Invite`, `RemoveMembers`, and `UpdateAppComponents`
+evolutions are marked superseded and their intent is not re-issued or reported. The engine vectors
+(`group-data-fork-recovery/v1`) specify only that both clients converge, so the engine oracle cannot see this.
+The strict journeys stay ignored until the runtime either re-issues a parked intent or reports the loss to the
+caller; the default journeys keep the convergence, delivery, and persistence contract green in the ordinary run.
+
+### Known gap: survivors apply a voluntary leave only when something else runs convergence (#1736)
+
+The engine schedules a peer's SelfRemove auto-commit 10 to 50 ms after the proposal and marks the group as one the
+app should feed through its convergence timer. The app worker's schedule state, however, is derived from open
+convergence passes, unresolved convergence rows, queued outbound intents, pending fanouts, and deferred peels; a
+scheduled auto-commit is none of those, so the group reads `Idle` and no timer is armed. On 2026-09-06 four
+instrumented runs showed the proposal admitted by the relay immediately and the three survivors unchanged at epoch 1
+for 50 to 80 seconds, until their post-join rotations happened to run convergence and carried the removal with them
+(epoch 1 to 4 across three commits). The existing send-leave family canary shows the same shape: its post-leave
+checkpoint took 82 seconds. In a settled group with no rotation due, a departed member would stay on the roster and
+keep the current epoch secret until the next unrelated commit. The strict journey stays ignored until the worker
+arms a wakeup for scheduled auto-commits; the default journey allows three minutes so the eventual contract stays
+green. Neither run needed a manual `retry_group_convergence`.
+
+The invite-versus-rename race decides differently from run to run (#1735). When the invite won, the rename was dropped and
+the invitee joined normally. When the rename won (strict run, same day), `invite_members` had still returned
+success, the founders settled at the next epoch with three members and the new name, and the invitee's device had
+accepted the Welcome from the parked branch: it reported itself a full member at the same epoch number with four
+members and the old name, with no pending confirmation and no error event. That device cannot decrypt the real
+group's traffic and its own sends are undecryptable to the members. This is the stale-Welcome incident archetype
+reaching the public app with no repair; the engine family `membership-reentry/v1` covers the shape only after an
+explicit remove and fresh re-invite. The default journey records the invitee's view in `after-race.json` whenever
+the founders' settled roster excludes it.
+
 ## Running and preserving evidence
 
 The later consolidation applies the 2,048-row mitigation to the broader WIP checkout. Evidence for this combination

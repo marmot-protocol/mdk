@@ -65,6 +65,7 @@ pub mod vector;
 pub use app_runtime::{
     APP_RUNTIME_OBSERVATION_SCHEMA_VERSION, AppRuntimeApplicationProjectionV1, AppRuntimeHarness,
     AppRuntimeLocalDiagnosticsV1, AppRuntimeObservationV1, AppRuntimeProtocolProjectionV1,
+    ConcurrentMutation, ConcurrentMutationOutcome, ConcurrentMutationReport,
 };
 pub use bus::{ClientId, DeliveryPolicy, TransportBus};
 pub use campaign_metrics::{

@@ -1067,6 +1067,21 @@ by app deduplication (#1721). Both run in the required public recovery CI job.
 Commands, limits, and remaining coverage gaps are in
 [`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
 
+`tests/app_runtime_interaction_journeys.rs` adds interaction journeys the serialized public families cannot express:
+two groups on one device (traffic, a removal, and a reopen must not leak across groups, and the second invitation of the
+same member exercises a fresh KeyPackage), two admins saving different profile fields at the same instant, an invite
+racing a rename, a member removed while its device is closed (it must learn the removal from relay history, keep
+its pre-removal history exactly, and have its own sends refused), and a voluntary leave from a four-member group.
+`AppRuntimeHarness::race_mutations` issues the concurrent commands.
+
+The default forms run in the ordinary crate test and gate only what the product delivers today: members settle on one
+public state, at least one racing edit is present in that settled state (measured on the projection, never on the
+command's return value), fresh traffic flows in every direction, history survives reopen, and survivors apply a leave
+within three minutes. The strict forms are ignored regressions for three tracked gaps: an edit or invite the runtime
+reported as saved is never lost (#1734), an invitee the founders exclude holds no projection rather than a stranded
+parked-branch membership (#1735), and survivors apply a leave within 30 seconds (#1736). The manual self-update journey
+is explicitly ignored because the protocol's quiet window and jitter run on real time.
+
 `cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
 capabilities before spending runtime budget. Its first bounded selection covers twelve families and records
 unsupported cases explicitly; it does not create new families, remove assertions, or count preflight as a pass.

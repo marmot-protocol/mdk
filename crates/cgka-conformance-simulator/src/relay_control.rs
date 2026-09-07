@@ -285,6 +285,58 @@ impl RelayControl {
         }
     }
 
+    /// Like [`Self::wait_for_action_events`], but admitted events beyond the
+    /// expected count are tolerated and the admitted count is returned. Use it
+    /// for concurrently issued commands: convergence may legitimately publish
+    /// recovery commits inside the window, and a rejected command may have
+    /// reached the relay before failing, so an exact count is not a meaningful
+    /// correlation there. The accepted publications must still all appear.
+    pub async fn wait_for_at_least_action_events(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+    ) -> Result<usize, RelayControlError> {
+        let RelayActionExpectation {
+            include_welcomes,
+            expected_publications,
+            expected_event_ids,
+            timeout,
+        } = expectation;
+        if expected_event_ids.len() > expected_publications {
+            return Err(RelayControlError {
+                code: "relay_action_publication_identity_count_mismatch",
+                message: "the action's expected relay event ids do not match its publication count",
+            });
+        }
+        let expected_event_ids = expected_event_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let recorded = self
+                .record_action_events(action_events, action_id, before, include_welcomes)
+                .await?;
+            let observed_event_ids = action_events
+                .get(action_id)
+                .into_iter()
+                .flatten()
+                .map(|event| event.event.id.to_hex())
+                .collect::<BTreeSet<_>>();
+            if recorded >= expected_publications
+                && expected_event_ids.is_subset(&observed_event_ids)
+            {
+                return Ok(recorded);
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayControlError {
+                    code: "relay_action_publication_timeout",
+                    message: "the action's expected retained relay publications were not admitted before the deadline",
+                });
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn set_action_event_visibility(
         &self,
         action_events: &RelayActionEvents,
@@ -602,5 +654,82 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "relay_action_publication_identity_mismatch");
+    }
+
+    #[tokio::test]
+    async fn at_least_waiter_requires_accepted_ids_but_tolerates_additional_admissions() {
+        let control = RelayControl::new();
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&control.publication_log),
+            hidden_event_ids: Arc::clone(&control.hidden_event_ids),
+        };
+        let keys = nostr::Keys::generate();
+        let accepted = nostr::EventBuilder::new(Kind::MlsGroupMessage, "accepted commit")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let recovery = nostr::EventBuilder::new(Kind::MlsGroupMessage, "convergence recovery")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let welcome = nostr::EventBuilder::new(Kind::GiftWrap, "early welcome")
+            .sign_with_keys(&keys)
+            .unwrap();
+        for event in [&recovery, &welcome] {
+            assert!(database.save_event(event).await.unwrap().is_success());
+        }
+        let accepted_ids = [accepted.id.to_hex()];
+        let expectation = || RelayActionExpectation {
+            include_welcomes: true,
+            expected_publications: 1,
+            expected_event_ids: &accepted_ids,
+            timeout: Duration::from_millis(200),
+        };
+
+        // Two unrelated admissions do not satisfy the wait: the accepted
+        // command's own event must appear.
+        let mut action_events = RelayActionEvents::new();
+        let missing = control
+            .wait_for_at_least_action_events(&mut action_events, "race", 0, expectation())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "relay_action_publication_timeout");
+
+        // Once it does, the additional admissions are counted, not rejected,
+        // where the exact waiter would report a count mismatch.
+        assert!(database.save_event(&accepted).await.unwrap().is_success());
+        let admitted = control
+            .wait_for_at_least_action_events(&mut action_events, "race", 0, expectation())
+            .await
+            .unwrap();
+        assert_eq!(admitted, 3);
+        let exact = control
+            .wait_for_action_events(&mut action_events, "race-exact", 0, expectation())
+            .await
+            .unwrap_err();
+        assert_eq!(exact.code, "relay_action_publication_identity_mismatch");
+
+        // Both waiters refuse an id list longer than the publication count.
+        let two_ids = [accepted.id.to_hex(), recovery.id.to_hex()];
+        let inconsistent = control
+            .wait_for_at_least_action_events(
+                &mut action_events,
+                "race-inconsistent",
+                0,
+                RelayActionExpectation {
+                    include_welcomes: true,
+                    expected_publications: 1,
+                    expected_event_ids: &two_ids,
+                    timeout: Duration::from_millis(50),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            inconsistent.code,
+            "relay_action_publication_identity_count_mismatch"
+        );
     }
 }
