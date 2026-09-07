@@ -86,8 +86,8 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        // Retain the intent behind every own group evolution until the commit
-        // is confirmed or rolled back, so a supersession can re-issue it
+        // Retain the intent behind every own group evolution through the
+        // rewind horizon, so a supersession can re-issue it
         // (mdk#1734). The baseline is read before staging so it describes the
         // state the caller was looking at.
         let recording = self.own_commit_recording(&intent)?;
@@ -129,17 +129,22 @@ impl<S: StorageProvider> Engine<S> {
         if let (
             Some((_, baseline)),
             Some(retained_intent),
-            Ok(SendResult::GroupEvolution { msg, .. }),
+            Ok(SendResult::GroupEvolution { msg, pending, .. }),
         ) = (recording, retained_intent, &result)
-        {
-            self.record_own_commit_intent(
+            && let Err(error) = self.record_own_commit_intent(
                 msg.id.clone(),
                 group_id,
                 source_epoch,
                 retained_intent,
                 baseline,
                 reissue_attempts,
-            )?;
+            )
+        {
+            // Staging already acquired the pending publication slot. If
+            // intent retention fails, the caller receives no handle with
+            // which to release it, so compensate before returning.
+            Box::pin(self.do_publish_failed(*pending)).await?;
+            return Err(error);
         }
         result
     }

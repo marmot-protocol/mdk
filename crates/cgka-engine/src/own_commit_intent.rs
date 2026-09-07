@@ -5,8 +5,7 @@
 //! parks the other. The parked committer already told its caller the change
 //! saved, so dropping the intent silently is a product defect. The send path
 //! records every own group-evolution commit's intent, together with the state
-//! it was authored against, from staging until the commit is confirmed or
-//! rolled back. When a supersession is announced or later derived from stored
+//! it was authored against, from staging through the rewind horizon. When a supersession is announced or later derived from stored
 //! dispositions, [`Engine::reissue_superseded_own_commit`] decides:
 //!
 //! - a profile edit or component update is re-queued only when the winning
@@ -30,7 +29,9 @@ use cgka_traits::engine::{
 };
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
-use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, StorageProvider};
+use cgka_traits::storage::{
+    OwnCommitBaseline, OwnCommitIntent, QueuedOutboundIntent, StorageProvider,
+};
 use cgka_traits::types::{GroupId, MessageId};
 use openmls::group::MlsGroup;
 use openmls_traits::OpenMlsProvider;
@@ -99,8 +100,8 @@ impl<S: StorageProvider> Engine<S> {
     /// Decide what becomes of the intent behind `commit_id` now that
     /// convergence has superseded that commit. Returns `None` when this device
     /// recorded no intent for it (a peer's commit, a self-update, or a record
-    /// already consumed). The record is always removed; a re-queued intent
-    /// lives on as an ordinary queued outbound intent.
+    /// already consumed). Successful decisions consume the record; a re-queued
+    /// intent replaces it atomically. Storage errors leave the original retryable.
     pub fn reissue_superseded_own_commit(
         &mut self,
         commit_id: &MessageId,
@@ -108,7 +109,33 @@ impl<S: StorageProvider> Engine<S> {
         let Some(record) = self.storage.own_commit_intent(commit_id)? else {
             return Ok(None);
         };
-        self.storage.delete_own_commit_intent(commit_id)?;
+        // Reading canonical state and preparing a replacement must succeed
+        // before consuming the only durable copy of the caller's intent.
+        let decision = self.prepare_superseded_own_commit(&record)?;
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                if let Some((_, Some(queued))) = &decision {
+                    storage.put_queued_outbound_intent(queued)?;
+                }
+                storage.delete_own_commit_intent(commit_id)?;
+                Ok(())
+            })?;
+        if let Some((_, Some(queued))) = &decision
+            && self
+                .epoch_manager
+                .state(&queued.group_id)
+                .is_some_and(cgka_traits::engine_state::EpochState::is_stable)
+        {
+            self.schedule_pending_convergence_group(&queued.group_id);
+        }
+        Ok(decision.map(|(report, _)| report))
+    }
+
+    fn prepare_superseded_own_commit(
+        &self,
+        record: &OwnCommitIntent,
+    ) -> Result<Option<(SupersededIntentReport, Option<QueuedOutboundIntent>)>, EngineError> {
+        let commit_id = &record.commit_id;
         let kind = match &record.intent {
             SendIntent::Invite { .. } => SupersededIntentKind::Invite,
             SendIntent::RemoveMembers { .. } => SupersededIntentKind::RemoveMembers,
@@ -126,29 +153,41 @@ impl<S: StorageProvider> Engine<S> {
 
         let group = self.stored_group_record(&record.group_id)?;
         let Some(group) = group else {
-            return Ok(Some(report(
-                SupersededIntentOutcome::NotMember,
-                "the group no longer exists on this device",
+            return Ok(Some((
+                report(
+                    SupersededIntentOutcome::NotMember,
+                    "the group no longer exists on this device",
+                ),
+                None,
             )));
         };
         if group.removed || group.disbanded.is_some() {
-            return Ok(Some(report(
-                SupersededIntentOutcome::NotMember,
-                "this device is no longer a member of the group",
+            return Ok(Some((
+                report(
+                    SupersededIntentOutcome::NotMember,
+                    "this device is no longer a member of the group",
+                ),
+                None,
             )));
         }
         if record.reissue_attempts >= MAX_OWN_COMMIT_REISSUE_ATTEMPTS {
-            return Ok(Some(report(
-                SupersededIntentOutcome::Abandoned,
-                "the change lost more concurrent commits than the engine retries",
+            return Ok(Some((
+                report(
+                    SupersededIntentOutcome::Abandoned,
+                    "the change lost more concurrent commits than the engine retries",
+                ),
+                None,
             )));
         }
 
         let intent = match &record.intent {
             SendIntent::Invite { .. } => {
-                return Ok(Some(report(
-                    SupersededIntentOutcome::ReinviteRequired,
-                    "the invite's KeyPackages were consumed by the parked Welcome; re-invite with fresh material",
+                return Ok(Some((
+                    report(
+                        SupersededIntentOutcome::ReinviteRequired,
+                        "the invite's KeyPackages were consumed by the parked Welcome; re-invite with fresh material",
+                    ),
+                    None,
                 )));
             }
             SendIntent::RemoveMembers { group_id, members } => {
@@ -158,9 +197,12 @@ impl<S: StorageProvider> Engine<S> {
                     .cloned()
                     .collect::<Vec<_>>();
                 if remaining.is_empty() {
-                    return Ok(Some(report(
-                        SupersededIntentOutcome::AlreadySatisfied,
-                        "the winning branch already removed every requested member",
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::AlreadySatisfied,
+                            "the winning branch already removed every requested member",
+                        ),
+                        None,
                     )));
                 }
                 SendIntent::RemoveMembers {
@@ -178,9 +220,12 @@ impl<S: StorageProvider> Engine<S> {
                     description: baseline_description,
                 } = &record.baseline
                 else {
-                    return Ok(Some(report(
-                        SupersededIntentOutcome::Conflict,
-                        "the profile edit carried no authoring baseline to compare against",
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the profile edit carried no authoring baseline to compare against",
+                        ),
+                        None,
                     )));
                 };
                 let mls_group = self.load_mls_group(group_id)?;
@@ -190,18 +235,24 @@ impl<S: StorageProvider> Engine<S> {
                 let description_untouched =
                     description.is_none() || current_description == *baseline_description;
                 if !(name_untouched && description_untouched) {
-                    return Ok(Some(report(
-                        SupersededIntentOutcome::Conflict,
-                        "the winning branch changed the same profile field; its value stands",
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the same profile field; its value stands",
+                        ),
+                        None,
                     )));
                 }
                 record.intent.clone()
             }
             SendIntent::UpdateAppComponents { group_id, updates } => {
                 let OwnCommitBaseline::AppComponents { components } = &record.baseline else {
-                    return Ok(Some(report(
-                        SupersededIntentOutcome::Conflict,
-                        "the component update carried no authoring baseline to compare against",
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the component update carried no authoring baseline to compare against",
+                        ),
+                        None,
                     )));
                 };
                 let mls_group = self.load_mls_group(group_id)?;
@@ -219,9 +270,12 @@ impl<S: StorageProvider> Engine<S> {
                         == baseline
                 });
                 if !untouched {
-                    return Ok(Some(report(
-                        SupersededIntentOutcome::Conflict,
-                        "the winning branch changed the same component; its value stands",
+                    return Ok(Some((
+                        report(
+                            SupersededIntentOutcome::Conflict,
+                            "the winning branch changed the same component; its value stands",
+                        ),
+                        None,
                     )));
                 }
                 record.intent.clone()
@@ -229,18 +283,24 @@ impl<S: StorageProvider> Engine<S> {
             _ => return Ok(None),
         };
 
-        match self.queue_outbound_intent(
+        match self.prepare_queued_outbound_intent(
             record.group_id.clone(),
             intent,
             record.reissue_attempts.saturating_add(1),
         ) {
-            Ok(_) => Ok(Some(report(
-                SupersededIntentOutcome::Reissued,
-                "the change is still valid against the canonical state and has been queued again",
+            Ok(queued) => Ok(Some((
+                report(
+                    SupersededIntentOutcome::Reissued,
+                    "the change is still valid against the canonical state and has been queued again",
+                ),
+                Some(queued),
             ))),
-            Err(EngineError::QueuedOutboundAtCapacity { .. }) => Ok(Some(report(
-                SupersededIntentOutcome::Abandoned,
-                "the group's outbound queue is full",
+            Err(EngineError::QueuedOutboundAtCapacity { .. }) => Ok(Some((
+                report(
+                    SupersededIntentOutcome::Abandoned,
+                    "the group's outbound queue is full",
+                ),
+                None,
             ))),
             Err(error) => Err(error),
         }

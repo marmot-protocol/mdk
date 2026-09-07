@@ -289,6 +289,7 @@ struct FaultStorage {
     fault: PutGroupFault,
     capability_fault: CapabilityWriteFault,
     leave_write_fault: LeaveWriteFault,
+    intent_write_fault: LeaveWriteFault,
     preparation_delay: PreparationDelay,
 }
 
@@ -450,6 +451,11 @@ impl MessageStorage for FaultStorage {
 
 impl OutboundIntentStorage for FaultStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected queued intent write failure".into(),
+            ));
+        }
         self.inner.put_queued_outbound_intent(record)
     }
     fn list_queued_outbound_intents(
@@ -465,6 +471,11 @@ impl OutboundIntentStorage for FaultStorage {
         &self,
         record: &cgka_traits::storage::OwnCommitIntent,
     ) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected own intent write failure".into(),
+            ));
+        }
         self.inner.put_own_commit_intent(record)
     }
     fn own_commit_intent(
@@ -480,6 +491,11 @@ impl OutboundIntentStorage for FaultStorage {
         self.inner.list_own_commit_intents(group_id)
     }
     fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected own intent delete failure".into(),
+            ));
+        }
         self.inner.delete_own_commit_intent(commit_id)
     }
 }
@@ -744,6 +760,7 @@ fn build_fault_selfremove_client(
         fault,
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -767,6 +784,7 @@ fn build_capability_fault_client(
         fault: PutGroupFault::default(),
         capability_fault,
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -791,6 +809,7 @@ fn build_leave_write_fault_client(
         fault: PutGroupFault::default(),
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault,
+        intent_write_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
@@ -1602,6 +1621,7 @@ async fn slow_preparation_case(
         fault: PutGroupFault::default(),
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
         preparation_delay: delay.clone(),
     })
     .legacy_compatibility_profile()
@@ -1886,6 +1906,149 @@ async fn queued_output_preserves_background_recovery_allowance() {
                 .list_queued_outbound_intents(&group_id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+}
+
+async fn setup_own_intent_fault_case(
+    fault: LeaveWriteFault,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: fault,
+        preparation_delay: PreparationDelay::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"own-intent-fault"))
+    .account_identity_proof_signer(proof_signer(b"own-intent-fault"))
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, result) = engine
+        .create_group(CreateGroupRequest {
+            name: "intent retention".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = result else {
+        panic!("create")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    (engine, storage, group_id)
+}
+
+#[tokio::test]
+async fn own_intent_record_failure_releases_the_unreturned_pending_commit() {
+    let fault = LeaveWriteFault::default();
+    let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+    let epoch = engine.epoch(&group_id).unwrap();
+    let intent = SendIntent::UpdateGroupData {
+        group_id: group_id.clone(),
+        name: Some("retained edit".into()),
+        description: None,
+    };
+    fault.arm_on_write(1);
+    assert!(matches!(
+        engine.send(intent.clone()).await,
+        Err(EngineError::Storage(StorageError::Busy(_)))
+    ));
+    assert!(
+        storage
+            .list_own_commit_intents(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.epoch(&group_id).unwrap(), epoch);
+    let result = engine
+        .send(intent)
+        .await
+        .expect("the failed staging must remain retryable");
+    let SendResult::GroupEvolution { pending, .. } = result else {
+        panic!("retry stages immediately: {result:?}")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    assert!(engine.epoch(&group_id).unwrap() > epoch);
+}
+
+#[tokio::test]
+async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
+    for fail_on_write in 1..=2 {
+        let fault = LeaveWriteFault::default();
+        let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+        // Persist an independently evidenced superseded edit against the current
+        // baseline. This targets the recovery transfer, not branch selection.
+        let commit_id = MessageId::new(vec![42; 32]);
+        storage
+            .put_own_commit_intent(&cgka_traits::storage::OwnCommitIntent {
+                commit_id: commit_id.clone(),
+                group_id: group_id.clone(),
+                source_epoch: engine.epoch(&group_id).unwrap(),
+                intent: SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some("retry edit".into()),
+                    description: None,
+                },
+                baseline: cgka_traits::storage::OwnCommitBaseline::GroupProfile {
+                    name: "intent retention".into(),
+                    description: String::new(),
+                },
+                reissue_attempts: 0,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        fault.arm_on_write(fail_on_write);
+        assert!(matches!(
+            engine.reissue_superseded_own_commit(&commit_id),
+            Err(EngineError::Storage(StorageError::Busy(_)))
+        ));
+        assert!(
+            storage.own_commit_intent(&commit_id).unwrap().is_some(),
+            "failed transfer must retain the source"
+        );
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty(),
+            "failed source deletion must roll back the queue write"
+        );
+        let report = engine
+            .reissue_superseded_own_commit(&commit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.outcome,
+            cgka_traits::engine::SupersededIntentOutcome::Reissued
+        );
+        assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+        let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].reissue_attempts, 1);
+        assert!(
+            engine
+                .reissue_superseded_own_commit(&commit_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

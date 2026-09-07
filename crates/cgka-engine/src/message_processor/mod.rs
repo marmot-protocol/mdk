@@ -2960,32 +2960,10 @@ impl<S: StorageProvider> Engine<S> {
         reissue_attempts: u32,
     ) -> Result<SendResult, EngineError> {
         let queue_started = Instant::now();
-        let created_at_ms = self.convergence_now_ms();
-        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
-        // Refuse before serializing or writing anything: the single durable
-        // write on this path is below, so a refusal here leaves nothing to
-        // compensate.
-        if existing_count >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
-            return Err(EngineError::QueuedOutboundAtCapacity { group_id });
-        }
-        let intent_bytes =
-            serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-queued-outbound-intent/v1");
-        hasher.update(group_id.as_slice());
-        hasher.update(self.identity.self_id().as_slice());
-        hasher.update(created_at_ms.to_be_bytes());
-        hasher.update((existing_count as u64).to_be_bytes());
-        hasher.update(&intent_bytes);
-        let intent_id = MessageId::new(hasher.finalize().to_vec());
-        self.storage
-            .put_queued_outbound_intent(&QueuedOutboundIntent {
-                id: intent_id.clone(),
-                group_id: group_id.clone(),
-                intent,
-                created_at_ms,
-                reissue_attempts,
-            })?;
+        let record =
+            self.prepare_queued_outbound_intent(group_id.clone(), intent, reissue_attempts)?;
+        let intent_id = record.id.clone();
+        self.storage.put_queued_outbound_intent(&record)?;
         // The drain is what releases this row, so writing it and arming the
         // drain are one step — see `has_queued_outbound_intents`. `Stable` is
         // the drain's own precondition: a group held by a publish or a halt
@@ -3011,6 +2989,40 @@ impl<S: StorageProvider> Engine<S> {
                 .unwrap_or(u64::MAX),
         );
         Ok(result)
+    }
+
+    /// Prepare a queue row without changing storage or the scheduler, so a
+    /// caller can transfer another durable intent into the queue atomically.
+    pub(crate) fn prepare_queued_outbound_intent(
+        &self,
+        group_id: GroupId,
+        intent: SendIntent,
+        reissue_attempts: u32,
+    ) -> Result<QueuedOutboundIntent, EngineError> {
+        let created_at_ms = self.convergence_now_ms();
+        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
+        // Refuse before serializing or writing anything. The caller persists
+        // the prepared row, so a refusal leaves nothing to compensate.
+        if existing_count >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+            return Err(EngineError::QueuedOutboundAtCapacity { group_id });
+        }
+        let intent_bytes =
+            serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-queued-outbound-intent/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(self.identity.self_id().as_slice());
+        hasher.update(created_at_ms.to_be_bytes());
+        hasher.update((existing_count as u64).to_be_bytes());
+        hasher.update(&intent_bytes);
+        let intent_id = MessageId::new(hasher.finalize().to_vec());
+        Ok(QueuedOutboundIntent {
+            id: intent_id,
+            group_id,
+            intent,
+            created_at_ms,
+            reissue_attempts,
+        })
     }
 
     /// Queue a `GroupStateChanged` event for the application to synthesize into
