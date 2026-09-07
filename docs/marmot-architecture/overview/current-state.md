@@ -30,7 +30,12 @@ validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
 It requires single-device acknowledgment before KeyPackage publication and offers
 advisory detection of packages that may belong to another installation.
 Account onboarding gates normal worker commands until required checks and
-KeyPackage publication complete. Host apps still need to adopt the identity-only
+KeyPackage publication complete. Hosts can cancel an interactive attempt at any
+step, including approved or ready checkpoints: the account stays signed out, the
+attempt is retired, and uncertain publication evidence is retained for later
+explicit checks rather than automatic replay. Cancellation of a proposal is
+distinct from cancelling a signer future and from ending the attempt. Open Chats
+remains host-owned. Host apps still need to adopt the identity-only
 entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).
 
 Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the

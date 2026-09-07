@@ -684,6 +684,66 @@ impl AccountHome {
         }
     }
 
+    /// Persist exact cancelled-checkpoint bytes under a content-addressed name.
+    /// Identical bytes are idempotent; a conflicting file fails closed.
+    pub fn retain_account_onboarding_repair_archive(
+        &self,
+        account_ref: &str,
+        bytes: &[u8],
+    ) -> AccountHomeResult<String> {
+        use sha2::{Digest, Sha256};
+
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.signed_out {
+            return Err(AccountHomeError::AccountExists(account.label));
+        }
+        let digest = hex::encode(Sha256::digest(bytes));
+        let directory = self.onboarding_repair_archive_dir(&account.label);
+        fs_private::create_dir_all_private(&directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&directory)?.permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&directory, permissions)?;
+        }
+        let path = directory.join(format!("{digest}.json"));
+        match fs::read(&path) {
+            Ok(existing) if existing == bytes => Ok(digest),
+            Ok(_) => Err(AccountHomeError::ImmutableArtifactConflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_secret_bytes(path, bytes)?;
+                Ok(digest)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Read one retained repair-archive artifact by the SHA-256 of its bytes.
+    pub fn account_onboarding_repair_archive(
+        &self,
+        account_ref: &str,
+        digest_hex: &str,
+    ) -> AccountHomeResult<Option<Vec<u8>>> {
+        if digest_hex.len() != 64 || !digest_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AccountHomeError::InvalidAccountLabel(digest_hex.to_owned()));
+        }
+        let account = self.account(account_ref)?;
+        let path = self
+            .onboarding_repair_archive_dir(&account.label)
+            .join(format!("{digest_hex}.json"));
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn onboarding_repair_archive_dir(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join("onboarding-repair-archive")
+    }
+
     /// Read the retained cancellation record for an explicit onboarding restart.
     pub fn cancelled_account_onboarding(
         &self,

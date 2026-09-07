@@ -982,3 +982,53 @@ impl AccountSecretStore for MemorySecretStore {
         Ok(())
     }
 }
+
+#[test]
+fn onboarding_repair_archive_is_idempotent_private_and_conflict_closed() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+    home.set_account_signed_out(&account.label, true).unwrap();
+    let bytes = br#"{"approved":true,"signed":"exact"}"#;
+    let digest = home
+        .retain_account_onboarding_repair_archive(&account.label, bytes)
+        .unwrap();
+    assert_eq!(digest, hex::encode(Sha256::digest(bytes)));
+    assert_eq!(
+        home.retain_account_onboarding_repair_archive(&account.label, bytes)
+            .unwrap(),
+        digest
+    );
+    assert_eq!(
+        home.account_onboarding_repair_archive(&account.label, &digest)
+            .unwrap()
+            .as_deref(),
+        Some(bytes.as_slice())
+    );
+    let directory = home
+        .account_dir(&account.label)
+        .join("onboarding-repair-archive");
+    let archive = directory.join(format!("{digest}.json"));
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    std::fs::write(&archive, b"corrupted-different-bytes").unwrap();
+    assert!(matches!(
+        home.retain_account_onboarding_repair_archive(&account.label, bytes),
+        Err(AccountHomeError::ImmutableArtifactConflict)
+    ));
+    assert!(matches!(
+        home.account_onboarding_repair_archive(&account.label, "../escape"),
+        Err(AccountHomeError::InvalidAccountLabel(_))
+    ));
+}

@@ -116,11 +116,13 @@ impl AccountManager {
         account_ref: &str,
         revision: u64,
     ) -> Result<OnboardingSnapshot, AppError> {
-        let transaction = self.onboarding_transaction(&self.resolve(account_ref)?.account_id_hex);
+        let (account_id, attempt) = self.peek_onboarding_attempt(account_ref)?;
+        let transaction = self.onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
         let mut checkpoint = self
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
+        self.require_captured_attempt(&checkpoint, attempt)?;
         let step = &checkpoint.snapshot.steps[OnboardingStep::SingleDevice.index()];
         if checkpoint.snapshot.revision != revision
             || checkpoint.approved

@@ -51,6 +51,8 @@ pub enum AccountHomeError {
     EncryptedSecretExport(String),
     #[error("account secret store service name cannot be empty")]
     EmptySecretStoreService,
+    #[error("immutable account artifact already exists with different contents")]
+    ImmutableArtifactConflict,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Interactive onboarding cancellation now ends approved, interrupted, or ready
+  sign-in attempts, keeps the account signed out, and retains uncertain
+  publication evidence for a later explicit restart.
+
 ## [0.9.19] - 2026-09-07
 
 ### Added

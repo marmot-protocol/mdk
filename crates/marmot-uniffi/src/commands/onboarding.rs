@@ -24,8 +24,12 @@ impl OnboardingSubscription {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
-    /// Cancel unfinished onboarding, retaining the signed-out identity and private state.
-    /// Approved unfinished repairs must be resumed before cancellation.
+    /// Cancel the current interactive onboarding attempt at any step, including
+    /// approved or ready checkpoints. The identity stays signed out. Already
+    /// journaled publication evidence is retained; cancellation is not remote
+    /// rollback. A later explicit `begin_*_onboarding` starts a new attempt.
+    /// Hosts should invalidate the UI attempt, ignore the old subscription, and
+    /// await this call before beginning again. Open Chats stays host-owned.
     pub async fn cancel_onboarding(&self, account_ref: String) -> Result<(), MarmotKitError> {
         Ok(self
             .runtime
@@ -216,5 +220,45 @@ impl Marmot {
             .cancel_onboarding_repair(&account_ref)
             .await?
             .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot_app::MarmotApp;
+    use nostr::prelude::ToBech32;
+
+    fn options() -> OnboardingOptionsFfi {
+        OnboardingOptionsFfi {
+            default_relays: vec!["wss://default.example".into()],
+            discovery_relays: vec!["wss://index.example".into()],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_onboarding_maps_approved_and_ready_attempts_to_signed_out_unit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(root.path(), "wss://default.example");
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+        let keys = nostr::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let snapshot = kit
+            .begin_onboarding(keys.secret_key().to_bech32().unwrap(), options())
+            .await
+            .expect("begin");
+        assert!(!snapshot.ready);
+        kit.cancel_onboarding(id.clone()).await.expect("cancel");
+        kit.cancel_onboarding(id.clone())
+            .await
+            .expect("repeat cancel is a no-op");
+        assert!(kit.onboarding_snapshot(id.clone()).unwrap().is_none());
+        let again = kit
+            .begin_onboarding(keys.secret_key().to_bech32().unwrap(), options())
+            .await
+            .expect("explicit restart");
+        assert!(!again.ready && !again.cancellation_pending);
+        kit.runtime.shutdown().await;
     }
 }

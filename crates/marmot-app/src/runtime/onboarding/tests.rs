@@ -630,7 +630,6 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
         .unwrap()
         .unwrap();
     assert!(c.approved);
-    assert!(second.accounts().cancel_onboarding(&id).await.is_err());
     assert_eq!(c.signed_repair, Some(expected.clone()));
     network.zero_acks.store(false, Ordering::SeqCst);
     assert!(
@@ -991,4 +990,217 @@ async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserve
     assert!(manager.onboarding_snapshot(&id).unwrap().unwrap().ready);
     assert!(manager.onboarding_worker_allowed(&id).unwrap());
     runtime.shutdown_and_close().await.unwrap();
+}
+
+fn repair_archive_bytes(root: &std::path::Path, id: &str) -> Vec<Vec<u8>> {
+    let directory = root
+        .join("accounts")
+        .join(id)
+        .join("onboarding-repair-archive");
+    let mut files = std::fs::read_dir(directory)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_approval() {
+    let (dir, first, network, keys, id) = fixture().await;
+    missing_relays(&first, &id).await;
+    let proposal = first
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.zero_acks.store(true, Ordering::SeqCst);
+    first
+        .accounts()
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    let signed = network.attempts.lock().unwrap()[0].clone();
+    let mut subscription = first.accounts().subscribe_onboarding(&id).unwrap();
+    first.accounts().cancel_onboarding(&id).await.unwrap();
+    let terminal = subscription.recv().await.unwrap();
+    assert!(terminal.cancellation_pending && !terminal.ready);
+    assert!(subscription.recv().await.is_none());
+    assert!(first.accounts().resolve(&id).unwrap().signed_out);
+    assert!(first.accounts().onboarding_snapshot(&id).unwrap().is_none());
+    assert!(!first.accounts().managed_accounts().unwrap()[0].running);
+    let archives = repair_archive_bytes(dir.path(), &id);
+    assert_eq!(archives.len(), 1);
+    let archived: OnboardingCheckpoint = serde_json::from_slice(&archives[0]).unwrap();
+    assert!(archived.approved);
+    assert_eq!(archived.signed_repair, Some(signed.clone()));
+    first.shutdown_and_close().await.unwrap();
+    let reopened = runtime(dir.path(), network.clone());
+    let resumed = reopened
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert!(!resumed.ready && !resumed.cancellation_pending);
+    assert!(resumed.proposal.is_none());
+    assert!(resumed.revision > archived.snapshot.revision);
+    reopened.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(network.attempts.lock().unwrap().len(), 1);
+    assert!(
+        reopened
+            .accounts()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .signed_repair
+            .is_none()
+    );
+    reopened.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn ready_onboarding_can_be_cancelled_before_open_chats() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for step in c.snapshot.steps.clone() {
+        c.set(step.step, OnboardingStatus::Passed, vec![]);
+    }
+    manager.save_onboarding(&mut c).unwrap();
+    assert!(manager.onboarding_snapshot(&id).unwrap().unwrap().ready);
+    manager.cancel_onboarding(&id).await.unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(!manager.managed_accounts().unwrap()[0].running);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn successive_approved_cancellations_keep_distinct_archives() {
+    let (dir, runtime, network, keys, id) = fixture().await;
+    missing_relays(&runtime, &id).await;
+    let first = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.zero_acks.store(true, Ordering::SeqCst);
+    runtime
+        .accounts()
+        .approve_onboarding_repair(&id, first.revision)
+        .await
+        .unwrap();
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    let after_first = repair_archive_bytes(dir.path(), &id);
+    assert_eq!(after_first.len(), 1);
+    runtime
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    missing_relays(&runtime, &id).await;
+    let second = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .approve_onboarding_repair(&id, second.revision)
+        .await
+        .unwrap();
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    assert_eq!(repair_archive_bytes(dir.path(), &id).len(), 2);
+    runtime
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    assert_eq!(repair_archive_bytes(dir.path(), &id).len(), 2);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_during_blocked_publish_does_not_start_another_send() {
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    missing_relays(&runtime, &id).await;
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.block_publish.store(true, Ordering::SeqCst);
+    let manager = runtime.accounts();
+    let account = id.clone();
+    let revision = proposal.revision;
+    let task = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.approve_onboarding_repair(&account, revision).await }
+    });
+    network.publishing.notified().await;
+    manager.cancel_onboarding(&id).await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(network.attempts.lock().unwrap().len(), 1);
+    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_cancellation_blocks_begin_until_cleanup_finishes() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut c).unwrap();
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_err()
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_ok()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_account_is_not_auto_signed_in_on_reopen() {
+    let (dir, first, network, _keys, id) = fixture().await;
+    first.accounts().cancel_onboarding(&id).await.unwrap();
+    first.shutdown_and_close().await.unwrap();
+    let reopened = runtime(dir.path(), network);
+    reopened.reconcile_accounts().await.unwrap();
+    let account = reopened.accounts().resolve(&id).unwrap();
+    assert!(account.signed_out);
+    assert!(!reopened.accounts().managed_accounts().unwrap()[0].running);
+    reopened.shutdown_and_close().await.unwrap();
 }

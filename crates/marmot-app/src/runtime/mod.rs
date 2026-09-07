@@ -185,7 +185,9 @@ pub struct AccountManager {
     worker_transactions: Arc<Mutex<()>>,
     generated_setup_local_transaction: Arc<Mutex<()>>,
     onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
+    onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
     onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
+    onboarding_cancellations: Arc<StdMutex<OnboardingCancellationTasks>>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
@@ -4054,7 +4056,7 @@ impl MarmotAppRuntime {
         if self
             .accounts
             .onboarding_snapshot(account_ref)?
-            .is_some_and(|s| !s.ready)
+            .is_some_and(|s| !s.ready || s.cancellation_pending)
         {
             return Ok(AccountSetupReadiness::Initializing);
         }
@@ -4780,7 +4782,13 @@ impl AccountManager {
             worker_transactions: Arc::new(Mutex::new(())),
             generated_setup_local_transaction: Arc::new(Mutex::new(())),
             onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
+            onboarding_state: Arc::new(StdMutex::new(HashMap::new())),
             onboarding_updates: Arc::new(StdMutex::new(HashMap::new())),
+            onboarding_cancellations: Arc::new(StdMutex::new(OnboardingCancellationTasks {
+                accepting: true,
+                inflight: HashMap::new(),
+                handles: Vec::new(),
+            })),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
@@ -5073,6 +5081,7 @@ impl AccountManager {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
+            self.finish_pending_onboarding_cancellations().await;
             let accounts = self
                 .app
                 .account_home()
@@ -6485,6 +6494,17 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        let onboarding_cancellation_tasks = {
+            let mut tasks = self
+                .onboarding_cancellations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.accepting = false;
+            std::mem::take(&mut tasks.handles)
+        };
+        for task in onboarding_cancellation_tasks {
+            let _ = task.await;
+        }
         let generated_setup_tasks = {
             let mut tasks = self
                 .generated_setup_tasks

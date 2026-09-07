@@ -156,15 +156,23 @@ one installation and conversations will not automatically appear on both.
 Reinstallation or cleared local state can produce the same evidence; do not
 claim to have identified a physical device or a particular app.
 
-Offer **Cancel** and **Continue anyway**. For Cancel, call
-`cancel_onboarding(account_ref)`: it signs the identity out, retains local data and
-completed repairs, and archives the checkpoint to remove the active gate. A later
-sign-in can use either the legacy or interactive entry point. The registered
-external-signer callback remains attached for explicit sign-in within this runtime;
-a process restart still requires the host to register it again. Cancellation is
-idempotent; if interrupted with `cancellation_pending`, call it again to finish.
-Normal onboarding mutations are blocked during that interval. Cancellation is
-not offered while an approved repair is unfinished and cannot discard that repair.
+Offer **Cancel** and **Continue anyway**. For Cancel, invalidate the current UI
+attempt first, then await `cancel_onboarding(account_ref)` before any new
+`begin_*_onboarding`. Cancellation is legal at every interactive step, including
+an approved but unconfirmed repair and a ready checkpoint that the host has not
+yet opened with Open Chats. Success signs the identity out, reaps its worker,
+delivers a terminal non-ready snapshot, and closes that subscription. It retains
+local data, credentials, journals, and any already-signed or already-sent
+publication evidence. It does not delete, replace, or prove non-publication of
+events that may already be on relays. A later explicit interactive begin starts
+a new attempt with the supplied options and no old proposal, approval, or
+signed repair; observing a previously published record is not replay permission.
+Legacy `login` remains available and does not consume archived onboarding
+choices. Reconcile, runtime start, signer attachment, and connectivity
+restoration are not explicit sign-in. If the call returns
+`AccountWorkerResponseTimedOut`, the pending fence remains and the host should
+retry the same cancel; dropping the waiter does not abort cleanup. Do not treat
+`ready` as an Open Chats command — the host still owns that transition.
 For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
 MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
 The acknowledgment survives KeyPackage publication failure, task interruption,
