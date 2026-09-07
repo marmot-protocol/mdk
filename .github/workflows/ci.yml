@@ -543,7 +543,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_conformance == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 65
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
+      MDK_APP_JOURNEY_ARTIFACTS: ${{ github.workspace }}/target/public-app-catchup-evidence
+      MDK_BACKLOG_TRACE: "1"
 
     steps:
       - name: Check out repository
@@ -572,18 +576,30 @@ jobs:
           git rev-parse HEAD > target/public-app-catchup-evidence/source-commit.txt
           rustc --version > target/public-app-catchup-evidence/rust-version.txt
 
-      - name: Recover the full backlog through the public app
-        timeout-minutes: 35
-        env:
-          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
-          MDK_APP_JOURNEY_ARTIFACTS: ${{ github.workspace }}/target/public-app-catchup-evidence
-          MDK_BACKLOG_TRACE: "1"
+      - name: Build public recovery tests with production policy
+        id: build_catchup
+        timeout-minutes: 15
         # Keep this separate from workspace test-policy feature unification.
-        # Both journeys own a 900-second watchdog and close every runtime.
         run: >-
           cargo test --release --locked -p cgka-conformance-simulator
-          --test app_runtime_journeys public_app_1024_message_backlog
-          -- --ignored --test-threads=1 --nocapture
+          --test app_runtime_journeys --no-run
+
+      - name: Recover the original 1024-message backlog
+        if: ${{ !cancelled() && steps.build_catchup.outcome == 'success' }}
+        timeout-minutes: 20
+        # Each journey owns a 900-second watchdog and closes every runtime.
+        run: >-
+          cargo test --release --locked -p cgka-conformance-simulator
+          --test app_runtime_journeys public_app_1024_message_backlog_recovers_completely
+          -- --exact --ignored --test-threads=1 --nocapture
+
+      - name: Recover the 1024-message backlog with extra epochs
+        if: ${{ !cancelled() && steps.build_catchup.outcome == 'success' }}
+        timeout-minutes: 20
+        run: >-
+          cargo test --release --locked -p cgka-conformance-simulator
+          --test app_runtime_journeys public_app_1024_message_backlog_with_extra_epochs_recovers_completely
+          -- --exact --ignored --test-threads=1 --nocapture
 
       - name: Upload public recovery evidence
         if: always()

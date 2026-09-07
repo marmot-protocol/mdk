@@ -30,15 +30,22 @@ every participant's exact payload multiset, then fresh bidirectional messaging a
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.
 
 The test remains ignored in ordinary crate runs because it is slow. The dedicated **Public app 1024-message
-recovery** job in `.github/workflows/ci.yml` explicitly selects both journeys in release mode without test-policy overrides,
+recovery** job in `.github/workflows/ci.yml` builds once, then selects each journey with `--exact` in its own timed
+step, in release mode without test-policy overrides. The second runs even if the first fails. The job
 uses the same conformance path classifier, and participates in **Required CI**. It uploads source provenance,
 expanded synthetic input and public observations, excluding participant databases and keys. It asserts successful
 recovery, not a particular failure count. A run that skips this job is not recovery evidence.
 
 Set `MDK_BACKLOG_TRACE=1` to include aggregate engine preparation, retry-slice and transport-release diagnostics
 on stderr. The required recovery job enables this to distinguish slow preparation with zero attempts from
-retry progress or resource release. These traces contain counts, durations and fixed outcome labels; participant
+retry progress or resource release. Preparation and per-slice traces use debug level, enabled by this test flag,
+so idle sweeps do not add production INFO traffic. These traces contain counts, durations and fixed outcome labels; participant
 databases and keys remain excluded from uploaded evidence.
+
+Recovery artifacts have fixed filenames: `recovery-progress.json` retains compact counts and the last completed pass,
+and `recovery-checkpoint.json` retains the latest tenth-pass or successful full observation. `terminal.json` captures
+the final observation when available. Files are replaced rather than accumulated across passes. Watchdog failures
+include the active phase, current/last-completed pass, last observed counts and completed restart count.
 
 On September 6, the worker-responsiveness fix passed this unchanged recovery contract twice. Background engine
 advance now shares a 64-row allowance and a cooperative 500-ms budget across sweeps; historical peel contexts
