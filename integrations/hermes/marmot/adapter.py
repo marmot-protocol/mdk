@@ -2987,7 +2987,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         spool_message_id: Optional[str] = None,
     ) -> None:
-        detached_ambient: list[str] = []
+        ambient_claim = None
         group_id_hex = ""
         spool_state = "claimed" if spool_message_id else None
         try:
@@ -3095,7 +3095,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # prepends channel_context to the trigger text as context without it
             # being a trigger itself, so the fact reaches the agent on this turn.
             # Hermes 0.19.0 exposes channel_context as stable user-role context.
-            detached_ambient = self._ambient_context.pending(group_id_hex)
+            try:
+                ambient_claim = self._ambient_context.claim(group_id_hex)
+                detached_ambient = ambient_claim.facts
+            except Exception:
+                # Ambient continuity is supplemental context. A corrupt, locked,
+                # or unavailable private store must not reject an unrelated real
+                # inbound turn or change its durable spool disposition.
+                logger.error(
+                    "Marmot ambient context claim failed; continuing without ambient context",
+                    exc_info=True,
+                )
+                ambient_claim = None
+                detached_ambient = ()
             ambient_context = (
                 "\n".join(_render_ambient_fact(fact.kind) for fact in detached_ambient)
                 if detached_ambient
@@ -3124,12 +3136,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 spool_state = "handed"
             await self.handle_message(hermes_event)
-            # A normal return is the host acceptance boundary. Delete only the
-            # snapshot attached to this turn; concurrently observed facts remain.
-            self._ambient_context.acknowledge(
-                group_id_hex, (fact.seq for fact in detached_ambient)
-            )
+            # A normal return is the host acceptance boundary. Retire only this
+            # owned snapshot; concurrently observed facts remain pending. Ambient
+            # persistence failure after acceptance cannot reclassify the host
+            # handoff as a failed or unresolved turn.
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    self._ambient_context.acknowledge(group_id_hex, ambient_claim.token)
+                except Exception:
+                    logger.error("Marmot ambient context acknowledgement failed", exc_info=True)
         except asyncio.CancelledError:
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    self._ambient_context.release(group_id_hex, ambient_claim.token)
+                except Exception:
+                    logger.error("Marmot ambient context claim release failed", exc_info=True)
             if spool_message_id and spool_state == "claimed":
                 self._inbound_spool.defer(
                     spool_message_id,
@@ -3153,6 +3174,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     )
             raise
         except Exception:
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    self._ambient_context.release(group_id_hex, ambient_claim.token)
+                except Exception:
+                    logger.error("Marmot ambient context claim release failed", exc_info=True)
             if spool_message_id and spool_state == "claimed":
                 self._inbound_spool.defer(
                     spool_message_id,
@@ -3335,14 +3361,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Mutations are quiet next-turn context and never trigger an agent turn.
         # Privacy-safe log: no ids, actors, emoji, or plaintext.
         logger.debug("Marmot inbound mutation observed")
+        kind = str(event.get("type") or "")
+        if kind not in {
+            "message_edited",
+            "message_deleted",
+            "reaction_added",
+            "reaction_removed",
+        }:
+            logger.debug("Ignoring unsupported Marmot mutation kind")
+            return
         group_id_hex = str(event.get("group_id_hex") or "")
         event_id_hex = str(event.get("event_id_hex") or "")
         context_key = f"marmot:mutation:{group_id_hex}:{event_id_hex}"
-        await self._surface_ambient_context(
-            event,
-            str(event.get("type") or ""),
-            context_key,
-        )
+        await self._surface_ambient_context(event, kind, context_key)
 
     async def _handle_group_state_changed(self, event: Dict[str, Any]) -> None:
         # A durable group-state change (membership/admin/rename/avatar). Surfaced
@@ -3382,7 +3413,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # If no message ever follows, the fact is only logged — matching
         # OpenClaw's "when omitted, those events are only logged" degraded mode.
         if group_id_hex:
-            self._ambient_context.record(group_id_hex, context_key, kind)
+            try:
+                self._ambient_context.record(group_id_hex, context_key, kind)
+            except Exception:
+                # Quiet continuity is best-effort degradation. Never let a
+                # private-store failure escape the control-event pump and stop
+                # subsequent real inbound delivery.
+                logger.error("Marmot ambient context record failed", exc_info=True)
 
     async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
         await self._maybe_prompt_for_missing_profile(account_id_hex, group_id_hex)

@@ -1,11 +1,13 @@
 import importlib.util
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "marmot" / "ambient_context.py"
@@ -60,7 +62,9 @@ os._exit(0)
             facts = restarted.pending(group_id)
             self.assertEqual([fact.kind for fact in facts], ["message_deleted"])
             self.assertFalse(restarted.record(group_id, event_id, "message_deleted"))
-            self.assertEqual(restarted.acknowledge(group_id, [facts[0].seq]), 1)
+            claim = restarted.claim(group_id)
+            self.assertEqual(list(claim.facts), facts)
+            self.assertEqual(restarted.acknowledge(group_id, claim.token), 1)
             self.assertEqual(restarted.pending(group_id), [])
             restarted.close()
 
@@ -69,6 +73,222 @@ os._exit(0)
                 self.assertNotIn(forbidden.encode(), persisted)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+
+    def test_acknowledged_event_stays_deduped_across_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            group_id = "22" * 32
+            event_id = "33" * 32
+            store = AmbientContextStore(path)
+            self.assertTrue(store.record(group_id, event_id, "message_deleted"))
+            claim = store.claim(group_id)
+            self.assertEqual([fact.kind for fact in claim.facts], ["message_deleted"])
+            self.assertEqual(store.acknowledge(group_id, claim.token), 1)
+            store.close()
+
+            restarted = AmbientContextStore(path)
+            self.assertFalse(restarted.record(group_id, event_id, "message_deleted"))
+            self.assertEqual(restarted.pending(group_id), [])
+            restarted.close()
+
+    def test_abrupt_process_death_releases_claim_for_new_exclusive_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            script = """
+import importlib.util
+import os
+import sys
+spec = importlib.util.spec_from_file_location("claimed_restart_ambient", os.environ["MODULE_PATH"])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+store = module.AmbientContextStore(os.environ["STORE_PATH"])
+store.record("22" * 32, "event", "message_deleted")
+assert store.claim("22" * 32).facts
+os._exit(0)
+"""
+            env = dict(os.environ)
+            env.update(
+                STORE_PATH=str(path),
+                MODULE_PATH=str(MODULE_PATH),
+                PYTHONDONTWRITEBYTECODE="1",
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=Path(__file__).resolve().parents[4],
+                env=env,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(completed.returncode, 0)
+
+            restarted = AmbientContextStore(path)
+            claim = restarted.claim("22" * 32)
+            self.assertEqual([fact.kind for fact in claim.facts], ["message_deleted"])
+            restarted.close()
+
+    def test_store_refuses_overlapping_process_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            first = AmbientContextStore(path)
+            first.open()
+            second = AmbientContextStore(path)
+            with self.assertRaises(AmbientContextError):
+                second.open()
+            first.close()
+
+    def test_claims_are_exclusive_and_release_restores_pending_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(Path(directory) / "private" / "ambient.sqlite3")
+            group_id = "22" * 32
+            store.record(group_id, "event", "message_deleted")
+
+            first = store.claim(group_id)
+            overlapping = store.claim(group_id)
+            self.assertEqual([fact.kind for fact in first.facts], ["message_deleted"])
+            self.assertEqual(overlapping.facts, ())
+            self.assertEqual(store.release(group_id, first.token), 1)
+            retried = store.claim(group_id)
+            self.assertEqual([fact.kind for fact in retried.facts], ["message_deleted"])
+            store.close()
+
+    def test_active_claim_is_not_evicted_before_acknowledgement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            store = AmbientContextStore(
+                path,
+                max_groups=1,
+                max_events_per_group=1,
+                max_events=1,
+            )
+            group_id = "22" * 32
+            event_id = "first"
+            store.record(group_id, event_id, "message_deleted")
+            claim = store.claim(group_id)
+
+            self.assertTrue(store.record(group_id, "second", "reaction_added"))
+            self.assertEqual(store.acknowledge(group_id, claim.token), 1)
+            self.assertFalse(store.record(group_id, event_id, "message_deleted"))
+            store.close()
+
+    def test_open_reapplies_lower_configured_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            store = AmbientContextStore(path, max_events=3, max_events_per_group=3)
+            for index in range(3):
+                store.record("22" * 32, f"event-{index}", "message_deleted")
+            store.close()
+
+            reopened = AmbientContextStore(path, max_events=1, max_events_per_group=1)
+            self.assertEqual(reopened.stats()["events"], 1)
+            reopened.close()
+
+    def test_pending_and_tombstones_share_aggregate_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(
+                Path(directory) / "private" / "ambient.sqlite3",
+                max_groups=3,
+                max_events_per_group=3,
+                max_events=3,
+                max_state_bytes=4096,
+            )
+            for index in range(3):
+                group_id = f"seen-{index}"
+                store.record(group_id, f"seen-event-{index}", "message_deleted")
+                claim = store.claim(group_id)
+                store.acknowledge(group_id, claim.token)
+            for index in range(3):
+                store.record(f"pending-{index}", f"pending-event-{index}", "reaction_added")
+
+            stats = store.stats()
+            self.assertLessEqual(stats["groups"], 3)
+            self.assertLessEqual(stats["events"], 3)
+            self.assertLessEqual(stats["state_bytes"], 4096)
+            store.close()
+
+    def test_schema_v1_store_migrates_without_losing_pending_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "private"
+            parent.mkdir(mode=0o700)
+            path = parent / "ambient.sqlite3"
+            observed_at = ambient_context.time.time()
+            db = sqlite3.connect(path)
+            db.execute(
+                "CREATE TABLE facts("
+                "seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "group_key BLOB NOT NULL,event_key BLOB NOT NULL UNIQUE,"
+                "kind TEXT NOT NULL,observed_at REAL NOT NULL)"
+            )
+            db.execute(
+                "INSERT INTO facts(group_key,event_key,kind,observed_at) VALUES(?,?,?,?)",
+                (
+                    ambient_context._digest(b"marmot-ambient-group-v1\0", "22" * 32),
+                    ambient_context._digest(b"marmot-ambient-event-v1\0", "event"),
+                    "message_deleted",
+                    observed_at,
+                ),
+            )
+            db.execute("PRAGMA user_version=1")
+            db.commit()
+            db.close()
+            path.chmod(0o600)
+
+            migrated = AmbientContextStore(path, max_age_s=10_000)
+            self.assertEqual(
+                [fact.kind for fact in migrated.pending("22" * 32, now=observed_at + 1)],
+                ["message_deleted"],
+            )
+            self.assertEqual(
+                [row[1] for row in migrated._require_db().execute("PRAGMA table_info(facts)")],
+                [
+                    "seq",
+                    "group_key",
+                    "event_key",
+                    "kind",
+                    "observed_at",
+                    "claim_owner",
+                    "claim_token",
+                    "claimed_at",
+                ],
+            )
+            migrated.close()
+
+    def test_malformed_store_fails_closed_and_releases_owner_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "private"
+            parent.mkdir(mode=0o700)
+            path = parent / "ambient.sqlite3"
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE facts(seq INTEGER PRIMARY KEY)")
+            db.commit()
+            db.close()
+            path.chmod(0o600)
+
+            first = AmbientContextStore(path)
+            with self.assertRaises(AmbientContextError):
+                first.open()
+            self.assertFalse(first.is_open)
+
+            second = AmbientContextStore(path)
+            with self.assertRaises(AmbientContextError) as failure:
+                second.open()
+            self.assertNotIn("already owned", str(failure.exception))
+
+    def test_permission_hardening_falls_back_when_nofollow_chmod_is_unsupported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            real_chmod = os.chmod
+
+            def unsupported_nofollow(candidate, mode, *, dir_fd=None, follow_symlinks=True):
+                if follow_symlinks is False:
+                    raise NotImplementedError("follow_symlinks unavailable")
+                return real_chmod(candidate, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with mock.patch.object(os, "chmod", side_effect=unsupported_nofollow):
+                store = AmbientContextStore(path)
+                self.assertTrue(store.record("22" * 32, "event", "message_deleted"))
+                store.close()
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_event_group_age_and_byte_bounds_evict_oldest_deterministically(self):
         with tempfile.TemporaryDirectory() as directory:

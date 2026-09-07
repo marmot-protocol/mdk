@@ -57,25 +57,37 @@ identifier-free representation only to the next real inbound message that
 passes activation. Admission rejection leaves the facts pending. A dispatch
 exception or cancellation also leaves them pending; a normal
 `handle_message` return acknowledges exactly the snapshot attached to that
-accepted turn, without deleting facts observed concurrently.
+accepted turn, without deleting facts observed concurrently. Per-group claims
+prevent overlapping dispatch producers from attaching one snapshot twice. An
+ambient-store failure is logged privately and never rejects or reclassifies an
+otherwise accepted real inbound turn.
 
 The durable rows contain only SHA-256 routing/dedupe keys, an allowlisted fact
 kind, ordering, and expiry metadata. They contain no message text, rename text,
 account/group/message identifiers, pubkeys, relay URLs, tokens, or stream
-capabilities. The private parent and database/WAL files are permission checked
-and symlink files are refused. State is deterministically bounded by group
-count, per-group and total event count, logical bytes, and age; oldest sequence
-numbers (and then oldest groups) are evicted first.
+capabilities. Acknowledged event hashes remain only as bounded replay-dedupe
+tombstones. The private parent and database/lock/WAL files are permission
+checked and symlink files are refused; unsupported no-follow path chmod uses a
+descriptor opened with `O_NOFOLLOW`. Pending facts and replay tombstones have
+separate per-group windows and share deterministic aggregate group, event-count,
+logical-byte, and age bounds; oldest observed entries (and then oldest groups)
+are evicted first. A live claim may temporarily add at most one already-bounded
+snapshot to the persisted limits; it is never evicted before the host outcome,
+and acknowledgement or release immediately restores the configured aggregate
+limits.
 
 A connector reconnect in the same process and a clean adapter disconnect leave
 unacknowledged facts on disk. WAL recovery preserves committed facts after
 abrupt process death. Replayed ambient events collapse through their persisted
-hashed event key; later non-duplicate facts retain observation order. On a new
-adapter/gateway generation, pending facts are recovered and follow the same
-activation and acknowledgement rules. A host call that is cancelled, rejects,
-or raises is not an accepted turn; its attached snapshot is eligible for the
-next attempt. The acceptance boundary is the normal return from Hermes's
-`handle_message`, followed by deletion of only that exact snapshot.
+hashed event key even after acknowledgement; later non-duplicate facts retain
+observation order. A non-blocking exclusive store lock proves one process
+generation owns claims. On a new adapter/gateway generation, acquiring that
+lock recovers claims abandoned by an abruptly dead owner; clean disconnect
+releases live claims before closing. Reconnect without process replacement
+keeps the same owner. A host call that is cancelled, rejects, or raises is not
+an accepted turn; its attached claim is released for the next attempt. The
+acceptance boundary is the normal return from Hermes's `handle_message`,
+followed by conversion of only that exact claim into replay tombstones.
 
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
