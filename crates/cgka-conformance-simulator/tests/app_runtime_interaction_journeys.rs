@@ -933,7 +933,7 @@ async fn check(journey: Journey) {
             "relay_order": "native local Nostr relay", "debug_assertions": cfg!(debug_assertions),
             "settlement_policy": match journey {
                 Journey::ManualSelfUpdate => "protocol-pinned 1000 ms settlement; maintenance windows zeroed when built with test-policy-overrides",
-                _ => "default production policy; no test override requested",
+                _ => "protocol-pinned 1000 ms settlement; production maintenance windows",
             },
             "immediate_maintenance_honored": matches!(journey, Journey::ManualSelfUpdate)
                 && AppRuntimeHarness::honors_maintenance_timing_override(),
@@ -946,7 +946,10 @@ async fn check(journey: Journey) {
         Journey::ManualSelfUpdate => {
             AppRuntimeHarness::new_with_immediate_maintenance(&clients).await
         }
-        _ => AppRuntimeHarness::new(&clients).await,
+        // Workspace feature unification can enable marmot-app's instant
+        // test settlement default through another crate. These journeys claim
+        // production behavior, so pin that policy in every build.
+        _ => AppRuntimeHarness::new_with_pinned_settlement(&clients).await,
     }
     .expect("public runtime setup");
     let exercise = async {
@@ -1012,9 +1015,12 @@ macro_rules! journey_test {
 }
 
 journey_test!(public_app_07_two_groups_stay_isolated, Journey::TwoGroups);
+// Strict since #1734: a losing profile edit is re-issued when the winning
+// commit left its field untouched, so an edit the runtime reported as saved
+// reaches the settled public state.
 journey_test!(
-    public_app_08_concurrent_admin_profile_edits_converge,
-    Journey::ConcurrentProfileEdits { strict: false }
+    public_app_08_concurrent_admin_profile_edits_are_never_lost,
+    Journey::ConcurrentProfileEdits { strict: true }
 );
 journey_test!(
     public_app_09_concurrent_invite_and_rename_converge,
@@ -1029,27 +1035,22 @@ journey_test!(
     Journey::LeaveWithSeveralRemaining { strict: false }
 );
 
-// The strict forms additionally require that an edit the runtime reported as
-// saved reaches the settled public state. Convergence currently parks the
-// losing committer's intent without re-issuing it, so they document a known
-// product gap rather than gating CI; see APP_PATH_COVERAGE.md.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: a losing admin edit is dropped after its caller was told it saved"]
-async fn public_app_08_strict_concurrent_admin_profile_edits_are_never_lost() {
-    check(Journey::ConcurrentProfileEdits { strict: true }).await;
-}
-
+// The strict form additionally requires that an invite or rename the runtime
+// reported as saved reaches the settled public state and that an excluded
+// invitee holds no projection. A losing rename is re-issued since #1734; a
+// losing invite still strands its invitee on a parked branch (#1735), so this
+// documents a known product gap rather than gating CI; see
+// APP_PATH_COVERAGE.md.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "known gap: a losing invite or rename is dropped after its caller was told it saved"]
 async fn public_app_09_strict_concurrent_invite_and_rename_are_never_lost() {
     check(Journey::ConcurrentInviteAndRename { strict: true }).await;
 }
 
-// The engine schedules a peer's SelfRemove auto-commit within 50 ms, but the
-// app worker's convergence schedule has no arm for it, so survivors apply a
-// leave only when some other commit or timer runs convergence for the group.
+// The worker now arms the engine's pending SelfRemove deadline, respecting
+// collecting-pass and publication barriers. This ordinary 30-second regression
+// requires survivors to apply a leave without an unrelated commit or timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: survivors apply a voluntary leave only when another commit runs convergence"]
 async fn public_app_12_strict_leave_is_applied_by_survivors_promptly() {
     check(Journey::LeaveWithSeveralRemaining { strict: true }).await;
 }

@@ -515,6 +515,18 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   announced once — it durably flips its record to `EpochInvalidated`, so a later pass no longer sees it as previously
   applied. That half of the hole predates announce-once. Both repairs flip forward only; `GroupStateRevalidated` has no
   account-layer consumer and neither reconciler un-marks a supersession.
+- **Every own group evolution keeps its intent until the commit is beyond the rewind horizon.** `do_send_ready`
+  records an `OwnCommitIntent` (kind, the pre-staging baseline of the edited fields, source epoch, attempt count) for
+  `Invite`, `RemoveMembers`, `UpdateGroupData`, and `UpdateAppComponents` before dispatch, keyed by the commit's
+  message id; `publish_failed` deletes it, confirmation does not, and
+  `reissue_superseded_own_commits_from_state` garbage-collects a `Processed` record once `group.epoch` exceeds
+  `source_epoch + max_rewind_commits`. When branch selection withdraws the commit, `reissue_superseded_own_commit`
+  (event path: the account layer's `GroupStateInvalidated` reconciler; derived path: `run_due_maintenance`) decides
+  from the record, never from the losing branch's bytes: re-queue an edit only when the canonical value of every field
+  the intent changed still equals the baseline, report `Conflict` otherwise; re-queue a removal for targets still on
+  the roster; an invite is `ReinviteRequired` (mdk#1735 owns the invitee); at most `MAX_OWN_COMMIT_REISSUE_ATTEMPTS`
+  re-issues, then `Abandoned`. The decision is returned as a `SupersededIntentReport` so the runtime can announce it
+  (mdk#1734). Tests: `tests/distributed_convergence.rs::superseded_profile_edit_*`.
 - **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`
   therefore runs both before an advance past E and immediately after a replayed proposal enters the store at E
   (`openmls_projection::process_openmls_messages_inner`, the `ProposalMessage` arm, under the same

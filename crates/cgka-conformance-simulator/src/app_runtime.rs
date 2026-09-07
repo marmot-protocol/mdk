@@ -767,6 +767,21 @@ impl AppRuntimeHarness {
             if !participant.online {
                 continue;
             }
+            // A future invitee can repair its account before it has this
+            // group's projection. Keep it on the real relay, but don't query
+            // MLS state for a group it has never joined. Explicit observation
+            // of that absent group still fails instead of inventing a state.
+            if participant
+                .app
+                .group(&participant.account_id, &hex::encode(group_id.as_slice()))
+                .map_err(app_error)?
+                .is_none()
+            {
+                participant.cached_members.remove(&group_label);
+                participant.cached_epochs.remove(&group_label);
+                drain_runtime_events(participant);
+                continue;
+            }
             let members = participant
                 .runtime()?
                 .group_members(&participant.account_id, &group_id)

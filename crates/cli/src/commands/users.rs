@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::{
     CommandOutput, UsersCommand, WnError, npub_for_account_id, parse_public_key, resolve_account,
+    terminal_safe_json_display, terminal_safe_text,
 };
 
 /// `users` without a running app runtime.
@@ -55,8 +56,10 @@ async fn run_users_command(
                 .directory_entry_for_account_id(&account_id)?
                 .ok_or_else(|| AppError::MissingDirectoryEntry(account_id.clone()))?;
             Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&entry)
-                    .expect("JSON response serialization cannot fail"),
+                plain: terminal_safe_json_display(
+                    &serde_json::to_string_pretty(&entry)
+                        .expect("JSON response serialization cannot fail"),
+                ),
                 json: json!({ "user": entry }),
             })
         }
@@ -78,7 +81,7 @@ async fn run_users_command(
             } else {
                 results
                     .iter()
-                    .map(|result| result.npub.clone())
+                    .map(|result| terminal_safe_text(&result.npub))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -91,7 +94,10 @@ async fn run_users_command(
             });
             if let Some(reason) = completeness.reason() {
                 json["incomplete_reason"] = json!(reason);
-                plain.push_str(&format!("\n(partial results: {reason})"));
+                plain.push_str(&format!(
+                    "\n(partial results: {})",
+                    terminal_safe_text(reason)
+                ));
             }
             Ok(CommandOutput { plain, json })
         }

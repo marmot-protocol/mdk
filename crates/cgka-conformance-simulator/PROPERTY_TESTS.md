@@ -315,13 +315,14 @@ binds every restart action id to a matching durable `restarted` lifecycle event.
 
 ### Public app journey contracts
 
-The fixed inputs in `tests/public_app_families.rs` use generator version 4 and the four public families: send/leave,
-membership re-entry, offline recovery and admin handoff. Counts below describe each test's loop, including repeated
-generation where replay equality is the assertion; they are not independent random samples.
+The fixed inputs in `tests/public_app_families.rs` cover the four generator-version-4 public families (send/leave,
+membership re-entry, offline recovery and admin handoff) and the two generator-version-1 pressure companions below.
+Counts describe each test's loop, including repeated generation where replay equality is the assertion;
+they are not independent random samples.
 
 | Check | Generated inputs | Count and rule |
 | --- | --- | --- |
-| Replay, prefix and capability contract | Each family: seed 7, indices 0–5 twice and 0–11 once; seed 42, indices 0–5 once | 30 generations per family, 120 total (72 distinct inputs). Repeated six-case outputs must match; the six-case prefix must match the twelve-case run; seed 42 must change actual workloads. All 48 seed-7 twelve-case outputs must select the app adapter, preflight and include payload expectations for every client. |
+| Replay, prefix and capability contract | Each of six families: seed 7, indices 0–5 twice and 0–11 once; seed 42, indices 0–5 once | 30 generations per family, 180 total (108 distinct inputs). Repeated six-case outputs must match; the six-case prefix must match the twelve-case run; seed 42 must change actual workloads. All 72 seed-7 twelve-case outputs must select the app adapter, preflight and include payload expectations for every client. |
 | Capability rejection | Send/leave, seed 7, index 0 | Three variants: remove public group-state observation, add private exact-equivalence assertion, or add private no-pending-work assertion. Each must fail preflight. |
 | Checkpoint validation | Admin handoff, seed 7, index 0 | Five invalid variants: empty observers, unknown member, duplicate member, observer absent from membership, or admin absent from membership. Each must fail compilation. |
 | Transition/checkpoint contract | All four families, seed 7, indices 0–5 | 24 cases. Require restart coverage, family-specific transition counts and a public checkpoint before subsequent traffic; admin grants must permit an edit and revocations must reject self-promotion before normal messaging. |
@@ -338,6 +339,17 @@ oracle mutation checks reject loss, duplicate messages, wrong membership count, 
 divergent epochs. The public group checkpoint also rejects a same-size wrong roster and an epoch below the logical
 mutation lower bound while accepting equal extra maintenance epochs. Unsupported adapters fail capability preflight.
 These checks establish public behavior, not engine-private equivalence or exhaustive asynchronous schedules.
+
+## Public pressure companion contracts
+
+`public_catalog_is_replayable_and_preflights_without_private_capabilities` also covers the generator-version-1
+admin-churn and late-join public families: same-seed replay, different-seed workload variation, six-case prefix
+stability within twelve cases, complete app capability preflight, and payload expectations for every participant.
+`public_pressure_catalog_preserves_admission_history_and_commit_depth` independently reconstructs recipients at
+each send across twelve cases. It pins 4/8/16 administration rounds, 4/12/36 pre-admission profile commits, two
+fresh admissions, and multiple reopen boundaries. Exact expected timelines must match that reconstruction.
+`public_admin_churn_strict_canary` and `public_late_join_strict_canary` are explicit real-socket acceptance tests
+with loss, duplicate, profile, roster, admin and epoch mutation checks; registration alone is not execution evidence.
 
 ## Current Gaps
 

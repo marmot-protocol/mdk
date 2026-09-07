@@ -773,6 +773,34 @@ See also the separate public companions below; they do not replace this engine o
   `no_pending_work_except_retained_join_commit` assertion: a welcome-joined member currently retains exactly its own
   join commit as a permanently deferred transport input, and any other pending work still fails the case. The
   retained join commit itself is tracked as a harness coverage gap.
+### Public admin churn and late joining after commit history
+
+`public-app-admin-churn/v1` and `public-app-late-join/v1` use
+`generate_public_app_pressure_case` (generator version `1`). Both select the full app runtime, real local Nostr
+relay and per-participant SQLCipher databases. They are public companions to the serialized administration and
+latecomer motifs in `admin-churn/v1`; the original engine scenarios and private assertions retain their meaning.
+
+- **Admin churn:** indices modulo three select 4/8/16 rounds of alternating profile and admin-policy changes,
+  after an initial delegation. Seeds choose the delegate, authorized editor, policy target and message sender.
+  Every round includes a message, with a participant reopen halfway through the workload.
+- **Late join:** two founders accumulate 4/12/36 profile commits and one message per four commits before inviting
+  the other participants individually. Each admission is followed by another profile commit and a joiner send.
+  Indices 0–2 reopen the founder before admission; indices 3–5 reopen each joiner after admission. The largest
+  arm starts admission after a long history; a fresh Welcome must establish the current state. This is serialized admission after commit
+  pressure, not a claim to reproduce the engine arm's forced same-flight Welcome/commit delivery or a commit race.
+
+Every mutation must reach the modeled roster, admins and profile jointly among the online members. All active
+members send after the workload; complete histories must persist across another reopen. The late joiners' exact
+payload multisets exclude all pre-admission messages, including the first joiner's send at the second joiner.
+The adapter can catch up an account before it has a group projection, while explicit observation of a missing
+group remains an error. These companions do not claim private MLS equivalence, internal input closure, or forced
+relay ordering. Socket timing and cryptographic randomness are not controlled by the seed.
+
+The six-case catalogs repeat at higher indices; distinct seeds vary legal actors and join order. Use a 900-second
+isolated-worker deadline for the 36-commit history. The ordinary generator tests check replay/prefix stability,
+capability preflight, exact admission histories and workload depth. Explicit strict socket canaries include the
+same loss/duplication/state oracle mutations as the original public families.
+
 ### `bounded-convergence-pressure/v1`
 
 - Generator: `generate_bounded_convergence_pressure_family` (generator version `2`). Version 2 adds the confirmed
@@ -1086,16 +1114,19 @@ its pre-removal history exactly, and have its own sends refused), and a voluntar
 The default forms run in the ordinary crate test and gate only what the product delivers today: members settle on one
 public state, at least one racing edit is present in that settled state (measured on the projection, never on the
 command's return value), fresh traffic flows in every direction, history survives reopen, and survivors apply a leave
-within three minutes. The strict forms are ignored regressions for three tracked gaps: an edit or invite the runtime
-reported as saved is never lost (#1734), an invitee the founders exclude holds no projection rather than a stranded
-parked-branch membership (#1735), and survivors apply a leave within 30 seconds (#1736). The manual self-update journey
-runs with zeroed maintenance windows when the crate is built with `test-policy-overrides`
-(`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter run
-on real time.
+within three minutes. Journey 08 is strict by default: a profile edit the runtime reported as saved reaches the settled
+state when the winner left its field untouched; a same-field race is reported to the host as a conflict (#1734). The
+strict 30-second leave regression also runs ordinarily after the SelfRemove deadline scheduling correction (#1736).
+The strict form of journey 09 remains ignored for the stranded-invitee gap (#1735): an invitee excluded by the canonical
+branch must hold no projection, and a losing invite needs recovery beyond the current re-invitation report.
+The manual self-update journey runs with zeroed maintenance windows when built with `test-policy-overrides`
+(`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter
+run on real time.
 
 `cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
-capabilities before spending runtime budget. Its first bounded selection covers twelve families and records
-unsupported cases explicitly; it does not create new families, remove assertions, or count preflight as a pass.
+capabilities before spending runtime budget. Its bounded selection covers twelve engine families and six public
+companions, and `--vectors DIR` recursively inventories fixed scenario fixtures and saved generated inputs.
+It records unsupported cases explicitly; it does not rewrite scenarios, remove assertions, or count preflight as a pass.
 
 ## Byte Fixtures
 

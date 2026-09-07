@@ -106,6 +106,9 @@ mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
 
+pub use cgka_traits::engine::{
+    SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
@@ -1766,6 +1769,7 @@ impl MarmotApp {
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
+            pending_superseded_change_events: Vec::new(),
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
@@ -3249,8 +3253,24 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .set_group_self_membership(group_id_hex, membership)?;
+        let storage = self.account_storage(&account.label)?;
+        // A voluntary departure stays voluntary. `Left` is written the moment
+        // this device publishes its leave; the commit that later realizes it
+        // is authored by a peer, and the roster-derived classification of
+        // that commit reads as an eviction. Now that peers apply a leave
+        // within seconds (mdk#1736) the two writes land back to back, so the
+        // eviction must never overwrite the recorded intent.
+        if membership == SelfMembership::Removed
+            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        {
+            tracing::debug!(
+                target: "marmot_app",
+                method = "set_group_self_membership",
+                "keeping voluntary Left classification over a realized removal"
+            );
+            return Ok(());
+        }
+        storage.set_group_self_membership(group_id_hex, membership)?;
         Ok(())
     }
 

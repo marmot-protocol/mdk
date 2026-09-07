@@ -24,7 +24,7 @@ use transport_quic_stream::{
 use crate::{
     AgentStreamDelta, CommandOutput, StreamCommand, WnError, agent_text_stream_payload_value,
     ensure_local_signing, normalize_group_id_hex, npub_for_account_id, resolve_account,
-    resolve_account_ref, stream_route_label, unix_now_seconds,
+    resolve_account_ref, stream_route_label, terminal_safe_text, unix_now_seconds,
 };
 
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
@@ -44,7 +44,8 @@ pub(crate) async fn stream_command_local(command: StreamCommand) -> Result<Comma
             Ok(CommandOutput {
                 plain: format!(
                     "received stream {stream_id} chunks={}\n{}",
-                    received.chunk_count, received.text
+                    received.chunk_count,
+                    terminal_safe_text(&received.text)
                 ),
                 json: json!({
                     "local_addr": local_addr.to_string(),
@@ -618,7 +619,7 @@ where
             "received brokered stream {} chunks={}\n{}",
             hex::encode(&received.stream_id),
             received.chunk_count,
-            received.text
+            terminal_safe_text(&received.text)
         ),
         json: json!({
             "brokered": true,

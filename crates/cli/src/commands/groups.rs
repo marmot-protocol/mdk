@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     CommandOutput, GroupCommand, GroupsCommand, MaintenancePolicySetting, WnError,
     ensure_local_signing, group_json, group_list_plain, group_show_output, normalize_group_id_hex,
-    npub_for_account_id, parse_public_key, resolve_account,
+    npub_for_account_id, parse_public_key, resolve_account, terminal_safe_text,
 };
 
 async fn accept_group_invite_retrying_busy(
@@ -431,7 +431,7 @@ pub(crate) async fn groups_command_with_runtime(
                 .group(&account.label, &group_id)?
                 .ok_or_else(|| AppError::UnknownGroup(group_id.clone()))?;
             Ok(CommandOutput {
-                plain: group.endpoint.clone(),
+                plain: terminal_safe_text(&group.endpoint),
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
@@ -813,14 +813,23 @@ fn pending_invites_plain(invites: &[marmot_app::AppGroupRecord]) -> String {
     invites
         .iter()
         .map(|group| {
-            let name = if group.profile.name.trim().is_empty() {
-                "unnamed"
+            let sanitized_name = terminal_safe_text(&group.profile.name);
+            let name = if sanitized_name.trim().is_empty() {
+                "unnamed".to_owned()
             } else {
-                group.profile.name.as_str()
+                sanitized_name
             };
+            let group_id = terminal_safe_text(&group.group_id_hex);
             match group.welcomer_account_id_hex.as_deref() {
-                Some(welcomer) => format!("{} {} from {}", group.group_id_hex, name, welcomer),
-                None => format!("{} {}", group.group_id_hex, name),
+                Some(welcomer) => {
+                    format!(
+                        "{} {} from {}",
+                        group_id,
+                        name,
+                        terminal_safe_text(welcomer)
+                    )
+                }
+                None => format!("{group_id} {name}"),
             }
         })
         .collect::<Vec<_>>()
@@ -922,5 +931,62 @@ mod tests {
                 group_id: "group".into(),
             }
         ));
+    }
+
+    fn sample_group(name: &str, welcomer: Option<&str>) -> marmot_app::AppGroupRecord {
+        let mut group: marmot_app::AppGroupRecord = serde_json::from_value(json!({
+            "group_id_hex": "aa".repeat(16),
+            "endpoint": "wss://relay.example",
+            "nostr_routing": {
+                "component_id": 1,
+                "component": "marmot.transport.nostr.routing.v1",
+                "nostr_group_id_hex": "bb".repeat(16),
+                "relays": ["wss://relay.example"],
+                "data_hex": ""
+            },
+            "profile": {
+                "component_id": 2,
+                "component": "marmot.group.profile.v1",
+                "name": name,
+                "description": "",
+                "data_hex": ""
+            },
+            "image": {
+                "component_id": 3,
+                "component": "marmot.group.blossom-image.v1",
+                "present": false,
+                "image_hash_hex": "",
+                "image_key_hex": "",
+                "image_nonce_hex": "",
+                "image_upload_key_hex": "",
+                "data_hex": ""
+            },
+            "admin_policy": {
+                "component_id": 4,
+                "component": "marmot.group.admin-policy.v1",
+                "admins": [],
+                "data_hex": ""
+            }
+        }))
+        .expect("sample group");
+        group.welcomer_account_id_hex = welcomer.map(str::to_owned);
+        group
+    }
+
+    #[test]
+    fn pending_invites_plain_sanitizes_names_and_keeps_unnamed_fallback() {
+        let named = sample_group("ops\u{1b}]52;c;YXR0YWNr\u{7}", Some("alice\u{202e}"));
+        let blank = sample_group("\u{1b}\u{7}\u{202e}", None);
+        let listed = pending_invites_plain(&[named, blank]);
+        assert_eq!(
+            listed,
+            format!(
+                "{} ops]52;c;YXR0YWNr from alice\n{} unnamed",
+                "aa".repeat(16),
+                "aa".repeat(16)
+            )
+        );
+        assert_eq!(listed.matches('\n').count(), 1);
+        assert!(!listed.contains('\u{1b}'));
     }
 }

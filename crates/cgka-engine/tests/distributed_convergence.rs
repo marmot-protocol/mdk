@@ -16,7 +16,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent,
-    SendResult,
+    SendResult, SupersededIntentKind, SupersededIntentOutcome,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -2865,6 +2865,7 @@ async fn engine_defers_child_commit_until_parent_arrives() {
                 description: None,
             },
             created_at_ms: 1_001,
+            reissue_attempts: 0,
         })
         .expect("persist already-queued admin group-state intent");
 
@@ -3138,6 +3139,7 @@ fn queue_intent(
             group_id: group_id.clone(),
             intent,
             created_at_ms,
+            reissue_attempts: 0,
         })
         .expect("persist queued outbound intent");
 }
@@ -4427,6 +4429,7 @@ async fn durable_unrecoverable_halt_blocks_queued_drain_without_rehydration() {
                 payload: app_payload_for(&alice, b"must remain queued"),
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .unwrap();
     let mut stored_group = storage.get_group(&group_id).unwrap();
@@ -9070,6 +9073,7 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
                 description: None,
             },
             created_at_ms: 0,
+            reissue_attempts: 0,
         })
         .unwrap();
 
@@ -9114,6 +9118,7 @@ async fn restart_schedules_groups_with_durable_queued_intents() {
                 payload: app_payload_for(&alice, b"send after restart"),
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .unwrap();
     drop(alice);
@@ -9165,6 +9170,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
                 initial_admins: vec![],
             },
             created_at_ms: 0,
+            reissue_attempts: 0,
         })
         .unwrap();
     let app_intent_id = MessageId::new(b"later-app".to_vec());
@@ -9177,6 +9183,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
                 payload: app_payload_for(&alice, b"after invite publish resolves"),
             },
             created_at_ms: 1,
+            reissue_attempts: 0,
         })
         .unwrap();
 
@@ -10197,4 +10204,270 @@ async fn live_deferral_reclassifies_graph_after_a_retry_sweep_and_new_rival() {
         },
         "live recovery evidence must use the current stored graph"
     );
+}
+
+/// Two admins commit a profile change from the same epoch; branch selection
+/// keeps one and parks the other. The parked committer already told its caller
+/// the change saved, so its intent must be re-issued when the winner left the
+/// edited field alone, and reported as a conflict when the winner changed the
+/// same field (mdk#1734).
+async fn race_profile_edits(
+    alice_edit: (Option<&str>, Option<&str>),
+    bob_edit: (Option<&str>, Option<&str>),
+) -> (
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    MessageId,
+    MessageId,
+) {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: "before".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let edit = |(name, description): (Option<&str>, Option<&str>)| SendIntent::UpdateGroupData {
+        group_id: group_id.clone(),
+        name: name.map(str::to_owned),
+        description: description.map(str::to_owned),
+    };
+    let (alice_commit, alice_pending) = evolution(alice.send(edit(alice_edit)).await.unwrap());
+    let (bob_commit, bob_pending) = evolution(bob.send(edit(bob_edit)).await.unwrap());
+    let alice_commit_id = alice_commit.id.clone();
+    let bob_commit_id = bob_commit.id.clone();
+    assert!(
+        alice_storage
+            .own_commit_intent(&alice_commit_id)
+            .unwrap()
+            .is_some(),
+        "staging an own profile commit retains its intent"
+    );
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    assert!(
+        alice_storage
+            .own_commit_intent(&alice_commit_id)
+            .unwrap()
+            .is_some(),
+        "confirming a publish keeps the intent until the branch is decided"
+    );
+
+    // Each side receives the rival from the same source epoch and adjudicates.
+    for (engine, rival) in [(&mut alice, &bob_commit), (&mut bob, &alice_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        let result = engine
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+        assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    }
+    (
+        alice,
+        alice_storage,
+        bob,
+        bob_storage,
+        group_id,
+        alice_commit_id,
+        bob_commit_id,
+    )
+}
+
+#[tokio::test]
+async fn superseded_profile_edit_is_reissued_when_the_winner_left_the_field_alone() {
+    let (mut alice, alice_storage, mut bob, bob_storage, group_id, alice_commit_id, bob_commit_id) =
+        race_profile_edits(
+            (Some("alice renamed it"), None),
+            (None, Some("bob described it")),
+        )
+        .await;
+    let alice_wins = committer_wins(&alice.self_id(), &bob.self_id());
+    let (loser, loser_storage, loser_commit_id, winner, winner_storage) = if alice_wins {
+        (
+            &mut bob,
+            &bob_storage,
+            &bob_commit_id,
+            &mut alice,
+            &alice_storage,
+        )
+    } else {
+        (
+            &mut alice,
+            &alice_storage,
+            &alice_commit_id,
+            &mut bob,
+            &bob_storage,
+        )
+    };
+
+    // The winner's own commit is live; nothing to re-issue there.
+    assert!(
+        winner
+            .reissue_superseded_own_commits_from_state()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        winner_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The loser's commit was parked; the winner touched the other field, so
+    // the edit is still valid and gets queued again with one attempt spent.
+    let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].commit_id, *loser_commit_id);
+    assert_eq!(reports[0].kind, SupersededIntentKind::GroupProfile);
+    assert_eq!(reports[0].outcome, SupersededIntentOutcome::Reissued);
+    assert!(
+        loser_storage
+            .own_commit_intent(loser_commit_id)
+            .unwrap()
+            .is_none(),
+        "a decided record is consumed"
+    );
+    let queued = loser_storage
+        .list_queued_outbound_intents(&group_id)
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].reissue_attempts, 1);
+    assert!(
+        loser
+            .reissue_superseded_own_commits_from_state()
+            .unwrap()
+            .is_empty(),
+        "re-issue is decided exactly once"
+    );
+
+    // The ordinary drain regenerates the edit against the canonical state and
+    // the winner applies it, so both fields end up everywhere.
+    let drained = loser
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let (reissued_commit, reissued_pending) = evolution(
+        drained
+            .into_iter()
+            .next()
+            .expect("the re-queued edit regenerates into a commit"),
+    );
+    loser.confirm_published(reissued_pending).await.unwrap();
+    assert!(
+        loser_storage
+            .own_commit_intent(&reissued_commit.id)
+            .unwrap()
+            .is_some(),
+        "a confirmed commit stays reconsiderable inside the rewind horizon, so its record is kept"
+    );
+    winner
+        .buffer_openmls_convergence_message_at(
+            &group_id,
+            route(reissued_commit.clone(), &group_id),
+            3_000_000,
+        )
+        .unwrap();
+    let applied = winner
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
+        .unwrap();
+    assert_eq!(applied.convergence_status, ConvergenceStatus::Settled);
+    for storage in [&alice_storage, &bob_storage] {
+        let group = storage.get_group(&group_id).unwrap();
+        assert_eq!(group.name, "alice renamed it");
+        assert_eq!(group.description, "bob described it");
+    }
+
+    // Records are garbage-collected once the group has advanced past the
+    // rewind horizon, and never before: with a one-commit horizon, two further
+    // commits retire the re-issued commit's record while the newest stays.
+    loser
+        .set_convergence_policy(CanonicalizationPolicy {
+            convergence: ConvergencePolicy {
+                max_rewind_commits: 1,
+                ..ConvergencePolicy::default()
+            },
+            ..CanonicalizationPolicy::default()
+        })
+        .unwrap();
+    let mut newest = None;
+    for index in 0..2 {
+        let (commit, pending) = evolution(
+            loser
+                .send(SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some(format!("later edit {index}")),
+                    description: None,
+                })
+                .await
+                .unwrap(),
+        );
+        loser.confirm_published(pending).await.unwrap();
+        newest = Some(commit.id.clone());
+    }
+    loser.reissue_superseded_own_commits_from_state().unwrap();
+    let remaining = loser_storage
+        .list_own_commit_intents(Some(&group_id))
+        .unwrap()
+        .into_iter()
+        .map(|record| record.commit_id)
+        .collect::<Vec<_>>();
+    assert!(
+        !remaining.contains(&reissued_commit.id),
+        "a confirmed commit below the rewind horizon no longer needs its intent"
+    );
+    assert!(
+        remaining.contains(&newest.expect("two later commits")),
+        "a commit still inside the horizon keeps its intent"
+    );
+}
+
+#[tokio::test]
+async fn superseded_profile_edit_on_the_same_field_is_reported_as_a_conflict() {
+    let (mut alice, alice_storage, mut bob, bob_storage, group_id, alice_commit_id, bob_commit_id) =
+        race_profile_edits((Some("alice's name"), None), (Some("bob's name"), None)).await;
+    let alice_wins = committer_wins(&alice.self_id(), &bob.self_id());
+    let (loser, loser_storage, loser_commit_id, winner_name) = if alice_wins {
+        (&mut bob, &bob_storage, &bob_commit_id, "alice's name")
+    } else {
+        (&mut alice, &alice_storage, &alice_commit_id, "bob's name")
+    };
+    let reports = loser.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].commit_id, *loser_commit_id);
+    assert_eq!(reports[0].outcome, SupersededIntentOutcome::Conflict);
+    assert!(
+        loser_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "a conflicting edit is dropped, never re-queued"
+    );
+    for storage in [&alice_storage, &bob_storage] {
+        assert_eq!(
+            storage.get_group(&group_id).unwrap().name,
+            winner_name,
+            "the winner's value stands on both devices"
+        );
+    }
 }

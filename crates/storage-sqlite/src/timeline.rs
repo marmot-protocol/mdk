@@ -1137,12 +1137,17 @@ impl SqliteAccountStorage {
                     .storage()?;
                 Ok(rows)
             };
+        // Start with origin-linked rows; ordinary chat history has no origin.
+        // Decode the text id to use the existing binary id index. Keep the
+        // original comparison so noncanonical hex still does not match.
         let to_withdraw = collect(
             "SELECT DISTINCT app_events.origin_commit_id
              FROM app_events
-             JOIN cgka_messages
-               ON lower(hex(cgka_messages.id)) = app_events.origin_commit_id
-             WHERE cgka_messages.state = ?1
+             CROSS JOIN cgka_messages
+               ON cgka_messages.id = unhex(app_events.origin_commit_id)
+              AND lower(hex(cgka_messages.id)) = app_events.origin_commit_id
+             WHERE app_events.origin_commit_id IS NOT NULL
+               AND cgka_messages.state = ?1
                AND app_events.invalidated = 0
              ORDER BY app_events.origin_commit_id",
             vec![deferred.into()],
@@ -1150,9 +1155,11 @@ impl SqliteAccountStorage {
         let to_revive = collect(
             "SELECT DISTINCT app_events.origin_commit_id
              FROM app_events
-             JOIN cgka_messages
-               ON lower(hex(cgka_messages.id)) = app_events.origin_commit_id
-             WHERE cgka_messages.state = ?1
+             CROSS JOIN cgka_messages
+               ON cgka_messages.id = unhex(app_events.origin_commit_id)
+              AND lower(hex(cgka_messages.id)) = app_events.origin_commit_id
+             WHERE app_events.origin_commit_id IS NOT NULL
+               AND cgka_messages.state = ?1
                AND app_events.invalidated = 1
                AND app_events.invalidation_reason = ?2
              ORDER BY app_events.origin_commit_id",

@@ -1100,6 +1100,19 @@ async fn run_app_runtime_account_worker(
                                     match client.advance_convergence_after_runtime_sync(&group_id).await {
                                         Ok(summary) => {
                                             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                            // A pass that superseded one of this
+                                            // device's own commits reports it
+                                            // through the client's pending
+                                            // buffer; this arm is the only seam
+                                            // that can observe such a pass
+                                            // without a later command to drain
+                                            // it (mdk#1734).
+                                            publish_client_pending_projection_updates(
+                                                &mut client,
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                            );
                                             match client.convergence_schedule_state(&group_id) {
                                                 Ok(state) => scheduled_convergence
                                                     .schedule_after_pass(&group_id, state),
@@ -1313,6 +1326,16 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        // An inline convergence pass on a delivered rival can
+                        // supersede one of this device's own commits; the
+                        // report waits in the client's pending buffer and this
+                        // arm has no later command to drain it (mdk#1734).
+                        publish_client_pending_projection_updates(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
                         start_post_join_history_after_visibility(
                             &mut client,
                             &summary,
@@ -2667,7 +2690,7 @@ fn account_worker_command_future<'a>(
     client: &'a mut AppClient,
     command: AccountWorkerCommand,
     context: AccountWorkerCommandContext<'a>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     let AccountWorkerCommandContext {
         commands,
         pending,
@@ -2729,6 +2752,12 @@ fn account_worker_command_future<'a>(
             let result = match client.sync_with_classified_partial_progress().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_client_pending_projection_updates(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
                     let backfill_result = run_pending_epoch_backfill_reporting_arm(
                         client,
                         events,
@@ -2787,6 +2816,12 @@ fn account_worker_command_future<'a>(
             let result = match client.repair_full_history().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    publish_client_pending_projection_updates(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("repair_full_history");
                     }
@@ -4865,6 +4900,19 @@ fn publish_client_pending_projection_updates(
 ) {
     for update in client.take_pending_projection_updates() {
         publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+    }
+    // Superseded own commits ride the same drain: every worker seam that can
+    // observe convergence effects already flushes projection updates here.
+    for report in client.take_pending_superseded_change_events() {
+        let _ = events.send(MarmotAppEvent::GroupChangeSuperseded {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            group_id: report.group_id,
+            commit_id_hex: hex::encode(report.commit_id.as_slice()),
+            kind: report.kind,
+            outcome: report.outcome,
+            reason: report.reason,
+        });
     }
 }
 
