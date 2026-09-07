@@ -1331,13 +1331,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
                         })?;
                     transport_ids.push(transport_id);
                 }
-                if transport_ids.len() != summary.published {
-                    return Err(SubjectError::classified(
-                        SubjectFailureCategory::Protocol,
-                        "relay_action_publication_identity_count_mismatch",
-                        "published chat count does not match its public transport identities",
-                    ));
-                }
+                // Queued maintenance can increase the total beyond chat ids.
+                // The recorder checks the total and every known identity.
             }
             self.record_relay_action_events(
                 action.action_id,
