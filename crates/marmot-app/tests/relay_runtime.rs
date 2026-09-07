@@ -11684,15 +11684,18 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
         ),
     }
 
-    // The race resolved into one durable request, and it is visible to hosts.
+    // The race resolved into one durable request, and it is visible to hosts
+    // until a peer commits it. Since peers now apply a leave within seconds
+    // (mdk#1736), the request may already have been realized by the time this
+    // reads; either way the row records exactly one voluntary departure.
     let group_id_hex = hex::encode(group_id.as_slice());
+    let row = app
+        .chat_list_row(&bob.account.label, &group_id_hex)
+        .unwrap()
+        .expect("bob's row survives the leave");
     assert!(
-        app.chat_list_row(&bob.account.label, &group_id_hex)
-            .unwrap()
-            .expect("bob's row survives the leave")
-            .leave_requested_at_ms
-            .is_some(),
-        "the winning leave leaves exactly one durable request behind"
+        row.leave_requested_at_ms.is_some() || row.self_membership == SelfMembership::Left,
+        "the winning leave leaves exactly one durable request behind, or has already been realized as Left; got {row:?}"
     );
 }
 
