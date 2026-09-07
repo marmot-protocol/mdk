@@ -148,6 +148,10 @@ timeout, and the original failure artifacts remain authoritative.
 | `cross-route-restart-permutations/v1` | Twelve public app-runtime restart boundaries in the four-party route scenario |
 | `cross-route-exact-restart-permutations/v1` | Exact/private engine companion to the public restart catalog |
 | `chat-journey/v1` | Legality-aware product journeys: membership, profile, app traffic, offline/catch-up, and restart |
+| `public-app-send-leave/v1`, `public-app-membership-reentry/v1` | Public departure/re-entry, exact visible histories and reopen persistence |
+| `public-app-offline-recovery/v1`, `public-app-admin-handoff/v1` | Public retained-history recovery and grant/edit/revoke authorization |
+| `public-app-admin-churn/v1` | Public sequential profile/admin churn with traffic and a reopen midway through the workload |
+| `public-app-late-join/v1` | Fresh admission after 4/12/36 profile commits, exact admission histories and reopen persistence |
 
 `--cases` is a count, not a complexity dial. Case index selects a deterministic arm or generated history. More cases
 increase coverage; they do not promise that later cases are larger. `--seed` changes the deterministic choices within
