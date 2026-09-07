@@ -4738,3 +4738,72 @@ async fn default_maintenance_timing_holds_a_manual_self_update_in_its_quiet_wind
     );
     assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
 }
+
+#[tokio::test]
+async fn immediate_maintenance_timing_walks_a_post_join_obligation_without_waiting() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    // A post-join obligation as the engine creates it at join: waiting on the
+    // retained-history subscription, with the full 30-second jitter sampled.
+    let obligation_id = cgka_traits::MessageId::new(vec![7; 32]);
+    runtime
+        .session()
+        .put_maintenance_obligation(&cgka_traits::maintenance::MaintenanceObligation {
+            id: obligation_id.clone(),
+            group_id: group_id.clone(),
+            trigger: cgka_traits::MaintenanceTrigger::PostJoin,
+            phase: cgka_traits::MaintenancePhase::CatchUp,
+            created_at: cgka_traits::Timestamp(100_000),
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: None,
+            own_leaf_baseline_hash: Some(runtime.session().own_leaf_hash(&group_id).unwrap()),
+            sampled_jitter_ms: 30_000,
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        })
+        .unwrap();
+    runtime
+        .mark_post_join_subscription_installed(&group_id)
+        .unwrap();
+
+    let mut phases = Vec::new();
+    for _ in 0..3 {
+        runtime.run_due_maintenance().await.unwrap();
+        phases.push(
+            runtime
+                .session()
+                .maintenance_obligation(&obligation_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+        );
+    }
+    assert_eq!(
+        phases,
+        [
+            cgka_traits::MaintenancePhase::EoseTimeout,
+            cgka_traits::MaintenancePhase::Quiet,
+            cgka_traits::MaintenancePhase::Jitter,
+        ],
+        "zero EOSE timeout, grace, and quiet windows advance one phase per sweep"
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "the sampled 30-second jitter is bounded by the zero window: {effects:?}"
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+}

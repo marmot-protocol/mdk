@@ -49,8 +49,8 @@ use cgka_traits::{
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceTiming,
-    TransportRoutingError, TransportRoutingPolicy,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, TransportRoutingError,
+    TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
@@ -105,6 +105,7 @@ mod sqlcipher;
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
+pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{

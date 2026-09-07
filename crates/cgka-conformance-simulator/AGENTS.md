@@ -448,4 +448,7 @@ Keep these aligned with [`README.md`](README.md), [`SCENARIOS.md`](SCENARIOS.md)
   those windows through `MarmotAppConfig::with_dev_maintenance_timing`, which is honored only when this crate is built
   with `test-policy-overrides` (now also enabling `marmot-app/test-policy-overrides`). Gate any journey that depends
   on it with `cfg_attr(not(feature = "test-policy-overrides"), ignore)` and check
-  `AppRuntimeHarness::honors_maintenance_timing_override()` rather than assuming the knob took effect.
+  `AppRuntimeHarness::honors_maintenance_timing_override()` rather than assuming the knob took effect. That build
+  also switches `AppRuntimeHarness::new()` to marmot-app's instant-settlement test default, so journeys that claim
+  production settlement must use `new_with_pinned_settlement` or `new_with_immediate_maintenance` (both pin the
+  1,000 ms window), and a recipe that enables the feature must select its tests explicitly rather than run the crate.
