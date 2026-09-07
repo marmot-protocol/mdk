@@ -234,3 +234,31 @@ account; they must be restored or opened with a compatible runtime, not silently
 discarded because they may contain approved publication intent. C
 consumers have equivalent methods and subscriptions; external-signer entry
 points retain the C API's existing callback-vtable limitation.
+
+## Live timeline updates
+
+`TimelineMessagesSubscription::next()` returns the complete bounded window on
+every update. Its conversion cache avoids reparsing unchanged rows, but those
+rows still get cloned and serialized across FFI. `next_update()` returns raw
+projection deltas, or a replacement `Page` after a refresh. These methods consume
+the same stream; use only one per subscription. Delta consumers must maintain
+ordering, removals, and window limits themselves; raw projections do not report
+which rows the runtime evicted from its bounded window.
+
+Projection `messages` and upsert `changes` retain their existing wire format.
+When corresponding source records are identical, conversion now parses Markdown
+and resolves media once, then clones the converted record for the second field.
+Different records and removals retain independent conversion.
+
+Run the conversion and wire-serialization benchmark with:
+
+```sh
+cargo test -p marmot-uniffi --release --lib bench_live_timeline_updates -- --ignored --nocapture
+```
+
+It compares cached full pages, current deltas, and the original independent
+conversion of both delta fields. Each window has 25, 100, or 500 rows and one
+edited Markdown message per update. Results include source cloning, conversion,
+and UniFFI serialization: p50/p95 over 100 samples after 10 warm-up iterations,
+plus serialized byte counts. They exclude storage, runtime window application,
+FFI scheduling, and Swift/Kotlin decoding and rendering.
