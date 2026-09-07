@@ -3,7 +3,7 @@ use crate::connection::CachedSql;
 use crate::connection::retry_on_busy;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, i64_to_u64,
-    message_state_from_i64, message_state_to_i64, serialize,
+    message_state_from_i64, message_state_to_i64, serialize, unix_now_seconds_i64,
 };
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::message::{
@@ -83,12 +83,12 @@ impl SqliteAccountStorage {
             }
             conn.execute_cached(
                 "INSERT INTO app_epoch_backfill_intents(group_id, stalled_epoch, updated_at)
-                 SELECT group_id, MAX(epoch), unixepoch() FROM cgka_released_transport_receipts
+                 SELECT group_id, MAX(epoch), ?1 FROM cgka_released_transport_receipts
                  GROUP BY group_id
                  ON CONFLICT(group_id) DO UPDATE SET
                     stalled_epoch = MAX(app_epoch_backfill_intents.stalled_epoch, excluded.stalled_epoch),
                     updated_at = excluded.updated_at",
-                [],
+                params![unix_now_seconds_i64()],
             ).storage()?;
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;

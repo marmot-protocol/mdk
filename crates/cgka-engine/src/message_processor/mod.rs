@@ -1625,7 +1625,7 @@ impl<S: StorageProvider> Engine<S> {
         backlog: usize,
         outcome: crate::engine_metrics::DeferredPeelMetricOutcome,
     ) {
-        tracing::info!(
+        tracing::debug!(
             target: "cgka_engine::message_processor",
             method = "retry_deferred_peels",
             phase = "slice_complete",
@@ -1725,7 +1725,7 @@ impl<S: StorageProvider> Engine<S> {
         // Prepare from metadata; payload reads belong only to selected rows.
         // State filtering also avoids touching unrelated retained history.
         let mut deferred = self.storage.list_deferred_message_metadata(group_id)?;
-        tracing::info!(
+        tracing::debug!(
             target: "cgka_engine::message_processor",
             method = "retry_deferred_peels",
             phase = "metadata_loaded",
@@ -1901,7 +1901,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
-        tracing::info!(
+        tracing::debug!(
             target: "cgka_engine::message_processor",
             method = "retry_deferred_peels",
             phase = "fingerprint_loaded",

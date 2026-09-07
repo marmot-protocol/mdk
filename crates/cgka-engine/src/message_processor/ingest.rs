@@ -43,6 +43,8 @@ use tls_codec::{Deserialize as _, Serialize as _};
 /// Internal ingest result. An opaque row has no lineage verdict until a live
 /// caller needs to report one. Retry sweeps only maintain its durable lifecycle;
 /// classifying their discarded result would rescan the commit graph per row.
+/// Keeping that absence in a separate variant prevents a placeholder lineage
+/// from escaping as an apparently valid verdict when a caller starts using it.
 pub(super) enum GroupMessageIngestOutcome {
     Outcome(IngestOutcome),
     Deferred(GroupId),

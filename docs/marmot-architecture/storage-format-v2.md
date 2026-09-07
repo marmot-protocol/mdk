@@ -22,6 +22,13 @@ host receipt bookkeeping may use the trait's delete-only default. A backend
 that advertises possession or suppresses delivery must atomically revoke those
 receipts or persist the evidence needed to revoke them after restart.
 
+The app's receipt stores are advisory transport indexes used for duplicate checks
+and bounded reconciliation queries. Engine row absence alone cannot replace
+their possession answer: older databases did not backfill every accepted wrapper
+into the engine's transport markers. The journal records explicit releases while
+preserving these existing query paths; deriving every receipt from engine state
+would also need a migration-compatible mapping for historical transport ids.
+
 For app-owned databases, SQLCipher atomically deletes the raw row, removes its
 reconciliation inventory and persisted seen entry, and records the id and owning group in
 `cgka_released_transport_receipts`. Ordinary message deletion does not create
