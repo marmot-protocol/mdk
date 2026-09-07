@@ -1756,11 +1756,12 @@ mod tests {
                 start.elapsed() / 20,
             ));
         }
-        eprintln!(
+        assert!(
+            measurements[0].0 > measurements[1].0 * 5,
             "ingress prune capacity={INGRESS_DEDUP_MARKER_CAPACITY}: old={:?}, new={:?} (VM steps, elapsed)",
-            measurements[0], measurements[1]
+            measurements[0],
+            measurements[1]
         );
-        assert!(measurements[0].0 > measurements[1].0 * 5);
     }
 
     #[test]
@@ -1808,11 +1809,12 @@ mod tests {
                 assert_eq!(statement.get_status(StatementStatus::Sort), 0);
             }
         }
-        eprintln!(
+        assert!(
+            measurements[1].0 * 2 < measurements[0].0,
             "pending application order: old={:?}, new={:?} (VM steps, elapsed)",
-            measurements[0], measurements[1]
+            measurements[0],
+            measurements[1]
         );
-        assert!(measurements[1].0 * 2 < measurements[0].0);
     }
 
     #[test]

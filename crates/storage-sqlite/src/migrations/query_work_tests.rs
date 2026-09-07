@@ -40,8 +40,10 @@ fn measured<T>(
         .unwrap()
         .trace_v2(TraceEventCodes::empty(), None);
     let steps = QUERY_STEPS.load(Ordering::Relaxed);
-    eprintln!("{label}: {steps} VM steps, {elapsed:?}");
-    assert!(steps < max_steps, "{label}: {steps} >= {max_steps}");
+    assert!(
+        steps < max_steps,
+        "{label}: {steps} >= {max_steps}, elapsed={elapsed:?}"
+    );
     result
 }
 
@@ -91,7 +93,6 @@ fn seed_query_history(conn: &rusqlite::Connection, count: i64) {
 fn maintenance_query_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     for count in [256, 4_096] {
-        eprintln!("history rows={count}");
         let store = SqliteAccountStorage::in_memory().unwrap();
         seed_query_history(&store.lock().unwrap(), count);
 
@@ -220,7 +221,6 @@ fn replay_query_work() {
 
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     for count in [256, 4_096] {
-        eprintln!("history rows={count}");
         let store = SqliteAccountStorage::in_memory().unwrap();
         let now = crate::unix_now_seconds();
         seed_replay_history(&store, count, i64::try_from(now).unwrap());

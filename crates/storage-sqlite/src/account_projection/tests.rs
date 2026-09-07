@@ -3825,10 +3825,11 @@ fn seen_event_prune_query_work() {
                 assert_eq!(statement.get_status(StatementStatus::Sort), 0);
             }
         }
-        eprintln!(
+        assert!(
+            measurements[0].0 > measurements[1].0 * 5,
             "seen prune capacity={capacity}: old={:?}, new={:?} (VM steps, elapsed)",
-            measurements[0], measurements[1]
+            measurements[0],
+            measurements[1]
         );
-        assert!(measurements[0].0 > measurements[1].0 * 5);
     }
 }
