@@ -643,15 +643,32 @@ impl AppClient {
         for published in &effects.published_app_messages {
             let group_id_hex = hex::encode(published.group_id.as_slice());
             let source_message_id_hex = hex::encode(published.message_id.as_slice());
-            if let Some(update) = self.app.finalize_account_app_event_source_retention(
+            let finalized = self.app.finalize_account_app_event_source_retention(
                 &self.state.label,
                 &group_id_hex,
                 &published.app_event_id,
                 Some(source_message_id_hex.as_str()),
                 published.source_epoch.0,
                 published.retention,
-            )? {
-                updates.push(update);
+            );
+            match finalized {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) => {}
+                Err(error) => {
+                    // Keep the accepted fanouts durable until projection can
+                    // be repaired. Replaying them does not publish again.
+                    for published in &effects.published_app_messages {
+                        self.pending_convergence_groups
+                            .insert(published.group_id.clone());
+                    }
+                    tracing::warn!(
+                        target: "marmot_app::client::projection",
+                        method = "finalize_published_app_message_source_retention",
+                        error_kind = error.privacy_safe_kind(),
+                        "published application-message projection deferred",
+                    );
+                    return Ok(updates);
+                }
             }
         }
         let fail_acknowledgement = cfg!(feature = "test-policy-overrides")

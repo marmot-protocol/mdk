@@ -120,6 +120,8 @@ mod migration_0059_chat_list_unread_membership;
 mod migration_0060_released_transport_receipts;
 #[path = "migrations/0061_transport_reconciliation_replay_cursor.rs"]
 mod migration_0061_transport_reconciliation_replay_cursor;
+#[path = "migrations/0062_chat_list_preview_indexes.rs"]
+mod migration_0062_chat_list_preview_indexes;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -440,6 +442,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0061_transport_reconciliation_replay_cursor",
         apply: migration_0061_transport_reconciliation_replay_cursor::apply,
     },
+    Migration {
+        version: 62,
+        name: "0062_chat_list_preview_indexes",
+        apply: migration_0062_chat_list_preview_indexes::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -663,6 +670,15 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
+
+    #[test]
+    fn preview_indexes_are_repeatable() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut conn = store.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        migration_0062_chat_list_preview_indexes::apply(&tx).unwrap();
+        tx.commit().unwrap();
+    }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
@@ -1026,7 +1042,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 61,
+                found: 62,
                 latest_supported: 46,
             }
         ));
@@ -1082,7 +1098,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 61,
+                found: 62,
                 latest_supported: 46,
             }
         ));
@@ -1386,7 +1402,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 61,
+                found: 62,
                 latest_supported: 46,
             }
         ));
