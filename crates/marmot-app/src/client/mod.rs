@@ -648,7 +648,7 @@ impl AppClient {
             "publish",
             crate::ProductUnit::Action,
         );
-        let product_result = self.publish_key_package_unobserved().await;
+        let product_result = Box::pin(self.publish_key_package_unobserved()).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -1125,7 +1125,7 @@ impl AppClient {
             "rotate",
             crate::ProductUnit::Action,
         );
-        let product_result = self.rotate_key_package_unobserved().await;
+        let product_result = Box::pin(self.rotate_key_package_unobserved()).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -2374,7 +2374,7 @@ impl AppClient {
             "remove_members",
             crate::ProductUnit::Action,
         );
-        let product_result = self.remove_members_unobserved(group_id, member_refs).await;
+        let product_result = Box::pin(self.remove_members_unobserved(group_id, member_refs)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -2440,7 +2440,7 @@ impl AppClient {
             "leave",
             crate::ProductUnit::Action,
         );
-        let product_result = self.leave_group_unobserved(group_id).await;
+        let product_result = Box::pin(self.leave_group_unobserved(group_id)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -2511,7 +2511,7 @@ impl AppClient {
             "disband",
             crate::ProductUnit::Action,
         );
-        let product_result = self.disband_group_unobserved(group_id).await;
+        let product_result = Box::pin(self.disband_group_unobserved(group_id)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -2588,7 +2588,7 @@ impl AppClient {
             "delete",
             crate::ProductUnit::Action,
         );
-        let product_result = self.delete_group_local_unobserved(group_id).await;
+        let product_result = Box::pin(self.delete_group_local_unobserved(group_id)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -2947,7 +2947,7 @@ impl AppClient {
             "decline_invite",
             crate::ProductUnit::Action,
         );
-        let product_result = self.decline_group_invite_unobserved(group_id).await;
+        let product_result = Box::pin(self.decline_group_invite_unobserved(group_id)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -3005,7 +3005,7 @@ impl AppClient {
             "demote_admin",
             crate::ProductUnit::Action,
         );
-        let product_result = self.demote_admin_unobserved(group_id, member_ref).await;
+        let product_result = Box::pin(self.demote_admin_unobserved(group_id, member_ref)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -3043,7 +3043,7 @@ impl AppClient {
             "demote_admin",
             crate::ProductUnit::Action,
         );
-        let product_result = self.self_demote_admin_unobserved(group_id).await;
+        let product_result = Box::pin(self.self_demote_admin_unobserved(group_id)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -3124,9 +3124,9 @@ impl AppClient {
             "retention",
             crate::ProductUnit::Action,
         );
-        let product_result = self
-            .update_message_retention_unobserved(group_id, disappearing_message_secs)
-            .await;
+        let product_result =
+            Box::pin(self.update_message_retention_unobserved(group_id, disappearing_message_secs))
+                .await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -4092,9 +4092,8 @@ impl AppClient {
             "image_update",
             crate::ProductUnit::Action,
         );
-        let product_result = self
-            .update_group_image_unobserved(group_id, plaintext, media_type)
-            .await;
+        let product_result =
+            Box::pin(self.update_group_image_unobserved(group_id, plaintext, media_type)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -4375,7 +4374,7 @@ impl AppClient {
             "convergence",
             crate::ProductUnit::Action,
         );
-        let product_result = self.retry_group_convergence_unobserved(group_id).await;
+        let product_result = Box::pin(self.retry_group_convergence_unobserved(group_id)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -4439,9 +4438,8 @@ impl AppClient {
             "profile_update",
             crate::ProductUnit::Action,
         );
-        let product_result = self
-            .update_group_profile_unobserved(group_id, name, description)
-            .await;
+        let product_result =
+            Box::pin(self.update_group_profile_unobserved(group_id, name, description)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "success"
@@ -5113,7 +5111,11 @@ impl AppClient {
             .collect())
     }
 
-    fn clear_confirmed_welcome_intent(&self, message_id_hex: &str) -> Result<(), AppError> {
+    fn clear_confirmed_welcome_intent(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        message_id_hex: &str,
+    ) -> Result<(), AppError> {
         let observation = self
             .app
             .product_analytics
@@ -5123,10 +5125,7 @@ impl AppClient {
                 crate::ProductUnit::Transition,
             )
             .map(crate::ProductObservation::counts_only);
-        if self
-            .app
-            .account_storage(&self.state.label)?
-            .take_pending_welcome_delivery(message_id_hex)?
+        if storage.take_pending_welcome_delivery(message_id_hex)?
             && let Some(observation) = observation
         {
             observation.count("confirmed", crate::ProductUnit::Transition, 1);
@@ -5144,6 +5143,7 @@ impl AppClient {
         if message_ids.is_empty() {
             return Ok(());
         }
+        let storage = self.app.account_storage(&self.state.label)?;
         for message_id_hex in message_ids {
             let delivered = effects.reports.iter().any(|report| {
                 hex::encode(report.message_id.as_slice()) == *message_id_hex
@@ -5153,7 +5153,7 @@ impl AppClient {
                 .iter()
                 .any(|failure| hex::encode(failure.message_id.as_slice()) == *message_id_hex);
             if delivered {
-                self.clear_confirmed_welcome_intent(message_id_hex)?;
+                self.clear_confirmed_welcome_intent(&storage, message_id_hex)?;
             }
         }
         Ok(())
@@ -5461,7 +5461,7 @@ impl AppClient {
             "retry",
             crate::ProductUnit::Attempt,
         );
-        let product_result = self.redeliver_welcome_unobserved(message_id_hex).await;
+        let product_result = Box::pin(self.redeliver_welcome_unobserved(message_id_hex)).await;
         if let Some(observation) = product_observation {
             observation.finish(if product_result.is_ok() {
                 "confirmed"
@@ -5497,7 +5497,8 @@ impl AppClient {
                 publish_failure_error(&effects.failures)
             });
         }
-        self.clear_confirmed_welcome_intent(message_id_hex)?;
+        let storage = self.app.account_storage(&self.state.label)?;
+        self.clear_confirmed_welcome_intent(&storage, message_id_hex)?;
         Ok(send_summary_from_effects(&effects))
     }
 }

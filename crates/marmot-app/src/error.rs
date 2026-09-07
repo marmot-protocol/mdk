@@ -339,14 +339,17 @@ impl AppError {
 
     /// Broad, bounded cause derived only from typed variants.
     pub(crate) fn sync_error_class(&self) -> SyncErrorClass {
-        match self.privacy_safe_kind() {
-            "storage_busy" => return SyncErrorClass::StorageBusy,
-            "storage_corruption" => return SyncErrorClass::StorageCorruption,
-            "storage_capacity" => return SyncErrorClass::StorageCapacity,
-            _ => {}
-        }
         match self {
-            Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) => SyncErrorClass::Storage,
+            Self::Storage(error) => storage_error_class(error),
+            Self::Sqlite(error) => match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    SyncErrorClass::StorageBusy
+                }
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => SyncErrorClass::StorageCorruption,
+                Some(rusqlite::ErrorCode::DiskFull) => SyncErrorClass::StorageCapacity,
+                _ => SyncErrorClass::Storage,
+            },
+            Self::Io(_) => SyncErrorClass::Storage,
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
@@ -400,7 +403,7 @@ fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
 
 fn session_error_class(error: &cgka_session::SessionError) -> SyncErrorClass {
     match error {
-        cgka_session::SessionError::Storage(_) => SyncErrorClass::Storage,
+        cgka_session::SessionError::Storage(error) => storage_error_class(error),
         cgka_session::SessionError::Engine(error) => engine_error_class(error),
     }
 }
@@ -409,7 +412,7 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
     use cgka_traits::error::{EngineError, PeelerError};
 
     match error {
-        EngineError::Storage(_) => SyncErrorClass::Storage,
+        EngineError::Storage(error) => storage_error_class(error),
         EngineError::Peeler(
             PeelerError::DecryptFailed
             | PeelerError::MissingContext { .. }
@@ -494,6 +497,15 @@ fn session_error_kind(error: &cgka_session::SessionError) -> &'static str {
         // Engine names come from the engine so an app tracing field and an
         // engine forensic audit row say the same word for the same failure.
         cgka_session::SessionError::Engine(error) => error.privacy_safe_kind(),
+    }
+}
+
+fn storage_error_class(error: &StorageError) -> SyncErrorClass {
+    match error {
+        StorageError::Busy(_) => SyncErrorClass::StorageBusy,
+        StorageError::Corruption(_) => SyncErrorClass::StorageCorruption,
+        StorageError::Capacity(_) => SyncErrorClass::StorageCapacity,
+        _ => SyncErrorClass::Storage,
     }
 }
 

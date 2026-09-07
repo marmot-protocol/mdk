@@ -563,53 +563,9 @@ impl MarmotApp {
             "lookup",
             crate::ProductUnit::Attempt,
         );
-        let mut key_package_lifetime_rejected = false;
-        let result = (|| {
-            let metadata = key_package_metadata(&key_package)
-                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
-            if metadata.protocol_profile != ProtocolProfile::Current
-                || metadata.credential_identity_hex != account_id_hex
-            {
-                return Err(AppError::InvalidKeyPackageEvent(
-                    "member KeyPackage identity or profile is invalid".to_owned(),
-                ));
-            }
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if now < metadata.not_before || now > metadata.not_after {
-                key_package_lifetime_rejected = true;
-                if let Some(observation) = observation.as_ref() {
-                    observation.count(
-                        if now > metadata.not_after {
-                            "expired"
-                        } else {
-                            "unavailable"
-                        },
-                        crate::ProductUnit::Attempt,
-                        1,
-                    );
-                }
-                return Err(AppError::InvalidKeyPackageEvent(
-                    "member KeyPackage is outside its current lifetime".to_owned(),
-                ));
-            }
-            Ok(key_package)
-        })();
+        let (result, outcome) = validate_current_member_key_package(account_id_hex, key_package);
         if let Some(observation) = observation {
-            // Lifetime rejection already supplies its more precise outcome.
-            let lifetime_rejected = result
-                .as_ref()
-                .err()
-                .is_some_and(|_| key_package_lifetime_rejected);
-            if !lifetime_rejected {
-                observation.count(
-                    if result.is_ok() { "usable" } else { "invalid" },
-                    crate::ProductUnit::Attempt,
-                    1,
-                );
-            }
+            observation.count(outcome, crate::ProductUnit::Attempt, 1);
             observation.discard();
         }
         result
@@ -1028,4 +984,47 @@ impl MarmotApp {
             );
         }
     }
+}
+
+// The closed outcome accompanies the result without storing mutable flags in a closure.
+fn validate_current_member_key_package(
+    account_id_hex: &str,
+    key_package: KeyPackage,
+) -> (Result<KeyPackage, AppError>, &'static str) {
+    let metadata = match key_package_metadata(&key_package) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return (
+                Err(AppError::InvalidKeyPackageEvent(error.to_string())),
+                "invalid",
+            );
+        }
+    };
+    if metadata.protocol_profile != ProtocolProfile::Current
+        || metadata.credential_identity_hex != account_id_hex
+    {
+        return (
+            Err(AppError::InvalidKeyPackageEvent(
+                "member KeyPackage identity or profile is invalid".to_owned(),
+            )),
+            "invalid",
+        );
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now < metadata.not_before || now > metadata.not_after {
+        return (
+            Err(AppError::InvalidKeyPackageEvent(
+                "member KeyPackage is outside its current lifetime".to_owned(),
+            )),
+            if now > metadata.not_after {
+                "expired"
+            } else {
+                "unavailable"
+            },
+        );
+    }
+    (Ok(key_package), "usable")
 }

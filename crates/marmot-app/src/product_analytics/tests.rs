@@ -557,8 +557,13 @@ fn stale_backlog_sample_cannot_enter_new_grant() {
 #[tokio::test]
 async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for (status, expire_during_retry) in [(401u16, false), (500, false), (429, false), (429, true)]
-    {
+    for (status, expire_during_retry) in [
+        (401u16, false),
+        (500, false),
+        (503, false),
+        (429, false),
+        (429, true),
+    ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (c, clock) = configured();
         clock.wall.store(
@@ -642,7 +647,7 @@ async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() 
             );
             c.send_pending().await;
             assert_eq!(requests.load(Ordering::Relaxed), 1);
-        } else if status == 500 || expire_during_retry {
+        } else if matches!(status, 500 | 503) || expire_during_retry {
             assert_eq!(report.failed_batches, 1);
             assert_eq!(report.accepted_batches, 0);
             assert!(report.dropped_events > 0);
@@ -777,7 +782,7 @@ fn stale_otlp_authentication_failure_cannot_suspend_new_generation() {
 fn storage_failures_are_classified_without_raw_causes_or_sync_fanout_duplicates() {
     let (c, clock) = configured();
     grant(&c);
-    let observation = c.storage_observation().unwrap();
+    let permit = c.permit().unwrap();
     let error = AppError::Storage(cgka_traits::StorageError::Corruption(
         "private database contents".into(),
     ));
@@ -785,7 +790,7 @@ fn storage_failures_are_classified_without_raw_causes_or_sync_fanout_duplicates(
         error.sync_error_class(),
         crate::SyncErrorClass::StorageCorruption
     );
-    observation.storage_failure(&Err::<(), _>(error));
+    c.storage_failure(Some(&permit), &error);
     clock.mono.store(100, Ordering::Relaxed);
     let failure = crate::SyncFailureClassification::new(
         crate::SyncFailureStage::StatePersist,
@@ -793,10 +798,13 @@ fn storage_failures_are_classified_without_raw_causes_or_sync_fanout_duplicates(
     );
     c.observe_sync("background", Duration::from_millis(20), Some(failure));
     for _ in 0..10 {
-        observation.storage_failure(&Err::<(), _>(crate::AccountCatchUpFailure::new(
-            "private raw cause".into(),
-            failure,
-        )));
+        c.storage_failure(
+            Some(&permit),
+            &AppError::AccountCatchUp(crate::AccountCatchUpFailure::new(
+                "private raw cause".into(),
+                failure,
+            )),
+        );
     }
     let rows = c.test_payloads();
     let storage: Vec<_> = rows
@@ -907,4 +915,93 @@ fn registry_limits_accept_boundaries_and_reject_one_past_without_echoing_values(
     }
     config.registry[0].properties[0].rule = ProductPropertyRule::Boolean;
     assert_ne!(revision, config.registry_revision());
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[test]
+fn consent_preserves_lifecycle_without_replaying_preconsent_activity() {
+    let (c, _) = configured();
+    let event = || ProductEvent {
+        name: "app_screen_viewed".into(),
+        properties: BTreeMap::from([("screen".into(), "inbox".into())]),
+    };
+    c.activity(ProductAnalyticsActivity::ForegroundNotification);
+    assert_eq!(
+        c.record(event()).unwrap(),
+        ProductRecordResult::IgnoredDisabled
+    );
+    assert!(c.lock().session.is_none());
+    assert!(c.lock().queue.is_empty());
+    grant(&c);
+    assert_eq!(c.record(event()).unwrap(), ProductRecordResult::Recorded);
+    let first = c.lock().session.clone().unwrap().0;
+    assert_eq!(c.lock().queue.len(), 2);
+    // The launch before consent is not replayed as a notification journey.
+    assert_eq!(
+        c.lock().queue[0].payload["props"]["launch_reason"],
+        "ordinary"
+    );
+    c.revoke_memory();
+    assert!(c.lock().queue.is_empty());
+    grant(&c);
+    assert_eq!(c.record(event()).unwrap(), ProductRecordResult::Recorded);
+    assert_ne!(c.lock().session.clone().unwrap().0, first);
+    c.revoke_memory();
+    c.activity(ProductAnalyticsActivity::Background);
+    grant(&c);
+    assert_eq!(
+        c.record(event()).unwrap(),
+        ProductRecordResult::IgnoredDisabled
+    );
+    assert!(c.lock().session.is_none());
+}
+
+#[test]
+fn saved_permission_is_inspectable_without_loading_the_export_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = crate::MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let runtime = app.runtime();
+    let (configured, _) = configured();
+    runtime
+        .set_product_analytics_runtime_config(configured.lock().config.clone())
+        .unwrap();
+    let granted = runtime.set_usage_diagnostics_consent(true).unwrap();
+    let standalone = crate::MarmotApp::with_relay(tmp.path(), "wss://relay.example").runtime();
+    assert_eq!(
+        standalone.stored_usage_diagnostics_settings().unwrap(),
+        granted
+    );
+    assert_eq!(
+        standalone.usage_diagnostics_settings().unwrap().decision,
+        UsageDiagnosticsDecision::AcceptanceRequired
+    );
+    assert!(
+        standalone
+            .begin_product_operation(ProductFamily::Runtime, "startup", ProductUnit::Attempt)
+            .is_none()
+    );
+}
+
+#[test]
+fn invalid_optional_host_environment_preserves_an_existing_diagnostic_grant() {
+    for (operator, environment) in [("", "staging"), ("operator", "invalid")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = crate::MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+        let runtime = app.clone().runtime();
+        runtime.set_usage_diagnostics_consent(true).unwrap();
+        let before = runtime.stored_usage_diagnostics_settings().unwrap();
+        let permit = app.usage_diagnostics_permit().unwrap();
+        configure_product_analytics_from_values(&runtime, "agent", |name| match name {
+            "MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT" => {
+                Some("https://analytics.example/api/v0/events".into())
+            }
+            "MARMOT_PRODUCT_ANALYTICS_APP_KEY" => Some("A-SH-secret".into()),
+            "MARMOT_PRODUCT_ANALYTICS_OPERATOR" => Some(operator.into()),
+            "MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT" => Some(environment.into()),
+            _ => None,
+        });
+        assert!(permit.valid());
+        assert_eq!(runtime.stored_usage_diagnostics_settings().unwrap(), before);
+        assert!(!app.product_analytics.lock().config.ready());
+    }
 }

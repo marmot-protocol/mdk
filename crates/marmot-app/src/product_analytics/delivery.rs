@@ -110,6 +110,9 @@ impl ProductAnalytics {
                     Err(error) if error.is_connect() => {
                         retry_delay = Some(1u64 << attempt);
                     }
+                    // A server/proxy 5xx can follow an accepted upstream write.
+                    // Aptabase provides no idempotency receipt, so retrying it can
+                    // double-count. Only known nonacceptance is retried above.
                     _ => {}
                 }
             } else {

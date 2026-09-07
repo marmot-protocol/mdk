@@ -1,4 +1,5 @@
 //! Opt-in, bounded product observations. No account, message or transport identities enter this module.
+
 use crate::{AppError, MarmotApp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,6 +10,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
+
+static CATALOGUE: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!(
+        "../../../../docs/marmot-architecture/product-event-catalogue.json"
+    ))
+    .expect("checked-in product catalogue")
+});
 
 mod builtins;
 mod catalogue;
@@ -296,10 +304,7 @@ impl ProductAnalyticsRuntimeConfig {
                     .collect::<Vec<_>>(),
                 PRODUCT_OUTCOMES,
                 PRODUCT_DURATION_BOUNDS_MS,
-                serde_json::from_str::<serde_json::Value>(include_str!(
-                    "../../../../docs/marmot-architecture/product-event-catalogue.json"
-                ))
-                .expect("checked-in product catalogue must be valid JSON")["events"]
+                CATALOGUE["events"]
                     .as_array()
                     .expect("catalogue events")
                     .iter()
@@ -427,6 +432,7 @@ pub struct ProductAnalytics {
 }
 struct State {
     config: ProductAnalyticsRuntimeConfig,
+    registry_revision: String,
     settings: UsageDiagnosticsSettings,
     diagnostic_id: String,
     scope: String,
@@ -459,6 +465,7 @@ impl Default for ProductAnalytics {
         Self {
             inner: Arc::new(Mutex::new(State {
                 config: ProductAnalyticsRuntimeConfig::default(),
+                registry_revision: ProductAnalyticsRuntimeConfig::default().registry_revision(),
                 settings: UsageDiagnosticsSettings::default(),
                 diagnostic_id: String::new(),
                 scope: Self::scope(&ProductAnalyticsRuntimeConfig::default(), "", ""),
@@ -504,7 +511,7 @@ impl ProductAnalytics {
         s.session = None;
         s.seen.clear();
         s.last_clock = None;
-        s.foreground = false;
+        // Lifecycle state is not an observation. Preserve it across consent changes.
         s.diagnostic_id.clear();
     }
     pub(crate) fn permit(&self) -> Option<DiagnosticsPermit> {
@@ -554,10 +561,12 @@ impl ProductAnalytics {
         scope: String,
     ) -> Result<(), ProductAnalyticsError> {
         config.validate()?;
+        let registry_revision = config.registry_revision();
         let _consent = self.consent_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = self.lock();
         self.invalidate(&mut s);
         s.config = config;
+        s.registry_revision = registry_revision;
         s.scope = Self::scope(&s.config, &scope, &s.telemetry_origin);
         s.status = UsageDiagnosticsStatus::default();
         Ok(())
@@ -771,12 +780,6 @@ impl ProductAnalytics {
         }
         // Repeat the closed-schema check at serialization. Admission is not the
         // only privacy boundary: a future internal producer must not bypass it.
-        static CATALOGUE: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
-            serde_json::from_str(include_str!(
-                "../../../../docs/marmot-architecture/product-event-catalogue.json"
-            ))
-            .expect("checked-in product catalogue")
-        });
         let builtin = CATALOGUE["events"].as_array().and_then(|events| {
             events
                 .iter()
@@ -1243,6 +1246,13 @@ impl ProductAnalytics {
     pub fn activity(&self, activity: ProductAnalyticsActivity) {
         let mut s = self.lock();
         if !Self::enabled(&s) {
+            match activity {
+                ProductAnalyticsActivity::Foreground
+                | ProductAnalyticsActivity::ForegroundNotification
+                | ProductAnalyticsActivity::ForegroundDeepLink => s.foreground = true,
+                ProductAnalyticsActivity::Background => s.foreground = false,
+                ProductAnalyticsActivity::AccountChanged => {}
+            }
             return;
         }
         self.advance(&mut s);
@@ -1354,14 +1364,16 @@ impl MarmotApp {
         if receipt.decision == UsageDiagnosticsDecision::Granted
             && (state.persistence_failed
                 || r.policy_revision != USAGE_DIAGNOSTICS_POLICY
-                || r.registry_revision != state.config.registry_revision()
+                || r.registry_revision != state.registry_revision
                 || r.scope_revision != state.scope)
         {
             receipt.decision = UsageDiagnosticsDecision::AcceptanceRequired;
         }
         Ok(receipt)
     }
-    fn stored_usage_diagnostics_settings(&self) -> Result<UsageDiagnosticsSettings, AppError> {
+    pub(crate) fn stored_usage_diagnostics_settings(
+        &self,
+    ) -> Result<UsageDiagnosticsSettings, AppError> {
         let r = self.shared_storage()?.usage_diagnostics_settings()?;
         Ok(UsageDiagnosticsSettings {
             decision: match r.decision {
@@ -1387,7 +1399,7 @@ impl MarmotApp {
         if r.decision == 2
             && (state.persistence_failed
                 || r.policy_revision != USAGE_DIAGNOSTICS_POLICY
-                || r.registry_revision != state.config.registry_revision()
+                || r.registry_revision != state.registry_revision
                 || r.scope_revision != state.scope)
         {
             receipt.decision = UsageDiagnosticsDecision::AcceptanceRequired;
@@ -1423,8 +1435,14 @@ impl MarmotApp {
         let state = self.product_analytics.lock();
         r.decision = if enabled { 2 } else { 1 };
         r.policy_revision = USAGE_DIAGNOSTICS_POLICY.into();
-        r.registry_revision = state.config.registry_revision();
+        r.registry_revision = state.registry_revision.clone();
         r.scope_revision = state.scope.clone();
+        r.updated_at_ms = self
+            .product_analytics
+            .clock
+            .wall_seconds()
+            .saturating_mul(1000)
+            .min(i64::MAX as u64) as i64;
         drop(state);
         let id = enabled.then(|| old_id.unwrap_or_else(crate::generate_telemetry_install_id));
         storage.set_usage_diagnostics_settings(&r, id.as_deref())?;
@@ -1466,56 +1484,7 @@ pub struct ProductObservation {
     unit: ProductUnit,
     finished: bool,
 }
-pub(crate) trait StorageFailureResult {
-    fn storage_failure_kind(&self) -> Option<&'static str>;
-}
-impl<T> StorageFailureResult for Result<T, AppError> {
-    fn storage_failure_kind(&self) -> Option<&'static str> {
-        self.as_ref().err().map(AppError::privacy_safe_kind)
-    }
-}
-// Sync completion owns these failures; this response is also forwarded/fanned out.
-impl<T> StorageFailureResult for Result<T, crate::AccountCatchUpFailure> {
-    fn storage_failure_kind(&self) -> Option<&'static str> {
-        None
-    }
-}
-impl StorageFailureResult for () {
-    fn storage_failure_kind(&self) -> Option<&'static str> {
-        None
-    }
-}
-impl StorageFailureResult for bool {
-    fn storage_failure_kind(&self) -> Option<&'static str> {
-        None
-    }
-}
-impl StorageFailureResult for usize {
-    fn storage_failure_kind(&self) -> Option<&'static str> {
-        None
-    }
-}
 impl ProductObservation {
-    /// A failed canonical command, not an error notification or raw SQL log.
-    pub(crate) fn storage_failure(&self, result: &impl StorageFailureResult) {
-        let Some(kind) = result.storage_failure_kind() else {
-            return;
-        };
-        let operation = match kind {
-            "storage_busy" => "busy",
-            "storage_corruption" => "corruption",
-            "storage_capacity" => "capacity",
-            _ => return,
-        };
-        self.collector.observe_count(
-            &self.permit,
-            ProductFamily::Storage,
-            operation,
-            "failure",
-            ProductUnit::Attempt,
-            1,
-        );
-    }
     pub(crate) fn counts_only(mut self) -> Self {
         self.finished = true;
         self
@@ -1609,9 +1578,29 @@ impl Drop for ProductObservation {
     }
 }
 impl ProductAnalytics {
-    pub(crate) fn storage_observation(&self) -> Option<ProductObservation> {
-        self.begin(ProductFamily::Storage, "open", ProductUnit::Attempt)
-            .map(ProductObservation::counts_only)
+    /// Called only at a canonical failing command boundary, with its admission generation.
+    pub(crate) fn storage_failure(&self, permit: Option<&DiagnosticsPermit>, error: &AppError) {
+        let Some(permit) = permit else {
+            return;
+        };
+        // A forwarded sync failure is already owned by the sync completion observation.
+        if matches!(error, AppError::AccountCatchUp(_)) {
+            return;
+        }
+        let operation = match error.sync_error_class() {
+            crate::app_telemetry::SyncErrorClass::StorageBusy => "busy",
+            crate::app_telemetry::SyncErrorClass::StorageCorruption => "corruption",
+            crate::app_telemetry::SyncErrorClass::StorageCapacity => "capacity",
+            _ => return,
+        };
+        self.observe_count(
+            permit,
+            ProductFamily::Storage,
+            operation,
+            "failure",
+            ProductUnit::Attempt,
+            1,
+        );
     }
     pub fn begin(
         &self,
@@ -1684,4 +1673,49 @@ impl ProductAnalytics {
 #[cfg(all(test, feature = "product-analytics-export"))]
 pub(crate) fn test_product_collector() -> ProductAnalytics {
     tests::configured().0
+}
+
+/// Configure optional headless-host analytics from its environment. Invalid analytics
+/// settings never prevent the host from opening or disable its diagnostic pipeline.
+pub fn configure_product_analytics_from_environment(
+    runtime: &crate::MarmotAppRuntime,
+    host_surface: &str,
+) {
+    configure_product_analytics_from_values(runtime, host_surface, |name| std::env::var(name).ok());
+}
+
+fn configure_product_analytics_from_values(
+    runtime: &crate::MarmotAppRuntime,
+    host_surface: &str,
+    get: impl Fn(&str) -> Option<String>,
+) {
+    let endpoint = get("MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT");
+    let key = get("MARMOT_PRODUCT_ANALYTICS_APP_KEY");
+    if endpoint.is_none() && key.is_none() {
+        return;
+    }
+    let config = ProductAnalyticsRuntimeConfig {
+        events_endpoint: endpoint,
+        app_key: key,
+        operator: get("MARMOT_PRODUCT_ANALYTICS_OPERATOR").unwrap_or_default(),
+        allow_loopback: get("MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK").as_deref() == Some("1"),
+        registry: Vec::new(),
+        metadata: ProductAnalyticsMetadata {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            os_family: std::env::consts::OS.into(),
+            os_major_version: String::new(),
+            device_class: "headless".into(),
+            host_surface: host_surface.into(),
+            environment: get("MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT")
+                .unwrap_or_else(|| "development".into()),
+            is_debug: cfg!(debug_assertions),
+        },
+    };
+    if runtime
+        .set_product_analytics_runtime_config(config)
+        .is_err()
+    {
+        tracing::warn!(target: "marmot_app::product_analytics", method = "configure_product_analytics_from_environment",
+            error_code = "invalid_product_analytics_configuration", "optional product analytics configuration rejected");
+    }
 }

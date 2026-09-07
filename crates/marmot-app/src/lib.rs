@@ -5239,10 +5239,11 @@ impl MarmotApp {
     }
 
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
-        let observation = self.product_analytics.storage_observation();
+        let permit = self.product_analytics.permit();
         let result = self.account_storage_unobserved(label);
-        if let Some(observation) = observation {
-            observation.storage_failure(&result);
+        if let Err(error) = &result {
+            self.product_analytics
+                .storage_failure(permit.as_ref(), error);
         }
         result
     }

@@ -70,6 +70,7 @@ pub struct StoredUsageDiagnosticsSettings {
     pub registry_revision: String,
     pub scope_revision: String,
     pub updated_at_ms: i64,
+    /// Immutable migration history, retained even after a new consent decision.
     pub previously_enabled: bool,
 }
 
@@ -96,10 +97,10 @@ impl SqliteSharedStorage {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
             tx.execute("UPDATE usage_diagnostics_settings SET decision=?1, policy_revision=?2, registry_revision=?3, scope_revision=?4, updated_at_ms=?5 WHERE id=1",
-                params![settings.decision, settings.policy_revision, settings.registry_revision, settings.scope_revision, unix_now_ms()]).storage()?;
+                params![settings.decision, settings.policy_revision, settings.registry_revision, settings.scope_revision, settings.updated_at_ms]).storage()?;
             tx.execute("DELETE FROM telemetry_install", []).storage()?;
             if let Some(id) = install_id {
-                tx.execute("INSERT INTO telemetry_install (id, install_id, updated_at_ms) VALUES (1, ?1, ?2)", params![id, unix_now_ms()]).storage()?;
+                tx.execute("INSERT INTO telemetry_install (id, install_id, updated_at_ms) VALUES (1, ?1, ?2)", params![id, settings.updated_at_ms]).storage()?;
             }
             tx.commit().storage()
         })
@@ -904,11 +905,13 @@ mod usage_diagnostics_tests {
             policy_revision: "p".into(),
             registry_revision: "r".into(),
             scope_revision: "s".into(),
+            updated_at_ms: 123456,
             ..Default::default()
         };
         store
             .set_usage_diagnostics_settings(&granted, Some("new-id"))
             .unwrap();
+        assert_eq!(store.usage_diagnostics_settings().unwrap(), granted);
         assert_eq!(
             store.telemetry_install_id().unwrap().as_deref(),
             Some("new-id")

@@ -2267,6 +2267,15 @@ impl MarmotAppRuntime {
         self.accounts.app.usage_diagnostics_settings()
     }
 
+    /// Read the saved decision for local administration without evaluating this
+    /// process's destination/registry or starting collectors. Export authorization
+    /// still uses `usage_diagnostics_settings` and the active generation gate.
+    pub fn stored_usage_diagnostics_settings(
+        &self,
+    ) -> Result<crate::UsageDiagnosticsSettings, AppError> {
+        self.accounts.app.stored_usage_diagnostics_settings()
+    }
+
     pub fn set_usage_diagnostics_consent(
         &self,
         enabled: bool,
