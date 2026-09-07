@@ -375,3 +375,12 @@ async fn public_admin_handoff_strict_canary() {
     strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 0).await;
     strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 2).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real sockets and SQLCipher; run explicitly in release mode"]
+async fn public_repeated_admin_handoff_strict_canary() {
+    // A second grant/revoke cycle must not reuse stale authorization from the
+    // first. Exercise both restart variants through the same strict app oracle.
+    strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 1).await;
+    strict_canary(PUBLIC_APP_ADMIN_HANDOFF_FAMILY, 3).await;
+}

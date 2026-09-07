@@ -363,4 +363,5 @@ including the revoke-then-reopen variant. The delegate attempts to promote itsel
 `NotGroupAdmin` maps to the expected `not_group_admin` result. Busy workers, timeouts and storage errors cannot
 satisfy it. The harness pauses unrelated maintenance while checking that the attempt changes neither public
 protocol state nor relay publication count, then resumes maintenance and checks ordinary messaging still works.
-The strict admin-handoff canary executes cases 0 and 2; the saved version-3 inputs retain their earlier contracts.
+The strict admin-handoff canaries execute cases 0–3, including both one- and two-cycle handoffs in both restart
+variants; the saved version-3 inputs retain their earlier contracts.
