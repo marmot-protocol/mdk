@@ -1158,6 +1158,22 @@ pub enum MarmotAppEvent {
         stalled_epoch: u64,
         arms: u32,
     },
+    /// Convergence superseded a commit this device authored after its command
+    /// had already returned success (mdk#1734). `outcome` says what became of
+    /// the change: re-queued and about to be re-issued, or dropped for the
+    /// stated `reason` (the winner changed the same field, the request is
+    /// already satisfied, an invite needs fresh material, or the engine gave
+    /// up). Hosts should tell the user when a change they saw saved was not
+    /// re-applied.
+    GroupChangeSuperseded {
+        account_id_hex: String,
+        account_label: String,
+        group_id: GroupId,
+        commit_id_hex: String,
+        kind: cgka_traits::engine::SupersededIntentKind,
+        outcome: cgka_traits::engine::SupersededIntentOutcome,
+        reason: &'static str,
+    },
 }
 
 impl MarmotAppRuntime {

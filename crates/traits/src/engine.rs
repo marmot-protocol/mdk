@@ -175,6 +175,76 @@ pub enum SendIntent {
 ///
 /// `GroupEvolution` carries both the commit and any welcomes produced by
 /// member additions.
+/// Which kind of own commit convergence superseded (mdk#1734).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersededIntentKind {
+    GroupProfile,
+    AppComponents,
+    RemoveMembers,
+    Invite,
+}
+
+impl SupersededIntentKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupProfile => "group_profile",
+            Self::AppComponents => "app_components",
+            Self::RemoveMembers => "remove_members",
+            Self::Invite => "invite",
+        }
+    }
+}
+
+/// What the engine did with a superseded own commit's intent (mdk#1734).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersededIntentOutcome {
+    /// The intent is still valid against the canonical state and has been
+    /// queued again; the next outbound drain re-issues it.
+    Reissued,
+    /// The winning branch changed the same field or component. The caller's
+    /// edit is dropped; the winner's value stands.
+    Conflict,
+    /// The winning branch already produced the requested state (for example
+    /// it removed the same members), so there is nothing to re-issue.
+    AlreadySatisfied,
+    /// A lost invite cannot be replayed: its KeyPackages were consumed by the
+    /// parked Welcome. The inviter must re-invite with fresh material.
+    ReinviteRequired,
+    /// The intent lost more races than the engine will retry, or the outbound
+    /// queue is full; the caller must repeat the change deliberately.
+    Abandoned,
+    /// This device is no longer a member of the group.
+    NotMember,
+}
+
+impl SupersededIntentOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reissued => "reissued",
+            Self::Conflict => "conflict",
+            Self::AlreadySatisfied => "already_satisfied",
+            Self::ReinviteRequired => "reinvite_required",
+            Self::Abandoned => "abandoned",
+            Self::NotMember => "not_member",
+        }
+    }
+}
+
+/// One superseded own commit and what became of its intent. Carries no
+/// payloads or member identities beyond the group and commit ids so it can
+/// travel through effects and runtime events unchanged (mdk#1734).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededIntentReport {
+    pub group_id: GroupId,
+    pub commit_id: MessageId,
+    pub kind: SupersededIntentKind,
+    pub outcome: SupersededIntentOutcome,
+    /// Fixed, privacy-safe explanation for logs and UI copy.
+    pub reason: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
     /// The requested idempotent mutation was already reflected by canonical

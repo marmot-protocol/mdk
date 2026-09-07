@@ -24,6 +24,9 @@ pub const PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY: &str = "public-app-membership-re
 pub const PUBLIC_APP_OFFLINE_RECOVERY_FAMILY: &str = "public-app-offline-recovery/v1";
 pub const PUBLIC_APP_ADMIN_HANDOFF_FAMILY: &str = "public-app-admin-handoff/v1";
 pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "4";
+pub const PUBLIC_APP_ADMIN_CHURN_FAMILY: &str = "public-app-admin-churn/v1";
+pub const PUBLIC_APP_LATE_JOIN_FAMILY: &str = "public-app-late-join/v1";
+pub const PUBLIC_APP_PRESSURE_GENERATOR_VERSION: &str = "1";
 
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
@@ -816,6 +819,104 @@ pub fn generate_public_app_journey_case(
         sender: "alice".into(),
     });
     model.finish_public(family, seed)
+}
+
+/// Public companions for the serialized admin-churn and latecomer motifs.
+/// They deliberately own public history/state oracles rather than weakening
+/// the exact/private assertions of their engine counterparts.
+pub fn generate_public_app_pressure_case(
+    family: &str,
+    seed: u64,
+    case_index: u64,
+) -> GeneratedScenarioCase {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x4150_505f_5052_4553 ^ case_index.rotate_left(23));
+    let mut model = match family {
+        PUBLIC_APP_ADMIN_CHURN_FAMILY => JourneyModel::new_public(case_index),
+        PUBLIC_APP_LATE_JOIN_FAMILY => {
+            let mut model = JourneyModel::new(case_index, JourneyProfile::Membership);
+            model.public_app = true;
+            model.public_state_checkpoint();
+            model
+        }
+        _ => panic!("unregistered public pressure family: {family}"),
+    };
+    model.apply(JourneyAction::Send {
+        sender: "alice".into(),
+    });
+    match family {
+        PUBLIC_APP_ADMIN_CHURN_FAMILY => {
+            let delegate = CLIENTS[1 + rng.gen_range(0..3)].to_owned();
+            model.apply(JourneyAction::UpdateAdminPolicy { target: delegate });
+            let rounds = [4, 8, 16][case_index as usize % 3];
+            for round in 0..rounds {
+                let kind = if round % 2 == 0 {
+                    JourneyActionKind::UpdateProfile
+                } else {
+                    JourneyActionKind::UpdateAdminPolicy
+                };
+                let action = model.choose_kind(&mut rng, kind);
+                model.apply(action);
+                let send = model.choose_kind(&mut rng, JourneyActionKind::Send);
+                model.apply(send);
+                if round + 1 == rounds / 2 {
+                    let restart = model.choose_kind(&mut rng, JourneyActionKind::Restart);
+                    model.apply(restart);
+                }
+            }
+        }
+        PUBLIC_APP_LATE_JOIN_FAMILY => {
+            // Cross the retained-context horizon in the largest arm before
+            // asking a fresh Welcome to establish the current public state.
+            let commits = [4, 12, 36][case_index as usize % 3];
+            for index in 0..commits {
+                model.apply(JourneyAction::UpdateProfile {
+                    actor: "alice".into(),
+                });
+                if index % 4 == 3 {
+                    let send = model.choose_kind(&mut rng, JourneyActionKind::Send);
+                    model.apply(send);
+                }
+            }
+            if (case_index / 3).is_multiple_of(2) {
+                model.apply(JourneyAction::Restart {
+                    client: "alice".into(),
+                });
+            }
+            let joiners = if rng.gen_bool(0.5) {
+                ["carol", "david"]
+            } else {
+                ["david", "carol"]
+            };
+            for invitee in joiners {
+                model.apply(JourneyAction::Invite {
+                    invitee: invitee.into(),
+                });
+                model.apply(JourneyAction::UpdateProfile {
+                    actor: "alice".into(),
+                });
+                if !(case_index / 3).is_multiple_of(2) {
+                    model.apply(JourneyAction::Restart {
+                        client: invitee.into(),
+                    });
+                }
+                model.apply(JourneyAction::Send {
+                    sender: invitee.into(),
+                });
+            }
+        }
+        _ => unreachable!(),
+    }
+    for sender in model.members.iter().cloned().collect::<Vec<_>>() {
+        model.apply(JourneyAction::Send { sender });
+    }
+    let restart = model.choose_kind(&mut rng, JourneyActionKind::Restart);
+    model.apply(restart);
+    model.apply(JourneyAction::Send {
+        sender: "alice".into(),
+    });
+    let mut case = model.finish_public(family, seed);
+    case.generator_version = PUBLIC_APP_PRESSURE_GENERATOR_VERSION.into();
+    case
 }
 
 /// Generate deterministic, product-shaped canonical scenarios.

@@ -644,7 +644,7 @@ impl<S: StorageProvider> Engine<S> {
             .should_queue_outbound_intent(&group_id, &intent)
             .await?
         {
-            return self.queue_outbound_intent(group_id, intent);
+            return self.queue_outbound_intent(group_id, intent, 0);
         }
 
         let prepare_started = Instant::now();
@@ -691,7 +691,7 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        self.queue_outbound_intent(group_id, intent)
+        self.queue_outbound_intent(group_id, intent, 0)
     }
 
     fn validate_send_acceptance(&mut self, intent: &SendIntent) -> Result<GroupId, EngineError> {
@@ -876,7 +876,9 @@ impl<S: StorageProvider> Engine<S> {
             self.engine_metrics
                 .note_queued_outbound_wait_ms(now_ms.saturating_sub(record.created_at_ms));
             let prepare_started = Instant::now();
-            let prepared = self.do_send_ready(record.intent.clone()).await;
+            let prepared = self
+                .do_send_ready_with_reissue_attempts(record.intent.clone(), record.reissue_attempts)
+                .await;
             self.engine_metrics.note_outbound_wire_prepare_ms(
                 prepare_started
                     .elapsed()
@@ -1605,6 +1607,55 @@ impl<S: StorageProvider> Engine<S> {
 
     pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         self.has_unresolved_convergence_inputs(group_id)
+    }
+
+    /// Milliseconds until the earliest scheduled SelfRemove auto-commit for
+    /// this group is due: `Some(0)` once it is due, `None` when nothing is
+    /// scheduled or the group cannot stage one right now (quarantined,
+    /// unhydrated, removed, epoch not `Stable`, or this device is itself leaving).
+    ///
+    /// Runtime schedulers must keep a wakeup armed while this is `Some`, but
+    /// only use this deadline when no active convergence pass or outbound
+    /// publication retry blocks staging new work. The schedule is in-memory
+    /// engine state rather than a convergence input, so
+    /// a group whose only pending work is a peer's leave otherwise reads as
+    /// idle, and the removal waits for an unrelated commit to run convergence
+    /// (mdk#1736). Only a convergence advance stages the commit.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError> {
+        if self.quarantined_reason(group_id).is_some() || self.unhydrated_groups.contains(group_id)
+        {
+            return Ok(None);
+        }
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(None);
+        }
+        if self.load_leave_request_state(group_id)?.is_some() {
+            return Ok(None);
+        }
+        let now_ms = self.convergence_now_ms();
+        let delay = self
+            .scheduled_self_remove_auto_commits
+            .values()
+            .filter(|scheduled| &scheduled.group_id == group_id)
+            .map(|scheduled| scheduled.due_at_ms.saturating_sub(now_ms))
+            .min();
+        if delay.is_some()
+            && self
+                .stored_group_record(group_id)?
+                .is_none_or(|group| group.removed)
+        {
+            // Input-only convergence can realize our eviction while fanout
+            // blocks the outbound drain. Removed copies exit that drain before
+            // maintenance, so a stale timer would otherwise stay due forever.
+            self.drop_self_remove_auto_commit_schedules_for_group(group_id);
+            return Ok(None);
+        }
+        Ok(delay)
     }
 
     /// Whether durable queued outbound intents exist for this group. Runtime
@@ -2924,6 +2975,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<usize, EngineError> {
+        self.drop_self_remove_auto_commit_schedules_for_group(group_id);
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.storage.delete_deferred_peel_generation(group_id)?;
         let queued = self.storage.list_queued_outbound_intents(group_id)?;
@@ -2951,37 +3003,17 @@ impl<S: StorageProvider> Engine<S> {
         Ok(queued.len())
     }
 
-    fn queue_outbound_intent(
+    pub(crate) fn queue_outbound_intent(
         &mut self,
         group_id: GroupId,
         intent: SendIntent,
+        reissue_attempts: u32,
     ) -> Result<SendResult, EngineError> {
         let queue_started = Instant::now();
-        let created_at_ms = self.convergence_now_ms();
-        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
-        // Refuse before serializing or writing anything: the single durable
-        // write on this path is below, so a refusal here leaves nothing to
-        // compensate.
-        if existing_count >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
-            return Err(EngineError::QueuedOutboundAtCapacity { group_id });
-        }
-        let intent_bytes =
-            serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-queued-outbound-intent/v1");
-        hasher.update(group_id.as_slice());
-        hasher.update(self.identity.self_id().as_slice());
-        hasher.update(created_at_ms.to_be_bytes());
-        hasher.update((existing_count as u64).to_be_bytes());
-        hasher.update(&intent_bytes);
-        let intent_id = MessageId::new(hasher.finalize().to_vec());
-        self.storage
-            .put_queued_outbound_intent(&QueuedOutboundIntent {
-                id: intent_id.clone(),
-                group_id: group_id.clone(),
-                intent,
-                created_at_ms,
-            })?;
+        let record =
+            self.prepare_queued_outbound_intent(group_id.clone(), intent, reissue_attempts)?;
+        let intent_id = record.id.clone();
+        self.storage.put_queued_outbound_intent(&record)?;
         // The drain is what releases this row, so writing it and arming the
         // drain are one step — see `has_queued_outbound_intents`. `Stable` is
         // the drain's own precondition: a group held by a publish or a halt
@@ -3007,6 +3039,40 @@ impl<S: StorageProvider> Engine<S> {
                 .unwrap_or(u64::MAX),
         );
         Ok(result)
+    }
+
+    /// Prepare a queue row without changing storage or the scheduler, so a
+    /// caller can transfer another durable intent into the queue atomically.
+    pub(crate) fn prepare_queued_outbound_intent(
+        &self,
+        group_id: GroupId,
+        intent: SendIntent,
+        reissue_attempts: u32,
+    ) -> Result<QueuedOutboundIntent, EngineError> {
+        let created_at_ms = self.convergence_now_ms();
+        let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
+        // Refuse before serializing or writing anything. The caller persists
+        // the prepared row, so a refusal leaves nothing to compensate.
+        if existing_count >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+            return Err(EngineError::QueuedOutboundAtCapacity { group_id });
+        }
+        let intent_bytes =
+            serde_json::to_vec(&intent).map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-queued-outbound-intent/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(self.identity.self_id().as_slice());
+        hasher.update(created_at_ms.to_be_bytes());
+        hasher.update((existing_count as u64).to_be_bytes());
+        hasher.update(&intent_bytes);
+        let intent_id = MessageId::new(hasher.finalize().to_vec());
+        Ok(QueuedOutboundIntent {
+            id: intent_id,
+            group_id,
+            intent,
+            created_at_ms,
+            reissue_attempts,
+        })
     }
 
     /// Queue a `GroupStateChanged` event for the application to synthesize into

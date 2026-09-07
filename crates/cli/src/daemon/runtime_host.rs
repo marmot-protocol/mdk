@@ -703,6 +703,11 @@ pub(crate) async fn handle_app_runtime_event(
         // operators through the runtime event stream and the group's forensic
         // `epoch_stall_backfill_escalated` row.
         marmot_app::MarmotAppEvent::EpochStallEscalated { .. } => {}
+        // A same-epoch race withdrew one of this device's own group changes.
+        // The runtime already re-issued it or classified why it cannot; the
+        // report reaches operators through the runtime event stream, and
+        // there is no activity summary shape for it.
+        marmot_app::MarmotAppEvent::GroupChangeSuperseded { .. } => {}
     }
 }
 

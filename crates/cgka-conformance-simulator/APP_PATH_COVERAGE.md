@@ -98,14 +98,13 @@ may already have reached the relay, so only accepted publications are correlated
 | Test suffix | Public contract |
 | --- | --- |
 | `07_two_groups_stay_isolated` | Work and pair groups on one device; the second invite of Bob needs a fresh KeyPackage; a non-member has no projection; a removal and a reopen leave the other group's exact history untouched |
-| `08_concurrent_admin_profile_edits_converge` | Two admins save name and description at the same instant; members settle on one state in which at least one edit is present (measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
-| `08_strict_concurrent_admin_profile_edits_are_never_lost` (ignored, #1734) | As above, and every edit the runtime reported as saved is present in the settled state |
+| `08_concurrent_admin_profile_edits_are_never_lost` | Two admins save name and description at the same instant; members settle on one state in which both edits are present, because the losing commit's edit is re-issued when the winner left its field untouched (#1734; measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
 | `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
-| `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1734, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
+| `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
+| `11_manual_self_update_advances_every_member` (ignored with production timing) | A manual SelfUpdate advances every member; ordinary test-policy builds zero maintenance windows, while production timing requires an explicit run |
 | `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
-| `12_strict_leave_is_applied_by_survivors_promptly` (ignored, #1736) | As above, but the survivors must apply the leave within 30 seconds |
-| `11_manual_self_update_advances_every_member` (ignored unless built with `test-policy-overrides`) | A manual self-update advances the shared epoch with no loss, then messaging and reopen persistence hold. The harness zeroes the maintenance quiet window and jitter in test-policy builds, where the rotation must land within 45 seconds, below the 60-second production quiet window, so a build whose override silently stopped applying fails rather than passing on production timing; `just simulator-fast-maintenance` runs it that way in the nightly lane. An ordinary build would wait out the real-time 60-second quiet window plus up to 30 seconds of jitter (passed locally in about 150 seconds on 2026-09-06), so it stays ignored there |
+| `12_strict_leave_is_applied_by_survivors_promptly` | Ordinary 30-second regression: the worker arms the pending SelfRemove deadline and survivors promptly apply a voluntary departure |
 
 On 2026-09-06 the four default race, group, and removal journeys passed locally in debug mode in about 80 seconds
 total, the default leave journey passed in about two minutes, and the strict variants failed only on the documented
@@ -113,7 +112,9 @@ contracts below. The default concurrent journeys accept either race outcome. The
 is present in the settled state, or when fresh traffic or reopen persistence breaks. They do not prove that a same-epoch
 fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
 [#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
-and [#1736](https://github.com/marmot-protocol/mdk/issues/1736); the ignored strict journeys are their regressions.
+and [#1736](https://github.com/marmot-protocol/mdk/issues/1736). The profile-edit never-lost contract is now the default
+journey 08, and the strict 30-second departure regression also runs ordinarily. The strict journey 09 stays ignored
+for the stranded-invitee gap (#1735).
 
 Run the default journeys the way the conformance CI job does, or serially with retained evidence:
 
@@ -127,35 +128,49 @@ cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_i
   --test-threads=1 --nocapture
 ```
 
-Add `--include-ignored` to also run the strict regressions and, against production maintenance timing, the manual
+Add `--include-ignored` to also run the strict stranded-invitee regression and, against production maintenance timing, the manual
 self-update journey; `just simulator-fast-maintenance` runs that journey with zeroed maintenance windows instead. Under nextest the
 `app-runtime-journeys` test group in `.config/nextest.toml` runs at most two public journeys at a time, because each
 one starts a local relay and several SQLCipher runtimes and then waits on real settlement windows.
 
-### Known gap: a losing admin edit is dropped after its caller was told it saved (#1734)
+### Fixed: a losing admin edit is re-issued or reported, never silently dropped (#1734)
 
 The first run of the strict profile-edit journey (2026-09-06) showed both `update_group_profile` calls returning
 success, every member settling at the next epoch with Bob's description, and Alice's rename absent everywhere, with
-no error event on any device. This matches the account layer: when convergence parks an own commit, only a
-`SelfUpdate` evolution re-arms its maintenance obligation; `Invite`, `RemoveMembers`, and `UpdateAppComponents`
-evolutions are marked superseded and their intent is not re-issued or reported. The engine vectors
-(`group-data-fork-recovery/v1`) specify only that both clients converge, so the engine oracle cannot see this.
-The strict journeys stay ignored until the runtime either re-issues a parked intent or reports the loss to the
-caller; the default journeys keep the convergence, delivery, and persistence contract green in the ordinary run.
+no error event on any device. Until #1734 that matched the account layer: when convergence parked an own commit,
+only a `SelfUpdate` evolution re-armed its maintenance obligation; `Invite`, `RemoveMembers`, `UpdateGroupData`, and
+`UpdateAppComponents` evolutions were marked superseded and their intent was neither re-issued nor reported. The
+engine now retains the intent behind every own group evolution together with the authoring baseline
+(`cgka_own_commit_intents`, kept until the group has advanced past the rewind horizon), and when a pass withdraws
+that commit it decides per kind: a profile or component edit is re-queued when the winning branch left the edited
+field untouched and reported as a conflict when it changed it; a removal is re-queued for targets that are still
+members; an invite is reported as needing a fresh invitation (#1735 owns the invitee's side). Re-issue is bounded to
+two attempts. Every decision reaches the host as `MarmotAppEvent::GroupChangeSuperseded { kind, outcome, reason }`
+(UniFFI and C ABI mirrors), and `run_due_maintenance` re-derives a missed announcement from the stored disposition.
+Journey 08 now requires both edits in the settled state; `crates/marmot-app/tests/relay_runtime.rs` races two admins
+on a real relay for the re-issued and the conflict outcome, and `crates/cgka-engine/tests/distributed_convergence.rs`
+pins the field rule, the bounded re-issue, and the horizon garbage collection.
 
-### Known gap: survivors apply a voluntary leave only when something else runs convergence (#1736)
+### Fixed scheduling gap: wake the runtime for a peer's voluntary leave (#1736)
 
-The engine schedules a peer's SelfRemove auto-commit 10 to 50 ms after the proposal and marks the group as one the
-app should feed through its convergence timer. The app worker's schedule state, however, is derived from open
-convergence passes, unresolved convergence rows, queued outbound intents, pending fanouts, and deferred peels; a
-scheduled auto-commit is none of those, so the group reads `Idle` and no timer is armed. On 2026-09-06 four
-instrumented runs showed the proposal admitted by the relay immediately and the three survivors unchanged at epoch 1
-for 50 to 80 seconds, until their post-join rotations happened to run convergence and carried the removal with them
-(epoch 1 to 4 across three commits). The existing send-leave family canary shows the same shape: its post-leave
-checkpoint took 82 seconds. In a settled group with no rotation due, a departed member would stay on the roster and
-keep the current epoch secret until the next unrelated commit. The strict journey stays ignored until the worker
-arms a wakeup for scheduled auto-commits; the default journey allows three minutes so the eventual contract stays
-green. Neither run needed a manual `retry_group_convergence`.
+The engine schedules a peer's SelfRemove auto-commit 10 to 50 ms after the proposal. Previously, its runtime deadline
+query only exposed convergence passes. A processed proposal could therefore read as idle and lose its timer wakeup.
+On 2026-09-06 instrumented runs showed survivors unchanged for 50 to 80 seconds until unrelated post-join rotations
+carried the removal. The 2026-09-07 original-master canary spent 97 seconds at its departure checkpoint, and the
+strict public test reproduced survivors failing to apply the departure within 30 seconds. The eventual campaign
+contract still passed, demonstrating why the stricter regression is necessary.
+
+`scheduled_self_remove_auto_commit_delay_ms` exposes the earliest scheduled SelfRemove deadline through the engine,
+session and account runtime. The app uses this deadline only after active convergence passes, unresolved inputs,
+and durable outbound fanout retries have had priority. A due leave cannot shorten a collecting pass or spin while
+publication is in backoff. Non-stable publication states retain their existing handling. The separate deadline API
+and preservation of voluntary `Left` status are adapted from #1743; rejoining resets that attribution so a later
+eviction still reports `Removed`. The
+engine regression `selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_publish` failed before
+the correction and passes through encrypted-file close/reopen, exact deadline boundaries and publication cleanup.
+With the fixed production-policy binary, the strict public journey applied departure in four seconds and passed;
+the original saved canary input also passed. The strict 30-second journey now runs in the ordinary suite. No manual
+`retry_group_convergence` is involved. Evidence is under `target/app-launch-20260907/`.
 
 The invite-versus-rename race decides differently from run to run (#1735). When the invite won, the rename was dropped and
 the invitee joined normally. When the rename won (strict run, same day), `invite_members` had still returned
@@ -176,14 +191,23 @@ The original and cap-only worktrees were preserved; PR #1711 records their conso
 ### Inventory existing generated families before expanding execution
 
 `cgka-conformance-app-inventory` checks the actual app adapter's action capabilities against a bounded selection
-from the twelve original families and three new public journey families. It defaults to seeds 7, 42 and 17001; explicit seed arguments replace them.
+from the twelve original families and six public journey families. It defaults to seeds 7, 42 and 17001; explicit seed arguments replace them.
 It saves unchanged generated inputs only for action-compatible cases and records every rejected case with its missing
 capabilities. This is preflight coverage, not a test pass: each selected case must still pass its strict runtime oracle.
 
 ```sh
 cargo run --release --locked -p cgka-conformance-simulator --bin cgka-conformance-app-inventory -- \
-  target/app-inventory-run-1 7 42 17001
+  target/app-inventory-run-1 7 42 17001 --vectors crates/cgka-conformance-simulator/vectors
 ```
+
+The optional `--vectors DIR` recursively inventories fixture and saved-generated-input JSON under `fixed_vectors`,
+recording input kinds, relative filenames, source hashes, compiler errors, required-capability gaps and whether each
+fixture has an exact expected trace. Catalog manifests, byte fixtures and schemas are listed separately as
+`non_scenario_documents`; they are not engine scenario failures.
+Those rows are port-planning evidence only: the original fixture and its oracle are unchanged and unexecuted.
+In particular, an engine receive-event trace can differ from the app's persisted local-and-remote timeline even
+when every action passes capability preflight. An app command that already published also cannot satisfy an
+engine-only request to roll that publication back; capability matching alone does not establish semantic compatibility.
 
 Replay a saved compatible input with `cgka-conformance-simulator-report --generated-input INPUT --adapter app-runtime
 --storage file --strict-oracle --out FRESH_DIRECTORY`. Preserve the input, execution adapter and report together.
@@ -228,7 +252,10 @@ cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_j
 
 Release mode without policy-override features is the production-policy verification command. Workspace debug or
 feature-unified CI runs are supplementary evidence. The six basic tests are ordinary tests, included by the existing
-simulator smoke filter; the dedicated public recovery CI job runs the ignored large test with the command above.
+simulator smoke filter. The `Simulator Nightly` workflow runs both ignored 1,024-message recovery variants
+on master daily at 03:17 UTC, with production policy and retained JSON evidence. They do not block each PR;
+the smaller recovery journeys and strict regressions remain in PR CI. To run just the large recovery lane
+on demand, dispatch `simulator-nightly.yml` with `recovery_only=true` (and select the desired branch).
 These statements describe test selection; inspect the job at the revision under review for its observed result.
 
 Each test writes a fresh owner-only subdirectory containing input metadata, public checkpoint observations and a
@@ -399,6 +426,60 @@ Logs are under `target/pr1711-review-20260906/`; the earlier 15-case matrix rema
 
 This coverage remains bounded to serialized journeys. Real relay rejection, partial publication fanout and invite
 delivery/retry faults remain separate next targets; preflight inventory does not establish those outcomes.
+
+## Public commit-history companions
+
+The generator-version-1 `public-app-admin-churn/v1` and `public-app-late-join/v1` catalogs add serialized
+administration with traffic and fresh admission after up to 36 profile commits. Their workload, restart boundaries
+and exact public history/state contracts are documented in [SCENARIOS.md](SCENARIOS.md#public-admin-churn-and-late-joining-after-commit-history).
+The original four public families remain generator version 4 with unchanged saved-input semantics.
+
+The first two explicit canaries are:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p cgka-conformance-simulator \
+  --test public_app_families public_admin_churn_strict_canary -- --ignored --exact
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p cgka-conformance-simulator \
+  --test public_app_families public_late_join_strict_canary -- --ignored --exact
+```
+
+For the full six-case catalogs, use the isolated campaign runner with `--storage file --case-timeout-secs 900`
+and a fresh evidence directory. These companions preserve public expectations rather than removing incompatible
+private assertions from an engine input. A bounded inventory or a compiled generator is not a passing campaign.
+
+### Launch campaign, 2026-09-07
+
+Against local master `d42f516909cd41680192eb2e813af6965c9a4348`, all four original public families passed a seed-0
+canary and six cases at each of seeds 7, 42 and 17001: 76/76 runs. The two new companions each passed a seed-7
+canary and six seed-42 cases: 14/14 runs, including both 36-commit late-admission/reopen variants. These used
+frozen production-policy release binaries, per-participant SQLCipher files, local relay sockets and at most two
+isolated workers concurrently. The original families kept their 360-second deadline; the new pressure companions
+used 900 seconds. The longest completed case took 405.116 seconds. No campaign timed out, crashed, reported
+artifact-integrity errors or lacked required oracle evidence.
+
+Evidence and source/binary provenance are under `target/app-launch-20260907/`; the 76 baseline runs and 14 new-family
+runs used separate frozen binaries. The recursive inventory records 516 generated samples (144 action-compatible,
+372 capability gaps) and 32 fixed/saved scenarios (12 action-compatible). All 108 previously compatible generated
+input envelopes are unchanged. Inventory compatibility is not execution coverage. These bounded four-participant,
+serialized campaigns do not resolve the concurrent accepted-command/Welcome risks described above.
+Both new-family strict socket canaries also passed their oracle-mutation checks for lost/duplicate payloads and
+incorrect membership, profile, admin or epoch observations.
+
+Before integrating the own-intent recovery fix, the departure-fix production-policy binary passed both 1,024-message recovery journeys (including extra epochs), all nine
+app adapter tests, all six ordinary interaction tests and all four public generator contracts. The ordinary
+interaction run includes the promoted strict leave regression; its three ignored tests are the two known strict
+concurrent-operation regressions and the slow manual self-update journey. The engine suite passed 555 tests with
+its supported test-policy feature, and `just fast-ci` passed. These are local results, not device or remote-CI evidence.
+
+Explicit original-master race checks remained red: the strict profile race lost an accepted rename, and all three
+invite-versus-rename repetitions failed. Two left the invitee on a stranded branch; the third admitted the invitee
+but dropped an accepted rename. Inputs and public observations are retained under `target/app-launch-20260907/known-races/`.
+The departure scheduling correction alone did not repair those gaps. The combined reliability branch now also
+includes own-intent recovery for #1734, with strict journey 08 promoted to the ordinary suite. The stranded-invitee
+case (#1735) remains open and its strict regression stays ignored. Intent retention failures roll back staging;
+re-issue transfers the retained intent into the outbound queue atomically, with fault-injection regressions for
+both queue insertion and source deletion. The account dispatcher constructs only the selected command future
+to keep nested MLS work within the configured runtime stack budget.
 
 ## Recovery implementation boundaries
 

@@ -14630,11 +14630,8 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
     );
 }
 
-/// A voluntary leave and an eviction may be recorded with either app
-/// membership label — attribution depends on which seam realizes the
-/// departure — but the engine sets the same terminal `Group::removed` marker
-/// for both. Routing must therefore key off that one marker, never off the
-/// app projection.
+/// A voluntary leave keeps its durable attribution after convergence and reopen.
+/// Routing uses the engine's terminal marker for both departures and evictions.
 #[tokio::test]
 async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -14688,11 +14685,22 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert_eq!(
+        app.stored_group_self_membership("bob", &hex::encode(group_id.as_slice()))
+            .unwrap(),
+        Some(SelfMembership::Left),
+        "the realizing commit must preserve the voluntary departure"
+    );
     drop(bob_client);
     let reopened = app
         .client_with_relay_plane("bob", &plane, None)
         .await
         .unwrap();
+    assert_eq!(
+        app.stored_group_self_membership("bob", &hex::encode(group_id.as_slice()))
+            .unwrap(),
+        Some(SelfMembership::Left)
+    );
     assert_eq!(
         installed_group_routes(&reopened, &group_id),
         0,
@@ -19111,5 +19119,340 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
         client.runtime.maintenance_timing(),
         expected,
         "the override must reach the runtime that schedules rotations only in test-policy builds"
+    );
+}
+
+/// Exercise a real processed SelfRemove behind a persisted failed publication.
+/// A due lifecycle timer must not turn the account worker into a 10 ms poller
+/// while the transport's frozen event is still in retry backoff.
+#[tokio::test]
+async fn due_peer_leave_preserves_the_outbound_fanout_retry_barrier() {
+    assert_peer_leave_behind_fanout(false).await;
+}
+
+#[tokio::test]
+async fn removed_device_retires_peer_leave_timer_after_input_only_convergence() {
+    assert_peer_leave_behind_fanout(true).await;
+}
+
+async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    home.create_account("carol").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    let mut carol = app
+        .client_with_relay_plane("carol", &plane, None)
+        .await
+        .unwrap();
+    alice.sync().await.unwrap();
+    bob_client.sync().await.unwrap();
+    let group_id = carol
+        .create_group(
+            "leave behind backoff",
+            &[&alice_account.account_id_hex, &bob.account_id_hex],
+        )
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+
+    assert!(
+        alice
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+
+    relay.fail_publishes_as_unavailable();
+    let summary = alice
+        .send(&group_id, b"retained publication")
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let mut fanout = alice
+        .runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    // Preserve the real failed event, but model several unavailable attempts
+    // so this assertion is independent of sub-second machine scheduling.
+    for index in fanout.outstanding_target_indexes() {
+        let failure = fanout.target_failure(index).unwrap().clone();
+        for _ in 0..6 {
+            fanout
+                .mark_attempt_started_at(index, notifications::unix_now_ms().try_into().unwrap())
+                .unwrap();
+            fanout
+                .record_target_failure(index, failure.clone())
+                .unwrap();
+        }
+    }
+    alice
+        .runtime
+        .session()
+        .put_outbound_fanout(&fanout)
+        .unwrap();
+    relay.allow_publishes();
+    bob_client.leave_group(&group_id).await.unwrap();
+    relay.fail_publishes_as_unavailable();
+    alice.sync().await.unwrap();
+    let delay = alice
+        .runtime
+        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+        .unwrap()
+        .expect("the peer leave is processed before inspecting its scheduling barrier");
+    tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+    assert_eq!(
+        alice
+            .runtime
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        Some(0)
+    );
+    assert!(
+        matches!(alice.convergence_schedule_state(&group_id).unwrap(),
+        ConvergenceScheduleState::PendingOutbound { retry_after_ms: Some(delay) } if delay > 0)
+    );
+    let attempts = relay.attempted_event_ids().len();
+    alice.retry_group_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        relay.attempted_event_ids().len(),
+        attempts,
+        "neither fanout nor removal may publish before the retry cutoff"
+    );
+    assert_eq!(
+        alice.runtime.group_record(&group_id).unwrap().epoch,
+        bob_client.runtime.group_record(&group_id).unwrap().epoch
+    );
+
+    if remove_observer {
+        relay.allow_publishes();
+        carol
+            .remove_members(&group_id, &[&alice_account.account_id_hex])
+            .await
+            .unwrap();
+        relay.fail_publishes_as_unavailable();
+        alice.sync().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !alice.runtime.group_record(&group_id).unwrap().removed {
+            // The durable fanout blocks outbound work, so only convergence
+            // inputs run. They must still be allowed to realize our eviction.
+            alice.retry_group_convergence(&group_id).await.unwrap();
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            alice
+                .runtime
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "a removed device must retire a timer whose staging path can no longer run"
+        );
+        relay.allow_publishes();
+        for mut retained in alice
+            .runtime
+            .session()
+            .outbound_fanouts_for_group(&group_id)
+            .unwrap()
+        {
+            retained.wake_retryable_unavailable_targets();
+            alice
+                .runtime
+                .session()
+                .put_outbound_fanout(&retained)
+                .unwrap();
+        }
+        alice.retry_group_convergence(&group_id).await.unwrap();
+        assert!(
+            matches!(
+                alice.convergence_schedule_state(&group_id).unwrap(),
+                ConvergenceScheduleState::Idle
+            ),
+            "after fanout cleanup the worker must disarm instead of polling every 10 ms"
+        );
+        return;
+    }
+
+    relay.allow_publishes();
+    assert!(fanout.wake_retryable_unavailable_targets() > 0);
+    alice
+        .runtime
+        .session()
+        .put_outbound_fanout(&fanout)
+        .unwrap();
+    alice.retry_group_convergence(&group_id).await.unwrap();
+    assert!(
+        !alice
+            .runtime
+            .has_pending_outbound_fanouts(&group_id)
+            .unwrap()
+    );
+    assert_eq!(
+        alice.members(&group_id).unwrap().len(),
+        2,
+        "the due removal progresses once the actual fanout barrier clears"
+    );
+}
+
+#[tokio::test]
+async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("departure attribution", &[])
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    app.set_group_self_membership("alice", &group_hex, SelfMembership::Left)
+        .unwrap();
+    app.set_group_self_membership("alice", &group_hex, SelfMembership::Removed)
+        .unwrap();
+    drop(client);
+    app.close_storage().unwrap();
+    drop(app);
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    assert_eq!(
+        reopened
+            .stored_group_self_membership("alice", &group_hex)
+            .unwrap(),
+        Some(SelfMembership::Left)
+    );
+    reopened
+        .set_group_self_membership("alice", &group_hex, SelfMembership::Member)
+        .unwrap();
+    reopened
+        .set_group_self_membership("alice", &group_hex, SelfMembership::Removed)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .stored_group_self_membership("alice", &group_hex)
+            .unwrap(),
+        Some(SelfMembership::Removed),
+        "an eviction after rejoining must not inherit the old voluntary departure"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let carol = home.create_account("carol").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::default().with_dev_settlement_quiescence_ms(10_000),
+    )
+    .with_test_relay_client(relay.clone());
+    for member in [&bob, &carol] {
+        remember_test_member_inbox(&app, &member.account_id_hex, "wss://relay.example");
+    }
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    let mut carol_client = app
+        .client_with_relay_plane("carol", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    carol_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group(
+            "leave during collection",
+            &[&bob.account_id_hex, &carol.account_id_hex],
+        )
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+    assert!(
+        carol_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+    bob_client.leave_group(&group_id).await.unwrap();
+    alice.sync().await.unwrap();
+    let delay = alice
+        .runtime
+        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+    carol_client
+        .runtime
+        .send(cgka_traits::SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    alice.sync().await.unwrap();
+    assert_eq!(
+        alice
+            .runtime
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        Some(0)
+    );
+    let pass_delay = alice
+        .runtime
+        .prepare_convergence_cutoff_delay_ms(&group_id)
+        .unwrap()
+        .expect("the peer commit opens a real collecting pass");
+    assert!(pass_delay > 1_000);
+    assert!(
+        matches!(alice.convergence_schedule_state(&group_id).unwrap(),
+        ConvergenceScheduleState::Collecting { remaining_ms } if remaining_ms > 1_000 && remaining_ms <= pass_delay),
+        "a due leave must not bypass the collecting pass's cutoff"
     );
 }

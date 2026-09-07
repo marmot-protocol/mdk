@@ -386,6 +386,9 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
+    /// (mdk#1734). Deduplicated by commit id across effect batches.
+    pub(crate) pending_superseded_change_events: Vec<cgka_traits::engine::SupersededIntentReport>,
     /// Canonical create/invite work whose Welcome fanout has not run yet.
     /// The managed account worker replies first, then drives this delivery.
     pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
@@ -4490,7 +4493,39 @@ impl AppClient {
         Ok(())
     }
 
+    /// Queue this batch's superseded own commits for the runtime worker to
+    /// broadcast as `GroupChangeSuperseded` events (mdk#1734).
+    pub(crate) fn note_superseded_intent_reports(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        for report in &effects.superseded_intents {
+            if self
+                .pending_superseded_change_events
+                .iter()
+                .any(|pending| pending.commit_id == report.commit_id)
+            {
+                continue;
+            }
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "note_superseded_intent_reports",
+                kind = report.kind.as_str(),
+                outcome = report.outcome.as_str(),
+                "convergence superseded an own commit"
+            );
+            self.pending_superseded_change_events.push(report.clone());
+        }
+    }
+
+    pub(crate) fn take_pending_superseded_change_events(
+        &mut self,
+    ) -> Vec<cgka_traits::engine::SupersededIntentReport> {
+        std::mem::take(&mut self.pending_superseded_change_events)
+    }
+
     fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+        self.note_superseded_intent_reports(effects);
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
         if effects.reports.is_empty() {
