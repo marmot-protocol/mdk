@@ -711,6 +711,29 @@ mod tests {
             .unwrap_err();
         assert_eq!(exact.code, "relay_action_publication_identity_mismatch");
 
+        // A chat plus queued maintenance has two publications but only the
+        // chat's known identity. Count correlation must still require that id.
+        for (id, succeeds) in [(accepted.id.to_hex(), true), ("missing".to_owned(), false)] {
+            let result = control
+                .wait_for_action_events(
+                    &mut RelayActionEvents::new(),
+                    "chat-and-maintenance",
+                    0,
+                    RelayActionExpectation {
+                        include_welcomes: false,
+                        expected_publications: 2,
+                        expected_event_ids: &[id],
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .await;
+            if succeeds {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code, "relay_action_publication_timeout");
+            }
+        }
+
         // Both waiters refuse an id list longer than the publication count.
         let two_ids = [accepted.id.to_hex(), recovery.id.to_hex()];
         let inconsistent = control

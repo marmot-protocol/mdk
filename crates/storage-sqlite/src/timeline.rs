@@ -1716,7 +1716,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
 ) -> StorageResult<()> {
     let activity_filter = crate::chat_list::chat_list_activity_filter_sql("preview.");
     let preview_order = crate::chat_list::chat_list_preview_order_desc("preview.");
-    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.");
+    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.", "?1");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
                 preview.kind, preview.timeline_at, preview.deleted,
@@ -1727,7 +1727,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                     WHEN preview.source_message_id_hex IS NULL THEN 'pending'
                     ELSE 'delivered'
                 END
-         FROM message_timeline AS preview
+         FROM message_timeline AS preview NOT INDEXED
          WHERE preview.group_id_hex = ?1
            AND {activity_filter}
            AND {preview_eligibility}
@@ -2131,6 +2131,8 @@ fn app_events_targeting_message_tx(
     // .any(|t| t == target)` relationship (one edge per "e" tag value), so the
     // indexed join is equivalent to the former JSON `LIKE` scan plus Rust-side
     // re-filter, without either. Ordering is preserved byte-for-byte.
+    // Keep the target index outermost; scanning history to avoid a small
+    // modifier sort makes even a message with no modifiers cost O(history).
     let mut stmt = tx
         .prepare_cached(
             "SELECT app_events.group_id_hex, app_events.message_id_hex, app_events.source_message_id_hex,
@@ -2140,7 +2142,7 @@ fn app_events_targeting_message_tx(
                     app_events.invalidated, app_events.invalidation_reason,
                     app_events.moderation_grant
              FROM message_modifier_edges AS edges
-             JOIN app_events
+             CROSS JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
               AND app_events.message_id_hex = edges.modifier_message_id_hex
              WHERE edges.group_id_hex = ?1

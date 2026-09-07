@@ -52,6 +52,121 @@ fn one_pixel_png() -> Vec<u8> {
     bytes
 }
 
+#[tokio::test]
+async fn send_finalizes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://history.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("send projection", &[]).await.unwrap();
+    client.take_pending_projection_updates();
+    let mut updates = Vec::new();
+    let result = client
+        .send_with_local_projection(&group, b"hello", |update| updates.push(update))
+        .await
+        .unwrap();
+    assert_eq!(result.published, 1);
+    assert_eq!(updates.len(), 2);
+    for (index, update) in updates.iter().enumerate() {
+        let row = update
+            .timeline_messages
+            .iter()
+            .find(|row| row.message_id_hex == result.message_ids[0])
+            .unwrap();
+        assert_eq!(row.source_message_id_hex.is_some(), index == 1);
+    }
+    assert!(
+        client
+            .take_pending_projection_updates()
+            .iter()
+            .all(|update| {
+                update
+                    .timeline_messages
+                    .iter()
+                    .all(|row| row.message_id_hex != result.message_ids[0])
+            })
+    );
+    assert!(
+        client
+            .runtime
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "diagnostic history-size timing matrix"]
+async fn send_history_timings() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://history.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("history probe", &[]).await.unwrap();
+    let epoch = client.runtime.group_record(&group).unwrap().epoch.0;
+    let group_hex = hex::encode(group.as_slice());
+    let storage = app.account_storage("alice").unwrap();
+    let now = unix_now_seconds();
+    let mut seeded = 0;
+    for count in [0, 100, 1_000, 10_000] {
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            for index in seeded..count {
+                storage.record_app_event(&storage_sqlite::StoredAppEvent {
+                    group_id_hex: group_hex.clone(),
+                    message_id_hex: format!("{index:064x}"),
+                    source_message_id_hex: Some(format!("{:064x}", index + 100_000)),
+                    source_epoch: Some(epoch),
+                    direction: "received".into(),
+                    sender: "ee".repeat(32),
+                    plaintext: "historical message".into(),
+                    kind: MARMOT_APP_EVENT_KIND_CHAT,
+                    tags: Vec::new(),
+                    recorded_at: now - 100_000 + index,
+                    received_at: now - 100_000 + index,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                })?;
+            }
+            Ok::<_, cgka_traits::StorageError>(())
+        })
+        .unwrap();
+        seeded = count;
+        let mut timings = Vec::new();
+        for index in 0..5 {
+            let payload = format!("probe {count} {index}");
+            let started = std::time::Instant::now();
+            let mut projection_us = Vec::new();
+            let result = client
+                .send_with_local_projection(&group, payload.as_bytes(), |_| {
+                    projection_us.push(started.elapsed().as_micros());
+                })
+                .await
+                .unwrap();
+            let total_us = started.elapsed().as_micros();
+            let prune = std::time::Instant::now();
+            client.prune_plaintext_retention_for_group(&group).unwrap();
+            let prune_us = prune.elapsed().as_micros();
+            let refresh = std::time::Instant::now();
+            let row = app
+                .refresh_chat_list_row("alice", &group_hex)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.unread_count, 0);
+            let refresh_us = refresh.elapsed().as_micros();
+            timings.push((total_us, projection_us, prune_us, refresh_us));
+            assert_eq!(result.published, 1);
+        }
+        eprintln!("history_rows={count} app_send_us={timings:?}");
+    }
+}
+
 #[test]
 fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
     run_composed_app_runtime_test("prepared-group-image-create", || async {
@@ -16007,6 +16122,110 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
         .find(|message| message.message_id_hex == app_event_id)
         .expect("the finalized local message remains in the timeline");
     assert!(row.source_message_id_hex.is_some());
+}
+
+/// A failed source write retains the accepted fanout for cleanup-only replay.
+#[tokio::test]
+async fn accepted_projection_retries() {
+    for trigger in [
+        "CREATE TRIGGER fail_projection BEFORE UPDATE ON app_events
+         WHEN NEW.source_message_id_hex IS NOT NULL AND OLD.source_message_id_hex IS NULL
+         BEGIN SELECT RAISE(ABORT, 'injected source write failure'); END;",
+        "CREATE TRIGGER fail_projection BEFORE INSERT ON chat_list_rows
+         WHEN EXISTS (SELECT 1 FROM app_events WHERE direction = 'sent'
+                      AND source_message_id_hex IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT, 'injected chat-list refresh failure'); END;",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://projection-failure.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("projection failure", &[])
+            .await
+            .unwrap();
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute_batch(trigger).unwrap();
+        client.take_pending_projection_updates();
+        let attempts = relay.attempted_event_ids().len();
+        let summary = client
+            .send(&group_id, b"accepted despite projection failure")
+            .await
+            .expect("an accepted send must succeed despite source projection failure");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::Published
+        );
+        assert_eq!(
+            client.runtime.session().outbound_fanouts().unwrap().len(),
+            1
+        );
+        assert!(client.take_pending_convergence_groups().contains(&group_id));
+        let unfinalized: bool = connection
+            .query_row(
+                "SELECT source_message_id_hex IS NULL AND retention_seconds IS NULL
+         FROM app_events WHERE message_id_hex = ?1",
+                [&summary.message_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            unfinalized,
+            "injected failure must roll back source finalization: {trigger}"
+        );
+        client.take_pending_projection_updates();
+        connection
+            .execute_batch("DROP TRIGGER fail_projection")
+            .unwrap();
+        client.retry_group_convergence(&group_id).await.unwrap();
+        assert!(
+            client
+                .runtime
+                .session()
+                .outbound_fanouts()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(relay.attempted_event_ids().len(), attempts + 1);
+        let row = app
+            .timeline_messages_with_query(
+                "alice",
+                storage_sqlite::TimelineMessageQuery {
+                    group_id_hex: Some(hex::encode(group_id.as_slice())),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|row| row.message_id_hex == summary.message_ids[0])
+            .unwrap();
+        assert!(row.source_message_id_hex.is_some());
+        let updates = client.take_pending_projection_updates();
+        assert!(
+            updates.iter().any(|update| update
+                .timeline_messages
+                .iter()
+                .any(|message| message.message_id_hex == summary.message_ids[0]
+                    && message.source_message_id_hex.is_some())),
+            "recovery must emit the delivered completion to subscribers"
+        );
+    }
 }
 
 /// A resource refusal carried by a host-requested convergence retry must arm

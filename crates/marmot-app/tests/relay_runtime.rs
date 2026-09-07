@@ -55,6 +55,137 @@ fn use_fast_audit_batches(runtime: &MarmotAppRuntime) {
 
 const AUDIT_TRACKER_NON_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[ignore = "diagnostic active-group send and publication timing matrix"]
+async fn active_group_send_timings() {
+    for member_count in [2, 5, 9] {
+        eprintln!("starting members={member_count}");
+        let dir = tempfile::tempdir().unwrap();
+        let (_relay, url) = timeout(Duration::from_secs(5), mock_relay())
+            .await
+            .expect("local relay starts");
+        eprintln!("local relay ready");
+        let mut runtimes = Vec::new();
+        let mut accounts = Vec::new();
+        for index in 0..member_count {
+            let app = MarmotApp::with_relay_and_config(
+                dir.path().join(index.to_string()),
+                url.clone(),
+                MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            );
+            let runtime = MarmotAppRuntime::new(app);
+            let account = timeout(
+                Duration::from_secs(45),
+                create_network_ready_identity(
+                    &runtime,
+                    AccountSetupRequest {
+                        default_relays: vec![endpoint(&url)],
+                        bootstrap_relays: vec![endpoint(&url)],
+                        publish_initial_key_package: true,
+                        ..AccountSetupRequest::default()
+                    },
+                ),
+            )
+            .await
+            .expect("identity setup completes");
+            eprintln!("created member={index}");
+            accounts.push(account.account.account_id_hex);
+            runtimes.push(runtime);
+        }
+        let group = timeout(
+            Duration::from_secs(45),
+            runtimes[0].create_group(&accounts[0], "active latency probe", &accounts[1..], None),
+        )
+        .await
+        .expect("group setup completes")
+        .unwrap();
+        eprintln!("created group members={member_count}");
+        for index in 1..member_count {
+            accept_group_invite_retrying_busy(&runtimes[index], &accounts[index], &group)
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_secs(2)).await;
+        let group_hex = hex::encode(group.as_slice());
+        for round in 0..7 {
+            // Contrast ordinary traffic with sends during a group-state change.
+            if round >= 5 {
+                runtimes[0]
+                    .update_group_profile(
+                        &accounts[0],
+                        &group,
+                        Some(format!("epoch round {round}")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let sends = runtimes.iter().zip(&accounts).map(|(runtime, account)| {
+                let group = &group;
+                let group_hex = &group_hex;
+                async move {
+                    let before = runtime
+                        .app_performance_snapshot()
+                        .outbound_message_send
+                        .duration_ms
+                        .sum_ms;
+                    let started = Instant::now();
+                    let result = runtime
+                        .send_message(account, group, format!("active round {round}").into_bytes())
+                        .await
+                        .unwrap();
+                    let elapsed = started.elapsed().as_millis();
+                    let worker_ms = runtime
+                        .app_performance_snapshot()
+                        .outbound_message_send
+                        .duration_ms
+                        .sum_ms
+                        - before;
+                    let visible = timeout(Duration::from_secs(30), async {
+                        loop {
+                            let row = runtime
+                                .timeline_message(account, group_hex, &result.message_ids[0])
+                                .unwrap();
+                            if row.is_some_and(|row| row.source_message_id_hex.is_some()) {
+                                break;
+                            }
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    assert!(visible, "accepted message must obtain a published source");
+                    (
+                        elapsed,
+                        worker_ms,
+                        result.published,
+                        started.elapsed().as_millis(),
+                        visible,
+                    )
+                }
+            });
+            let timings = futures::future::join_all(sends).await;
+            eprintln!(
+                "members={member_count} round={round} total_ms_worker_ms_published_visible_ms_visible={timings:?}"
+            );
+        }
+        sleep(Duration::from_secs(2)).await;
+        let started = Instant::now();
+        let result = runtimes[0]
+            .send_message(&accounts[0], &group, b"idle probe".to_vec())
+            .await
+            .unwrap();
+        eprintln!(
+            "members={member_count} idle_ms={} published={}",
+            started.elapsed().as_millis(),
+            result.published
+        );
+        for runtime in runtimes {
+            runtime.shutdown_and_close().await.unwrap();
+        }
+    }
+}
+
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();

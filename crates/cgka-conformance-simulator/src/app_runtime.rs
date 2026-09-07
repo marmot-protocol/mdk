@@ -1118,82 +1118,103 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectInviteMembers<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let invitees = self.account_ids(action.invitees)?;
-        let participant = self.participant(action.inviter)?;
-        let summary = participant
-            .runtime()?
-            .invite_members(&participant.account_id, &group_id, &invitees)
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.inviter,
-            before,
-            true,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        self.record_accepted_publication(action.inviter, action.pending);
-        Ok(())
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let invitees = self.account_ids(action.invitees)?;
+            let participant = self.participant(action.inviter)?;
+            let summary = participant
+                .runtime()?
+                .invite_members(&participant.account_id, &group_id, &invitees)
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.inviter,
+                before,
+                true,
+                summary.published,
+                &summary.message_ids,
+            )
+            .await?;
+            self.record_accepted_publication(action.inviter, action.pending);
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     async fn update_group_data(
         &mut self,
         action: SubjectUpdateGroupData<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let participant = self.participant(action.client)?;
-        let summary = participant
-            .runtime()?
-            .update_group_profile(
-                &participant.account_id,
-                &group_id,
-                action.name.map(str::to_owned),
-                action.description.map(str::to_owned),
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let participant = self.participant(action.client)?;
+            let summary = participant
+                .runtime()?
+                .update_group_profile(
+                    &participant.account_id,
+                    &group_id,
+                    action.name.map(str::to_owned),
+                    action.description.map(str::to_owned),
+                )
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.client,
+                before,
+                false,
+                summary.published,
+                &summary.message_ids,
             )
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.client,
-            before,
-            false,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        self.record_accepted_publication(action.client, action.pending);
-        Ok(())
+            .await?;
+            self.record_accepted_publication(action.client, action.pending);
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     async fn remove_members(
         &mut self,
         action: SubjectRemoveMembers<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let members = self.account_ids(action.members)?;
-        let participant = self.participant(action.remover)?;
-        let summary = participant
-            .runtime()?
-            .remove_members(&participant.account_id, &group_id, &members)
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.remover,
-            before,
-            false,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        self.record_accepted_publication(action.remover, action.pending);
-        Ok(())
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let members = self.account_ids(action.members)?;
+            let participant = self.participant(action.remover)?;
+            let summary = participant
+                .runtime()?
+                .remove_members(&participant.account_id, &group_id, &members)
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.remover,
+                before,
+                false,
+                summary.published,
+                &summary.message_ids,
+            )
+            .await?;
+            self.record_accepted_publication(action.remover, action.pending);
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     async fn self_update(&mut self, action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
@@ -1215,26 +1236,33 @@ impl ConvergenceSubject for AppRuntimeHarness {
         if action.action_id.is_none() {
             return self.probe_admin_policy_refusal(action).await;
         }
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let message_ids = self
-            .apply_admin_set(action.client, &group_id, action.admins)
-            .await?;
-        if let Some(action_id) = action.action_id {
-            self.record_relay_action_events(
-                action_id,
-                action.client,
-                before,
-                false,
-                message_ids.len(),
-                &message_ids,
-            )
-            .await?;
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let message_ids = self
+                .apply_admin_set(action.client, &group_id, action.admins)
+                .await?;
+            if let Some(action_id) = action.action_id {
+                self.record_relay_action_events(
+                    action_id,
+                    action.client,
+                    before,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
+                )
+                .await?;
+            }
+            if let Some(pending) = action.pending {
+                self.record_accepted_publication(action.client, pending);
+            }
+            Ok(())
         }
-        if let Some(pending) = action.pending {
-            self.record_accepted_publication(action.client, pending);
-        }
-        Ok(())
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     fn scenario_publication_already_accepted(&self, client: &str, publication: &str) -> bool {
@@ -1318,13 +1346,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
                         })?;
                     transport_ids.push(transport_id);
                 }
-                if transport_ids.len() != summary.published {
-                    return Err(SubjectError::classified(
-                        SubjectFailureCategory::Protocol,
-                        "relay_action_publication_identity_count_mismatch",
-                        "published chat count does not match its public transport identities",
-                    ));
-                }
+                // Queued maintenance can increase the total beyond chat ids.
+                // The recorder checks the total and every known identity.
             }
             self.record_relay_action_events(
                 action.action_id,
@@ -1345,24 +1368,31 @@ impl ConvergenceSubject for AppRuntimeHarness {
     }
 
     async fn leave(&mut self, action_id: &str, client: &str) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let participant = self.participant(client)?;
-        let summary = participant
-            .runtime()?
-            .leave_group(&participant.account_id, &group_id)
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action_id,
-            client,
-            before,
-            false,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        Ok(())
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let participant = self.participant(client)?;
+            let summary = participant
+                .runtime()?
+                .leave_group(&participant.account_id, &group_id)
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action_id,
+                client,
+                before,
+                false,
+                summary.published,
+                &summary.message_ids,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     fn deliver_all(&mut self) -> Result<(), SubjectError> {
@@ -2056,6 +2086,59 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Even a pre-publication validation error must release maintenance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_error_resumes_work() {
+        let clients = vec!["alice".to_owned()];
+        let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+        subject
+            .create_group(SubjectCreateGroup {
+                action_id: "create",
+                creator: "alice",
+                name: "maintenance cleanup",
+                invitees: &[],
+                required_features: &[],
+                initial_admins: &clients,
+                pending: "create",
+            })
+            .await
+            .unwrap();
+        let group = subject.active_group().unwrap();
+        subject.set_all_maintenance_paused(true).await.unwrap();
+        let participant = subject.participant("alice").unwrap();
+        let account = participant.account_id.clone();
+        let runtime = participant.runtime().unwrap();
+        assert!(
+            runtime
+                .maintenance_status(&account, &group)
+                .await
+                .unwrap()
+                .paused
+        );
+
+        // Fail after entering the command's paused region, before publishing.
+        let selected = subject.active_scenario_group.take();
+        let result = subject
+            .update_group_data(SubjectUpdateGroupData {
+                action_id: "invalid-profile",
+                client: "alice",
+                name: Some("renamed"),
+                description: None,
+                pending: "invalid-profile",
+            })
+            .await;
+        subject.active_scenario_group = selected;
+        assert_eq!(result.unwrap_err().code, "scenario_group_missing");
+        let runtime = subject.participant("alice").unwrap().runtime().unwrap();
+        let paused = runtime
+            .maintenance_status(&account, &group)
+            .await
+            .unwrap()
+            .paused;
+        subject.shutdown().await;
+        assert!(!paused, "maintenance must resume after the failed command");
+    }
 
     #[test]
     fn public_group_checkpoint_allows_maintenance_epochs_but_rejects_semantic_drift() {

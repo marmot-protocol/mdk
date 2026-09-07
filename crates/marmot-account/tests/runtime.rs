@@ -369,6 +369,7 @@ struct RecordingAdapterInner {
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
+    endpoint_gate: Mutex<Option<(TransportEndpoint, Arc<tokio::sync::Semaphore>)>>,
 }
 
 struct WelcomePublishGate {
@@ -480,6 +481,12 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        let endpoint_gate = self.inner.endpoint_gate.lock().unwrap().clone();
+        if let Some((endpoint, gate)) = endpoint_gate
+            && request.target.endpoints().contains(&endpoint)
+        {
+            gate.acquire().await.unwrap().forget();
+        }
         let welcome_gate = if matches!(&request.message.envelope, TransportEnvelope::Welcome { .. })
         {
             self.inner.welcome_gate.lock().unwrap().clone()
