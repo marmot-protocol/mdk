@@ -591,24 +591,6 @@ export function createMarmotInboundDispatcher(
                     ctxPayload,
                     payload,
                     info,
-                    // A text-only Marmot reply must receive an exact queue identity so
-                    // an unknown post-send outcome can be reconciled without duplication.
-                    // Media has a durable adapter but no unknown-send reconciler yet, so
-                    // require only the capability that matches this concrete payload.
-                    requiredCapabilities:
-                      payload.mediaUrl || (payload.mediaUrls?.length ?? 0) > 0
-                        ? {
-                            text: true,
-                            media: true,
-                            replyTo: true,
-                            messageSendingHooks: true,
-                          }
-                        : {
-                            text: true,
-                            replyTo: true,
-                            messageSendingHooks: true,
-                            reconcileUnknownSend: true,
-                          },
                     // A normal response threads to the inbound message that
                     // triggered this turn. The destination itself comes from
                     // ctxPayload.OriginatingTo / ctxPayload.To.
