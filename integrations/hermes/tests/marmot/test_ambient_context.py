@@ -127,6 +127,45 @@ os._exit(0)
             self.assertEqual([fact.kind for fact in claim.facts], ["message_deleted"])
             restarted.close()
 
+    def test_abrupt_death_after_handoff_commit_never_replays_accepted_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            script = """
+import importlib.util
+import os
+import sys
+spec = importlib.util.spec_from_file_location("committed_restart_ambient", os.environ["MODULE_PATH"])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+store = module.AmbientContextStore(os.environ["STORE_PATH"])
+store.record("22" * 32, "accepted-event", "message_deleted")
+claim = store.claim("22" * 32)
+assert store.commit("22" * 32, claim.token) == 1
+os._exit(0)
+"""
+            env = dict(os.environ)
+            env.update(
+                STORE_PATH=str(path),
+                MODULE_PATH=str(MODULE_PATH),
+                PYTHONDONTWRITEBYTECODE="1",
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=Path(__file__).resolve().parents[4],
+                env=env,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(completed.returncode, 0)
+
+            restarted = AmbientContextStore(path)
+            self.assertEqual(restarted.pending("22" * 32), [])
+            self.assertFalse(
+                restarted.record("22" * 32, "accepted-event", "message_deleted")
+            )
+            restarted.close()
+
     def test_store_refuses_overlapping_process_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private" / "ambient.sqlite3"
@@ -152,7 +191,7 @@ os._exit(0)
             self.assertEqual([fact.kind for fact in retried.facts], ["message_deleted"])
             store.close()
 
-    def test_active_claim_is_not_evicted_before_acknowledgement(self):
+    def test_active_claim_keeps_absolute_event_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private" / "ambient.sqlite3"
             store = AmbientContextStore(
@@ -167,11 +206,44 @@ os._exit(0)
             claim = store.claim(group_id)
 
             self.assertTrue(store.record(group_id, "second", "reaction_added"))
-            self.assertEqual(store.acknowledge(group_id, claim.token), 1)
+            self.assertLessEqual(store.stats()["events"], 1)
+            self.assertEqual(store.acknowledge(group_id, claim.token), 0)
             self.assertEqual(
                 [fact.kind for fact in store.pending(group_id)],
                 ["reaction_added"],
             )
+            store.close()
+
+    def test_overlapping_claims_keep_group_event_byte_and_age_bounds_absolute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "private"
+            group_a, group_b = "aa" * 32, "bb" * 32
+            store = AmbientContextStore(
+                root / "bounded.sqlite3",
+                max_groups=1,
+                max_events_per_group=100,
+                max_events=100,
+                max_state_bytes=4096,
+                max_age_s=10,
+            )
+            for index in range(12):
+                store.record(group_a, f"a-{index}", "message_deleted", observed_at=100)
+            claim_a = store.claim(group_a, now=100)
+            self.assertTrue(claim_a.facts)
+
+            for index in range(30):
+                store.record(group_b, f"b-{index}", "reaction_added", observed_at=101)
+            claim_b = store.claim(group_b, now=101)
+            self.assertTrue(claim_b.facts)
+            stats = store.stats()
+            self.assertLessEqual(stats["groups"], 1)
+            self.assertLessEqual(stats["events"], 100)
+            self.assertLessEqual(stats["state_bytes"], 4096)
+
+            # claimed_at never refreshes observed_at: age eviction remains an
+            # absolute retention cap even while a handoff is in flight.
+            self.assertEqual(store.pending(group_b, now=112), [])
+            self.assertEqual(store.release(group_b, claim_b.token), 0)
             store.close()
 
     def test_open_reapplies_lower_configured_bounds(self):
@@ -275,6 +347,7 @@ os._exit(0)
                     "claim_owner",
                     "claim_token",
                     "claimed_at",
+                    "committed",
                 ],
             )
             migrated.close()

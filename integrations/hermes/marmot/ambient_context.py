@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _ALLOWED_KINDS = frozenset(
     {
         "message_deleted",
@@ -131,11 +131,14 @@ class AmbientContextStore:
             if result is None or result[0] != "ok":
                 raise AmbientContextError("ambient context integrity check failed")
             with db:
-                # The exclusive file lock proves that every persisted claim was
-                # abandoned by a prior process generation.
+                # A committed claim crossed the durable host-handoff boundary.
+                # Retire it before reclaiming ordinary claims abandoned by the
+                # previous process generation, so a crash after host acceptance
+                # cannot make the same context eligible again.
+                self._retire_committed_claims()
                 db.execute(
                     "UPDATE facts SET claim_owner=NULL,claim_token=NULL,claimed_at=NULL "
-                    "WHERE claim_token IS NOT NULL"
+                    "WHERE claim_token IS NOT NULL AND committed=0"
                 )
                 self._gc(time.time())
                 self._enforce_all_bounds()
@@ -159,7 +162,7 @@ class AmbientContextStore:
                         with db:
                             db.execute(
                                 "UPDATE facts SET claim_owner=NULL,claim_token=NULL,claimed_at=NULL "
-                                "WHERE claim_owner=?",
+                                "WHERE claim_owner=? AND committed=0",
                                 (self.owner_id,),
                             )
                             self._gc(time.time())
@@ -230,7 +233,8 @@ class AmbientContextStore:
             with db:
                 self._gc(at)
                 rows = db.execute(
-                    "SELECT seq,kind FROM facts WHERE group_key=? ORDER BY seq", (group_key,)
+                    "SELECT seq,kind FROM facts WHERE group_key=? AND committed=0 ORDER BY seq",
+                    (group_key,),
                 ).fetchall()
             self._checkpoint()
             return [AmbientFact(int(row["seq"]), str(row["kind"])) for row in rows]
@@ -304,6 +308,30 @@ class AmbientContextStore:
         except (OSError, sqlite3.Error) as exc:
             raise AmbientContextError("ambient acknowledgement failed") from exc
 
+    def commit(self, group_id: str, token: str) -> int:
+        """Persist that this claim crossed the host-handoff boundary.
+
+        A normal exception or cancellation rolls this state back with
+        ``release``. An abrupt process death leaves it committed, so the next
+        exclusive owner retires it instead of replaying accepted context.
+        """
+        if not token:
+            return 0
+        self.open()
+        db = self._require_db()
+        group_key = _digest(b"marmot-ambient-group-v1\0", group_id)
+        try:
+            with db:
+                changed = db.execute(
+                    "UPDATE facts SET committed=1 WHERE group_key=? "
+                    "AND claim_owner=? AND claim_token=? AND committed=0",
+                    (group_key, self.owner_id, token),
+                ).rowcount
+            self._checkpoint()
+            return int(changed)
+        except (OSError, sqlite3.Error) as exc:
+            raise AmbientContextError("ambient claim commit failed") from exc
+
     def release(self, group_id: str, token: str) -> int:
         """Release an unaccepted claim for a later eligible real turn."""
         if not token:
@@ -314,7 +342,7 @@ class AmbientContextStore:
         try:
             with db:
                 changed = db.execute(
-                    "UPDATE facts SET claim_owner=NULL,claim_token=NULL,claimed_at=NULL "
+                    "UPDATE facts SET claim_owner=NULL,claim_token=NULL,claimed_at=NULL,committed=0 "
                     "WHERE group_key=? AND claim_owner=? AND claim_token=?",
                     (group_key, self.owner_id, token),
                 ).rowcount
@@ -342,7 +370,7 @@ class AmbientContextStore:
         db = self._require_db()
         with db:
             version = int(db.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, SCHEMA_VERSION}:
                 raise AmbientContextError("unsupported ambient context schema")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS facts("
@@ -355,6 +383,7 @@ class AmbientContextStore:
                 ("claim_owner", "TEXT"),
                 ("claim_token", "TEXT"),
                 ("claimed_at", "REAL"),
+                ("committed", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in columns:
                     db.execute(f"ALTER TABLE facts ADD COLUMN {column} {declaration}")
@@ -373,12 +402,12 @@ class AmbientContextStore:
     def _gc(self, now: float) -> None:
         db = self._require_db()
         if self.max_age_s <= 0:
-            db.execute("DELETE FROM facts WHERE claim_token IS NULL")
+            db.execute("DELETE FROM facts")
             db.execute("DELETE FROM seen")
         else:
             cutoff = now - self.max_age_s
             db.execute(
-                "DELETE FROM facts WHERE observed_at<? AND claim_token IS NULL",
+                "DELETE FROM facts WHERE observed_at<?",
                 (cutoff,),
             )
             db.execute("DELETE FROM seen WHERE observed_at<?", (cutoff,))
@@ -392,49 +421,39 @@ class AmbientContextStore:
         ).fetchall()
         for row in groups:
             group_key = row[0]
-            claimed_count = int(
-                db.execute(
-                    "SELECT count(*) FROM facts "
-                    "WHERE group_key=? AND claim_token IS NOT NULL",
-                    (group_key,),
-                ).fetchone()[0]
-            )
             self._delete_oldest_any(
-                int(row[1]) - (self.max_events_per_group + claimed_count),
+                int(row[1]) - self.max_events_per_group,
                 group_key=group_key,
             )
 
-        claimed_groups = int(
-            db.execute(
-                "SELECT count(DISTINCT group_key) FROM facts WHERE claim_token IS NOT NULL"
-            ).fetchone()[0]
-        )
-        while self._group_count() > self.max_groups + claimed_groups:
+        while self._group_count() > self.max_groups:
             if not self._delete_oldest_aggregate_group():
                 break
 
-        claimed_total = int(
-            db.execute("SELECT count(*) FROM facts WHERE claim_token IS NOT NULL").fetchone()[0]
-        )
         total = int(
             db.execute(
                 "SELECT (SELECT count(*) FROM facts)+(SELECT count(*) FROM seen)"
             ).fetchone()[0]
         )
-        self._delete_oldest_any(total - (self.max_events + claimed_total))
+        self._delete_oldest_any(total - self.max_events)
 
-        claimed_bytes = int(
-            db.execute(
-                "SELECT COALESCE(sum(length(group_key)+length(event_key)+"
-                "length(kind)+88),0) FROM facts WHERE claim_token IS NOT NULL"
-            ).fetchone()[0]
-        )
-        while self._logical_bytes() > self.max_state_bytes + claimed_bytes:
+        while self._logical_bytes() > self.max_state_bytes:
             if not self._delete_oldest_any(1):
-                # Active claims are never discarded before host acceptance.
-                # Their temporary overage is itself capped by the configured
-                # pending-fact window and settles on acknowledge or release.
                 break
+
+    def _retire_committed_claims(self) -> int:
+        db = self._require_db()
+        rows = db.execute(
+            "SELECT group_key,event_key,observed_at FROM facts WHERE committed=1 ORDER BY seq"
+        ).fetchall()
+        for row in rows:
+            db.execute(
+                "INSERT OR IGNORE INTO seen(group_key,event_key,observed_at) VALUES(?,?,?)",
+                (row["group_key"], row["event_key"], row["observed_at"]),
+            )
+        if rows:
+            db.execute("DELETE FROM facts WHERE committed=1")
+        return len(rows)
 
     def _delete_oldest_any(self, count: int, *, group_key: bytes | None = None) -> int:
         if count <= 0:
@@ -449,7 +468,7 @@ class AmbientContextStore:
         rows = db.execute(
             "SELECT source,seq FROM ("
             "SELECT 'facts' AS source,seq,observed_at FROM facts "
-            f"WHERE claim_token IS NULL{facts_group_clause} UNION ALL "
+            f"WHERE 1=1{facts_group_clause} UNION ALL "
             f"SELECT 'seen' AS source,seq,observed_at FROM seen{seen_group_clause}) "
             "ORDER BY observed_at,source,seq LIMIT ?",
             tuple(params),
@@ -463,16 +482,13 @@ class AmbientContextStore:
         db = self._require_db()
         row = db.execute(
             "SELECT group_key FROM ("
-            "SELECT group_key,observed_at FROM facts WHERE claim_token IS NULL UNION ALL "
+            "SELECT group_key,observed_at FROM facts UNION ALL "
             "SELECT group_key,observed_at FROM seen) candidate "
-            "WHERE NOT EXISTS (SELECT 1 FROM facts claimed "
-            "WHERE claimed.group_key=candidate.group_key "
-            "AND claimed.claim_token IS NOT NULL) "
             "GROUP BY group_key ORDER BY min(observed_at),hex(group_key) LIMIT 1"
         ).fetchone()
         if row is None:
             return False
-        db.execute("DELETE FROM facts WHERE group_key=? AND claim_token IS NULL", (row[0],))
+        db.execute("DELETE FROM facts WHERE group_key=?", (row[0],))
         db.execute("DELETE FROM seen WHERE group_key=?", (row[0],))
         return True
 

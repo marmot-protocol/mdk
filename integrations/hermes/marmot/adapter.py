@@ -1523,6 +1523,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._mark_connected()
             return True
         except Exception as exc:
+            for attribute in ("_listener_task", "_inbound_spool_retry_task"):
+                task = getattr(self, attribute)
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    setattr(self, attribute, None)
+            self._ambient_context.close()
+            self._inbound_spool.close(graceful=True)
             logger.error("Failed to connect Marmot adapter: %s", exc)
             set_fatal = getattr(self, "_set_fatal_error", None)
             if callable(set_fatal):
@@ -3113,6 +3124,22 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 if detached_ambient
                 else None
             )
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    committed = self._ambient_context.commit(group_id_hex, ambient_claim.token)
+                    if committed != len(ambient_claim.facts):
+                        raise RuntimeError("ambient claim changed before durable handoff")
+                except Exception:
+                    logger.error(
+                        "Marmot ambient context handoff commit failed; continuing without ambient context",
+                        exc_info=True,
+                    )
+                    try:
+                        self._ambient_context.release(group_id_hex, ambient_claim.token)
+                    except Exception:
+                        logger.error("Marmot ambient context claim release failed", exc_info=True)
+                    ambient_claim = None
+                    ambient_context = None
             contexts = [
                 context
                 for context in (
@@ -3136,10 +3163,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 spool_state = "handed"
             await self.handle_message(hermes_event)
-            # A normal return is the host acceptance boundary. Retire only this
-            # owned snapshot; concurrently observed facts remain pending. Ambient
-            # persistence failure after acceptance cannot reclassify the host
-            # handoff as a failed or unresolved turn.
+            # The claim was durably committed immediately before host invocation,
+            # so acknowledgement after a normal return is bounded cleanup only;
+            # failure cannot make the accepted facts reusable after restart.
             if ambient_claim is not None and ambient_claim.facts:
                 try:
                     self._ambient_context.acknowledge(group_id_hex, ambient_claim.token)

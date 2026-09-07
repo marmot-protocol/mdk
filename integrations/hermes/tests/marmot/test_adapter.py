@@ -1474,6 +1474,22 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     await adapter.disconnect()
                 self.assertIsNone(adapter._listener_task)
 
+    async def test_connect_failure_closes_store_opened_before_later_store_fails(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=object(),
+        )
+        adapter._ambient_context.open = unittest.mock.Mock(
+            side_effect=RuntimeError("ambient open failed")
+        )
+
+        self.assertFalse(await adapter.connect())
+
+        self.assertFalse(adapter._inbound_spool.is_open)
+        self.assertFalse(adapter._ambient_context.is_open)
+        self.assertIsNone(adapter._listener_task)
+        self.assertIsNone(adapter._inbound_spool_retry_task)
+
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
             {
@@ -4473,8 +4489,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(accepted, ["accepted"])
         self.assertEqual(adapter._inbound_spool.get(message_id).state, "handed")
+        ambient_path = adapter._ambient_context.path
         adapter._ambient_context.close()
         adapter._inbound_spool.close()
+
+        restarted = self.adapter_module.AmbientContextStore(ambient_path)
+        self.assertEqual(restarted.pending(group_id), [])
+        self.assertFalse(restarted.record(group_id, "event", "message_deleted"))
+        restarted.close()
 
     async def test_ambient_context_is_bounded_and_survives_failed_turn(self):
         class FakeClient:
