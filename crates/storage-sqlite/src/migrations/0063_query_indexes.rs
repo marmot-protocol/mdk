@@ -29,6 +29,21 @@ CREATE INDEX idx_disband_tombstones_hex
 CREATE INDEX idx_app_events_pending_sent
     ON app_events(group_id_hex)
     WHERE direction = 'sent' AND source_message_id_hex IS NULL AND invalidated = 0;
+
+-- Account-wide recent messages use the same ordering across all groups.
+CREATE INDEX idx_app_events_recency ON app_events(recorded_at, message_id_hex);
+
+-- Enumerate KeyPackages without reading unrelated OpenMLS values.
+CREATE INDEX idx_openmls_values_label
+    ON openmls_values(provider_version, label, storage_key);
+
+-- Proposal cleanup must skip the group's cached epoch keys.
+DROP INDEX idx_openmls_values_group;
+CREATE INDEX idx_openmls_values_group
+    ON openmls_values(provider_version, group_key, label);
+
+-- Local deletion records the group's last message as a replay frontier.
+CREATE INDEX idx_cgka_messages_group_order ON cgka_messages(group_id, insert_order);
 "#,
     )
     .storage()
