@@ -66,6 +66,25 @@ transition. Maintenance tests distinguish loaded state, actual attempts, drained
 durations and persisted edges. Directory tests exercise cache and network paths;
 collector tests reject stale source observations and unregistered source values.
 
+## Review follow-up validation
+
+The four CI stack-overflow journeys were rerun locally with
+`RUST_MIN_STACK=2097152`: connector pending-invite reconciliation, relay-runtime
+remove/re-add, CLI invite/remove, and simulator concurrent invite/rename all
+passed. Command dispatch now constructs only the selected boxed future, so its
+construction frame is released before nested publication work is polled. Stack
+limits and retry policies were not increased.
+
+The agent library suite passed 154 tests with one ignored. The separate identity
+TTY test missed its ten-second prompt deadline on the first run and passed on a
+focused rerun; that initial timing failure is retained as a validation limitation.
+Management-socket regressions cover failed bind, malformed/stalled peers,
+independent control responsiveness, connection bounds and cancellation. A real
+`wn` subprocess regression verifies saved consent across enable/show/disable with
+export configuration removed between processes. The previously reported local
+group-delete assertion passed in isolation; full serial coverage remains a CI
+gate.
+
 ## Local evidence
 
 The following checks have passed during implementation; their scope is narrower
@@ -73,7 +92,7 @@ than deployment or full catalogue acceptance:
 
 - `just fast-ci`: formatting, workspace/default and exporter feature builds,
   clippy, binding parity, repository policy checks, and pinned convergence tests.
-- Product tests: 23 passed, covering exact bucket edges, registry/serialization privacy, queue and
+- Product tests: 26 passed (both exporter features enabled), covering exact bucket edges, registry/serialization privacy, queue and
   clock/session boundaries, consent migration/identity/persistence, stale work,
   HTTP batch limits/prefixes, retry/rejection behavior, background draining and
   close-before-drain ordering.

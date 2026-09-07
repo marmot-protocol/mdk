@@ -74,14 +74,20 @@ The CLI hosts accept explicit `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT`,
 `MARMOT_PRODUCT_ANALYTICS_APP_KEY`, `MARMOT_PRODUCT_ANALYTICS_OPERATOR`, and
 `MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT` environment configuration. The development
 loopback override is `MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK=1`; it permits only
-an exact loopback destination. Environment configuration never grants consent.
+an exact loopback destination. Environment configuration never grants consent. Invalid optional analytics settings produce a fixed, redacted warning and leave host startup and diagnostic authorization intact.
 
 Use `wn [--json] usage-diagnostics show|enable|disable` or
 `wn-agent usage-diagnostics show|enable|disable [--home PATH] [--json]` for local
 controls. Active `wnd` owns its changes. `wn-agent` exposes a separate owner-only
 local management socket; its agent-control credentials and remote messages cannot
 accept this permission. Standalone `wn`/TUI collectors are silent. Frozen-cursor
-notification runtimes are always silent.
+notification runtimes are always silent. The local controls report the
+saved permission separately from current exporter readiness. A standalone process
+can inspect a saved grant without loading the daemon's destination or registry;
+this does not authorize that process to export. Rust local administration uses
+`stored_usage_diagnostics_settings()`; normal export authorization still uses the
+effective settings and generation gate. Management connections have a separate
+four-client limit and cannot block regular agent-control admission.
 
 Report foreground/background/account-context boundaries through
 `set_product_analytics_activity`. Foreground sessions expire after 30 minutes of

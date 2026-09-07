@@ -263,7 +263,7 @@ fn main() -> ExitCode {
                         println!("{}", serde_json::to_string(&report).unwrap_or_default());
                     } else {
                         println!(
-                            "Share usage and diagnostics: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}",
+                            "Saved usage and diagnostics permission: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}",
                             report.settings.decision,
                             report.status.telemetry,
                             report.status.product_analytics,

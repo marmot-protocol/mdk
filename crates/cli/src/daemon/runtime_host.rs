@@ -576,7 +576,7 @@ pub(crate) fn open_app_runtime(
         false,
     )?;
     let runtime = app.runtime();
-    crate::configure_product_analytics(&runtime)?;
+    marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
     Ok(runtime)
 }
 

@@ -499,7 +499,7 @@ async fn execute_inner(
     match command {
         Command::UsageDiagnostics { command } => {
             let runtime = app.runtime();
-            configure_product_analytics(&runtime)?;
+            marmot_app::configure_product_analytics_from_environment(&runtime, "daemon");
             usage_diagnostics_command(&runtime, command)
         }
         Command::Debug { command } => {
@@ -1330,11 +1330,12 @@ pub(crate) fn usage_diagnostics_command(
         runtime
             .set_usage_diagnostics_consent(matches!(command, UsageDiagnosticsCommand::Enable))?;
     }
-    let settings = runtime.usage_diagnostics_settings()?;
-    let status = runtime.usage_diagnostics_status();
+    let settings = runtime.stored_usage_diagnostics_settings()?;
+    let mut status = runtime.usage_diagnostics_status();
+    status.consent = runtime.usage_diagnostics_settings()?.decision;
     Ok(CommandOutput {
         plain: format!(
-            "Share usage and diagnostics: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}\n",
+            "Saved usage and diagnostics permission: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}\n",
             settings.decision,
             status.telemetry,
             status.product_analytics,
@@ -1342,33 +1343,6 @@ pub(crate) fn usage_diagnostics_command(
         ),
         json: json!({"settings":settings,"status":status,"disclosure":marmot_app::USAGE_DIAGNOSTICS_DISCLOSURE}),
     })
-}
-
-fn configure_product_analytics(runtime: &marmot_app::MarmotAppRuntime) -> Result<(), WnError> {
-    let endpoint = std::env::var("MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT").ok();
-    let key = std::env::var("MARMOT_PRODUCT_ANALYTICS_APP_KEY").ok();
-    if endpoint.is_none() && key.is_none() {
-        return Ok(());
-    }
-    runtime.set_product_analytics_runtime_config(marmot_app::ProductAnalyticsRuntimeConfig {
-        events_endpoint: endpoint,
-        app_key: key,
-        operator: std::env::var("MARMOT_PRODUCT_ANALYTICS_OPERATOR").unwrap_or_default(),
-        allow_loopback: std::env::var("MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK").as_deref()
-            == Ok("1"),
-        registry: Vec::new(),
-        metadata: marmot_app::ProductAnalyticsMetadata {
-            app_version: env!("CARGO_PKG_VERSION").into(),
-            os_family: std::env::consts::OS.into(),
-            os_major_version: String::new(),
-            device_class: "headless".into(),
-            host_surface: "daemon".into(),
-            environment: std::env::var("MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT")
-                .unwrap_or_else(|_| "development".into()),
-            is_debug: cfg!(debug_assertions),
-        },
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]

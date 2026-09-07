@@ -26,9 +26,11 @@ fn apply(
         runtime
             .set_usage_diagnostics_consent(matches!(command, UsageDiagnosticsCommand::Enable))?;
     }
+    let mut status = runtime.usage_diagnostics_status();
+    status.consent = runtime.usage_diagnostics_settings()?.decision;
     Ok(UsageDiagnosticsReport {
-        settings: runtime.usage_diagnostics_settings()?,
-        status: runtime.usage_diagnostics_status(),
+        settings: runtime.stored_usage_diagnostics_settings()?,
+        status,
         disclosure: marmot_app::USAGE_DIAGNOSTICS_DISCLOSURE.into(),
     })
 }
@@ -38,6 +40,34 @@ fn path(home: &Path) -> std::path::PathBuf {
 pub(crate) fn bind(home: &Path) -> Result<tokio::net::UnixListener, ConnectorError> {
     crate::bind_connector_socket_with_mode(&path(home), 0o700, 0o600)
 }
+const MANAGEMENT_CONNECTION_LIMIT: usize = 4;
+
+pub(crate) async fn serve(listener: tokio::net::UnixListener, runtime: MarmotAppRuntime) {
+    let mut clients = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = clients.join_next(), if !clients.is_empty() => {}
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) if clients.len() < MANAGEMENT_CONNECTION_LIMIT => {
+                    let runtime = runtime.clone();
+                    clients.spawn(async move {
+                        if serve_one(stream, &runtime).await.is_err() {
+                            tracing::warn!(target: "agent_connector", method = "usage_diagnostics_serve",
+                                error_code = "management_peer_failed", "local diagnostics request failed");
+                        }
+                    });
+                }
+                Ok(_) => {} // Close excess peers without taking regular control capacity.
+                Err(_) => {
+                    tracing::warn!(target: "agent_connector", method = "usage_diagnostics_serve",
+                        error_code = "management_accept_failed", "local diagnostics accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn serve_one(
     mut stream: tokio::net::UnixStream,
     runtime: &MarmotAppRuntime,
@@ -109,7 +139,7 @@ pub async fn manage_usage_diagnostics(
                 config,
             )?;
             let runtime = app.runtime();
-            crate::configure_product_analytics(&runtime)?;
+            marmot_app::configure_product_analytics_from_environment(&runtime, "agent");
             apply(&runtime, command)
         }
         Err(error) => Err(error.into()),
@@ -119,6 +149,48 @@ pub async fn manage_usage_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn management_clients_are_bounded_and_cancel_with_the_listener_owner() {
+        let home = tempfile::Builder::new()
+            .prefix(".mdk-cap-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        let app = MarmotApp::with_relay(home.path(), "wss://relay.example");
+        let listener = bind(home.path()).unwrap();
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(serve(listener, app.runtime()));
+        let mut stalled = Vec::new();
+        for _ in 0..MANAGEMENT_CONNECTION_LIMIT {
+            stalled.push(
+                tokio::net::UnixStream::connect(path(home.path()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut excess = tokio::net::UnixStream::connect(path(home.path()))
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), excess.read(&mut byte))
+                .await
+                .expect("excess clients must be closed immediately")
+                .unwrap(),
+            0
+        );
+        server.abort_all();
+        while server.join_next().await.is_some() {}
+        for mut peer in stalled {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .expect("owner exit cancels every management peer")
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     #[tokio::test]
     async fn owner_socket_updates_the_active_consent_without_starting_collectors() {
         let home = tempfile::Builder::new()

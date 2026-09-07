@@ -86,11 +86,6 @@ pub(crate) enum MaintenancePolicySetting {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum Command {
-    /// Inspect or change the local Share usage and diagnostics permission.
-    UsageDiagnostics {
-        #[command(subcommand)]
-        command: UsageDiagnosticsCommand,
-    },
     #[command(about = "Open the interactive terminal UI")]
     Tui {
         #[arg(
@@ -212,6 +207,11 @@ pub(crate) enum Command {
     Relays {
         #[command(subcommand)]
         command: RelaysCommand,
+    },
+    /// Inspect or change the local Share usage and diagnostics permission.
+    UsageDiagnostics {
+        #[command(subcommand)]
+        command: UsageDiagnosticsCommand,
     },
     #[command(about = "Read and update local CLI preferences")]
     Settings {
