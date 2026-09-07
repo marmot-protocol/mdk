@@ -313,6 +313,32 @@ bookkeeping fixed that adapter defect in MDK #1465, and the exact seed-0 catalog
 engine change. An explicit ignored test replays the catalog through the isolated-process adapter, whose validation
 binds every restart action id to a matching durable `restarted` lifecycle event.
 
+### Public app journey contracts
+
+The fixed inputs in `tests/public_app_families.rs` use generator version 4 and the four public families: send/leave,
+membership re-entry, offline recovery and admin handoff. Counts below describe each test's loop, including repeated
+generation where replay equality is the assertion; they are not independent random samples.
+
+| Check | Generated inputs | Count and rule |
+| --- | --- | --- |
+| Replay, prefix and capability contract | Each family: seed 7, indices 0–5 twice and 0–11 once; seed 42, indices 0–5 once | 30 generations per family, 120 total (72 distinct inputs). Repeated six-case outputs must match; the six-case prefix must match the twelve-case run; seed 42 must change actual workloads. All 48 seed-7 twelve-case outputs must select the app adapter, preflight and include payload expectations for every client. |
+| Capability rejection | Send/leave, seed 7, index 0 | Three variants: remove public group-state observation, add private exact-equivalence assertion, or add private no-pending-work assertion. Each must fail preflight. |
+| Checkpoint validation | Admin handoff, seed 7, index 0 | Five invalid variants: empty observers, unknown member, duplicate member, observer absent from membership, or admin absent from membership. Each must fail compilation. |
+| Transition/checkpoint contract | All four families, seed 7, indices 0–5 | 24 cases. Require restart coverage, family-specific transition counts and a public checkpoint before subsequent traffic; admin grants must permit an edit and revocations must reject self-promotion before normal messaging. |
+| Strict socket canaries | Seed 7, index 0 for all four families, plus admin handoff indices 1–3 | Seven executions across five explicitly ignored tests; admin indices 0 and 2 cover one grant/revoke cycle, and indices 1 and 3 cover two cycles, in both restart variants. Each execution has a 360-second timeout and must complete with no expectation, invariant, weak-oracle or missing-behavior failures. |
+
+`tests/public_app_families.rs` covers deterministic replay, prefix stability, seeded workload variation and full
+app capability preflight for send/leave, membership re-entry, offline recovery and admin handoff. The admin family
+requires a delegated profile edit between every grant and revocation, with reopen on both sides across the catalog.
+Version 4 also requires a precise unauthorized self-promotion refusal after each revoke, with no public-state
+change or relay publication. The socket canary executes the revoke/reopen case and rejects a generic runtime
+error substituted for the expected authorization refusal.
+Explicit socket canaries execute through MarmotAppRuntime and per-participant SQLCipher databases. Their terminal
+oracle mutation checks reject loss, duplicate messages, wrong membership count, wrong profile, wrong admin set and
+divergent epochs. The public group checkpoint also rejects a same-size wrong roster and an epoch below the logical
+mutation lower bound while accepting equal extra maintenance epochs. Unsupported adapters fail capability preflight.
+These checks establish public behavior, not engine-private equivalence or exhaustive asynchronous schedules.
+
 ## Current Gaps
 
 - The shrinkable `HarnessIntent` strategy remains intentionally limited to send/leave. Invites and group-profile

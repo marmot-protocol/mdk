@@ -22,7 +22,8 @@ pub const STATEFUL_CHAT_JOURNEY_GENERATOR_VERSION: &str = "2";
 pub const PUBLIC_APP_SEND_LEAVE_FAMILY: &str = "public-app-send-leave/v1";
 pub const PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY: &str = "public-app-membership-reentry/v1";
 pub const PUBLIC_APP_OFFLINE_RECOVERY_FAMILY: &str = "public-app-offline-recovery/v1";
-pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "2";
+pub const PUBLIC_APP_ADMIN_HANDOFF_FAMILY: &str = "public-app-admin-handoff/v1";
+pub const PUBLIC_APP_JOURNEY_GENERATOR_VERSION: &str = "4";
 
 const CLIENTS: [&str; 4] = ["alice", "bob", "carol", "david"];
 
@@ -563,18 +564,27 @@ impl JourneyModel {
     }
 
     fn public_state_checkpoint(&mut self) {
-        for client in self
+        let clients = self
             .members
             .intersection(&self.online)
             .cloned()
-            .collect::<Vec<_>>()
-        {
-            self.eventually(crate::ScenarioPredicateV2::ClientState {
-                client,
-                epoch: Some(self.epoch),
-                member_count: Some(self.members.len()),
-            });
-        }
+            .collect::<Vec<_>>();
+        // Preserve the old aggregate allowance of 30 rounds per online member,
+        // but require every member to satisfy the state contract together.
+        let max_iterations = 30 * clients.len();
+        self.steps.push(ScenarioStep::Assert {
+            assertion: crate::ScenarioAssertionV2::Eventually {
+                predicate: crate::ScenarioPredicateV2::PublicGroupState {
+                    clients,
+                    members: self.members.iter().cloned().collect(),
+                    admins: self.admins.iter().cloned().collect(),
+                    name: self.group_name.clone(),
+                    description: self.group_description.clone(),
+                    minimum_epoch: self.epoch,
+                },
+                max_iterations,
+            },
+        });
     }
 
     fn public_delivered_payload_checkpoint(&mut self, payload: &str) {
@@ -617,7 +627,7 @@ impl JourneyModel {
         self.non_members.insert(client.into());
         self.epoch += 1;
         self.deliver_to_online();
-        // A leave publishes a request; the remaining administrator must apply
+        // A leave publishes a request; the remaining members must apply
         // it before we count later traffic as outside the departed membership.
         self.public_state_checkpoint();
     }
@@ -634,19 +644,11 @@ impl JourneyModel {
         });
         self.expected.push(TraceExpectation::ClientsConverged {
             clients: active.clone(),
-            epoch: Some(self.epoch),
+            epoch: None,
             member_count: Some(active.len()),
         });
         for client in &active {
             self.expected.extend([
-                TraceExpectation::ClientState {
-                    client: client.clone(),
-                    epoch: self.epoch,
-                    member_count: active.len(),
-                    received_payloads: None,
-                    added_members: None,
-                    removed_members: None,
-                },
                 TraceExpectation::GroupProfile {
                     client: client.clone(),
                     name: self.group_name.clone(),
@@ -750,6 +752,56 @@ pub fn generate_public_app_journey_case(
                     sender: "bob".into(),
                 });
             }
+        }
+        PUBLIC_APP_ADMIN_HANDOFF_FAMILY => {
+            for _ in 0..1 + case_index % 2 {
+                model.apply(JourneyAction::UpdateAdminPolicy {
+                    target: victim.clone(),
+                });
+                // The delegated member must exercise the permission, including
+                // after reopen, before the founder revokes it.
+                if (case_index / 2).is_multiple_of(2) {
+                    model.apply(JourneyAction::Restart {
+                        client: victim.clone(),
+                    });
+                }
+                model.apply(JourneyAction::UpdateProfile {
+                    actor: victim.clone(),
+                });
+                model.apply(JourneyAction::Send {
+                    sender: victim.clone(),
+                });
+                model.apply(JourneyAction::UpdateAdminPolicy {
+                    target: victim.clone(),
+                });
+                if !(case_index / 2).is_multiple_of(2) {
+                    model.apply(JourneyAction::Restart {
+                        client: victim.clone(),
+                    });
+                }
+                let refusal_step = model.steps.len();
+                let mut forbidden_admins = model.admins.clone();
+                forbidden_admins.insert(victim.clone());
+                model
+                    .steps
+                    .push(ScenarioStep::ExpectUpdateAdminPolicyError {
+                        client: victim.clone(),
+                        admins: forbidden_admins.into_iter().collect(),
+                        error: "not_group_admin".into(),
+                    });
+                model.expected.push(TraceExpectation::ExpectedError {
+                    step_index: refusal_step,
+                    client: victim.clone(),
+                    operation: "update_admin_policy".into(),
+                    error: "not_group_admin".into(),
+                });
+                model.public_state_checkpoint();
+                model.apply(JourneyAction::Send {
+                    sender: victim.clone(),
+                });
+            }
+            // Preserve the delegated profile in the terminal oracle. A later
+            // founder edit would hide a missing delegated profile projection.
         }
         _ => panic!("unregistered public app journey family: {family}"),
     }

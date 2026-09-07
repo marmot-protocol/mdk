@@ -244,10 +244,12 @@ own contracts. Every subsequent revision must pass the dedicated large recovery 
 
 ## Seeded public companion families
 
-The public send/leave, membership re-entry and small offline recovery families are documented in
+The public send/leave, membership re-entry, admin handoff and small offline recovery families are documented in
 [SCENARIOS.md](SCENARIOS.md#public-app-journey-families). Each input owns its public expectations; no engine
 assertions are stripped during replay. `Exactly` and bounded `Eventually` predicates now read public app epoch,
-member count and visible payload counts. Exact engine state and private pending work still fail capability preflight;
+member count and visible payload counts. Generator version 4 also checks exact expected public roster/admin/profile
+state jointly across online members, agreement on epoch and a logical-mutation epoch lower bound. It permits additional
+automatic-maintenance epochs. Exact engine state and private pending work still fail capability preflight;
 virtual-time `Within`/`Never` assertions remain unsupported. `Eventually` bounds tick rounds, not wall time; the
 campaign child deadline separately bounds a stuck runtime operation.
 
@@ -270,10 +272,10 @@ CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo run --release --locked -p cgk
 ```
 
 The input preserves the logical workload, assertions, family version and seed. It does not preserve cryptographic
-randomness or socket scheduling. These small generated cases do not close the known 1,024-message failure.
+randomness or socket scheduling. The separate 1,024-message regression remains its own required gate.
 
 
-### First generated execution results (2026-09-06)
+### First generated execution results (2026-09-06, before recovery fixes)
 
 Five isolated membership re-entry cases passed at seeds 7, 42 and 17001 (case 0 at seed 7; cases 0/1 at the other
 seeds). The maintained re-entry oracle mutation canary and all nine existing app-adapter tests passed. The updated
@@ -289,7 +291,7 @@ Source provenance, exact inputs, commands, reports and failure capsules are unde
 `target/public-app-families-20260906/`. Its `REPORT.md` separates initial harness failures, repeated delivery failures,
 oracle uncertainty and test passes. No full CI or production SQLCipher fix is claimed.
 
-### Four-message projection regression follow-up (2026-09-06)
+### Four-message projection regression follow-up (2026-09-06, before worker-budget fix)
 
 The saved offline seed-7/case-0 input now passes all 435 actions with zero expectation/invariant failures after
 an app projection fix. Every participant has all 11 messages at epoch 2; Bob retains them after reopen. The engine
@@ -341,6 +343,62 @@ assertion in Linux CI; without a native trace, its origin is unproven. Keep that
 recovery assertion failures and worker response timeouts.
 
 
+### Recovery checkpoint and next public coverage slice (2026-09-06)
+
+The later worker-budget fix and deferred-input barrier resolved the large public regression at checkpoint
+`fe395e8c` (PR #1711). Its validation ran all seven app journeys, including the 1,024-message case with complete
+delivery to all four participants, fresh messages and reopen persistence. The compact fixture preserves the original
+workload digest. Evidence is under `target/fixture-cleanup-20260906/`; earlier failures above are historical results.
+
+The next slice adds `public-app-admin-handoff/v1` and advances the public journey generator to version 3.
+Application actions and payloads retain their original meaning; checkpoints now assert public semantic state instead
+of predicting an exact epoch number. Existing saved version-1 inputs retain their original assertions on replay.
+Version 3 includes the parent's send-checkpoint optimization (full history is still checked at restart, reconnect
+and completion). Its distinct version avoids reusing the parent's version-2 generator identity.
+Production code and engine-private oracles are unchanged by this stacked slice.
+It covers one/two grant-edit-revoke cycles, reopen before delegated editing or after revocation, and continued
+messaging by the revoked administrator. Its explicit strict canary is:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false cargo test --release --locked -p cgka-conformance-simulator \
+  --test public_app_families public_admin_handoff_strict_canary -- --ignored --exact
+```
+
+The default contract tests include this family in replay, seed variation, prefix and capability checks. The socket
+canary also rejects a mutated terminal admin set, in addition to missing/duplicate payloads and wrong profile or
+membership count. Broader executed results and the preserved send/leave investigation are recorded under
+`target/public-app-slice2-20260906/`.
+
+The expanded version-1 runs exposed exact-epoch assertion failures in longer offline histories and repeated admin
+cycles as well as send/leave. The semantic checkpoints check the intended public state jointly before later traffic. The original
+send/leave case now waits until all three survivors agree at epoch 4, then verifies the profile change and complete
+delivery at epoch 5. It also checks the departed member receives no later messages. Saved version-1 failures remain
+available with their original contracts.
+
+Before integrating the parent PR review fixes, the version-2 isolated full-app matrix at `392969bc`
+passed **15/15** (these saved inputs retain their original contracts):
+
+| Family | Seed | Case indices | Result |
+| --- | --- | --- | --- |
+| Admin handoff | 17001 | 0–5 | 6/6 |
+| Offline recovery | 42 | 0–5 | 6/6 |
+| Send/leave | 7 | 0–1 | 2/2 |
+| Membership re-entry | 7 | 0 | 1/1 |
+
+Each run used production policy, public app calls, per-participant SQLCipher databases, real local relay sockets,
+fresh saved inputs and a 360-second isolated-worker deadline. All completed without timeouts, native crashes,
+artifact-integrity errors or missing oracle evidence. The report directory contains frozen binary/source hashes,
+commands and per-case public observations. `just fast-ci`, three generator/compiler contract tests, the seven-mutation
+public-state unit test, six compiler tests, 33 subject tests and the revised admin socket canary passed as well.
+The subject unit tests use their supported debug/test-policy configuration; full-app runs use production policy.
+
+After integrating parent checkpoint `097e9101`, generator version 3 passes all three public contracts,
+the send/restart checkpoint regression, the full-app admin-handoff canary (91.28 seconds), and `just fast-ci`.
+Logs are under `target/pr1711-review-20260906/`; the earlier 15-case matrix remains version-2 evidence.
+
+This coverage remains bounded to serialized journeys. Real relay rejection, partial publication fanout and invite
+delivery/retry faults remain separate next targets; preflight inventory does not establish those outcomes.
+
 ## Recovery implementation boundaries
 
 The durable deferred-generation barrier covers uncontested catch-up as well as competing branches: all admitted
@@ -366,3 +424,23 @@ Readiness now uses the storage backend's state-filtered query, excluding unrelat
 [#1715](https://github.com/marmot-protocol/mdk/issues/1715) covers payload-free readiness queries, preparation cost
 and repeated zero-attempt wake pressure. [#1716](https://github.com/marmot-protocol/mdk/issues/1716) covers fairness
 when the bounded SDK reconciliation cursor map evicts active routes.
+
+### CI recovery driver correction after #1711 merged
+
+The earlier #1713 CI run `34054398652` reached 256/1,024 messages and epoch 8 after 30 repair
+passes, with progress still occurring in its final passes. It failed the pass-count guard at 613 seconds,
+not the 900-second watchdog. The driver now keeps attempting within that unchanged watchdog.
+Exact payload/state equality, fresh traffic, restart persistence, and clean runtime closure are still required.
+This corrects premature test termination; it does not establish a preparation-time bound or claim to fix
+all large-backlog recovery failures (see #1715).
+
+
+### Revocation enforcement coverage
+
+Public journey generator version 4 adds a negative authorization probe after every delegated-admin revocation,
+including the revoke-then-reopen variant. The delegate attempts to promote itself through the public app; only
+`NotGroupAdmin` maps to the expected `not_group_admin` result. Busy workers, timeouts and storage errors cannot
+satisfy it. The harness pauses unrelated maintenance while checking that the attempt changes neither public
+protocol state nor relay publication count, then resumes maintenance and checks ordinary messaging still works.
+The strict admin-handoff canaries execute cases 0–3, including both one- and two-cycle handoffs in both restart
+variants; the saved version-3 inputs retain their earlier contracts.

@@ -206,6 +206,7 @@ pub fn generate_family_case(
 ) -> Result<GeneratedScenarioCase, UnsupportedGeneratedFamily> {
     let case = match family {
         crate::PUBLIC_APP_SEND_LEAVE_FAMILY
+        | crate::PUBLIC_APP_ADMIN_HANDOFF_FAMILY
         | crate::PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY
         | crate::PUBLIC_APP_OFFLINE_RECOVERY_FAMILY => {
             crate::generate_public_app_journey_case(family, seed, case_index)

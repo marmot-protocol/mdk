@@ -14,6 +14,7 @@ const FAMILIES: &[(&str, u64)] = &[
     ("public-app-send-leave/v1", 6),
     ("public-app-membership-reentry/v1", 6),
     ("public-app-offline-recovery/v1", 6),
+    ("public-app-admin-handoff/v1", 6),
     ("send-leave/v1", 12),
     ("convergence-e2e-delivery/v1", 12),
     ("convergence-chaos/v1", 12),

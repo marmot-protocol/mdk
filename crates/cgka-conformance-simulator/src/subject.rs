@@ -54,6 +54,7 @@ pub enum SubjectCapability {
     ProcessLifecycle,
     StorageFaultInjection,
     AssertionEvaluation,
+    PublicGroupStateObservation,
     MultiGroup,
     RetainedRelayHistory,
     RetainedRelayControl,
@@ -81,6 +82,7 @@ impl SubjectCapability {
             Self::ProcessLifecycle => "process_lifecycle",
             Self::StorageFaultInjection => "storage_fault_injection",
             Self::AssertionEvaluation => "assertion_evaluation",
+            Self::PublicGroupStateObservation => "public_group_state_observation",
             Self::MultiGroup => "multi_group",
             Self::RetainedRelayHistory => "retained_relay_history",
             Self::RetainedRelayControl => "retained_relay_control",
@@ -604,6 +606,12 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             )
         ) {
             capabilities.push(SubjectCapability::ExactConformanceObservation);
+        }
+        if matches!(
+            predicate,
+            Some(crate::ScenarioPredicateV2::PublicGroupState { .. })
+        ) {
+            capabilities.push(SubjectCapability::PublicGroupStateObservation);
         }
         return capabilities;
     }
@@ -2019,6 +2027,11 @@ impl ConvergenceSubject for EngineHarnessSubject {
     ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
         use crate::ScenarioPredicateV2;
         let (matched, actual) = match predicate {
+            ScenarioPredicateV2::PublicGroupState { .. } => {
+                return Err(SubjectError::unsupported(
+                    SubjectCapability::PublicGroupStateObservation,
+                ));
+            }
             ScenarioPredicateV2::ClientState {
                 client,
                 epoch,
