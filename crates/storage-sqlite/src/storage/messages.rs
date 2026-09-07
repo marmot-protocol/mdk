@@ -1764,6 +1764,62 @@ mod tests {
     }
 
     #[test]
+    fn pending_application_order_query_work() {
+        use rusqlite::StatementStatus;
+        use std::time::Instant;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 4096)
+             INSERT INTO pending_application_events(message_id, group_id, message_insert_order, record)
+             SELECT randomblob(16), randomblob(16), x, randomblob(128) FROM n",
+        )
+        .unwrap();
+        let legacy = "SELECT record FROM pending_application_events
+                      ORDER BY message_insert_order, message_id";
+        let indexed = "SELECT record FROM pending_application_events INDEXED BY
+                       idx_pending_application_events_order
+                       ORDER BY message_insert_order, message_id";
+        conn.execute_batch("DROP INDEX idx_pending_application_events_order")
+            .unwrap();
+        let mut measurements = Vec::new();
+        for (index, sql) in [legacy, indexed].into_iter().enumerate() {
+            if index == 1 {
+                conn.execute_batch(
+                    "CREATE INDEX idx_pending_application_events_order
+                     ON pending_application_events(message_insert_order, message_id)",
+                )
+                .unwrap();
+            }
+            let mut statement = conn.prepare(sql).unwrap();
+            let start = Instant::now();
+            for _ in 0..20 {
+                let rows = statement
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap();
+                assert_eq!(rows.count(), 4096);
+            }
+            measurements.push((
+                statement.get_status(StatementStatus::VmStep) / 20,
+                start.elapsed() / 20,
+            ));
+        }
+        eprintln!(
+            "pending application order: old={:?}, new={:?} (VM steps, elapsed)",
+            measurements[0], measurements[1]
+        );
+        assert_eq!(measurements[1].0 < measurements[0].0, true);
+        assert_eq!(measurements[1].0 * 2 < measurements[0].0, true);
+        assert_eq!(
+            conn.prepare(indexed)
+                .unwrap()
+                .get_status(StatementStatus::Sort),
+            0
+        );
+    }
+
+    #[test]
     fn processed_transport_ids_survive_marker_capacity_churn_and_cascade() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let group = sample_group(gid(1), 0, 0);
