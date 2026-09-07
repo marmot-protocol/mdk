@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   AgentControlEvent,
@@ -82,6 +82,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   resetMarmotInboundAccountsForTests();
   resetMarmotInboundRuntimeForTests();
 });
@@ -222,7 +223,7 @@ describe("startMarmotInbound", () => {
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]?.text.split("\n")).toHaveLength(32);
     expect(warnings).toContain(
-      "marmot: inbound debounce overloaded (reason=per_group_depth, active_groups=1, max_depth_per_group=32, max_tracked_groups=256)",
+      "marmot: inbound debounce overloaded (reason=per_key_depth, active_keys=1, max_depth_per_key=32, max_tracked_keys=256)",
     );
     expect(warnings.join(" ")).not.toContain(events[32]!.message.message_id_hex);
   });
@@ -640,7 +641,8 @@ describe("startMarmotInbound", () => {
     expect(cleared).toBe(1);
   });
 
-  it("dispatches distinct groups concurrently and keeps per-group FIFO order", async () => {
+  it("dispatches debounced distinct groups concurrently and keeps per-group FIFO order", async () => {
+    vi.useFakeTimers();
     const a1 = HEX32("d1");
     const a2 = HEX32("d2");
     const b1 = HEX32("d3");
@@ -649,7 +651,7 @@ describe("startMarmotInbound", () => {
     const gate = (id: string) => new Promise<void>((resolve) => gates.set(id, resolve));
 
     const api: InboundPluginApi = {
-      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false } } },
       logger: noopLogger,
     };
     const stop = startMarmotInbound(
@@ -659,25 +661,66 @@ describe("startMarmotInbound", () => {
         await gate(message.messageIdHex);
       },
       {
-        clientFactory: () =>
-          inboundStubClient([
-            inboundEvent("ca", "d1"), // group A, message 1
-            inboundEvent("ca", "d2"), // group A, message 2 (FIFO behind a1)
-            inboundEvent("cb", "d3"), // group B, message 1 (independent)
-          ]),
+        clientFactory: () => {
+          const secondGroupATurn = inboundEvent("ca", "d2");
+          secondGroupATurn.message.sender.account_id_hex = HEX32("bc");
+          return inboundStubClient([
+            inboundEvent("ca", "d1"), // group A, sender 1
+            secondGroupATurn, // group A, sender 2: separate debounce key, FIFO turn
+            inboundEvent("cb", "d3"), // group B (independent)
+          ]);
+        },
       },
     );
 
-    // A's first and B's first run concurrently; A's second must wait behind A's first.
-    await waitFor(() => started.includes(a1) && started.includes(b1));
+    await vi.advanceTimersByTimeAsync(10);
+    // A's first and B's first run concurrently; A's second remains FIFO behind A's first.
+    expect(started).toContain(a1);
+    expect(started).toContain(b1);
     expect(started).not.toContain(a2);
 
-    gates.get(a1)?.(); // release A's first -> A's second may start
-    await waitFor(() => started.includes(a2));
+    gates.get(a1)?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toContain(a2);
 
     gates.get(a2)?.();
     gates.get(b1)?.();
+    await vi.advanceTimersByTimeAsync(0);
     stop();
+  });
+
+  it("cancels a buffered debounce on stop and accepts the replay after restart", async () => {
+    vi.useFakeTimers();
+    const event = inboundEvent("cc", "d4");
+    const dispatched: MarmotInboundMessage[] = [];
+    const config = {
+      channels: { marmot: { debounceMs: 25, profileNameOnboarding: false } },
+    };
+    const firstStop = startMarmotInbound(
+      { config, logger: noopLogger },
+      (message) => {
+        dispatched.push(message);
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    firstStop();
+    await vi.advanceTimersByTimeAsync(25);
+    expect(dispatched).toHaveLength(0);
+
+    const secondStop = startMarmotInbound(
+      { config, logger: noopLogger },
+      (message) => {
+        dispatched.push(message);
+      },
+      { clientFactory: () => inboundStubClient([event]) },
+    );
+    await vi.advanceTimersByTimeAsync(25);
+    expect(dispatched.map((message) => message.messageIdHex)).toEqual([
+      event.message.message_id_hex,
+    ]);
+    secondStop();
   });
 });
 

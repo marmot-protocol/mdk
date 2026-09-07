@@ -143,6 +143,34 @@ describe("MarmotInboundBridge", () => {
     expect(calls).toBe(1);
   });
 
+  it("reports local submission failure without reporting a transport drop", async () => {
+    const id = HEX32("db");
+    const controller = new AbortController();
+    const client = {
+      async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+        yield inboundMessage(id);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        controller.abort();
+      },
+    } as unknown as InboundSubscribeClient;
+    const submissionErrors: unknown[] = [];
+    const transportErrors: unknown[] = [];
+    const bridge = new MarmotInboundBridge(client, {
+      reconnectDelayMs: 1,
+      onMessage: async () => {
+        throw new Error("local queue failure");
+      },
+      onSubmissionError: (error) => submissionErrors.push(error),
+      onError: (error) => transportErrors.push(error),
+    });
+
+    await bridge.run(controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(submissionErrors).toHaveLength(1);
+    expect(transportErrors).toHaveLength(0);
+  });
+
   it("delivers inbound messages, dedupes by id, and surfaces resync", async () => {
     const resync: AgentControlEvent = {
       type: "resync_required",

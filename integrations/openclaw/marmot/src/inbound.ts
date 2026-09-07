@@ -104,6 +104,8 @@ export interface MarmotInboundBridgeOptions {
   /** A durable mutation/group-state fact that must not trigger a turn. */
   onAmbientEvent?: (event: MarmotAmbientEvent) => void | Promise<void>;
   onResync?: (info: { droppedEvents: number }) => void | Promise<void>;
+  /** Local queue/debounce submission failure; does not imply transport loss. */
+  onSubmissionError?: (error: unknown) => void;
   onError?: (error: unknown) => void;
   /** Base reconnect delay (first attempt). Grows exponentially up to the cap. */
   reconnectDelayMs?: number;
@@ -296,7 +298,8 @@ export class MarmotInboundBridge {
       });
     } catch (error) {
       this.pending.delete(messageIdHex);
-      throw error;
+      this.options.onSubmissionError?.(error);
+      return;
     }
     const observeSubmission = (submission: void | MarmotInboundSubmission): void => {
       if (submission?.admission === "overloaded") {
@@ -323,7 +326,7 @@ export class MarmotInboundBridge {
         .catch((error: unknown) => {
           // Submission failed before an explicit admission result, so replay is safe.
           this.pending.delete(messageIdHex);
-          this.options.onError?.(error);
+          this.options.onSubmissionError?.(error);
         });
     } else {
       observeSubmission(await submitted);
