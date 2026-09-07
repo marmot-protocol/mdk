@@ -122,6 +122,11 @@ mod migration_0060_released_transport_receipts;
 mod migration_0061_transport_reconciliation_replay_cursor;
 #[path = "migrations/0062_chat_list_preview_indexes.rs"]
 mod migration_0062_chat_list_preview_indexes;
+#[path = "migrations/0063_query_indexes.rs"]
+mod migration_0063_query_indexes;
+#[cfg(test)]
+#[path = "migrations/query_work_tests.rs"]
+mod query_work_tests;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -447,6 +452,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0062_chat_list_preview_indexes",
         apply: migration_0062_chat_list_preview_indexes::apply,
     },
+    Migration {
+        version: 63,
+        name: "0063_query_indexes",
+        apply: migration_0063_query_indexes::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -665,6 +675,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const CRASH_CHILD_ENV: &str = "MDK_STORAGE_TEST_CRASH_CHILD";
+
     const CRASH_DATABASE_ENV: &str = "MDK_STORAGE_TEST_CRASH_DATABASE";
     const CRASH_READY_FILE_ENV: &str = "MDK_STORAGE_TEST_CRASH_READY_FILE";
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
@@ -678,6 +689,29 @@ mod tests {
         let tx = conn.transaction().unwrap();
         migration_0062_chat_list_preview_indexes::apply(&tx).unwrap();
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn seen_recency_index_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..62]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO seen_events(rowid, event_id, seen_at) VALUES
+             (2, 'old', 1), (5, 'tie-first', 9), (11, 'tie-last', 9);",
+        )
+        .unwrap();
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+        let mut statement = conn
+            .prepare("SELECT event_id FROM seen_events ORDER BY seen_at DESC, rowid DESC")
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids, ["tie-last", "tie-first", "old"]);
+        assert_eq!(statement.get_status(rusqlite::StatementStatus::Sort), 0);
     }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
@@ -1042,7 +1076,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 62,
+                found: 63,
                 latest_supported: 46,
             }
         ));
@@ -1098,7 +1132,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 62,
+                found: 63,
                 latest_supported: 46,
             }
         ));
@@ -1402,7 +1436,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 62,
+                found: 63,
                 latest_supported: 46,
             }
         ));
