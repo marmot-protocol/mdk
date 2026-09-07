@@ -3223,8 +3223,24 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .set_group_self_membership(group_id_hex, membership)?;
+        let storage = self.account_storage(&account.label)?;
+        // A voluntary departure stays voluntary. `Left` is written the moment
+        // this device publishes its leave; the commit that later realizes it
+        // is authored by a peer, and the roster-derived classification of
+        // that commit reads as an eviction. Now that peers apply a leave
+        // within seconds (mdk#1736) the two writes land back to back, so the
+        // eviction must never overwrite the recorded intent.
+        if membership == SelfMembership::Removed
+            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        {
+            tracing::debug!(
+                target: "marmot_app",
+                method = "set_group_self_membership",
+                "keeping voluntary Left classification over a realized removal"
+            );
+            return Ok(());
+        }
+        storage.set_group_self_membership(group_id_hex, membership)?;
         Ok(())
     }
 

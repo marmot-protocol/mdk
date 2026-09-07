@@ -2862,6 +2862,124 @@ async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_p
 }
 
 #[tokio::test]
+async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_publish() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("alice.sqlite3");
+        let key = storage_sqlite::SqlCipherKey::new("synthetic leave deadline key").unwrap();
+        let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+        let build = |storage| {
+            EngineBuilder::new(storage)
+                .legacy_compatibility_profile()
+                .identity(pad32(b"alice"))
+                .account_identity_proof_signer(proof_signer(b"alice"))
+                .feature_registry(selfremove_registry())
+                .peeler(Box::new(MockPeeler))
+                .convergence_clock(std::sync::Arc::new(clock.clone()))
+                .build()
+                .unwrap()
+        };
+        let mut alice = build(SqliteAccountStorage::open_encrypted(&database, &key).unwrap());
+        let mut bob = build_client(b"bob");
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "leave deadline".into(),
+                description: String::new(),
+                members: vec![bob.fresh_key_package().await.unwrap()],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } = created
+        else {
+            panic!("expected group creation");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None
+        );
+        let SendResult::Proposal { mut msg } = bob
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected SelfRemove proposal");
+        };
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+        assert_eq!(
+            bob.scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "the leaving device cannot commit its own departure"
+        );
+        alice.ingest(msg).await.unwrap();
+        if reopen {
+            // Drop the sole database owner; a clone would not test SQLCipher reopen.
+            drop(alice);
+            alice = build(SqliteAccountStorage::open_encrypted(&database, &key).unwrap());
+            alice.hydrate_all_stored_groups().unwrap();
+        }
+        assert_eq!(
+            alice.drain_pending_convergence_groups(),
+            vec![group_id.clone()]
+        );
+        let delay = alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap()
+            .expect("a processed SelfRemove must keep the runtime timer armed");
+        assert!((10..=50).contains(&delay));
+        clock.advance_ms(delay - 1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            Some(1)
+        );
+        clock.advance_ms(1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            Some(0)
+        );
+        alice.advance_convergence(&group_id).await.unwrap();
+        let mut publications = alice.drain_auto_publish();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "a staged auto-commit now awaits publication, not another lifecycle wakeup"
+        );
+        alice
+            .confirm_published(publications.remove(0).pending)
+            .await
+            .unwrap();
+        assert_eq!(alice.members(&group_id).unwrap().len(), 1);
+        assert_eq!(
+            alice
+                .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
 async fn selfremove_full_flow_with_auto_commit() {
     // MIP-03 end-to-end (post-§149):
     //   alice creates group with bob + carol, confirms; both join via welcome

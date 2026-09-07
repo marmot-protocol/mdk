@@ -1044,11 +1044,10 @@ async fn public_app_09_strict_concurrent_invite_and_rename_are_never_lost() {
     check(Journey::ConcurrentInviteAndRename { strict: true }).await;
 }
 
-// The engine schedules a peer's SelfRemove auto-commit within 50 ms, but the
-// app worker's convergence schedule has no arm for it, so survivors apply a
-// leave only when some other commit or timer runs convergence for the group.
+// The worker now arms the engine's pending SelfRemove deadline, respecting
+// collecting-pass and publication barriers. This ordinary 30-second regression
+// requires survivors to apply a leave without an unrelated commit or timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: survivors apply a voluntary leave only when another commit runs convergence"]
 async fn public_app_12_strict_leave_is_applied_by_survivors_promptly() {
     check(Journey::LeaveWithSeveralRemaining { strict: true }).await;
 }

@@ -2215,6 +2215,17 @@ where
         Ok(self.session.deferred_peel_cutoff_delay_ms(group_id)?)
     }
 
+    /// Milliseconds until a scheduled SelfRemove auto-commit for this group is
+    /// due; schedulers must keep a wakeup armed while this is `Some`.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<u64>> {
+        Ok(self
+            .session
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
+    }
+
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
     }

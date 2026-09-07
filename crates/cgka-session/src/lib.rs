@@ -1084,6 +1084,16 @@ impl AccountDeviceSession {
         Ok(self.engine.reissue_superseded_own_commits_from_state()?)
     }
 
+    /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<u64>> {
+        Ok(self
+            .engine
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
+    }
+
     pub fn confirm_regenerated_queued_intent(
         &mut self,
         intent: &QueuedIntentRef,
