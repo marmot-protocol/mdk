@@ -144,6 +144,18 @@ fn refused_as(error: &SubjectError, kind: &str) -> bool {
         && error.message.ends_with(&format!(": {kind}"))
 }
 
+/// Tick a device that may legitimately hold no projection of the active group
+/// yet: its Welcome is still in flight, or the invite never published one. The
+/// harness reports that state through its public member read as
+/// `unknown_group`, which is an expected outcome here, not a failure.
+async fn tick_possible_non_member(subject: &mut AppRuntimeHarness, client: &str) -> TestResult {
+    match subject.tick(&labels(&[client])).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_unknown_group(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Drive public catch-up until the named group's members all expose the
 /// expected timeline and shared state, or fail with the last observations.
 async fn expect_timeline(
@@ -495,12 +507,12 @@ async fn concurrent_invite_and_rename(
         .outcomes
         .iter()
         .any(|outcome| outcome.client == "alice" && outcome.accepted);
-    // Ticks accept the pending Welcome on the invitee's device once it arrives.
     // Membership is decided by the founders' settled roster, not by the
-    // inviter's success report.
-    subject
-        .tick(&labels(&["alice", "bob", "carol", "david"]))
-        .await?;
+    // inviter's success report. The invitee is progressed separately: until a
+    // Welcome reaches it, or if the rejected invite never published one, its
+    // device holds no group at all, which must not abort the journey.
+    subject.tick(&founders).await?;
+    tick_possible_non_member(subject, "david").await?;
     let founders_state = subject
         .await_observable_settlement(&founders, SETTLEMENT)
         .await?;
@@ -514,6 +526,25 @@ async fn concurrent_invite_and_rename(
         members.push("david".to_owned());
         // A late joiner is entitled to messages sent after admission only.
         expected.insert("david".into(), Vec::new());
+        // The founders can commit the add before the Welcome lands on the
+        // invitee's device; keep ticking it until it holds the group.
+        let deadline = tokio::time::Instant::now() + SETTLEMENT;
+        loop {
+            tick_possible_non_member(subject, "david").await?;
+            match subject.observations(&labels(&["david"])).await {
+                Ok(_) => break,
+                Err(error)
+                    if is_unknown_group(&error) && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => {
+                    return Err(
+                        format!("admitted invitee never received its Welcome: {error}").into(),
+                    );
+                }
+            }
+        }
     }
     let observations = subject
         .await_observable_settlement(&members, SETTLEMENT)
