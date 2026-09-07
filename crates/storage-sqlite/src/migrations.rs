@@ -671,6 +671,15 @@ mod tests {
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
 
+    #[test]
+    fn preview_indexes_are_repeatable() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut conn = store.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        migration_0062_chat_list_preview_indexes::apply(&tx).unwrap();
+        tx.commit().unwrap();
+    }
+
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
         let conn = store.lock().unwrap();
         let mut stmt = conn

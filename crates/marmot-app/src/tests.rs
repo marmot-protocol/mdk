@@ -16116,6 +16116,84 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
     assert!(row.source_message_id_hex.is_some());
 }
 
+/// A failed source write retains the accepted fanout for cleanup-only replay.
+#[tokio::test]
+async fn accepted_projection_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://projection-failure.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("projection failure", &[])
+        .await
+        .unwrap();
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_source_write
+         BEFORE UPDATE ON app_events
+         WHEN NEW.source_message_id_hex IS NOT NULL AND OLD.source_message_id_hex IS NULL
+         BEGIN SELECT RAISE(ABORT, 'injected source write failure'); END;",
+        )
+        .unwrap();
+    let attempts = relay.attempted_event_ids().len();
+    let summary = client
+        .send(&group_id, b"accepted despite projection failure")
+        .await
+        .expect("an accepted send must succeed despite source projection failure");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(
+        client.runtime.session().outbound_fanouts().unwrap().len(),
+        1
+    );
+    assert!(client.take_pending_convergence_groups().contains(&group_id));
+    connection
+        .execute_batch("DROP TRIGGER fail_source_write")
+        .unwrap();
+    client.retry_group_convergence(&group_id).await.unwrap();
+    assert!(
+        client
+            .runtime
+            .session()
+            .outbound_fanouts()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(relay.attempted_event_ids().len(), attempts + 1);
+    let row = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|row| row.message_id_hex == summary.message_ids[0])
+        .unwrap();
+    assert!(row.source_message_id_hex.is_some());
+}
+
 /// A resource refusal carried by a host-requested convergence retry must arm
 /// epoch-gap recovery even when that same pass's publish check fails it.
 ///

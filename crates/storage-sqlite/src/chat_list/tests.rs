@@ -157,64 +157,92 @@ fn setup_store() -> SqliteAccountStorage {
     setup_store_with_group(group())
 }
 
+/// Preview work stays bounded for accepted history and displaced pending sends.
 #[test]
 fn preview_query_work() {
     use rusqlite::StatementStatus;
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static PREVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static HIGH_WATER_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PREVIEW_STEPS: AtomicUsize = AtomicUsize::new(0);
+    static HIGH_WATER_STEPS: AtomicUsize = AtomicUsize::new(0);
 
-    let store = setup_store();
-    let mut seeded = 0;
-    for count in [100, 1_000] {
-        cgka_traits::StorageProvider::with_transaction(&store, |store| {
-            for index in seeded..count {
+    for direction in ["received", "sent"] {
+        let store = setup_store();
+        let mut seeded = 0;
+        let mut baseline = 0;
+        for count in [100, 1_000] {
+            cgka_traits::StorageProvider::with_transaction(&store, |store| {
+                for index in seeded..count {
+                    let mut event = chat(&format!("history-{index}"), REMOTE, index, "history");
+                    event.direction = direction.to_owned();
+                    if direction == "sent" {
+                        event.source_message_id_hex = None;
+                    }
+                    store.record_app_event(&event)?;
+                }
                 store.record_app_event(&chat(
-                    &format!("history-{index}"),
+                    &format!("accepted-{count}"),
                     REMOTE,
-                    index,
-                    "history",
+                    count,
+                    "latest",
                 ))?;
-            }
-            Ok::<_, cgka_traits::StorageError>(())
-        })
-        .unwrap();
-        seeded = count;
-        {
-            let conn = store.lock().unwrap();
-            conn.flush_prepared_statement_cache();
-            conn.trace_v2(
-                TraceEventCodes::SQLITE_TRACE_PROFILE,
-                Some(|event| {
-                    let TraceEvent::Profile(statement, _) = event else {
-                        return;
-                    };
-                    let sql = statement.sql();
-                    let counter = if sql.starts_with("SELECT preview.message_id_hex") {
-                        &PREVIEW_COUNT
-                    } else if sql.starts_with("SELECT accepted_source.insert_order") {
-                        &HIGH_WATER_COUNT
-                    } else {
-                        return;
-                    };
-                    assert_eq!(statement.get_status(StatementStatus::Sort), 0);
-                    assert!(statement.get_status(StatementStatus::VmStep) < 128);
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }),
-            );
-        }
-        store
-            .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+                Ok::<_, cgka_traits::StorageError>(())
+            })
             .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .trace_v2(TraceEventCodes::empty(), None);
+            seeded = count;
+            store
+                .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+                .unwrap();
+            {
+                let conn = store.lock().unwrap();
+                conn.flush_prepared_statement_cache();
+                conn.trace_v2(
+                    TraceEventCodes::SQLITE_TRACE_PROFILE,
+                    Some(|event| {
+                        let TraceEvent::Profile(statement, _) = event else {
+                            return;
+                        };
+                        let sql = statement.sql();
+                        let counter = if sql.starts_with("SELECT preview.message_id_hex") {
+                            &PREVIEW_STEPS
+                        } else if sql.starts_with("SELECT accepted_source.insert_order") {
+                            &HIGH_WATER_STEPS
+                        } else {
+                            return;
+                        };
+                        counter.store(
+                            statement.get_status(StatementStatus::VmStep) as usize,
+                            Ordering::Relaxed,
+                        );
+                    }),
+                );
+            }
+            let row = store
+                .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+                .unwrap()
+                .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .trace_v2(TraceEventCodes::empty(), None);
+            assert_eq!(
+                row.last_message.unwrap().message_id_hex,
+                format!("accepted-{count}")
+            );
+            let steps = PREVIEW_STEPS.load(Ordering::Relaxed);
+            eprintln!("direction={direction} count={count} preview_steps={steps}");
+            assert!(steps > 0 && steps < 512, "preview steps: {steps}");
+            assert!((1..128).contains(&HIGH_WATER_STEPS.load(Ordering::Relaxed)));
+            if baseline != 0 {
+                assert_eq!(
+                    steps, baseline,
+                    "retained history must not increase preview work"
+                );
+            }
+            baseline = steps;
+        }
     }
-    assert_eq!(PREVIEW_COUNT.load(Ordering::Relaxed), 2);
-    assert_eq!(HIGH_WATER_COUNT.load(Ordering::Relaxed), 2);
 }
 
 fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {

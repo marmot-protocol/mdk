@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
-CREATE INDEX idx_message_timeline_chat_preview
+CREATE INDEX IF NOT EXISTS idx_message_timeline_chat_preview
     ON message_timeline (
         group_id_hex,
         CASE
@@ -23,7 +23,7 @@ CREATE INDEX idx_message_timeline_chat_preview
         message_id_hex DESC
     );
 
-CREATE INDEX idx_app_events_group_insert_order
+CREATE INDEX IF NOT EXISTS idx_app_events_group_insert_order
     ON app_events (group_id_hex, insert_order DESC);
 "#,
     )

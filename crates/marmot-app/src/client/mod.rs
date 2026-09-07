@@ -3089,20 +3089,31 @@ impl AppClient {
         let source_state =
             published.map(|published| (published.source_epoch.0, published.retention));
         if should_project_locally {
-            let update = self.record_local_app_event_projection(
-                group_id,
-                &sender,
-                &event,
-                source_message_id_hex,
-                source_state,
-                published.is_some(),
-            )?;
-            on_local_projection(update);
-            self.prune_plaintext_retention_for_group(group_id)?;
+            let projection = (|| {
+                let update = self.record_local_app_event_projection(
+                    group_id,
+                    &sender,
+                    &event,
+                    source_message_id_hex,
+                    source_state,
+                    published.is_some(),
+                )?;
+                on_local_projection(update);
+                self.prune_plaintext_retention_for_group(group_id)
+            })();
+            if let Err(error) = projection {
+                self.pending_convergence_groups.insert(group_id.clone());
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_kind = error.privacy_safe_kind(),
+                    "accepted application-message projection deferred",
+                );
+            }
         }
-        // The current row already has its source and retention. Finalization
-        // now skips its duplicate projection, acknowledges the durable send,
-        // and forwards updates for any siblings published in the same pass.
+        // Finalization skips an already-completed local projection, repairs
+        // failed source writes, and forwards sibling updates before retiring
+        // the accepted fanouts.
         let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         self.pending_projection_updates.extend(finalize_updates);
         // A send that lands while inbound convergence input is retained folds

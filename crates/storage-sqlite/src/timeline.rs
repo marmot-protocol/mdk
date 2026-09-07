@@ -1716,7 +1716,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
 ) -> StorageResult<()> {
     let activity_filter = crate::chat_list::chat_list_activity_filter_sql("preview.");
     let preview_order = crate::chat_list::chat_list_preview_order_desc("preview.");
-    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.");
+    let preview_eligibility = crate::chat_list::chat_list_preview_eligibility_sql("preview.", "?1");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
                 preview.kind, preview.timeline_at, preview.deleted,
@@ -1727,7 +1727,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                     WHEN preview.source_message_id_hex IS NULL THEN 'pending'
                     ELSE 'delivered'
                 END
-         FROM message_timeline AS preview
+         FROM message_timeline AS preview NOT INDEXED
          WHERE preview.group_id_hex = ?1
            AND {activity_filter}
            AND {preview_eligibility}
