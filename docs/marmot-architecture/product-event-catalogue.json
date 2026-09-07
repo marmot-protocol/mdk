@@ -1,0 +1,1939 @@
+{
+  "revision": "mdk-product-v1",
+  "policy": "usage-diagnostics-v1",
+  "count_buckets": [
+    "0",
+    "1",
+    "2",
+    "3_5",
+    "6_10",
+    "11_20",
+    "21_50",
+    "51_100",
+    "101_250",
+    "251_1000",
+    "1001_plus"
+  ],
+  "duration_upper_bounds_ms": [
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2000,
+    5000,
+    10000,
+    30000,
+    60000,
+    300000,
+    900000,
+    3600000
+  ],
+  "common_properties": [
+    "schema_version",
+    "device_class",
+    "host_surface",
+    "environment"
+  ],
+  "events": [
+    {
+      "name": "mdk_runtime_summary",
+      "owner": "marmot-app runtime lifecycle and app-performance completion",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "startup",
+          "resume",
+          "readiness",
+          "catch_up",
+          "shutdown",
+          "coverage",
+          "overflow"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ],
+        "activity": [
+          "foreground",
+          "background"
+        ]
+      },
+      "purpose": "Understand opted-in runtime activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_account_summary",
+      "owner": "marmot-app account setup and sign-out",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "create",
+          "import",
+          "external_signer",
+          "login",
+          "logout",
+          "switch",
+          "profile_update",
+          "local_ready",
+          "network_ready"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in account activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_key_package_summary",
+      "owner": "marmot-app AppClient KeyPackage operations",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample; lookup/action is one canonical member-resolution command; lookup/attempt is one package validation, with explicit lifetime classification",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "generate",
+          "publish",
+          "rotate",
+          "retire",
+          "lookup"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in keypackage activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_group_summary",
+      "owner": "marmot-app authoritative group command completion",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "create",
+          "accept_invite",
+          "decline_invite",
+          "invite",
+          "remove_members",
+          "leave",
+          "delete",
+          "archive",
+          "unarchive",
+          "profile_update",
+          "image_update",
+          "promote_admin",
+          "demote_admin",
+          "disband",
+          "retention"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in group activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_welcome_summary",
+      "owner": "marmot-app Welcome publication and retry completion",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample; publish/transition counts successful removal of a live pending repair obligation; startup index reconciliation is silent; retry/attempt is one bounded retry invocation",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "publish",
+          "retry",
+          "process"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in welcome activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_message_action_summary",
+      "owner": "AppClient::send_app_event_with_local_projection",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample; publication/transition is emitted once when outgoing source-retention finalization commits, including pending/unknown recovery",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "text",
+          "reply",
+          "reaction",
+          "unreact",
+          "edit",
+          "delete",
+          "media",
+          "custom",
+          "publication"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in messageaction activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_message_processing_summary",
+      "owner": "AppClient::ingest_delivery",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "receive",
+          "duplicate",
+          "deferred",
+          "invalidation",
+          "failure"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in messageprocessing activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_media_summary",
+      "owner": "complete_media_http and reviewed media stage completion",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "upload",
+          "download",
+          "cancel",
+          "cache_hit",
+          "failover",
+          "integrity",
+          "decrypt",
+          "group_image"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ],
+        "media_kind": [
+          "image",
+          "video",
+          "audio",
+          "document",
+          "other"
+        ]
+      },
+      "purpose": "Understand opted-in media activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_directory_summary",
+      "owner": "marmot-app directory methods",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "profile",
+          "follows",
+          "relay_list",
+          "key_package",
+          "search",
+          "follow",
+          "unfollow",
+          "publish"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ],
+        "source": [
+          "cache",
+          "network",
+          "mixed"
+        ]
+      },
+      "purpose": "Understand opted-in directory activity and reliability without content or identity Source is the resolution path (cache/network), not an endpoint; successful fallback may still follow a network attempt.",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_notification_summary",
+      "owner": "marmot-app notification state and push publication",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "register",
+          "update",
+          "remove",
+          "trigger",
+          "schedule",
+          "mute",
+          "unmute",
+          "enable",
+          "disable"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in notification activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_sync_summary",
+      "owner": "app-performance classified sync result",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "initial",
+          "foreground",
+          "background",
+          "reconnect",
+          "full_history"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ],
+        "failure_stage": [
+          "transport_activation",
+          "group_subscription_sync",
+          "relay_receive",
+          "cgka_ingest",
+          "state_persist",
+          "account_worker",
+          "unknown"
+        ],
+        "error_class": [
+          "timeout",
+          "transport_closed",
+          "relay_directory",
+          "protocol",
+          "crypto",
+          "storage",
+          "cancelled",
+          "unknown",
+          "storage_busy",
+          "storage_corruption",
+          "storage_capacity"
+        ]
+      },
+      "purpose": "Understand opted-in sync activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_connectivity_summary",
+      "owner": "app-performance transport activation and runtime connectivity",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "availability",
+          "connect",
+          "reconnect",
+          "publish_quorum"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in connectivity activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_recovery_summary",
+      "owner": "run_pending_epoch_backfill_reporting_arm and AppClient recovery",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "quarantine",
+          "hydration",
+          "invalidation",
+          "revalidation",
+          "unrecoverable",
+          "pending_commit",
+          "convergence",
+          "backfill",
+          "overflow"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in recovery activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_maintenance_summary",
+      "owner": "AccountDeviceRuntime persisted phases, AppClient::run_due_maintenance, retention sweep",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "sweep",
+          "self_update",
+          "key_package",
+          "retention",
+          "deferred",
+          "capacity",
+          "pending",
+          "catch_up",
+          "ambiguous",
+          "failed"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in maintenance activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_storage_summary",
+      "owner": "app-performance account open and terminal close",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "open",
+          "migration",
+          "recovery",
+          "corruption",
+          "capacity",
+          "busy",
+          "close"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in storage activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_agent_summary",
+      "owner": "agent-connector logical leader and background operations",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "bootstrap",
+          "readiness",
+          "control",
+          "control_read",
+          "control_write",
+          "control_preview",
+          "final_message",
+          "replay",
+          "invite_policy"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in agent activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_stream_summary",
+      "owner": "marmot-app stream submission and connector preview lifecycle",
+      "trigger": "authoritative completion, persisted transition, or window-close state sample",
+      "units": [
+        "action",
+        "attempt",
+        "transition",
+        "backlog",
+        "coverage"
+      ],
+      "properties": {
+        "operation": [
+          "start",
+          "watch",
+          "finalize",
+          "cancel",
+          "first_preview",
+          "disconnect",
+          "overflow",
+          "integrity"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "confirmed",
+          "unknown",
+          "rejected",
+          "deferred",
+          "no_work_due",
+          "performed",
+          "cancelled",
+          "timeout",
+          "network",
+          "storage",
+          "capacity",
+          "invalid",
+          "unsupported",
+          "not_ready",
+          "empty",
+          "cache",
+          "none",
+          "partial",
+          "available",
+          "duplicate",
+          "usable",
+          "absent",
+          "expired",
+          "unavailable"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ],
+        "count_bucket": [
+          "0",
+          "1",
+          "2",
+          "3_5",
+          "6_10",
+          "11_20",
+          "21_50",
+          "51_100",
+          "101_250",
+          "251_1000",
+          "1001_plus"
+        ],
+        "partial": [
+          "true",
+          "false"
+        ],
+        "unit": [
+          "action",
+          "attempt",
+          "transition",
+          "backlog",
+          "coverage"
+        ]
+      },
+      "purpose": "Understand opted-in stream activity and reliability without content or identity",
+      "mode": "aggregate"
+    },
+    {
+      "name": "mdk_session_started",
+      "mode": "journey",
+      "properties": {
+        "launch_reason": [
+          "ordinary",
+          "notification",
+          "deep_link"
+        ]
+      },
+      "owner": "marmot-app collector",
+      "trigger": "first opted-in foreground activity after session rotation",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "mdk_runtime_ready",
+      "mode": "journey",
+      "properties": {
+        "outcome": [
+          "success",
+          "failure"
+        ],
+        "duration_bucket": [
+          "le_10ms",
+          "le_25ms",
+          "le_50ms",
+          "le_100ms",
+          "le_250ms",
+          "le_500ms",
+          "le_1s",
+          "le_2s",
+          "le_5s",
+          "le_10s",
+          "le_30s",
+          "le_1m",
+          "le_5m",
+          "le_15m",
+          "le_60m",
+          "gt_60m"
+        ]
+      },
+      "owner": "host readiness observation",
+      "trigger": "first opted-in local readiness result per session",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "mdk_onboarding_step",
+      "mode": "journey",
+      "properties": {
+        "step": [
+          "start",
+          "identity_selection",
+          "local_ready",
+          "network_ready",
+          "complete"
+        ],
+        "path": [
+          "create",
+          "import",
+          "external_signer"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "cancelled"
+        ]
+      },
+      "owner": "host onboarding observation",
+      "trigger": "first observed step during opted-in foreground session",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "app_screen_viewed",
+      "mode": "journey",
+      "properties": {
+        "screen": [
+          "onboarding",
+          "inbox",
+          "conversation",
+          "directory",
+          "compose",
+          "group_details",
+          "settings",
+          "diagnostics",
+          "agent"
+        ]
+      },
+      "owner": "host UI",
+      "trigger": "first visit to an approved screen per session",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "app_compose",
+      "mode": "aggregate",
+      "properties": {
+        "action": [
+          "open",
+          "cancel"
+        ]
+      },
+      "owner": "host UI",
+      "trigger": "compose opened or cancelled",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "app_message_search",
+      "mode": "aggregate",
+      "properties": {
+        "outcome": [
+          "success",
+          "empty",
+          "failure",
+          "cancelled"
+        ]
+      },
+      "owner": "host UI",
+      "trigger": "search completion without search terms",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "app_attachment",
+      "mode": "aggregate",
+      "properties": {
+        "action": [
+          "picker",
+          "open",
+          "save"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "cancelled"
+        ]
+      },
+      "owner": "host UI",
+      "trigger": "attachment interaction outcome without names or sizes",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "app_settings",
+      "mode": "aggregate",
+      "properties": {
+        "section": [
+          "appearance",
+          "notifications",
+          "privacy",
+          "account",
+          "storage",
+          "diagnostics"
+        ]
+      },
+      "owner": "host UI",
+      "trigger": "approved settings section interaction",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    },
+    {
+      "name": "app_notification_permission",
+      "mode": "aggregate",
+      "properties": {
+        "outcome": [
+          "granted",
+          "denied",
+          "restricted",
+          "provisional"
+        ]
+      },
+      "owner": "host UI",
+      "trigger": "native notification permission result",
+      "units": [
+        "action"
+      ],
+      "purpose": "Measure the observed opted-in journey or approved feature interaction"
+    }
+  ],
+  "duration_buckets": [
+    "le_10ms",
+    "le_25ms",
+    "le_50ms",
+    "le_100ms",
+    "le_250ms",
+    "le_500ms",
+    "le_1s",
+    "le_2s",
+    "le_5s",
+    "le_10s",
+    "le_30s",
+    "le_1m",
+    "le_5m",
+    "le_15m",
+    "le_60m",
+    "gt_60m"
+  ]
+}

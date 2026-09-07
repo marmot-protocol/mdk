@@ -1652,8 +1652,8 @@ pub enum RelayExportError {
     #[cfg(feature = "otlp-export")]
     #[error("relay telemetry export authorization token is not configured")]
     MissingAuthorizationToken,
-    /// The OTLP push could not be sent.
-    #[cfg(feature = "otlp-export")]
+    /// The collector request could not be sent.
+    #[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
     #[error("relay telemetry export request failed to send")]
     Request,
     /// The collector returned a non-success status.
@@ -1673,8 +1673,15 @@ impl MarmotRelayPlane {
     /// never sent over a non-TLS transport.
     pub fn telemetry_exporter(
         &self,
-        config: RelayTelemetryExportConfig,
+        mut config: RelayTelemetryExportConfig,
+        permit: crate::DiagnosticsPermit,
     ) -> Option<RelayTelemetryExporter> {
+        if let Some(resource) = &mut config.resource {
+            resource.service_instance_id = permit.diagnostic_id.clone();
+        }
+        if !permit.valid() {
+            return None;
+        }
         if !config.export_allowed() {
             if config.enabled {
                 // Opted in but the URL/auth/resource gate is incomplete: fail
@@ -1691,9 +1698,18 @@ impl MarmotRelayPlane {
         Some(RelayTelemetryExporter {
             relay_plane: self.clone(),
             config,
-            started_at: std::time::SystemTime::now(),
+            permit,
+            baseline: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
+struct ExportCollectionPeriod {
+    started: std::time::SystemTime,
+    baseline: RelayTelemetryExportBatch,
+    previous: RelayTelemetryExportBatch,
 }
 
 /// Opt-in exporter that pushes relay telemetry to a first-party OTLP collector.
@@ -1701,12 +1717,11 @@ impl MarmotRelayPlane {
 /// Only constructed by [`MarmotRelayPlane::telemetry_exporter`] when opted in.
 #[derive(Clone)]
 pub struct RelayTelemetryExporter {
+    permit: crate::DiagnosticsPermit,
+    #[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
+    baseline: std::sync::Arc<std::sync::Mutex<Option<ExportCollectionPeriod>>>,
     relay_plane: MarmotRelayPlane,
     config: RelayTelemetryExportConfig,
-    /// Collection start, used as the cumulative `start_time` for OTLP points.
-    /// Only read by the feature-gated OTLP push.
-    #[cfg_attr(not(feature = "otlp-export"), allow(dead_code))]
-    started_at: std::time::SystemTime,
 }
 
 impl RelayTelemetryExporter {
@@ -1733,6 +1748,9 @@ impl RelayTelemetryExporter {
         engine: Option<EngineReorgMetrics>,
         app_performance: Option<AppPerformanceSnapshot>,
     ) -> RelayTelemetryExportBatch {
+        if !self.permit.valid() {
+            return RelayTelemetryExportBatch::default();
+        }
         let rollup = self.relay_plane.telemetry_rollup(engine).await;
         // The exporter only exists when opted in, so resolution is always
         // available here; default to an empty resolution defensively.
@@ -1746,7 +1764,7 @@ impl RelayTelemetryExporter {
 }
 
 #[cfg(feature = "otlp-export")]
-mod host_safety;
+use crate::collector_host_safety as host_safety;
 
 #[cfg(feature = "otlp-export")]
 mod otlp {
@@ -1928,6 +1946,7 @@ mod otlp {
         resource: &RelayTelemetryResource,
         authorization_bearer_token: &str,
         started_at: SystemTime,
+        permit: &crate::DiagnosticsPermit,
     ) -> Result<(), RelayExportError> {
         push_with_resolver(
             batch,
@@ -1936,6 +1955,7 @@ mod otlp {
             authorization_bearer_token,
             started_at,
             host_safety::system_resolve,
+            Some(permit),
         )
         .await
     }
@@ -1947,6 +1967,7 @@ mod otlp {
         authorization_bearer_token: &str,
         started_at: SystemTime,
         resolver: F,
+        permit: Option<&crate::DiagnosticsPermit>,
     ) -> Result<(), RelayExportError>
     where
         F: FnOnce(String, u16) -> Fut,
@@ -1954,7 +1975,11 @@ mod otlp {
     {
         // Include our explicit DNS lookup in the overall attempt deadline.
         tokio::time::timeout(REQUEST_TIMEOUT, async {
-            let pin = host_safety::resolve_with(metrics_url, resolver).await?;
+            if permit.is_some_and(|p|!p.valid()) { return Err(RelayExportError::Request); }
+            let pin = if let Some(permit)=permit {
+                tokio::select! { biased; _=permit.cancelled()=>return Err(RelayExportError::Request), result=host_safety::resolve_with(metrics_url,resolver)=>result? }
+            } else { host_safety::resolve_with(metrics_url,resolver).await? };
+            if permit.is_some_and(|p|!p.valid()) { return Err(RelayExportError::Request); }
             let client = pin.build_client()?;
             let request = to_request(
                 batch,
@@ -1963,14 +1988,15 @@ mod otlp {
                 unix_nano(SystemTime::now()),
             );
             let body = request.encode_to_vec();
-            let response = client
+            let request = client
                 .post(pin.url)
                 .header("content-type", "application/x-protobuf")
                 .bearer_auth(authorization_bearer_token)
-                .body(body)
-                .send()
-                .await
-                .map_err(|_| RelayExportError::Request)?;
+                .body(body);
+            if permit.is_some_and(|p|!p.valid()) { return Err(RelayExportError::Request); }
+            let response=if let Some(permit)=permit {
+                tokio::select! {biased; _=permit.cancelled()=>return Err(RelayExportError::Request), result=request.send()=>result}
+            } else {request.send().await}.map_err(|_|RelayExportError::Request)?;
             if !response.status().is_success() {
                 return Err(RelayExportError::Status(response.status().as_u16()));
             }
@@ -2022,6 +2048,7 @@ mod otlp {
                     "bearer-secret",
                     SystemTime::now(),
                     |_, _| async { Ok(vec![addr.ip()]) },
+                    None,
                 )
                 .await;
                 let error = result.unwrap_err();
@@ -2054,7 +2081,11 @@ mod otlp {
                 ..Default::default()
             };
             let plane = crate::MarmotRelayPlane::full_history();
-            assert!(plane.telemetry_exporter(complete.clone()).is_some());
+            assert!(
+                plane
+                    .telemetry_exporter(complete.clone(), crate::product_analytics::test_permit())
+                    .is_some()
+            );
             for case in 0..7 {
                 let mut config = complete.clone();
                 match case {
@@ -2068,7 +2099,11 @@ mod otlp {
                 }
                 // Construction is the only entrance to export; no exporter
                 // exists on these paths to invoke a DNS resolver or HTTP push.
-                assert!(plane.telemetry_exporter(config).is_none());
+                assert!(
+                    plane
+                        .telemetry_exporter(config, crate::product_analytics::test_permit())
+                        .is_none()
+                );
             }
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
@@ -2239,6 +2274,14 @@ impl RelayTelemetryExporter {
         engine: Option<EngineReorgMetrics>,
         app_performance: Option<AppPerformanceSnapshot>,
     ) -> Result<usize, RelayExportError> {
+        if !self.permit.valid()
+            || self
+                .permit
+                .telemetry_rejected
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(RelayExportError::Request);
+        }
         let endpoint = self
             .config
             .endpoint
@@ -2254,18 +2297,61 @@ impl RelayTelemetryExporter {
             .authorization_bearer_token
             .as_deref()
             .ok_or(RelayExportError::MissingAuthorizationToken)?;
-        let batch = self
-            .build_batch_with_app_performance(engine, app_performance)
-            .await;
+        // Baseline every source series before resolving export labels. A relay whose
+        // label becomes available later must not expose its pre-consent history.
+        let rollup = self.relay_plane.telemetry_rollup(engine).await;
+        let internal_labels = RelayLabelResolution::from_pairs(rollup.relays.iter().map(|relay| {
+            (
+                RelayIndex(relay.relay_index),
+                cgka_traits::TransportEndpoint(relay.relay_index.to_string()),
+            )
+        }));
+        let raw_batch = build_export_batch_with_app_performance(
+            &rollup,
+            &internal_labels,
+            app_performance.as_ref(),
+        );
+        let (mut batch, started_at) = self.since_baseline(raw_batch);
+        if !self.permit.valid() {
+            return Err(RelayExportError::Request);
+        }
+        let resolution = self
+            .relay_plane
+            .resolve_relay_labels(&self.config)
+            .await
+            .unwrap_or_default();
+        batch.points.retain_mut(|point| {
+            let Some(index) = point.relay.as_deref() else {
+                return true;
+            };
+            let Some(endpoint) = index
+                .parse()
+                .ok()
+                .and_then(|index| resolution.label_for(RelayIndex(index)))
+            else {
+                return false;
+            };
+            point.relay = Some(endpoint.0.clone());
+            true
+        });
+        if !self.permit.valid() {
+            return Err(RelayExportError::Request);
+        }
         let count = batch.len();
         otlp::push(
             &batch,
             &endpoint,
             resource,
             authorization_bearer_token,
-            self.started_at,
+            started_at,
+            &self.permit,
         )
-        .await?;
+        .await
+        .inspect_err(|error| {
+            if matches!(error, RelayExportError::Status(400 | 401 | 403 | 404 | 422)) {
+                self.permit.reject_telemetry();
+            }
+        })?;
         tracing::debug!(
             target: "marmot_app::relay_telemetry_export",
             method = "export_once",
@@ -2309,6 +2395,9 @@ impl RelayTelemetryExporter {
             .await
             {
                 Ok(Ok(count)) => return Ok(count),
+                Ok(Err(err @ RelayExportError::Status(400 | 401 | 403 | 404 | 422))) => {
+                    return Err(err);
+                }
                 Ok(Err(err)) => last_error = Some(err),
                 Err(_) => last_error = Some(RelayExportError::Request),
             }
@@ -2367,8 +2456,17 @@ impl RelayTelemetryExporter {
             );
         }
         loop {
+            if !self.permit.valid()
+                || self
+                    .permit
+                    .telemetry_rejected
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
             let delay = jittered_export_interval(self.config.interval);
             tokio::select! {
+                _ = self.permit.cancelled()=>break,
                 _ = tokio::time::sleep(delay) => {
                     if self
                         .export_once_with_retries_and_app_performance(
@@ -2400,3 +2498,124 @@ impl RelayTelemetryExporter {
 
 #[cfg(test)]
 mod tests;
+
+impl RelayTelemetryExporter {
+    /// Keep local lifetime measurements intact; each exporter has its own collection epoch.
+    #[cfg(any(test, feature = "otlp-export"))]
+    fn since_baseline(
+        &self,
+        current: RelayTelemetryExportBatch,
+    ) -> (RelayTelemetryExportBatch, std::time::SystemTime) {
+        let mut state = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = state.as_ref().is_some_and(|period| {
+            current.points.iter().any(|point| {
+                period
+                    .previous
+                    .points
+                    .iter()
+                    .chain(period.baseline.points.iter())
+                    .find(|old| {
+                        old.name == point.name
+                            && old.relay == point.relay
+                            && old.failure == point.failure
+                    })
+                    .is_some_and(|old| metric_reset(&point.value, &old.value))
+            })
+        });
+        if state.is_none() || reset {
+            *state = Some(ExportCollectionPeriod {
+                started: std::time::SystemTime::now(),
+                baseline: current.clone(),
+                previous: current.clone(),
+            });
+        }
+        let period = state.as_mut().expect("initialized export baseline");
+        let started = period.started;
+        period.previous = current.clone();
+        let baseline = &period.baseline;
+        let mut output = current.clone();
+        for point in &mut output.points {
+            let old = baseline.points.iter().find(|old| {
+                old.name == point.name && old.relay == point.relay && old.failure == point.failure
+            });
+            // A series first observed during this period has no pre-consent history.
+            let Some(old) = old else { continue };
+            match (&mut point.value, &old.value) {
+                (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => {
+                    *value -= base
+                }
+                (ExportMetricValue::Histogram(value), ExportMetricValue::Histogram(base)) => {
+                    for (count, base) in value.bucket_counts.iter_mut().zip(&base.bucket_counts) {
+                        *count -= base;
+                    }
+                    value.overflow_count -= base.overflow_count;
+                    value.sum_ms -= base.sum_ms;
+                }
+                _ => {}
+            }
+        }
+        let counters = output.points.clone();
+        for point in &mut output.points {
+            if point.name == metric_names::OBSERVED_REORG_RATE {
+                let count = |name| {
+                    counters
+                        .iter()
+                        .find_map(|p| match p.value {
+                            ExportMetricValue::Counter(v) if p.name == name => Some(v),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                };
+                let settles = count(metric_names::SETTLES);
+                let reorgs = count(metric_names::POST_SETTLE_REORGS);
+                point.value = ExportMetricValue::Gauge(if settles == 0 {
+                    0.0
+                } else {
+                    reorgs as f64 / settles as f64
+                });
+            }
+            if point.name == metric_names::FIRST_DELIVERER_RATE {
+                let count = |name| {
+                    counters
+                        .iter()
+                        .find_map(|p| match p.value {
+                            ExportMetricValue::Counter(v)
+                                if p.name == name && p.relay == point.relay =>
+                            {
+                                Some(v)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                };
+                let total = count(metric_names::DELIVERY_COUNT);
+                let redundant = count(metric_names::REDUNDANT_COUNT);
+                point.value = ExportMetricValue::Gauge(if total == 0 {
+                    0.0
+                } else {
+                    total.saturating_sub(redundant) as f64 / total as f64
+                });
+            }
+        }
+        (output, started)
+    }
+}
+#[cfg(any(test, feature = "otlp-export"))]
+fn metric_reset(value: &ExportMetricValue, baseline: &ExportMetricValue) -> bool {
+    match (value, baseline) {
+        (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => value < base,
+        (ExportMetricValue::Histogram(value), ExportMetricValue::Histogram(base)) => {
+            value.bounds_ms != base.bounds_ms
+                || value.bucket_counts.len() != base.bucket_counts.len()
+                || value.sum_ms < base.sum_ms
+                || value.overflow_count < base.overflow_count
+                || value
+                    .bucket_counts
+                    .iter()
+                    .zip(&base.bucket_counts)
+                    .any(|(v, b)| v < b)
+        }
+        (ExportMetricValue::Gauge(_), ExportMetricValue::Gauge(_)) => false,
+        _ => true,
+    }
+}

@@ -12385,11 +12385,13 @@ fn telemetry_install_id_is_stable_uuid_per_app_root() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
+    assert!(app.telemetry_install_id().is_err());
+    app.set_usage_diagnostics_consent(true).unwrap();
     let first = app.telemetry_install_id().unwrap();
     let second = app.telemetry_install_id().unwrap();
-    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .telemetry_install_id()
-        .unwrap();
+    let other = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    other.restore_usage_diagnostics().unwrap();
+    let reopened = other.telemetry_install_id().unwrap();
 
     assert_eq!(first, second);
     assert_eq!(first, reopened);
@@ -12413,6 +12415,8 @@ fn relay_telemetry_settings_persist_in_shared_storage() {
         export_enabled: true,
         export_interval_seconds: 30,
     };
+    assert!(app.set_relay_telemetry_settings(updated.clone()).is_err());
+    app.set_usage_diagnostics_consent(true).unwrap();
     let stored = app.set_relay_telemetry_settings(updated).unwrap();
 
     assert_eq!(
@@ -12434,6 +12438,7 @@ fn relay_telemetry_settings_persist_in_shared_storage() {
     );
 
     let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    reopened.restore_usage_diagnostics().unwrap();
     assert_eq!(reopened.relay_telemetry_settings().unwrap(), stored);
 }
 
@@ -15849,6 +15854,18 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://mixed-publish.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    #[cfg(feature = "product-analytics-export")]
+    let app = {
+        let mut app = app;
+        app.product_analytics = crate::product_analytics::test_product_collector();
+        app
+    };
+    #[cfg(feature = "product-analytics-export")]
+    let _analytics_runtime = {
+        let runtime = app.runtime();
+        runtime.set_usage_diagnostics_consent(true).unwrap();
+        runtime
+    };
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("mixed publish", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -15963,6 +15980,32 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         "the delivered and failed sibling updates must remain available for runtime broadcast"
     );
 
+    #[cfg(feature = "product-analytics-export")]
+    {
+        // A partial-progress failure and every replay/fan-out of its summary
+        // must preserve the one successfully persisted publication edge.
+        for _ in 0..10 {
+            client
+                .finalize_published_app_message_source_retention(&effects)
+                .unwrap();
+        }
+        let rows = app.product_analytics.test_payloads();
+        let publication: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["eventName"] == "mdk_message_action_summary"
+                    && row["props"]["operation"] == "publication"
+            })
+            .collect();
+        assert_eq!(publication.len(), 1);
+        assert_eq!(publication[0]["props"]["count_bucket"], "1");
+        assert_eq!(publication[0]["props"]["unit"], "transition");
+        assert!(
+            !serde_json::to_string(&rows)
+                .unwrap()
+                .contains("sibling publish")
+        );
+    }
     let row = app
         .timeline_messages_with_query(
             "alice",
@@ -19112,4 +19155,66 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
         expected,
         "the override must reach the runtime that schedules rotations only in test-policy builds"
     );
+}
+
+#[cfg(feature = "product-analytics-export")]
+#[tokio::test]
+async fn backend_maintenance_collects_without_host_tracking_and_frozen_stays_silent() {
+    for frozen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let config = MarmotAppConfig {
+            cursor_persistence: if frozen {
+                CursorPersistence::Frozen
+            } else {
+                CursorPersistence::Advance
+            },
+            ..Default::default()
+        };
+        let app = MarmotApp::with_relay_and_config(dir.path(), "wss://maintenance.example", config)
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = app.runtime();
+        runtime
+            .set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig {
+                events_endpoint: Some("https://analytics.example/api/v0/events".into()),
+                app_key: Some("A-SH-test".into()),
+                operator: "test".into(),
+                allow_loopback: false,
+                registry: vec![],
+                metadata: ProductAnalyticsMetadata {
+                    app_version: "1.0".into(),
+                    os_family: "linux".into(),
+                    os_major_version: "6".into(),
+                    device_class: "desktop".into(),
+                    host_surface: "native".into(),
+                    environment: "staging".into(),
+                    is_debug: true,
+                },
+            })
+            .unwrap();
+        let mut client = app.client("alice").await.unwrap();
+        client.run_due_maintenance().await.unwrap();
+        assert!(app.product_analytics.test_payloads().is_empty());
+        runtime.set_usage_diagnostics_consent(true).unwrap();
+        client.run_due_maintenance().await.unwrap();
+        let payloads = app.product_analytics.test_payloads();
+        if frozen {
+            assert!(payloads.is_empty());
+        } else {
+            assert!(
+                payloads
+                    .iter()
+                    .any(|event| event["eventName"] == "mdk_maintenance_summary"
+                        && event["props"]["operation"] == "sweep"
+                        && event["props"]["unit"] == "attempt")
+            );
+            assert!(
+                payloads
+                    .iter()
+                    .all(|event| event.to_string().find("alice").is_none())
+            );
+        }
+    }
 }

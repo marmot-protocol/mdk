@@ -757,6 +757,21 @@ async fn relay_telemetry_settings_binding_round_trips() {
     assert!(!settings.export_enabled);
     assert_eq!(settings.export_interval_seconds, 60);
 
+    assert!(matches!(
+        kit.set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
+            export_enabled: true,
+            export_interval_seconds: 30
+        })
+        .await,
+        Err(MarmotKitError::ConsentRequired)
+    ));
+    let receipt = kit
+        .set_usage_diagnostics_consent(true)
+        .expect("accept combined permission");
+    assert_eq!(
+        receipt.decision,
+        marmot_uniffi::UsageDiagnosticsDecisionFfi::Granted
+    );
     let stored = kit
         .set_relay_telemetry_settings(RelayTelemetrySettingsFfi {
             export_enabled: true,

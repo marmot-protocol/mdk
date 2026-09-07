@@ -320,6 +320,59 @@ impl PreparedSessionCommit {
     }
 }
 
+/// Neutral deltas since the last drain. Durable state loads are never transitions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceActivity {
+    /// Bounded neutral execution samples; counters remain complete on overflow.
+    pub attempt_durations: Vec<MaintenanceAttemptDuration>,
+    pub retired_key_packages: u64,
+    pub self_update_attempts: u64,
+    pub key_package_attempts: u64,
+    pub key_package_failed_attempts: u64,
+    pub failed_attempts: u64,
+    pub completed_transitions: u64,
+    pub deferred_transitions: u64,
+    pub failed_transitions: u64,
+}
+/// One actual scheduler execution, without any account or obligation identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceAttemptDuration {
+    pub key_package: bool,
+    pub failed: bool,
+    pub duration: std::time::Duration,
+}
+impl MaintenanceActivity {
+    /// Merge neutral execution deltas without wrapping counters.
+    pub fn absorb(&mut self, previous: Self) {
+        let remaining = 256usize.saturating_sub(self.attempt_durations.len());
+        self.attempt_durations
+            .extend(previous.attempt_durations.into_iter().take(remaining));
+        self.retired_key_packages = self
+            .retired_key_packages
+            .saturating_add(previous.retired_key_packages);
+        self.self_update_attempts = self
+            .self_update_attempts
+            .saturating_add(previous.self_update_attempts);
+        self.key_package_attempts = self
+            .key_package_attempts
+            .saturating_add(previous.key_package_attempts);
+        self.key_package_failed_attempts = self
+            .key_package_failed_attempts
+            .saturating_add(previous.key_package_failed_attempts);
+        self.failed_attempts = self
+            .failed_attempts
+            .saturating_add(previous.failed_attempts);
+        self.completed_transitions = self
+            .completed_transitions
+            .saturating_add(previous.completed_transitions);
+        self.deferred_transitions = self
+            .deferred_transitions
+            .saturating_add(previous.deferred_transitions);
+        self.failed_transitions = self
+            .failed_transitions
+            .saturating_add(previous.failed_transitions);
+    }
+}
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -330,6 +383,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
+    maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Exact Welcome events whose relay-only publish phase currently runs
     /// outside the serialized account owner. Other maintenance/manual retry
@@ -359,6 +413,7 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
+            maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
@@ -1157,6 +1212,12 @@ where
         if deleted > 0 {
             self.session
                 .promote_key_package_lifecycle(&retired, &lifecycle)?;
+            let mut activity = self
+                .maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            activity.retired_key_packages =
+                activity.retired_key_packages.saturating_add(deleted as u64);
         }
         Ok(deleted)
     }
@@ -1260,7 +1321,7 @@ where
             semantic_rearm_count: 0,
             last_failure_code: None,
         };
-        self.session.put_maintenance_obligation(&obligation)?;
+        self.persist_maintenance_obligation(&obligation)?;
         self.maintenance_quiet_monotonic
             .insert(id.clone(), self.monotonic_clock.elapsed());
         Ok(id)
@@ -1279,7 +1340,7 @@ where
                     now.0
                         .saturating_add(self.maintenance_timing.eose_timeout.as_secs()),
                 ));
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
             }
         }
         Ok(())
@@ -1299,7 +1360,7 @@ where
                     now.0
                         .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                 ));
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
             }
         }
         Ok(())
@@ -1321,7 +1382,7 @@ where
                 obligation.phase = MaintenancePhase::Quiet;
                 obligation.quiet_since = Some(now);
                 obligation.not_before = None;
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
                 self.maintenance_quiet_monotonic
                     .insert(obligation.id, self.monotonic_clock.elapsed());
             }
@@ -1357,35 +1418,42 @@ where
         self.reconcile_superseded_maintenance_from_state(now)?;
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
-        if self.key_package_has_pending_fanout()?
-            && let Err(_error) = self.retry_key_package_fanout().await
-        {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "run_due_maintenance",
-                error_kind = "key_package_fanout_retry",
-                "key package exact-event fanout remains retryable"
-            );
+        if self.key_package_has_pending_fanout()? {
+            let started = self.monotonic_clock.elapsed();
+            let result = self.retry_key_package_fanout().await;
+            self.note_key_package_maintenance_attempt(result.is_err());
+            self.note_maintenance_duration(started, true, result.is_err());
+            if result.is_err() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "run_due_maintenance",
+                    error_kind = "key_package_fanout_retry",
+                    "key package exact-event fanout remains retryable"
+                );
+            }
         }
         let key_package_due = self.key_package_network_maintenance_due()?;
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some());
-        if key_package_due
-            && (!self.maintenance_paused || key_package_prepared)
-            && let Err(error) = self.publish_fresh_key_package().await
-        {
-            tracing::warn!(
-                target: TRACE_TARGET,
-                method = "run_due_maintenance",
-                error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
-                    "clock_skew_blocked"
-                } else {
-                    "key_package_retry"
-                },
-                "key package maintenance remains retryable"
-            );
+        if key_package_due && (!self.maintenance_paused || key_package_prepared) {
+            let started = self.monotonic_clock.elapsed();
+            let result = self.publish_fresh_key_package().await;
+            self.note_key_package_maintenance_attempt(result.is_err());
+            self.note_maintenance_duration(started, true, result.is_err());
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "run_due_maintenance",
+                    error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
+                        "clock_skew_blocked"
+                    } else {
+                        "key_package_retry"
+                    },
+                    "key package maintenance remains retryable"
+                );
+            }
         }
         self.retry_confirmed_transport_fanouts(&mut output).await?;
 
@@ -1457,7 +1525,7 @@ where
                     semantic_rearm_count: 0,
                     last_failure_code: None,
                 };
-                self.session.put_maintenance_obligation(&obligation)?;
+                self.persist_maintenance_obligation(&obligation)?;
                 self.maintenance_quiet_monotonic
                     .insert(id, self.monotonic_clock.elapsed());
             }
@@ -1614,7 +1682,28 @@ where
                                 queued: Vec::new(),
                                 pending_convergence: Vec::new(),
                             };
-                            let retried = self.publish_session_effects(retry).await?;
+                            self.maintenance_activity
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .self_update_attempts += 1;
+                            let started = self.monotonic_clock.elapsed();
+                            let retried = self.publish_session_effects(retry).await;
+                            self.note_maintenance_duration(
+                                started,
+                                false,
+                                retried.as_ref().map_or(true, |e| {
+                                    !e.failures.is_empty()
+                                        && !e.pending.iter().any(|r| {
+                                            matches!(r, PendingResolution::Confirmed { .. })
+                                        })
+                                }),
+                            );
+                            let retried = retried.inspect_err(|_error| {
+                                self.maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed_attempts += 1;
+                            })?;
                             let confirmed = retried.pending.iter().any(|resolution| {
                                 matches!(
                                     resolution,
@@ -1622,6 +1711,14 @@ where
                                         if *resolved == pending
                                 )
                             });
+                            if !confirmed && !retried.failures.is_empty() {
+                                let mut activity = self
+                                    .maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                activity.failed_attempts =
+                                    activity.failed_attempts.saturating_add(1);
+                            }
                             output.absorb_account_effects(retried);
                             if confirmed {
                                 self.complete_maintenance_obligation(&mut obligation, now)?;
@@ -1665,16 +1762,39 @@ where
             }
 
             let group_id = obligation.group_id.clone();
-            match self
+            self.maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .self_update_attempts += 1;
+            let started = self.monotonic_clock.elapsed();
+            let sent = self
                 .send(SendIntent::SelfUpdate {
                     group_id: group_id.clone(),
                 })
-                .await
-            {
+                .await;
+            self.note_maintenance_duration(
+                started,
+                false,
+                sent.as_ref().map_or(true, |e| {
+                    !e.failures.is_empty()
+                        && !e
+                            .pending
+                            .iter()
+                            .any(|r| matches!(r, PendingResolution::Confirmed { .. }))
+                }),
+            );
+            match sent {
                 Ok(effects) => {
                     let confirmed = effects.pending.iter().any(|resolution| {
                         matches!(resolution, PendingResolution::Confirmed { .. })
                     });
+                    if !confirmed && !effects.failures.is_empty() {
+                        let mut activity = self
+                            .maintenance_activity
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        activity.failed_attempts = activity.failed_attempts.saturating_add(1);
+                    }
                     output.absorb_account_effects(effects);
                     if confirmed {
                         self.complete_maintenance_obligation(&mut obligation, now)?;
@@ -1688,6 +1808,10 @@ where
                     }
                 }
                 Err(error) => {
+                    self.maintenance_activity
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .failed_attempts += 1;
                     obligation.phase = MaintenancePhase::Retry;
                     obligation.attempt_count = obligation.attempt_count.saturating_add(1);
                     obligation.last_failure_code = Some(
@@ -1704,13 +1828,78 @@ where
         Ok(output)
     }
 
+    fn note_maintenance_duration(
+        &self,
+        started: std::time::Duration,
+        key_package: bool,
+        failed: bool,
+    ) {
+        let duration = self.monotonic_clock.elapsed().saturating_sub(started);
+        let mut activity = self
+            .maintenance_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if activity.attempt_durations.len() < 256 {
+            activity.attempt_durations.push(MaintenanceAttemptDuration {
+                key_package,
+                failed,
+                duration,
+            });
+        }
+    }
+
+    fn note_key_package_maintenance_attempt(&self, failed: bool) {
+        let mut activity = self
+            .maintenance_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        activity.key_package_attempts = activity.key_package_attempts.saturating_add(1);
+        if failed {
+            activity.key_package_failed_attempts =
+                activity.key_package_failed_attempts.saturating_add(1);
+        }
+    }
+
+    pub fn take_maintenance_activity(&self) -> MaintenanceActivity {
+        std::mem::take(
+            &mut *self
+                .maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+    fn persist_maintenance_obligation(&self, after: &MaintenanceObligation) -> AccountResult<()> {
+        let before = self
+            .session
+            .maintenance_obligation(&after.id)?
+            .map(|v| v.phase);
+        self.session.put_maintenance_obligation(after)?;
+        if before.as_ref() != Some(&after.phase) {
+            let mut activity = self
+                .maintenance_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let count = match after.phase {
+                MaintenancePhase::Complete => &mut activity.completed_transitions,
+                MaintenancePhase::Failed => &mut activity.failed_transitions,
+                MaintenancePhase::Retry
+                | MaintenancePhase::ClockSkewBlocked
+                | MaintenancePhase::EoseTimeout
+                | MaintenancePhase::Paused => &mut activity.deferred_transitions,
+                _ => return Ok(()),
+            };
+            *count = count.saturating_add(1);
+        }
+        Ok(())
+    }
+
     fn put_maintenance_obligation_if_changed(
         &self,
         before: &MaintenanceObligation,
         after: &MaintenanceObligation,
     ) -> AccountResult<()> {
         if before != after {
-            self.session.put_maintenance_obligation(after)?;
+            self.persist_maintenance_obligation(after)?;
         }
         Ok(())
     }
@@ -1770,7 +1959,7 @@ where
     ) -> AccountResult<()> {
         obligation.phase = MaintenancePhase::Complete;
         obligation.last_failure_code = None;
-        self.session.put_maintenance_obligation(obligation)?;
+        self.persist_maintenance_obligation(obligation)?;
         self.maintenance_quiet_monotonic.remove(&obligation.id);
         if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
             state.last_own_leaf_rotation_at = Some(completed_at);
@@ -2502,7 +2691,7 @@ where
                     }
                     obligation.phase = MaintenancePhase::Failed;
                     obligation.last_failure_code = Some("local_member_removed".into());
-                    self.session.put_maintenance_obligation(&obligation)?;
+                    self.persist_maintenance_obligation(&obligation)?;
                     self.maintenance_quiet_monotonic.remove(&obligation.id);
                 }
                 if let Some(mut state) = self.session.group_maintenance(&group_id)? {
@@ -2682,7 +2871,7 @@ where
             obligation.last_failure_code = Some("superseded_by_convergence".into());
             self.maintenance_quiet_monotonic
                 .insert(obligation.id.clone(), self.monotonic_clock.elapsed());
-            self.session.put_maintenance_obligation(&obligation)?;
+            self.persist_maintenance_obligation(&obligation)?;
         }
         Ok(())
     }

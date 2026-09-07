@@ -10,11 +10,33 @@ struct Migration {
     apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_shared_store",
-    apply: version_1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_shared_store",
+        apply: version_1,
+    },
+    Migration {
+        version: 2,
+        name: "0002_usage_diagnostics",
+        apply: version_2,
+    },
+];
+
+fn version_2(tx: &Transaction<'_>) -> StorageResult<()> {
+    tx.execute_batch("CREATE TABLE usage_diagnostics_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        decision INTEGER NOT NULL CHECK (decision IN (0, 1, 2)),
+        policy_revision TEXT NOT NULL,
+        registry_revision TEXT NOT NULL,
+        scope_revision TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        previously_enabled INTEGER NOT NULL CHECK (previously_enabled IN (0, 1))
+    );
+    INSERT INTO usage_diagnostics_settings
+        SELECT 1, 0, '', '', '', 0, COALESCE((SELECT export_enabled FROM relay_telemetry_settings WHERE id = 1), 0);")
+        .map_err(sqlite_error)
+}
 const VERSION_1_SQL: &str = include_str!("v1.sql");
 const LEGACY_SQL: &str = include_str!("legacy.sql");
 const LEDGER: &str = "shared_schema_migrations";

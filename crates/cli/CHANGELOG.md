@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+- Added `usage-diagnostics show|enable|disable` with JSON output and live daemon
+  routing. One explicit local consent controls OTLP and stock Aptabase exports;
+  prior telemetry users reconfirm. Standalone commands and TUI children are silent
+  collectors. Aptabase configuration and app keys do not grant consent.
+
+
 ## [0.9.18] - 2026-09-05
 
 ### Changed

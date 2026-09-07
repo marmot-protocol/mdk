@@ -62,7 +62,49 @@ pub struct StoredAuditLogSettings {
     pub enabled: bool,
 }
 
+/// Installation-local consent receipt. 0 = acceptance required, 1 = declined, 2 = granted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoredUsageDiagnosticsSettings {
+    pub decision: u8,
+    pub policy_revision: String,
+    pub registry_revision: String,
+    pub scope_revision: String,
+    pub updated_at_ms: i64,
+    pub previously_enabled: bool,
+}
+
 impl SqliteSharedStorage {
+    pub fn usage_diagnostics_settings(&self) -> StorageResult<StoredUsageDiagnosticsSettings> {
+        self.lock()?.query_row_cached(
+            "SELECT decision, policy_revision, registry_revision, scope_revision, updated_at_ms, previously_enabled FROM usage_diagnostics_settings WHERE id = 1", [],
+            |r| Ok(StoredUsageDiagnosticsSettings {
+                decision: r.get(0)?, policy_revision: r.get(1)?, registry_revision: r.get(2)?,
+                scope_revision: r.get(3)?, updated_at_ms: r.get(4)?, previously_enabled: r.get(5)?,
+            }),
+        ).storage()
+    }
+
+    /// Consent and diagnostic identity change in one transaction. No key is stored here.
+    pub fn set_usage_diagnostics_settings(
+        &self,
+        settings: &StoredUsageDiagnosticsSettings,
+        install_id: Option<&str>,
+    ) -> StorageResult<()> {
+        retry_on_busy(|| {
+            let mut conn = self.lock()?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
+            tx.execute("UPDATE usage_diagnostics_settings SET decision=?1, policy_revision=?2, registry_revision=?3, scope_revision=?4, updated_at_ms=?5 WHERE id=1",
+                params![settings.decision, settings.policy_revision, settings.registry_revision, settings.scope_revision, unix_now_ms()]).storage()?;
+            tx.execute("DELETE FROM telemetry_install", []).storage()?;
+            if let Some(id) = install_id {
+                tx.execute("INSERT INTO telemetry_install (id, install_id, updated_at_ms) VALUES (1, ?1, ?2)", params![id, unix_now_ms()]).storage()?;
+            }
+            tx.commit().storage()
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -800,18 +842,18 @@ mod migration_contract_tests {
     use super::*;
 
     #[test]
-    fn fresh_shared_storage_records_version_one() {
+    fn fresh_shared_storage_records_current_version() {
         let storage = SqliteSharedStorage::in_memory().unwrap();
         let row: (i64, String) = storage
             .lock()
             .unwrap()
             .query_row(
-                "SELECT version, name FROM shared_schema_migrations",
+                "SELECT version, name FROM shared_schema_migrations ORDER BY version DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (1, "0001_shared_store".into()));
+        assert_eq!(row, (2, "0002_usage_diagnostics".into()));
     }
 
     #[test]
@@ -820,5 +862,80 @@ mod migration_contract_tests {
         conn.execute_batch("CREATE TABLE directory_users (account_id_hex TEXT)")
             .unwrap();
         assert!(SqliteSharedStorage::from_connection(conn).is_err());
+    }
+}
+
+#[cfg(test)]
+mod usage_diagnostics_tests {
+    use super::*;
+    #[test]
+    fn migration_preserves_legacy_opt_in_interval_and_audit() {
+        for enabled in [false, true] {
+            let connection = rusqlite::Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(include_str!("shared/v1.sql"))
+                .unwrap();
+            connection.execute("INSERT INTO relay_telemetry_settings(id,export_enabled,export_interval_seconds,updated_at_ms) VALUES(1,?1,73,0)",[enabled]).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO audit_log_settings(id,enabled,updated_at_ms) VALUES(1,1,0)",
+                    [],
+                )
+                .unwrap();
+            let store = SqliteSharedStorage::from_connection(connection).unwrap();
+            let receipt = store.usage_diagnostics_settings().unwrap();
+            assert_eq!(receipt.decision, 0);
+            assert_eq!(receipt.previously_enabled, enabled);
+            assert_eq!(
+                store
+                    .relay_telemetry_settings()
+                    .unwrap()
+                    .export_interval_seconds,
+                73
+            );
+            assert!(store.audit_log_settings().unwrap().enabled);
+        }
+    }
+    #[test]
+    fn receipt_and_identity_are_atomic() {
+        let store = SqliteSharedStorage::in_memory().unwrap();
+        let granted = StoredUsageDiagnosticsSettings {
+            decision: 2,
+            policy_revision: "p".into(),
+            registry_revision: "r".into(),
+            scope_revision: "s".into(),
+            ..Default::default()
+        };
+        store
+            .set_usage_diagnostics_settings(&granted, Some("new-id"))
+            .unwrap();
+        assert_eq!(
+            store.telemetry_install_id().unwrap().as_deref(),
+            Some("new-id")
+        );
+        let invalid = StoredUsageDiagnosticsSettings {
+            decision: 9,
+            ..granted.clone()
+        };
+        assert!(
+            store
+                .set_usage_diagnostics_settings(&invalid, None)
+                .is_err()
+        );
+        assert_eq!(
+            store.telemetry_install_id().unwrap().as_deref(),
+            Some("new-id")
+        );
+        assert_eq!(store.usage_diagnostics_settings().unwrap().decision, 2);
+        store
+            .set_usage_diagnostics_settings(
+                &StoredUsageDiagnosticsSettings {
+                    decision: 1,
+                    ..granted
+                },
+                None,
+            )
+            .unwrap();
+        assert!(store.telemetry_install_id().unwrap().is_none());
     }
 }

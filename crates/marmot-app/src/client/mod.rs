@@ -101,11 +101,13 @@ pub(crate) struct UnpublishedWelcomeDelivery {
 }
 
 pub(crate) struct PendingWelcomeDeliveryRecovery {
+    observation: Option<crate::ProductObservation>,
     welcome_ids: Vec<String>,
     publish: PreparedWelcomePublishTask,
 }
 
 pub(crate) struct CompletedWelcomeDeliveryRecovery {
+    observation: Option<crate::ProductObservation>,
     welcome_ids: Vec<String>,
     publish: CompletedWelcomePublishTask,
 }
@@ -117,6 +119,7 @@ impl PendingWelcomeDeliveryRecovery {
 
     pub(crate) async fn run(self) -> CompletedWelcomeDeliveryRecovery {
         CompletedWelcomeDeliveryRecovery {
+            observation: self.observation,
             welcome_ids: self.welcome_ids,
             publish: self.publish.run().await,
         }
@@ -295,6 +298,7 @@ pub(crate) struct GroupRouteRefresh {
 pub struct AppClient {
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
+    pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
     // before this guard so ownership is released only after engine teardown.
     pub(crate) _session_guard: crate::AppAccountSessionGuard,
@@ -639,6 +643,23 @@ impl AppClient {
     }
 
     pub async fn publish_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::KeyPackage,
+            "publish",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.publish_key_package_unobserved().await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn publish_key_package_unobserved(&mut self) -> Result<KeyPackage, AppError> {
         self.app
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
@@ -731,8 +752,154 @@ impl AppClient {
                 .maintenance_run_summary(&marmot_account::AccountDeviceEffects::default())?;
             return Ok(maintenance_run_summary_from_account(summary));
         }
-        let effects = self.runtime.run_due_maintenance().await?;
-        self.observe_recovery_evidence_then_summarize_maintenance(&effects)
+        // Drain edges between ticks too. A new consent generation establishes a
+        // baseline so earlier local work cannot become a post-consent backlog.
+        let mut previous = self.runtime.take_maintenance_activity();
+        if !self
+            .maintenance_observation_generation
+            .as_ref()
+            .is_some_and(crate::DiagnosticsPermit::valid)
+        {
+            previous = Default::default();
+        }
+        self.maintenance_observation_generation = self.app.product_analytics.permit();
+        let product_observation = self
+            .app
+            .product_analytics
+            .begin(
+                crate::ProductFamily::Maintenance,
+                "self_update",
+                crate::ProductUnit::Attempt,
+            )
+            .map(crate::ProductObservation::counts_only);
+        let key_package_observation = self
+            .app
+            .product_analytics
+            .begin(
+                crate::ProductFamily::Maintenance,
+                "key_package",
+                crate::ProductUnit::Attempt,
+            )
+            .map(crate::ProductObservation::counts_only);
+        let sweep = self.app.product_analytics.begin(
+            crate::ProductFamily::Maintenance,
+            "sweep",
+            crate::ProductUnit::Attempt,
+        );
+        let effects = self.runtime.run_due_maintenance().await;
+        let mut activity = self.runtime.take_maintenance_activity();
+        activity.absorb(previous);
+        // Timed executions replace their matching count-only sample, never add
+        // another attempt. Overflow retains complete counts without durations.
+        let mut timed = [[0u64; 2]; 2];
+        for sample in &activity.attempt_durations {
+            let observation = if sample.key_package {
+                key_package_observation.as_ref()
+            } else {
+                product_observation.as_ref()
+            };
+            if let Some(observation) = observation {
+                observation.duration_sample(
+                    if sample.failed {
+                        "failure"
+                    } else {
+                        "performed"
+                    },
+                    sample.duration,
+                );
+                timed[usize::from(sample.key_package)][usize::from(sample.failed)] += 1;
+            }
+        }
+        if let Some(observation) = product_observation {
+            for (outcome, unit, count) in [
+                (
+                    "performed",
+                    crate::ProductUnit::Attempt,
+                    activity
+                        .self_update_attempts
+                        .saturating_sub(activity.failed_attempts)
+                        .saturating_sub(timed[0][0]),
+                ),
+                (
+                    "failure",
+                    crate::ProductUnit::Attempt,
+                    activity.failed_attempts.saturating_sub(timed[0][1]),
+                ),
+                (
+                    "success",
+                    crate::ProductUnit::Transition,
+                    activity.completed_transitions,
+                ),
+                (
+                    "deferred",
+                    crate::ProductUnit::Transition,
+                    activity.deferred_transitions,
+                ),
+                (
+                    "failure",
+                    crate::ProductUnit::Transition,
+                    activity.failed_transitions,
+                ),
+            ] {
+                observation.count(outcome, unit, count);
+            }
+        }
+        if let Some(observation) = key_package_observation {
+            observation.count(
+                "performed",
+                crate::ProductUnit::Attempt,
+                activity
+                    .key_package_attempts
+                    .saturating_sub(activity.key_package_failed_attempts)
+                    .saturating_sub(timed[1][0]),
+            );
+            observation.count(
+                "failure",
+                crate::ProductUnit::Attempt,
+                activity
+                    .key_package_failed_attempts
+                    .saturating_sub(timed[1][1]),
+            );
+        }
+        if let Some(observation) = self
+            .app
+            .product_analytics
+            .begin(
+                crate::ProductFamily::KeyPackage,
+                "retire",
+                crate::ProductUnit::Transition,
+            )
+            .map(crate::ProductObservation::counts_only)
+        {
+            // Use the sweep's generation, not a grant made while it was awaiting I/O.
+            if self
+                .maintenance_observation_generation
+                .as_ref()
+                .is_some_and(crate::DiagnosticsPermit::valid)
+            {
+                observation.count(
+                    "success",
+                    crate::ProductUnit::Transition,
+                    activity.retired_key_packages,
+                );
+            }
+        }
+        if let Some(sweep) = sweep {
+            sweep.finish(
+                if effects.is_err()
+                    || activity.failed_attempts + activity.key_package_failed_attempts > 0
+                {
+                    "failure"
+                } else if activity.self_update_attempts + activity.key_package_attempts > 0 {
+                    "performed"
+                } else if activity.deferred_transitions > 0 {
+                    "deferred"
+                } else {
+                    "no_work_due"
+                },
+            );
+        }
+        self.observe_recovery_evidence_then_summarize_maintenance(&effects?)
     }
 
     /// Observe one maintenance tick's recovery evidence, then summarize the
@@ -953,6 +1120,23 @@ impl AppClient {
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::KeyPackage,
+            "rotate",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.rotate_key_package_unobserved().await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn rotate_key_package_unobserved(&mut self) -> Result<KeyPackage, AppError> {
         self.app
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
@@ -1873,6 +2057,26 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Recovery,
+            "hydration",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.retry_hydrate_quarantined_group_unobserved(group_id);
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    fn retry_hydrate_quarantined_group_unobserved(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
         Ok(self.runtime.retry_hydrate_quarantined_group(group_id)?)
     }
 
@@ -2165,6 +2369,27 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "remove_members",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.remove_members_unobserved(group_id, member_refs).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn remove_members_unobserved(
+        &mut self,
+        group_id: &GroupId,
+        member_refs: &[&str],
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
@@ -2210,6 +2435,26 @@ impl AppClient {
     }
 
     pub async fn leave_group(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "leave",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.leave_group_unobserved(group_id).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn leave_group_unobserved(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
         let audit_context = Self::local_human_action_context(
             "leave_group",
             vec!["membership"],
@@ -2258,6 +2503,26 @@ impl AppClient {
     /// Persist the irreversible request and return without waiting for the
     /// disband Commit or its mandatory convergence pass.
     pub async fn disband_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<AppDisbandRequest, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "disband",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.disband_group_unobserved(group_id).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn disband_group_unobserved(
         &mut self,
         group_id: &GroupId,
     ) -> Result<AppDisbandRequest, AppError> {
@@ -2318,6 +2583,26 @@ impl AppClient {
     /// restored without restoring the projection. The durable deletion frontier
     /// filters historical replay until a strictly newer app message arrives.
     pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "delete",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.delete_group_local_unobserved(group_id).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn delete_group_local_unobserved(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
         if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
         }
@@ -2657,6 +2942,26 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<GroupInviteDeclineResult, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "decline_invite",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.decline_group_invite_unobserved(group_id).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn decline_group_invite_unobserved(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<GroupInviteDeclineResult, AppError> {
         let audit_context = Self::local_human_action_context(
             "decline_group_invite",
             vec!["membership"],
@@ -2695,6 +3000,27 @@ impl AppClient {
         group_id: &GroupId,
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "demote_admin",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.demote_admin_unobserved(group_id, member_ref).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn demote_admin_unobserved(
+        &mut self,
+        group_id: &GroupId,
+        member_ref: &str,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
         let member_id = self.app.member_id(member_ref)?;
         let target = admin_pubkey_from_member_id(&member_id)?;
@@ -2712,6 +3038,26 @@ impl AppClient {
     }
 
     pub async fn self_demote_admin(&mut self, group_id: &GroupId) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "demote_admin",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.self_demote_admin_unobserved(group_id).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn self_demote_admin_unobserved(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let local = admin_pubkey_from_account_id_hex(&account.account_id_hex)?;
@@ -2769,6 +3115,29 @@ impl AppClient {
     }
 
     pub async fn update_message_retention(
+        &mut self,
+        group_id: &GroupId,
+        disappearing_message_secs: u64,
+    ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "retention",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self
+            .update_message_retention_unobserved(group_id, disappearing_message_secs)
+            .await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn update_message_retention_unobserved(
         &mut self,
         group_id: &GroupId,
         disappearing_message_secs: u64,
@@ -2965,6 +3334,55 @@ impl AppClient {
     }
 
     pub(crate) async fn send_app_event_with_local_projection<F>(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+        on_local_projection: F,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        use crate::{ProductFamily as Family, ProductUnit};
+        let (family, operation) = match &intent {
+            AppMessageIntent::Chat { .. } => (Family::MessageAction, "text"),
+            AppMessageIntent::Reply { .. } => (Family::MessageAction, "reply"),
+            AppMessageIntent::Reaction { .. } => (Family::MessageAction, "reaction"),
+            AppMessageIntent::Unreact { .. } | AppMessageIntent::DeleteReactions { .. } => {
+                (Family::MessageAction, "unreact")
+            }
+            AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
+            AppMessageIntent::Delete { .. } => (Family::MessageAction, "delete"),
+            AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
+            AppMessageIntent::PushTokenUpdate { .. } => (Family::Notification, "update"),
+            AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
+            AppMessageIntent::StreamStart { .. } => (Family::Stream, "start"),
+            AppMessageIntent::StreamFinal { .. } => (Family::Stream, "finalize"),
+            AppMessageIntent::AgentActivity { .. }
+            | AppMessageIntent::AgentOperation { .. }
+            | AppMessageIntent::GroupSystem { .. }
+            | AppMessageIntent::Custom { .. } => (Family::MessageAction, "custom"),
+        };
+        let observation = self
+            .app
+            .product_analytics
+            .begin(family, operation, ProductUnit::Action);
+        let result = self
+            .send_app_event_with_local_projection_unobserved(group_id, intent, on_local_projection)
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(match &result {
+                Ok((_, summary)) => match summary.accept_disposition {
+                    cgka_traits::SendAcceptDisposition::Published => "confirmed",
+                    cgka_traits::SendAcceptDisposition::AcceptedPending => "pending",
+                    cgka_traits::SendAcceptDisposition::CompletionUnknown => "unknown",
+                },
+                Err(_) => "rejected",
+            });
+        }
+        result
+    }
+
+    async fn send_app_event_with_local_projection_unobserved<F>(
         &mut self,
         group_id: &GroupId,
         intent: AppMessageIntent,
@@ -3669,6 +4087,30 @@ impl AppClient {
         plaintext: Vec<u8>,
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "image_update",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self
+            .update_group_image_unobserved(group_id, plaintext, media_type)
+            .await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn update_group_image_unobserved(
+        &mut self,
+        group_id: &GroupId,
+        plaintext: Vec<u8>,
+        media_type: &str,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         let audit_context = Self::local_human_action_context(
             "update_group_image",
@@ -3928,6 +4370,26 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Recovery,
+            "convergence",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self.retry_group_convergence_unobserved(group_id).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn retry_group_convergence_unobserved(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
         self.sync_runtime_groups().await?;
@@ -3967,6 +4429,30 @@ impl AppClient {
     }
 
     pub async fn update_group_profile(
+        &mut self,
+        group_id: &GroupId,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "profile_update",
+            crate::ProductUnit::Action,
+        );
+        let product_result = self
+            .update_group_profile_unobserved(group_id, name, description)
+            .await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn update_group_profile_unobserved(
         &mut self,
         group_id: &GroupId,
         name: Option<&str>,
@@ -4074,6 +4560,23 @@ impl AppClient {
     /// delivery that re-persists `self.state` will carry the updated flag rather
     /// than silently reverting it to a stale `archived = false`.
     pub fn set_group_archived(
+        &mut self,
+        group_id: &GroupId,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        let observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            if archived { "archive" } else { "unarchive" },
+            crate::ProductUnit::Action,
+        );
+        let result = self.set_group_archived_unobserved(group_id, archived);
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    fn set_group_archived_unobserved(
         &mut self,
         group_id: &GroupId,
         archived: bool,
@@ -4610,6 +5113,27 @@ impl AppClient {
             .collect())
     }
 
+    fn clear_confirmed_welcome_intent(&self, message_id_hex: &str) -> Result<(), AppError> {
+        let observation = self
+            .app
+            .product_analytics
+            .begin(
+                crate::ProductFamily::Welcome,
+                "publish",
+                crate::ProductUnit::Transition,
+            )
+            .map(crate::ProductObservation::counts_only);
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .take_pending_welcome_delivery(message_id_hex)?
+            && let Some(observation) = observation
+        {
+            observation.count("confirmed", crate::ProductUnit::Transition, 1);
+        }
+        Ok(())
+    }
+
     /// Clear only intent rows whose exact Welcome met its acknowledgement
     /// policy. Failed or unattempted rows stay durable for re-delivery.
     fn clear_delivered_founding_welcome_intents(
@@ -4620,7 +5144,6 @@ impl AppClient {
         if message_ids.is_empty() {
             return Ok(());
         }
-        let storage = self.app.account_storage(&self.state.label)?;
         for message_id_hex in message_ids {
             let delivered = effects.reports.iter().any(|report| {
                 hex::encode(report.message_id.as_slice()) == *message_id_hex
@@ -4630,7 +5153,7 @@ impl AppClient {
                 .iter()
                 .any(|failure| hex::encode(failure.message_id.as_slice()) == *message_id_hex);
             if delivered {
-                storage.clear_pending_welcome_delivery(message_id_hex)?;
+                self.clear_confirmed_welcome_intent(message_id_hex)?;
             }
         }
         Ok(())
@@ -4845,7 +5368,17 @@ impl AppClient {
                 return None;
             }
         };
+        let observation = if publish.message_ids().is_empty() {
+            None
+        } else {
+            self.app.product_analytics.begin(
+                crate::ProductFamily::Welcome,
+                "retry",
+                crate::ProductUnit::Attempt,
+            )
+        };
         Some(PendingWelcomeDeliveryRecovery {
+            observation,
             welcome_ids,
             publish,
         })
@@ -4863,11 +5396,23 @@ impl AppClient {
             .await
         {
             Ok(effects) => {
+                if let Some(observation) = completed.observation {
+                    observation.finish(
+                        if effects.failures.is_empty() && effects.welcome_failures.is_empty() {
+                            "confirmed"
+                        } else {
+                            "pending"
+                        },
+                    );
+                }
                 let _ =
                     self.clear_delivered_founding_welcome_intents(&completed.welcome_ids, &effects);
                 self.remember_published_reports(&effects);
             }
             Err(error) => {
+                if let Some(observation) = completed.observation {
+                    observation.finish("failure");
+                }
                 tracing::warn!(
                     target: "marmot_app::client",
                     method = "finish_pending_welcome_delivery_recovery_best_effort",
@@ -4911,6 +5456,26 @@ impl AppClient {
         &mut self,
         message_id_hex: &str,
     ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Welcome,
+            "retry",
+            crate::ProductUnit::Attempt,
+        );
+        let product_result = self.redeliver_welcome_unobserved(message_id_hex).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "confirmed"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn redeliver_welcome_unobserved(
+        &mut self,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
         let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
         let effects = self.runtime.redeliver_welcome(&message_id).await?;
         // Only clear the durable pending record once every "still undelivered"
@@ -4932,9 +5497,7 @@ impl AppClient {
                 publish_failure_error(&effects.failures)
             });
         }
-        self.app
-            .account_storage(&self.state.label)?
-            .clear_pending_welcome_delivery(message_id_hex)?;
+        self.clear_confirmed_welcome_intent(message_id_hex)?;
         Ok(send_summary_from_effects(&effects))
     }
 }

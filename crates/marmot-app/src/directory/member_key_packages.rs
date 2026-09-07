@@ -276,7 +276,12 @@ impl MarmotApp {
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
-        match tokio::time::timeout(
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::KeyPackage,
+            "lookup",
+            crate::ProductUnit::Action,
+        );
+        let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
             self.resolve_member_key_packages_inner(&member_refs, purpose),
         )
@@ -286,7 +291,16 @@ impl MarmotApp {
             Err(_) => Err(AppError::RelayDirectory(
                 "member KeyPackage resolution deadline exceeded".to_owned(),
             )),
+        };
+        if let Some(observation) = observation {
+            observation.finish(match &result {
+                Ok(_) => "usable",
+                Err(AppError::MissingKeyPackage(_)) => "absent",
+                Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
+                Err(_) => "unavailable",
+            });
         }
+        result
     }
 
     async fn resolve_member_key_packages_inner(
@@ -294,6 +308,14 @@ impl MarmotApp {
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
+        let directory_observation = self
+            .product_analytics
+            .begin(
+                crate::ProductFamily::Directory,
+                "key_package",
+                crate::ProductUnit::Attempt,
+            )
+            .map(crate::ProductObservation::counts_only);
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for member_ref in member_refs {
@@ -426,6 +448,25 @@ impl MarmotApp {
             .await;
         }
 
+        if let Some(observation) = directory_observation {
+            let unresolved: HashSet<_> = unresolved.iter().copied().collect();
+            for (index, outcome) in outcomes.iter().enumerate() {
+                let outcome = match outcome {
+                    Some(Ok(_)) => "success",
+                    Some(Err(AppError::MissingKeyPackage(_))) | None => "empty",
+                    Some(Err(_)) => "failure",
+                };
+                observation.directory_sample(
+                    outcome,
+                    if unresolved.contains(&index) {
+                        "network"
+                    } else {
+                        "cache"
+                    },
+                    1,
+                );
+            }
+        }
         match purpose {
             MemberResolutionPurpose::Commit => {
                 for target in &targets {
@@ -517,25 +558,61 @@ impl MarmotApp {
         account_id_hex: &str,
         key_package: KeyPackage,
     ) -> Result<KeyPackage, AppError> {
-        let metadata = key_package_metadata(&key_package)
-            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
-        if metadata.protocol_profile != ProtocolProfile::Current
-            || metadata.credential_identity_hex != account_id_hex
-        {
-            return Err(AppError::InvalidKeyPackageEvent(
-                "member KeyPackage identity or profile is invalid".to_owned(),
-            ));
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::KeyPackage,
+            "lookup",
+            crate::ProductUnit::Attempt,
+        );
+        let mut key_package_lifetime_rejected = false;
+        let result = (|| {
+            let metadata = key_package_metadata(&key_package)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            if metadata.protocol_profile != ProtocolProfile::Current
+                || metadata.credential_identity_hex != account_id_hex
+            {
+                return Err(AppError::InvalidKeyPackageEvent(
+                    "member KeyPackage identity or profile is invalid".to_owned(),
+                ));
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now < metadata.not_before || now > metadata.not_after {
+                key_package_lifetime_rejected = true;
+                if let Some(observation) = observation.as_ref() {
+                    observation.count(
+                        if now > metadata.not_after {
+                            "expired"
+                        } else {
+                            "unavailable"
+                        },
+                        crate::ProductUnit::Attempt,
+                        1,
+                    );
+                }
+                return Err(AppError::InvalidKeyPackageEvent(
+                    "member KeyPackage is outside its current lifetime".to_owned(),
+                ));
+            }
+            Ok(key_package)
+        })();
+        if let Some(observation) = observation {
+            // Lifetime rejection already supplies its more precise outcome.
+            let lifetime_rejected = result
+                .as_ref()
+                .err()
+                .is_some_and(|_| key_package_lifetime_rejected);
+            if !lifetime_rejected {
+                observation.count(
+                    if result.is_ok() { "usable" } else { "invalid" },
+                    crate::ProductUnit::Attempt,
+                    1,
+                );
+            }
+            observation.discard();
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now < metadata.not_before || now > metadata.not_after {
-            return Err(AppError::InvalidKeyPackageEvent(
-                "member KeyPackage is outside its current lifetime".to_owned(),
-            ));
-        }
-        Ok(key_package)
+        result
     }
 
     fn relay_lists_from_records(

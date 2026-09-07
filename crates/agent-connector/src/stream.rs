@@ -756,6 +756,11 @@ impl AgentConnector {
         let session = self
             .streams
             .remove_authorized(stream_id_hex, stream_capability)?;
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Stream,
+            "cancel",
+            marmot_app::ProductUnit::Action,
+        );
         // Send a graceful cancel over the dedicated cancel signal and let the
         // compose session drain it: the session emits a live `Abort` record (so
         // online subscribers observe the cancellation) and shuts itself down.
@@ -769,6 +774,9 @@ impl AgentConnector {
         match session.cancel_tx.try_send(()) {
             Ok(()) | Err(TrySendError::Full(())) => {}
             Err(TrySendError::Closed(())) => session.abort.abort(),
+        }
+        if let Some(observation) = observation {
+            observation.finish("performed");
         }
         Ok(AgentControlResponse::Ack)
     }

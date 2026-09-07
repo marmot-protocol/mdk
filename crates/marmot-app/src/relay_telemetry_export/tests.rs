@@ -534,16 +534,22 @@ async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
     // Off by default, and enabled-without-endpoint is still inert.
     assert!(
         relay_plane
-            .telemetry_exporter(RelayTelemetryExportConfig::disabled())
+            .telemetry_exporter(
+                RelayTelemetryExportConfig::disabled(),
+                crate::product_analytics::test_permit()
+            )
             .is_none()
     );
     assert!(
         relay_plane
-            .telemetry_exporter(RelayTelemetryExportConfig {
-                enabled: true,
-                endpoint: None,
-                ..Default::default()
-            })
+            .telemetry_exporter(
+                RelayTelemetryExportConfig {
+                    enabled: true,
+                    endpoint: None,
+                    ..Default::default()
+                },
+                crate::product_analytics::test_permit()
+            )
             .is_none()
     );
 
@@ -551,6 +557,7 @@ async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
         .telemetry_exporter(
             RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
                 .with_runtime_config(runtime_config()),
+            crate::product_analytics::test_permit(),
         )
         .expect("opted-in exporter is constructed");
     let batch = exporter.build_batch(None).await;
@@ -564,4 +571,80 @@ async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
             .any(|point| point.name == metric_names::CROSS_RELAY_SPREAD)
     );
     assert!(batch.points.iter().all(|point| point.relay.is_none()));
+}
+
+#[test]
+fn collection_period_subtracts_history_and_detects_resets_against_previous_sample() {
+    let exporter = MarmotRelayPlane::full_history()
+        .telemetry_exporter(
+            RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                .with_runtime_config(runtime_config()),
+            crate::product_analytics::test_permit(),
+        )
+        .unwrap();
+    let batch = |total, redundant, buckets: Vec<u64>, sum| RelayTelemetryExportBatch {
+        points: vec![
+            ExportMetricPoint {
+                name: metric_names::DELIVERY_COUNT,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(total),
+            },
+            ExportMetricPoint {
+                name: metric_names::REDUNDANT_COUNT,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(redundant),
+            },
+            ExportMetricPoint {
+                name: metric_names::FIRST_DELIVERER_RATE,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(0.99),
+            },
+            ExportMetricPoint {
+                name: metric_names::CROSS_RELAY_SPREAD,
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![10, 20],
+                    bucket_counts: buckets,
+                    overflow_count: 0,
+                    sum_ms: sum,
+                }),
+            },
+        ],
+    };
+    let (initial, start) = exporter.since_baseline(batch(10, 5, vec![2, 3], 80));
+    assert_eq!(initial.points[0].value, ExportMetricValue::Counter(0));
+    let (later, later_start) = exporter.since_baseline(batch(20, 7, vec![4, 4], 110));
+    assert_eq!(start, later_start);
+    assert_eq!(later.points[0].value, ExportMetricValue::Counter(10));
+    assert_eq!(later.points[2].value, ExportMetricValue::Gauge(0.8));
+    assert_eq!(
+        later.points[3].value,
+        ExportMetricValue::Histogram(ExportHistogram {
+            bounds_ms: vec![10, 20],
+            bucket_counts: vec![2, 1],
+            overflow_count: 0,
+            sum_ms: 30
+        })
+    );
+    // Still above the original baseline, but below the previous sample: a source reset.
+    let (reset, reset_start) = exporter.since_baseline(batch(15, 6, vec![3, 4], 100));
+    assert!(reset_start >= later_start);
+    assert_eq!(reset.points[0].value, ExportMetricValue::Counter(0));
+    let mut next = batch(16, 6, vec![3, 5], 120);
+    next.points.push(ExportMetricPoint {
+        name: "new_series",
+        relay: None,
+        failure: None,
+        value: ExportMetricValue::Counter(3),
+    });
+    let (next, _) = exporter.since_baseline(next);
+    assert_eq!(
+        next.points.last().unwrap().value,
+        ExportMetricValue::Counter(3)
+    );
+    assert_eq!(next.points[2].value, ExportMetricValue::Gauge(1.0));
 }

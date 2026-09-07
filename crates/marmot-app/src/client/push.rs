@@ -15,6 +15,32 @@ impl AppClient {
         server_pubkey_hex: &str,
         relay_hint: Option<String>,
     ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
+        let observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Notification,
+            "register",
+            crate::ProductUnit::Action,
+        );
+        let result = self
+            .upsert_and_share_push_registration_unobserved(
+                platform,
+                raw_token,
+                server_pubkey_hex,
+                relay_hint,
+            )
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    async fn upsert_and_share_push_registration_unobserved(
+        &mut self,
+        platform: notifications::PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<notifications::PushRegistrationSyncResult, AppError> {
         let registration = self.app.upsert_push_registration(
             &self.state.label,
             platform,
@@ -550,11 +576,24 @@ impl AppClient {
             for chunk in notifications::notification_trigger_chunks(&encrypted_tokens) {
                 let event =
                     notifications::build_notification_gift_wrap(&server_pubkey_hex, chunk).await?;
-                self.app
+                let observation = self.app.product_analytics.begin(
+                    crate::ProductFamily::Notification,
+                    "trigger",
+                    crate::ProductUnit::Attempt,
+                );
+                let result = self
+                    .app
                     .relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone())
                     .publish_event(&endpoints, &event, 1)
-                    .await
-                    .map_err(AppError::Transport)?;
+                    .await;
+                if let Some(observation) = observation {
+                    observation.finish(if result.is_ok() {
+                        "confirmed"
+                    } else {
+                        "failure"
+                    });
+                }
+                result.map_err(AppError::Transport)?;
             }
         }
         Ok(())

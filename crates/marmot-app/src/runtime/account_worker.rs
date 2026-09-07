@@ -910,6 +910,7 @@ async fn run_app_runtime_account_worker(
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
+        product: shared.product_analytics.clone(),
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -992,6 +993,7 @@ async fn run_app_runtime_account_worker(
     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
+    let product_backlog = shared.product_analytics.backlog_source();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
@@ -1554,12 +1556,15 @@ async fn run_app_runtime_account_worker(
                     &mut legacy_message_promotion,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
-                    match timeout(
-                        Duration::from_secs(15),
-                        client.sync_with_partial_progress(),
-                    )
-                    .await
-                    {
+                    let observation = shared.product_analytics.begin(crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt);
+                    let catch_up = timeout(Duration::from_secs(15), client.sync_with_partial_progress()).await;
+                    let outcome = match &catch_up {
+                        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
+                        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
+                        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+                    };
+                    if let Some(observation) = observation { observation.finish(outcome.as_str()); }
+                    match catch_up {
                         Ok(Ok(summary)) => {
                             publish_app_runtime_summary(
                                 &events,
@@ -1643,9 +1648,20 @@ async fn run_app_runtime_account_worker(
                         account_error_message("post-join maintenance subscription failed", &err),
                     );
                 }
+                let backlog_permit = shared.product_analytics.permit();
                 match client.run_due_maintenance().await {
                     Ok(summary) => {
-                        let _ = summary;
+                        if let Some(permit) = &backlog_permit {
+                            product_backlog.sample(permit, crate::ProductFamily::Maintenance,"pending",u64::from(summary.deferred));
+                            product_backlog.sample(permit, crate::ProductFamily::Maintenance,"ambiguous",u64::from(summary.ambiguous_exposure));
+                            // Empty effects excludes this tick's failed attempts:
+                            // this is a durable-state level, sampled once/window.
+                            if let Ok(state) = client.runtime.maintenance_run_summary(&Default::default()) {
+                                product_backlog.sample(permit, crate::ProductFamily::Maintenance,"failed",u64::from(state.failures));
+                            }
+
+                            product_backlog.sample(permit, crate::ProductFamily::Recovery, "quarantine", client.quarantined_groups().len() as u64);
+                        }
                         publish_client_pending_projection_updates(
                             &mut client,
                             &events,
@@ -2267,6 +2283,7 @@ async fn handle_startup_hydration_command(
 const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 
 struct MediaHttpContext {
+    product: crate::product_analytics::ProductAnalytics,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
     /// Prevent concurrent host retries from uploading the same durable blob
@@ -2284,6 +2301,7 @@ struct MediaHttpDone {
     /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
     permit: OwnedSemaphorePermit,
     completion: MediaHttpCompletion,
+    cancellation: Option<crate::ProductObservation>,
 }
 
 enum MediaHttpCompletion {
@@ -2316,6 +2334,11 @@ fn spawn_media_http<T>(
     work: impl std::future::Future<Output = T> + Send + 'static,
     into_done: impl FnOnce(T) -> MediaHttpCompletion + Send + 'static,
 ) {
+    let cancellation = media_http.product.begin(
+        crate::ProductFamily::Media,
+        "cancel",
+        crate::ProductUnit::Attempt,
+    );
     let tx = media_http.tx.clone();
     let mut worker_lifetime = media_http.worker_lifetime.subscribe();
     tokio::spawn(async move {
@@ -2327,6 +2350,7 @@ fn spawn_media_http<T>(
         let _ = tx.send(MediaHttpDone {
             permit,
             completion: into_done(output),
+            cancellation,
         });
     });
 }
@@ -2376,7 +2400,14 @@ async fn complete_media_http(
     shared: &RuntimeSharedServices,
     media_http: &MediaHttpContext,
 ) {
-    let MediaHttpDone { permit, completion } = done;
+    let MediaHttpDone {
+        permit,
+        completion,
+        cancellation,
+    } = done;
+    if let Some(cancellation) = cancellation {
+        cancellation.discard();
+    }
     match completion {
         MediaHttpCompletion::Upload {
             finish,
@@ -2388,10 +2419,26 @@ async fn complete_media_http(
                 Ok(result) => client.finish_encrypted_media_upload(finish, result).await,
                 Err(err) => Err(err),
             };
-            shared.app_performance_telemetry().record(
+            // Mixed uploads are one batch attempt, classified as other.
+            let media_type = result
+                .as_ref()
+                .ok()
+                .and_then(|v| {
+                    v.attachments
+                        .first()
+                        .filter(|first| {
+                            v.attachments
+                                .iter()
+                                .all(|item| item.reference.media_type == first.reference.media_type)
+                        })
+                        .map(|item| item.reference.media_type.as_str())
+                })
+                .unwrap_or("");
+            shared.app_performance_telemetry().record_media(
                 AppPerformanceOperation::MediaUpload,
                 started_at.elapsed(),
                 result.is_ok(),
+                media_type,
             );
             let _ = respond.send(result);
         }
@@ -2400,10 +2447,11 @@ async fn complete_media_http(
             respond,
             started_at,
         } => {
-            shared.app_performance_telemetry().record(
+            shared.app_performance_telemetry().record_media(
                 AppPerformanceOperation::MediaDownload,
                 started_at.elapsed(),
                 result.is_ok(),
+                result.as_ref().map(|v| v.media_type.as_str()).unwrap_or(""),
             );
             let _ = respond.send(result);
         }
@@ -2426,10 +2474,11 @@ async fn complete_media_http(
                     Err(persistence_error) => Err(persistence_error),
                 },
             };
-            shared.app_performance_telemetry().record(
+            shared.app_performance_telemetry().record_media(
                 AppPerformanceOperation::GroupCreateImageUpload,
                 started_at.elapsed(),
                 succeeded,
+                "image/",
             );
             let _ = respond.send(response);
         }
@@ -2597,20 +2646,30 @@ async fn handle_account_worker_command(
         media_http,
         scheduled_convergence,
     } = context;
+    let storage_observation = shared.product_analytics.storage_observation();
+    macro_rules! respond_diagnosed {
+        ($respond:expr, $result:expr) => {{
+            let result = $result;
+            if let Some(observation) = &storage_observation {
+                observation.storage_failure(&result);
+            }
+            $respond.send(result)
+        }};
+    }
     match command {
         AccountWorkerCommand::ConnectivityRestored { respond } => {
             let result = client.note_connectivity_restored().map(|_| ());
             scheduled_convergence.wake_after_connectivity_restored();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::NetworkStartupSettled { respond } => {
-            let _ = respond.send(());
+            let _ = respond_diagnosed!(respond, ());
         }
         AccountWorkerCommand::StartupCatchUpResult { result, respond } => {
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::Drain { respond } => {
-            let _ = respond.send(());
+            let _ = respond_diagnosed!(respond, ());
         }
         AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
             let pending = match client
@@ -2628,12 +2687,12 @@ async fn handle_account_worker_command(
                     true
                 }
             };
-            let _ = respond.send(pending);
+            let _ = respond_diagnosed!(respond, pending);
         }
         #[cfg(test)]
         AccountWorkerCommand::UnhydratedGroupCount { respond } => {
             let count = client.runtime.session().unhydrated_group_ids().len();
-            let _ = respond.send(count);
+            let _ = respond_diagnosed!(respond, count);
         }
         AccountWorkerCommand::CatchUp { respond } => {
             let sync_started_at = Instant::now();
@@ -2685,7 +2744,7 @@ async fn handle_account_worker_command(
                     .map(AccountCatchUpFailure::classification),
             );
             let retry_after_response = result.is_ok();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
             if retry_after_response {
                 client
                     .retry_pending_push_registration_shares_best_effort()
@@ -2733,7 +2792,7 @@ async fn handle_account_worker_command(
                     .err()
                     .map(AccountCatchUpFailure::classification),
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::CreateGroup {
             queued_at,
@@ -2797,7 +2856,7 @@ async fn handle_account_worker_command(
                 }
             }
             let created = result.is_ok();
-            let response_sent = respond.send(result).is_ok();
+            let response_sent = respond_diagnosed!(respond, result).is_ok();
             telemetry.record(
                 AppPerformanceOperation::GroupCreateResponseHandoff,
                 response_handoff_started_at.elapsed(),
@@ -2862,7 +2921,7 @@ async fn handle_account_worker_command(
                 started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UploadPreparedGroupImage {
             upload_id,
@@ -2875,18 +2934,18 @@ async fn handle_account_worker_command(
                 app.allow_loopback_blob_endpoints(),
             ) {
                 Ok(PreparedGroupImageUploadStart::Complete(status)) => {
-                    let _ = respond.send(Ok(status));
+                    let _ = respond_diagnosed!(respond, Ok(status));
                 }
                 Ok(PreparedGroupImageUploadStart::Http(http)) => {
                     if let Err(err) = reserve_prepared_group_image_upload(media_http, &upload_id) {
-                        let _ = respond.send(Err(err));
+                        let _ = respond_diagnosed!(respond, Err(err));
                         return;
                     }
                     let permit = match reserve_media_http(media_http) {
                         Ok(permit) => permit,
                         Err(err) => {
                             release_prepared_group_image_upload(media_http, &upload_id);
-                            let _ = respond.send(Err(err));
+                            let _ = respond_diagnosed!(respond, Err(err));
                             return;
                         }
                     };
@@ -2901,7 +2960,7 @@ async fn handle_account_worker_command(
                     });
                 }
                 Err(err) => {
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                 }
             }
         }
@@ -2915,7 +2974,7 @@ async fn handle_account_worker_command(
                         }
                         status
                     });
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::PreparedGroupImages { respond } => {
             let result = client.prepared_initial_group_images().map(|mut statuses| {
@@ -2926,7 +2985,7 @@ async fn handle_account_worker_command(
                 }
                 statuses
             });
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
             // On-demand promotion (mdk#1161): normally a no-op (the startup
@@ -2938,12 +2997,13 @@ async fn handle_account_worker_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
             // The page is one worker command, but each requested group keeps
             // the same on-demand promotion and quarantine gate as `Members`.
-            let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
+            let _ =
+                respond_diagnosed!(respond, member_ids_page_after_hydration(client, &group_ids));
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
             // See the Members arm: on-demand promotion for pipeline-abort
@@ -2953,11 +3013,11 @@ async fn handle_account_worker_command(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
             let result = group_roster_after_hydration(client, &group_id);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => {
             let result = client.enable_group_disbanding(&group_id).await;
@@ -2969,7 +3029,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::DisbandGroup { group_id, respond } => {
             let result = client.disband_group(&group_id).await;
@@ -2979,7 +3039,7 @@ async fn handle_account_worker_command(
                 account_label,
                 &group_id,
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::AcknowledgeDisbandFailure { group_id, respond } => {
             let result = client.acknowledge_disband_failure(&group_id);
@@ -2991,11 +3051,11 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let result = Ok(client.quarantined_groups());
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond } => {
             let result = client.retry_hydrate_quarantined_group(&group_id);
@@ -3027,7 +3087,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UpdateMessageRetention {
             group_id,
@@ -3051,7 +3111,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
             group_id,
@@ -3075,7 +3135,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UpdateGroupAvatarUrl {
             group_id,
@@ -3105,7 +3165,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SafeExportSecret {
             group_id,
@@ -3113,7 +3173,7 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.safe_export_secret(&group_id, component_id);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::ExporterSecret {
             group_id,
@@ -3122,7 +3182,7 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.exporter_secret(&group_id, &label, length);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::InviteMembers {
             group_id,
@@ -3159,7 +3219,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
             if canonical {
                 // Reply first so the inviter is not blocked on Welcome publish.
                 // Snapshot reads (members, MLS state, roster) are served from a
@@ -3217,7 +3277,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::LeaveGroup { group_id, respond } => {
             let result = client.leave_group(&group_id).await;
@@ -3244,7 +3304,7 @@ async fn handle_account_worker_command(
                 account_label,
                 &group_id,
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::DeleteGroupLocal { group_id, respond } => {
             let result = client.delete_group_local(&group_id).await;
@@ -3256,7 +3316,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => {
             let result = client.accept_group_invite(&group_id);
@@ -3269,7 +3329,7 @@ async fn handle_account_worker_command(
                 );
             }
             let retry_after_response = result.is_ok();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
             if retry_after_response {
                 client
                     .retry_pending_push_registration_shares_best_effort()
@@ -3292,7 +3352,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SetGroupArchived {
             group_id,
@@ -3309,7 +3369,7 @@ async fn handle_account_worker_command(
             // the archive-specific trigger. Keep this worker handler
             // limited to mutating the authoritative in-memory state.
             let result = client.set_group_archived(&group_id, archived);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::PromoteAdmin {
             group_id,
@@ -3331,7 +3391,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::DemoteAdmin {
             group_id,
@@ -3353,7 +3413,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SelfDemoteAdmin { group_id, respond } => {
             let result = client.self_demote_admin(&group_id).await;
@@ -3371,7 +3431,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UpdateGroupProfile {
             group_id,
@@ -3396,7 +3456,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UpdateGroupImage {
             group_id,
@@ -3421,13 +3481,13 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::DownloadGroupImage { group_id, respond } => {
             let permit = match reserve_media_http(media_http) {
                 Ok(permit) => permit,
                 Err(err) => {
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                     return;
                 }
             };
@@ -3436,7 +3496,7 @@ async fn handle_account_worker_command(
                     MediaHttpCompletion::GroupImage { result, respond }
                 }),
                 Err(err) => {
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                 }
             }
         }
@@ -3461,7 +3521,7 @@ async fn handle_account_worker_command(
                 send_started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SendAppEvent {
             group_id,
@@ -3507,7 +3567,7 @@ async fn handle_account_worker_command(
                 send_started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::BuildMediaImetaTag {
             group_id,
@@ -3515,7 +3575,7 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.build_media_imeta_tag(&group_id, &reference).await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UploadMedia {
             group_id,
@@ -3531,7 +3591,7 @@ async fn handle_account_worker_command(
                         started_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                     return;
                 }
             };
@@ -3555,7 +3615,7 @@ async fn handle_account_worker_command(
                         started_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                 }
             }
         }
@@ -3579,7 +3639,7 @@ async fn handle_account_worker_command(
                         enqueued_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                     return;
                 }
             };
@@ -3616,17 +3676,17 @@ async fn handle_account_worker_command(
                         enqueued_at.elapsed(),
                         false,
                     );
-                    let _ = respond.send(Err(err));
+                    let _ = respond_diagnosed!(respond, Err(err));
                 }
             }
         }
         AccountWorkerCommand::SecureDeleteExpiredPlaintext { group_id, respond } => {
             let result = client.secure_delete_expired_plaintext_for_group(&group_id);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SweepExpiredRetention { now_ms, respond } => {
             let result = client.sweep_expired_retention(now_ms);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::StartAgentTextStream {
             group_id,
@@ -3651,7 +3711,7 @@ async fn handle_account_worker_command(
                     },
                 )
                 .await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::FinishAgentTextStream {
             group_id,
@@ -3668,7 +3728,7 @@ async fn handle_account_worker_command(
                     );
                 })
                 .await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => {
             let result = client.retry_group_convergence(&group_id).await;
@@ -3686,18 +3746,18 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
             let result = client.pending_welcome_deliveries();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::RedeliverWelcome {
             message_id_hex,
             respond,
         } => {
             let result = client.redeliver_welcome(&message_id_hex).await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::PublishKeyPackage { respond } => {
             let result = async {
@@ -3705,7 +3765,7 @@ async fn handle_account_worker_command(
                 Ok(key_package.bytes().len())
             }
             .await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
             let started_at = Instant::now();
@@ -3719,7 +3779,7 @@ async fn handle_account_worker_command(
                 started_at.elapsed(),
                 result.is_ok(),
             );
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::RotateKeyPackage { respond } => {
             let result = async {
@@ -3727,33 +3787,33 @@ async fn handle_account_worker_command(
                 Ok(key_package.bytes().len())
             }
             .await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::KeyPackageMaintenanceStatus { respond } => {
-            let _ = respond.send(client.key_package_maintenance_status());
+            let _ = respond_diagnosed!(respond, client.key_package_maintenance_status());
         }
         AccountWorkerCommand::DurablyOwnedKeyPackages { respond } => {
-            let _ = respond.send(client.durably_owned_key_packages());
+            let _ = respond_diagnosed!(respond, client.durably_owned_key_packages());
         }
         AccountWorkerCommand::MaintenanceStatus { group_id, respond } => {
-            let _ = respond.send(client.maintenance_status(&group_id));
+            let _ = respond_diagnosed!(respond, client.maintenance_status(&group_id));
         }
         AccountWorkerCommand::ScheduleManualSelfUpdate { group_id, respond } => {
-            let _ = respond.send(client.schedule_manual_self_update(&group_id));
+            let _ = respond_diagnosed!(respond, client.schedule_manual_self_update(&group_id));
         }
         AccountWorkerCommand::PeriodicMaintenancePolicy { respond } => {
-            let _ = respond.send(client.periodic_maintenance_policy());
+            let _ = respond_diagnosed!(respond, client.periodic_maintenance_policy());
         }
         AccountWorkerCommand::SetPeriodicMaintenancePolicy { policy, respond } => {
-            let _ = respond.send(client.set_periodic_maintenance_policy(policy));
+            let _ = respond_diagnosed!(respond, client.set_periodic_maintenance_policy(policy));
         }
         AccountWorkerCommand::PauseMaintenance { respond } => {
             client.pause_maintenance();
-            let _ = respond.send(Ok(()));
+            let _ = respond_diagnosed!(respond, Ok(()));
         }
         AccountWorkerCommand::ResumeMaintenance { respond } => {
             client.resume_maintenance();
-            let _ = respond.send(Ok(()));
+            let _ = respond_diagnosed!(respond, Ok(()));
         }
         AccountWorkerCommand::RunDueMaintenance { respond } => {
             let result = client.run_due_maintenance().await;
@@ -3765,11 +3825,11 @@ async fn handle_account_worker_command(
                     account_label,
                 );
             }
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SharePushRegistration { respond } => {
             let result = client.share_push_registration().await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::UpsertPushRegistration {
             platform,
@@ -3786,18 +3846,18 @@ async fn handle_account_worker_command(
                     relay_hint,
                 )
                 .await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::ClearPushRegistration { respond } => {
             let result = client.clear_and_share_push_registration().await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SetNativePushEnabled { enabled, respond } => {
             let result = client
                 .app
                 .set_native_push_enabled(&client.state.label, enabled);
             let should_retry = result.is_ok();
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
             if should_retry {
                 client
                     .retry_pending_push_registration_shares_best_effort()
@@ -3809,21 +3869,21 @@ async fn handle_account_worker_command(
             respond,
         } => {
             let result = client.remove_push_registration(registration).await;
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::RetryPushRegistration { respond } => {
             let pending = client
                 .retry_pending_push_registration_shares_best_effort()
                 .await;
-            let _ = respond.send(pending);
+            let _ = respond_diagnosed!(respond, pending);
         }
         AccountWorkerCommand::DeleteAuditLog { path, respond } => {
             let result = client.rotate_audit_log_if_active(&path);
-            let _ = respond.send(result);
+            let _ = respond_diagnosed!(respond, result);
         }
         AccountWorkerCommand::SetAuditRecording { enabled, respond } => {
             client.set_audit_recording(enabled);
-            let _ = respond.send(Ok(()));
+            let _ = respond_diagnosed!(respond, Ok(()));
         }
     }
     // Publishing from this seam — rather than inside each send arm — keeps
@@ -4466,6 +4526,22 @@ fn publish_sync_summary_with_audit(
 /// policy choice visible instead of conflating deferral with no pending work.
 /// Explicit full-history repair already performed the unfloored replay and
 /// consumes the same intent without calling this helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyPackageMaintenanceCatchUpOutcome {
+    Completed,
+    Failed,
+    TimedOut,
+}
+impl KeyPackageMaintenanceCatchUpOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "success",
+            Self::Failed => "failure",
+            Self::TimedOut => "timeout",
+        }
+    }
+}
+
 async fn run_pending_epoch_backfill_reporting_arm(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
@@ -4475,7 +4551,26 @@ async fn run_pending_epoch_backfill_reporting_arm(
     seam: EpochBackfillExecutionSeam,
 ) -> Result<(), AccountCatchUpFailure> {
     let backfill_armed = client.has_pending_epoch_backfill();
-    let mut result = match client.run_pending_epoch_backfill(seam).await {
+    let observation = backfill_armed
+        .then(|| {
+            shared.product_analytics.begin(
+                crate::ProductFamily::Recovery,
+                "backfill",
+                crate::ProductUnit::Attempt,
+            )
+        })
+        .flatten();
+    let backfill_result = client.run_pending_epoch_backfill(seam).await;
+    if let Some(observation) = observation {
+        observation.finish(match &backfill_result {
+            Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
+            Ok(EpochBackfillRunOutcome::Incomplete(_)) => "partial",
+            Ok(EpochBackfillRunOutcome::Deferred) => "deferred",
+            Ok(EpochBackfillRunOutcome::NotPending) => "no_work_due",
+            Err(_) => "failure",
+        });
+    }
+    let mut result = match backfill_result {
         // An incomplete replay published the same real summary: it ingested
         // whatever it reached before the relays failed to confirm they had
         // served the account's stored history. Its intent stays pending, so the
@@ -4853,6 +4948,7 @@ mod tests {
         let (worker_lifetime, _) = watch::channel(());
         (
             MediaHttpContext {
+                product: Default::default(),
                 tx,
                 permits: Arc::new(Semaphore::new(limit)),
                 prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -4935,6 +5031,7 @@ mod tests {
         let permit = reserve_media_http(&media_http).unwrap();
         let (respond, response) = oneshot::channel();
         let done = MediaHttpDone {
+            cancellation: None,
             permit,
             completion: MediaHttpCompletion::PreparedGroupImageUpload {
                 upload_id: staged.upload_id.clone(),
@@ -5470,6 +5567,7 @@ mod tests {
         let (media_http_tx, _media_http_rx) = mpsc::unbounded_channel();
         let (media_http_worker_lifetime, _) = watch::channel(());
         let media_http = MediaHttpContext {
+            product: Default::default(),
             tx: media_http_tx,
             permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
             prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),

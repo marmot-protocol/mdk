@@ -32,7 +32,7 @@ pub(crate) use args::{
     AccountCommand, ChatsCommand, Cli, Command, DaemonCommand, DebugCommand, FollowsCommand,
     GroupCommand, GroupsCommand, KeyPackageCommand, MaintenancePolicySetting, MediaCommand,
     MessageCommand, MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand,
-    SettingsCommand, StreamCommand, UsersCommand,
+    SettingsCommand, StreamCommand, UsageDiagnosticsCommand, UsersCommand,
 };
 pub(crate) use error::{WnError, wn_error_json};
 pub(crate) use secret::ImportNsec;
@@ -497,6 +497,11 @@ async fn execute_inner(
         account_home.clone(),
     )?;
     match command {
+        Command::UsageDiagnostics { command } => {
+            let runtime = app.runtime();
+            configure_product_analytics(&runtime)?;
+            usage_diagnostics_command(&runtime, command)
+        }
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
         }
@@ -1117,6 +1122,16 @@ fn app_for(
     directory_relays: Vec<String>,
     account_home: AccountHome,
 ) -> Result<MarmotApp, WnError> {
+    app_for_role(home, relay, directory_relays, account_home, true)
+}
+
+fn app_for_role(
+    home: PathBuf,
+    relay: Option<String>,
+    directory_relays: Vec<String>,
+    account_home: AccountHome,
+    silent: bool,
+) -> Result<MarmotApp, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
@@ -1125,6 +1140,7 @@ fn app_for(
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
         .with_directory_relay_urls(directory_relays);
+    config.usage_diagnostics_silent = silent;
     // Explicit test builds only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the
     // pinned convergence settlement window (e.g. `0` for integration tests).
     if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
@@ -1304,6 +1320,55 @@ fn json_wn_error(err: WnError) -> CliOutput {
         ),
         stderr: String::new(),
     }
+}
+
+pub(crate) fn usage_diagnostics_command(
+    runtime: &marmot_app::MarmotAppRuntime,
+    command: UsageDiagnosticsCommand,
+) -> Result<CommandOutput, WnError> {
+    if !matches!(command, UsageDiagnosticsCommand::Show) {
+        runtime
+            .set_usage_diagnostics_consent(matches!(command, UsageDiagnosticsCommand::Enable))?;
+    }
+    let settings = runtime.usage_diagnostics_settings()?;
+    let status = runtime.usage_diagnostics_status();
+    Ok(CommandOutput {
+        plain: format!(
+            "Share usage and diagnostics: {:?}\nOTLP: {:?}\nProduct analytics: {:?}\n{}\n",
+            settings.decision,
+            status.telemetry,
+            status.product_analytics,
+            marmot_app::USAGE_DIAGNOSTICS_DISCLOSURE
+        ),
+        json: json!({"settings":settings,"status":status,"disclosure":marmot_app::USAGE_DIAGNOSTICS_DISCLOSURE}),
+    })
+}
+
+fn configure_product_analytics(runtime: &marmot_app::MarmotAppRuntime) -> Result<(), WnError> {
+    let endpoint = std::env::var("MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT").ok();
+    let key = std::env::var("MARMOT_PRODUCT_ANALYTICS_APP_KEY").ok();
+    if endpoint.is_none() && key.is_none() {
+        return Ok(());
+    }
+    runtime.set_product_analytics_runtime_config(marmot_app::ProductAnalyticsRuntimeConfig {
+        events_endpoint: endpoint,
+        app_key: key,
+        operator: std::env::var("MARMOT_PRODUCT_ANALYTICS_OPERATOR").unwrap_or_default(),
+        allow_loopback: std::env::var("MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK").as_deref()
+            == Ok("1"),
+        registry: Vec::new(),
+        metadata: marmot_app::ProductAnalyticsMetadata {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            os_family: std::env::consts::OS.into(),
+            os_major_version: String::new(),
+            device_class: "headless".into(),
+            host_surface: "daemon".into(),
+            environment: std::env::var("MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT")
+                .unwrap_or_else(|_| "development".into()),
+            is_debug: cfg!(debug_assertions),
+        },
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

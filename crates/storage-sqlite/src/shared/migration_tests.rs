@@ -16,7 +16,7 @@ fn fresh_file_preserves_pragmas_permissions_and_close() {
     let storage = SqliteSharedStorage::open(&path).unwrap();
     {
         let conn = storage.lock().unwrap();
-        assert_eq!(count(&conn), 1);
+        assert_eq!(count(&conn), 2);
         for (pragma, expected) in [
             ("busy_timeout", 5000),
             ("synchronous", 1),
@@ -79,7 +79,7 @@ fn current_open_is_read_only_and_idempotent_while_writer_holds_lock() {
         .unwrap();
     let second = SqliteSharedStorage::open(&path).unwrap();
     let conn = second.lock().unwrap();
-    assert_eq!(count(&conn), 1);
+    assert_eq!(count(&conn), 2);
     assert_eq!(
         conn.query_row(
             "SELECT applied_at_unix_seconds FROM shared_schema_migrations",
@@ -110,7 +110,7 @@ fn concurrent_openers_record_once() {
                 scope.spawn(|| {
                     barrier.wait();
                     let storage = SqliteSharedStorage::open(&path).unwrap();
-                    assert_eq!(count(&storage.lock().unwrap()), 1);
+                    assert_eq!(count(&storage.lock().unwrap()), 2);
                 })
             })
             .collect();
@@ -118,7 +118,7 @@ fn concurrent_openers_record_once() {
             handle.join().unwrap();
         }
     });
-    assert_eq!(count(&conn), 1);
+    assert_eq!(count(&conn), 2);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn invalid_history_and_future_versions_fail_before_body() {
         "(1, 'private name', 0)",
         "(0, '0001_shared_store', 0)",
         "(-1, '0001_shared_store', 0), (1, '0001_shared_store', 0)",
-        "(2, 'future private name', 0)",
+        "(3, 'future private name', 0)",
     ] {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(LEDGER_SQL).unwrap();
@@ -191,12 +191,12 @@ fn invalid_history_and_future_versions_fail_before_body() {
         ))
         .unwrap();
         let error = run_all(&mut conn).unwrap_err();
-        if rows.starts_with("(2") {
+        if rows.starts_with("(3") {
             assert!(matches!(
                 error,
                 StorageError::UnsupportedSchemaVersion {
-                    found: 2,
-                    latest_supported: 1
+                    found: 3,
+                    latest_supported: 2
                 }
             ));
         } else {
@@ -269,7 +269,7 @@ fn body_and_ledger_failures_roll_back_and_redact_sqlite_messages() {
     assert!(!table_exists(&conn, "directory_users").unwrap());
     conn.execute_batch("DROP TRIGGER reject").unwrap();
     run_all(&mut conn).unwrap();
-    assert_eq!(count(&conn), 1);
+    assert_eq!(count(&conn), 2);
 }
 
 #[test]

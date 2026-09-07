@@ -55,9 +55,8 @@ impl Marmot {
         Ok(self.runtime.relay_telemetry_settings()?.into())
     }
 
-    /// Stable random identifier for this app install, suitable for the OTLP
-    /// `service.instance.id` resource attribute. Separate from audit-log device
-    /// identity.
+    /// Consent-bound random OTLP identifier, stable until revocation. Requires
+    /// a current combined grant; never use this value in product events.
     pub fn telemetry_install_id(&self) -> Result<String, MarmotKitError> {
         Ok(self.runtime.telemetry_install_id()?)
     }
@@ -74,8 +73,9 @@ impl Marmot {
         Ok(())
     }
 
-    /// Persist device-wide relay telemetry export settings and return the
-    /// normalized settings that were stored.
+    /// Deprecated consent control. Use `set_usage_diagnostics_consent` instead.
+    /// Enable requires a combined grant; disable revokes both exporters.
+    /// This compatibility setter still updates the telemetry interval.
     pub async fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettingsFfi,

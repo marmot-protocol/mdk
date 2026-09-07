@@ -130,6 +130,9 @@ enum MarmotStatus
   MARMOT_STATUS_GROUP_REMOVED = 63,
   MARMOT_STATUS_ONBOARDING_ACTION_UNAVAILABLE = 64,
   MARMOT_STATUS_ONBOARDING_REQUIRED = 65,
+  MARMOT_STATUS_CONSENT_REQUIRED = 66,
+  MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67,
+  MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -556,6 +559,14 @@ typedef enum MarmotRelayEndpointPolicy {
    */
   MARMOT_RELAY_ENDPOINT_POLICY_UNSAFE,
 } MarmotRelayEndpointPolicy;
+
+typedef enum MarmotProductRecordResult {
+  MARMOT_PRODUCT_RECORD_RESULT_RECORDED,
+  MARMOT_PRODUCT_RECORD_RESULT_IGNORED_DISABLED,
+  MARMOT_PRODUCT_RECORD_RESULT_IGNORED_UNCONFIGURED,
+  MARMOT_PRODUCT_RECORD_RESULT_IGNORED_DUPLICATE,
+  MARMOT_PRODUCT_RECORD_RESULT_DROPPED_CAPACITY,
+} MarmotProductRecordResult;
 
 /**
  * Why a timeline delta fired.
@@ -3132,6 +3143,69 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot host_splash_ready;
   struct MarmotAppPerformanceOperationSnapshot host_foreground_local_ready;
 } MarmotAppPerformanceSnapshot;
+
+typedef struct MarmotUsageDiagnosticsSettings {
+  uint32_t decision;
+  char *policy_revision;
+  char *registry_revision;
+  int64_t updated_at_ms;
+  uint8_t previously_enabled;
+} MarmotUsageDiagnosticsSettings;
+
+typedef struct MarmotUsageDiagnosticsStatus {
+  uint32_t consent;
+  uint32_t telemetry;
+  uint32_t product_analytics;
+  uint64_t queued_events;
+  uint64_t dropped_events;
+  uint64_t accepted_batches;
+  uint64_t failed_batches;
+} MarmotUsageDiagnosticsStatus;
+
+typedef struct MarmotProductAnalyticsMetadata {
+  char *app_version;
+  char *os_family;
+  char *os_major_version;
+  char *device_class;
+  char *host_surface;
+  char *environment;
+  uint8_t is_debug;
+} MarmotProductAnalyticsMetadata;
+
+typedef struct MarmotProductPropertySchema {
+  char *name;
+  uint32_t kind;
+  char **choices;
+  uintptr_t choices_len;
+} MarmotProductPropertySchema;
+
+typedef struct MarmotProductEventSchema {
+  char *name;
+  uint32_t mode;
+  struct MarmotProductPropertySchema *properties;
+  uintptr_t properties_len;
+} MarmotProductEventSchema;
+
+typedef struct MarmotProductAnalyticsRuntimeConfig {
+  char *events_endpoint;
+  char *app_key;
+  struct MarmotProductAnalyticsMetadata metadata;
+  struct MarmotProductEventSchema *registry;
+  uintptr_t registry_len;
+  uint8_t allow_loopback;
+  char *operator_;
+} MarmotProductAnalyticsRuntimeConfig;
+
+typedef struct MarmotProductEventProperty {
+  char *name;
+  char *value;
+} MarmotProductEventProperty;
+
+typedef struct MarmotProductEvent {
+  char *name;
+  struct MarmotProductEventProperty *properties;
+  uintptr_t properties_len;
+} MarmotProductEvent;
 
 /**
  * One live-received message.
@@ -5944,7 +6018,9 @@ MarmotStatus marmot_account_id_hex(const struct MarmotClient *client,
 MarmotStatus marmot_relay_health(const struct MarmotClient *client, struct MarmotRelayHealth **out);
 
 /**
- * Replace the relay-telemetry export settings. Free the result with
+ * Deprecated consent control: use `marmot_set_usage_diagnostics_consent`.
+ * Enable requires a combined grant; disable revokes both exporters. The
+ * telemetry interval remains configurable. Free the result with
  * `marmot_relay_telemetry_settings_free`.
  *
  * # Safety
@@ -6540,6 +6616,75 @@ MarmotStatus marmot_approve_onboarding_repair(const struct MarmotClient *client,
 MarmotStatus marmot_cancel_onboarding_repair(const struct MarmotClient *client,
                                              const char *account_ref,
                                              struct MarmotOnboardingSnapshot **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_usage_diagnostics_settings(const struct MarmotClient *client,
+                                               struct MarmotUsageDiagnosticsSettings **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_usage_diagnostics_consent(const struct MarmotClient *client,
+                                                  uint8_t enabled,
+                                                  struct MarmotUsageDiagnosticsSettings **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_usage_diagnostics_status(const struct MarmotClient *client,
+                                             struct MarmotUsageDiagnosticsStatus **out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_flush_product_analytics(const struct MarmotClient *client);
+
+/**
+ * Forward a validated product analytics input.
+ * # Safety
+ * Client and borrowed input must be valid; output, when present, must be writable.
+ */
+MarmotStatus marmot_set_product_analytics_runtime_config(const struct MarmotClient *client,
+                                                         const struct MarmotProductAnalyticsRuntimeConfig *input);
+
+/**
+ * Forward a validated product analytics input.
+ * # Safety
+ * Client and borrowed input must be valid; output, when present, must be writable.
+ */
+MarmotStatus marmot_record_product_event(const struct MarmotClient *client,
+                                         const struct MarmotProductEvent *input,
+                                         enum MarmotProductRecordResult *out);
+
+/**
+ * Signal host activity. Discriminants are validated before conversion.
+ * # Safety
+ * Client must be a live handle.
+ */
+MarmotStatus marmot_set_product_analytics_activity(const struct MarmotClient *client,
+                                                   uint32_t activity);
 
 /**
  *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_event_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
@@ -8093,6 +8238,26 @@ void marmot_timeline_subscription_update_free(struct MarmotTimelineSubscriptionU
  * this library.
  */
 void marmot_onboarding_snapshot_free(struct MarmotOnboardingSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_usage_diagnostics_settings_free(struct MarmotUsageDiagnosticsSettings *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_usage_diagnostics_status_free(struct MarmotUsageDiagnosticsStatus *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

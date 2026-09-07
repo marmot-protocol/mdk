@@ -35,6 +35,8 @@ impl std::fmt::Display for AccountCatchUpFailure {
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    ProductAnalytics(#[from] crate::ProductAnalyticsError),
+    #[error(transparent)]
     Account(#[from] marmot_account::AccountError),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
@@ -250,6 +252,7 @@ impl AppError {
 
     pub(crate) fn privacy_safe_kind(&self) -> &'static str {
         match self {
+            Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),
             Self::AccountHome(error) => account_home_error_kind(error),
             Self::Session(error) => session_error_kind(error),
@@ -257,7 +260,14 @@ impl AppError {
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
             Self::Json(_) => "json",
-            Self::Sqlite(_) => "sqlite",
+            Self::Sqlite(error) => match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    "storage_busy"
+                }
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => "storage_corruption",
+                Some(rusqlite::ErrorCode::DiskFull) => "storage_capacity",
+                _ => "sqlite",
+            },
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
@@ -329,6 +339,12 @@ impl AppError {
 
     /// Broad, bounded cause derived only from typed variants.
     pub(crate) fn sync_error_class(&self) -> SyncErrorClass {
+        match self.privacy_safe_kind() {
+            "storage_busy" => return SyncErrorClass::StorageBusy,
+            "storage_corruption" => return SyncErrorClass::StorageCorruption,
+            "storage_capacity" => return SyncErrorClass::StorageCapacity,
+            _ => {}
+        }
         match self {
             Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) => SyncErrorClass::Storage,
             Self::Session(error) => session_error_class(error),
@@ -488,6 +504,8 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
         StorageError::TimelineCursorExpired => "storage_timeline_cursor_expired",
         StorageError::Busy(_) => "storage_busy",
+        StorageError::Corruption(_) => "storage_corruption",
+        StorageError::Capacity(_) => "storage_capacity",
         StorageError::Closed(_) => "storage_closed",
         StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
         StorageError::Backend(_) => "storage_backend",

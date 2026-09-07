@@ -254,6 +254,7 @@ impl AgentConnector {
                 .with_allow_loopback_relay_endpoints(config.allow_loopback_relays),
         )?;
         let runtime = MarmotAppRuntime::new(app.clone());
+        configure_product_analytics(&runtime)?;
         let reconcile_telemetry =
             std::sync::Arc::new(reconcile_telemetry::ReconcileTelemetry::default());
         let inbound_catch_up =
@@ -296,7 +297,20 @@ impl AgentConnector {
         self.spawn_invite_policy_worker();
         self.spawn_stream_session_sweeper();
         self.spawn_media_temp_sweeper();
-        self.ensure_agent_accounts_ready().await?;
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Agent,
+            "readiness",
+            marmot_app::ProductUnit::Attempt,
+        );
+        let readiness = self.ensure_agent_accounts_ready().await;
+        if let Some(observation) = observation {
+            observation.finish(if readiness.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        readiness?;
         Ok(())
     }
 
@@ -363,7 +377,9 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     )?;
     let socket_path = config.socket.clone();
     let max_connections = config.max_connections;
+    let management_home = config.home.clone();
     let connector = AgentConnector::open(config)?;
+    let management = usage_diagnostics::bind(&management_home)?;
     let link_loss = wait_control_socket_link_loss(&socket_path, link_identity);
     tokio::pin!(link_loss);
     // Losing the published path makes this process unreachable, so cancellation
@@ -381,6 +397,11 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
             err = &mut link_loss => {
                 return Err(err);
             }
+            accepted = management.accept() => {
+                let (stream, _) = accepted?;
+                usage_diagnostics::serve_one(stream, &connector.runtime).await?;
+                continue;
+            },
             accepted = listener.accept() => accepted,
         };
         let (mut stream, _peer_addr) = match accepted {
@@ -470,4 +491,36 @@ async fn wait_control_socket_link_loss(
             return err;
         }
     }
+}
+
+mod usage_diagnostics;
+pub use usage_diagnostics::{
+    UsageDiagnosticsCommand, UsageDiagnosticsReport, manage_usage_diagnostics,
+};
+
+fn configure_product_analytics(runtime: &MarmotAppRuntime) -> Result<(), ConnectorError> {
+    let endpoint = std::env::var("MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT").ok();
+    let key = std::env::var("MARMOT_PRODUCT_ANALYTICS_APP_KEY").ok();
+    if endpoint.is_none() && key.is_none() {
+        return Ok(());
+    }
+    runtime.set_product_analytics_runtime_config(marmot_app::ProductAnalyticsRuntimeConfig {
+        events_endpoint: endpoint,
+        app_key: key,
+        operator: std::env::var("MARMOT_PRODUCT_ANALYTICS_OPERATOR").unwrap_or_default(),
+        allow_loopback: std::env::var("MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK").as_deref()
+            == Ok("1"),
+        registry: Vec::new(),
+        metadata: marmot_app::ProductAnalyticsMetadata {
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            os_family: std::env::consts::OS.into(),
+            os_major_version: String::new(),
+            device_class: "headless".into(),
+            host_surface: "agent".into(),
+            environment: std::env::var("MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT")
+                .unwrap_or_else(|_| "development".into()),
+            is_debug: cfg!(debug_assertions),
+        },
+    })?;
+    Ok(())
 }

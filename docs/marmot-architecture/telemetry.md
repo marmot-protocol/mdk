@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-06
+updated: 2026-09-07
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -25,7 +25,7 @@ runtime. It complements the policy docs:
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay metrics may carry only `relay`; account sync/catch-up failure counters carry only the closed `failure_stage` and `error_class` attributes. Other app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Agent connector reconciliation telemetry | Always collected while `wn-agent` runs: process-local cumulative counters for the shared inbound catch-up driver and the invite-policy worker (passes, outcomes, accounts/candidate rows considered), plus one privacy-safe `tracing` event per scheduled pass carrying a `source` label, duration, result, and aggregate counts (mdk#1380). | No. Counters are process-local; tracing events follow the no-ids/no-urls/no-content rules. | [`reconcile_telemetry.rs`](../../crates/agent-connector/src/reconcile_telemetry.rs), [`event_projection.rs`](../../crates/agent-connector/src/event_projection.rs), [`invite_policy.rs`](../../crates/agent-connector/src/invite_policy.rs) |
 | Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
-| Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
+| Product analytics | Stock Aptabase via the opt-in usage and diagnostics collector; approved finite observations and memory-only queues. No crash SDK is added. | Yes, with the product export feature, configuration, and combined consent. | [Usage and diagnostics](usage-diagnostics.md) |
 
 ## Source map
 
@@ -750,4 +750,4 @@ cargo nextest run -p cgka-conformance-simulator --test tracing_audit
 ```
 
 The repo-level `just check` and `just test` recipes include the `otlp-export` feature set through the shared
-`otlp-features` variable.
+`diagnostics-features` variable.

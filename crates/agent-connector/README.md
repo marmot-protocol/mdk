@@ -239,3 +239,11 @@ just check
 just clippy
 just test
 ```
+
+### Usage and diagnostics
+
+`wn-agent usage-diagnostics show|enable|disable --home PATH [--json]` manages local
+combined OTLP/product consent. An active daemon handles updates on a separate
+owner-only local socket; the agent-control protocol cannot grant consent. The
+agent root has its own permission, independent from White Noise. See the
+[host and operator contract](../../docs/marmot-architecture/usage-diagnostics.md).

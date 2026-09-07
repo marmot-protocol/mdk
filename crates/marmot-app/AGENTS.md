@@ -129,7 +129,7 @@ App runtime bridge for the first real Marmot app surfaces.
   opt-in and off by default: `MarmotRelayPlane::telemetry_exporter` is the single construction gate, relay-identity
   resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
-  build. Keep per-attempt collector DNS validation and pinning in `relay_telemetry_export/host_safety.rs`: validate
+  build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/proxies, and retain TLS verification. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. See
   `docs/marmot-architecture/relay-observability.md` and `overview/dial-safety.md`.

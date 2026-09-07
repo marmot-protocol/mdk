@@ -233,6 +233,39 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         required_list_kind: Option<&str>,
     ) -> Result<Option<AccountRelayListStatus>, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "relay_list",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_current_account_relay_list_status_for_account_id_unobserved(
+                account_id_hex,
+                bootstrap_relays,
+                required_list_kind,
+            )
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(Some(_)) => "success",
+                    Ok(None) => "empty",
+                    Err(_) => "failure",
+                },
+                "network",
+                1,
+            );
+            observation.discard();
+        }
+        result
+    }
+
+    async fn fetch_current_account_relay_list_status_for_account_id_unobserved(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        required_list_kind: Option<&str>,
+    ) -> Result<Option<AccountRelayListStatus>, AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
@@ -324,6 +357,34 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Option<UserProfileMetadata>, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "profile",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_current_user_profile_for_account_id_unobserved(account_id_hex, bootstrap_relays)
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(Some(_)) => "success",
+                    Ok(None) => "empty",
+                    Err(_) => "failure",
+                },
+                "network",
+                1,
+            );
+            observation.discard();
+        }
+        result
+    }
+
+    async fn fetch_current_user_profile_for_account_id_unobserved(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<UserProfileMetadata>, AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
@@ -353,6 +414,35 @@ impl MarmotApp {
     }
 
     pub async fn fetch_latest_key_package_for_account_id(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<FetchedKeyPackage, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "key_package",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_latest_key_package_for_account_id_unobserved(account_id_hex, bootstrap_relays)
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(_) => "success",
+                    Err(AppError::MissingKeyPackage(_)) => "empty",
+                    Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
+                    Err(_) => "failure",
+                },
+                "network",
+                1,
+            );
+            observation.discard();
+        }
+        result
+    }
+
+    async fn fetch_latest_key_package_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
@@ -588,6 +678,26 @@ impl MarmotApp {
         profile: UserProfileMetadata,
         endpoints: Vec<TransportEndpoint>,
     ) -> Result<(), AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "publish",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .publish_user_profile_to_endpoints_unobserved(label, profile, endpoints)
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    async fn publish_user_profile_to_endpoints_unobserved(
+        &self,
+        label: &str,
+        profile: UserProfileMetadata,
+        endpoints: Vec<TransportEndpoint>,
+    ) -> Result<(), AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let content = serde_json::to_string(&profile_content_json(&profile))?;
@@ -817,6 +927,34 @@ impl MarmotApp {
     }
 
     pub async fn fetch_current_follow_list_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "follows",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self
+            .fetch_current_follow_list_for_account_id_unobserved(account_id_hex, source_relays)
+            .await;
+        if let Some(observation) = observation {
+            observation.directory_sample(
+                match &result {
+                    Ok(Some(_)) => "success",
+                    Ok(None) => "empty",
+                    Err(_) => "failure",
+                },
+                "network",
+                1,
+            );
+            observation.discard();
+        }
+        result
+    }
+
+    async fn fetch_current_follow_list_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,

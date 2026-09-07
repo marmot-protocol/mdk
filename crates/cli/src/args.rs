@@ -86,6 +86,11 @@ pub(crate) enum MaintenancePolicySetting {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum Command {
+    /// Inspect or change the local Share usage and diagnostics permission.
+    UsageDiagnostics {
+        #[command(subcommand)]
+        command: UsageDiagnosticsCommand,
+    },
     #[command(about = "Open the interactive terminal UI")]
     Tui {
         #[arg(
@@ -1196,4 +1201,11 @@ pub(crate) fn parse_radius(s: &str) -> Result<(u8, u8), String> {
         return Err(format!("radius start ({start}) must be <= end ({end})"));
     }
     Ok((start, end))
+}
+
+#[derive(Clone, Debug, clap::Subcommand, serde::Serialize, serde::Deserialize)]
+pub(crate) enum UsageDiagnosticsCommand {
+    Show,
+    Enable,
+    Disable,
 }
