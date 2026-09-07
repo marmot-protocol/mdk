@@ -6733,6 +6733,51 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("handed", adapter._inbound_spool.get("55" * 32).state)
         adapter._inbound_spool.close()
 
+    async def test_failed_debounce_release_retries_without_restart(self):
+        adapter = self.make_adapter(
+            extra={"group_activation": "always", "debounce_ms": 10}
+        )
+        original_enqueue = adapter._enqueue_debounced
+        original_release = adapter._inbound_spool.release_debounce
+        release_attempts = 0
+
+        def fail_after_buffering(event):
+            key = adapter._debounce_key(event)
+            adapter._debounce_pending.setdefault(key, []).append(event)
+            raise RuntimeError("synthetic timer registration failure")
+
+        def fail_release_once(message_ids, *, reason):
+            nonlocal release_attempts
+            release_attempts += 1
+            if release_attempts == 1:
+                raise self.adapter_module.sqlite3.OperationalError(
+                    "synthetic debounce release failure"
+                )
+            return original_release(message_ids, reason=reason)
+
+        adapter._enqueue_debounced = fail_after_buffering
+        adapter._inbound_spool.release_debounce = fail_release_once
+        retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+        try:
+            with self.assertRaisesRegex(RuntimeError, "timer registration"):
+                await adapter._handle_control_event(
+                    self.make_event(message_id="33", text="first")
+                )
+            adapter._enqueue_debounced = original_enqueue
+            for _ in range(150):
+                if adapter.events:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual(2, release_attempts)
+            self.assertEqual([item.text for item in adapter.events], ["first"])
+            self.assertEqual("handed", adapter._inbound_spool.get("33" * 32).state)
+            self.assertFalse(retry.done())
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+            adapter._inbound_spool.close()
+
     async def test_retry_loop_survives_raw_sqlite_read_error(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
         adapter._ensure_inbound_spool_open()

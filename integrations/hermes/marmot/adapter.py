@@ -1456,6 +1456,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # bursts into one turn. Disabled when debounce_ms <= 0.
         self._debounce_pending: Dict[str, list[Dict[str, Any]]] = {}
         self._debounce_tasks: Dict[str, asyncio.Task] = {}
+        # Failed compensating releases must remain discoverable in-process.
+        # Durable debounce rows are intentionally hidden from due(), so the
+        # ordinary spool retry loop cannot recover them without this handle.
+        self._debounce_release_pending: Dict[str, str] = {}
         # Set true once the current subscription yields/acks (healthy); used by
         # the reconnect-backoff loop to reset its attempt counter.
         self._inbound_established = False
@@ -2791,6 +2795,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             except asyncio.TimeoutError:
                 pass
             self._inbound_spool_wakeup.clear()
+            self._retry_pending_debounce_releases()
             try:
                 records = self._inbound_spool.due()
             except (InboundSpoolError, OSError, sqlite3.Error):
@@ -3249,12 +3254,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         message_ids = [message_id for message_id in message_ids if message_id]
         if not message_ids or not self._inbound_spool.is_open:
             return
-        try:
-            self._inbound_spool.release_debounce(message_ids, reason=reason)
-        except (InboundSpoolError, OSError, sqlite3.Error):
-            logger.error("Marmot inbound debounce release failed", exc_info=True)
-        finally:
-            self._inbound_spool_wakeup.set()
+        for message_id in message_ids:
+            self._debounce_release_pending.setdefault(message_id, reason)
+        self._retry_pending_debounce_releases()
+        self._inbound_spool_wakeup.set()
+
+    def _retry_pending_debounce_releases(self) -> None:
+        if not self._debounce_release_pending or not self._inbound_spool.is_open:
+            return
+        by_reason: Dict[str, list[str]] = {}
+        for message_id, reason in tuple(self._debounce_release_pending.items()):
+            by_reason.setdefault(reason, []).append(message_id)
+        for reason, message_ids in by_reason.items():
+            try:
+                self._inbound_spool.release_debounce(message_ids, reason=reason)
+            except (InboundSpoolError, OSError, sqlite3.Error):
+                logger.error("Marmot inbound debounce release failed", exc_info=True)
+                continue
+            for message_id in message_ids:
+                if self._debounce_release_pending.get(message_id) == reason:
+                    self._debounce_release_pending.pop(message_id, None)
 
     async def _handle_mutation(self, event: Dict[str, Any]) -> None:
         # Mutations are quiet next-turn context and never trigger an agent turn.
