@@ -817,14 +817,14 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
-        let has_queued = self.has_queued_outbound_intents(group_id)?;
-        let settled = if has_queued {
-            self.advance_before_queued_outbound_intents(group_id, now_ms)
-                .await?
-        } else {
-            self.advance_convergence_inputs_with_deadline(group_id, now_ms, deadline)
-                .await?
-        };
+        // This entry point belongs to background recovery even when output is
+        // queued. Borrowing a send's four-row preflight allowance here makes
+        // queued maintenance throttle the worker's entire deferred generation.
+        // The generation/fairness barriers still settle before output drains;
+        // each queued intent retains its foreground preflight below.
+        let settled = self
+            .advance_convergence_inputs_with_deadline(group_id, now_ms, deadline)
+            .await?;
         if !settled {
             return Ok(Vec::new());
         }

@@ -1744,3 +1744,127 @@ async fn slow_preparation_releases_exactly_one_expired_row() {
             == 0
     }));
 }
+
+/// Queued output must not turn background recovery into a four-row foreground
+/// send attempt. The frozen raw generation still completes before output drains.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn queued_output_preserves_background_recovery_allowance() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+    use cgka_traits::storage::DeferredPeelGenerationStorage;
+
+    for explicit_time in [false, true] {
+        let (mut engine, storage, group_id, ids, _delay) = slow_preparation_case(96).await;
+        // Keep the production four-row foreground limit. Its independent time
+        // budget is enlarged only to make this row-accounting test deterministic.
+        engine.set_foreground_deferred_peel_budget(5_000, 4);
+        let payload = MarmotAppEvent::new(
+            hex::encode(engine.self_id().as_slice()),
+            1_700_000_000,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            "queued during opaque recovery",
+        )
+        .encode()
+        .unwrap();
+        let result = engine
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap();
+        let SendResult::Queued { intent_id, .. } = result else {
+            panic!("foreground send must queue behind a partial generation");
+        };
+        assert_eq!(
+            deferred_attempts(&storage, &ids),
+            4,
+            "actual foreground send retains its four-row allowance"
+        );
+        let advanced = if explicit_time {
+            engine
+                .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+                .await
+                .unwrap()
+        } else {
+            engine.advance_convergence(&group_id).await.unwrap()
+        };
+        let background_attempts = deferred_attempts(&storage, &ids) - 4;
+        eprintln!(
+            "queued background recovery: explicit_time={explicit_time}, attempts={background_attempts}"
+        );
+        assert!(
+            (1..=64).contains(&background_attempts),
+            "wall-clock recovery must make progress within its row allowance: {background_attempts}"
+        );
+        if explicit_time {
+            assert_eq!(
+                background_attempts, 64,
+                "explicit-time recovery keeps its deterministic row slice"
+            );
+        }
+        assert!(
+            advanced.is_empty(),
+            "queued output must wait for the whole frozen generation"
+        );
+        assert!(
+            storage
+                .deferred_peel_generation(&group_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Complete with deterministic row slices. Wall-clock throughput is
+        // host-dependent; the public entry point was exercised above.
+        let mut drained = Vec::new();
+        for pass in 0..8 {
+            drained.extend(
+                engine
+                    .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001 + pass)
+                    .await
+                    .unwrap(),
+            );
+            if !drained.is_empty() {
+                break;
+            }
+        }
+        assert!(matches!(
+            drained.as_slice(),
+            [SendResult::ApplicationMessage { .. }]
+        ));
+        assert_eq!(
+            deferred_attempts(&storage, &ids),
+            96,
+            "every opaque row gets one definitive attempt before output"
+        );
+        assert!(
+            storage
+                .deferred_peel_generation(&group_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .advance_convergence(&group_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an in-flight queued result must not regenerate twice"
+        );
+        engine.confirm_queued_outbound_intent(&intent_id).unwrap();
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
