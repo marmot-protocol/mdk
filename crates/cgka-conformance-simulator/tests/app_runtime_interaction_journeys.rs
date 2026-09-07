@@ -933,7 +933,7 @@ async fn check(journey: Journey) {
             "relay_order": "native local Nostr relay", "debug_assertions": cfg!(debug_assertions),
             "settlement_policy": match journey {
                 Journey::ManualSelfUpdate => "protocol-pinned 1000 ms settlement; maintenance windows zeroed when built with test-policy-overrides",
-                _ => "default production policy; no test override requested",
+                _ => "protocol-pinned 1000 ms settlement; production maintenance windows",
             },
             "immediate_maintenance_honored": matches!(journey, Journey::ManualSelfUpdate)
                 && AppRuntimeHarness::honors_maintenance_timing_override(),
@@ -946,7 +946,10 @@ async fn check(journey: Journey) {
         Journey::ManualSelfUpdate => {
             AppRuntimeHarness::new_with_immediate_maintenance(&clients).await
         }
-        _ => AppRuntimeHarness::new(&clients).await,
+        // Workspace feature unification can enable marmot-app's instant
+        // test settlement default through another crate. These journeys claim
+        // production behavior, so pin that policy in every build.
+        _ => AppRuntimeHarness::new_with_pinned_settlement(&clients).await,
     }
     .expect("public runtime setup");
     let exercise = async {

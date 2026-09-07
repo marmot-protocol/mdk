@@ -354,7 +354,7 @@ workspace release looks like:
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.18"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.19"
 
 install_verified() (
   set -eu
