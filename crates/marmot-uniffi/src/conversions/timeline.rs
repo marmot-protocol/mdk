@@ -366,14 +366,39 @@ pub struct TimelineProjectionUpdateFfi {
 
 impl From<AppProjectionUpdate> for TimelineProjectionUpdateFfi {
     fn from(value: AppProjectionUpdate) -> Self {
+        let mut source_changes = value.timeline_changes.into_iter();
+        let mut changes = Vec::with_capacity(source_changes.len());
+        let messages = value
+            .timeline_messages
+            .into_iter()
+            .map(|record| {
+                // Storage emits the same rows in both compatibility messages
+                // and ordered upserts. Parse matching rows only once; preserve
+                // independent conversion for removals or differing records.
+                let change = source_changes.next();
+                let matching = matches!(
+                    &change,
+                    Some(TimelineMessageChange::Upsert { message, .. }) if **message == record
+                );
+                let message = TimelineMessageRecordFfi::from(record);
+                match change {
+                    Some(TimelineMessageChange::Upsert { trigger, .. }) if matching => {
+                        changes.push(TimelineMessageChangeFfi::Upsert {
+                            trigger: trigger.into(),
+                            message: message.clone(),
+                        });
+                    }
+                    Some(change) => changes.push(change.into()),
+                    None => {}
+                }
+                message
+            })
+            .collect();
+        changes.extend(source_changes.map(Into::into));
         Self {
             group_id_hex: value.group_id_hex,
-            messages: value
-                .timeline_messages
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            changes: value.timeline_changes.into_iter().map(Into::into).collect(),
+            messages,
+            changes,
             chat_list_row: value.chat_list_row.map(Into::into),
             chat_list_trigger: value.chat_list_trigger.into(),
         }
@@ -454,6 +479,74 @@ mod tests {
                 .iter()
                 .all(|entry| entry.count as usize == entry.senders.len())
         );
+    }
+
+    #[test]
+    fn projection_wire_is_unchanged() {
+        let mut first = record_with_media(Some(7), None, None);
+        first.plaintext = "hello **world**".into();
+        let mut second = first.clone();
+        second.plaintext = "edited *text*".into();
+        let upsert = |message| TimelineMessageChange::Upsert {
+            trigger: TimelineUpdateTrigger::MessageEditedOrReprojected,
+            message: Box::new(message),
+        };
+        let remove = TimelineMessageChange::Remove {
+            message_id_hex: "removed".into(),
+            reason: TimelineRemoveReason::Pruned,
+        };
+        // Matching records, same-id edits, removals, unequal lengths, and
+        // changes-only updates must keep the independently encoded wire bytes.
+        for (records, changes) in [
+            (vec![first.clone()], vec![upsert(first.clone())]),
+            (vec![first.clone()], vec![upsert(second.clone())]),
+            (
+                vec![first.clone()],
+                vec![remove.clone(), upsert(second.clone())],
+            ),
+            (
+                vec![first.clone(), second.clone()],
+                vec![upsert(first.clone())],
+            ),
+            (vec![first.clone()], Vec::new()),
+            (Vec::new(), vec![upsert(second), remove]),
+        ] {
+            let source = AppProjectionUpdate {
+                group_id_hex: "group".into(),
+                timeline_messages: records,
+                timeline_changes: changes,
+                chat_list_row: None,
+                chat_list_trigger: Default::default(),
+            };
+            let expected = TimelineProjectionUpdateFfi {
+                group_id_hex: source.group_id_hex.clone(),
+                messages: source
+                    .timeline_messages
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                changes: source
+                    .timeline_changes
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                chat_list_row: None,
+                chat_list_trigger: source.chat_list_trigger.into(),
+            };
+            let mut expected_bytes = Vec::new();
+            let mut actual_bytes = Vec::new();
+            <TimelineProjectionUpdateFfi as uniffi::Lower<crate::UniFfiTag>>::write(
+                expected,
+                &mut expected_bytes,
+            );
+            <TimelineProjectionUpdateFfi as uniffi::Lower<crate::UniFfiTag>>::write(
+                source.into(),
+                &mut actual_bytes,
+            );
+            assert_eq!(actual_bytes, expected_bytes);
+        }
     }
 
     fn imeta_tag(byte: u8, media_type: &str, file_name: &str) -> Vec<String> {
