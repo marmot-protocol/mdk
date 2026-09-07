@@ -122,10 +122,11 @@ mod migration_0060_released_transport_receipts;
 mod migration_0061_transport_reconciliation_replay_cursor;
 #[path = "migrations/0062_chat_list_preview_indexes.rs"]
 mod migration_0062_chat_list_preview_indexes;
-#[path = "migrations/0061_seen_event_recency_index.rs"]
-mod migration_0061_seen_event_recency_index;
-#[path = "migrations/0062_pending_application_order_index.rs"]
-mod migration_0062_pending_application_order_index;
+#[path = "migrations/0063_query_indexes.rs"]
+mod migration_0063_query_indexes;
+#[cfg(test)]
+#[path = "migrations/query_work_tests.rs"]
+mod query_work_tests;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -452,14 +453,9 @@ const MIGRATIONS: &[Migration] = &[
         apply: migration_0062_chat_list_preview_indexes::apply,
     },
     Migration {
-        version: 61,
-        name: "0061_seen_event_recency_index",
-        apply: migration_0061_seen_event_recency_index::apply,
-    },
-    Migration {
-        version: 62,
-        name: "0062_pending_application_order_index",
-        apply: migration_0062_pending_application_order_index::apply,
+        version: 63,
+        name: "0063_query_indexes",
+        apply: migration_0063_query_indexes::apply,
     },
 ];
 
@@ -698,7 +694,7 @@ mod tests {
     #[test]
     fn seen_recency_index_upgrade() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run(&mut conn, &MIGRATIONS[..60]).unwrap();
+        run(&mut conn, &MIGRATIONS[..62]).unwrap();
         conn.execute_batch(
             "INSERT INTO seen_events(rowid, event_id, seen_at) VALUES
              (2, 'old', 1), (5, 'tie-first', 9), (11, 'tie-last', 9);",
@@ -1080,7 +1076,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 62,
+                found: 63,
                 latest_supported: 46,
             }
         ));
@@ -1136,7 +1132,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 62,
+                found: 63,
                 latest_supported: 46,
             }
         ));
@@ -1440,7 +1436,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 62,
+                found: 63,
                 latest_supported: 46,
             }
         ));

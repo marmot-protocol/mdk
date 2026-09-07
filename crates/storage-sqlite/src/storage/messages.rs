@@ -1764,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_application_order_query_work() {
+    fn pending_replay_query_work() {
         use rusqlite::StatementStatus;
         use std::time::Instant;
 
@@ -1778,13 +1778,10 @@ mod tests {
         .unwrap();
         let legacy = "SELECT record FROM pending_application_events
                       ORDER BY message_insert_order, message_id";
-        let indexed = "SELECT record FROM pending_application_events INDEXED BY
-                       idx_pending_application_events_order
-                       ORDER BY message_insert_order, message_id";
         conn.execute_batch("DROP INDEX idx_pending_application_events_order")
             .unwrap();
         let mut measurements = Vec::new();
-        for (index, sql) in [legacy, indexed].into_iter().enumerate() {
+        for index in 0..2 {
             if index == 1 {
                 conn.execute_batch(
                     "CREATE INDEX idx_pending_application_events_order
@@ -1792,31 +1789,30 @@ mod tests {
                 )
                 .unwrap();
             }
-            let mut statement = conn.prepare(sql).unwrap();
+            let mut statement = conn.prepare(legacy).unwrap();
             let start = Instant::now();
             for _ in 0..20 {
                 let rows = statement
                     .query_map([], |row| row.get::<_, Vec<u8>>(0))
                     .unwrap();
-                assert_eq!(rows.count(), 4096);
+                assert_eq!(
+                    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap().len(),
+                    4096
+                );
             }
             measurements.push((
                 statement.get_status(StatementStatus::VmStep) / 20,
                 start.elapsed() / 20,
             ));
+            if index == 1 {
+                assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+            }
         }
         eprintln!(
             "pending application order: old={:?}, new={:?} (VM steps, elapsed)",
             measurements[0], measurements[1]
         );
-        assert!(measurements[1].0 < measurements[0].0);
         assert!(measurements[1].0 * 2 < measurements[0].0);
-        assert_eq!(
-            conn.prepare(indexed)
-                .unwrap()
-                .get_status(StatementStatus::Sort),
-            0
-        );
     }
 
     #[test]
