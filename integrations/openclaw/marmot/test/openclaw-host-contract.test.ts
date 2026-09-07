@@ -421,4 +421,75 @@ describe("installed OpenClaw inbound host contract", () => {
       stop();
     }
   });
+
+  betaContract("releases a debounce key when the group queue adopts the batch", async () => {
+    const events: AgentControlEvent[] = Array.from({ length: 33 }, (_, index) => ({
+      type: "inbound_message",
+      account_id_hex: HEX32("aa"),
+      group_id_hex: HEX32("cc"),
+      message: {
+        message_id_hex: (index + 1).toString(16).padStart(64, "0"),
+        sender: { account_id_hex: HEX32("bb"), display_name: null, is_self: false },
+        text: `message-${index}`,
+        recorded_at: 123 + index,
+        media: [],
+      },
+    }));
+    const client = {
+      accountList: async () => ({
+        type: "account_list" as const,
+        accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
+      }),
+      async *subscribeInbound(
+        _filter?: unknown,
+        _signal?: AbortSignal,
+        hooks?: { onReady?: () => void },
+      ): AsyncGenerator<AgentControlEvent> {
+        hooks?.onReady?.();
+        for (const event of events) {
+          yield event;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        await new Promise<void>((resolve) => {
+          if (_signal?.aborted) {
+            resolve();
+          } else {
+            _signal?.addEventListener("abort", () => resolve(), { once: true });
+          }
+        });
+      },
+    } as unknown as MarmotAgentControlClient;
+    let releaseFirst!: () => void;
+    const firstCompletion = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const dispatched = vi.fn(async (_message: MarmotInboundMessage) => {
+      if (dispatched.mock.calls.length === 1) {
+        await firstCompletion;
+      }
+    });
+    const warnings: string[] = [];
+    const stop = startMarmotInbound(
+      {
+        config: {
+          channels: { marmot: { debounceMs: 1, profileNameOnboarding: false } },
+        },
+        logger: { info: () => undefined, warn: (message) => warnings.push(message) },
+      },
+      dispatched,
+      { clientFactory: () => client },
+    );
+
+    try {
+      await vi.waitFor(() =>
+        expect(warnings).toContain(
+          "marmot: inbound queue overloaded (reason=per_group_depth, active_groups=1, max_depth_per_group=32, max_tracked_groups=256)",
+        ),
+      );
+      expect(warnings.join(" ")).not.toContain("inbound debounce overloaded");
+    } finally {
+      releaseFirst();
+      stop();
+    }
+  });
 });

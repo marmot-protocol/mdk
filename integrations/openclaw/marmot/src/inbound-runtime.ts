@@ -54,8 +54,12 @@ interface CompatibleInboundDebounceFlush {
   completion: Promise<void>;
 }
 
+interface CompatibleInboundDebounceAdmissionLifecycle {
+  onAdopted: () => void | Promise<void>;
+}
+
 type CompatibleInboundDebounceFlushFactory = (params: {
-  dispatch: (lifecycle: unknown) => Promise<void>;
+  dispatch: (lifecycle: CompatibleInboundDebounceAdmissionLifecycle) => Promise<void>;
 }) => CompatibleInboundDebounceFlush;
 
 type CompatibleInboundDebouncerFactory = <T>(params: {
@@ -427,7 +431,10 @@ export function startMarmotInbound(
         pendingDebounceDepths.set(key, next);
       }
     };
-    const flushInboundBatch = (items: PendingDebounceItem[]): Promise<void> => {
+    const flushInboundBatch = (
+      items: PendingDebounceItem[],
+      lifecycle?: CompatibleInboundDebounceAdmissionLifecycle,
+    ): Promise<void> => {
       if (items.length === 0) {
         return Promise.resolve();
       }
@@ -450,7 +457,9 @@ export function startMarmotInbound(
           index === representativeIndex ? queued : coalescedSubmission(queued.completion),
         );
       });
-      return queued.completion.then(() => undefined);
+      return Promise.resolve(lifecycle?.onAdopted())
+        .then(() => queued.completion)
+        .then(() => undefined);
     };
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =
@@ -462,10 +471,11 @@ export function startMarmotInbound(
               `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`,
             onFlush: (items, createFlush) => {
               // Stable awaits this Promise directly. Beta's factory publishes
-              // separate admission/completion promises around the same dispatch;
-              // returning the real queued completion keeps both contracts honest.
+              // separate admission/completion promises around the same dispatch.
+              // Mark adoption as soon as the group queue accepts the batch so
+              // beta can release this debounce key while the turn completes.
               return createFlush
-                ? createFlush({ dispatch: async (_lifecycle) => flushInboundBatch(items) })
+                ? createFlush({ dispatch: (lifecycle) => flushInboundBatch(items, lifecycle) })
                 : flushInboundBatch(items);
             },
             onCancel: (items) => {
