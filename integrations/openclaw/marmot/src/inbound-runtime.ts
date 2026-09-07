@@ -234,6 +234,14 @@ export function startMarmotInbound(
   const controller = new AbortController();
   let stopping = false;
   let cancelPendingDebounce = (): void => undefined;
+  const stopInbound = (): void => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    cancelPendingDebounce();
+    controller.abort();
+  };
   // Release the guard when the loop is stopped so a clean restart can re-subscribe.
   controller.signal.addEventListener(
     "abort",
@@ -249,12 +257,13 @@ export function startMarmotInbound(
     { once: true },
   );
   // Always drive the loop off the internal controller so the returned stop() is
-  // authoritative; forward an externally-supplied signal into it.
+  // authoritative. Route external aborts through that same idempotent stop path
+  // so startup races also mark the runtime stopping before async setup resumes.
   if (options.signal) {
     if (options.signal.aborted) {
-      controller.abort();
+      stopInbound();
     } else {
-      options.signal.addEventListener("abort", () => controller.abort(), { once: true });
+      options.signal.addEventListener("abort", stopInbound, { once: true });
     }
   }
   const signal = controller.signal;
@@ -605,14 +614,7 @@ export function startMarmotInbound(
     await bridge.run(signal);
   })();
 
-  return () => {
-    if (stopping) {
-      return;
-    }
-    stopping = true;
-    cancelPendingDebounce();
-    controller.abort();
-  };
+  return stopInbound;
 }
 
 export interface SyncAllowlistOptions {
