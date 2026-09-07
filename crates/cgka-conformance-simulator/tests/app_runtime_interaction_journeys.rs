@@ -16,11 +16,16 @@ use serde_json::json;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const SETTLEMENT: Duration = Duration::from_secs(60);
 /// A manual self-update publishes only after the protocol's quiet window and
-/// sampled jitter (60 s plus up to 30 s on real clocks). Built with
-/// `test-policy-overrides`, the journey's harness zeroes those windows and the
-/// rotation lands within a few maintenance sweeps; this budget is the ceiling
+/// sampled jitter (60 s plus up to 30 s on real clocks). This is the ceiling
 /// for the production-timing run, which stays ignored in ordinary builds.
 const MAINTENANCE_PUBLICATION_BUDGET: Duration = Duration::from_secs(150);
+/// Built with `test-policy-overrides`, the journey's harness zeroes those
+/// windows and the rotation lands within a few maintenance sweeps (about 15 s
+/// locally, most of it public catch-up round trips). Production timing cannot
+/// rotate before its 60 s quiet window has elapsed, so finishing inside this
+/// budget is the proof that the override actually reached the runtime; a
+/// build whose wiring silently fell back to production windows fails here.
+const FAST_MAINTENANCE_PUBLICATION_BUDGET: Duration = Duration::from_secs(45);
 /// How long the survivors of a voluntary leave may take to apply it. The
 /// engine schedules the SelfRemove auto-commit within 50 ms of the proposal,
 /// so the strict form allows a generous 30 s. The default form allows three
@@ -848,14 +853,20 @@ async fn manual_self_update(subject: &mut AppRuntimeHarness, out: &Path) -> Test
         .await?;
     // Each explicit sweep advances the obligation one phase (quiet, jitter,
     // publish) when the windows are zero, so poll quickly in that build and
-    // slowly against production timing.
-    let sweep_interval = if AppRuntimeHarness::honors_maintenance_timing_override() {
-        Duration::from_millis(500)
+    // slowly against production timing. The feature build's budget sits below
+    // the production quiet window on purpose: it is what proves the zeroed
+    // windows took effect rather than merely that a rotation eventually happened.
+    let fast = AppRuntimeHarness::honors_maintenance_timing_override();
+    let (sweep_interval, budget) = if fast {
+        (
+            Duration::from_millis(500),
+            FAST_MAINTENANCE_PUBLICATION_BUDGET,
+        )
     } else {
-        Duration::from_secs(2)
+        (Duration::from_secs(2), MAINTENANCE_PUBLICATION_BUDGET)
     };
     let scheduled_at = tokio::time::Instant::now();
-    let deadline = scheduled_at + MAINTENANCE_PUBLICATION_BUDGET;
+    let deadline = scheduled_at + budget;
     let mut sweeps = 0_u32;
     let observations = loop {
         subject.run_due_maintenance(&labels(&["bob"])).await?;
@@ -868,9 +879,16 @@ async fn manual_self_update(subject: &mut AppRuntimeHarness, out: &Path) -> Test
         }
         if tokio::time::Instant::now() >= deadline {
             save(out, "self-update-stalled.json", &observations)?;
-            return Err(
-                "manual self-update did not advance the shared public epoch in time".into(),
-            );
+            return Err(if fast {
+                format!(
+                    "manual self-update did not rotate within {}s: the zeroed maintenance windows \
+                     did not take effect, since production timing cannot rotate before its 60s quiet window",
+                    budget.as_secs()
+                )
+                .into()
+            } else {
+                "manual self-update did not advance the shared public epoch in time".into()
+            });
         }
         tokio::time::sleep(sweep_interval).await;
     };
