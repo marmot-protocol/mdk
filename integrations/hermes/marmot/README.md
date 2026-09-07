@@ -47,6 +47,49 @@ claiming exactly-once external tool effects, complete session lineage, or
 general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state
 counts only; payloads and identifiers are never logged.
 
+### Quiet ambient continuity
+
+`message_deleted`, edit/reaction mutations, and coarse `group_state_changed`
+facts never invoke `handle_message` and never trigger an agent turn. The adapter
+persists them in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
+`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches an explicitly marked untrusted,
+identifier-free representation only to the next real inbound message that
+passes activation. Admission rejection leaves the facts pending. A dispatch
+exception or cancellation also leaves them pending; a normal
+`handle_message` return acknowledges exactly the snapshot attached to that
+accepted turn, without deleting facts observed concurrently. Per-group claims
+prevent overlapping dispatch producers from attaching one snapshot twice. An
+ambient-store failure is logged privately and never rejects or reclassifies an
+otherwise accepted real inbound turn.
+
+The durable rows contain only SHA-256 routing/dedupe keys, an allowlisted fact
+kind, ordering, and expiry metadata. They contain no message text, rename text,
+account/group/message identifiers, pubkeys, relay URLs, tokens, or stream
+capabilities. Acknowledged event hashes remain only as bounded replay-dedupe
+tombstones. The private parent and database/lock/WAL files are checked and
+kept private; symlink files are refused. The file-mode fallback opens the
+already-validated regular file with `O_NOFOLLOW` and applies mode through the
+descriptor. Pending facts and replay tombstones share one per-group window and
+deterministic aggregate group, event-count, logical-byte, and age bounds;
+oldest observed entries (and then oldest groups) are evicted first. A
+live claim may temporarily add at most one already-bounded snapshot to the
+persisted limits; it is never evicted before the host outcome, and
+acknowledgement or release immediately restores the configured aggregate
+limits.
+
+A connector reconnect in the same process and a clean adapter disconnect leave
+unacknowledged facts on disk. WAL recovery preserves committed facts after
+abrupt process death. Replayed ambient events collapse through their persisted
+hashed event key even after acknowledgement; later non-duplicate facts retain
+observation order. A non-blocking exclusive store lock proves one process
+generation owns claims. On a new adapter/gateway generation, acquiring that
+lock recovers claims abandoned by an abruptly dead owner; clean disconnect
+releases live claims before closing. Reconnect without process replacement
+keeps the same owner. A host call that is cancelled, rejects, or raises is not
+an accepted turn; its attached claim is released for the next attempt. The
+acceptance boundary is the normal return from Hermes's `handle_message`,
+followed by conversion of only that exact claim into replay tombstones.
+
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
 id or the latest inbound message and accept arbitrary non-blank, control-free

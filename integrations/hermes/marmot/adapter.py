@@ -37,6 +37,7 @@ from .agent_control import (
     _normalize_hex,
     _normalize_stream_capability,
 )
+from .ambient_context import AmbientContextStore
 from .inbound_spool import InboundSpool, InboundSpoolError, StaleClaim
 
 from gateway.config import Platform, PlatformConfig
@@ -637,6 +638,15 @@ def group_state_change_sentence(change: str, detail: Optional[str] = None) -> st
     return "The group state changed."
 
 
+def _render_ambient_fact(kind: str) -> str:
+    """Render persisted allowlisted metadata as explicitly untrusted context."""
+    if kind.startswith("group_state:"):
+        fact = {"type": "group_state_changed", "change": kind.split(":", 1)[1]}
+    else:
+        fact = {"type": kind}
+    return f"Marmot ambient context (untrusted): {json.dumps(fact, separators=(',', ':'))}"
+
+
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 _BECH32_VALUES = {character: index for index, character in enumerate(_BECH32_CHARSET)}
 
@@ -765,6 +775,13 @@ def resolve_inbound_spool_path(extra: Dict[str, Any], socket_path: str | Path) -
     if configured:
         return Path(str(configured)).expanduser()
     return resolve_marmot_home(extra, socket_path) / "hermes" / "inbound-spool-v1.sqlite3"
+
+
+def resolve_ambient_context_path(extra: Dict[str, Any], socket_path: str | Path) -> Path:
+    configured = _first_config_value(extra, "ambient_context_path", env="MARMOT_AMBIENT_CONTEXT_PATH")
+    if configured:
+        return Path(str(configured)).expanduser()
+    return resolve_marmot_home(extra, socket_path) / "hermes" / "ambient-context-v1.sqlite3"
 
 
 def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) -> list[Path]:
@@ -1412,6 +1429,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             max_terminal=int(extra.get("inbound_spool_max_terminal") or 8192),
             terminal_retention_s=int(extra.get("inbound_spool_terminal_retention_s") or 7 * 24 * 60 * 60),
         )
+        ambient_context_path = resolve_ambient_context_path(extra, self.socket_path)
+        if (
+            getattr(config, "_ambient_context_test_path", None)
+            and not _first_config_value(extra, "ambient_context_path", env="MARMOT_AMBIENT_CONTEXT_PATH")
+        ):
+            ambient_context_path = Path(config._ambient_context_test_path)
+        self._ambient_context = AmbientContextStore(
+            ambient_context_path,
+            max_groups=int(extra.get("ambient_context_max_groups") or MAX_PENDING_AMBIENT_GROUPS),
+            max_events_per_group=int(
+                extra.get("ambient_context_max_events_per_group")
+                or MAX_PENDING_AMBIENT_EVENTS_PER_GROUP
+            ),
+            max_events=int(extra.get("ambient_context_max_events") or DEFAULT_AMBIENT_CONTEXT_WINDOW),
+            max_state_bytes=int(extra.get("ambient_context_max_bytes") or 1024 * 1024),
+            max_age_s=int(extra.get("ambient_context_max_age_s") or 7 * 24 * 60 * 60),
+        )
+        self._store_generation_enabled = True
         self._inbound_spool_retry_task: Optional[asyncio.Task] = None
         self._inbound_spool_wakeup = asyncio.Event()
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
@@ -1441,17 +1476,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Reserve ids while admission is being decided. A reservation prevents
         # concurrent duplicates without making a shed message terminally seen.
         self._pending_inbound_ids: set[str] = set()
-        # Dedupe repeated ambient surfacings (deletion / group-state change) by a
-        # context key (mirror inbound.ts contextKeys).
-        self._recent_ambient_keys = _RecentKeys(DEFAULT_AMBIENT_CONTEXT_WINDOW)
-        # Pending quiet next-turn ambient context, keyed by group id. Ambient
-        # events (a deletion, a group-state change) are NOT reply triggers: they
-        # are buffered here and prepended to the next real inbound message for
-        # that group as channel_context, so the agent sees the fact on its next
-        # turn without an ambient event spuriously starting an agent turn of its
-        # own. Mirrors OpenClaw's quiet-next-turn surfacer (inbound-runtime.ts);
-        # when no message follows, the fact is only logged (also OpenClaw parity).
-        self._pending_ambient_context: Dict[str, list[str]] = {}
+        # Quiet facts are persisted by hashed group/event keys and allowlisted
+        # kind only. Ambient events never enter the real-message admission path.
         # Optional inbound debounce: coalesce rapid same-(account,group,sender)
         # bursts into one turn. Disabled when debounce_ms <= 0.
         self._debounce_pending: Dict[str, list[Dict[str, Any]]] = {}
@@ -1478,9 +1504,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         try:
+            self._enable_store_generation()
             await self._ensure_account_id()
             await self._sync_welcomer_allowlist()
             recovery = self._inbound_spool.open()
+            try:
+                self._ambient_context.open()
+            except Exception:
+                # Ambient continuity is deliberately degradable. A private
+                # store fault must not prevent real inbound delivery.
+                self._ambient_context.disable_generation()
+                logger.error("Marmot ambient context unavailable; continuing without it", exc_info=True)
             if recovery["reclaimed"] or recovery["unresolved"]:
                 logger.warning(
                     "Marmot inbound spool recovered obligations "
@@ -1497,11 +1531,27 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._mark_connected()
             return True
         except Exception as exc:
+            for attribute in ("_listener_task", "_inbound_spool_retry_task"):
+                task = getattr(self, attribute)
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    setattr(self, attribute, None)
+            self._store_generation_enabled = False
+            self._ambient_context.disable_generation()
+            self._inbound_spool.close(graceful=True)
             logger.error("Failed to connect Marmot adapter: %s", exc)
             set_fatal = getattr(self, "_set_fatal_error", None)
             if callable(set_fatal):
                 set_fatal("marmot_connect_failed", str(exc), retryable=True)
             return False
+
+    def _enable_store_generation(self) -> None:
+        self._store_generation_enabled = True
+        self._ambient_context.enable_generation()
 
     async def _sync_welcomer_allowlist(self) -> None:
         if not self.welcomer_allowlist:
@@ -1548,12 +1598,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.error("Marmot inbound debounce disconnect release failed", exc_info=True)
         finally:
             self._debounce_release_pending.clear()
-        self._pending_ambient_context.clear()
         self._last_inbound_message_ids.clear()
         self._activation_cache.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._inbound_spool.close(graceful=True)
+        self._store_generation_enabled = False
+        self._ambient_context.disable_generation()
         self._mark_disconnected()
 
     def _cancel_debounce_tasks(self) -> None:
@@ -2800,6 +2851,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         )
 
     def _ensure_inbound_spool_open(self) -> None:
+        if not self._store_generation_enabled:
+            raise InboundSpoolError("inbound spool generation is closed")
         if not self._inbound_spool.is_open:
             self._inbound_spool.open()
 
@@ -2961,7 +3014,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         *,
         spool_message_id: Optional[str] = None,
     ) -> None:
-        detached_ambient: list[str] = []
+        ambient_claim = None
         group_id_hex = ""
         spool_state = "claimed" if spool_message_id else None
         try:
@@ -3069,9 +3122,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # prepends channel_context to the trigger text as context without it
             # being a trigger itself, so the fact reaches the agent on this turn.
             # Hermes 0.19.0 exposes channel_context as stable user-role context.
-            detached_ambient = self._detach_pending_ambient_context(group_id_hex)
+            try:
+                ambient_claim = self._ambient_context.claim(group_id_hex)
+                detached_ambient = ambient_claim.facts
+            except Exception:
+                # Ambient continuity is supplemental context. A corrupt, locked,
+                # or unavailable private store must not reject an unrelated real
+                # inbound turn or change its durable spool disposition.
+                logger.error(
+                    "Marmot ambient context claim failed; continuing without ambient context",
+                    exc_info=True,
+                )
+                ambient_claim = None
+                detached_ambient = ()
             ambient_context = (
-                "\n".join(detached_ambient) if detached_ambient else None
+                "\n".join(_render_ambient_fact(fact.kind) for fact in detached_ambient)
+                if detached_ambient
+                else None
             )
             contexts = [
                 context
@@ -3096,8 +3163,27 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 spool_state = "handed"
             await self.handle_message(hermes_event)
+            # A normal return is the host acceptance boundary. Persist that
+            # boundary before best-effort tombstone cleanup; unlike a pre-call
+            # commit, this can never retire context that the host did not accept.
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    committed = self._ambient_context.commit(group_id_hex, ambient_claim.token)
+                    if committed != len(ambient_claim.facts):
+                        raise RuntimeError("ambient claim changed before host acceptance commit")
+                except Exception:
+                    logger.error("Marmot ambient context acceptance commit failed", exc_info=True)
+                else:
+                    try:
+                        self._ambient_context.acknowledge(group_id_hex, ambient_claim.token)
+                    except Exception:
+                        logger.error("Marmot ambient context acknowledgement failed", exc_info=True)
         except asyncio.CancelledError:
-            self._restore_pending_ambient_context(group_id_hex, detached_ambient)
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    self._ambient_context.release(group_id_hex, ambient_claim.token)
+                except Exception:
+                    logger.error("Marmot ambient context claim release failed", exc_info=True)
             if spool_message_id and spool_state == "claimed":
                 self._inbound_spool.defer(
                     spool_message_id,
@@ -3121,7 +3207,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     )
             raise
         except Exception:
-            self._restore_pending_ambient_context(group_id_hex, detached_ambient)
+            if ambient_claim is not None and ambient_claim.facts:
+                try:
+                    self._ambient_context.release(group_id_hex, ambient_claim.token)
+                except Exception:
+                    logger.error("Marmot ambient context claim release failed", exc_info=True)
             if spool_message_id and spool_state == "claimed":
                 self._inbound_spool.defer(
                     spool_message_id,
@@ -3304,14 +3394,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Mutations are quiet next-turn context and never trigger an agent turn.
         # Privacy-safe log: no ids, actors, emoji, or plaintext.
         logger.debug("Marmot inbound mutation observed")
+        kind = str(event.get("type") or "")
+        if kind not in {
+            "message_edited",
+            "message_deleted",
+            "reaction_added",
+            "reaction_removed",
+        }:
+            logger.debug("Ignoring unsupported Marmot mutation kind")
+            return
         group_id_hex = str(event.get("group_id_hex") or "")
         event_id_hex = str(event.get("event_id_hex") or "")
         context_key = f"marmot:mutation:{group_id_hex}:{event_id_hex}"
-        await self._surface_ambient_context(
-            event,
-            _mutation_channel_context(event),
-            context_key,
-        )
+        await self._surface_ambient_context(event, kind, context_key)
 
     async def _handle_group_state_changed(self, event: Dict[str, Any]) -> None:
         # A durable group-state change (membership/admin/rename/avatar). Surfaced
@@ -3323,21 +3418,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         account_id_hex = str(event.get("account_id_hex") or self.account_id_hex or "")
         if account_id_hex and group_id_hex:
             self._activation_cache.invalidate(account_id_hex, group_id_hex)
-        sentence = group_state_change_sentence(change, event.get("detail"))
-        context_key = f"marmot:group_state_changed:{group_id_hex}:{change}"
-        await self._surface_ambient_context(event, sentence, context_key)
+        event_identity = str(event.get("event_id_hex") or event.get("recorded_at") or "")
+        context_key = f"marmot:group_state_changed:{group_id_hex}:{change}:{event_identity}"
+        allowed_changes = {
+            "member_added", "member_removed", "member_left", "admin_added",
+            "admin_removed", "group_renamed", "group_avatar_changed",
+            "disappearing_timer_changed",
+        }
+        allowed_change = change if change in allowed_changes else "changed"
+        await self._surface_ambient_context(
+            event, f"group_state:{allowed_change}", context_key
+        )
 
     async def _surface_ambient_context(
         self,
         event: Dict[str, Any],
-        text: str,
+        kind: str,
         context_key: str,
     ) -> None:
-        # Dedupe repeated surfacings of the same fact.
-        if context_key in self._recent_ambient_keys:
-            return
-        self._recent_ambient_keys.add(context_key)
-
         group_id_hex = str(event.get("group_id_hex") or "")
         # Quiet next-turn context: an ambient event is NEVER a reply trigger, so
         # do NOT route it through handle_message() (which would start/queue an
@@ -3347,51 +3445,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # and prepending it to the NEXT real inbound message's channel_context.
         # If no message ever follows, the fact is only logged — matching
         # OpenClaw's "when omitted, those events are only logged" degraded mode.
-        self._append_pending_ambient_context(group_id_hex, text)
-
-    def _append_pending_ambient_context(self, group_id_hex: str, text: str) -> None:
-        self._ensure_pending_ambient_group_capacity(group_id_hex)
-        pending = self._pending_ambient_context.setdefault(group_id_hex, [])
-        if len(pending) >= MAX_PENDING_AMBIENT_EVENTS_PER_GROUP:
-            pending.pop(0)
-            logger.warning(
-                "Marmot ambient context limit reached; evicting oldest fact"
-            )
-        pending.append(text)
-
-    def _ensure_pending_ambient_group_capacity(self, group_id_hex: str) -> None:
-        if (
-            group_id_hex not in self._pending_ambient_context
-            and len(self._pending_ambient_context) >= MAX_PENDING_AMBIENT_GROUPS
-        ):
-            oldest_group = next(iter(self._pending_ambient_context))
-            self._pending_ambient_context.pop(oldest_group, None)
-            logger.warning(
-                "Marmot ambient context group limit reached; evicting oldest group"
-            )
-
-    def _detach_pending_ambient_context(self, group_id_hex: str) -> list[str]:
-        return self._pending_ambient_context.pop(group_id_hex, [])
-
-    def _restore_pending_ambient_context(
-        self, group_id_hex: str, detached: list[str]
-    ) -> None:
-        if not group_id_hex or not detached:
-            return
-        combined = detached + self._pending_ambient_context.get(group_id_hex, [])
-        overflow = max(0, len(combined) - MAX_PENDING_AMBIENT_EVENTS_PER_GROUP)
-        if overflow:
-            logger.warning(
-                "Marmot ambient context limit reached; evicting oldest fact"
-            )
-        self._ensure_pending_ambient_group_capacity(group_id_hex)
-        self._pending_ambient_context[group_id_hex] = combined[overflow:]
-
-    def _take_pending_ambient_context(self, group_id_hex: str) -> Optional[str]:
-        # Drain and join the buffered ambient sentences for a group. Returns None
-        # when nothing is pending so callers can leave channel_context unset.
-        pending = self._detach_pending_ambient_context(group_id_hex)
-        return "\n".join(pending) if pending else None
+        if group_id_hex:
+            try:
+                self._ambient_context.record(group_id_hex, context_key, kind)
+            except Exception:
+                # Quiet continuity is best-effort degradation. Never let a
+                # private-store failure escape the control-event pump and stop
+                # subsequent real inbound delivery.
+                logger.error("Marmot ambient context record failed", exc_info=True)
 
     async def _maybe_send_profile_prompt_on_join(self, account_id_hex: str, group_id_hex: str) -> None:
         await self._maybe_prompt_for_missing_profile(account_id_hex, group_id_hex)
