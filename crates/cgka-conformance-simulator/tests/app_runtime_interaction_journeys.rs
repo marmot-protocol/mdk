@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, error::Error, path::Path, time::Duration};
 
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeObservationV1, ConcurrentMutation, ConcurrentMutationReport,
-    ConvergenceSubject, SubjectCreateGroup, SubjectFailureCategory, SubjectRemoveMembers,
-    SubjectSelfUpdate, SubjectSendApplication,
+    ConvergenceSubject, SubjectCreateGroup, SubjectError, SubjectFailureCategory,
+    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
 };
 use serde_json::json;
 
@@ -107,6 +107,17 @@ async fn send(
     sender: &str,
     payload: &str,
 ) -> TestResult {
+    try_send(subject, group, sender, payload).await?;
+    Ok(())
+}
+
+/// A send whose refusal the journey wants to classify rather than fail on.
+async fn try_send(
+    subject: &mut AppRuntimeHarness,
+    group: &str,
+    sender: &str,
+    payload: &str,
+) -> Result<(), SubjectError> {
     subject.select_scenario_group(group, false)?;
     subject
         .send_application(SubjectSendApplication {
@@ -114,8 +125,23 @@ async fn send(
             sender,
             payload,
         })
-        .await?;
-    Ok(())
+        .await
+}
+
+/// The harness reports a group this device holds no projection of either as
+/// an expected refusal from the public member read (`unknown_group` in the
+/// classified message) or, when that read passes but the projection is
+/// missing, as its own `unknown_group` code.
+fn is_unknown_group(error: &SubjectError) -> bool {
+    error.code == "unknown_group"
+        || (error.category == SubjectFailureCategory::ExpectedRefusal
+            && error.message.ends_with("unknown_group"))
+}
+
+/// An expected public refusal whose privacy-safe kind is `kind`.
+fn refused_as(error: &SubjectError, kind: &str) -> bool {
+    error.category == SubjectFailureCategory::ExpectedRefusal
+        && error.message.ends_with(&format!(": {kind}"))
 }
 
 /// Drive public catch-up until the named group's members all expose the
@@ -252,9 +278,7 @@ async fn two_groups(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
             save(out, "carol-pair-leak.json", &observation)?;
             return Err("non-member carol holds a projection of the pair group".into());
         }
-        Err(error)
-            if error.category == SubjectFailureCategory::ExpectedRefusal
-                && error.message.contains("unknown_group") => {}
+        Err(error) if is_unknown_group(&error) => {}
         Err(error) => {
             return Err(format!("unexpected pair-group read failure for carol: {error}").into());
         }
@@ -299,11 +323,33 @@ async fn two_groups(subject: &mut AppRuntimeHarness, out: &Path) -> TestResult {
         .map(|_| ())
 }
 
+/// Whether every settled observation carries the edit.
+fn edit_applied(observations: &[AppRuntimeObservationV1], field: &str, value: &str) -> bool {
+    !observations.is_empty()
+        && observations.iter().all(|o| match field {
+            "name" => o.protocol.group_name == value,
+            _ => o.protocol.group_description == value,
+        })
+}
+
+/// Which racing profile edits are present in the settled public state,
+/// regardless of what the runtime told the caller.
+fn settled_edits(
+    observations: &[AppRuntimeObservationV1],
+    edits: &[(&str, &str, &str)],
+) -> Vec<String> {
+    edits
+        .iter()
+        .filter(|(_, field, value)| edit_applied(observations, field, value))
+        .map(|(client, field, _)| format!("{client}:{field}"))
+        .collect()
+}
+
 /// Which racing profile edits the runtime reported as saved but the settled
 /// public state does not contain. Convergence keeps one branch and parks the
 /// other; the parked committer's intent is not re-issued today, so a losing
-/// admin edit is dropped after its caller was told it succeeded. The strict
-/// journeys fail on this; the default journeys record it as evidence.
+/// admin edit is dropped after its caller was told it succeeded (#1734). The
+/// strict journeys fail on this; the default journeys record it as evidence.
 fn dropped_accepted_edits(
     report: &ConcurrentMutationReport,
     observations: &[AppRuntimeObservationV1],
@@ -317,12 +363,7 @@ fn dropped_accepted_edits(
                 .iter()
                 .any(|outcome| outcome.client == *client && outcome.accepted)
         })
-        .filter(|(_, field, value)| {
-            !observations.iter().all(|o| match *field {
-                "name" => o.protocol.group_name == *value,
-                _ => o.protocol.group_description == *value,
-            })
-        })
+        .filter(|(_, field, value)| !edit_applied(observations, field, value))
         .map(|(client, field, _)| format!("{client}:{field}"))
         .collect()
 }
@@ -387,14 +428,19 @@ async fn concurrent_profile_edits(
         ("alice", "name", "alice renamed it"),
         ("bob", "description", "bob described it"),
     ];
+    let settled = settled_edits(&observations, &edits);
     let dropped = dropped_accepted_edits(&report, &observations, &edits);
     save(
         out,
         "after-race.json",
-        &json!({ "dropped_accepted_edits": dropped, "observations": observations }),
+        &json!({
+            "settled_edits": settled, "dropped_accepted_edits": dropped,
+            "observations": observations,
+        }),
     )?;
-    let landed = edits.len() - dropped.len();
-    if landed == 0 {
+    // Presence is measured on the settled projection itself, so a command the
+    // runtime rejected before publishing never counts as landed.
+    if settled.is_empty() {
         return Err("neither concurrent profile edit reached the settled public state".into());
     }
     require_edits_retained(&dropped, strict)?;
@@ -402,10 +448,12 @@ async fn concurrent_profile_edits(
 }
 
 /// One admin invites a fourth member while another admin renames the group at
-/// the same instant. The founders must settle on one state, the invitee must
-/// either become a full member who sends and receives or hold no membership
-/// at all, and at least one of the two edits must have landed. The strict form
-/// also requires that an invite or rename reported as saved is not lost.
+/// the same instant. The founders must settle on one state with at least one
+/// of the two edits present, and an invitee the founders admitted must send
+/// and receive. When the founders exclude the invitee, the default form records
+/// its device state (no projection, or a stranded parked-branch membership);
+/// the strict form requires no projection and that an invite or rename
+/// reported as saved is not lost (#1734, #1735).
 async fn concurrent_invite_and_rename(
     subject: &mut AppRuntimeHarness,
     out: &Path,
@@ -470,27 +518,47 @@ async fn concurrent_invite_and_rename(
     let observations = subject
         .await_observable_settlement(&members, SETTLEMENT)
         .await?;
-    let mut dropped = dropped_accepted_edits(
-        &report,
-        &observations,
-        &[("bob", "name", "renamed during invite")],
-    );
-    if invite_accepted && !david_joined {
+    let edits = [("bob", "name", "renamed during invite")];
+    let mut settled = settled_edits(&observations, &edits);
+    let mut dropped = dropped_accepted_edits(&report, &observations, &edits);
+    if david_joined {
+        settled.push("alice:invite".into());
+    } else if invite_accepted {
         dropped.push("alice:invite".into());
     }
-    let david_stranded = subject.observations(&labels(&["david"])).await.ok();
+    // An invitee the founders exclude must hold no projection of the group. A
+    // device that still reports membership joined a parked branch through a
+    // stale Welcome: the stranded-invitee gap (#1735).
+    let invitee_state = if david_joined {
+        "member"
+    } else {
+        match subject.observations(&labels(&["david"])).await {
+            Ok(view) => {
+                save(out, "stranded-invitee.json", &view)?;
+                "stranded"
+            }
+            Err(error) if is_unknown_group(&error) => "no_projection",
+            Err(error) => {
+                return Err(format!("unexpected invitee read failure: {error}").into());
+            }
+        }
+    };
     save(
         out,
         "after-race.json",
         &json!({
-            "dropped_accepted_edits": dropped, "david_joined": david_joined,
-            "observations": observations,
-            "david_when_not_a_member": if david_joined { None } else { david_stranded },
+            "settled_edits": settled, "dropped_accepted_edits": dropped,
+            "invitee_state": invitee_state, "observations": observations,
         }),
     )?;
-    if dropped.len() == 2 {
+    if settled.is_empty() {
         return Err(
             "neither the concurrent invite nor the rename reached the settled state".into(),
+        );
+    }
+    if strict && invitee_state == "stranded" {
+        return Err(
+            "invitee excluded by the founders still reports membership on a parked branch".into(),
         );
     }
     require_edits_retained(&dropped, strict)?;
@@ -579,7 +647,7 @@ async fn removed_while_offline(subject: &mut AppRuntimeHarness, out: &Path) -> T
 
     // A removed device must be refused when it tries to send, and nothing it
     // attempts may reach the remaining members.
-    let refusal = send(subject, "main", "carol", "stale-from-carol").await;
+    let refusal = try_send(subject, "main", "carol", "stale-from-carol").await;
     save(
         out,
         "carol-send-refusal.json",
@@ -587,7 +655,7 @@ async fn removed_while_offline(subject: &mut AppRuntimeHarness, out: &Path) -> T
     )?;
     match refusal {
         Ok(()) => return Err("removed member's send was accepted by its own runtime".into()),
-        Err(error) if error.to_string().contains("group_removed") => {}
+        Err(error) if refused_as(&error, "group_removed") => {}
         Err(error) => {
             return Err(
                 format!("removed member's send failed for the wrong reason: {error}").into(),
@@ -698,7 +766,7 @@ async fn leave_with_several_remaining(
     // attempts afterwards may reach the survivors. Whether its own runtime
     // refuses the send is recorded, not asserted: a voluntary leave is a
     // different terminal state from an administrative removal.
-    let attempt = send(subject, "main", "david", "stale-from-david").await;
+    let attempt = try_send(subject, "main", "david", "stale-from-david").await;
     subject.catch_up(&labels(&["david"])).await?;
     let david = subject.observations(&labels(&["david"])).await?.remove(0);
     save(
@@ -817,9 +885,11 @@ async fn check(journey: Journey) {
             Journey::ManualSelfUpdate => manual_self_update(&mut subject, artifacts.path()).await,
         }
     };
-    let result = match tokio::time::timeout(Duration::from_secs(600), exercise).await {
+    // Same budget as the basic public journeys: the leave journey alone stacks
+    // several sixty-second settlement deadlines around its three-minute wait.
+    let result = match tokio::time::timeout(Duration::from_secs(900), exercise).await {
         Ok(result) => result,
-        Err(_) => Err("public interaction journey exceeded its 600-second watchdog".into()),
+        Err(_) => Err("public interaction journey exceeded its 900-second watchdog".into()),
     };
     // Close every runtime before asserting. Never exit the process while a
     // SQLCipher worker may still be writing (see APP_PATH_COVERAGE.md).

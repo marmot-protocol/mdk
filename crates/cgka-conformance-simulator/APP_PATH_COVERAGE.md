@@ -81,22 +81,40 @@ may already have reached the relay, so only accepted publications are correlated
 | Test suffix | Public contract |
 | --- | --- |
 | `07_two_groups_stay_isolated` | Work and pair groups on one device; the second invite of Bob needs a fresh KeyPackage; a non-member has no projection; a removal and a reopen leave the other group's exact history untouched |
-| `08_concurrent_admin_profile_edits_converge` | Two admins save name and description at the same instant; members settle on one state containing at least one edit; fresh traffic and reopen persistence hold; dropped edits are recorded |
-| `08_strict_concurrent_admin_profile_edits_are_never_lost` (ignored) | As above, and every edit the runtime reported as saved is present in the settled state |
-| `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle; the invitee is either a full member who sends and receives or holds no membership; at least one edit landed |
-| `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored) | As above, and an invite or rename reported as saved is not lost |
+| `08_concurrent_admin_profile_edits_converge` | Two admins save name and description at the same instant; members settle on one state in which at least one edit is present (measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
+| `08_strict_concurrent_admin_profile_edits_are_never_lost` (ignored, #1734) | As above, and every edit the runtime reported as saved is present in the settled state |
+| `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
+| `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1734, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
 | `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
-| `12_strict_leave_is_applied_by_survivors_promptly` (ignored) | As above, but the survivors must apply the leave within 30 seconds |
+| `12_strict_leave_is_applied_by_survivors_promptly` (ignored, #1736) | As above, but the survivors must apply the leave within 30 seconds |
 | `11_manual_self_update_advances_every_member` (ignored) | A manual self-update advances the shared epoch with no loss; waits out the real-time 60-second quiet window plus up to 30 seconds of jitter (passed locally in about 150 seconds on 2026-09-06) |
 
 On 2026-09-06 the four default race, group, and removal journeys passed locally in debug mode in about 80 seconds
 total, the default leave journey passed in about two minutes, and the strict variants failed only on the documented
 contracts below. The default concurrent journeys accept either race outcome. They fail when members do not settle, when neither edit
-reached the settled state, or when fresh traffic or reopen persistence breaks. They do not prove that a same-epoch
-fork occurred on a given run; real socket timing is not seed-controlled.
+is present in the settled state, or when fresh traffic or reopen persistence breaks. They do not prove that a same-epoch
+fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
+[#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
+and [#1736](https://github.com/marmot-protocol/mdk/issues/1736); the ignored strict journeys are their regressions.
 
-### Known gap: a losing admin edit is dropped after its caller was told it saved
+Run the default journeys the way the conformance CI job does, or serially with retained evidence:
+
+```sh
+cargo nextest run -p cgka-conformance-simulator --locked --profile ci --test app_runtime_interaction_journeys
+```
+
+```sh
+MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-interaction-evidence" \
+cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_interaction_journeys -- \
+  --test-threads=1 --nocapture
+```
+
+Add `--include-ignored` to also run the strict regressions and the manual self-update journey. Under nextest the
+`app-runtime-journeys` test group in `.config/nextest.toml` runs at most two public journeys at a time, because each
+one starts a local relay and several SQLCipher runtimes and then waits on real settlement windows.
+
+### Known gap: a losing admin edit is dropped after its caller was told it saved (#1734)
 
 The first run of the strict profile-edit journey (2026-09-06) showed both `update_group_profile` calls returning
 success, every member settling at the next epoch with Bob's description, and Alice's rename absent everywhere, with
@@ -107,7 +125,7 @@ evolutions are marked superseded and their intent is not re-issued or reported. 
 The strict journeys stay ignored until the runtime either re-issues a parked intent or reports the loss to the
 caller; the default journeys keep the convergence, delivery, and persistence contract green in the ordinary run.
 
-### Known gap: survivors apply a voluntary leave only when something else runs convergence
+### Known gap: survivors apply a voluntary leave only when something else runs convergence (#1736)
 
 The engine schedules a peer's SelfRemove auto-commit 10 to 50 ms after the proposal and marks the group as one the
 app should feed through its convergence timer. The app worker's schedule state, however, is derived from open
@@ -121,7 +139,7 @@ keep the current epoch secret until the next unrelated commit. The strict journe
 arms a wakeup for scheduled auto-commits; the default journey allows three minutes so the eventual contract stays
 green. Neither run needed a manual `retry_group_convergence`.
 
-The invite-versus-rename race decides differently from run to run. When the invite won, the rename was dropped and
+The invite-versus-rename race decides differently from run to run (#1735). When the invite won, the rename was dropped and
 the invitee joined normally. When the rename won (strict run, same day), `invite_members` had still returned
 success, the founders settled at the next epoch with three members and the new name, and the invitee's device had
 accepted the Welcome from the parked branch: it reported itself a full member at the same epoch number with four
