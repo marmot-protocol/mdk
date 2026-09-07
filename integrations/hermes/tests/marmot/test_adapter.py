@@ -6635,11 +6635,11 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-    def make_adapter(self, *, extra=None):
+    def make_adapter(self, *, extra=None, client=None):
         merged = {"account_id_hex": "11" * 32, "profile_name_onboarding": False}
         merged.update(extra or {})
         return self.adapter_module.MarmotPlatformAdapter(
-            self.config_cls(extra=merged), client=object()
+            self.config_cls(extra=merged), client=client if client is not None else object()
         )
 
     async def test_journal_commit_precedes_queue_admission(self):
@@ -6690,13 +6690,80 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter._inbound_spool.close()
 
     async def test_mention_policy_skip_is_explicit_terminal_disposition(self):
-        adapter = self.make_adapter(extra={"group_activation": "mention"})
+        class MultiPartyClient:
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"type": "group_info", "is_direct": False, "member_count": 3}
+
+        adapter = self.make_adapter(
+            extra={"group_activation": "mention"}, client=MultiPartyClient()
+        )
         await adapter._handle_control_event(self.make_event(mentions_self=False))
         await adapter._inbound_queue.join()
         record = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("intentionally_skipped", record.state)
         self.assertEqual("mention_policy_skip", record.disposition)
         self.assertEqual([], adapter.events)
+        adapter._inbound_spool.close()
+
+    async def test_group_info_error_defers_then_recovery_unblocks_group_fifo(self):
+        class RecoveringClient:
+            fail_lookup = True
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                if self.fail_lookup:
+                    raise RuntimeError("synthetic group lookup failure")
+                return {"type": "group_info", "is_direct": True, "member_count": 2}
+
+        client = RecoveringClient()
+        adapter = self.make_adapter(
+            extra={"group_activation": "mention"}, client=client
+        )
+        adapter._ensure_inbound_spool_open()
+        first = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="33", text="first", mentions_self=False)
+        )
+        second = self.adapter_module._normalize_inbound_message_event(
+            self.make_event(message_id="55", text="second", mentions_self=False)
+        )
+        adapter._inbound_spool.record(first)
+        adapter._inbound_spool.record(second)
+        adapter._admit_due_spooled = lambda: None
+
+        first_claim = adapter._inbound_spool.claim(
+            first["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            first_claim.event, spool_message_id=first_claim.message_id
+        )
+        deferred = adapter._inbound_spool.get(first["message_id_hex"])
+        self.assertEqual("pending", deferred.state)
+        self.assertEqual("dispatch_failed_before_handoff", deferred.disposition)
+        with self.assertRaises(self.adapter_module.StaleClaim):
+            adapter._inbound_spool.claim(
+                second["message_id_hex"], ignore_backoff=True
+            )
+
+        client.fail_lookup = False
+        first_claim = adapter._inbound_spool.claim(
+            first["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            first_claim.event, spool_message_id=first_claim.message_id
+        )
+        second_claim = adapter._inbound_spool.claim(
+            second["message_id_hex"], ignore_backoff=True
+        )
+        await adapter._dispatch_inbound_message(
+            second_claim.event, spool_message_id=second_claim.message_id
+        )
+
+        self.assertEqual(["first", "second"], [event.text for event in adapter.events])
+        self.assertEqual(
+            "completed", adapter._inbound_spool.get(first["message_id_hex"]).state
+        )
+        self.assertEqual(
+            "completed", adapter._inbound_spool.get(second["message_id_hex"]).state
+        )
         adapter._inbound_spool.close()
 
     async def test_retry_loop_survives_one_admission_error(self):

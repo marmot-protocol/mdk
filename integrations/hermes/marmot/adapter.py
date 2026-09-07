@@ -3176,14 +3176,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         cached = self._activation_cache.get(account_id_hex, group_id_hex)
         if cached is not None:
             return cached
-        try:
-            response = await self.client.group_info(account_id_hex, group_id_hex)
-            is_direct = bool(response.get("is_direct"))
-            self._activation_cache.set(account_id_hex, group_id_hex, is_direct)
-            return is_direct
-        except Exception:
-            logger.debug("Marmot group membership lookup failed; skipping turn (fail-closed)")
-            return False
+        response = await self.client.group_info(account_id_hex, group_id_hex)
+        is_direct = bool(response.get("is_direct"))
+        self._activation_cache.set(account_id_hex, group_id_hex, is_direct)
+        return is_direct
 
     async def _download_inbound_media(self, event: Dict[str, Any]) -> Tuple[list[str], list[str]]:
         media_refs = event.get("media") or []
