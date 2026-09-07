@@ -220,11 +220,37 @@ a group-members query hits `AccountWorkerResponseTimedOut` during repair pass 3;
 reported no errors. The 191.60-second run exited as an ordinary test failure; it did not exhaust the full recovery
 budget or reach fresh-message/persistence checks.
 
-**Current large-backlog acceptance status:** passing at `fe395e8c`. The bounded background recovery fix
+**Historical large-backlog acceptance at PR #1711:** passing at `fe395e8c`. The bounded background recovery fix
 resolved this worker timeout. The post-cleanup run passed all seven public journeys (330.50 seconds), including
 all 1,024 original messages, fresh traffic and recipient persistence after restart. The release-policy commands are maintained above; PR #1711 records local artifact provenance. Full GitHub CI
 subsequently passed at `be004e3d`, before the dedicated large public recovery job was introduced; that CI result
 must not be represented as execution of the newly added job.
+
+### Subsequent recovery investigation (2026-09-07)
+
+The dedicated Linux job exposed intermittent failures after that checkpoint. Keep the original 1,024-message
+journey and its extra-epoch companion as required regressions, including exact message sets, fresh traffic and
+reopen persistence. A successful earlier run does not establish that every recovery path is correct.
+
+The investigation separated several causes:
+
+- Released raw inputs must retire their transport receipts and durably re-arm replay. The SQLCipher release
+  journal bridges that engine/app boundary across failures and reopen; its acknowledgement also retains a
+  retry obligation if loading the newly armed work fails. Historical pre-journal losses require separate repair
+  ([#1724](https://github.com/marmot-protocol/mdk/issues/1724)).
+- Queued outbound work incorrectly selected the four-row foreground preflight from background convergence.
+  Background recovery must retain its 64-row allowance and generation barrier even when an outbound intent is
+  waiting. A deterministic queued-output regression distinguishes this from foreground send latency limits.
+- Slow preparation can consume the cooperative slice budget before an attempt. A bounded minimum-progress
+  regression covers that case. However, the instrumented Linux plateau had fast preparation and repeated
+  four-row slices; it is not evidence that slow preparation caused that plateau.
+- A chat send can publish older queued work in the same engine pass. The harness must correlate its own
+  message through the public timeline's transport identity, rather than count every relay publication in the
+  interval. Unrelated publications remain on the relay and are excluded only from that action's fault selectors.
+
+Repeated effect observation refreshes local `received_at`; projection replay tests compare stable identities,
+insertion order and all other message fields across that timestamp change. No native SQLCipher crash has been
+reproduced in these maintained runs; ordinary assertion failures and worker response timeouts are separate evidence.
 
 
 ## Recovery implementation boundaries
