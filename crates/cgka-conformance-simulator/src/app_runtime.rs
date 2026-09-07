@@ -1068,7 +1068,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                         .and_then(|message| message.source_message_id_hex)
                         .ok_or_else(|| {
                             SubjectError::classified(
-                                SubjectFailureCategory::Environment,
+                                SubjectFailureCategory::Protocol,
                                 "published_message_transport_identity_missing",
                                 "a published chat message has no public transport identity",
                             )
@@ -1077,7 +1077,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 }
                 if transport_ids.len() != summary.published {
                     return Err(SubjectError::classified(
-                        SubjectFailureCategory::Environment,
+                        SubjectFailureCategory::Protocol,
                         "relay_action_publication_identity_count_mismatch",
                         "published chat count does not match its public transport identities",
                     ));

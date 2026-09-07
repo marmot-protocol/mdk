@@ -33,7 +33,11 @@ by MarmotApp before engine hydration. The check shares the release transaction
 and does not require an existing receipt: the app may hold only an unsaved
 in-memory seen entry. A standalone SQLite engine database without app ownership
 uses ordinary deletion and accumulates no journal or app backfill work, so the
-journal bound is not a lifetime limit on standalone engine releases.
+journal bound is not a lifetime limit on standalone engine releases. If an
+app-owned journal fills, the release error aborts that group's current deferred
+sweep, including retries of unrelated rows. Recovery resumes after the app
+consumes the journal; retaining the raw bytes and replay evidence takes priority
+over progress while the journal is full.
 
 The app consumes this evidence on account open and before receipt checkpoints,
 reconciliation, duplicate/echo shortcuts, and after engine ingest. Consumption
