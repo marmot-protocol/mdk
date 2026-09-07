@@ -3497,6 +3497,23 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     return seed
 
 
+def _enablement_seed(plugin_settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Layer namespaced plugin settings behind higher-priority environment values."""
+
+    seed = dict(_env_enablement() or {})
+    for key in ("socket_path", "home", "account_id_hex", "group_id_hex"):
+        value = plugin_settings.get(key)
+        if value not in (None, ""):
+            seed.setdefault(key, value)
+    home_channel = plugin_settings.get("home_channel")
+    if home_channel not in (None, ""):
+        seed.setdefault(
+            "home_channel",
+            {"chat_id": str(home_channel), "name": "Marmot"},
+        )
+    return seed or None
+
+
 async def _standalone_send(
     pconfig,
     chat_id,
@@ -3556,25 +3573,17 @@ async def _marmot_status_tool(args: Dict[str, Any]) -> str:
 
     del args
     adapter = _live_adapter()
-    if adapter is None:
-        return json.dumps(
-            {
-                "ok": False,
-                "state": "gateway_inactive",
-                "plugin_discovered": True,
-                "enabled": False,
-                "config_valid": False,
-                "wn_agent_reachable": False,
-                "authenticated": False,
-                "account_selected": False,
-                "home_resolved": False,
-                "media": media_capability_status(),
-            },
-            sort_keys=True,
-        )
 
     try:
-        status = await probe_readiness(adapter.config, client=adapter.client)
+        if adapter is None:
+            gateway_config = importlib.import_module("gateway.config")
+            loaded = gateway_config.load_gateway_config()
+            config = loaded.platforms.get(Platform("marmot"))
+            if config is None:
+                config = PlatformConfig(enabled=False)
+            status = await probe_readiness(config)
+        else:
+            status = await probe_readiness(adapter.config, client=adapter.client)
     except Exception as exc:
         logger.debug("Marmot readiness probe failed", exc_info=True)
         return json.dumps(
@@ -3730,6 +3739,9 @@ def register(ctx):
 
         return validate_config(effective(config))
 
+    def enablement_seed():
+        return _enablement_seed(plugin_settings)
+
     async def standalone_sender(
         config,
         chat_id,
@@ -3755,7 +3767,7 @@ def register(ctx):
         check_fn=check_requirements,
         is_connected=configured_for_enablement,
         validate_config=configured_for_enablement,
-        env_enablement_fn=_env_enablement,
+        env_enablement_fn=enablement_seed,
         cron_deliver_env_var="MARMOT_HOME_CHANNEL",
         standalone_sender_fn=standalone_sender,
         allowed_users_env="MARMOT_ALLOWED_USERS",

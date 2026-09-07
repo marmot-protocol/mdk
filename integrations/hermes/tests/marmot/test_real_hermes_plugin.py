@@ -13,11 +13,13 @@ import argparse
 import asyncio
 import importlib
 import inspect
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 
 def _parse_args() -> argparse.Namespace:
@@ -233,6 +235,31 @@ async def _exercise_media_routes(adapter_module, platform_config, temp_root: Pat
     return {"connector_calls": len(fake.calls), "routes": routes}
 
 
+def _exercise_settings_only_default_target(expected_group_id: str) -> None:
+    send_tool = importlib.import_module("tools.send_message_tool")
+    captured = {}
+
+    async def fake_send(platform, pconfig, chat_id, text, **kwargs):
+        captured.update(platform=platform.value, chat_id=chat_id, text=text)
+        return {"success": True, "message_id": "default-target-probe"}
+
+    with (
+        mock.patch.object(send_tool, "prepare_send_message_platforms", return_value=None),
+        mock.patch.object(send_tool, "_send_to_platform", side_effect=fake_send),
+    ):
+        result = json.loads(
+            send_tool.send_message_tool(
+                {"action": "send", "target": "marmot", "message": "settings-only home"}
+            )
+        )
+
+    if not result.get("success") or captured.get("chat_id") != expected_group_id:
+        raise AssertionError(
+            "settings-only Marmot home did not resolve before adapter dispatch: "
+            f"result={result!r}, captured={captured!r}"
+        )
+
+
 def _module_matches_path(module, expected: Path) -> bool:
     module_file = getattr(module, "__file__", None)
     return isinstance(module_file, str) and Path(module_file).resolve() == expected
@@ -430,6 +457,20 @@ def main() -> int:
         media_calls = asyncio.run(
             _exercise_media_routes(adapter_module, config_module.PlatformConfig, home)
         )
+
+        settings_home = "22" * 32
+        config_api = importlib.import_module("hermes_cli.config")
+        raw_config = config_api.load_config()
+        plugins = raw_config.setdefault("plugins", {})
+        entries = plugins.setdefault("entries", {})
+        marmot_entry = entries.setdefault("marmot", {})
+        marmot_entry["settings"] = {
+            "socket_path": str(home / "marmot-agent.sock"),
+            "home_channel": settings_home,
+        }
+        config_api.save_config(raw_config, strip_defaults=False)
+        manager.discover_and_load(force=True)
+        _exercise_settings_only_default_target(settings_home)
 
         print(
             "real-hermes plugin install/discovery/media passed "
