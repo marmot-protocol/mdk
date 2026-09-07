@@ -1089,7 +1089,9 @@ command's return value), fresh traffic flows in every direction, history survive
 within three minutes. The strict forms are ignored regressions for three tracked gaps: an edit or invite the runtime
 reported as saved is never lost (#1734), an invitee the founders exclude holds no projection rather than a stranded
 parked-branch membership (#1735), and survivors apply a leave within 30 seconds (#1736). The manual self-update journey
-is explicitly ignored because the protocol's quiet window and jitter run on real time.
+runs with zeroed maintenance windows when the crate is built with `test-policy-overrides`
+(`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter run
+on real time.
 
 `cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
 capabilities before spending runtime budget. Its first bounded selection covers twelve families and records

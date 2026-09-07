@@ -15,10 +15,17 @@ use serde_json::json;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const SETTLEMENT: Duration = Duration::from_secs(60);
-/// A manual self-update publishes only after the protocol's real-time quiet
-/// window and sampled jitter (60 s plus up to 30 s); the public runtime has no
-/// virtual clock, so this budget is wall-clock by necessity.
+/// A manual self-update publishes only after the protocol's quiet window and
+/// sampled jitter (60 s plus up to 30 s on real clocks). This is the ceiling
+/// for the production-timing run, which stays ignored in ordinary builds.
 const MAINTENANCE_PUBLICATION_BUDGET: Duration = Duration::from_secs(150);
+/// Built with `test-policy-overrides`, the journey's harness zeroes those
+/// windows and the rotation lands within a few maintenance sweeps (about 15 s
+/// locally, most of it public catch-up round trips). Production timing cannot
+/// rotate before its 60 s quiet window has elapsed, so finishing inside this
+/// budget is the proof that the override actually reached the runtime; a
+/// build whose wiring silently fell back to production windows fails here.
+const FAST_MAINTENANCE_PUBLICATION_BUDGET: Duration = Duration::from_secs(45);
 /// How long the survivors of a voluntary leave may take to apply it. The
 /// engine schedules the SelfRemove auto-commit within 50 ms of the proposal,
 /// so the strict form allows a generous 30 s. The default form allows three
@@ -844,9 +851,26 @@ async fn manual_self_update(subject: &mut AppRuntimeHarness, out: &Path) -> Test
             pending: "bob-self-update",
         })
         .await?;
-    let deadline = tokio::time::Instant::now() + MAINTENANCE_PUBLICATION_BUDGET;
+    // Each explicit sweep advances the obligation one phase (quiet, jitter,
+    // publish) when the windows are zero, so poll quickly in that build and
+    // slowly against production timing. The feature build's budget sits below
+    // the production quiet window on purpose: it is what proves the zeroed
+    // windows took effect rather than merely that a rotation eventually happened.
+    let fast = AppRuntimeHarness::honors_maintenance_timing_override();
+    let (sweep_interval, budget) = if fast {
+        (
+            Duration::from_millis(500),
+            FAST_MAINTENANCE_PUBLICATION_BUDGET,
+        )
+    } else {
+        (Duration::from_secs(2), MAINTENANCE_PUBLICATION_BUDGET)
+    };
+    let scheduled_at = tokio::time::Instant::now();
+    let deadline = scheduled_at + budget;
+    let mut sweeps = 0_u32;
     let observations = loop {
         subject.run_due_maintenance(&labels(&["bob"])).await?;
+        sweeps += 1;
         subject.catch_up(&clients).await?;
         let observations = subject.observations(&clients).await?;
         let advanced = observations.iter().all(|o| o.protocol.epoch > epoch_before);
@@ -855,13 +879,29 @@ async fn manual_self_update(subject: &mut AppRuntimeHarness, out: &Path) -> Test
         }
         if tokio::time::Instant::now() >= deadline {
             save(out, "self-update-stalled.json", &observations)?;
-            return Err(
-                "manual self-update did not advance the shared public epoch in time".into(),
-            );
+            return Err(if fast {
+                format!(
+                    "manual self-update did not rotate within {}s: the zeroed maintenance windows \
+                     did not take effect, since production timing cannot rotate before its 60s quiet window",
+                    budget.as_secs()
+                )
+                .into()
+            } else {
+                "manual self-update did not advance the shared public epoch in time".into()
+            });
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(sweep_interval).await;
     };
-    save(out, "after-self-update.json", &observations)?;
+    save(
+        out,
+        "after-self-update.json",
+        &json!({
+            "seconds_until_rotation": scheduled_at.elapsed().as_secs(),
+            "maintenance_sweeps": sweeps,
+            "immediate_maintenance_honored": AppRuntimeHarness::honors_maintenance_timing_override(),
+            "observations": observations,
+        }),
+    )?;
     fresh_traffic_and_reopen(subject, "main", &mut expected, "bob", out, "main").await
 }
 
@@ -891,13 +931,24 @@ async fn check(journey: Journey) {
             "journey": label, "version": 1, "clients": clients,
             "adapter": "marmot_app_runtime", "storage": "sqlcipher_per_participant",
             "relay_order": "native local Nostr relay", "debug_assertions": cfg!(debug_assertions),
-            "settlement_policy": "default production policy; no test override requested",
+            "settlement_policy": match journey {
+                Journey::ManualSelfUpdate => "protocol-pinned 1000 ms settlement; maintenance windows zeroed when built with test-policy-overrides",
+                _ => "default production policy; no test override requested",
+            },
+            "immediate_maintenance_honored": matches!(journey, Journey::ManualSelfUpdate)
+                && AppRuntimeHarness::honors_maintenance_timing_override(),
         }),
     )
     .unwrap();
-    let mut subject = AppRuntimeHarness::new(&clients)
-        .await
-        .expect("public runtime setup");
+    let mut subject = match journey {
+        // Production maintenance windows would hold this journey for 60 to 90
+        // seconds; the harness zeroes them in test-policy builds only.
+        Journey::ManualSelfUpdate => {
+            AppRuntimeHarness::new_with_immediate_maintenance(&clients).await
+        }
+        _ => AppRuntimeHarness::new(&clients).await,
+    }
+    .expect("public runtime setup");
     let exercise = async {
         match journey {
             Journey::TwoGroups => two_groups(&mut subject, artifacts.path()).await,
@@ -1003,8 +1054,15 @@ async fn public_app_12_strict_leave_is_applied_by_survivors_promptly() {
     check(Journey::LeaveWithSeveralRemaining { strict: true }).await;
 }
 
+// Built with `test-policy-overrides`, the harness zeroes the maintenance quiet
+// window and jitter and this runs in seconds (`just simulator-fast-maintenance`).
+// In an ordinary build it would wait out the real-time windows, so it stays
+// ignored there and can still be run explicitly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waits out the real-time maintenance quiet window and jitter; run explicitly"]
+#[cfg_attr(
+    not(feature = "test-policy-overrides"),
+    ignore = "waits out the real-time maintenance quiet window and jitter; run explicitly or under test-policy-overrides"
+)]
 async fn public_app_11_manual_self_update_advances_every_member() {
     check(Journey::ManualSelfUpdate).await;
 }
