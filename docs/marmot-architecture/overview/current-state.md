@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-06
+updated: 2026-09-07
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -72,6 +72,12 @@ MDK now persists a per-group frozen convergence pass around that selector. The p
 one-second selection-relevant quiescence window and five-second absolute cap, resumes safely across restart, resolves
 only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
 another group.
+
+Relay reconciliation replay progress is owned by each account's encrypted route state. It survives
+subscription rebuilds and empty or failed comparisons, and advances before fetch I/O independently
+of admitted event inventory. Retired routes are counted separately from reconciliation failures.
+The SDK requires a route-scoped progress store instead of evicting cursors from a shared cache;
+see [reconciliation progress ownership](../../../crates/transport-nostr-adapter/README.md#reconciliation-progress-ownership).
 
 ## Protocol implementations
 

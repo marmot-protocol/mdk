@@ -67,7 +67,31 @@ const SDK_RECONCILIATION_REPLAY_BATCH: usize = 128;
 /// Must match the storage inventory ceiling. The relay applies the same limit,
 /// bounding the dry-run result even on first boot with an empty inventory.
 const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384;
-const SDK_RECONCILIATION_CURSOR_LIMIT: usize = 256;
+
+/// Account-owned advisory replay progress, independent of admitted event inventory.
+/// The host must preserve this across routine subscription rebuilds and serialize
+/// calls for one route. Saving must complete before replay fetch I/O starts.
+/// Implementations should return aggregate errors without route or event identifiers.
+pub trait NostrReconciliationProgress: Send + Sync {
+    fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError>;
+    fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError>;
+}
+
+fn select_reconciliation_remote_ids(
+    remote: &HashSet<EventId>,
+    progress: &dyn NostrReconciliationProgress,
+) -> Result<Vec<EventId>, TransportAdapterError> {
+    let after = progress.load_cursor()?.map(EventId::from_byte_array);
+    let ids = bounded_reconciliation_remote_ids(remote, after);
+    // Selection is advisory, including cancellation or fetch failure. Refused
+    // IDs recur on wrap; only durable ingestion changes the admitted inventory.
+    // Empty comparisons also occur when all relays fail negotiation. Preserve
+    // progress so the next successful comparison does not restart at a refused prefix.
+    if let Some(last) = ids.last() {
+        progress.save_cursor(Some(last.to_bytes()))?;
+    }
+    Ok(ids)
+}
 
 fn bounded_reconciliation_remote_ids(
     remote: &HashSet<EventId>,
@@ -158,9 +182,6 @@ pub struct NostrSdkRelayClient {
     /// Relays that explicitly rejected NIP-77 are skipped for the rest of this
     /// process. Transient connection failures are never cached here.
     reconciliation_unsupported_relays: Arc<RwLock<HashSet<RelayUrl>>>,
-    /// Advisory fairness cursors survive subscription rebuilds. Forgetting an
-    /// entry repeats a batch; it never acknowledges delivery or relay coverage.
-    reconciliation_replay_cursors: Arc<Mutex<HashMap<(MemberId, String), EventId>>>,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -246,7 +267,6 @@ impl NostrSdkRelayClient {
             #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             reconciliation_unsupported_relays: Arc::new(RwLock::new(HashSet::new())),
-            reconciliation_replay_cursors: Arc::new(Mutex::new(HashMap::new())),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -258,12 +278,14 @@ impl NostrSdkRelayClient {
     /// Reconcile one route's event set against durable account admission.
     /// NIP-77 compares event ids, including SDK-seen events that the account
     /// could not retain. Replay is bounded independently of the set difference.
+    /// `progress` belongs to this account and route and must survive rebuilds.
     pub async fn reconcile_subscription(
         &self,
         subscription: NostrSubscription,
         local_items: &[NostrReconciliationItem],
         reconcile_since: u64,
         reconcile_until: u64,
+        progress: &dyn NostrReconciliationProgress,
     ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
         let mut plan = Self::plan_subscription(&subscription)?;
         // Startup compares the gap below the subscription floor; explicit
@@ -345,29 +367,7 @@ impl NostrSdkRelayClient {
         // rotating batch so even a completely refused batch cannot starve
         // later dependencies; durable app ingestion shrinks the next diff.
         let remote_item_count = output.val.remote.len();
-        let remote_ids = {
-            let key = (plan.account_id.clone(), subscription_id.clone());
-            let mut cursors = self.reconciliation_replay_cursors.lock().await;
-            let ids =
-                bounded_reconciliation_remote_ids(&output.val.remote, cursors.get(&key).copied());
-            if let Some(last) = ids.last().copied() {
-                // Bound advisory state even across retired accounts/routes.
-                // Subscription rebuilds must not reset an active repair to
-                // the same refused prefix on every pass.
-                if cursors.len() >= SDK_RECONCILIATION_CURSOR_LIMIT
-                    && !cursors.contains_key(&key)
-                    && let Some(retired) = cursors.keys().next().cloned()
-                {
-                    cursors.remove(&retired);
-                }
-                // Advance before I/O so a cancelled or unavailable batch
-                // cannot starve a later dependency. Refused ids recur on wrap.
-                cursors.insert(key, last);
-            } else {
-                cursors.remove(&key);
-            }
-            ids
-        };
+        let remote_ids = select_reconciliation_remote_ids(&output.val.remote, progress)?;
         let mut sdk_events = Vec::new();
         let mut missing_ids = Vec::new();
         for event_id in remote_ids {
@@ -1731,6 +1731,76 @@ mod tests {
     use tokio::time::{Duration, advance, timeout};
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
 
+    #[derive(Default)]
+    struct TestReconciliationProgress {
+        cursor: std::sync::Mutex<Option<[u8; 32]>>,
+        saved: tokio::sync::Notify,
+    }
+
+    impl NostrReconciliationProgress for TestReconciliationProgress {
+        fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError> {
+            Ok(*self.cursor.lock().unwrap())
+        }
+        fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError> {
+            *self.cursor.lock().unwrap() = cursor;
+            self.saved.notify_one();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reconciliation_reaches_tail_for_257_owned_routes_after_empty_comparisons() {
+        let remote = (0..SDK_RECONCILIATION_REPLAY_BATCH + 1)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[24..].copy_from_slice(&(index as u64).to_be_bytes());
+                EventId::from_byte_array(bytes)
+            })
+            .collect::<HashSet<_>>();
+        let dependency = *remote.iter().max().unwrap();
+        // 257 tracks #1716's former shared-cache boundary. This tests selection;
+        // encrypted persistence and account isolation are storage-layer tests.
+        let routes = (0..257)
+            .map(|_| TestReconciliationProgress::default())
+            .collect::<Vec<_>>();
+        for route in &routes {
+            let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
+            assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
+            assert!(!selected.contains(&dependency));
+            let cursor = route.load_cursor().unwrap();
+            assert!(
+                select_reconciliation_remote_ids(&HashSet::new(), route)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(route.load_cursor().unwrap(), cursor);
+        }
+        // Every batch is refused; nothing shrinks the remote-only set. Routes
+        // above the former shared cache cap must nevertheless reach the tail.
+        for route in &routes {
+            let selected = select_reconciliation_remote_ids(&remote, route).unwrap();
+            assert_eq!(selected.len(), SDK_RECONCILIATION_REPLAY_BATCH);
+            assert!(selected.contains(&dependency));
+        }
+        for route in &routes {
+            assert!(
+                select_reconciliation_remote_ids(&remote, route)
+                    .unwrap()
+                    .contains(remote.iter().min().unwrap()),
+                "refused prefix recurs on wrap"
+            );
+        }
+        // Even a saved cursor above a changed remote set wraps without clearing.
+        let lower = HashSet::from([*remote.iter().min().unwrap()]);
+        routes[0].save_cursor(Some([0xff; 32])).unwrap();
+        assert_eq!(
+            select_reconciliation_remote_ids(&lower, &routes[0])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// Build a kind-445 group event DTO pre-signed by a fresh ephemeral key,
     /// matching the production peeler wrap path (spec/transports/nostr.md:64-66).
     /// The publish path rejects unsigned 445s, so publish tests must pre-sign.
@@ -1769,6 +1839,7 @@ mod tests {
         relay.run().await.unwrap();
         let endpoint = relay.url().await;
         let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let progress = TestReconciliationProgress::default();
         let mut notifications = sdk.client.notifications();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();
         sdk.client.connect().await;
@@ -1781,7 +1852,7 @@ mod tests {
             attempt: SubscriptionAttempt::INITIAL,
         };
         let (_, fetched) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX)
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
         assert_eq!(fetched.len(), 1);
@@ -1815,7 +1886,7 @@ mod tests {
             created_at: event.created_at.as_secs(),
         }];
         let (_, after_admission) = sdk
-            .reconcile_subscription(subscription, &inventory, 0, u64::MAX)
+            .reconcile_subscription(subscription, &inventory, 0, u64::MAX, &progress)
             .await
             .unwrap();
         assert!(
@@ -1865,6 +1936,7 @@ mod tests {
         relay.run().await.unwrap();
         let endpoint = relay.url().await;
         let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let progress = TestReconciliationProgress::default();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();
         sdk.client.connect().await;
         let subscription = NostrSubscription::Group {
@@ -1896,9 +1968,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        tokio::select! {
+            biased;
+            _ = progress.saved.notified() => {}
+            result = sdk.reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress) => {
+                panic!("reconciliation completed before cancellation: {result:?}");
+            }
+        }
+        let after_cancel = progress.load_cursor().unwrap().unwrap();
+        let expected_tail = published
+            .iter()
+            .map(|event| event.id)
+            .filter(|id| id.to_bytes() > after_cancel)
+            .collect::<HashSet<_>>();
+        assert_eq!(expected_tail.len(), 9);
+        let (_, resumed) = sdk
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+            .await
+            .unwrap();
+        let resumed_ids = resumed
+            .iter()
+            .map(|event| EventId::from_hex(&event.event.id).unwrap())
+            .collect::<HashSet<_>>();
+        assert!(
+            expected_tail.is_subset(&resumed_ids),
+            "cancellation preserves forward replay progress"
+        );
+        progress.save_cursor(None).unwrap();
         let mut notifications = sdk.client.notifications();
         let (_, first) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX)
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
         assert_eq!(first.len(), SDK_RECONCILIATION_REPLAY_BATCH);
@@ -1917,7 +2016,7 @@ mod tests {
         // Refusing an entire batch must still expose the remaining history,
         // including a dependency that was outside the first bounded batch.
         let (_, rotated) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX)
+            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
         assert_eq!(rotated.len(), SDK_RECONCILIATION_REPLAY_BATCH);
@@ -1936,7 +2035,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (_, second) = sdk
-            .reconcile_subscription(subscription, &inventory, 0, u64::MAX)
+            .reconcile_subscription(subscription, &inventory, 0, u64::MAX, &progress)
             .await
             .unwrap();
         assert_eq!(second.len(), 10);

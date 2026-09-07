@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
@@ -60,6 +61,57 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
             hex::encode(via_welcome.as_slice())
         }
         _ => fallback.to_owned(),
+    }
+}
+
+struct StoredReconciliationProgress<'a> {
+    storage: &'a storage_sqlite::SqliteAccountStorage,
+    route: &'a TransportReconciliationRoute,
+    retired: AtomicBool,
+}
+
+impl<'a> StoredReconciliationProgress<'a> {
+    fn new(
+        storage: &'a storage_sqlite::SqliteAccountStorage,
+        route: &'a TransportReconciliationRoute,
+    ) -> Self {
+        Self {
+            storage,
+            route,
+            retired: AtomicBool::new(false),
+        }
+    }
+
+    fn map_storage_error(
+        &self,
+        error: cgka_traits::storage::StorageError,
+        operation: &'static str,
+    ) -> cgka_traits::TransportAdapterError {
+        if matches!(error, cgka_traits::storage::StorageError::NotFound) {
+            self.retired.store(true, Ordering::Relaxed);
+        }
+        cgka_traits::TransportAdapterError::Subscription(operation.into())
+    }
+}
+
+impl transport_nostr_adapter::NostrReconciliationProgress for StoredReconciliationProgress<'_> {
+    fn load_cursor(&self) -> Result<Option<[u8; 32]>, cgka_traits::TransportAdapterError> {
+        self.storage
+            .transport_reconciliation_replay_cursor(self.route)
+            .map_err(|error| {
+                self.map_storage_error(error, "read durable reconciliation progress failed")
+            })
+    }
+
+    fn save_cursor(
+        &self,
+        cursor: Option<[u8; 32]>,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.storage
+            .advance_transport_reconciliation_replay_cursor(self.route, cursor)
+            .map_err(|error| {
+                self.map_storage_error(error, "save durable reconciliation progress failed")
+            })
     }
 }
 
@@ -801,6 +853,7 @@ impl AppClient {
 
         let mut attempted_routes = 0usize;
         let mut routes_failed = 0usize;
+        let mut routes_retired = 0usize;
         let mut relays_succeeded = 0usize;
         let mut relays_failed = 0usize;
         let mut remote_items = 0usize;
@@ -824,6 +877,7 @@ impl AppClient {
                 .map(nostr_reconciliation_item)
                 .collect::<Vec<_>>();
             attempted_routes += 1;
+            let progress = StoredReconciliationProgress::new(&storage, &route);
             let result = match route_work {
                 TransportReconciliationWork::Inbox(endpoints) => {
                     self.adapter
@@ -832,6 +886,7 @@ impl AppClient {
                             &local_items,
                             inventory.since,
                             reconcile_until,
+                            &progress,
                         )
                         .await
                 }
@@ -842,6 +897,7 @@ impl AppClient {
                             &local_items,
                             inventory.since,
                             reconcile_until,
+                            &progress,
                         )
                         .await
                 }
@@ -854,6 +910,7 @@ impl AppClient {
                     received_items += summary.received_items;
                 }
                 Ok(None) => {}
+                Err(_) if progress.retired.load(Ordering::Relaxed) => routes_retired += 1,
                 Err(_) => routes_failed += 1,
             }
         }
@@ -863,6 +920,7 @@ impl AppClient {
             method = "reconcile_transport_history",
             attempted_routes,
             routes_failed,
+            routes_retired,
             relays_succeeded,
             relays_failed,
             remote_items,
@@ -4893,6 +4951,56 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use transport_nostr_adapter::AccountSubscriptionEose;
+
+    #[test]
+    fn stored_reconciliation_progress_resumes_and_reports_closed_storage() {
+        use storage_sqlite::{SqliteAccountStorage, TransportReconciliationRoute};
+        use transport_nostr_adapter::NostrReconciliationProgress;
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let inbox = TransportReconciliationRoute::Inbox;
+        storage
+            .transport_reconciliation_inventory(&inbox, 100)
+            .unwrap();
+        let progress = super::StoredReconciliationProgress::new(&storage, &inbox);
+        assert_eq!(progress.load_cursor().unwrap(), None);
+        progress.save_cursor(Some([1; 32])).unwrap();
+        // A fresh wrapper, as used after a subscription rebuild, resumes the
+        // same owned route without relying on shared SDK cache entries.
+        let rebuilt = super::StoredReconciliationProgress::new(&storage, &inbox);
+        assert_eq!(rebuilt.load_cursor().unwrap(), Some([1; 32]));
+        assert!(
+            storage
+                .transport_reconciliation_inventory(&inbox, 100)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        storage.close().unwrap();
+        assert!(rebuilt.save_cursor(Some([2; 32])).is_err());
+        assert!(!rebuilt.retired.load(super::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn stored_reconciliation_progress_distinguishes_retired_routes() {
+        use cgka_traits::storage::GroupStorage;
+        use storage_sqlite::TransportReconciliationRoute;
+        use transport_nostr_adapter::NostrReconciliationProgress;
+        let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
+        let route_id = [7; 32];
+        let route = TransportReconciliationRoute::Group(route_id);
+        storage
+            .transport_reconciliation_inventory(&route, 100)
+            .unwrap();
+        let progress = super::StoredReconciliationProgress::new(&storage, &route);
+        progress.save_cursor(Some([1; 32])).unwrap();
+        storage.delete_transport_group_route(&route_id).unwrap();
+        assert!(progress.load_cursor().is_err());
+        assert!(progress.retired.load(super::Ordering::Relaxed));
+        let late_writer = super::StoredReconciliationProgress::new(&storage, &route);
+        assert!(late_writer.save_cursor(Some([2; 32])).is_err());
+        assert!(late_writer.retired.load(super::Ordering::Relaxed));
+        storage.close().unwrap();
+    }
 
     /// A commit or retry can release several retained messages in one effects batch.
     /// Each row needs its own source identity, including when no relay envelope

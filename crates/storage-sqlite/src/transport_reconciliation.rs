@@ -169,6 +169,60 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Read the advisory replay position of an existing account-owned route.
+    /// Inventory initialization establishes ownership; a retired route is not recreated.
+    pub fn transport_reconciliation_replay_cursor(
+        &self,
+        route: &TransportReconciliationRoute,
+    ) -> StorageResult<Option<[u8; 32]>> {
+        let (kind, id) = route.storage_key();
+        let bytes: Option<Vec<u8>> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT replay_after FROM transport_reconciliation_route_state
+             WHERE route_kind = ?1 AND route_id = ?2",
+                params![kind, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?
+            .ok_or(StorageError::NotFound)?;
+        bytes
+            .map(|bytes| {
+                bytes.try_into().map_err(|_| {
+                    StorageError::Serialization(
+                        "invalid transport reconciliation replay cursor".into(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    /// Record selection before replay I/O; this never admits an event.
+    /// Update only an existing route, so a cancelled repair cannot resurrect one
+    /// deleted while its network comparison was in flight.
+    pub fn advance_transport_reconciliation_replay_cursor(
+        &self,
+        route: &TransportReconciliationRoute,
+        cursor: Option<[u8; 32]>,
+    ) -> StorageResult<()> {
+        let (kind, id) = route.storage_key();
+        retry_on_busy(|| {
+            let changed = self
+                .lock()?
+                .execute_cached(
+                    "UPDATE transport_reconciliation_route_state SET replay_after = ?3
+                 WHERE route_kind = ?1 AND route_id = ?2",
+                    params![kind, id, cursor.as_ref().map(|id| id.as_slice())],
+                )
+                .storage()?;
+            if changed == 0 {
+                return Err(StorageError::NotFound);
+            }
+            Ok(())
+        })
+    }
+
     pub fn transport_reconciliation_inventory(
         &self,
         route: &TransportReconciliationRoute,
@@ -303,6 +357,167 @@ impl SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_cursor_retries_observed_writer_contention() {
+        use std::cell::Cell;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        thread_local! {
+            static BUSY_OBSERVED: Cell<Option<mpsc::Sender<()>>> = const { Cell::new(None) };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-contention.db");
+        let key = crate::SqlCipherKey::new("synthetic replay contention").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .transport_reconciliation_inventory(&TransportReconciliationRoute::Inbox, 100)
+            .unwrap();
+        let blocker = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        blocker
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let (busy_tx, busy_rx) = mpsc::channel();
+        let writer = store.clone();
+        let worker = std::thread::spawn(move || {
+            BUSY_OBSERVED.set(Some(busy_tx));
+            writer
+                .lock()
+                .unwrap()
+                .busy_handler(Some(|_| {
+                    BUSY_OBSERVED.with(|signal| {
+                        if let Some(signal) = signal.take() {
+                            let _ = signal.send(());
+                        }
+                    });
+                    // Force this attempt to return SQLITE_BUSY. Only the outer
+                    // retry can succeed after the blocker is released.
+                    false
+                }))
+                .unwrap();
+            writer.advance_transport_reconciliation_replay_cursor(
+                &TransportReconciliationRoute::Inbox,
+                Some([7; 32]),
+            )
+        });
+        // Release only after SQLite reports real contention, without a sleep.
+        let observed = busy_rx.recv_timeout(Duration::from_secs(5));
+        let released = blocker.lock().unwrap().execute_batch("ROLLBACK");
+        let result = worker.join();
+        released.unwrap();
+        observed.unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(
+            store
+                .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
+                .unwrap(),
+            Some([7; 32])
+        );
+        store.close().unwrap();
+        blocker.close().unwrap();
+    }
+
+    #[test]
+    fn retired_route_cannot_be_resurrected_by_late_replay_progress() {
+        use crate::storage::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let route_id = [0x44; 32];
+        let route = TransportReconciliationRoute::Group(route_id);
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .put_transport_group_route(&route_id, &gid(1), cgka_traits::EpochId(0))
+            .unwrap();
+        store
+            .transport_reconciliation_inventory(&route, unix_now_secs().unwrap())
+            .unwrap();
+        store
+            .advance_transport_reconciliation_replay_cursor(&route, Some([1; 32]))
+            .unwrap();
+        store.delete_transport_group_route(&route_id).unwrap();
+        assert!(matches!(
+            store.transport_reconciliation_replay_cursor(&route),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            store.advance_transport_reconciliation_replay_cursor(&route, Some([2; 32])),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            store.transport_reconciliation_replay_cursor(&route),
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn replay_progress_survives_more_than_256_owned_routes_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.db");
+        let key = crate::SqlCipherKey::new("synthetic replay progress").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let now = unix_now_secs().unwrap();
+        let routes = (0_u64..257)
+            .map(|index| {
+                let mut id = [0; 32];
+                id[24..].copy_from_slice(&index.to_be_bytes());
+                TransportReconciliationRoute::Group(id)
+            })
+            .collect::<Vec<_>>();
+        for route in &routes {
+            store
+                .transport_reconciliation_inventory(route, now)
+                .unwrap();
+            store
+                .advance_transport_reconciliation_replay_cursor(route, Some([7; 32]))
+                .unwrap();
+        }
+        store.close().unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        for route in &routes {
+            assert_eq!(
+                store.transport_reconciliation_replay_cursor(route).unwrap(),
+                Some([7; 32])
+            );
+            assert!(
+                store
+                    .transport_reconciliation_inventory(route, now)
+                    .unwrap()
+                    .items
+                    .is_empty(),
+                "selecting a replay batch must never manufacture durable admission"
+            );
+        }
+        let other_account = SqliteAccountStorage::in_memory().unwrap();
+        other_account
+            .transport_reconciliation_inventory(&routes[0], now)
+            .unwrap();
+        assert_eq!(
+            other_account
+                .transport_reconciliation_replay_cursor(&routes[0])
+                .unwrap(),
+            None
+        );
+        store
+            .advance_transport_reconciliation_replay_cursor(&routes[0], None)
+            .unwrap();
+        assert_eq!(
+            store
+                .transport_reconciliation_replay_cursor(&routes[0])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .transport_reconciliation_replay_cursor(&routes[1])
+                .unwrap(),
+            Some([7; 32])
+        );
+        store.close().unwrap();
+        other_account.close().unwrap();
+    }
 
     #[test]
     fn reconciliation_items_are_route_scoped_deduplicated_and_ordered() {

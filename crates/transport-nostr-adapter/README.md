@@ -75,3 +75,23 @@ cargo test -p transport-nostr-adapter --features sdk
 ```
 
 See [`AGENTS.md`](AGENTS.md) for scope, the `sdk` feature, and privacy-safe telemetry rules.
+
+## Reconciliation progress ownership
+
+`NostrSdkRelayClient::reconcile_subscription` requires a `NostrReconciliationProgress` store for
+that account and route. Hosts serialize reconciliation per route and preserve its cursor across
+subscription rebuilds. Selection saves the next position before fetching, including when the
+caller later cancels. A failed progress read or write stops replay; it must not silently restart
+at a refused prefix. Empty remote sets preserve the cursor: failed relay comparisons can also
+produce an empty set, and the next nonempty set wraps around the saved position.
+
+MarmotApp stores the cursor in its encrypted account database alongside existing route inventory
+(migration 0061). Route retirement deletes it, and a late replay cannot recreate deleted route
+state. The SDK no longer has a shared 256-entry replay cursor cache, so activity on other routes
+cannot evict an active route's progress. State adds at most one 32-byte cursor to each existing
+route row; the 128-event fetch batch and 16,384-ID reconciliation set bounds remain unchanged.
+
+Replay position is advisory, separate from admitted event inventory. Failed or cancelled fetches
+advance position but acknowledge no delivery. Refused events recur on wrap; only durable app
+ingestion removes an event from the missing set. SDK callers must supply this new progress
+argument; no FFI signature changes are required.
