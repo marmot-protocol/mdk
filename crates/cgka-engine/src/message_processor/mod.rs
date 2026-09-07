@@ -1607,6 +1607,43 @@ impl<S: StorageProvider> Engine<S> {
         self.has_unresolved_convergence_inputs(group_id)
     }
 
+    /// Milliseconds until the earliest scheduled SelfRemove auto-commit for
+    /// this group is due: `Some(0)` once it is due, `None` when nothing is
+    /// scheduled or the group cannot stage one right now (quarantined,
+    /// unhydrated, epoch not `Stable`, or this device is itself leaving).
+    ///
+    /// Runtime schedulers must keep a wakeup armed while this is `Some`, but
+    /// only use this deadline when no active convergence pass or outbound
+    /// publication retry blocks staging new work. The schedule is in-memory
+    /// engine state rather than a convergence input, so
+    /// a group whose only pending work is a peer's leave otherwise reads as
+    /// idle, and the removal waits for an unrelated commit to run convergence
+    /// (mdk#1736). Only a convergence advance stages the commit.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>, EngineError> {
+        if self.quarantined_reason(group_id).is_some() || self.unhydrated_groups.contains(group_id)
+        {
+            return Ok(None);
+        }
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Ok(None);
+        }
+        if self.load_leave_request_state(group_id)?.is_some() {
+            return Ok(None);
+        }
+        let now_ms = self.convergence_now_ms();
+        Ok(self
+            .scheduled_self_remove_auto_commits
+            .values()
+            .filter(|scheduled| &scheduled.group_id == group_id)
+            .map(|scheduled| scheduled.due_at_ms.saturating_sub(now_ms))
+            .min())
+    }
+
     /// Whether durable queued outbound intents exist for this group. Runtime
     /// schedulers must keep a wakeup armed while any remain: the scheduled
     /// drain is what regenerates and publishes them (and, on an inactive

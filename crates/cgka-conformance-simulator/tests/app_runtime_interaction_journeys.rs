@@ -1049,7 +1049,6 @@ async fn public_app_09_strict_concurrent_invite_and_rename_are_never_lost() {
 // app worker's convergence schedule has no arm for it, so survivors apply a
 // leave only when some other commit or timer runs convergence for the group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: survivors apply a voluntary leave only when another commit runs convergence"]
 async fn public_app_12_strict_leave_is_applied_by_survivors_promptly() {
     check(Journey::LeaveWithSeveralRemaining { strict: true }).await;
 }

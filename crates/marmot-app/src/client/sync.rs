@@ -556,16 +556,25 @@ impl AppClient {
             None => {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                    // Fanout retry is a barrier to staging more outbound work,
+                    // including a due SelfRemove and queued local mutations.
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
+                    })
                 } else if self.runtime.has_queued_outbound_intents(group_id)? {
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: None,
                     })
-                } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
-                    Ok(ConvergenceScheduleState::PendingOutbound {
-                        retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
-                    })
                 } else {
-                    match self.runtime.deferred_peel_cutoff_delay_ms(group_id)? {
+                    // Only an otherwise idle group may use the lifecycle timer.
+                    // It cannot shorten a collecting pass or a fanout retry:
+                    // advance_convergence cannot stage the removal behind either.
+                    let lifecycle_delay = self
+                        .runtime
+                        .scheduled_self_remove_auto_commit_delay_ms(group_id)?;
+                    let deferred_delay = self.runtime.deferred_peel_cutoff_delay_ms(group_id)?;
+                    match lifecycle_delay.into_iter().chain(deferred_delay).min() {
                         Some(0) => Ok(ConvergenceScheduleState::Ready),
                         Some(remaining_ms) => {
                             Ok(ConvergenceScheduleState::Collecting { remaining_ms })
