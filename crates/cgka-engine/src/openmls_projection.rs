@@ -3669,6 +3669,25 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     source_epoch,
                     proposal_ref,
                 });
+                if let Some(max_retained_anchor_rewind) = retain_replayed_anchors {
+                    // A rival at this epoch may consume this proposal *by
+                    // reference* — the SelfRemove auto-commit shape, where
+                    // every peer that sees one `Leave` commits the same
+                    // `ProposalRef`. Once the commit this device adopts
+                    // merges, the proposal record is `Processed` and the
+                    // seeder stops re-supplying it, so the epoch's retained
+                    // anchor becomes the only surviving record of the pending
+                    // proposal. Refresh it now, while the store still holds
+                    // the proposal: a rewind to this epoch must land on the
+                    // state as the device *left* it, or the rival's
+                    // `ProposalRef` resolves against nothing and OpenMLS
+                    // rejects it as `MissingProposal`.
+                    retain_current_group_epoch_snapshot(
+                        storage,
+                        group_id,
+                        max_retained_anchor_rewind,
+                    )?;
+                }
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 if reject_legacy_group_additions && staged.add_proposals().next().is_some() {
