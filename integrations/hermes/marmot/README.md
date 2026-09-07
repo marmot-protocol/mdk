@@ -47,6 +47,36 @@ claiming exactly-once external tool effects, complete session lineage, or
 general delivery idempotency. `InboundSpool.snapshot()` exposes aggregate state
 counts only; payloads and identifiers are never logged.
 
+### Quiet ambient continuity
+
+`message_deleted`, edit/reaction mutations, and coarse `group_state_changed`
+facts never invoke `handle_message` and never trigger an agent turn. The adapter
+persists them in `$MARMOT_HOME/hermes/ambient-context-v1.sqlite3` (or
+`MARMOT_AMBIENT_CONTEXT_PATH`) and attaches an explicitly marked untrusted,
+identifier-free representation only to the next real inbound message that
+passes activation. Admission rejection leaves the facts pending. A dispatch
+exception or cancellation also leaves them pending; a normal
+`handle_message` return acknowledges exactly the snapshot attached to that
+accepted turn, without deleting facts observed concurrently.
+
+The durable rows contain only SHA-256 routing/dedupe keys, an allowlisted fact
+kind, ordering, and expiry metadata. They contain no message text, rename text,
+account/group/message identifiers, pubkeys, relay URLs, tokens, or stream
+capabilities. The private parent and database/WAL files are permission checked
+and symlink files are refused. State is deterministically bounded by group
+count, per-group and total event count, logical bytes, and age; oldest sequence
+numbers (and then oldest groups) are evicted first.
+
+A connector reconnect in the same process and a clean adapter disconnect leave
+unacknowledged facts on disk. WAL recovery preserves committed facts after
+abrupt process death. Replayed ambient events collapse through their persisted
+hashed event key; later non-duplicate facts retain observation order. On a new
+adapter/gateway generation, pending facts are recovered and follow the same
+activation and acknowledgement rules. A host call that is cancelled, rejects,
+or raises is not an accepted turn; its attached snapshot is eligible for the
+next attempt. The acceptance boundary is the normal return from Hermes's
+`handle_message`, followed by deletion of only that exact snapshot.
+
 The model-callable `marmot_reaction` tool and adapter hooks expose Marmot
 reaction add/remove primitives to Hermes. They target an exact durable message
 id or the latest inbound message and accept arbitrary non-blank, control-free
