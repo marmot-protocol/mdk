@@ -89,6 +89,7 @@ class AmbientContextStore:
         self.owner_id = uuid.uuid4().hex
         self._db: sqlite3.Connection | None = None
         self._lock_fd: int | None = None
+        self._generation_enabled = True
 
     def __del__(self) -> None:
         try:
@@ -101,6 +102,8 @@ class AmbientContextStore:
         return self._db is not None
 
     def open(self) -> None:
+        if not self._generation_enabled:
+            raise AmbientContextError("ambient context generation is closed")
         if self._db is not None:
             return
         self._prepare_private_parent()
@@ -182,6 +185,13 @@ class AmbientContextStore:
             self._lock_fd = None
             if lock_fd is not None:
                 self._close_lock(lock_fd)
+
+    def enable_generation(self) -> None:
+        self._generation_enabled = True
+
+    def disable_generation(self) -> None:
+        self.close()
+        self._generation_enabled = False
 
     def record(
         self,
@@ -402,12 +412,12 @@ class AmbientContextStore:
     def _gc(self, now: float) -> None:
         db = self._require_db()
         if self.max_age_s <= 0:
-            db.execute("DELETE FROM facts")
+            db.execute("DELETE FROM facts WHERE claim_token IS NULL")
             db.execute("DELETE FROM seen")
         else:
             cutoff = now - self.max_age_s
             db.execute(
-                "DELETE FROM facts WHERE observed_at<?",
+                "DELETE FROM facts WHERE observed_at<? AND claim_token IS NULL",
                 (cutoff,),
             )
             db.execute("DELETE FROM seen WHERE observed_at<?", (cutoff,))
@@ -467,10 +477,10 @@ class AmbientContextStore:
         params.append(count)
         rows = db.execute(
             "SELECT source,seq FROM ("
-            "SELECT 'facts' AS source,seq,observed_at FROM facts "
-            f"WHERE 1=1{facts_group_clause} UNION ALL "
-            f"SELECT 'seen' AS source,seq,observed_at FROM seen{seen_group_clause}) "
-            "ORDER BY observed_at,source,seq LIMIT ?",
+            "SELECT 'facts' AS source,1 AS source_rank,seq,observed_at FROM facts "
+            f"WHERE claim_token IS NULL{facts_group_clause} UNION ALL "
+            f"SELECT 'seen' AS source,0 AS source_rank,seq,observed_at FROM seen{seen_group_clause}) "
+            "ORDER BY observed_at,source_rank,seq LIMIT ?",
             tuple(params),
         ).fetchall()
         for row in rows:
@@ -482,13 +492,16 @@ class AmbientContextStore:
         db = self._require_db()
         row = db.execute(
             "SELECT group_key FROM ("
-            "SELECT group_key,observed_at FROM facts UNION ALL "
+            "SELECT group_key,observed_at FROM facts WHERE claim_token IS NULL UNION ALL "
             "SELECT group_key,observed_at FROM seen) candidate "
+            "WHERE NOT EXISTS (SELECT 1 FROM facts claimed "
+            "WHERE claimed.group_key=candidate.group_key "
+            "AND claimed.claim_token IS NOT NULL) "
             "GROUP BY group_key ORDER BY min(observed_at),hex(group_key) LIMIT 1"
         ).fetchone()
         if row is None:
             return False
-        db.execute("DELETE FROM facts WHERE group_key=?", (row[0],))
+        db.execute("DELETE FROM facts WHERE group_key=? AND claim_token IS NULL", (row[0],))
         db.execute("DELETE FROM seen WHERE group_key=?", (row[0],))
         return True
 

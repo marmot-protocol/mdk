@@ -1474,21 +1474,60 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     await adapter.disconnect()
                 self.assertIsNone(adapter._listener_task)
 
-    async def test_connect_failure_closes_store_opened_before_later_store_fails(self):
+    async def test_ambient_open_failure_degrades_without_blocking_real_inbound(self):
+        inbound = wire_event(
+            {
+                "type": "inbound_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "message_id_hex": "33" * 32,
+                "sender_account_id_hex": "44" * 32,
+                "text": "still delivered",
+                "mentions_self": True,
+            }
+        )
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                yield inbound
+
         adapter = self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra={"account_id_hex": "11" * 32}),
-            client=object(),
+            client=FakeClient(),
         )
         adapter._ambient_context.open = unittest.mock.Mock(
             side_effect=RuntimeError("ambient open failed")
         )
 
-        self.assertFalse(await adapter.connect())
+        self.assertTrue(await adapter.connect())
+        for _ in range(100):
+            if adapter.events:
+                break
+            await asyncio.sleep(0.01)
 
+        self.assertEqual([event.text for event in adapter.events], ["still delivered"])
+        await adapter.disconnect()
         self.assertFalse(adapter._inbound_spool.is_open)
         self.assertFalse(adapter._ambient_context.is_open)
         self.assertIsNone(adapter._listener_task)
         self.assertIsNone(adapter._inbound_spool_retry_task)
+
+    async def test_disconnect_prevents_store_reopen_from_delayed_work(self):
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(extra={"account_id_hex": "11" * 32}),
+            client=object(),
+        )
+        adapter._inbound_spool.open()
+        adapter._ambient_context.open()
+
+        await adapter.disconnect()
+
+        with self.assertRaises(self.adapter_module.InboundSpoolError):
+            adapter._ensure_inbound_spool_open()
+        with self.assertRaisesRegex(Exception, "generation is closed"):
+            adapter._ambient_context.record("22" * 32, "late", "message_deleted")
+        self.assertFalse(adapter._inbound_spool.is_open)
+        self.assertFalse(adapter._ambient_context.is_open)
 
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
@@ -4537,7 +4576,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         retained = adapter._ambient_context.pending(group_id)
         self.assertEqual(len(retained), 16)
-        self.assertEqual(retained[-1].kind, "reaction_added")
+        self.assertTrue(all(fact.kind == "message_deleted" for fact in retained))
 
         delivered_context = []
 
@@ -4565,7 +4604,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('"type":"message_deleted"', delivered_context[0])
         remaining = adapter._ambient_context.pending(group_id)
-        self.assertEqual([fact.kind for fact in remaining], ["reaction_removed"])
+        self.assertEqual(remaining, [])
 
     # --- Behavior 6: optional debounce coalescing preserves mentions+media ----
     async def test_debounce_coalesces_and_preserves_mentions_and_media(self):
@@ -7081,6 +7120,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(adapter._inbound_spool.is_open)
 
         adapter._inbound_spool.release_debounce = original_release
+        adapter._enable_store_generation()
         adapter._ensure_inbound_spool_open()
         recovered = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("pending", recovered.state)

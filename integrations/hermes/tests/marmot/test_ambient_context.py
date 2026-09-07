@@ -191,7 +191,7 @@ os._exit(0)
             self.assertEqual([fact.kind for fact in retried.facts], ["message_deleted"])
             store.close()
 
-    def test_active_claim_keeps_absolute_event_bound(self):
+    def test_active_claim_is_retained_while_new_fact_is_refused_at_hard_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private" / "ambient.sqlite3"
             store = AmbientContextStore(
@@ -205,13 +205,10 @@ os._exit(0)
             store.record(group_id, event_id, "message_deleted")
             claim = store.claim(group_id)
 
-            self.assertTrue(store.record(group_id, "second", "reaction_added"))
+            self.assertFalse(store.record(group_id, "second", "reaction_added"))
             self.assertLessEqual(store.stats()["events"], 1)
-            self.assertEqual(store.acknowledge(group_id, claim.token), 0)
-            self.assertEqual(
-                [fact.kind for fact in store.pending(group_id)],
-                ["reaction_added"],
-            )
+            self.assertEqual(store.release(group_id, claim.token), 1)
+            self.assertEqual([fact.kind for fact in store.pending(group_id)], ["message_deleted"])
             store.close()
 
     def test_overlapping_claims_keep_group_event_byte_and_age_bounds_absolute(self):
@@ -231,20 +228,41 @@ os._exit(0)
             claim_a = store.claim(group_a, now=100)
             self.assertTrue(claim_a.facts)
 
-            for index in range(30):
-                store.record(group_b, f"b-{index}", "reaction_added", observed_at=101)
-            claim_b = store.claim(group_b, now=101)
-            self.assertTrue(claim_b.facts)
+            self.assertFalse(store.record(group_b, "b-0", "reaction_added", observed_at=101))
             stats = store.stats()
             self.assertLessEqual(stats["groups"], 1)
             self.assertLessEqual(stats["events"], 100)
             self.assertLessEqual(stats["state_bytes"], 4096)
 
-            # claimed_at never refreshes observed_at: age eviction remains an
-            # absolute retention cap even while a handoff is in flight.
-            self.assertEqual(store.pending(group_b, now=112), [])
-            self.assertEqual(store.release(group_b, claim_b.token), 0)
+            # Active ownership preserves the claim through the in-flight turn;
+            # release keeps the original observed_at, so it expires immediately
+            # rather than being refreshed by claimed_at.
+            self.assertEqual(len(store.pending(group_a, now=112)), 12)
+            self.assertEqual(store.release(group_a, claim_a.token), 12)
+            self.assertEqual(store.pending(group_a, now=112), [])
             store.close()
+
+    def test_equal_timestamp_eviction_prefers_seen_tombstone_to_pending_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private" / "ambient.sqlite3"
+            store = AmbientContextStore(path, max_events=1)
+            group_id = "22" * 32
+            store.record(group_id, "old", "message_deleted", observed_at=100)
+            claim = store.claim(group_id, now=100)
+            self.assertEqual(store.acknowledge(group_id, claim.token), 1)
+
+            self.assertTrue(store.record(group_id, "new", "reaction_added", observed_at=100))
+            self.assertEqual([fact.kind for fact in store.pending(group_id, now=100)], ["reaction_added"])
+            store.close()
+
+    def test_disabled_generation_cannot_lazy_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = AmbientContextStore(Path(directory) / "private" / "ambient.sqlite3")
+            store.record("22" * 32, "event", "message_deleted")
+            store.disable_generation()
+            with self.assertRaises(AmbientContextError):
+                store.pending("22" * 32)
+            self.assertFalse(store.is_open)
 
     def test_open_reapplies_lower_configured_bounds(self):
         with tempfile.TemporaryDirectory() as directory:

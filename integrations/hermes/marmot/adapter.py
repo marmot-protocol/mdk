@@ -1446,6 +1446,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             max_state_bytes=int(extra.get("ambient_context_max_bytes") or 1024 * 1024),
             max_age_s=int(extra.get("ambient_context_max_age_s") or 7 * 24 * 60 * 60),
         )
+        self._store_generation_enabled = True
         self._inbound_spool_retry_task: Optional[asyncio.Task] = None
         self._inbound_spool_wakeup = asyncio.Event()
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
@@ -1503,10 +1504,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         try:
+            self._enable_store_generation()
             await self._ensure_account_id()
             await self._sync_welcomer_allowlist()
             recovery = self._inbound_spool.open()
-            self._ambient_context.open()
+            try:
+                self._ambient_context.open()
+            except Exception:
+                # Ambient continuity is deliberately degradable. A private
+                # store fault must not prevent real inbound delivery.
+                self._ambient_context.disable_generation()
+                logger.error("Marmot ambient context unavailable; continuing without it", exc_info=True)
             if recovery["reclaimed"] or recovery["unresolved"]:
                 logger.warning(
                     "Marmot inbound spool recovered obligations "
@@ -1532,13 +1540,18 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     except asyncio.CancelledError:
                         pass
                     setattr(self, attribute, None)
-            self._ambient_context.close()
+            self._store_generation_enabled = False
+            self._ambient_context.disable_generation()
             self._inbound_spool.close(graceful=True)
             logger.error("Failed to connect Marmot adapter: %s", exc)
             set_fatal = getattr(self, "_set_fatal_error", None)
             if callable(set_fatal):
                 set_fatal("marmot_connect_failed", str(exc), retryable=True)
             return False
+
+    def _enable_store_generation(self) -> None:
+        self._store_generation_enabled = True
+        self._ambient_context.enable_generation()
 
     async def _sync_welcomer_allowlist(self) -> None:
         if not self.welcomer_allowlist:
@@ -1590,7 +1603,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
         self._inbound_spool.close(graceful=True)
-        self._ambient_context.close()
+        self._store_generation_enabled = False
+        self._ambient_context.disable_generation()
         self._mark_disconnected()
 
     def _cancel_debounce_tasks(self) -> None:
@@ -2837,6 +2851,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         )
 
     def _ensure_inbound_spool_open(self) -> None:
+        if not self._store_generation_enabled:
+            raise InboundSpoolError("inbound spool generation is closed")
         if not self._inbound_spool.is_open:
             self._inbound_spool.open()
 
@@ -3124,22 +3140,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 if detached_ambient
                 else None
             )
-            if ambient_claim is not None and ambient_claim.facts:
-                try:
-                    committed = self._ambient_context.commit(group_id_hex, ambient_claim.token)
-                    if committed != len(ambient_claim.facts):
-                        raise RuntimeError("ambient claim changed before durable handoff")
-                except Exception:
-                    logger.error(
-                        "Marmot ambient context handoff commit failed; continuing without ambient context",
-                        exc_info=True,
-                    )
-                    try:
-                        self._ambient_context.release(group_id_hex, ambient_claim.token)
-                    except Exception:
-                        logger.error("Marmot ambient context claim release failed", exc_info=True)
-                    ambient_claim = None
-                    ambient_context = None
             contexts = [
                 context
                 for context in (
@@ -3163,14 +3163,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
                 spool_state = "handed"
             await self.handle_message(hermes_event)
-            # The claim was durably committed immediately before host invocation,
-            # so acknowledgement after a normal return is bounded cleanup only;
-            # failure cannot make the accepted facts reusable after restart.
+            # A normal return is the host acceptance boundary. Persist that
+            # boundary before best-effort tombstone cleanup; unlike a pre-call
+            # commit, this can never retire context that the host did not accept.
             if ambient_claim is not None and ambient_claim.facts:
                 try:
-                    self._ambient_context.acknowledge(group_id_hex, ambient_claim.token)
+                    committed = self._ambient_context.commit(group_id_hex, ambient_claim.token)
+                    if committed != len(ambient_claim.facts):
+                        raise RuntimeError("ambient claim changed before host acceptance commit")
                 except Exception:
-                    logger.error("Marmot ambient context acknowledgement failed", exc_info=True)
+                    logger.error("Marmot ambient context acceptance commit failed", exc_info=True)
+                else:
+                    try:
+                        self._ambient_context.acknowledge(group_id_hex, ambient_claim.token)
+                    except Exception:
+                        logger.error("Marmot ambient context acknowledgement failed", exc_info=True)
         except asyncio.CancelledError:
             if ambient_claim is not None and ambient_claim.facts:
                 try:
