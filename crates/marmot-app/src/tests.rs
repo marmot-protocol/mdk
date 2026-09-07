@@ -16119,79 +16119,105 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
 /// A failed source write retains the accepted fanout for cleanup-only replay.
 #[tokio::test]
 async fn accepted_projection_retries() {
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://projection-failure.example")
-        .with_test_relay_client(relay.clone());
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client
-        .create_group("projection failure", &[])
-        .await
-        .unwrap();
-    let path = app.account_storage_path("alice");
-    let keys = app.account_home().load_signing_keys("alice").unwrap();
-    let key = app
-        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
-        .unwrap();
-    let connection = rusqlite::Connection::open(path).unwrap();
-    storage_sqlite::open_hardened_sqlcipher(
-        &connection,
-        &key,
-        storage_sqlite::SqlCipherHardening::cipher_only(),
-    )
-    .unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_source_write
-         BEFORE UPDATE ON app_events
+    for trigger in [
+        "CREATE TRIGGER fail_projection BEFORE UPDATE ON app_events
          WHEN NEW.source_message_id_hex IS NOT NULL AND OLD.source_message_id_hex IS NULL
          BEGIN SELECT RAISE(ABORT, 'injected source write failure'); END;",
+        "CREATE TRIGGER fail_projection BEFORE INSERT ON chat_list_rows
+         WHEN EXISTS (SELECT 1 FROM app_events WHERE direction = 'sent'
+                      AND source_message_id_hex IS NOT NULL)
+         BEGIN SELECT RAISE(ABORT, 'injected chat-list refresh failure'); END;",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://projection-failure.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("projection failure", &[])
+            .await
+            .unwrap();
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
         )
         .unwrap();
-    let attempts = relay.attempted_event_ids().len();
-    let summary = client
-        .send(&group_id, b"accepted despite projection failure")
-        .await
-        .expect("an accepted send must succeed despite source projection failure");
-    assert_eq!(
-        summary.accept_disposition,
-        cgka_traits::SendAcceptDisposition::Published
-    );
-    assert_eq!(
-        client.runtime.session().outbound_fanouts().unwrap().len(),
-        1
-    );
-    assert!(client.take_pending_convergence_groups().contains(&group_id));
-    connection
-        .execute_batch("DROP TRIGGER fail_source_write")
-        .unwrap();
-    client.retry_group_convergence(&group_id).await.unwrap();
-    assert!(
-        client
-            .runtime
-            .session()
-            .outbound_fanouts()
+        connection.execute_batch(trigger).unwrap();
+        client.take_pending_projection_updates();
+        let attempts = relay.attempted_event_ids().len();
+        let summary = client
+            .send(&group_id, b"accepted despite projection failure")
+            .await
+            .expect("an accepted send must succeed despite source projection failure");
+        assert_eq!(
+            summary.accept_disposition,
+            cgka_traits::SendAcceptDisposition::Published
+        );
+        assert_eq!(
+            client.runtime.session().outbound_fanouts().unwrap().len(),
+            1
+        );
+        assert!(client.take_pending_convergence_groups().contains(&group_id));
+        let unfinalized: bool = connection
+            .query_row(
+                "SELECT source_message_id_hex IS NULL AND retention_seconds IS NULL
+         FROM app_events WHERE message_id_hex = ?1",
+                [&summary.message_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            unfinalized,
+            "chat-list failure must roll back source finalization"
+        );
+        client.take_pending_projection_updates();
+        connection
+            .execute_batch("DROP TRIGGER fail_projection")
+            .unwrap();
+        client.retry_group_convergence(&group_id).await.unwrap();
+        assert!(
+            client
+                .runtime
+                .session()
+                .outbound_fanouts()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(relay.attempted_event_ids().len(), attempts + 1);
+        let row = app
+            .timeline_messages_with_query(
+                "alice",
+                storage_sqlite::TimelineMessageQuery {
+                    group_id_hex: Some(hex::encode(group_id.as_slice())),
+                    ..Default::default()
+                },
+            )
             .unwrap()
-            .is_empty()
-    );
-    assert_eq!(relay.attempted_event_ids().len(), attempts + 1);
-    let row = app
-        .timeline_messages_with_query(
-            "alice",
-            storage_sqlite::TimelineMessageQuery {
-                group_id_hex: Some(hex::encode(group_id.as_slice())),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-        .messages
-        .into_iter()
-        .find(|row| row.message_id_hex == summary.message_ids[0])
-        .unwrap();
-    assert!(row.source_message_id_hex.is_some());
+            .messages
+            .into_iter()
+            .find(|row| row.message_id_hex == summary.message_ids[0])
+            .unwrap();
+        assert!(row.source_message_id_hex.is_some());
+        let updates = client.take_pending_projection_updates();
+        assert!(
+            updates.iter().any(|update| update
+                .timeline_messages
+                .iter()
+                .any(|message| message.message_id_hex == summary.message_ids[0]
+                    && message.source_message_id_hex.is_some())),
+            "recovery must emit the delivered completion to subscribers"
+        );
+    }
 }
 
 /// A resource refusal carried by a host-requested convergence retry must arm

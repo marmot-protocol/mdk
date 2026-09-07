@@ -3948,11 +3948,9 @@ impl AppClient {
         self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
         // finalize updates carry the pending -> delivered flip for each of them.
-        // Unlike the send path — which drops the same updates because it
-        // immediately re-records the row and hands that update to the caller —
-        // there is nothing here to re-emit them, so buffer them for the account
-        // worker to broadcast. Dropping them leaves storage delivered while
-        // every timeline and chat-list subscriber still shows pending.
+        // Buffer these updates for the account worker, as the direct send path
+        // does for sibling completions and deferred source repairs. Dropping
+        // them leaves subscribers pending even though storage is delivered.
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         self.pending_projection_updates.extend(finalize_updates);
         let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;

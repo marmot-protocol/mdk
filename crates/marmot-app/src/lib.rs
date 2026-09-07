@@ -5266,13 +5266,16 @@ impl MarmotApp {
         message: &AppMessageProjection,
         received_at: u64,
     ) -> Result<AppProjectionUpdate, AppError> {
-        let storage_update = self
-            .account_storage(label)?
-            .record_app_event_with_retention(
+        // Keep source/retention and chat-list refresh atomic: a refresh failure
+        // must leave the accepted fanout able to reconstruct its completion.
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage.record_app_event_with_retention(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
             )?;
-        self.app_projection_update(label, storage_update)
+            self.app_projection_update(label, storage_update)
+        })
     }
 
     /// As [`Self::record_account_app_event`], but a conflicting row's
@@ -5285,13 +5288,15 @@ impl MarmotApp {
         message: &AppMessageProjection,
     ) -> Result<AppProjectionUpdate, AppError> {
         let now = unix_now_seconds();
-        let storage_update = self
-            .account_storage(label)?
-            .record_app_event_refreshing_moderation_grant_with_retention(
-                &stored_app_event_from_projection(message, now),
-                message.retention,
-            )?;
-        self.app_projection_update(label, storage_update)
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage
+                .record_app_event_refreshing_moderation_grant_with_retention(
+                    &stored_app_event_from_projection(message, now),
+                    message.retention,
+                )?;
+            self.app_projection_update(label, storage_update)
+        })
     }
 
     pub(crate) fn finalize_account_app_event_source_retention(
@@ -5303,16 +5308,19 @@ impl MarmotApp {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
-        self.account_storage(label)?
-            .finalize_app_event_source_retention(
-                group_id_hex,
-                message_id_hex,
-                source_message_id_hex,
-                source_epoch,
-                retention,
-            )?
-            .map(|update| self.app_projection_update(label, update))
-            .transpose()
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .finalize_app_event_source_retention(
+                    group_id_hex,
+                    message_id_hex,
+                    source_message_id_hex,
+                    source_epoch,
+                    retention,
+                )?
+                .map(|update| self.app_projection_update(label, update))
+                .transpose()
+        })
     }
 
     pub(crate) fn invalidate_timeline_source_message(
