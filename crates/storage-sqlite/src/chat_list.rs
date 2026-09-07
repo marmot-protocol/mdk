@@ -1098,8 +1098,30 @@ pub(crate) fn chat_list_activity_filter_sql(column_prefix: &str) -> String {
     )
 }
 
-fn accepted_activity_insert_order_high_water_sql(group_id_expression: &str) -> String {
+fn accepted_activity_order_sql(group_id_expression: &str) -> String {
     let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    // Walk newest insertions first; the first eligible row is the high water.
+    // CROSS JOIN keeps the ordered source index outside the timeline lookup.
+    format!(
+        "SELECT accepted_source.insert_order
+         FROM app_events AS accepted_source INDEXED BY idx_app_events_group_insert_order
+         CROSS JOIN message_timeline AS accepted
+         WHERE accepted_source.group_id_hex = {group_id_expression}
+           AND accepted.group_id_hex = accepted_source.group_id_hex
+           AND accepted.message_id_hex = accepted_source.message_id_hex
+           AND {accepted_activity_filter}
+           AND accepted.invalidation_status IS NULL
+           AND NOT (
+               accepted.direction = 'sent'
+               AND accepted.source_message_id_hex IS NULL
+           )
+         ORDER BY accepted_source.insert_order DESC
+         LIMIT 1"
+    )
+}
+
+fn accepted_activity_insert_order_high_water_sql(group_id_expression: &str) -> String {
+    let latest = accepted_activity_order_sql(group_id_expression);
     format!(
         "MAX(
             COALESCE((
@@ -1107,20 +1129,7 @@ fn accepted_activity_insert_order_high_water_sql(group_id_expression: &str) -> S
                 FROM chat_list_rows AS boundary
                 WHERE boundary.group_id_hex = {group_id_expression}
             ), 0),
-            COALESCE((
-                SELECT MAX(accepted_source.insert_order)
-                FROM message_timeline AS accepted
-                JOIN app_events AS accepted_source
-                  ON accepted_source.group_id_hex = accepted.group_id_hex
-                 AND accepted_source.message_id_hex = accepted.message_id_hex
-                WHERE accepted.group_id_hex = {group_id_expression}
-                  AND {accepted_activity_filter}
-                  AND accepted.invalidation_status IS NULL
-                  AND NOT (
-                      accepted.direction = 'sent'
-                      AND accepted.source_message_id_hex IS NULL
-                  )
-            ), 0)
+            COALESCE(({latest}), 0)
          )"
     )
 }
@@ -1157,40 +1166,16 @@ pub(crate) fn chat_list_preview_eligibility_sql(column_prefix: &str) -> String {
 /// chat-list preview forever. Failed local sends remain visible in the timeline
 /// without outranking accepted history.
 pub(crate) fn chat_list_preview_order_desc(column_prefix: &str) -> String {
-    let accepted_activity_filter = chat_list_activity_filter_sql("accepted.");
+    // All callers apply preview eligibility first: an eligible pending row
+    // has no later accepted activity, so ranking needs only row-local fields.
+    // Keep this expression aligned with migration 0062's preview index.
     format!(
         "CASE
             WHEN {column_prefix}direction = 'sent'
              AND {column_prefix}invalidation_status = 'local_publish_failed' THEN 0
-            ELSE 1
-         END DESC,
-         CASE
             WHEN {column_prefix}direction = 'sent'
              AND {column_prefix}source_message_id_hex IS NULL
-             AND {column_prefix}invalidation_status IS NULL
-             AND NOT EXISTS (
-                SELECT 1
-                FROM message_timeline AS accepted
-                JOIN app_events AS accepted_source
-                  ON accepted_source.group_id_hex = accepted.group_id_hex
-                 AND accepted_source.message_id_hex = accepted.message_id_hex
-                WHERE accepted.group_id_hex = {column_prefix}group_id_hex
-                  AND {accepted_activity_filter}
-                  AND accepted.invalidation_status IS NULL
-                  AND NOT (
-                      accepted.direction = 'sent'
-                      AND accepted.source_message_id_hex IS NULL
-                  )
-                  AND accepted_source.insert_order > COALESCE((
-                      SELECT current_source.insert_order
-                      FROM app_events AS current_source
-                      WHERE current_source.group_id_hex = {column_prefix}group_id_hex
-                        AND current_source.message_id_hex = {column_prefix}message_id_hex
-                  ), -1)
-             ) THEN 2
-            WHEN {column_prefix}direction = 'sent'
-             AND {column_prefix}source_message_id_hex IS NULL
-             AND {column_prefix}invalidation_status IS NULL THEN 0
+             AND {column_prefix}invalidation_status IS NULL THEN 2
             ELSE 1
          END DESC,
          {column_prefix}timeline_order_class DESC,
@@ -2113,25 +2098,12 @@ fn latest_accepted_activity_insert_order_tx(
     tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<i64>> {
-    let activity_filter = chat_list_activity_filter_sql("accepted.");
     tx.query_row_cached(
-        &format!(
-            "SELECT MAX(accepted_source.insert_order)
-             FROM message_timeline AS accepted
-             JOIN app_events AS accepted_source
-               ON accepted_source.group_id_hex = accepted.group_id_hex
-              AND accepted_source.message_id_hex = accepted.message_id_hex
-             WHERE accepted.group_id_hex = ?1
-               AND {activity_filter}
-               AND accepted.invalidation_status IS NULL
-               AND NOT (
-                   accepted.direction = 'sent'
-                   AND accepted.source_message_id_hex IS NULL
-               )"
-        ),
+        &accepted_activity_order_sql("?1"),
         params![group_id_hex],
         |row| row.get(0),
     )
+    .optional()
     .storage()
 }
 

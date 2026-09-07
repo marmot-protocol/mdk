@@ -120,6 +120,8 @@ mod migration_0059_chat_list_unread_membership;
 mod migration_0060_released_transport_receipts;
 #[path = "migrations/0061_transport_reconciliation_replay_cursor.rs"]
 mod migration_0061_transport_reconciliation_replay_cursor;
+#[path = "migrations/0062_chat_list_preview_indexes.rs"]
+mod migration_0062_chat_list_preview_indexes;
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -439,6 +441,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 61,
         name: "0061_transport_reconciliation_replay_cursor",
         apply: migration_0061_transport_reconciliation_replay_cursor::apply,
+    },
+    Migration {
+        version: 62,
+        name: "0062_chat_list_preview_indexes",
+        apply: migration_0062_chat_list_preview_indexes::apply,
     },
 ];
 
@@ -1026,7 +1033,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 61,
+                found: 62,
                 latest_supported: 46,
             }
         ));
@@ -1082,7 +1089,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 61,
+                found: 62,
                 latest_supported: 46,
             }
         ));
@@ -1386,7 +1393,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 61,
+                found: 62,
                 latest_supported: 46,
             }
         ));

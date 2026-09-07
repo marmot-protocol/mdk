@@ -1437,3 +1437,94 @@ async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
     assert!(duplicate_resume.reports.is_empty());
     assert_eq!(resumed_adapter.publishes().len(), original_endpoints.len());
 }
+
+#[tokio::test]
+#[ignore = "diagnostic member-size and stalled-relay timing matrix"]
+async fn send_waits_for_slow_relay() {
+    for member_count in [2, 5, 9, 17] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("send latency test key").unwrap();
+        let mut alice = session(dir.path().join("alice.sqlite"), &key, b"latency-alice");
+        let sender = hex::encode(alice.self_id().as_slice());
+        let mut members = Vec::new();
+        for index in 1..member_count {
+            let name = format!("latency-member-{index}");
+            let mut member = session(
+                dir.path().join(format!("{index}.sqlite")),
+                &key,
+                name.as_bytes(),
+            );
+            members.push(member.fresh_key_package().await.unwrap());
+        }
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "send latency".into(),
+                description: String::new(),
+                members,
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group_id = created.group_id;
+        let pending = match &created.effects.publish[0] {
+            PublishWork::GroupCreated { pending, .. } => *pending,
+            other => panic!("expected group creation, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+        let fast = TransportEndpoint("wss://fast.example".into());
+        let slow = TransportEndpoint("wss://slow.example".into());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let adapter = RecordingAdapter::default();
+        let routing = StaticTransportRouting::new(Vec::new()).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![fast, slow.clone()],
+        );
+        let mut runtime = AccountDeviceRuntime::new(
+            alice,
+            adapter.clone(),
+            routing,
+            RecordingKeyPackages::default(),
+        );
+        let mut timings = Vec::new();
+        for index in 0..10 {
+            let payload = app_payload_for(&sender, format!("healthy send {index}"));
+            let started = std::time::Instant::now();
+            let effects = runtime
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload,
+                })
+                .await
+                .unwrap();
+            timings.push(started.elapsed().as_micros());
+            assert_eq!(effects.published_app_messages.len(), 1);
+        }
+        eprintln!("members={member_count} healthy_send_us={timings:?}");
+        adapter.inner.publishes.lock().unwrap().clear();
+        *adapter.inner.endpoint_gate.lock().unwrap() = Some((slow, gate.clone()));
+        let send = runtime.send(SendIntent::AppMessage {
+            group_id,
+            payload: app_payload_for(&sender, b"latency probe"),
+        });
+        tokio::pin!(send);
+
+        // The first relay accepts immediately. The second alone holds completion.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send)
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter.publishes().len(), 2);
+        gate.add_permits(1);
+        let effects = tokio::time::timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(effects.published_app_messages.len(), 1);
+        assert_eq!(effects.reports[0].required_acks, 1);
+        assert_eq!(effects.reports[0].accepted.len(), 2);
+    }
+}

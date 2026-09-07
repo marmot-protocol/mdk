@@ -157,6 +157,66 @@ fn setup_store() -> SqliteAccountStorage {
     setup_store_with_group(group())
 }
 
+#[test]
+fn preview_query_work() {
+    use rusqlite::StatementStatus;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PREVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static HIGH_WATER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    let store = setup_store();
+    let mut seeded = 0;
+    for count in [100, 1_000] {
+        cgka_traits::StorageProvider::with_transaction(&store, |store| {
+            for index in seeded..count {
+                store.record_app_event(&chat(
+                    &format!("history-{index}"),
+                    REMOTE,
+                    index,
+                    "history",
+                ))?;
+            }
+            Ok::<_, cgka_traits::StorageError>(())
+        })
+        .unwrap();
+        seeded = count;
+        {
+            let conn = store.lock().unwrap();
+            conn.flush_prepared_statement_cache();
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_PROFILE,
+                Some(|event| {
+                    let TraceEvent::Profile(statement, _) = event else {
+                        return;
+                    };
+                    let sql = statement.sql();
+                    let counter = if sql.starts_with("SELECT preview.message_id_hex") {
+                        &PREVIEW_COUNT
+                    } else if sql.starts_with("SELECT accepted_source.insert_order") {
+                        &HIGH_WATER_COUNT
+                    } else {
+                        return;
+                    };
+                    assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+                    assert!(statement.get_status(StatementStatus::VmStep) < 128);
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+        }
+        store
+            .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .trace_v2(TraceEventCodes::empty(), None);
+    }
+    assert_eq!(PREVIEW_COUNT.load(Ordering::Relaxed), 2);
+    assert_eq!(HIGH_WATER_COUNT.load(Ordering::Relaxed), 2);
+}
+
 fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
     let bytes = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
         url: url.to_owned(),

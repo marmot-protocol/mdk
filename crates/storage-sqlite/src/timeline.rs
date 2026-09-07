@@ -2131,6 +2131,8 @@ fn app_events_targeting_message_tx(
     // .any(|t| t == target)` relationship (one edge per "e" tag value), so the
     // indexed join is equivalent to the former JSON `LIKE` scan plus Rust-side
     // re-filter, without either. Ordering is preserved byte-for-byte.
+    // Keep the target index outermost; scanning history to avoid a small
+    // modifier sort makes even a message with no modifiers cost O(history).
     let mut stmt = tx
         .prepare_cached(
             "SELECT app_events.group_id_hex, app_events.message_id_hex, app_events.source_message_id_hex,
@@ -2140,7 +2142,7 @@ fn app_events_targeting_message_tx(
                     app_events.invalidated, app_events.invalidation_reason,
                     app_events.moderation_grant
              FROM message_modifier_edges AS edges
-             JOIN app_events
+             CROSS JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
               AND app_events.message_id_hex = edges.modifier_message_id_hex
              WHERE edges.group_id_hex = ?1

@@ -3078,11 +3078,6 @@ impl AppClient {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
-        // Discarded deliberately, unlike on the convergence-retry path: the
-        // re-record below reprojects the same row with its new source id and
-        // hands that update to `on_local_projection`, so forwarding these too
-        // would emit the flip twice.
-        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let published = effects.published_app_messages.iter().find(|published| {
             published.group_id == *group_id && published.app_event_id == app_event_id
         });
@@ -3105,6 +3100,11 @@ impl AppClient {
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
         }
+        // The current row already has its source and retention. Finalization
+        // now skips its duplicate projection, acknowledges the durable send,
+        // and forwards updates for any siblings published in the same pass.
+        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        self.pending_projection_updates.extend(finalize_updates);
         // A send that lands while inbound convergence input is retained folds
         // those commits before publishing, so `effects.events` can carry peer
         // state changes (e.g. a mid-window group rename). Observe them through
