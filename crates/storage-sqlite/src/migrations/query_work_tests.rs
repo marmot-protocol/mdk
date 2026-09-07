@@ -387,6 +387,12 @@ fn query_indexes_upgrade() {
     let before = contents(&conn);
     super::run_all(&mut conn).unwrap();
     super::run_all(&mut conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    super::migration_0063_query_indexes::apply(&tx).unwrap();
+    tx.execute_batch("DROP INDEX idx_openmls_values_group;")
+        .unwrap();
+    super::migration_0063_query_indexes::apply(&tx).unwrap();
+    tx.commit().unwrap();
     assert_eq!(contents(&conn), before);
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))

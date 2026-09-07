@@ -6,44 +6,44 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         r#"
 -- SQLite appends rowid, preserving the seen-event recency tie-breaker.
-CREATE INDEX idx_seen_events_recency ON seen_events(seen_at);
+CREATE INDEX IF NOT EXISTS idx_seen_events_recency ON seen_events(seen_at);
 
 -- Engine hydration replays pending events across groups in source order.
-CREATE INDEX idx_pending_application_events_order
+CREATE INDEX IF NOT EXISTS idx_pending_application_events_order
     ON pending_application_events(message_insert_order, message_id);
 
 -- Promotion must skip already-normalized history on every bounded batch.
-CREATE INDEX idx_cgka_messages_legacy_order
+CREATE INDEX IF NOT EXISTS idx_cgka_messages_legacy_order
     ON cgka_messages(insert_order) WHERE storage_format = 1;
 
 -- Retire an epoch across components without scanning every cached epoch.
-CREATE INDEX idx_media_secrets_retirement
+CREATE INDEX IF NOT EXISTS idx_media_secrets_retirement
     ON encrypted_media_epoch_secrets(group_id_hex, source_epoch)
     WHERE retention_managed = 1;
 
 -- Chat projections use text ids; protocol tombstones retain opaque binary ids.
-CREATE INDEX idx_disband_tombstones_hex
+CREATE INDEX IF NOT EXISTS idx_disband_tombstones_hex
     ON cgka_disband_tombstones(lower(hex(group_id)));
 
 -- A terminal sweep usually has no unpublished sends among retained history.
-CREATE INDEX idx_app_events_pending_sent
+CREATE INDEX IF NOT EXISTS idx_app_events_pending_sent
     ON app_events(group_id_hex)
     WHERE direction = 'sent' AND source_message_id_hex IS NULL AND invalidated = 0;
 
 -- Account-wide recent messages use the same ordering across all groups.
-CREATE INDEX idx_app_events_recency ON app_events(recorded_at, message_id_hex);
+CREATE INDEX IF NOT EXISTS idx_app_events_recency ON app_events(recorded_at, message_id_hex);
 
 -- Enumerate KeyPackages without reading unrelated OpenMLS values.
-CREATE INDEX idx_openmls_values_label
+CREATE INDEX IF NOT EXISTS idx_openmls_values_label
     ON openmls_values(provider_version, label, storage_key);
 
 -- Proposal cleanup must skip the group's cached epoch keys.
-DROP INDEX idx_openmls_values_group;
-CREATE INDEX idx_openmls_values_group
+DROP INDEX IF EXISTS idx_openmls_values_group;
+CREATE INDEX IF NOT EXISTS idx_openmls_values_group
     ON openmls_values(provider_version, group_key, label);
 
 -- Local deletion records the group's last message as a replay frontier.
-CREATE INDEX idx_cgka_messages_group_order ON cgka_messages(group_id, insert_order);
+CREATE INDEX IF NOT EXISTS idx_cgka_messages_group_order ON cgka_messages(group_id, insert_order);
 "#,
     )
     .storage()
