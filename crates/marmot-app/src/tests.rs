@@ -826,6 +826,16 @@ pub(crate) fn bounded_epoch_backfill_config() -> MarmotAppConfig {
         .with_dev_epoch_backfill_retry_backoff_ms(0)
 }
 
+/// Queue/correlation tests also run without `test-policy-overrides`, where the
+/// configured zero backoff is correctly ignored. Advance the already-armed
+/// deadline instead of bypassing the automatic seam or waiting in wall-clock.
+fn expire_epoch_backfill_retry_cooldown(client: &mut crate::AppClient) {
+    *client
+        .epoch_backfill_retry_not_before
+        .as_mut()
+        .expect("a failed replay must arm its retry cooldown") = std::time::Instant::now();
+}
+
 /// Open a client on the app's *own* relay plane.
 ///
 /// [`MarmotApp::client`] mints a fresh plane per client, so a test that drives
@@ -1192,6 +1202,7 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             "failed activation must retain pending recovery"
         );
 
+        expire_epoch_backfill_retry_cooldown(&mut client);
         let retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
@@ -3811,6 +3822,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_operation_intents_on_failure() {
             "the failed operation must be queued instead of orphaned"
         );
 
+        expire_epoch_backfill_retry_cooldown(&mut client);
         let operation_b_retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
@@ -4147,6 +4159,7 @@ fn deferred_primary_epoch_backfill_rotates_behind_queued_older_operation() {
             "the deferred newer operation must rotate behind the queued older work"
         );
 
+        expire_epoch_backfill_retry_cooldown(&mut client);
         let older_retry = client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
