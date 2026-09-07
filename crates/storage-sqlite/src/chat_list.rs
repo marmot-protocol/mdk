@@ -328,6 +328,12 @@ pub struct ChatListRow {
     /// Durable user-visible activity anchor. Projection maintenance never
     /// advances this value.
     pub activity_sort_at: u64,
+    /// Wall-clock time of the last projection write for this row. Every
+    /// rebuild re-stamps it, even when the derived content is unchanged,
+    /// because `chat_list_projection_complete_tx` fences it against the
+    /// source tables' timestamps to decide whether the row is fresh. Keeping
+    /// an old stamp on a no-op rebuild would make such a row look stale
+    /// forever. Compare durable content, not this stamp.
     pub updated_at: u64,
     /// The local account's membership in this group (active member, left, or
     /// removed). Denormalized from `account_groups.self_membership`.
