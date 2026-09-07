@@ -11817,6 +11817,20 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
     })
     .await;
 
+    // Keep the only remaining committer offline while inspecting the pending
+    // request. A live Alice can now apply SelfRemove before the command replies
+    // are observed, legitimately clearing the request this test wants to inspect.
+    // The separate peer-leave regression covers that automatic completion path.
+    runtime
+        .sign_out(
+            &alice_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+
     // Both leaves are in flight before either worker command runs, so neither
     // can benefit from the other having recorded the request.
     let (first, second) = tokio::join!(
@@ -11858,6 +11872,7 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
             .is_some(),
         "the winning leave leaves exactly one durable request behind"
     );
+    runtime.shutdown().await;
 }
 
 /// Convergence remediation-plan liveness guard: successive inbound commits,
