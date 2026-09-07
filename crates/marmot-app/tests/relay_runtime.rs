@@ -16,8 +16,8 @@ use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, ChatListRow, MarmotApp,
+    MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
     NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
     RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
@@ -10287,7 +10287,28 @@ async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
         .chat_list_row(&alice.account.label, &created.chat_list_row.group_id_hex)
         .unwrap()
         .expect("created chat-list row is queryable immediately");
-    assert_eq!(created.chat_list_row, queried);
+    // Race: `updated_at` is the projection's maintenance stamp, not durable
+    // conversation content. Storage fences it against the source tables'
+    // timestamps in `chat_list_projection_complete_tx`, so every rebuild
+    // re-stamps it to wall-clock now even when the row is otherwise
+    // identical. This is the account's first chat-list query, so
+    // `ensure_chat_list_projection` rebuilds the whole projection (a fresh
+    // database starts at projection version 0, and an earlier account-state
+    // save may already have marked it stale) instead of serving the row the
+    // create tail wrote. When a wall-clock second boundary falls between that
+    // write and this query, the stamp moves forward by one. The durable-row
+    // contract is every other field; the stamp may only advance.
+    assert!(
+        queried.updated_at >= created.chat_list_row.updated_at,
+        "projection maintenance may only advance updated_at"
+    );
+    assert_eq!(
+        ChatListRow {
+            updated_at: queried.updated_at,
+            ..created.chat_list_row.clone()
+        },
+        queried
+    );
 
     let emitted = wait_for_event(&mut events, |event| {
         matches!(
