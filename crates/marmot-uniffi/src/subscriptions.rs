@@ -604,16 +604,22 @@ mod tests {
             delta_times.sort_unstable();
             original_times.sort_unstable();
             assert_eq!(sizes[1], sizes[2]);
-            eprintln!(
-                "rows={count} full_p50_ns={} full_p95_ns={} delta_p50_ns={} delta_p95_ns={} original_p50_ns={} original_p95_ns={} full_bytes={} delta_bytes={}",
-                full_times[49],
-                full_times[94],
-                delta_times[49],
-                delta_times[94],
-                original_times[49],
-                original_times[94],
-                sizes[0],
-                sizes[1],
+            // Structured tracing rather than direct output: the repo-wide
+            // audit forbids `eprintln!` in library sources, tests included.
+            // Run with a subscriber (for example `RUST_LOG=info`) to read it.
+            tracing::info!(
+                target: "marmot_uniffi::benchmark",
+                method = "live_timeline_conversion_benchmark",
+                rows = count,
+                full_p50_ns = full_times[49],
+                full_p95_ns = full_times[94],
+                delta_p50_ns = delta_times[49],
+                delta_p95_ns = delta_times[94],
+                original_p50_ns = original_times[49],
+                original_p95_ns = original_times[94],
+                full_bytes = sizes[0],
+                delta_bytes = sizes[1],
+                "live timeline conversion benchmark"
             );
         }
     }
