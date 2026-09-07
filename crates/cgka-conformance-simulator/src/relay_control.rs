@@ -189,6 +189,32 @@ impl RelayControl {
         before: usize,
         expectation: RelayActionExpectation<'_>,
     ) -> Result<(), RelayControlError> {
+        self.wait_for_action_events_inner(action_events, action_id, before, expectation, false)
+            .await
+    }
+
+    /// Correlate an action with a complete set of public transport identities.
+    /// Other runtime work can publish in the same interval; those events stay
+    /// on the relay but must never become targets of this action's selectors.
+    pub async fn wait_for_exact_action_events(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+    ) -> Result<(), RelayControlError> {
+        self.wait_for_action_events_inner(action_events, action_id, before, expectation, true)
+            .await
+    }
+
+    async fn wait_for_action_events_inner(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+        exact_identity: bool,
+    ) -> Result<(), RelayControlError> {
         let RelayActionExpectation {
             include_welcomes,
             expected_publications,
@@ -202,11 +228,26 @@ impl RelayControl {
             });
         }
         let expected_event_ids = expected_event_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if exact_identity && expected_event_ids.len() != expected_publications {
+            return Err(RelayControlError {
+                code: "relay_action_publication_identity_count_mismatch",
+                message: "exact action correlation requires every publication identity",
+            });
+        }
         let deadline = Instant::now() + timeout;
         loop {
-            let recorded = self
-                .record_action_events(action_events, action_id, before, include_welcomes)
+            self.record_action_events(action_events, action_id, before, include_welcomes)
                 .await?;
+            if exact_identity {
+                let mut seen = BTreeSet::new();
+                if let Some(events) = action_events.get_mut(action_id) {
+                    events.retain(|event| {
+                        expected_event_ids.contains(&event.event.id.to_hex())
+                            && seen.insert(event.event.id)
+                    });
+                }
+            }
+            let recorded = action_events.get(action_id).map_or(0, Vec::len);
             let observed_event_ids = action_events
                 .get(action_id)
                 .into_iter()
@@ -437,6 +478,86 @@ mod tests {
             .await
             .unwrap();
         assert!(database.event_by_id(&welcome.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn exact_action_identity_waits_for_its_event_and_excludes_concurrent_work() {
+        let control = RelayControl::new();
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&control.publication_log),
+            hidden_event_ids: Arc::clone(&control.hidden_event_ids),
+        };
+        let keys = nostr::Keys::generate();
+        let maintenance = nostr::EventBuilder::new(Kind::MlsGroupMessage, "queued maintenance")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let current = nostr::EventBuilder::new(Kind::MlsGroupMessage, "current action")
+            .sign_with_keys(&keys)
+            .unwrap();
+        database.save_event(&maintenance).await.unwrap();
+        let expected_ids = [current.id.to_hex()];
+        let expectation = || RelayActionExpectation {
+            include_welcomes: false,
+            expected_publications: 1,
+            expected_event_ids: &expected_ids,
+            timeout: Duration::ZERO,
+        };
+        let mut actions = RelayActionEvents::new();
+        let error = control
+            .wait_for_exact_action_events(&mut actions, "current", 0, expectation())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "relay_action_publication_timeout");
+        assert!(actions["current"].is_empty());
+
+        database.save_event(&current).await.unwrap();
+        control
+            .wait_for_exact_action_events(&mut actions, "current", 0, expectation())
+            .await
+            .unwrap();
+        assert_eq!(actions["current"].len(), 1);
+        assert_eq!(actions["current"][0].event.id, current.id);
+        assert_eq!(actions["current"][0].publication_sequence, 1);
+        let selector = ScenarioMessageSelectorV2 {
+            action_id: Some("current".into()),
+            occurrence: 0,
+            ..Default::default()
+        };
+        control
+            .set_action_event_visibility(&actions, &selector, false)
+            .await
+            .unwrap();
+        assert!(database.event_by_id(&current.id).await.unwrap().is_none());
+        assert!(
+            database
+                .event_by_id(&maintenance.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let error = control
+            .wait_for_exact_action_events(
+                &mut actions,
+                "incomplete",
+                0,
+                RelayActionExpectation {
+                    include_welcomes: false,
+                    expected_publications: 1,
+                    expected_event_ids: &[],
+                    timeout: Duration::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            "relay_action_publication_identity_count_mismatch"
+        );
     }
 
     #[tokio::test]
