@@ -40,6 +40,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tls_codec::{Deserialize as _, Serialize as _};
 
+/// Internal ingest result. An opaque row has no lineage verdict until a live
+/// caller needs to report one. Retry sweeps only maintain its durable lifecycle;
+/// classifying their discarded result would rescan the commit graph per row.
+/// Keeping that absence in a separate variant prevents a placeholder lineage
+/// from escaping as an apparently valid verdict when a caller starts using it.
+pub(super) enum GroupMessageIngestOutcome {
+    Outcome(IngestOutcome),
+    Deferred(GroupId),
+}
+
 /// What a deferred-peel sweep offers the ingest seam for one retained row.
 ///
 /// The candidate branch states this sweep materialized are offered to a row the
@@ -295,8 +305,16 @@ impl<S: StorageProvider> Engine<S> {
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
-        self.ingest_group_message_from_sweep(msg, transport_group_id, DeferredPeelSweep::LIVE)
-            .await
+        match self
+            .ingest_group_message_from_sweep(msg, transport_group_id, DeferredPeelSweep::LIVE)
+            .await?
+        {
+            GroupMessageIngestOutcome::Outcome(outcome) => Ok(outcome),
+            GroupMessageIngestOutcome::Deferred(group_id) => {
+                let lineage = self.deferral_lineage(&group_id)?;
+                Ok(IngestOutcome::TransportDeferred { group_id, lineage })
+            }
+        }
     }
 
     /// [`Self::ingest_group_message`] on behalf of a deferred-peel sweep.
@@ -307,12 +325,13 @@ impl<S: StorageProvider> Engine<S> {
     /// recovered application message is routed (see the evidence guard below).
     /// Every other step, from dedup to terminal classification, is shared with
     /// the ordinary path.
-    pub(crate) async fn ingest_group_message_from_sweep(
+    pub(super) async fn ingest_group_message_from_sweep(
         &mut self,
         msg: &TransportMessage,
         transport_group_id: Vec<u8>,
         sweep: DeferredPeelSweep<'_>,
-    ) -> Result<IngestOutcome, EngineError> {
+    ) -> Result<GroupMessageIngestOutcome, EngineError> {
+        let reported = |outcome| Ok(GroupMessageIngestOutcome::Outcome(outcome));
         let group_id = self.resolve_or_backfill_group_id_for_transport(&transport_group_id)?;
 
         // Authenticated terminal evidence is permanent. Drop late traffic
@@ -320,7 +339,7 @@ impl<S: StorageProvider> Engine<S> {
         // unknown-group input.
         if self.storage.disband_tombstone(&group_id)?.is_some() {
             self.storage.put_ingress_dedup_marker(&msg.id)?;
-            return Ok(IngestOutcome::Ignored {
+            return reported(IngestOutcome::Ignored {
                 category: InputRejectionCategory::UnknownGroup,
             });
         }
@@ -345,7 +364,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(EngineError::Storage(error));
                 }
                 Err(DeferredPeelPayloadPreparationError::CodecLimit) => {
-                    return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
+                    return reported(self.peel_deferred_capacity_refused(&group_id, &msg.id));
                 }
             };
             let deferred_payload_bytes = prepared.encoded_payload.len();
@@ -371,9 +390,9 @@ impl<S: StorageProvider> Engine<S> {
                     ),
                 );
             } else {
-                return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
+                return reported(self.peel_deferred_capacity_refused(&group_id, &msg.id));
             }
-            return Ok(IngestOutcome::LocalState {
+            return reported(IngestOutcome::LocalState {
                 state: LocalIngestState::Quarantined,
             });
         }
@@ -403,7 +422,7 @@ impl<S: StorageProvider> Engine<S> {
                 // same event must process instead of classifying as a
                 // duplicate of a message that left no durable record.
                 self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
-                return Ok(IngestOutcome::Ignored {
+                return reported(IngestOutcome::Ignored {
                     category: InputRejectionCategory::UnknownGroup,
                 });
             }
@@ -428,14 +447,14 @@ impl<S: StorageProvider> Engine<S> {
             self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Failed)?;
             self.realize_self_eviction(&group_id, current_epoch)?;
             self.return_unmodified_mls_group(&group_id, mls_group);
-            return Ok(IngestOutcome::LocalState {
+            return reported(IngestOutcome::LocalState {
                 state: LocalIngestState::Removed,
             });
         }
         if !self.epoch_manager.can_ingest(&group_id) {
             self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Retryable)?;
             self.return_unmodified_mls_group(&group_id, mls_group);
-            return Ok(IngestOutcome::Buffered {
+            return reported(IngestOutcome::Buffered {
                 group_id,
                 epoch: current_epoch,
             });
@@ -523,21 +542,21 @@ impl<S: StorageProvider> Engine<S> {
                             InputRejectionCategory::InvalidEncoding
                         };
                         self.return_unmodified_mls_group(&group_id, mls_group);
-                        return self.terminal_peel_rejection_ignored(
+                        return reported(self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
                             "malformed_payload_snapshot_fallback",
                             category,
-                        );
+                        )?);
                     }
                     Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
                         self.return_unmodified_mls_group(&group_id, mls_group);
-                        return self.terminal_peel_rejection_ignored(
+                        return reported(self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
                             "wrong_recipient_snapshot_fallback",
                             InputRejectionCategory::WrongRecipient,
-                        );
+                        )?);
                     }
                     Err(e) => return Err(e),
                 };
@@ -574,7 +593,9 @@ impl<S: StorageProvider> Engine<S> {
                         }
                         Err(DeferredPeelPayloadPreparationError::CodecLimit) => {
                             self.return_unmodified_mls_group(&group_id, mls_group);
-                            return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
+                            return reported(
+                                self.peel_deferred_capacity_refused(&group_id, &msg.id),
+                            );
                         }
                     };
                     let deferred_payload_bytes = prepared.encoded_payload.len();
@@ -589,7 +610,7 @@ impl<S: StorageProvider> Engine<S> {
                             "peel-deferred row cap reached; dropping undecryptable input unpersisted"
                         );
                         self.return_unmodified_mls_group(&group_id, mls_group);
-                        return Ok(self.peel_deferred_capacity_refused(&group_id, &msg.id));
+                        return reported(self.peel_deferred_capacity_refused(&group_id, &msg.id));
                     }
                     self.persist_encoded_transport_message_for_existing_group(
                         msg,
@@ -616,9 +637,8 @@ impl<S: StorageProvider> Engine<S> {
                             crate::message_disposition::MessageDisposition::RetryPending.tag(),
                         ),
                     );
-                    let lineage = self.deferral_lineage(&group_id)?;
                     self.return_unmodified_mls_group(&group_id, mls_group);
-                    return Ok(IngestOutcome::TransportDeferred { group_id, lineage });
+                    return Ok(GroupMessageIngestOutcome::Deferred(group_id));
                 }
             }
             Err(PeelerError::StaleEpoch {
@@ -653,21 +673,21 @@ impl<S: StorageProvider> Engine<S> {
                             InputRejectionCategory::InvalidEncoding
                         };
                         self.return_unmodified_mls_group(&group_id, mls_group);
-                        return self.terminal_peel_rejection_ignored(
+                        return reported(self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
                             "malformed_payload_snapshot_fallback",
                             category,
-                        );
+                        )?);
                     }
                     Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
                         self.return_unmodified_mls_group(&group_id, mls_group);
-                        return self.terminal_peel_rejection_ignored(
+                        return reported(self.terminal_peel_rejection_ignored(
                             &raw_msg_id,
                             &msg.id,
                             "wrong_recipient_snapshot_fallback",
                             InputRejectionCategory::WrongRecipient,
-                        );
+                        )?);
                     }
                     Err(e) => return Err(e),
                 };
@@ -714,7 +734,7 @@ impl<S: StorageProvider> Engine<S> {
                         ),
                     );
                     self.return_unmodified_mls_group(&group_id, mls_group);
-                    return Ok(IngestOutcome::Stale {
+                    return reported(IngestOutcome::Stale {
                         reason: StaleReason::AlreadyAtEpoch {
                             current: context_epoch,
                             msg_epoch: message_epoch,
@@ -746,21 +766,21 @@ impl<S: StorageProvider> Engine<S> {
                     InputRejectionCategory::InvalidEncoding
                 };
                 self.return_unmodified_mls_group(&group_id, mls_group);
-                return self.terminal_peel_rejection_ignored(
+                return reported(self.terminal_peel_rejection_ignored(
                     &raw_msg_id,
                     &msg.id,
                     reason,
                     category,
-                );
+                )?);
             }
             Err(PeelerError::WrongRecipient) => {
                 self.return_unmodified_mls_group(&group_id, mls_group);
-                return self.terminal_peel_rejection_ignored(
+                return reported(self.terminal_peel_rejection_ignored(
                     &raw_msg_id,
                     &msg.id,
                     "wrong_recipient",
                     InputRejectionCategory::WrongRecipient,
-                );
+                )?);
             }
             Err(e) => return Err(EngineError::Peeler(e)),
         };
@@ -781,7 +801,7 @@ impl<S: StorageProvider> Engine<S> {
                     MessageState::Failed,
                 )?;
                 self.return_unmodified_mls_group(&group_id, mls_group);
-                return Ok(IngestOutcome::Ignored {
+                return reported(IngestOutcome::Ignored {
                     category: InputRejectionCategory::InvalidEncoding,
                 });
             }
@@ -803,17 +823,17 @@ impl<S: StorageProvider> Engine<S> {
             // marker pool so a later restart can short-circuit before peel.
             self.storage
                 .put_processed_transport_id(&group_id, &raw_msg_id)?;
-            return Ok(outcome);
+            return reported(outcome);
         }
         if self.seen_message_ids.contains(&content_id) {
             self.return_unmodified_mls_group(&group_id, mls_group);
-            return Ok(IngestOutcome::Ignored {
+            return reported(IngestOutcome::Ignored {
                 category: InputRejectionCategory::Duplicate,
             });
         }
         if self.sent_message_ids.contains(&content_id) {
             self.return_unmodified_mls_group(&group_id, mls_group);
-            return Ok(IngestOutcome::Ignored {
+            return reported(IngestOutcome::Ignored {
                 category: InputRejectionCategory::OwnEcho,
             });
         }
@@ -853,7 +873,7 @@ impl<S: StorageProvider> Engine<S> {
                     "malformed_mls_message",
                 )?;
                 self.return_unmodified_mls_group(&group_id, mls_group);
-                return Ok(IngestOutcome::Ignored {
+                return reported(IngestOutcome::Ignored {
                     category: InputRejectionCategory::InvalidEncoding,
                 });
             }
@@ -878,7 +898,7 @@ impl<S: StorageProvider> Engine<S> {
                     "non_mls_message_body",
                 )?;
                 self.return_unmodified_mls_group(&group_id, mls_group);
-                return Ok(IngestOutcome::Ignored {
+                return reported(IngestOutcome::Ignored {
                     category: InputRejectionCategory::InvalidEncoding,
                 });
             }
@@ -914,7 +934,7 @@ impl<S: StorageProvider> Engine<S> {
             );
             self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
             self.return_unmodified_mls_group(&group_id, mls_group);
-            return Ok(IngestOutcome::Stale {
+            return reported(IngestOutcome::Stale {
                 reason: StaleReason::PreMembership,
             });
         }
@@ -946,7 +966,7 @@ impl<S: StorageProvider> Engine<S> {
         let evidence_for_a_contested_pass =
             msg_content_type == ContentType::Application && sweep.has_branch_contexts();
         if recovered_from_candidate_branch || evidence_for_a_contested_pass {
-            return self.buffer_openmls_message_into_convergence(
+            return reported(self.buffer_openmls_message_into_convergence(
                 group_id,
                 &openmls_msg,
                 msg,
@@ -960,7 +980,7 @@ impl<S: StorageProvider> Engine<S> {
                     },
                     drain: sweep.drain_policy(),
                 },
-            );
+            )?);
         }
 
         // Set when convergence admission is refused ONLY because the
@@ -1003,7 +1023,7 @@ impl<S: StorageProvider> Engine<S> {
             false
         };
         if commit_should_enter_convergence {
-            return self.buffer_openmls_message_into_convergence(
+            return reported(self.buffer_openmls_message_into_convergence(
                 group_id,
                 &openmls_msg,
                 msg,
@@ -1013,10 +1033,10 @@ impl<S: StorageProvider> Engine<S> {
                     wrapper_retirement_reason: "buffered_into_convergence",
                     drain: sweep.drain_policy(),
                 },
-            );
+            )?);
         }
         if msg_content_type == ContentType::Application && msg_epoch > current_epoch {
-            return self.buffer_openmls_message_into_convergence(
+            return reported(self.buffer_openmls_message_into_convergence(
                 group_id,
                 &openmls_msg,
                 msg,
@@ -1026,7 +1046,7 @@ impl<S: StorageProvider> Engine<S> {
                     wrapper_retirement_reason: "buffered_into_convergence",
                     drain: sweep.drain_policy(),
                 },
-            );
+            )?);
         }
 
         // The retained row, exact wrapper identity, and the secret-tree
@@ -1067,7 +1087,7 @@ impl<S: StorageProvider> Engine<S> {
                 };
                 self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                 self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
-                return Ok(IngestOutcome::Stale {
+                return reported(IngestOutcome::Stale {
                     reason: if pre_membership {
                         StaleReason::PreMembership
                     } else {
@@ -1098,12 +1118,13 @@ impl<S: StorageProvider> Engine<S> {
                             "fork_rival_missing_retained_anchor",
                         )?;
                     }
-                    return self
-                        .unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current);
+                    return reported(
+                        self.unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current)?,
+                    );
                 }
 
                 self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                return Ok(IngestOutcome::Stale {
+                return reported(IngestOutcome::Stale {
                     reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
                 });
             }
@@ -1119,7 +1140,7 @@ impl<S: StorageProvider> Engine<S> {
                 // OpenMLS signal itself.
                 self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                 self.realize_self_eviction(&group_id, current_epoch)?;
-                return Ok(IngestOutcome::LocalState {
+                return reported(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,
                 });
             }
@@ -1134,7 +1155,7 @@ impl<S: StorageProvider> Engine<S> {
                     let result = self
                         .converge_stored_openmls_messages(&group_id)
                         .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
-                    return Ok(convergence_ingest_outcome(
+                    return reported(convergence_ingest_outcome(
                         &result,
                         msg,
                         group_id,
@@ -1144,12 +1165,12 @@ impl<S: StorageProvider> Engine<S> {
                 if let Some(category) =
                     crate::app_components::classify_process_message_rejection(&e, msg_content_type)
                 {
-                    return self.terminalize_rejected_proposal(
+                    return reported(self.terminalize_rejected_proposal(
                         &group_id,
                         &msg.id,
                         Some(&raw_msg_id),
                         category,
-                    );
+                    )?);
                 }
                 self.update_stored_message_state(&msg.id, MessageState::Retryable)?;
                 return Err(EngineError::Backend(format!("process_message: {e:?}")));
@@ -1186,7 +1207,7 @@ impl<S: StorageProvider> Engine<S> {
                         &raw_msg_id,
                         "unattributable_sender",
                     )?;
-                    return Ok(IngestOutcome::Ignored {
+                    return reported(IngestOutcome::Ignored {
                         category: InputRejectionCategory::InvalidSignature,
                     });
                 };
@@ -1207,7 +1228,7 @@ impl<S: StorageProvider> Engine<S> {
                                 &raw_msg_id,
                                 "invalid_app_payload",
                             )?;
-                            return Ok(IngestOutcome::Ignored {
+                            return reported(IngestOutcome::Ignored {
                                 category: InputRejectionCategory::InvalidEncoding,
                             });
                         }
@@ -1263,7 +1284,7 @@ impl<S: StorageProvider> Engine<S> {
                 // before the durable lookup.
                 self.seen_message_ids.insert(msg.id.clone());
                 self.return_mls_group(&group_id, mls_group);
-                Ok(IngestOutcome::Processed)
+                reported(IngestOutcome::Processed)
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 let before = EpochId(mls_group.epoch().as_u64());
@@ -1272,24 +1293,26 @@ impl<S: StorageProvider> Engine<S> {
                     staged.add_proposals().next().is_some(),
                 ) {
                     return match error {
-                        EngineError::InvalidTransition(_) => self.terminalize_rejected_proposal(
-                            &group_id,
-                            &msg.id,
-                            Some(&raw_msg_id),
-                            ProposalRejectionCategory::UnsupportedProposal,
-                        ),
+                        EngineError::InvalidTransition(_) => {
+                            reported(self.terminalize_rejected_proposal(
+                                &group_id,
+                                &msg.id,
+                                Some(&raw_msg_id),
+                                ProposalRejectionCategory::UnsupportedProposal,
+                            )?)
+                        }
                         error => Err(error),
                     };
                 }
                 if let Err(rejection) =
                     crate::app_components::authorize_staged_commit_proposals(&mls_group, &staged)
                 {
-                    return self.terminalize_rejected_proposal(
+                    return reported(self.terminalize_rejected_proposal(
                         &group_id,
                         &msg.id,
                         Some(&raw_msg_id),
                         rejection.category,
-                    );
+                    )?);
                 }
                 if let Err(err) = crate::app_components::require_admin_for_staged_commit(
                     &mls_group,
@@ -1379,7 +1402,7 @@ impl<S: StorageProvider> Engine<S> {
                     let result = self
                         .converge_stored_openmls_messages(&group_id)
                         .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
-                    return Ok(convergence_ingest_outcome(
+                    return reported(convergence_ingest_outcome(
                         &result,
                         msg,
                         group_id,
@@ -1636,7 +1659,7 @@ impl<S: StorageProvider> Engine<S> {
                 // caught before the durable lookup.
                 self.seen_message_ids.insert(msg.id.clone());
                 self.return_mls_group(&group_id, mls_group);
-                Ok(IngestOutcome::Processed)
+                reported(IngestOutcome::Processed)
             }
             ProcessedMessageContent::ProposalMessage(queued) => {
                 if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
@@ -1644,24 +1667,26 @@ impl<S: StorageProvider> Engine<S> {
                     matches!(queued.proposal(), Proposal::Add(_)),
                 ) {
                     return match error {
-                        EngineError::InvalidTransition(_) => self.terminalize_rejected_proposal(
-                            &group_id,
-                            &msg.id,
-                            Some(&raw_msg_id),
-                            ProposalRejectionCategory::UnsupportedProposal,
-                        ),
+                        EngineError::InvalidTransition(_) => {
+                            reported(self.terminalize_rejected_proposal(
+                                &group_id,
+                                &msg.id,
+                                Some(&raw_msg_id),
+                                ProposalRejectionCategory::UnsupportedProposal,
+                            )?)
+                        }
                         error => Err(error),
                     };
                 }
                 if let Err(rejection) =
                     crate::app_components::authorize_standalone_proposal(&mls_group, &queued)
                 {
-                    return self.terminalize_rejected_proposal(
+                    return reported(self.terminalize_rejected_proposal(
                         &group_id,
                         &msg.id,
                         Some(&raw_msg_id),
                         rejection.category,
-                    );
+                    )?);
                 }
                 // Ask the auto-committer policy whether we should commit
                 // this proposal. OpenMLS does not auto-enqueue processed
@@ -1695,15 +1720,16 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 self.return_mls_group(&group_id, mls_group);
                 self.valid_proposal_groups.insert(group_id);
-                Ok(IngestOutcome::Processed)
+                reported(IngestOutcome::Processed)
             }
-            ProcessedMessageContent::ExternalJoinProposalMessage(_) => self
-                .terminalize_rejected_proposal(
+            ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                reported(self.terminalize_rejected_proposal(
                     &group_id,
                     &msg.id,
                     Some(&raw_msg_id),
                     ProposalRejectionCategory::UnsupportedProposal,
-                ),
+                )?)
+            }
             ProcessedMessageContent::OwnPendingCommit
             | ProcessedMessageContent::OwnPrivateMessage => {
                 // This normally returns through the durable sent-content
@@ -1714,7 +1740,7 @@ impl<S: StorageProvider> Engine<S> {
                 self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                 self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, "own_echo")?;
                 self.seen_message_ids.insert(msg.id.clone());
-                Ok(IngestOutcome::Ignored {
+                reported(IngestOutcome::Ignored {
                     category: InputRejectionCategory::OwnEcho,
                 })
             }

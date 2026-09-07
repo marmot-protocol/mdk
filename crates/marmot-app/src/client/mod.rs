@@ -402,6 +402,13 @@ pub struct AppClient {
     pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Release consumption durably armed recovery, but loading its intents
+    /// failed. Retry on this client even though the journal is already empty;
+    /// account open independently restores these intents after a restart.
+    pub(crate) released_backfill_reload_pending: bool,
+    /// One-shot storage-read failure after durable release consumption.
+    #[cfg(test)]
+    pub(crate) fail_next_released_backfill_reload: bool,
     /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
     /// when a replay failure must not overwrite a newer arm minted in flight.
     pub(crate) queued_epoch_backfills:

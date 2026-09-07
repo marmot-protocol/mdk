@@ -3,7 +3,11 @@
 ## Large offline catch-up regression
 
 `public_app_1024_message_backlog_recovers_completely` in
-[`tests/app_runtime_journeys.rs`](tests/app_runtime_journeys.rs) is the maintained public regression.
+[`tests/app_runtime_journeys.rs`](tests/app_runtime_journeys.rs) is the original maintained public regression.
+`public_app_1024_message_backlog_with_extra_epochs_recovers_completely` adds two public profile updates while
+the recipient is offline, before the same workload. This variant reproduced retry-budget release followed by
+blocked app redelivery in #1721; it requires the same complete recovery contract. Each run records its extra
+updates in `prelude.json`, alongside the unchanged expanded `backlog-input.json`.
 It requires all 1,024 original payloads exactly once, shared public group state, fresh messages from every member,
 and complete recipient history after restart. Reaching the repair budget is a failure, never success.
 
@@ -19,16 +23,29 @@ This is a public workload companion to the pinned 1,024-message engine input. It
 order; this does **not** reproduce the engine fixture's forced reverse delivery. Initial group creation uses public
 app acknowledgement semantics. Private MLS assertions and simulated relay steps are not presented as app coverage.
 
-The reproduction allows 30 explicit full-history repairs, two seconds between passes, and up to three recipient
-reopens after six unchanged transitions. A 900-second watchdog bounds the whole journey. Success additionally checks
+The reproduction repeats explicit full-history repairs with two seconds between passes, allowing up to three recipient
+reopens after six unchanged transitions. A 900-second watchdog bounds the whole journey; there is no separate pass-count
+cutoff because production time-bounded slices guarantee no minimum message throughput per call. Success additionally checks
 every participant's exact payload multiset, then fresh bidirectional messaging and recipient restart persistence.
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.
 
 The test remains ignored in ordinary crate runs because it is slow. The dedicated **Public app 1024-message
-recovery** job in `.github/workflows/ci.yml` explicitly selects it in release mode without test-policy overrides,
+recovery** job in `.github/workflows/ci.yml` builds once, then selects each journey with `--exact` in its own timed
+step, in release mode without test-policy overrides. The second runs even if the first fails. The job
 uses the same conformance path classifier, and participates in **Required CI**. It uploads source provenance,
 expanded synthetic input and public observations, excluding participant databases and keys. It asserts successful
 recovery, not a particular failure count. A run that skips this job is not recovery evidence.
+
+Set `MDK_BACKLOG_TRACE=1` to include aggregate engine preparation, retry-slice and transport-release diagnostics
+on stderr. The required recovery job enables this to distinguish slow preparation with zero attempts from
+retry progress or resource release. Preparation and per-slice traces use debug level, enabled by this test flag,
+so idle sweeps do not add production INFO traffic. These traces contain counts, durations and fixed outcome labels; participant
+databases and keys remain excluded from uploaded evidence.
+
+Recovery artifacts have fixed filenames: `recovery-progress.json` retains compact counts and the last completed pass,
+and `recovery-checkpoint.json` retains the latest tenth-pass or successful full observation. `terminal.json` captures
+the final observation when available. Files are replaced rather than accumulated across passes. Watchdog failures
+include the active phase, current/last-completed pass, last observed counts and completed restart count.
 
 On September 6, the worker-responsiveness fix passed this unchanged recovery contract twice. Background engine
 advance now shares a 64-row allowance and a cooperative 500-ms budget across sweeps; historical peel contexts
@@ -126,7 +143,7 @@ Run the large regression explicitly:
 MDK_APP_JOURNEY_ARTIFACTS="$PWD/target/app-path-evidence" \
 CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false \
 cargo test --release --locked -p cgka-conformance-simulator --test app_runtime_journeys \
-  public_app_1024_message_backlog_recovers_completely -- --ignored --exact --test-threads=1 --nocapture
+  public_app_1024_message_backlog -- --ignored --test-threads=1 --nocapture
 ```
 
 Release mode without policy-override features is the production-policy verification command. Workspace debug or
@@ -210,18 +227,47 @@ a group-members query hits `AccountWorkerResponseTimedOut` during repair pass 3;
 reported no errors. The 191.60-second run exited as an ordinary test failure; it did not exhaust the full recovery
 budget or reach fresh-message/persistence checks.
 
-**Current large-backlog acceptance status:** passing at `fe395e8c`. The bounded background recovery fix
+**Historical large-backlog acceptance at PR #1711:** passing at `fe395e8c`. The bounded background recovery fix
 resolved this worker timeout. The post-cleanup run passed all seven public journeys (330.50 seconds), including
 all 1,024 original messages, fresh traffic and recipient persistence after restart. The release-policy commands are maintained above; PR #1711 records local artifact provenance. Full GitHub CI
 subsequently passed at `be004e3d`, before the dedicated large public recovery job was introduced; that CI result
 must not be represented as execution of the newly added job.
 
+### Subsequent recovery investigation (2026-09-07)
+
+The dedicated Linux job exposed intermittent failures after that checkpoint. Keep the original 1,024-message
+journey and its extra-epoch companion as required regressions, including exact message sets, fresh traffic and
+reopen persistence. A successful earlier run does not establish that every recovery path is correct.
+
+The investigation separated several causes:
+
+- Released raw inputs must retire their transport receipts and durably re-arm replay. The SQLCipher release
+  journal bridges that engine/app boundary across failures and reopen; its acknowledgement also retains a
+  retry obligation if loading the newly armed work fails. Historical pre-journal losses require separate repair
+  ([#1724](https://github.com/marmot-protocol/mdk/issues/1724)).
+- Queued outbound work incorrectly selected the four-row foreground preflight from background convergence.
+  Background recovery must retain its 64-row allowance and generation barrier even when an outbound intent is
+  waiting. A deterministic queued-output regression distinguishes this from foreground send latency limits.
+- Slow preparation can consume the cooperative slice budget before an attempt. A bounded minimum-progress
+  regression covers that case. However, the instrumented Linux plateau had fast preparation and repeated
+  four-row slices; it is not evidence that slow preparation caused that plateau.
+- A chat send can publish older queued work in the same engine pass. The harness must correlate its own
+  message through the public timeline's transport identity, rather than count every relay publication in the
+  interval. Unrelated publications remain on the relay and are excluded only from that action's fault selectors.
+
+Repeated effect observation refreshes local `received_at`; projection replay tests compare stable identities,
+insertion order and all other message fields across that timestamp change. The large-recovery journeys have not
+reproduced a native SQLCipher crash. A separate concurrent storage-close test exited with SIGSEGV after a failed
+assertion in Linux CI; without a native trace, its origin is unproven. Keep that evidence separate from ordinary
+recovery assertion failures and worker response timeouts.
+
 
 ## Recovery implementation boundaries
 
 The durable deferred-generation barrier covers uncontested catch-up as well as competing branches: all admitted
-raw rows must try the current context before recovered commits can prune it. Background host calls share 64 rows
-and a cooperative 500-ms deadline; explicit-time engine calls share the row bound without consulting elapsed real
+raw rows must try the current context before recovered commits can prune it. Each background recovery slice shares
+64 rows and a cooperative 500-ms deadline; queued-intent foreground preflights retain their separate budgets.
+Explicit-time engine calls share the recovery row bound without consulting elapsed real
 time. Partial work survives cancellation and restart. Historical peel contexts are materialized once per sweep,
 and live storage is restored before awaiting the peeler; secret retention policy is unchanged.
 

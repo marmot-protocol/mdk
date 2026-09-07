@@ -633,6 +633,54 @@ impl AppClient {
         }
     }
 
+    /// Repair durable release evidence independently of lossy engine effects.
+    pub(crate) fn reconcile_released_transport_receipts(
+        &mut self,
+    ) -> Result<Vec<String>, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let released = storage.consume_released_transport_receipts()?;
+        self.released_backfill_reload_pending |= !released.is_empty();
+        if !self.released_backfill_reload_pending {
+            return Ok(Vec::new());
+        }
+        let released = released
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<HashSet<_>>();
+        // No await or fallible operation between acknowledging the durable
+        // journal and removing its ids from memory. Never checkpoint stale ids
+        // back over the transactional deletion, including unsaved ring entries.
+        let unsaved_start = self
+            .state
+            .seen_events
+            .len()
+            .saturating_sub(self.pending_seen_event_count);
+        self.pending_seen_event_count = self.state.seen_events[unsaved_start..]
+            .iter()
+            .filter(|id| !released.contains(*id))
+            .count();
+        self.seen_events_index.retain(|id| !released.contains(id));
+        self.state.seen_events.retain(|id| !released.contains(id));
+        if !released.is_empty() {
+            tracing::info!(
+                target: "marmot_app::relay_plane",
+                method = "reconcile_released_transport_receipts",
+                released_count = released.len(),
+                "retired released transport receipt claims and restored replay eligibility"
+            );
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_released_backfill_reload) {
+            return Err(cgka_traits::storage::StorageError::Busy(
+                "injected released backfill intent read failure".into(),
+            )
+            .into());
+        }
+        self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
+        self.released_backfill_reload_pending = false;
+        Ok(released.into_iter().collect())
+    }
+
     /// Apply the publish gate to `effects`, observing the same batch's
     /// epoch-gap recovery evidence first.
     ///
@@ -658,6 +706,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
+        self.reconcile_released_transport_receipts()?;
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
@@ -721,7 +770,8 @@ impl AppClient {
     /// Each route reconciles against the exact event-id set retained in this
     /// account's SQLCipher database, so traffic in one busy group cannot move
     /// or evict another route's completeness state.
-    async fn reconcile_transport_history(&self, reconcile_until: u64) -> Result<(), AppError> {
+    async fn reconcile_transport_history(&mut self, reconcile_until: u64) -> Result<(), AppError> {
+        self.reconcile_released_transport_receipts()?;
         let storage = self.app.account_storage(&self.state.label)?;
         let routing = self.routing.snapshot();
         let mut work = Vec::with_capacity(routing.group_routes.len().saturating_add(1));
@@ -1113,6 +1163,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        self.reconcile_released_transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
@@ -1455,6 +1506,7 @@ impl AppClient {
                     ));
                 }
             };
+            self.reconcile_released_transport_receipts()?;
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
@@ -1949,6 +2001,18 @@ impl AppClient {
             // Any delivery proves the stream is alive, including one this drain
             // goes on to skip as an echo or a duplicate.
             silence_started = std::time::Instant::now();
+            if let Err(error) = self.reconcile_released_transport_receipts() {
+                return Err(self
+                    .finish_failed_sync_drain(
+                        summary,
+                        routes_dirty,
+                        counts.clone(),
+                        StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                        drain_started,
+                        cursor_before_secs,
+                    )
+                    .await);
+            }
             let event_id = hex::encode(delivery.message.id.as_slice());
             if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index)
                 || self.seen_events_index.contains(&event_id)
@@ -2242,9 +2306,12 @@ impl AppClient {
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
             transport_reconciliation_record(self.adapter.account_id(), &delivery);
+        self.reconcile_released_transport_receipts()?;
         let effects = self.runtime.ingest_delivery(delivery).await?;
+        let released = self.reconcile_released_transport_receipts()?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
-        let must_stay_fetchable = effects.left_object_unpersisted;
+        let must_stay_fetchable =
+            effects.left_object_unpersisted || released.contains(&source_message_id_hex);
         if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
             self.record_transport_reconciliation_item(route, item);
         }
@@ -2527,6 +2594,9 @@ impl AppClient {
             });
     }
 
+    /// Merge durable arms into their existing retry owners. Counters describe
+    /// account-wide replay attempts, so new groups get a fresh queued intent
+    /// instead of inheriting another run's EOSE failures or resetting that run.
     pub(crate) fn restore_persisted_epoch_backfill_intents(
         &mut self,
         intents: Vec<storage_sqlite::StoredEpochBackfillIntent>,
@@ -2538,12 +2608,29 @@ impl AppClient {
                 malformed = malformed.saturating_add(1);
                 continue;
             };
-            pending.groups.insert(
-                cgka_traits::GroupId::new(group_id),
-                PendingEpochBackfillGroup {
-                    stalled_epoch: intent.stalled_epoch,
-                },
-            );
+            let group_id = cgka_traits::GroupId::new(group_id);
+            if let Some(existing) = self
+                .pending_epoch_backfill
+                .iter_mut()
+                .chain(self.queued_epoch_backfills.iter_mut())
+                .filter_map(|owner| owner.groups.get_mut(&group_id))
+                .max_by_key(|group| group.stalled_epoch)
+            {
+                // Epoch progress continues the existing recovery run. Its
+                // backoff is capped, and a novel-progress drain resets pacing;
+                // repeated journal loads must not buy a fresh retry ordinal.
+                existing.stalled_epoch = existing.stalled_epoch.max(intent.stalled_epoch);
+            } else {
+                pending
+                    .groups
+                    .entry(group_id)
+                    .and_modify(|group| {
+                        group.stalled_epoch = group.stalled_epoch.max(intent.stalled_epoch)
+                    })
+                    .or_insert(PendingEpochBackfillGroup {
+                        stalled_epoch: intent.stalled_epoch,
+                    });
+            }
         }
         if malformed > 0 {
             tracing::warn!(
@@ -2554,7 +2641,11 @@ impl AppClient {
             );
         }
         if !pending.groups.is_empty() {
-            self.pending_epoch_backfill = Some(pending);
+            if self.pending_epoch_backfill.is_none() && self.queued_epoch_backfills.is_empty() {
+                self.pending_epoch_backfill = Some(pending);
+            } else {
+                self.queued_epoch_backfills.push_back(pending);
+            }
         }
     }
 
@@ -2860,9 +2951,21 @@ impl AppClient {
     }
 
     fn clear_epoch_backfill_intent(&self, pending: &PendingEpochBackfill) -> Result<(), AppError> {
+        let mut completed = pending.clone();
+        // A release during this execution can rearm the same group at the same
+        // epoch. Epoch equality alone cannot distinguish the new durable intent
+        // from the one this execution served. Leave cleanup to its next owner,
+        // including work rotated into the queue, so restart cannot lose it.
+        completed.groups.retain(|group_id, _| {
+            !self
+                .pending_epoch_backfill
+                .iter()
+                .chain(self.queued_epoch_backfills.iter())
+                .any(|next| next.groups.contains_key(group_id))
+        });
         self.app.clear_epoch_backfill_intents(
             &self.state.label,
-            &Self::stored_epoch_backfill_intents(pending),
+            &Self::stored_epoch_backfill_intents(&completed),
         )
     }
 
@@ -3876,6 +3979,7 @@ impl AppClient {
         &mut self,
         created_group_id_hex: Option<&str>,
     ) -> Result<Option<crate::ChatListRow>, AppError> {
+        self.reconcile_released_transport_receipts()?;
         let frontiers_to_clear = self
             .pending_local_group_deletion_frontier_clears
             .iter()
@@ -4925,7 +5029,15 @@ mod tests {
             .observe_drained_session_events(&effects)
             .await
             .unwrap();
-        assert_eq!(app.messages("alice").unwrap(), messages);
+        let replayed = app.messages("alice").unwrap();
+        assert_eq!(replayed.len(), messages.len());
+        for (actual, mut expected) in replayed.into_iter().zip(messages) {
+            // Re-observation stamps a fresh local receipt time. Stable message
+            // identity, insertion order and contents must survive replay even
+            // when it crosses a wall-clock second boundary.
+            expected.received_at = actual.received_at;
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test]
@@ -4950,6 +5062,357 @@ mod tests {
             crate::client::epoch_stall::PendingEpochBackfillGroup { stalled_epoch },
         );
         pending
+    }
+
+    #[tokio::test]
+    async fn released_receipts_preserve_only_the_surviving_unsaved_tail() {
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
+
+        for (pending_count, released_indices, expected_count) in [
+            (3, vec![0, 3], 2),
+            (0, vec![0], 0),
+            (2, vec![3, 4], 0),
+            (5, vec![0, 3], 3),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let mut client = app.client("alice").await.unwrap();
+            let group = client.create_group("seen tail", &[]).await.unwrap();
+            let storage = app.account_storage("alice").unwrap();
+            let ids = (0..5)
+                .map(|i| MessageId::new(vec![i; 32]))
+                .collect::<Vec<_>>();
+            let ring = ids
+                .iter()
+                .map(|id| hex::encode(id.as_slice()))
+                .collect::<Vec<_>>();
+            client.state.seen_events = ring.clone();
+            client.seen_events_index = ring.iter().cloned().collect();
+            client.pending_seen_event_count = pending_count;
+            let expected_tail = ring[5 - pending_count..]
+                .iter()
+                .filter(|id| !released_indices.iter().any(|index| **id == ring[*index]))
+                .cloned()
+                .collect::<Vec<_>>();
+            for index in &released_indices {
+                let raw = MessageRecord {
+                    id: ids[*index].clone(),
+                    group_id: group.clone(),
+                    epoch: EpochId(0),
+                    state: MessageState::PeelDeferred,
+                    payload: Vec::new(),
+                    deferred_peel: None,
+                };
+                storage.put_message(&raw).unwrap();
+                storage.release_message_for_replay(&raw).unwrap();
+            }
+            client.reconcile_released_transport_receipts().unwrap();
+            assert_eq!(client.pending_seen_event_count, expected_count);
+            let start = client.state.seen_events.len() - client.pending_seen_event_count;
+            assert_eq!(client.state.seen_events[start..], expected_tail);
+            assert_eq!(client.seen_events_index.len(), 5 - released_indices.len());
+        }
+    }
+
+    fn assert_backfill_retry_state_unchanged(
+        actual: &PendingEpochBackfill,
+        before: &PendingEpochBackfill,
+    ) {
+        assert_eq!(actual.attempt_id, before.attempt_id);
+        assert_eq!(actual.execution_attempts, before.execution_attempts);
+        assert_eq!(
+            actual.eose_unconfirmed_attempts,
+            before.eose_unconfirmed_attempts
+        );
+        assert_eq!(actual.no_progress_attempts, before.no_progress_attempts);
+        assert_eq!(actual.last_deferred_audit, before.last_deferred_audit);
+    }
+
+    #[tokio::test]
+    async fn released_backfill_restore_preserves_owned_retry_progress_and_merges_new_work() {
+        use cgka_traits::GroupId;
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let primary_group = GroupId::new(vec![1]);
+        let queued_group = GroupId::new(vec![2]);
+        let memory_only_group = GroupId::new(vec![3]);
+        let new_group = GroupId::new(vec![4]);
+        let mut primary = armed_backfill(&primary_group, 5);
+        primary
+            .groups
+            .extend(armed_backfill(&memory_only_group, 8).groups);
+        primary.execution_attempts = 7;
+        primary.eose_unconfirmed_attempts = 3;
+        primary.no_progress_attempts = 2;
+        primary.last_deferred_audit =
+            Some(crate::client::epoch_stall::EpochBackfillDeferredSnapshot {
+                reason: marmot_forensics::EpochBackfillDeferredReason::GroupEpochUnavailable,
+                retry_ordinal: 7,
+                group_epochs: vec![(primary_group.clone(), Some(5))],
+            });
+        let mut queued = armed_backfill(&queued_group, 7);
+        queued.execution_attempts = 4;
+        queued.eose_unconfirmed_attempts = 2;
+        queued.no_progress_attempts = 1;
+        client.pending_epoch_backfill = Some(primary.clone());
+        client.queued_epoch_backfills.push_back(queued.clone());
+        let paced_until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        client.epoch_backfill_retry_not_before = Some(paced_until);
+        let intent = |group: &GroupId, stalled_epoch| storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group.as_slice()),
+            stalled_epoch,
+        };
+        client.restore_persisted_epoch_backfill_intents(vec![
+            intent(&primary_group, 5),
+            intent(&queued_group, 7),
+            intent(&new_group, 3),
+        ]);
+        assert_backfill_retry_state_unchanged(
+            client.pending_epoch_backfill.as_ref().unwrap(),
+            &primary,
+        );
+        assert!(
+            client
+                .pending_epoch_backfill
+                .as_ref()
+                .unwrap()
+                .groups
+                .contains_key(&memory_only_group)
+        );
+        assert_eq!(client.queued_epoch_backfills.len(), 2);
+        assert_backfill_retry_state_unchanged(&client.queued_epoch_backfills[0], &queued);
+        let fresh = client.queued_epoch_backfills[1].clone();
+        assert_eq!(fresh.groups.len(), 1);
+        assert_eq!(fresh.groups[&new_group].stalled_epoch, 3);
+        assert_eq!(
+            (
+                fresh.execution_attempts,
+                fresh.eose_unconfirmed_attempts,
+                fresh.no_progress_attempts
+            ),
+            (0, 0, 0)
+        );
+
+        // Same/older markers cannot reset a live run; a later epoch updates its
+        // existing owner, without duplicating queued groups or changing pacing.
+        client.restore_persisted_epoch_backfill_intents(vec![
+            intent(&primary_group, 4),
+            intent(&queued_group, 9),
+            intent(&new_group, 2),
+        ]);
+        assert_eq!(
+            client.pending_epoch_backfill.as_ref().unwrap().groups[&primary_group].stalled_epoch,
+            5
+        );
+        assert_eq!(
+            client.queued_epoch_backfills[0].groups[&queued_group].stalled_epoch,
+            9
+        );
+        assert_eq!(client.queued_epoch_backfills.len(), 2);
+        assert_backfill_retry_state_unchanged(
+            client.pending_epoch_backfill.as_ref().unwrap(),
+            &primary,
+        );
+        assert_backfill_retry_state_unchanged(&client.queued_epoch_backfills[0], &queued);
+        assert_backfill_retry_state_unchanged(&client.queued_epoch_backfills[1], &fresh);
+        assert_eq!(client.epoch_backfill_retry_not_before, Some(paced_until));
+        client.pending_epoch_backfill = None;
+        client.restore_persisted_epoch_backfill_intents(vec![intent(&queued_group, 9)]);
+        assert!(
+            client.pending_epoch_backfill.is_none(),
+            "queued ownership must not be duplicated"
+        );
+        assert_eq!(client.queued_epoch_backfills.len(), 2);
+        let later_group = GroupId::new(vec![5]);
+        client.restore_persisted_epoch_backfill_intents(vec![intent(&later_group, 1)]);
+        assert!(
+            client.pending_epoch_backfill.is_none(),
+            "new work must not jump ahead of queued owners"
+        );
+        assert_eq!(client.queued_epoch_backfills.len(), 3);
+        assert_backfill_retry_state_unchanged(&client.queued_epoch_backfills[0], &queued);
+        assert!(
+            client.queued_epoch_backfills[2]
+                .groups
+                .contains_key(&later_group)
+        );
+    }
+
+    #[tokio::test]
+    async fn released_backfill_reload_retries_after_consumption_without_reopen() {
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("reload failure", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let raw = MessageRecord {
+            id: MessageId::new(vec![0xfd; 32]),
+            group_id: group.clone(),
+            epoch: EpochId(client.group_mls_state(&group).unwrap().epoch),
+            state: MessageState::PeelDeferred,
+            payload: Vec::new(),
+            deferred_peel: None,
+        };
+        let id_hex = hex::encode(raw.id.as_slice());
+        client.seen_events_index.insert(id_hex.clone());
+        client.state.seen_events.push(id_hex.clone());
+        storage.put_message(&raw).unwrap();
+        storage.release_message_for_replay(&raw).unwrap();
+        client.fail_next_released_backfill_reload = true;
+        assert!(matches!(
+            client.reconcile_released_transport_receipts(),
+            Err(crate::AppError::Storage(
+                cgka_traits::storage::StorageError::Busy(_)
+            ))
+        ));
+        assert!(client.released_backfill_reload_pending);
+        assert!(!client.seen_events_index.contains(&id_hex));
+        assert!(!client.state.seen_events.contains(&id_hex));
+        assert!(
+            storage
+                .consume_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
+        assert!(!client.has_pending_epoch_backfill());
+
+        // No new release and no reopen: the same client must retry the read
+        // after acknowledgment has already emptied the durable journal.
+        assert!(
+            client
+                .reconcile_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(client.has_pending_epoch_backfill());
+        assert!(!client.released_backfill_reload_pending);
+        let pending = client.pending_epoch_backfill.as_ref().unwrap();
+        assert_eq!(pending.groups[&group].stalled_epoch, raw.epoch.0);
+
+        // Successful reload disarms the flag: steady-state empty reconciles
+        // must not pay for a full pending-intent read on every delivery.
+        client.fail_next_released_backfill_reload = true;
+        assert!(
+            client
+                .reconcile_released_transport_receipts()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(client.fail_next_released_backfill_reload);
+    }
+
+    #[tokio::test]
+    async fn older_backfill_completion_preserves_released_intent_across_reopen() {
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
+        use marmot_forensics::EpochBackfillExecutionSeam;
+
+        for (queued, epoch_increment) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+                .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+            let mut client = app.client("alice").await.unwrap();
+            let group = client
+                .create_group("release during replay", &[])
+                .await
+                .unwrap();
+            let epoch = client.group_mls_state(&group).unwrap().epoch;
+            let old = armed_backfill(&group, epoch);
+            client.persist_epoch_backfill_intent(&old).unwrap();
+            client.pending_epoch_backfill = Some(old);
+            let execution = client
+                .begin_epoch_backfill_execution(EpochBackfillExecutionSeam::ExplicitCatchUp)
+                .unwrap();
+            assert!(!client.has_pending_epoch_backfill());
+
+            // Engine release occurs during the old replay's final drain. Its
+            // journal is consumed before EOSE completion clears old work.
+            let storage = app.account_storage("alice").unwrap();
+            let raw = MessageRecord {
+                id: MessageId::new(vec![0xfe; 32]),
+                group_id: group.clone(),
+                epoch: EpochId(epoch + epoch_increment),
+                state: MessageState::PeelDeferred,
+                payload: Vec::new(),
+                deferred_peel: None,
+            };
+            storage.put_message(&raw).unwrap();
+            storage.release_message_for_replay(&raw).unwrap();
+            client.reconcile_released_transport_receipts().unwrap();
+            if queued {
+                let pending = client.pending_epoch_backfill.take().unwrap();
+                client.queued_epoch_backfills.push_back(pending);
+            }
+            client
+                .clear_epoch_backfill_intent(&execution.pending)
+                .unwrap();
+            assert_eq!(
+                storage.pending_epoch_backfill_intents().unwrap().len(),
+                1,
+                "old completion consumed a rearmed intent: queued={queued}, epoch_increment={epoch_increment}"
+            );
+            drop(client); // Crash boundary: no later attempt has persisted again.
+            let mut reopened = app.client("alice").await.unwrap();
+            assert!(reopened.has_pending_epoch_backfill());
+            let next = reopened.take_next_pending_epoch_backfill().unwrap();
+            assert_eq!(next.groups[&group].stalled_epoch, epoch + epoch_increment);
+            reopened.clear_epoch_backfill_intent(&next).unwrap();
+            assert!(
+                storage.pending_epoch_backfill_intents().unwrap().is_empty(),
+                "the final execution must still clean up completed work"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn older_backfill_completion_still_clears_groups_without_new_work() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let primary = client.create_group("primary rearm", &[]).await.unwrap();
+        let queued = client.create_group("queued rearm", &[]).await.unwrap();
+        let finished = client.create_group("finished", &[]).await.unwrap();
+        let mut completed = armed_backfill(&primary, 0);
+        completed.groups.extend(armed_backfill(&queued, 0).groups);
+        completed.groups.extend(armed_backfill(&finished, 0).groups);
+        client.persist_epoch_backfill_intent(&completed).unwrap();
+        client.pending_epoch_backfill = Some(armed_backfill(&primary, 0));
+        client
+            .queued_epoch_backfills
+            .push_back(armed_backfill(&queued, 0));
+        client.clear_epoch_backfill_intent(&completed).unwrap();
+        let remaining = app.pending_epoch_backfill_intents("alice").unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            !remaining
+                .iter()
+                .any(|intent| intent.group_id_hex == hex::encode(finished.as_slice()))
+        );
     }
 
     fn failed_replay_outcome() -> EpochBackfillReplayOutcome {

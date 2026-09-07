@@ -262,25 +262,35 @@ impl AppRuntimeHarness {
         expected_event_ids: &[String],
     ) -> Result<(), SubjectError> {
         self.participant(actor)?;
-        // Scenario commands execute serially. Where the public app API exposes
-        // transport message ids, validate those exact relay events; chat sends
-        // expose only application-event ids, so they retain the bounded count
-        // fallback at this command boundary. Kind-445 outer authors are
-        // intentionally ephemeral and cannot identify the actor.
-        self.relay_control
-            .wait_for_action_events(
-                &mut self.relay_action_events,
-                action_id,
-                before,
-                RelayActionExpectation {
-                    include_welcomes,
-                    expected_publications,
-                    expected_event_ids,
-                    timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
-                },
-            )
-            .await
-            .map_err(relay_control_error)
+        // Maintenance and queued work can publish alongside a serial scenario
+        // command. Complete public transport identities distinguish that work
+        // from the action without relying on ephemeral kind-445 outer authors.
+        let expectation = RelayActionExpectation {
+            include_welcomes,
+            expected_publications,
+            expected_event_ids,
+            timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
+        };
+        let result = if expected_event_ids.len() == expected_publications {
+            self.relay_control
+                .wait_for_exact_action_events(
+                    &mut self.relay_action_events,
+                    action_id,
+                    before,
+                    expectation,
+                )
+                .await
+        } else {
+            self.relay_control
+                .wait_for_action_events(
+                    &mut self.relay_action_events,
+                    action_id,
+                    before,
+                    expectation,
+                )
+                .await
+        };
+        result.map_err(relay_control_error)
     }
 
     async fn set_shared_relay_event_presence(
@@ -1040,13 +1050,46 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 )
                 .await
                 .map_err(app_error)?;
+            // SendSummary names application events. Resolve their published
+            // transport identity through the public timeline projection, which
+            // the send completes before returning. The same engine pass may
+            // also publish an older queued maintenance operation.
+            let mut transport_ids = Vec::new();
+            if summary.published > 0 {
+                for app_event_id in &summary.message_ids {
+                    let transport_id = participant
+                        .runtime()?
+                        .timeline_message(
+                            &participant.account_id,
+                            &hex::encode(group_id.as_slice()),
+                            app_event_id,
+                        )
+                        .map_err(app_error)?
+                        .and_then(|message| message.source_message_id_hex)
+                        .ok_or_else(|| {
+                            SubjectError::classified(
+                                SubjectFailureCategory::Protocol,
+                                "published_message_transport_identity_missing",
+                                "a published chat message has no public transport identity",
+                            )
+                        })?;
+                    transport_ids.push(transport_id);
+                }
+                if transport_ids.len() != summary.published {
+                    return Err(SubjectError::classified(
+                        SubjectFailureCategory::Protocol,
+                        "relay_action_publication_identity_count_mismatch",
+                        "published chat count does not match its public transport identities",
+                    ));
+                }
+            }
             self.record_relay_action_events(
                 action.action_id,
                 action.sender,
                 before,
                 false,
                 summary.published,
-                &[],
+                &transport_ids,
             )
             .await
         }

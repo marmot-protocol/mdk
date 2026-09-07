@@ -2591,3 +2591,39 @@ async fn historical_peel_context_materialization_is_amortized_within_a_sweep() {
         "32 failed peels must materialize the same anchor only once, like one failed peel"
     );
 }
+
+/// A failed opaque sweep must do real decryption work and persist attempts,
+/// without repeating the group-history classification only live ingest reports.
+#[tokio::test]
+async fn opaque_retry_batch_does_not_repeat_live_lineage_classification() {
+    let (mut alice, mut carol, storage, peeler, group_id, _commit2, _commit3) =
+        carol_behind_two_epochs().await;
+    let template = send_app(&mut alice, &group_id, "future opaque batch").await;
+    let classifications_before = carol.engine_metrics().deferred_lineage_classifications;
+    let mut rows = Vec::new();
+    for index in 0..32 {
+        let wrapped = TransportMessage {
+            id: MessageId::new(format!("lineage-scan-{index}").into_bytes()),
+            ..template.clone()
+        };
+        assert!(matches!(
+            carol.ingest(wrapped.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        rows.push((wrapped.id.clone(), peeler.attempts_for(&wrapped.id)));
+    }
+    let classifications = carol.engine_metrics().deferred_lineage_classifications;
+    assert_eq!(classifications - classifications_before, 32);
+    assert_eq!(carol.retry_deferred_peels(&group_id).await.unwrap(), 0);
+    for (id, attempts) in rows {
+        assert!(peeler.attempts_for(&id) > attempts, "each row was retried");
+        let retained = storage.get_message(&id).unwrap();
+        assert_eq!(retained.state, MessageState::PeelDeferred);
+        assert_eq!(retained.deferred_peel.unwrap().distinct_context_attempts, 1);
+    }
+    assert_eq!(
+        carol.engine_metrics().deferred_lineage_classifications,
+        classifications,
+        "the sweep must not rescan the stored graph for each discarded lineage"
+    );
+}

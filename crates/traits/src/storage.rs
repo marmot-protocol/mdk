@@ -17,7 +17,7 @@ use crate::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
     MaintenanceObligation, PeriodicMaintenancePolicy,
 };
-use crate::message::{MessageRecord, MessageState};
+use crate::message::{DeferredMessageMetadata, MessageRecord, MessageState};
 use crate::transport_adapter::OutboundFanout;
 use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
@@ -210,6 +210,15 @@ pub trait MessageStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()>;
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord>;
     fn delete_message(&self, id: &MessageId) -> StorageResult<()>;
+
+    /// Release retained transport bytes without a terminal deduplication verdict.
+    /// Backends with host receipt bookkeeping must atomically retain evidence
+    /// that those receipts are obsolete, so losing the engine event cannot
+    /// prevent exact-id redelivery. Backends without such bookkeeping may delete.
+    fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
+        self.delete_message(&record.id)
+    }
+
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()>;
     fn list_messages(
         &self,
@@ -250,6 +259,21 @@ pub trait MessageStorage {
             .list_messages(group_id, at_or_after_epoch)?
             .into_iter()
             .filter(|record| states.contains(&record.state))
+            .collect())
+    }
+
+    /// Deferred rows in the same stable order as `list_messages_in_states`,
+    /// without copying payload bytes when the backend supports separate metadata.
+    /// This is a complete metadata enumeration: callers must still discover work
+    /// behind an already-attempted prefix. Legacy backends may use the fallback.
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DeferredMessageMetadata>> {
+        Ok(self
+            .list_messages_in_states(group_id, &[MessageState::PeelDeferred], EpochId(0))?
+            .into_iter()
+            .map(DeferredMessageMetadata::from)
             .collect())
     }
 

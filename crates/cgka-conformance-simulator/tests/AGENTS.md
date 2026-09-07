@@ -17,7 +17,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
     capability preflight, interaction coverage, and explicit real-socket strict oracle canaries.
 
 - **File:** `app_runtime_journeys.rs`
-  - **Owns:** Basic public app acceptance journeys and the explicit slow 1,024-message public catch-up gate,
+  - **Owns:** Basic public app acceptance journeys and the explicit slow 1,024-message public catch-up gates,
+    including the extra-epoch released-object replay regression (#1721),
     also selected by the dedicated required public recovery CI job with production policy.
     Real local relay, SQLCipher roots, exact public payload/state checks, post-change messaging, and restart
     persistence. See `../APP_PATH_COVERAGE.md` for replay and evidence commands.

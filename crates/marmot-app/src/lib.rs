@@ -1740,11 +1740,15 @@ impl MarmotApp {
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
+            released_backfill_reload_pending: false,
+            #[cfg(test)]
+            fail_next_released_backfill_reload: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
+        client.reconcile_released_transport_receipts()?;
         let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
         client.restore_persisted_epoch_backfill_intents(persisted_backfills);
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;

@@ -25,10 +25,44 @@ enum Journey {
     Restart,
     Offline,
     LargeBacklog,
+    LargeBacklogExtraEpochs,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct RecoveryProgress {
+    phase: &'static str,
+    pass: Option<usize>,
+    completed_pass: Option<usize>,
+    expected: usize,
+    observed: BTreeMap<String, usize>,
+    restarts: usize,
 }
 
 fn save(out: &Path, name: &str, value: &impl serde::Serialize) -> TestResult {
     fs_private::write_private(&out.join(name), &serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+fn save_recovery_checkpoint(
+    out: &Path,
+    progress: &RecoveryProgress,
+    observations: &impl serde::Serialize,
+    recovered: bool,
+) -> TestResult {
+    save(out, "recovery-progress.json", progress)?;
+    // Keep a bounded checkpoint set even when the watchdog permits hundreds
+    // of passes. The terminal observation is also retained by check().
+    if progress
+        .completed_pass
+        .is_some_and(|pass| pass.is_multiple_of(10))
+        || recovered
+    {
+        save(
+            out,
+            "recovery-checkpoint.json",
+            &json!({ "progress": progress, "complete": recovered, "observations": observations }),
+        )?;
+    }
     Ok(())
 }
 
@@ -98,6 +132,7 @@ async fn exercise(
     clients: &[String],
     journey: Journey,
     out: &Path,
+    recovery_progress: &mut RecoveryProgress,
 ) -> TestResult {
     let founders = if matches!(journey, Journey::Invite) {
         &clients[..2]
@@ -105,7 +140,10 @@ async fn exercise(
         clients
     };
     subject.select_scenario_group("main", true)?;
-    let admins = if matches!(journey, Journey::LargeBacklog) {
+    let admins = if matches!(
+        journey,
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs
+    ) {
         clients
     } else {
         &clients[..1]
@@ -125,8 +163,16 @@ async fn exercise(
     subject
         .await_observable_settlement(founders, SETTLEMENT)
         .await?;
-    if matches!(journey, Journey::LargeBacklog) {
-        return large_backlog(subject, clients, out).await;
+    if matches!(
+        journey,
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs
+    ) {
+        let prelude_updates = if matches!(journey, Journey::LargeBacklogExtraEpochs) {
+            2
+        } else {
+            0
+        };
+        return large_backlog(subject, clients, out, prelude_updates, recovery_progress).await;
     }
 
     let mut expected = founders
@@ -216,7 +262,7 @@ async fn exercise(
             subject.set_online("bob", true).await?;
             subject.repair_full_history(&["bob".into()]).await?;
         }
-        Journey::LargeBacklog => unreachable!(),
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs => unreachable!(),
     }
     expect_timeline(subject, &expected, out, "after-change.json").await?;
     // Every remaining member must both send and receive in the recovered epoch.
@@ -248,7 +294,11 @@ async fn large_backlog(
     subject: &mut AppRuntimeHarness,
     clients: &[String],
     out: &Path,
+    prelude_updates: usize,
+    recovery_progress: &mut RecoveryProgress,
 ) -> TestResult {
+    recovery_progress.phase = "publishing_backlog";
+    recovery_progress.expected = 1024;
     let input = resolve_scenario_input_bytes(&offline_catchup::bytes(1024))?;
     let online = clients
         .iter()
@@ -256,6 +306,30 @@ async fn large_backlog(
         .cloned()
         .collect::<Vec<_>>();
     subject.set_online("bob", false).await?;
+    // Extra legitimate epoch activity can cross the deferred retry boundary;
+    // released raw objects must remain replayable through the public app.
+    let prelude = (0..prelude_updates)
+        .map(|index| format!("recovery-prelude-{index}"))
+        .collect::<Vec<_>>();
+    save(
+        out,
+        "prelude.json",
+        &json!({ "version": 1, "sender": "alice", "profile_names": prelude }),
+    )?;
+    for name in prelude {
+        subject
+            .update_group_data(SubjectUpdateGroupData {
+                action_id: &name,
+                client: "alice",
+                name: Some(&name),
+                description: None,
+                pending: &name,
+            })
+            .await?;
+        subject
+            .await_observable_settlement(&online, SETTLEMENT)
+            .await?;
+    }
     let mut payloads = Vec::new();
     let mut rounds = 0;
     // Deliberate public workload companion, not an adapter override of private IR:
@@ -300,6 +374,7 @@ async fn large_backlog(
         .map(|c| (c.clone(), payloads.clone()))
         .collect::<BTreeMap<_, _>>();
     save(out, "expected.json", &expected)?;
+    recovery_progress.phase = "reconnect";
     subject
         .set_online("bob", true)
         .await
@@ -307,16 +382,22 @@ async fn large_backlog(
     let mut previous = None;
     let mut unchanged = 0;
     let mut restarts = 0;
-    let mut recovered = false;
-    for pass in 0..30 {
+    // Production slices are bounded by elapsed time, so a repair call has no
+    // minimum message throughput. Keep driving within check()'s existing
+    // 900-second watchdog instead of declaring failure after 30 calls.
+    for pass in 0_usize.. {
+        recovery_progress.pass = Some(pass);
+        recovery_progress.phase = "full_history_repair";
         subject
             .repair_full_history(&["bob".into()])
             .await
             .map_err(|error| format!("repair pass {pass}, full-history repair: {error}"))?;
+        recovery_progress.phase = "catch_up";
         subject
             .catch_up(clients)
             .await
             .map_err(|error| format!("repair pass {pass}, catch-up: {error}"))?;
+        recovery_progress.phase = "observations";
         let observations = subject
             .observations(clients)
             .await
@@ -325,15 +406,18 @@ async fn large_backlog(
             .iter()
             .find(|o| o.participant == "bob")
             .ok_or("missing bob")?;
-        recovered = complete(&observations, &expected, clients.len());
-        save(
-            out,
-            &format!("recovery-{pass:02}.json"),
-            &json!({
-                "pass": pass, "complete": recovered, "recovery_restarts": restarts,
-                "expected": 1024, "observations": observations,
-            }),
-        )?;
+        let recovered = complete(&observations, &expected, clients.len());
+        recovery_progress.completed_pass = Some(pass);
+        recovery_progress.observed = observations
+            .iter()
+            .map(|o| {
+                (
+                    o.participant.clone(),
+                    o.application.visible_plaintexts.len(),
+                )
+            })
+            .collect();
+        save_recovery_checkpoint(out, recovery_progress, &observations, recovered)?;
         eprintln!(
             "repair_pass={pass} observed={} expected=1024 complete={recovered}",
             bob.application.visible_plaintexts.len()
@@ -349,18 +433,21 @@ async fn large_backlog(
         };
         if unchanged >= 6 {
             if restarts >= 3 {
-                break;
+                return Err(
+                    "large backlog stopped progressing after three recovery restarts".into(),
+                );
             }
+            recovery_progress.phase = "reopen";
             subject.reopen("bob").await?;
             restarts += 1;
+            recovery_progress.restarts = restarts;
             unchanged = 0;
         }
         previous = Some(progress);
+        recovery_progress.phase = "backoff";
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    if !recovered {
-        return Err("large backlog failed complete public recovery within 30 repair passes".into());
-    }
+    recovery_progress.phase = "post_recovery_messaging";
     for client in clients {
         let payload = format!("post-recovery-{client}");
         send(subject, client, &payload).await?;
@@ -369,12 +456,20 @@ async fn large_backlog(
         }
     }
     expect_timeline(subject, &expected, out, "post-recovery-messaging.json").await?;
+    recovery_progress.phase = "restart_persistence";
     subject.reopen("bob").await?;
     subject.repair_full_history(&["bob".into()]).await?;
     expect_timeline(subject, &expected, out, "after-restart.json").await
 }
 
 async fn check(journey: Journey) {
+    if std::env::var_os("MDK_BACKLOG_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("cgka_engine::message_processor=debug,marmot_app::relay_plane=info")
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let label = format!("{journey:?}").to_lowercase();
     let mut builder = tempfile::Builder::new();
     let prefix = format!("app-journey-{label}-");
@@ -388,12 +483,17 @@ async fn check(journey: Journey) {
     fs_private::create_dir_all_private(artifacts.path()).unwrap();
     let labels: &[&str] = match journey {
         Journey::Invite | Journey::Removal => &["alice", "bob", "carol"],
-        Journey::LargeBacklog => &["alice", "bob", "carol", "david"],
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs => {
+            &["alice", "bob", "carol", "david"]
+        }
         _ => &["alice", "bob"],
     };
     let clients = labels.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
-    let backlog_source =
-        matches!(journey, Journey::LargeBacklog).then(|| offline_catchup::bytes(1024));
+    let backlog_source = matches!(
+        journey,
+        Journey::LargeBacklog | Journey::LargeBacklogExtraEpochs
+    )
+    .then(|| offline_catchup::bytes(1024));
     if let Some(bytes) = &backlog_source {
         fs_private::write_private(&artifacts.path().join("backlog-input.json"), bytes).unwrap();
     }
@@ -412,15 +512,37 @@ async fn check(journey: Journey) {
     let mut subject = AppRuntimeHarness::new(&clients)
         .await
         .expect("public runtime setup");
-    let result = match tokio::time::timeout(
+    let mut recovery_progress = RecoveryProgress {
+        phase: "setup",
+        ..RecoveryProgress::default()
+    };
+    let mut result = match tokio::time::timeout(
         Duration::from_secs(900),
-        exercise(&mut subject, &clients, journey, artifacts.path()),
+        exercise(&mut subject, &clients, journey, artifacts.path(), &mut recovery_progress),
     )
     .await
     {
         Ok(result) => result,
+        Err(_) if backlog_source.is_some() => Err(format!(
+            "public journey exceeded 900-second watchdog; last recovery progress: {recovery_progress:?}"
+        ).into()),
         Err(_) => Err("public journey exceeded 900-second watchdog".into()),
     };
+    if backlog_source.is_some() {
+        if result.is_ok() {
+            recovery_progress.phase = "complete";
+        }
+        if let Err(error) = save(
+            artifacts.path(),
+            "recovery-progress.json",
+            &recovery_progress,
+        ) {
+            result = Err(format!(
+                "saving recovery progress failed: {error}; journey result: {result:?}"
+            )
+            .into());
+        }
+    }
     if let Ok(observations) = subject.observations(&clients).await {
         save(artifacts.path(), "terminal.json", &observations).unwrap();
     }
@@ -453,6 +575,40 @@ async fn check(journey: Journey) {
     assert!(result.is_ok(), "{label}: {}", result.unwrap_err());
 }
 
+#[test]
+fn recovery_checkpoints_bound_artifacts_and_preserve_final_state() {
+    let out = tempfile::tempdir().unwrap();
+    let mut progress = RecoveryProgress {
+        phase: "observations",
+        expected: 1024,
+        ..RecoveryProgress::default()
+    };
+    for pass in 0..=103 {
+        progress.pass = Some(pass);
+        progress.completed_pass = Some(pass);
+        progress.observed.insert("bob".into(), pass);
+        save_recovery_checkpoint(
+            out.path(),
+            &progress,
+            &json!({ "last_pass": pass }),
+            pass == 103,
+        )
+        .unwrap();
+    }
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 2);
+    let checkpoint: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out.path().join("recovery-checkpoint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["progress"]["completed_pass"], 103);
+    assert_eq!(checkpoint["observations"]["last_pass"], 103);
+    assert_eq!(checkpoint["complete"], true);
+    let latest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.path().join("recovery-progress.json")).unwrap())
+            .unwrap();
+    assert_eq!(latest["observed"]["bob"], 103);
+}
+
 macro_rules! journey_test {
     ($name:ident, $journey:ident) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -476,4 +632,10 @@ journey_test!(public_app_06_small_offline_backlog, Offline);
 #[ignore = "explicit slow recovery gate; see APP_PATH_COVERAGE.md"]
 async fn public_app_1024_message_backlog_recovers_completely() {
     check(Journey::LargeBacklog).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "explicit slow recovery gate; covers resource release and replay"]
+async fn public_app_1024_message_backlog_with_extra_epochs_recovers_completely() {
+    check(Journey::LargeBacklogExtraEpochs).await;
 }

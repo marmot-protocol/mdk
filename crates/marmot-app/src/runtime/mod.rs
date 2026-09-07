@@ -232,6 +232,8 @@ pub struct RuntimeSharedServices {
     create_group_catch_up_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
     #[cfg(any(test, feature = "test-policy-overrides"))]
     next_startup_sync_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    next_scheduled_convergence_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
@@ -312,6 +314,8 @@ impl Default for RuntimeSharedServices {
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -340,6 +344,8 @@ impl RuntimeSharedServices {
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -380,6 +386,22 @@ impl RuntimeSharedServices {
     #[cfg(any(test, feature = "test-policy-overrides"))]
     fn take_next_startup_sync_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
         self.next_startup_sync_barrier.lock().unwrap().take()
+    }
+
+    /// Test-only hook: hold the next scheduled convergence pass between two
+    /// rendezvous so public read responsiveness can be checked deterministically.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub fn set_next_scheduled_convergence_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.next_scheduled_convergence_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    fn take_next_scheduled_convergence_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.next_scheduled_convergence_barrier
+            .lock()
+            .unwrap()
+            .take()
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
