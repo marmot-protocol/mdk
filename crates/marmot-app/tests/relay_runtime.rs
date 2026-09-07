@@ -10245,7 +10245,8 @@ async fn create_group_returns_before_blocked_founding_welcome() {
 }
 
 /// mdk#1487: the detailed create response carries the exact durable chat-list
-/// row that subscribers and ordinary queries observe at the response boundary.
+/// row emitted to subscribers at the response boundary. Ordinary queries keep
+/// its content, while projection maintenance may advance `updated_at`.
 #[tokio::test]
 async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
     let dir = tempfile::tempdir().unwrap();
