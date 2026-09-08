@@ -2121,9 +2121,43 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             .any(|member| member.id == carol_id),
         "trusted removal must clear Carol's active membership before re-entry"
     );
+    // A malformed offer and an unhydratable removed group precede the valid
+    // recovery in storage order. Neither may abort the account-wide sweep.
+    use cgka_traits::storage::WelcomeStorage;
+    let owned_offer = carol_storage.take_welcome(&fresh_carol_welcome.id).unwrap();
+    let mut malformed = owned_offer.clone();
+    malformed.message_id = cgka_traits::MessageId::new(vec![0xe1; 32]);
+    malformed.welcome_bytes = vec![0xff];
+    carol_storage.put_welcome(&malformed).unwrap();
+    let mut missing_mls_group = carol_storage.get_group(&group_id).unwrap();
+    missing_mls_group.id = GroupId::new(vec![0xe2; 16]);
+    carol_storage.put_group(&missing_mls_group).unwrap();
+    let mut blocked = owned_offer.clone();
+    blocked.message_id = cgka_traits::MessageId::new(vec![0xe3; 32]);
+    blocked.group_id = missing_mls_group.id.clone();
+    carol_storage.put_welcome(&blocked).unwrap();
+    carol_storage.put_welcome(&owned_offer).unwrap();
+    carol.hydrate_stable_groups_from_storage().unwrap();
     assert!(
         carol.retry_rejoins_after_trusted_removal().await.unwrap(),
-        "owned Welcome must recover without another relay delivery"
+        "owned Welcome must recover past bad candidates without another relay delivery"
+    );
+    let retained_offers = carol_storage.list_welcomes().unwrap();
+    assert!(
+        !retained_offers
+            .iter()
+            .any(|offer| offer.message_id == malformed.message_id),
+        "undecodable bytes must not poison every later maintenance pass"
+    );
+    assert!(
+        retained_offers
+            .iter()
+            .any(|offer| offer.message_id == blocked.message_id),
+        "an unhydratable group's otherwise valid material stays owned for repair"
+    );
+    assert!(
+        !carol.retry_rejoins_after_trusted_removal().await.unwrap(),
+        "an already quarantined group must remain isolated on later sweeps too"
     );
     assert!(matches!(
         carol.join_welcome(fresh_carol_welcome).await,

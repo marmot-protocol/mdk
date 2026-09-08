@@ -37,7 +37,7 @@ const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
 // Three network stages, each with a bounded single-author retry, can each
 // consume a 5s connection budget plus a 3s fetch budget. Keep enough time for
 // those stages and local validation while retaining one overall deadline.
-pub(crate) const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
+const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
 const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
@@ -249,7 +249,11 @@ impl MarmotApp {
         members: &[String],
     ) -> Result<Vec<KeyPackage>, AppError> {
         Ok(self
-            .resolve_member_key_packages_inner(members, MemberResolutionPurpose::Commit, true)
+            .resolve_member_key_packages_for_purpose(
+                members.to_vec(),
+                MemberResolutionPurpose::Commit,
+                true,
+            )
             .await?
             .key_packages)
     }
@@ -270,23 +274,32 @@ impl MarmotApp {
             .iter()
             .map(|member_ref| (*member_ref).to_owned())
             .collect::<Vec<_>>();
-        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Prewarm)
-            .await
-            .map(|resolved| resolved.stats.into())
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Prewarm,
+            false,
+        )
+        .await
+        .map(|resolved| resolved.stats.into())
     }
 
     pub(crate) async fn resolve_member_key_packages_with_stats(
         &self,
         member_refs: Vec<String>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
-        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Commit)
-            .await
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Commit,
+            false,
+        )
+        .await
     }
 
     async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
+        fresh: bool,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
@@ -295,7 +308,7 @@ impl MarmotApp {
         );
         let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose, false),
+            self.resolve_member_key_packages_inner(&member_refs, purpose, fresh),
         )
         .await
         {

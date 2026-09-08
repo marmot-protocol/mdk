@@ -842,22 +842,46 @@ impl<S: StorageProvider> Engine<S> {
             if candidate.rejoin.is_none() {
                 continue;
             }
-            let Some(group) = self.stored_group_record(&candidate.group_id)? else {
-                continue;
+            let group = match self.stored_group_record(&candidate.group_id) {
+                Ok(Some(group)) => group,
+                Ok(None) => continue,
+                Err(_) => {
+                    tracing::debug!(target: "cgka_engine::group_lifecycle",
+                        method = "retry_rejoins_after_trusted_removal", "skipping an unreadable group");
+                    continue;
+                }
             };
             if (!group.removed && !group.unrecoverable) || group.disbanded.is_some() {
                 continue;
             }
-            self.ensure_hydrated(&candidate.group_id)?;
-            let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
-                .map_err(|error| EngineError::Serialize(error.to_string()))?;
+            let welcome: TransportMessage = match serde_json::from_slice(&candidate.welcome_bytes) {
+                Ok(welcome) => welcome,
+                Err(_) => {
+                    // This stored payload can never be retried successfully.
+                    self.storage.take_welcome(&candidate.message_id)?;
+                    tracing::debug!(target: "cgka_engine::group_lifecycle",
+                        method = "retry_rejoins_after_trusted_removal", "retired an undecodable offer");
+                    continue;
+                }
+            };
+            if self.ensure_hydrated(&candidate.group_id).is_err()
+                || self.quarantined_groups.contains_key(&candidate.group_id)
+            {
+                tracing::debug!(target: "cgka_engine::group_lifecycle",
+                    method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
+                continue;
+            }
             match self.do_join_welcome(welcome).await {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
                 }
-                Err(EngineError::InvalidTransition(_)) => {}
-                Err(error) => return Err(error),
+                Err(_) => {
+                    // Keep retryable material owned, but isolate this offer's
+                    // failure from other rejoins and inviter-side recovery.
+                    tracing::debug!(target: "cgka_engine::group_lifecycle",
+                        method = "retry_rejoins_after_trusted_removal", "rejoin remains pending");
+                }
             }
         }
         Ok(joined)
@@ -1460,9 +1484,9 @@ impl<S: StorageProvider> Engine<S> {
                                 .ok_or(EngineError::InvalidWelcome)?;
                             storage.take_welcome(&oldest.message_id)?;
                             storage.put_ingress_dedup_marker(&oldest.message_id)?;
-                            if let Some(rejoin) = &oldest.rejoin {
-                                storage.put_ingress_dedup_marker(&rejoin.content_id)?;
-                            }
+                            // Eviction is capacity management, not rejection of
+                            // the authenticated Welcome. Another wrapper may
+                            // offer this content again or enable trusted reentry.
                         }
                         storage.put_welcome(&candidate)?;
                         Ok(())

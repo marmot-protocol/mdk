@@ -6,7 +6,40 @@ use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
 
+use cgka_traits::storage::WelcomeStorage;
+use cgka_traits::{GroupId, MessageId};
+use std::collections::{HashMap, HashSet};
+
 impl AppClient {
+    /// Read only bounded offer metadata, without loading any MLS group.
+    pub(crate) fn rejoin_offer_snapshot(&self) -> Result<HashMap<MessageId, GroupId>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .list_welcomes()?
+            .into_iter()
+            .filter(|offer| offer.rejoin.is_some())
+            .map(|offer| (offer.message_id, offer.group_id))
+            .collect())
+    }
+
+    pub(crate) fn reconcile_rejoin_offer_changes(
+        &mut self,
+        before: HashMap<MessageId, GroupId>,
+    ) -> Result<(), AppError> {
+        let after = self.rejoin_offer_snapshot()?;
+        let changed: HashSet<_> = before
+            .iter()
+            .chain(after.iter())
+            .filter(|(id, _)| before.get(*id) != after.get(*id))
+            .map(|(_, group)| group.clone())
+            .collect();
+        for group in changed {
+            self.mark_group_projection_dirty_hex(hex::encode(group.as_slice()));
+        }
+        Ok(())
+    }
+
     pub fn group_recovery_status(
         &self,
         group_id: &cgka_traits::GroupId,
@@ -237,14 +270,9 @@ impl AppClient {
                 if members.is_empty() || group.as_ref().is_none_or(|group| group.is_terminal()) {
                     vec![]
                 } else {
-                    match tokio::time::timeout(
-                        crate::directory::MEMBER_RESOLUTION_DEADLINE,
-                        self.app.resolve_fresh_reinvite_key_packages(&members),
-                    )
-                    .await
-                    {
-                        Ok(Ok(packages)) => packages,
-                        _ => break,
+                    match self.app.resolve_fresh_reinvite_key_packages(&members).await {
+                        Ok(packages) => packages,
+                        Err(_) => break,
                     }
                 };
             match self

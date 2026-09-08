@@ -1,6 +1,5 @@
 mod cache;
 mod member_key_packages;
-pub(crate) use member_key_packages::MEMBER_RESOLUTION_DEADLINE;
 mod methods;
 mod open_ranking;
 pub(crate) mod records;

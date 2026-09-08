@@ -2380,6 +2380,11 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
+        let rejoin_offers_before = if welcome {
+            Some(client.rejoin_offer_snapshot()?)
+        } else {
+            None
+        };
         let observation = client.app.product_analytics.begin(
             if welcome {
                 crate::ProductFamily::Welcome
@@ -2427,19 +2432,11 @@ impl AppClient {
         {
             client.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
         }
-        if matches!(
-            effects.outcome,
-            IngestOutcome::LocalState {
-                state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
-            }
-        ) {
-            for candidate in client.runtime.session().pending_group_rejoins()? {
-                if hex::encode(candidate.message_id.as_slice()) == source_message_id_hex {
-                    client.mark_group_projection_dirty_hex(hex::encode(
-                        candidate.group_id.as_slice(),
-                    ));
-                }
-            }
+        if let Some(before) = rejoin_offers_before {
+            // Account-wide eviction may remove an offer for a different group.
+            // Invalidate every changed group's host projection, not just the
+            // incoming Welcome's group. This scan reads bounded metadata only.
+            client.reconcile_rejoin_offer_changes(before)?;
         }
         let source_released = client
             .transport_receipts()?

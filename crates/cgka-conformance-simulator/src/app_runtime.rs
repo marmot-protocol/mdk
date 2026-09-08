@@ -489,12 +489,12 @@ impl AppRuntimeHarness {
         }
     }
 
-    /// Read the supported app recovery snapshot for the active scenario group.
     /// Public account identity, for reproducible ordering of concurrent authors.
     pub fn account_identity(&self, client: &str) -> Result<&str, SubjectError> {
         Ok(&self.participant(client)?.account_id)
     }
 
+    /// Read the supported app recovery snapshot for the active scenario group.
     pub async fn group_recovery_status(
         &self,
         client: &str,

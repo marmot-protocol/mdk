@@ -100,7 +100,7 @@ may already have reached the relay, so only accepted publications are correlated
 | `07_two_groups_stay_isolated` | Work and pair groups on one device; the second invite of Bob needs a fresh KeyPackage; a non-member has no projection; a removal and a reopen leave the other group's exact history untouched |
 | `08_concurrent_admin_profile_edits_are_never_lost` | Two admins save name and description at the same instant; members settle on one state in which both edits are present, because the losing commit's edit is re-issued when the winner left its field untouched (#1734; measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
 | `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
-| `09_strict_concurrent_invite_and_rename_are_never_lost` | Choose the larger-identity inviter so the invitation loses; require automatic fresh invitation, explicit recipient rejoin, offer and acceptance persistence across reopen, canonical roster/name, and fresh bidirectional messaging |
+| `09_strict_concurrent_invite_and_rename_are_never_lost` (opt-in) | Choose the larger-identity inviter so the invitation loses; require automatic fresh invitation, explicit recipient rejoin, offer and acceptance persistence across reopen, canonical roster/name, and fresh bidirectional messaging |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
 | `11_manual_self_update_advances_every_member` (ignored with production timing) | A manual SelfUpdate advances every member; ordinary test-policy builds zero maintenance windows, while production timing requires an explicit run |
 | `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
@@ -113,8 +113,9 @@ is present in the settled state, or when fresh traffic or reopen persistence bre
 fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
 [#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
 and [#1736](https://github.com/marmot-protocol/mdk/issues/1736). The profile-edit never-lost contract is now the default
-journey 08. The strict 30-second departure regression and strict journey 09 now also run ordinarily. Journey 09
-requires an actual recipient rejoin, so a run that misses the intended fork cannot silently pass.
+journey 08. The strict 30-second departure regression also runs ordinarily. Strict journey 09 is an opt-in
+real-socket diagnostic: it requires an actual recipient rejoin, and a run that misses the intended fork is
+inconclusive evidence. Required coverage of invitation recovery is the deterministic engine regression.
 
 Run the default journeys the way the conformance CI job does, or serially with retained evidence:
 

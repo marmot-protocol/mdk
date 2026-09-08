@@ -53,6 +53,61 @@ fn one_pixel_png() -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() {
+    use cgka_traits::storage::WelcomeStorage;
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let old_group = client.create_group("old offer", &[]).await.unwrap();
+    let new_group = client.create_group("new offer", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let old = PendingWelcome {
+        message_id: cgka_traits::MessageId::new(vec![0xe1; 32]),
+        group_id: old_group.clone(),
+        welcome_bytes: vec![],
+        rejoin: Some(RejoinWelcome {
+            epoch: cgka_traits::EpochId(0),
+            content_id: cgka_traits::MessageId::new(vec![0xe2; 32]),
+            welcomer: client.runtime.session().self_id(),
+            local_state_token: vec![],
+        }),
+    };
+    storage.put_welcome(&old).unwrap();
+    let before = client.rejoin_offer_snapshot().unwrap();
+    client.pending_group_projection_updates.clear();
+    storage.take_welcome(&old.message_id).unwrap();
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: cgka_traits::MessageId::new(vec![0xe3; 32]),
+            group_id: new_group.clone(),
+            ..old
+        })
+        .unwrap();
+    client.reconcile_rejoin_offer_changes(before).unwrap();
+    assert_eq!(
+        client.pending_group_projection_updates,
+        [
+            hex::encode(old_group.as_slice()),
+            hex::encode(new_group.as_slice())
+        ]
+        .into_iter()
+        .collect()
+    );
+    client.pending_group_projection_updates.clear();
+    let unchanged = client.rejoin_offer_snapshot().unwrap();
+    client.reconcile_rejoin_offer_changes(unchanged).unwrap();
+    assert!(
+        client.pending_group_projection_updates.is_empty(),
+        "unchanged offer metadata must not emit redundant host updates"
+    );
+}
+
+#[tokio::test]
 async fn send_finalizes_once() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

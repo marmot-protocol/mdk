@@ -10651,7 +10651,7 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
                 welcome_bytes: vec![],
                 rejoin: Some(cgka_traits::welcome::RejoinWelcome {
                     epoch: stale_record.epoch,
-                    content_id: id.clone(),
+                    content_id: cgka_traits::MessageId::new(vec![0xd0 + n; 32]),
                     welcomer: inviter.self_id(),
                     local_state_token: vec![0; 32],
                 }),
@@ -10671,6 +10671,12 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         carol_storage
             .has_ingress_dedup_marker(&filler_ids[0])
             .unwrap()
+    );
+    assert!(
+        !carol_storage
+            .has_ingress_dedup_marker(&cgka_traits::MessageId::new(vec![0xd0; 32]))
+            .unwrap(),
+        "capacity eviction must leave authenticated content retryable under another wrapper"
     );
     assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
     assert!(matches!(
@@ -10739,6 +10745,14 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         assert!(
             carol_storage.has_ingress_dedup_marker(&id).unwrap(),
             "confirmation terminally retires sibling offers as well as the selected one"
+        );
+    }
+    for n in 1..4u8 {
+        assert!(
+            carol_storage
+                .has_ingress_dedup_marker(&cgka_traits::MessageId::new(vec![0xd0 + n; 32]))
+                .unwrap(),
+            "confirmation, unlike eviction, terminally retires sibling content"
         );
     }
     assert_eq!(

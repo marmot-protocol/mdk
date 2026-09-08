@@ -12,14 +12,17 @@ same transaction that queues it; publication uses the ordinary outbound queue an
 One lookup is reserved durably before each network attempt. Each attempt uses the ordinary 50-second
 member-resolution deadline. Eight attempts are allowed, with delays of 5 seconds, 30 seconds, 2 minutes, 10 minutes,
 1 hour, 6 hours, then 24 hours twice. The last lookup occurs about 31 hours after the first; exhaustion is recorded
-after the final 24-hour wait. The later delays allow sleeping recipients time to replenish material. Restart and cancellation preserve the budget. At most two
+after the final 24-hour wait. The later delays allow sleeping recipients time to replenish material. Restart and
+cancellation preserve the budget. At most two
 successive supersessions are reissued, matching the existing own-intent policy. `GroupRecoveryStatus` exposes pending
 and failed fresh-material recovery counts; exhausted recovery requires a new user-initiated invitation. Network
 availability and fresh recipient material remain prerequisites, not outcomes this mechanism can guarantee.
 
 A fully validated replacement Welcome for an active group is stored as an offer (at most four per group and 64 per
-account); a full inbox atomically retires its oldest unconsented offer and records its dedup markers before storing
-the new one, so user decisions cannot pin the account transport cursor. Neither its epoch number nor its author's admin role on the incoming branch authorizes replacement.
+account); a full inbox atomically retires its oldest unconsented offer and records only its wrapper dedup marker
+before storing the new one, so user decisions cannot pin the account transport cursor. Eviction leaves the Welcome content retryable
+under another wrapper and invalidates both affected groups' projections if the account-wide cap evicts across groups.
+Neither its epoch number nor its author's admin role on the incoming branch authorizes replacement.
 `group_recovery_status` returns the authenticated author, Welcome id, incoming epoch, and a token for the local branch
 being discarded. A host must show that author and the effect of replacing the current group copy, obtain explicit
 recipient consent, then call `confirm_group_rejoin` with the displayed id and token. A changed local branch rejects a
