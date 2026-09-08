@@ -19831,13 +19831,13 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let update = updates.recv().await.unwrap();
-                if update.account_label() == "alice"
+                if update.account_label == "alice"
                     && let storage_sqlite::ChatPresentationRead::Ready(value) =
                         storage.chat_presentation(&group).unwrap()
                     && value.presentation.title
                         == storage_sqlite::PresentationText::Literal("Restarted peer".into())
                     // Earlier valid invalidations can remain queued after a newer commit.
-                    && update.version() == &storage.chat_presentation_version().unwrap()
+                    && update.version == storage.chat_presentation_version().unwrap()
                 {
                     break;
                 }
@@ -19872,7 +19872,7 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let update = recovered.recv().await.unwrap();
-                if update.account_label() == "alice" && update.version() == &committed {
+                if update.account_label == "alice" && update.version == committed {
                     break;
                 }
             }
@@ -19880,5 +19880,84 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         .await
         .expect("fresh worker must publish a commit whose original notification was lost");
         third.shutdown().await;
+    });
+}
+
+#[test]
+fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
+    run_composed_app_runtime_test("presentation-quarantine", || async {
+        use cgka_traits::storage::GroupStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let alice_account = home.create_account("alice").unwrap();
+        let bob_account = home.create_account("bob").unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+        let group_id;
+        {
+            let mut bob = app.client("bob").await.unwrap();
+            bob.publish_key_package().await.unwrap();
+            let mut alice = app.client("alice").await.unwrap();
+            group_id = alice
+                .create_group("", &[&bob_account.account_id_hex])
+                .await
+                .unwrap();
+        }
+        let id = hex::encode(group_id.as_slice());
+        let storage = app.account_storage("alice").unwrap();
+        let before = app.chat_list_row("alice", &id).unwrap().unwrap();
+        let original = storage.get_group(&group_id).unwrap();
+        let mut damaged = original.clone();
+        damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+        assert_ne!(damaged.protocol_profile, original.protocol_profile);
+        storage.put_group(&damaged).unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        assert_eq!(
+            alice.quarantined_groups().len(),
+            1,
+            "fixture must enter real hydration quarantine"
+        );
+        let quarantined = app.chat_list_row("alice", &id).unwrap().unwrap();
+        assert_eq!(quarantined.conversation_kind, before.conversation_kind);
+        assert_eq!(
+            storage
+                .direct_conversation_candidate_rows(&bob_account.account_id_hex)
+                .unwrap()
+                .len(),
+            1
+        );
+        let input = storage.chat_presentation_input(&id).unwrap().unwrap();
+        assert_eq!(input.member_count, Some(2));
+        assert!(
+            input.members.is_empty(),
+            "quarantined presentation roster must be withdrawn"
+        );
+        let selected = crate::chat_presentation::select_chat_presentation(
+            &input,
+            &alice_account.account_id_hex,
+            None,
+        );
+        assert!(selected.title == storage_sqlite::PresentationText::UnavailableConversation);
+        assert!(selected.peer_id.is_none());
+        storage.put_group(&original).unwrap();
+        assert!(alice.retry_hydrate_quarantined_group(&group_id).unwrap());
+        alice.reconcile_hydrated_account_state().unwrap();
+        assert_eq!(
+            storage
+                .chat_presentation_input(&id)
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            2
+        );
+        assert_eq!(
+            storage
+                .direct_conversation_candidate_rows(&bob_account.account_id_hex)
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }

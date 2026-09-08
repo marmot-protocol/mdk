@@ -476,10 +476,8 @@ impl AppClient {
         let mut cleared = Vec::new();
         for group in &mut self.state.groups {
             if quarantined.contains(&group.group_id_hex)
-                && (group.member_count.is_some() || group.presentation_member_ids_hex.is_some())
+                && group.presentation_member_ids_hex.is_some()
             {
-                group.member_count = None;
-                group.direct_member_ids_hex = None;
                 group.presentation_member_ids_hex = None;
                 cleared.push(group.group_id_hex.clone());
             }

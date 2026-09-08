@@ -261,12 +261,12 @@ pending-work and revision reads; they do not scan groups, directory history, or 
 
 The existing account worker runs these bounded steps after readiness, yields between batches, and stops with its
 normal lifecycle. Coalesced process-local wakeups cover directory/source writes; the existing 15-second maintenance
-tick recovers missed wakeups. A fresh worker compares committed presentation revisions before notifying, recovering
+tick recovers missed wakeups. A batch with no checkpoint or row progress stops immediate rescheduling and retries on a later wakeup/tick. A fresh worker compares committed presentation revisions before notifying, recovering
 commit-before-broadcast interruption. These internal invalidations are the P3 subscription input.
 
 Groups missing a legacy chat row use a durable, bounded initialization queue and the existing row projector. This
 first-row construction retains the legacy projector's query cost; profile refresh and steady-state repair do not
-rebuild history. Quarantined rosters lose current peer evidence until live reconciliation supplies it again.
+rebuild history. Quarantined rosters lose current peer evidence until live reconciliation supplies it again; existing member counts and direct-conversation reuse indexes remain intact. Two-person roster identities use the same canonical order in memory and storage.
 
 ### Consumer accounting
 

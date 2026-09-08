@@ -53,7 +53,10 @@ impl SqliteAccountStorage {
             state,
         })
     }
-    /// The checkpoint and up to 50 selected rows commit together. Racing preparation retries its whole batch.
+    /// The checkpoint and up to 50 selected rows commit together.
+    /// Returns true only if the checkpoint state or a row advanced. A rejected
+    /// checkpoint CAS or an entirely stale/unchanged batch returns false so the
+    /// caller can wait for a later wakeup instead of spinning without progress.
     pub fn commit_chat_presentation_batch(
         &self,
         expected: &ChatPresentationCheckpoint,
@@ -74,7 +77,8 @@ impl SqliteAccountStorage {
                     return Err(invalid("presentation batch directory epoch mismatch"));
                 }
             }
-            {
+            let state_changed = current.state != *next;
+            if state_changed {
                 let conn = self.lock()?;
                 conn.execute(
                     "UPDATE chat_presentation_checkpoint SET generation=generation+1,state=?1 WHERE id=1",
@@ -82,10 +86,16 @@ impl SqliteAccountStorage {
                 ).storage()?;
             }
             // Stale source rows remain on the pending worklist; they must not hold up unrelated fanout.
+            let mut applied = false;
             for (input, value) in values {
-                self.store_chat_presentation(input, value)?;
+                applied |= self.store_chat_presentation(input, value)? == ChatPresentationWrite::Applied;
             }
-            Ok(true)
+            if applied && !state_changed {
+                self.lock()?.execute(
+                    "UPDATE chat_presentation_checkpoint SET generation=generation+1 WHERE id=1", [],
+                ).storage()?;
+            }
+            Ok(state_changed || applied)
         })
     }
     pub fn chat_presentation_inputs_after(

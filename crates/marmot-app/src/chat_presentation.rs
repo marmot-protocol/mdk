@@ -8,6 +8,28 @@ use storage_sqlite::{
     PresentationText, SelectedAvatar,
 };
 
+/// Determine the eligible peer without selecting text, avatars, or cache keys.
+fn presentation_peer(input: &ChatPresentationInput, local_id: &str) -> Option<String> {
+    let local_id = canonical_identity(local_id);
+    let members: Option<Vec<_>> = input
+        .members
+        .iter()
+        .map(|s| canonical_identity(s))
+        .collect();
+    match (&local_id, &members) {
+        (Some(local), Some(members))
+            if input.member_count == Some(2)
+                && input.self_membership == storage_sqlite::SelfMembership::Member
+                && members.len() == 2
+                && members[0] != members[1]
+                && members.contains(local) =>
+        {
+            members.iter().find(|id| *id != local).cloned()
+        }
+        _ => None,
+    }
+}
+
 /// Resolve already-cached evidence. Profile subjects must match the current peer.
 /// Remote descriptors do not authorize a download; the media layer still owns dial safety,
 /// including `reject_unsafe_group_avatar_contact_url` and validated-address pinning.
@@ -22,18 +44,7 @@ pub(crate) fn select_chat_presentation(
         .iter()
         .map(|s| canonical_identity(s))
         .collect();
-    let peer = match (&local_id, &members) {
-        (Some(local), Some(members))
-            if input.member_count == Some(2)
-                && input.self_membership == storage_sqlite::SelfMembership::Member
-                && members.len() == 2
-                && members[0] != members[1]
-                && members.contains(local) =>
-        {
-            members.iter().find(|id| *id != local).cloned()
-        }
-        _ => None,
-    };
+    let peer = presentation_peer(input, local_id.as_deref().unwrap_or(""));
     let profile = profile
         .filter(|(id, _)| {
             canonical_identity(id)

@@ -2,20 +2,12 @@
 use storage_sqlite::ChatPresentationVersion;
 use tokio::sync::{broadcast, watch};
 
+// P3 consumes the fields; P2 publishes and tests the handoff.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct PresentationInvalidation {
     pub(crate) account_label: String,
     pub(crate) version: ChatPresentationVersion,
-}
-// P3 consumes these fields in the presented-snapshot subscription; P2 publishes and tests the handoff.
-#[allow(dead_code)]
-impl PresentationInvalidation {
-    pub(crate) fn account_label(&self) -> &str {
-        &self.account_label
-    }
-    pub(crate) fn version(&self) -> &ChatPresentationVersion {
-        &self.version
-    }
 }
 pub(crate) struct PresentationSignals {
     wakeups: watch::Sender<()>,

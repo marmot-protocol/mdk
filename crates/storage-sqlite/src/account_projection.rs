@@ -229,7 +229,7 @@ impl fmt::Debug for StoredAccountGroup {
             .field("prior_nostr_routes", &self.prior_nostr_routes)
             .field("self_membership", &self.self_membership)
             .field("components", &self.components)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

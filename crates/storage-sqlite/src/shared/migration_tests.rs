@@ -458,3 +458,42 @@ fn ledger_integer_primary_key_rejects_text_and_bad_name_is_invalid_history() {
         "backend failure: invalid shared store migration history"
     );
 }
+
+#[test]
+fn presentation_migration_preserves_existing_usage_settings_and_cached_profiles() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    run(&mut conn, &MIGRATIONS[..2]).unwrap();
+    conn.execute_batch("UPDATE usage_diagnostics_settings SET decision=1, policy_revision='accepted', updated_at_ms=123;
+        INSERT INTO directory_users(account_id_hex, npub, profile_json, relay_lists_json)
+        VALUES ('peer', 'fixture', '{\"name\":\"Cached before P2\"}', '{}');").unwrap();
+    run_all(&mut conn).unwrap();
+    run_all(&mut conn).unwrap();
+    assert_eq!(count(&conn), 3);
+    let settings: (i64, String, i64) = conn
+        .query_row(
+            "SELECT decision, policy_revision, updated_at_ms FROM usage_diagnostics_settings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(settings, (1, "accepted".into(), 123));
+    let profile: String = conn
+        .query_row(
+            "SELECT profile_json FROM directory_users WHERE account_id_hex='peer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(profile, "{\"name\":\"Cached before P2\"}");
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM directory_presentation_meta",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision, 0,
+        "existing profiles are read directly without replaying history"
+    );
+}

@@ -884,7 +884,7 @@ mod migration_contract_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (2, "0002_usage_diagnostics".into()));
+        assert_eq!(row, (3, "0003_directory_presentation".into()));
     }
 
     #[test]

@@ -846,19 +846,21 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        self.presentation_member_ids_hex = (members.len() == 2).then(|| {
-            members
+        self.presentation_member_ids_hex = (members.len() == 2
+            && members
                 .iter()
-                .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
-                .collect()
-        });
-        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() && members.len() == 2 {
-            Some(
-                members
+                .all(|member| member.id.as_slice().len() == 32)
+            && members[0].id != members[1].id)
+            .then(|| {
+                let mut ids: Vec<_> = members
                     .iter()
-                    .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
-                    .collect(),
-            )
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            });
+        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
+            self.presentation_member_ids_hex.clone()
         } else {
             None
         };
