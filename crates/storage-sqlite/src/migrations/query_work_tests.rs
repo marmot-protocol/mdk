@@ -514,7 +514,7 @@ fn media_reference_query_work() {
 }
 
 #[test]
-fn media_epoch_index_upgrade() {
+fn retention_indexes_upgrade() {
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     super::run(&mut conn, &super::MIGRATIONS[..63]).unwrap();
     seed_query_history(&conn, 256);
@@ -523,31 +523,201 @@ fn media_epoch_index_upgrade() {
                         WHERE source_epoch % 2 = 0;",
     )
     .unwrap();
+    conn.execute_batch(
+        "INSERT INTO message_timeline(group_id_hex, message_id_hex, direction, sender,
+             plaintext, kind, tags_json, timeline_at, received_at, reactions_json)
+         SELECT group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+             tags_json, recorded_at, received_at, '{}' FROM app_events;",
+    )
+    .unwrap();
     let contents = |conn: &rusqlite::Connection| {
-        conn.prepare(
-            "SELECT group_id_hex, component_id, source_epoch, secret,
-                             created_at_unix_seconds, retention_managed
-                      FROM encrypted_media_epoch_secrets ORDER BY rowid",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            (0..6)
-                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+        let mut rows = Vec::new();
+        for table in ["encrypted_media_epoch_secrets", "message_timeline"] {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = stmt.column_count();
+            rows.extend(
+                stmt.query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
+                .unwrap(),
+            );
+        }
+        rows
     };
     let before = contents(&conn);
     super::run_all(&mut conn).unwrap();
     super::run_all(&mut conn).unwrap();
     let tx = conn.transaction().unwrap();
     super::migration_0068_media_epoch_index::apply(&tx).unwrap();
+    super::migration_0069_chat_readiness_index::apply(&tx).unwrap();
     tx.commit().unwrap();
     assert_eq!(contents(&conn), before);
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();
     assert_eq!(integrity, "ok");
+}
+
+#[test]
+fn chat_readiness_query_work() {
+    let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    for count in [256, 16_384] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO account_groups(group_id_hex, endpoint, updated_at)
+                                VALUES ('aa', 'fixture', 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+                 INSERT INTO app_events(group_id_hex, message_id_hex, source_message_id_hex,
+                     direction, sender, plaintext, kind, tags_json, recorded_at, received_at)
+                 SELECT 'aa', printf('%064x', x), printf('%064x', x),
+                     'received', 'sender', 'text', 9, '[]', x, x FROM n",
+                [count],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO message_timeline(group_id_hex, message_id_hex, source_message_id_hex,
+                     direction, sender, plaintext, kind, tags_json, timeline_at, received_at, reactions_json)
+                 SELECT group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                     plaintext, kind, tags_json, recorded_at, received_at,
+                     '{\"by_emoji\":{},\"user_reactions\":[]}' FROM app_events;",
+            ).unwrap();
+        }
+        store
+            .refresh_chat_list_rows("local", &|_, _| false)
+            .unwrap();
+        let changes = store.lock().unwrap().total_changes();
+        {
+            measured(&store, &format!("chat readiness rows={count}"), 700, || {
+                store
+                    .ensure_chat_list_rows("local", &|_, _| panic!("unexpected rebuild"))
+                    .unwrap();
+            });
+        }
+        assert_eq!(store.lock().unwrap().total_changes(), changes);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE chat_list_rows SET updated_at = 100000;
+             UPDATE message_timeline SET received_at = 100001, deleted = 1
+             WHERE rowid = 1;
+             DELETE FROM chat_list_unread_dirty_messages;",
+            )
+            .unwrap();
+        store.ensure_chat_list_rows("local", &|_, _| false).unwrap();
+        let updated: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM chat_list_rows WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(updated > 100000);
+        store
+            .ensure_chat_list_rows("local", &|_, _| panic!("unexpected rebuild"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn pinned_chat_query_work() {
+    let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    for count in [64, 4_096] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+                 INSERT INTO account_groups(group_id_hex, endpoint, updated_at)
+                 SELECT printf('%064x', x), 'fixture', 0 FROM n",
+                [count],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO chat_list_rows(group_id_hex, updated_at)
+                 SELECT group_id_hex, 0 FROM account_groups;
+                 INSERT INTO chat_pin_positions(group_id_hex, ordinal)
+                 SELECT group_id_hex, rowid * 3 FROM account_groups;",
+            )
+            .unwrap();
+        }
+        {
+            let rows = measured(
+                &store,
+                &format!("pinned chats rows={count}"),
+                count * 170,
+                || {
+                    store
+                        .chat_list_rows(crate::ChatListQuery::default())
+                        .unwrap()
+                },
+            );
+            assert_eq!(rows.len(), count as usize);
+            for (position, row) in rows.iter().enumerate() {
+                assert!(row.pinned);
+                assert_eq!(row.pinned_position, Some(position as u32));
+                assert_eq!(row.group_id_hex, format!("{:064x}", position + 1));
+            }
+        }
+        let first = format!("{:064x}", 1);
+        let last = format!("{count:064x}");
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
+                [&first],
+            )
+            .unwrap();
+        let rows = store
+            .chat_list_rows(crate::ChatListQuery::default())
+            .unwrap();
+        assert_eq!(rows[0].pinned_position, Some(1));
+        assert_eq!(
+            store.chat_list_row(&last).unwrap().unwrap(),
+            *rows.last().unwrap()
+        );
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE account_groups SET archived = 1 WHERE group_id_hex = ?1",
+                [&last],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE chat_list_rows SET archived = 1 WHERE group_id_hex = ?1",
+                [&last],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .chat_list_rows(crate::ChatListQuery::default())
+                .unwrap()
+                .len(),
+            count as usize - 2
+        );
+        let rows = store
+            .chat_list_rows(crate::ChatListQuery {
+                include_archived: true,
+            })
+            .unwrap();
+        let archived = rows.last().unwrap();
+        assert_eq!(archived.group_id_hex, last);
+        assert!(!archived.pinned);
+        assert_eq!(archived.pinned_position, None);
+    }
 }
