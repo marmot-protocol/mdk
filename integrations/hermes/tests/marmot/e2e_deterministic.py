@@ -18,6 +18,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -165,7 +166,21 @@ class FakeAgentControlServer:
 
 
 def load_marmot_adapter_module(plugin_path: Path):
-    spec = importlib.util.spec_from_file_location("marmot_hermes_adapter_e2e", plugin_path)
+    package = "marmot_hermes_adapter_e2e"
+    package_spec = importlib.util.spec_from_file_location(
+        package,
+        plugin_path.with_name("__init__.py"),
+        submodule_search_locations=[str(plugin_path.parent)],
+    )
+    if package_spec is None or package_spec.loader is None:
+        raise RuntimeError(f"could not load plugin package: {plugin_path.parent}")
+    package_module = importlib.util.module_from_spec(package_spec)
+    sys.modules[package] = package_module
+    package_spec.loader.exec_module(package_module)
+    spec = importlib.util.spec_from_file_location(
+        f"{package}.adapter",
+        plugin_path,
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load plugin adapter: {plugin_path}")
     module = importlib.util.module_from_spec(spec)

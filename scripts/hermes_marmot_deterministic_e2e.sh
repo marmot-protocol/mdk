@@ -46,7 +46,7 @@ source "$dev_root/env.sh"
 
 if [ -n "${HERMES_AGENT_REPO:-}" ]; then
     export HERMES_AGENT_REPO
-    "$MDK_REPO/integrations/hermes/marmot/tests/test_installer_env.sh"
+    "$MDK_REPO/integrations/hermes/tests/marmot/test_installer_env.sh"
 fi
 
 if [ ! -x "$HERMES_AGENT_REPO/.venv/bin/python" ]; then
@@ -58,4 +58,4 @@ fi
 cd "$HERMES_AGENT_REPO"
 export PYTHONDONTWRITEBYTECODE=1
 exec "$HERMES_AGENT_REPO/.venv/bin/python" \
-    "$MDK_REPO/integrations/hermes/marmot/tests/e2e_deterministic.py"
+    "$MDK_REPO/integrations/hermes/tests/marmot/e2e_deterministic.py"
