@@ -721,7 +721,7 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let subscription_guard = self.subscription_lock.clone().lock_owned().await;
         let subscription = NostrSubscription::GroupMaintenance {
             account_id: account_id.clone(),
             group_id: group.group_id.clone(),
@@ -730,17 +730,45 @@ impl NostrTransportAdapter {
         };
         let subscription_id = subscription.subscription_id();
         let now_ms = self.now_ms();
-        self.state
-            .write()
-            .await
-            .record_subscription_starts(std::slice::from_ref(&subscription), now_ms);
+        {
+            let mut state = self.state.write().await;
+            if !state.accounts.contains_key(account_id) {
+                return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
+            }
+            if state.maintenance_routes.contains_key(&subscription_id) {
+                return Ok(subscription_id);
+            }
+            // A history REQ can synchronously replay messages. Routing must
+            // exist before SDK deduplication consumes their first delivery.
+            state
+                .maintenance_routes
+                .insert(subscription_id.clone(), subscription.clone());
+            state.rebuild_transport_group_index();
+            state.record_subscription_starts(std::slice::from_ref(&subscription), now_ms);
+        }
+        let (complete, abandoned) = oneshot::channel();
+        let cleanup_state = self.state.clone();
+        let cleanup_subscription = subscription.clone();
+        tokio::spawn(async move {
+            let _subscription_guard = subscription_guard;
+            if abandoned.await.is_err() {
+                let mut state = cleanup_state.write().await;
+                state
+                    .maintenance_routes
+                    .remove(&cleanup_subscription.subscription_id());
+                state.forget_subscription_starts(std::slice::from_ref(&cleanup_subscription));
+                state.rebuild_transport_group_index();
+            }
+        });
         if let Err(error) = self.relay_client.subscribe(subscription.clone()).await {
-            self.state
-                .write()
-                .await
-                .forget_subscription_starts(std::slice::from_ref(&subscription));
+            let mut state = self.state.write().await;
+            state.maintenance_routes.remove(&subscription_id);
+            state.forget_subscription_starts(std::slice::from_ref(&subscription));
+            state.rebuild_transport_group_index();
+            let _ = complete.send(());
             return Err(error);
         }
+        let _ = complete.send(());
         Ok(subscription_id)
     }
 
@@ -751,10 +779,12 @@ impl NostrTransportAdapter {
     ) -> Result<(), TransportAdapterError> {
         let _subscription_guard = self.subscription_lock.lock().await;
         self.relay_client.unsubscribe(subscription.clone()).await?;
-        self.state
-            .write()
-            .await
-            .forget_subscription_starts(std::slice::from_ref(&subscription));
+        let mut state = self.state.write().await;
+        state
+            .maintenance_routes
+            .remove(&subscription.subscription_id());
+        state.forget_subscription_starts(std::slice::from_ref(&subscription));
+        state.rebuild_transport_group_index();
         Ok(())
     }
 
@@ -1410,6 +1440,7 @@ struct AdapterState {
     /// sync may append only missing pre-REQ routes while a subscribe batch is in
     /// flight; both success and failure rebuild the index before returning.
     by_transport_group: HashMap<Vec<u8>, Vec<GroupRouteEntry>>,
+    maintenance_routes: HashMap<String, NostrSubscription>,
     /// Unconfirmed relay unsubscribes retained until teardown succeeds.
     /// Routing state (`accounts`/`by_transport_group`) already reflects the
     /// removal; these are relay-side cleanups only, drained on later
@@ -1424,7 +1455,7 @@ struct AdapterState {
 impl AdapterState {
     /// Rebuild the derived `by_transport_group` index from the authoritative
     /// `accounts` routing state. Called after every mutation so the index cannot
-    /// drift from the signed-routing source of truth (#698/#752).
+    /// drift from signed ordinary and temporary maintenance routes (#698/#752).
     fn rebuild_transport_group_index(&mut self) {
         let mut index: HashMap<Vec<u8>, Vec<GroupRouteEntry>> = HashMap::new();
         for (account_id, routes) in &self.accounts {
@@ -1440,6 +1471,11 @@ impl AdapterState {
             }
         }
         self.by_transport_group = index;
+        let maintenance = std::mem::take(&mut self.maintenance_routes);
+        for subscription in maintenance.values() {
+            self.stage_group_routes(std::slice::from_ref(subscription));
+        }
+        self.maintenance_routes = maintenance;
     }
 
     /// Add the endpoint coverage needed by new group REQs without replacing
@@ -1448,13 +1484,19 @@ impl AdapterState {
     /// window. A later index rebuild commits or discards these entries.
     fn stage_group_routes(&mut self, subscriptions: &[NostrSubscription]) {
         for subscription in subscriptions {
-            let NostrSubscription::Group {
+            let (NostrSubscription::Group {
                 account_id,
                 group_id,
                 transport_group_id,
                 endpoints,
                 ..
-            } = subscription
+            }
+            | NostrSubscription::GroupMaintenance {
+                account_id,
+                group_id,
+                transport_group_id,
+                endpoints,
+            }) = subscription
             else {
                 continue;
             };
@@ -1499,6 +1541,8 @@ impl AdapterState {
         // the high-water map is what survives their removal.
         self.activation_attempt_high_water
             .insert(activation.account_id.clone(), attempt);
+        self.maintenance_routes
+            .retain(|_, subscription| subscription.account_id() != &activation.account_id);
         self.accounts.insert(
             activation.account_id,
             AccountRoutes {
@@ -1608,6 +1652,8 @@ impl AdapterState {
 
     fn deactivate(&mut self, account_id: &MemberId, removed_count: usize) {
         self.accounts.remove(account_id);
+        self.maintenance_routes
+            .retain(|_, subscription| subscription.account_id() != account_id);
         self.account_replay_coverage.remove(account_id);
         self.metrics.subscriptions_removed += removed_count;
         self.rebuild_transport_group_index();
