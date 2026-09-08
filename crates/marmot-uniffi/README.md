@@ -262,3 +262,21 @@ edited Markdown message per update. Results include source cloning, conversion,
 and UniFFI serialization: p50/p95 over 100 samples after 10 warm-up iterations,
 plus serialized byte counts. They exclude storage, runtime window application,
 FFI scheduling, and Swift/Kotlin decoding and rendering.
+
+## Selected chat-list presentation
+
+`openPresentedChatList(accountRef, includeArchived)` returns an account-bound subscription.
+Take `snapshot()` once (generation plus sequence zero), then consume `next()` as complete replacement snapshots.
+Each row contains the existing chat-list fields and MDK's selected title/avatar; hosts render the typed fallback text
+with their own localization and load the selected avatar descriptor without a roster/profile lookup.
+`presentedChatList` and `presentedChatListRow` provide the same local contract for one-shot and creation/rebind paths.
+
+First use can await bounded local preparation. `ChatPresentationNotReady` means preparation did not advance and may be
+retried after maintenance; it is not an empty list or missing group. Storage errors remain errors. Ready reads do no
+network fetching or repair writes. Selected values survive offline reopen; avatar bytes still use the existing loaders.
+
+Order updates by the handle's generation and sequence. `presentationVersion` only versions selected presentation:
+an unread, pin, archive or mute update can have the same presentation revision. Drop the old handle when changing
+accounts; cancellation preserves a pending refresh, and shutdown ends the stream. Account-store replacement requires
+opening a new handle. Do not log rows or avatar material, including generated host-language record stringification.
+Existing chat-list APIs remain available during client migration. Android/iOS adoption is a separate delivery step.

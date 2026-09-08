@@ -1900,6 +1900,7 @@ fn app_error_kind(error: &AppError) -> &'static str {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
+        AppError::ChatPresentationNotReady => "chat_presentation_not_ready",
         AppError::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
         AppError::RuntimeBusy => "runtime_busy",
         AppError::RuntimeStopping => "runtime_stopping",
@@ -1927,6 +1928,7 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
             | AppError::AccountWorkerBusy
             | AppError::RuntimeBusy
             | AppError::TransportClosed
+            | AppError::ChatPresentationNotReady
             | AppError::DirectConversationIndexNotReady
     ) {
         participant.retryable_failures = participant.retryable_failures.saturating_add(1);
@@ -1951,6 +1953,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
         | AppError::AccountWorkerResponseTimedOut
+        | AppError::ChatPresentationNotReady
         | AppError::DirectConversationIndexNotReady
         | AppError::RuntimeStopping
         | AppError::TransportClosed
@@ -2212,6 +2215,7 @@ mod tests {
         for failure in [
             AppError::RuntimeBusy,
             AppError::AccountWorkerResponseTimedOut,
+            AppError::ChatPresentationNotReady,
         ] {
             let resource = app_error(failure);
             assert_eq!(resource.category, SubjectFailureCategory::Resource);

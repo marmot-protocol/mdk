@@ -511,3 +511,90 @@ fn valid_member_identity(raw: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// A complete existing row with MDK-selected display; callers need no peer lookup.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentedChatRow {
+    pub row: crate::ChatListRow,
+    pub presentation: ConversationPresentation,
+}
+impl std::fmt::Debug for PresentedChatRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedChatRow")
+            .field("presentation", &self.presentation)
+            .finish_non_exhaustive()
+    }
+}
+/// The version describes selected presentation only, not unread or other row fields.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentedChatListSnapshot {
+    pub rows: Vec<PresentedChatRow>,
+    pub presentation_version: ChatPresentationVersion,
+}
+impl std::fmt::Debug for PresentedChatListSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedChatListSnapshot")
+            .field("row_count", &self.rows.len())
+            .field("presentation_version", &self.presentation_version)
+            .finish()
+    }
+}
+impl SqliteAccountStorage {
+    /// Read existing row fields, selection and version in one local read transaction.
+    /// `None` means preparation is required, never an empty successful cache miss.
+    /// A keyed read with no group returns a ready snapshot with zero rows.
+    pub fn read_presented_chat_list(
+        &self,
+        query: crate::ChatListQuery,
+        group: Option<&str>,
+    ) -> StorageResult<Option<PresentedChatListSnapshot>> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction().storage()?;
+        let pending: bool = match group {
+            Some(group) => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex = ?1)",
+                [group], |r| r.get(0)).storage()?,
+            None => tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)", [], |r| r.get(0)).storage()?,
+        };
+        if pending {
+            return Ok(None);
+        }
+        let rows = match group {
+            Some(group) => crate::chat_list::chat_list_row_tx(&tx, group)?
+                .into_iter()
+                .collect(),
+            None => crate::chat_list::chat_list_rows_tx(&tx, query)?,
+        };
+        let mut presented = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (bytes, dirty): (Option<Vec<u8>>, bool) = tx.query_row(
+                "SELECT presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex = ?1",
+                [&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?))).storage()?;
+            let Some(bytes) = bytes else {
+                return Ok(None);
+            };
+            let mut presentation = decode_envelope(&bytes)?.value.presentation;
+            if dirty {
+                presentation.resolution = PresentationResolution::LastKnown;
+            }
+            presented.push(PresentedChatRow { row, presentation });
+        }
+        let presentation_version = tx
+            .query_row(
+                "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id = 1",
+                [],
+                |r| {
+                    Ok(ChatPresentationVersion {
+                        store_epoch: r.get(0)?,
+                        revision: nonnegative(r, 1)?,
+                    })
+                },
+            )
+            .storage()?;
+        tx.commit().storage()?;
+        Ok(Some(PresentedChatListSnapshot {
+            rows: presented,
+            presentation_version,
+        }))
+    }
+}

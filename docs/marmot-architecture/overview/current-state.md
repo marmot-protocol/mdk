@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-07
+updated: 2026-09-08
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,11 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+The additive presented-chat-list contract exposes complete existing rows plus durable MDK-selected title/avatar
+through Rust, UniFFI and C. An attached initial snapshot and ordered replacement updates cover both presentation and
+ordinary row changes. Android/iOS adoption remains separate; see the
+[native integration contract](../../../crates/marmot-uniffi/README.md#selected-chat-list-presentation).
 
 Deferred transport resource release now preserves app replay eligibility across
 lost engine effects and restart. SQLCipher records release evidence atomically

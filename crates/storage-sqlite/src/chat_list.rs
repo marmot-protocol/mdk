@@ -2312,7 +2312,10 @@ fn read_state_tx(
     .storage()
 }
 
-fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
+pub(crate) fn chat_list_rows_tx(
+    tx: &Connection,
+    query: ChatListQuery,
+) -> StorageResult<Vec<ChatListRow>> {
     let sql = if query.include_archived {
         format!(
             "{CHAT_LIST_ROW_SELECT_AND_JOINS}
@@ -2403,7 +2406,10 @@ fn direct_conversation_candidate_rows_tx(
     Ok(rows)
 }
 
-fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
+pub(crate) fn chat_list_row_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+) -> StorageResult<Option<ChatListRow>> {
     let now_ms = unix_now_ms();
     let sql = format!(
         "{CHAT_LIST_ROW_SELECT_AND_JOINS}

@@ -1304,6 +1304,7 @@ impl MarmotAppRuntime {
                 };
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
+                    _ = updates_tx.closed() => return,
                     event = events.recv() => Some(event),
                     _ = expiry_wait => None,
                 };

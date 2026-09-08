@@ -696,3 +696,62 @@ fn initialization_completes_a_new_row_and_ignores_deleted_work() {
     );
     assert!(store.chat_list_row("22").unwrap().is_none());
 }
+
+#[test]
+fn presented_snapshot_is_complete_read_only_and_clears_replaced_peer() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    let query = crate::ChatListQuery {
+        include_archived: true,
+    };
+    assert!(
+        store
+            .read_presented_chat_list(query.clone(), None)
+            .unwrap()
+            .is_none()
+    );
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    store
+        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+        .unwrap();
+    let before: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    let snapshot = store
+        .read_presented_chat_list(query.clone(), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.rows[0].row.activity_sort_at, 19);
+    assert_eq!(snapshot.rows[0].presentation.peer_id, Some("bb".repeat(32)));
+    assert_eq!(
+        snapshot.presentation_version,
+        store.chat_presentation_version().unwrap()
+    );
+    assert!(
+        store
+            .read_presented_chat_list(query.clone(), Some("22"))
+            .unwrap()
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let after: i64 = store
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "ready reads must not repair or write");
+    store
+        .set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
+        .unwrap();
+    assert!(
+        store
+            .read_presented_chat_list(query, None)
+            .unwrap()
+            .is_none(),
+        "a new peer must not inherit the old selection"
+    );
+}

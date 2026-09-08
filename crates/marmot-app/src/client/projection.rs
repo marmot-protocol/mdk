@@ -1133,6 +1133,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidGroupMembershipPage(_) => {
             "read_marker_failed:invalid_group_membership_page"
         }
+        AppError::ChatPresentationNotReady => "read_marker_failed:chat_presentation_not_ready",
         AppError::DirectConversationIndexNotReady => {
             "read_marker_failed:direct_conversation_index_not_ready"
         }

@@ -101,6 +101,7 @@ pub enum MarmotStatus {
     ConsentRequired = 66,
     InvalidProductAnalyticsConfiguration = 67,
     InvalidProductObservation = 68,
+    ChatPresentationNotReady = 69,
 }
 
 thread_local! {
@@ -188,6 +189,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::CreatedGroupProjectionUnavailable
         }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
+        MarmotKitError::ChatPresentationNotReady => MarmotStatus::ChatPresentationNotReady,
         MarmotKitError::DirectConversationIndexNotReady => {
             MarmotStatus::DirectConversationIndexNotReady
         }

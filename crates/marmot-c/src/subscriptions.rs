@@ -1215,3 +1215,93 @@ pub unsafe extern "C" fn marmot_onboarding_subscription_snapshot(
         unsafe { deliver(Ok::<_, MarmotKitError>(sub.inner.snapshot()), out) }
     })
 }
+
+/// Account-bound complete chat-list snapshots. Free before the parent client.
+/// This fallible stream uses blocking next so storage errors retain their typed status.
+pub struct MarmotPresentedChatListSubscription {
+    core: SubscriptionCore,
+    inner: Arc<marmot_uniffi::PresentedChatListSubscription>,
+}
+/// Open a complete chat list with both invalidation sources already attached.
+/// Take the initial snapshot once, then call next. Free with marmot_presented_chat_list_subscription_free.
+/// # Safety
+/// Client and string must be valid; out_sub must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_open_presented_chat_list(
+    client: *const MarmotClient,
+    account_ref: *const std::ffi::c_char,
+    include_archived: u8,
+    out_sub: *mut *mut MarmotPresentedChatListSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        match client.block_on(
+            client
+                .marmot
+                .open_presented_chat_list(account_ref, crate::memory::c_bool(include_archived)),
+        ) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotPresentedChatListSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(err) => status_from_error(&err),
+        }
+    })
+}
+/// Take the initial snapshot with sequence zero. A second call returns CLOSED and NULL.
+/// Free the result with marmot_presented_chat_list_update_free.
+/// # Safety
+/// sub must be live; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_presented_chat_list_subscription_snapshot(
+    sub: *const MarmotPresentedChatListSubscription,
+    out: *mut *mut crate::types::presentation::MarmotPresentedChatListUpdate,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        unsafe { deliver_next(Ok(sub.inner.snapshot()), out) }
+    })
+}
+/// Read a whole replacement. timeout_ms zero waits indefinitely. Timeout/closed/error leave
+/// out NULL; timeout or a storage error does not discard the pending refresh. Retry according
+/// to the typed status. Free results with marmot_presented_chat_list_update_free.
+/// # Safety
+/// sub must be live; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_presented_chat_list_subscription_next(
+    sub: *const MarmotPresentedChatListSubscription,
+    timeout_ms: u32,
+    out: *mut *mut crate::types::presentation::MarmotPresentedChatListUpdate,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        let result = match sub
+            .core
+            .block_next(timeout_ms, async { Some(sub.inner.next().await) })
+        {
+            Ok(Some(Ok(item))) => Ok(item),
+            Ok(Some(Err(err))) => Err(status_from_error(&err)),
+            Ok(None) => Ok(None),
+            Err(status) => Err(status),
+        };
+        unsafe { deliver_next(result, out) }
+    })
+}
+/// Cancel and free a presented-list handle. NULL is a no-op.
+/// # Safety
+/// sub must be NULL or a live library-owned handle not in use by another call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_presented_chat_list_subscription_free(
+    sub: *mut MarmotPresentedChatListSubscription,
+) {
+    crate::memory::free_guard(|| unsafe { free_plain(sub) });
+}

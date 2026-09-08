@@ -41,6 +41,8 @@ pub enum MarmotKitError {
     /// direct conversation.
     #[error("direct conversation index is not ready; retry after account hydration")]
     DirectConversationIndexNotReady,
+    #[error("chat presentation preparation is incomplete; retry after local maintenance")]
+    ChatPresentationNotReady,
     #[error("invalid chat pin: {details}")]
     InvalidChatPin { details: String },
     /// Host-supplied draft attachment metadata is malformed.
@@ -308,6 +310,7 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidGroupMembershipPage(_) => Self::InvalidGroupMembershipPage {
                 max_groups: marmot_app::MAX_GROUP_MEMBER_IDS_PAGE_SIZE as u64,
             },
+            AppError::ChatPresentationNotReady => Self::ChatPresentationNotReady,
             AppError::DirectConversationIndexNotReady => Self::DirectConversationIndexNotReady,
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,

@@ -2,8 +2,6 @@
 use storage_sqlite::ChatPresentationVersion;
 use tokio::sync::{broadcast, watch};
 
-// P3 consumes the fields; P2 publishes and tests the handoff.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct PresentationInvalidation {
     pub(crate) account_label: String,
