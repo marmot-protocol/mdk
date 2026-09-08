@@ -478,14 +478,25 @@ impl<S: StorageProvider> Engine<S> {
                 "this device is no longer a member of the group",
             )));
         }
+        let mls_group = self.load_mls_group(&record.group_id)?;
+        let admins = crate::app_components::admins_of_group(&mls_group)?;
+        let unapplied_existing_admin_grant = initial_admins.iter().any(|id| {
+            !expected.contains(&hex::encode(id.as_slice()))
+                && !admins.iter().any(|admin| admin.as_slice() == id.as_slice())
+        });
         if expected.is_empty() {
             self.storage.delete_own_commit_intent(commit_id)?;
+            if unapplied_existing_admin_grant {
+                return Ok(Some(report(
+                    SupersededIntentOutcome::Conflict,
+                    "the requested members joined elsewhere; their admin grants require a new action",
+                )));
+            }
             return Ok(Some(report(
                 SupersededIntentOutcome::AlreadySatisfied,
                 "the requested members are already on the canonical branch",
             )));
         }
-        let mls_group = self.load_mls_group(&record.group_id)?;
         if let Err(error) = crate::app_components::require_admin(
             &mls_group,
             &record.group_id,
@@ -537,6 +548,12 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(())
             })?;
         self.schedule_pending_convergence_group(&record.group_id);
+        if unapplied_existing_admin_grant {
+            return Ok(Some(report(
+                SupersededIntentOutcome::Conflict,
+                "missing members were queued for reinvitation; admin grants for existing members require a new action",
+            )));
+        }
         Ok(Some(report(
             SupersededIntentOutcome::Reissued,
             "a fresh invitation has been queued against canonical membership",

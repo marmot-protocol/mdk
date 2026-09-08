@@ -861,8 +861,8 @@ impl Marmot {
         welcome_id_hex: String,
         local_state_token: String,
     ) -> Result<crate::conversions::GroupRecoveryStatusFfi, MarmotKitError> {
-        let welcome_id = cgka_traits::MessageId::new(rejoin_id_bytes(&welcome_id_hex)?);
-        let token = rejoin_id_bytes(&local_state_token)?;
+        let welcome_id = cgka_traits::MessageId::new(welcome_id_bytes(&welcome_id_hex)?);
+        let token = rejoin_token_bytes(&local_state_token)?;
         Ok(self
             .runtime
             .confirm_group_rejoin(&account_ref, &welcome_id, &token)
@@ -875,7 +875,7 @@ impl Marmot {
         account_ref: String,
         welcome_id_hex: String,
     ) -> Result<(), MarmotKitError> {
-        let welcome_id = cgka_traits::MessageId::new(rejoin_id_bytes(&welcome_id_hex)?);
+        let welcome_id = cgka_traits::MessageId::new(welcome_id_bytes(&welcome_id_hex)?);
         Ok(self
             .runtime
             .decline_group_rejoin(&account_ref, &welcome_id)
@@ -1335,14 +1335,20 @@ impl Marmot {
     }
 }
 
-fn rejoin_id_bytes(value: &str) -> Result<Vec<u8>, MarmotKitError> {
+fn welcome_id_bytes(value: &str) -> Result<Vec<u8>, MarmotKitError> {
+    hex::decode(value).map_err(|_| MarmotKitError::InvalidHex {
+        details: "invalid Welcome identifier".into(),
+    })
+}
+
+fn rejoin_token_bytes(value: &str) -> Result<Vec<u8>, MarmotKitError> {
     if value.len() != 64 {
         return Err(MarmotKitError::InvalidHex {
-            details: "rejoin identifier must contain 32 bytes".into(),
+            details: "rejoin token must contain 32 bytes".into(),
         });
     }
     hex::decode(value).map_err(|_| MarmotKitError::InvalidHex {
-        details: "invalid rejoin identifier".into(),
+        details: "invalid rejoin token".into(),
     })
 }
 
@@ -1571,8 +1577,22 @@ mod tests {
     }
 
     #[test]
-    fn rejoin_identifiers_require_exactly_32_bytes() {
-        assert_eq!(rejoin_id_bytes(&"aa".repeat(32)).unwrap(), vec![0xaa; 32]);
+    fn welcome_identifiers_preserve_opaque_lengths() {
+        for length in [8, 16, 32, 48] {
+            assert_eq!(
+                welcome_id_bytes(&"aa".repeat(length)).unwrap(),
+                vec![0xaa; length]
+            );
+        }
+        assert!(welcome_id_bytes("xyz").is_err());
+    }
+
+    #[test]
+    fn rejoin_tokens_require_exactly_32_bytes() {
+        assert_eq!(
+            rejoin_token_bytes(&"aa".repeat(32)).unwrap(),
+            vec![0xaa; 32]
+        );
         for invalid in [
             String::new(),
             "aa".repeat(16),
@@ -1580,7 +1600,7 @@ mod tests {
             "zz".repeat(32),
         ] {
             assert!(matches!(
-                rejoin_id_bytes(&invalid),
+                rejoin_token_bytes(&invalid),
                 Err(MarmotKitError::InvalidHex { .. })
             ));
         }

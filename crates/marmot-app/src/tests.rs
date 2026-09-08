@@ -110,6 +110,55 @@ async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() 
 }
 
 #[tokio::test]
+async fn rejoin_decline_does_not_require_live_mls_state() {
+    use cgka_traits::storage::{GroupStorage, MessageStorage, WelcomeStorage};
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let template_id = client.create_group("offer", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    // Keep a real Marmot record but deliberately omit its corresponding MLS rows.
+    let group_id = cgka_traits::GroupId::new(vec![0xf1; 16]);
+    let mut group = storage.get_group(&template_id).unwrap();
+    group.id = group_id.clone();
+    storage.put_group(&group).unwrap();
+    let welcome_id = cgka_traits::MessageId::new(vec![0xe1; 16]);
+    let content_id = cgka_traits::MessageId::new(vec![0xe2; 32]);
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: welcome_id.clone(),
+            group_id: group_id.clone(),
+            welcome_bytes: vec![],
+            rejoin: Some(RejoinWelcome {
+                epoch: cgka_traits::EpochId(0),
+                content_id: content_id.clone(),
+                welcomer: client.runtime.session().self_id(),
+                local_state_token: vec![],
+            }),
+        })
+        .unwrap();
+    assert!(
+        client
+            .runtime
+            .session()
+            .pending_group_rejoins()
+            .unwrap()
+            .is_empty()
+    );
+    client.pending_recovery_status_updates.clear();
+    client.decline_group_rejoin(&welcome_id).unwrap();
+    assert!(storage.list_welcomes().unwrap().is_empty());
+    assert!(storage.has_ingress_dedup_marker(&welcome_id).unwrap());
+    assert!(storage.has_ingress_dedup_marker(&content_id).unwrap());
+    assert!(client.pending_recovery_status_updates.contains(&group_id));
+}
+
+#[tokio::test]
 async fn send_finalizes_once() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

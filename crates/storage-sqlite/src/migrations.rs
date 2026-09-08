@@ -132,8 +132,6 @@ mod migration_0065_chat_presentation;
 mod migration_0066_chat_presentation_maintenance;
 #[path = "migrations/0067_invitation_recovery.rs"]
 mod migration_0067_invitation_recovery;
-#[path = "migrations/0068_recovery_failure_warning.rs"]
-mod migration_0068_recovery_failure_warning;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -486,11 +484,6 @@ const MIGRATIONS: &[Migration] = &[
         version: 67,
         name: "0067_invitation_recovery",
         apply: migration_0067_invitation_recovery::apply,
-    },
-    Migration {
-        version: 68,
-        name: "0068_recovery_failure_warning",
-        apply: migration_0068_recovery_failure_warning::apply,
     },
 ];
 
@@ -868,19 +861,13 @@ mod tests {
             "UPDATE chat_presentation_checkpoint SET generation=7, state=x'cafe' WHERE id=1;",
         )
         .unwrap();
-        run(&mut conn, &MIGRATIONS[..67]).unwrap();
-        conn.execute_batch(
-            "INSERT INTO app_group_membership_uncertainty(group_id) VALUES(x'aa');
-            INSERT INTO app_group_membership_evidence VALUES(x'aa', x'01', 1);",
-        )
-        .unwrap();
         run_all(&mut conn).unwrap();
         drop(conn);
         let mut conn = keyed_connection(&path);
         run_all(&mut conn).unwrap();
         assert_eq!(
-            applied_name(&conn, 68).unwrap().as_deref(),
-            Some("0068_recovery_failure_warning")
+            applied_name(&conn, 67).unwrap().as_deref(),
+            Some("0067_invitation_recovery")
         );
         let intent: Vec<u8> = conn
             .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
@@ -903,10 +890,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            count, 0,
-            "early warnings must not become recovery-failure claims"
-        );
+        assert_eq!(count, 0, "upgrading must not invent recovery failures");
     }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
@@ -1271,7 +1255,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 68,
+                found: 67,
                 latest_supported: 46,
             }
         ));
@@ -1327,7 +1311,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 68,
+                found: 67,
                 latest_supported: 46,
             }
         ));
@@ -1631,7 +1615,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 68,
+                found: 67,
                 latest_supported: 46,
             }
         ));

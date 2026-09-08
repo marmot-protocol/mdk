@@ -806,9 +806,20 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Validated replacement offers, bound to the current local branch.
     pub fn pending_group_rejoins(&self) -> Result<Vec<PendingWelcome>, EngineError> {
+        self.pending_group_rejoins_for(None)
+    }
+
+    /// Filter stored metadata before reading MLS state for consent tokens.
+    pub fn pending_group_rejoins_for(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> Result<Vec<PendingWelcome>, EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut candidates = Vec::new();
         for mut candidate in self.storage.list_welcomes()? {
+            if group_id.is_some_and(|id| id != &candidate.group_id) {
+                continue;
+            }
             let Some(rejoin) = &mut candidate.rejoin else {
                 continue;
             };
@@ -895,18 +906,27 @@ impl<S: StorageProvider> Engine<S> {
         local_state_token: &[u8],
     ) -> Result<GroupId, EngineError> {
         let candidate = self
-            .pending_group_rejoins()?
+            .storage
+            .list_welcomes()?
             .into_iter()
             .find(|candidate| &candidate.message_id == welcome_id)
             .ok_or(EngineError::InvalidWelcome)?;
-        let rejoin = candidate
+        candidate
             .rejoin
             .as_ref()
             .ok_or(EngineError::InvalidWelcome)?;
-        if rejoin.local_state_token != local_state_token {
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let group = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(candidate.group_id.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(candidate.group_id.clone()))?;
+        if Sha256::digest(group.epoch_authenticator().as_slice()).as_slice() != local_state_token {
             return Err(rejoin_confirmation_required());
         }
         self.ensure_hydrated(&candidate.group_id)?;
+        // Recheck the live token inside the replacement transaction below.
         let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
             .map_err(|error| EngineError::Serialize(error.to_string()))?;
         let peeled = self

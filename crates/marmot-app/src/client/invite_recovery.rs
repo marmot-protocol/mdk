@@ -55,9 +55,8 @@ impl AppClient {
         let rejoin_invitations = self
             .runtime
             .session()
-            .pending_group_rejoins()?
+            .pending_group_rejoins_for(group_id)?
             .into_iter()
-            .filter(|candidate| &candidate.group_id == group_id)
             .filter_map(|candidate| {
                 candidate.rejoin.map(|rejoin| crate::GroupRejoinInvitation {
                     welcome_id_hex: hex::encode(candidate.message_id.as_slice()),
@@ -135,18 +134,18 @@ impl AppClient {
         welcome_id: &cgka_traits::MessageId,
     ) -> Result<(), AppError> {
         let candidate = self
-            .runtime
-            .session()
-            .pending_group_rejoins()?
+            .app
+            .account_storage(&self.state.label)?
+            .list_welcomes()?
             .into_iter()
-            .find(|candidate| &candidate.message_id == welcome_id)
+            .find(|candidate| &candidate.message_id == welcome_id && candidate.rejoin.is_some())
             .ok_or(AppError::Session(cgka_session::SessionError::Engine(
                 cgka_traits::EngineError::InvalidWelcome,
             )))?;
         self.runtime
             .session_mut()
             .decline_group_rejoin(welcome_id)?;
-        self.mark_group_projection_dirty_hex(hex::encode(candidate.group_id.as_slice()));
+        self.mark_recovery_status_changed(&candidate.group_id);
         Ok(())
     }
 

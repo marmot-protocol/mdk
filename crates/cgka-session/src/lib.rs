@@ -1099,6 +1099,13 @@ impl AccountDeviceSession {
         Ok(self.engine.pending_group_rejoins()?)
     }
 
+    pub fn pending_group_rejoins_for(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
+        Ok(self.engine.pending_group_rejoins_for(Some(group_id))?)
+    }
+
     pub async fn confirm_group_rejoin(
         &mut self,
         welcome_id: &MessageId,

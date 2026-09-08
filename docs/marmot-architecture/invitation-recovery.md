@@ -8,6 +8,9 @@ using the ordinary safe directory-discovery path, bypassing the initial cache/pr
 packages consumed by the lost invitation, changed or duplicate recipient identities, and loss of inviter authority.
 Only recipients absent from the canonical roster are invited again. Fresh intent replaces the recovery record in the
 same transaction that queues it; publication uses the ordinary outbound queue and acknowledgement rules.
+If a requested admin joined through another path without that grant, recovery reports `Conflict` and asks for
+a new admin action. Invitations for missing recipients still proceed, including their requested initial grants;
+already-present admins do not cause a conflict.
 
 One lookup is reserved durably before each network attempt. Each attempt uses the ordinary 50-second
 member-resolution deadline. Eight attempts are allowed, with delays of 5 seconds, 30 seconds, 2 minutes, 10 minutes,
@@ -37,6 +40,8 @@ anchors are discarded so delayed evidence cannot restore the branch the user dis
 is preserved. Publication already in flight must resolve before replacement. Failure rolls back tentative writes;
 restart replays the join event without asking the user to accept the same rejoin again. Declining removes only the
 selected offer and records both transport and content dedup markers, including against a new wrapper of that Welcome.
+Dismissal only requires the stored offer and remains possible when live MLS state is unavailable. Per-group recovery
+queries filter offer metadata before loading MLS state; confirmation only loads the selected offer's group.
 Trusted-removal reentry and the existing Unrecoverable repair exception retain their automatic behavior.
 
 The durable `automatic_recovery_failed` flag is raised only after three relay-confirmed full-history replays
@@ -55,9 +60,7 @@ so repeated local movement may delay detection; it cannot erase an already-repor
 under the existing backoff policy after the warning is shown. The warning never changes `pending_confirmation`
 or the authoritative roster. Hosts subscribe to `GroupStateUpdated` and reread the recovery query after account open.
 
-Migration 67 gates the new serialized recovery fields against older writers. Migration 68 removes the superseded
-early-warning evidence tables and adds the recovery-failure latch; old early warnings are discarded, not promoted
-into failure claims. Replay evidence and newly earned warnings are written atomically. Authenticated recovery also
+Migration 67 gates the new serialized recovery fields against older writers and adds the recovery-failure latch. Replay evidence and newly earned warnings are written atomically. Authenticated recovery also
 clears persisted replay evidence so reopening cannot resurrect a resolved warning.
 Existing history and invitation acceptance are preserved on upgrade. An intent already deleted by a previous MDK
 version cannot be reconstructed: an affected existing group can still expose the advisory warning and recover through

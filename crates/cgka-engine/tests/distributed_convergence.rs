@@ -10688,8 +10688,14 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         stale_record,
         "an offer is not consent"
     );
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&GroupId::new(vec![0xff; 16])))
+            .unwrap()
+            .is_empty()
+    );
     let offer = carol
-        .pending_group_rejoins()
+        .pending_group_rejoins_for(Some(&group_id))
         .unwrap()
         .into_iter()
         .find(|offer| offer.message_id == replacement.id)
@@ -10854,4 +10860,93 @@ async fn reinvite_lookup_budget_and_pacing_survive_restart() {
             .reserve_reinvite_lookup(&commit_id, u64::MAX)
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn reinvite_reports_unapplied_admin_grants_without_losing_missing_recipients() {
+    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
+    for mixed in [false, true] {
+        for already_admin in [false, true] {
+            let (mut alice, storage) = build_client(b"alice");
+            let (mut bob, _) = build_client(b"bob");
+            let (mut carol, _) = build_client(b"carol");
+            let bob_kp = bob.fresh_key_package().await.unwrap();
+            let (group_id, created) = alice
+                .create_group(CreateGroupRequest {
+                    name: "canonical group".into(),
+                    description: String::new(),
+                    members: vec![bob_kp.clone()],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: if already_admin {
+                        vec![bob.self_id()]
+                    } else {
+                        vec![]
+                    },
+                })
+                .await
+                .unwrap();
+            if let SendResult::GroupCreated { pending, .. } = created {
+                alice.confirm_published(pending).await.unwrap();
+            }
+            let commit_id = MessageId::new(vec![0xa1; 16]);
+            let mut old_packages = vec![bob_kp];
+            let mut requested_admins = vec![bob.self_id()];
+            let fresh = if mixed {
+                old_packages.push(carol.fresh_key_package().await.unwrap());
+                requested_admins.push(carol.self_id());
+                vec![carol.fresh_key_package().await.unwrap()]
+            } else {
+                vec![]
+            };
+            storage
+                .put_own_commit_intent(&OwnCommitIntent {
+                    commit_id: commit_id.clone(),
+                    group_id: group_id.clone(),
+                    source_epoch: EpochId(0),
+                    intent: SendIntent::Invite {
+                        group_id: group_id.clone(),
+                        key_packages: old_packages,
+                        initial_admins: requested_admins,
+                    },
+                    baseline: OwnCommitBaseline::None,
+                    reissue_attempts: 0,
+                    created_at_ms: 0,
+                    reinvite: Some(ReinviteRetry::default()),
+                })
+                .unwrap();
+            let report = alice
+                .reissue_invite_with_key_packages(&commit_id, fresh.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                report.outcome,
+                if !already_admin {
+                    SupersededIntentOutcome::Conflict
+                } else if mixed {
+                    SupersededIntentOutcome::Reissued
+                } else {
+                    SupersededIntentOutcome::AlreadySatisfied
+                }
+            );
+            if !already_admin {
+                assert!(report.reason.contains("admin grants"));
+            }
+            assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+            let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+            assert_eq!(queued.len(), usize::from(mixed));
+            if mixed {
+                let SendIntent::Invite {
+                    key_packages,
+                    initial_admins,
+                    ..
+                } = &queued[0].intent
+                else {
+                    panic!("missing recipient invitation must remain queued");
+                };
+                assert_eq!(key_packages, &fresh);
+                assert_eq!(initial_admins, &[carol.self_id()]);
+            }
+        }
+    }
 }

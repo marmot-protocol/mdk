@@ -166,6 +166,7 @@ impl MemberKeyPackagePrewarmCache {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemberResolutionPurpose {
     Commit,
+    CommitFresh,
     Prewarm,
 }
 
@@ -251,8 +252,7 @@ impl MarmotApp {
         Ok(self
             .resolve_member_key_packages_for_purpose(
                 members.to_vec(),
-                MemberResolutionPurpose::Commit,
-                true,
+                MemberResolutionPurpose::CommitFresh,
             )
             .await?
             .key_packages)
@@ -274,32 +274,23 @@ impl MarmotApp {
             .iter()
             .map(|member_ref| (*member_ref).to_owned())
             .collect::<Vec<_>>();
-        self.resolve_member_key_packages_for_purpose(
-            member_refs,
-            MemberResolutionPurpose::Prewarm,
-            false,
-        )
-        .await
-        .map(|resolved| resolved.stats.into())
+        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Prewarm)
+            .await
+            .map(|resolved| resolved.stats.into())
     }
 
     pub(crate) async fn resolve_member_key_packages_with_stats(
         &self,
         member_refs: Vec<String>,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
-        self.resolve_member_key_packages_for_purpose(
-            member_refs,
-            MemberResolutionPurpose::Commit,
-            false,
-        )
-        .await
+        self.resolve_member_key_packages_for_purpose(member_refs, MemberResolutionPurpose::Commit)
+            .await
     }
 
     async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
-        fresh: bool,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
@@ -308,7 +299,7 @@ impl MarmotApp {
         );
         let result = match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose, fresh),
+            self.resolve_member_key_packages_inner(&member_refs, purpose),
         )
         .await
         {
@@ -332,7 +323,6 @@ impl MarmotApp {
         &self,
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
-        fresh: bool,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let directory_observation = self
             .product_analytics
@@ -375,7 +365,7 @@ impl MarmotApp {
         let mut fresh_prewarmed_routes = HashSet::new();
         let mut reused_members = 0usize;
         for (index, target) in targets.iter_mut().enumerate() {
-            if fresh {
+            if purpose == MemberResolutionPurpose::CommitFresh {
                 unresolved.push(index);
                 continue;
             }
@@ -474,7 +464,6 @@ impl MarmotApp {
                 &key_package_unresolved,
                 &mut outcomes,
                 purpose,
-                fresh,
             )
             .await;
         }
@@ -499,7 +488,7 @@ impl MarmotApp {
             }
         }
         match purpose {
-            MemberResolutionPurpose::Commit => {
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
                 for target in &targets {
                     if !target.relay_lists.nip65.relays.is_empty()
                         || !target.relay_lists.inbox.relays.is_empty()
@@ -574,7 +563,9 @@ impl MarmotApp {
             fetched.key_package.clone(),
         )?;
         match purpose {
-            MemberResolutionPurpose::Commit => self.remember_directory_key_package(&fetched)?,
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
+                self.remember_directory_key_package(&fetched)?
+            }
             MemberResolutionPurpose::Prewarm => self
                 .member_key_package_prewarm_cache
                 .lock()
@@ -841,7 +832,6 @@ impl MarmotApp {
         unresolved: &[usize],
         outcomes: &mut [Option<Result<KeyPackage, AppError>>],
         purpose: MemberResolutionPurpose,
-        fresh: bool,
     ) {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -926,7 +916,7 @@ impl MarmotApp {
                     .filter(|record| record.event.pubkey == *account_id)
                     .cloned()
                     .collect::<Vec<_>>();
-                let cached = if fresh {
+                let cached = if purpose == MemberResolutionPurpose::CommitFresh {
                     None
                 } else {
                     self.directory_entry_for_account_id(account_id)
@@ -992,7 +982,7 @@ impl MarmotApp {
                             .map_err(|error| {
                                 AppError::RelayDirectory(format!("fetch key packages: {error}"))
                             })?;
-                        let cached = if fresh {
+                        let cached = if purpose == MemberResolutionPurpose::CommitFresh {
                             None
                         } else {
                             app.directory_entry_for_account_id(&target.account_id_hex)?
