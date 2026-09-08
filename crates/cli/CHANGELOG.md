@@ -9,8 +9,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-09-08
+
 ### Added
 
+- Durable chat names and avatars, background presentation maintenance, and
+  complete presented chat-list reads and subscriptions across the runtime,
+  Swift/Kotlin, and C bindings.
+- First-class Hermes plugin packaging and media dispatch.
 - Added `usage-diagnostics show|enable|disable` with JSON output and live daemon
   routing. One explicit local consent controls OTLP and stock Aptabase exports;
   prior telemetry users reconfirm. Standalone commands and TUI children are silent
@@ -18,6 +24,18 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Account databases advance through migrations 65–67 for durable chat
+  presentation, background maintenance checkpoints, and invitation recovery.
+  Shared storage advances through versions 2–3 for diagnostics consent and
+  profile-change tracking. Back up before upgrading; downgrade is unsupported.
+  Re-upgrade or restore a pre-upgrade database/export instead of removing
+  migration rows. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before `0.9.15` also cross migration 47: keep at least 3.25
+  times the account database size free for its history-table rebuild and
+  gradual post-readiness promotion. The 2,048-row release check measured a
+  4.01-times peak footprint (3.01 times additional space), a 6,159 ms migration,
+  4,916 ms promotion, and 146 ms slowest 32-row batch.
 - Interactive onboarding cancellation now ends approved, interrupted, or ready
   sign-in attempts, keeps the account signed out, and retains uncertain
   publication evidence for a later explicit restart. Late publication or signer
@@ -29,6 +47,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   uncertain publications. Explicit recovery retains opaque historical bytes
   and starts a fresh approval epoch; Swift/Kotlin/C hosts use the epoch-aware
   approval APIs for recovered attempts.
+
+### Fixed
+
+- Invitations superseded by convergence recover through durable reinvite and
+  rejoin state, including after restart.
+- Transport receipt synchronization uses one account-owned boundary, and
+  message-latency measurements cover recovery gating.
+- Audit uploads stop retrying files rejected with a bare HTTP 413 response.
+- Directory caches bound retained unknown profile metadata.
 
 ## [0.9.19] - 2026-09-07
 
@@ -2095,7 +2122,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.20...HEAD
+[0.9.20]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...v0.9.19
 [0.9.18]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...v0.9.17
