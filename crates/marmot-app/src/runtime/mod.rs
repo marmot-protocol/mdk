@@ -7092,6 +7092,20 @@ impl AccountManager {
             let _ = task.await;
         }
         let _worker_transaction = self.worker_transactions.lock().await;
+        // An admitted cancellation or reconcile can register a worker reaper
+        // after the first handle snapshot. Cancellation tasks have now joined,
+        // and this lock excludes every remaining reaper producer. Reapers do
+        // not acquire worker_transactions, so they can safely be joined here.
+        let onboarding_reapers = {
+            let mut tasks = self
+                .onboarding_cancellations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut tasks.handles)
+        };
+        for task in onboarding_reapers {
+            let _ = task.await;
+        }
         let workers = {
             let mut workers = self.workers.lock().await;
             workers

@@ -1562,10 +1562,13 @@ async fn cancel_between_liveness_and_activation_keeps_account_signed_out() {
         let account = id.clone();
         async move { manager.run_onboarding(&account).await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     manager.cancel_onboarding(&id).await.unwrap();
     hold.release.notify_one();
-    let _ = task.await.unwrap();
+    let _ = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("retired onboarding operation did not stop")
+        .unwrap();
     assert!(manager.resolve(&id).unwrap().signed_out);
     assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
     assert!(network.attempts.lock().unwrap().is_empty());
@@ -1588,10 +1591,13 @@ async fn cancel_between_liveness_and_publish_admission_does_not_send() {
         let revision = proposal.revision;
         async move { manager.approve_onboarding_repair(&account, revision).await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     runtime.accounts().cancel_onboarding(&id).await.unwrap();
     hold.release.notify_one();
-    let _ = task.await.unwrap();
+    let _ = timeout(Duration::from_secs(2), task)
+        .await
+        .expect("retired onboarding operation did not stop")
+        .unwrap();
     assert!(network.attempts.lock().unwrap().is_empty());
     assert!(
         runtime
@@ -1630,7 +1636,7 @@ async fn dropped_reconcile_during_worker_reap_still_reaps() {
         let manager = manager.clone();
         async move { manager.reconcile().await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     reconcile.abort();
     let _ = reconcile.await;
     assert!(!manager.onboarding_worker_tracked(&id).await);
@@ -1640,8 +1646,12 @@ async fn dropped_reconcile_during_worker_reap_still_reaps() {
         let account = id.clone();
         async move { manager.cancel_onboarding(&account).await }
     });
-    hold.release.notify_waiters();
-    cancel.await.unwrap().unwrap();
+    hold.release.notify_one();
+    timeout(Duration::from_secs(2), cancel)
+        .await
+        .expect("cancellation did not finish reaping")
+        .unwrap()
+        .unwrap();
     assert!(!manager.onboarding_worker_tracked(&id).await);
     assert!(!manager.onboarding_worker_reap_in_flight(&id));
     assert!(manager.resolve(&id).unwrap().signed_out);
@@ -1778,10 +1788,16 @@ async fn cancel_during_ready_cleanup_hold_retains_setup() {
         let account = id.clone();
         async move { manager.run_onboarding(&account).await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     manager.cancel_onboarding(&id).await.unwrap();
-    hold.release.notify_waiters();
-    assert!(running.await.unwrap().is_err());
+    hold.release.notify_one();
+    assert!(
+        timeout(Duration::from_secs(2), running)
+            .await
+            .expect("retired setup cleanup did not stop")
+            .unwrap()
+            .is_err()
+    );
     assert_eq!(
         manager
             .app
@@ -1962,12 +1978,27 @@ async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
         let account = id.clone();
         async move { manager.cancel_onboarding(&account).await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     first.abort();
     let _ = first.await;
     assert!(manager.onboarding_worker_reap_in_flight(&id));
-    hold.release.notify_waiters();
-    manager.await_onboarding_worker_reap_finished(&id).await;
+    let mut completed = manager
+        .onboarding_cancellations
+        .lock()
+        .unwrap()
+        .reaping
+        .get(&id)
+        .unwrap()
+        .subscribe();
+    hold.release.notify_one();
+    // Let cancellation consume and remove the map entry before observing the
+    // retained receiver, reproducing the ordering that broke the old poller.
+    manager.await_onboarding_owned_handles_finished().await;
+    assert!(manager.onboarding_worker_reap_watch_state(&id).is_none());
+    timeout(Duration::from_secs(2), completed.wait_for(|done| *done))
+        .await
+        .expect("worker reap did not complete")
+        .expect("worker reap dropped without completion");
     assert!(!manager.onboarding_worker_reap_in_flight(&id));
     manager.cancel_onboarding(&id).await.unwrap();
     assert!(!manager.onboarding_worker_tracked(&id).await);
@@ -2009,7 +2040,7 @@ async fn dropped_reconcile_reap_completes_with_zero_receivers_then_restarts() {
         let manager = manager.clone();
         async move { manager.reconcile().await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     reconcile.abort();
     let _ = reconcile.await;
     assert!(!manager.onboarding_worker_tracked(&id).await);
@@ -2018,7 +2049,7 @@ async fn dropped_reconcile_reap_completes_with_zero_receivers_then_restarts() {
         manager.onboarding_worker_reap_watch_state(&id),
         Some((false, 0))
     );
-    hold.release.notify_waiters();
+    hold.release.notify_one();
     manager.await_onboarding_owned_handles_finished().await;
     assert_eq!(
         manager.onboarding_worker_reap_watch_state(&id),
@@ -2064,7 +2095,7 @@ async fn timed_out_reap_waiter_retains_completion_through_shutdown() {
         let manager = manager.clone();
         async move { manager.reconcile().await }
     });
-    hold.entered.notified().await;
+    hold.wait_until_entered().await;
     reconcile.abort();
     let _ = reconcile.await;
     let timed_out = manager
@@ -2075,13 +2106,80 @@ async fn timed_out_reap_waiter_retains_completion_through_shutdown() {
         Err(AppError::AccountWorkerResponseTimedOut)
     ));
     assert!(manager.onboarding_worker_reap_in_flight(&id));
-    hold.release.notify_waiters();
+    hold.release.notify_one();
     manager.await_onboarding_owned_handles_finished().await;
     assert_eq!(
         manager.onboarding_worker_reap_watch_state(&id),
         Some((true, 0))
     );
     assert!(!manager.onboarding_worker_tracked(&id).await);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_reaps_late_onboarding_worker_after_reconcile_is_dropped() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    checkpoint.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut checkpoint).unwrap();
+
+    let recovery = OnboardingTestHold::new();
+    *manager
+        .onboarding_test_holds
+        .cancellation_recovery
+        .lock()
+        .unwrap() = Some(recovery.clone());
+    let reap = manager.install_onboarding_worker_reap_hold();
+    let reconcile = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.reconcile().await }
+    });
+    recovery.wait_until_entered().await;
+
+    // Poll shutdown through its initial handle snapshot. Reconcile still owns
+    // worker_transactions, so shutdown must wait before draining the workers.
+    let shutdown = manager.shutdown();
+    tokio::pin!(shutdown);
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert!(!manager.onboarding_cancellations.lock().unwrap().accepting);
+    recovery.release.notify_one();
+    reap.wait_until_entered().await;
+    assert!(!manager.onboarding_worker_tracked(&id).await);
+    reconcile.abort();
+    timeout(Duration::from_secs(2), reconcile)
+        .await
+        .expect("reconcile did not stop")
+        .unwrap_err();
+
+    // The only worker is now owned by a reaper added AFTER that snapshot.
+    // Shutdown must await it even though the worker map is already empty.
+    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    reap.release.notify_one();
+    timeout(Duration::from_secs(2), &mut shutdown)
+        .await
+        .expect("shutdown did not reap the late worker");
+    assert_eq!(
+        manager.onboarding_worker_reap_watch_state(&id),
+        Some((true, 0))
+    );
+    assert!(
+        manager
+            .onboarding_cancellations
+            .lock()
+            .unwrap()
+            .handles
+            .is_empty()
+    );
     runtime.shutdown_and_close().await.unwrap();
 }
 

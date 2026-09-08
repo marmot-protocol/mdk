@@ -18,6 +18,9 @@ impl AccountManager {
     }
 
     pub(crate) async fn finish_pending_onboarding_cancellations(&self) {
+        #[cfg(test)]
+        self.await_onboarding_test_hold(&self.onboarding_test_holds.cancellation_recovery)
+            .await;
         let accounts = match self.app.account_home().accounts() {
             Ok(accounts) => accounts,
             Err(error) => {

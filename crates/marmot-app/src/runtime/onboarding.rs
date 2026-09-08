@@ -43,6 +43,12 @@ impl OnboardingTestHold {
             release: Notify::new(),
         })
     }
+
+    pub async fn wait_until_entered(&self) {
+        timeout(Duration::from_secs(2), self.entered.notified())
+            .await
+            .expect("onboarding operation did not enter the test hold");
+    }
 }
 
 #[cfg(test)]
@@ -52,6 +58,7 @@ pub(super) struct OnboardingTestHolds {
     pub publication: StdMutex<Option<Arc<OnboardingTestHold>>>,
     pub setup_cleanup: StdMutex<Option<Arc<OnboardingTestHold>>>,
     pub worker_reap: StdMutex<Option<Arc<OnboardingTestHold>>>,
+    pub cancellation_recovery: StdMutex<Option<Arc<OnboardingTestHold>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -737,25 +744,6 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         !tasks.handles.is_empty() && tasks.handles.iter().all(JoinHandle::is_finished)
-    }
-    #[cfg(test)]
-    pub(crate) async fn await_onboarding_worker_reap_finished(&self, account_id: &str) {
-        let finished = timeout(Duration::from_secs(2), async {
-            loop {
-                if self
-                    .onboarding_worker_reap_watch_state(account_id)
-                    .is_some_and(|(completed, _)| completed)
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        assert!(
-            finished.is_ok(),
-            "worker reap did not retain completion within the test bound"
-        );
     }
     #[cfg(test)]
     pub(crate) async fn await_onboarding_owned_handles_finished(&self) {
