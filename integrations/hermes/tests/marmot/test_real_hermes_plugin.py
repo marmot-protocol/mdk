@@ -301,6 +301,13 @@ async def _run_busy_session_until_killed(
     await adapter._handle_control_event(inbound(followup_id, "busy follow-up"))
     await adapter._inbound_queue.join()
 
+    # Current Hermes queue mode first holds busy text in a bounded debounce
+    # slot, then flushes it into _pending_messages. Keep the first handler
+    # blocked and wait for that real host transition rather than assuming the
+    # pending slot is populated synchronously by handle_message().
+    deadline = time.monotonic() + 2.0
+    while not adapter._pending_messages and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
     if not adapter._pending_messages:
         raise AssertionError("real Hermes did not take the busy-session pending path")
     before_crash = adapter._inbound_spool.get(followup_id)
