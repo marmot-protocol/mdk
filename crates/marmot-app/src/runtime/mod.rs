@@ -188,6 +188,9 @@ pub struct AccountManager {
     onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
     onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
     onboarding_cancellations: Arc<StdMutex<OnboardingCancellationTasks>>,
+    onboarding_retirements: Arc<StdMutex<HashMap<String, watch::Sender<u64>>>>,
+    #[cfg(test)]
+    onboarding_test_holds: Arc<OnboardingTestHolds>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
@@ -4788,7 +4791,11 @@ impl AccountManager {
                 accepting: true,
                 inflight: HashMap::new(),
                 handles: Vec::new(),
+                reaping: HashMap::new(),
             })),
+            onboarding_retirements: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(test)]
+            onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {

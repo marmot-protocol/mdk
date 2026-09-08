@@ -16,6 +16,7 @@ struct Network {
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
     publishing: Notify,
+    release_publish: Notify,
 }
 #[async_trait]
 impl DirectoryRelayFetcher for Network {
@@ -464,7 +465,7 @@ impl NostrRelayClient for Network {
         self.attempts.lock().unwrap().push(event.clone());
         self.publishing.notify_one();
         if self.block_publish.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
+            self.release_publish.notified().await;
         }
         if self.zero_acks.load(Ordering::SeqCst) {
             return Ok(NostrPublishOutcome::default());
@@ -1203,4 +1204,575 @@ async fn cancelled_account_is_not_auto_signed_in_on_reopen() {
     assert!(account.signed_out);
     assert!(!reopened.accounts().managed_accounts().unwrap()[0].running);
     reopened.shutdown_and_close().await.unwrap();
+}
+
+async fn approve_blocked_repair(
+    runtime: &MarmotAppRuntime,
+    network: &Network,
+    id: &str,
+    step: OnboardingStep,
+) -> (
+    OnboardingSnapshot,
+    tokio::task::JoinHandle<Result<OnboardingSnapshot, AppError>>,
+) {
+    let manager = runtime.accounts();
+    let proposal = match step {
+        OnboardingStep::Profile => {
+            manager.run_onboarding(id).await.unwrap();
+            manager
+                .propose_onboarding_profile(
+                    id,
+                    UserProfileMetadata {
+                        name: Some("repair".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        }
+        OnboardingStep::Follows => {
+            manager.run_onboarding(id).await.unwrap();
+            manager
+                .continue_onboarding_without(id, OnboardingStep::Profile)
+                .await
+                .unwrap();
+            manager
+                .propose_onboarding_follows(id, vec![nostr::Keys::generate().public_key().to_hex()])
+                .await
+                .unwrap()
+        }
+        OnboardingStep::Relays => {
+            missing_relays(runtime, id).await;
+            manager
+                .propose_onboarding_relays(id, OnboardingStep::Relays, None)
+                .await
+                .unwrap()
+        }
+        OnboardingStep::InboxRelays => {
+            missing_relays(runtime, id).await;
+            let mut checkpoint = manager.onboarding_checkpoint(id).unwrap().unwrap();
+            checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
+            checkpoint.set(
+                OnboardingStep::InboxRelays,
+                OnboardingStatus::NeedsInput,
+                vec![finding(OnboardingIssue::Missing)],
+            );
+            manager.save_onboarding(&mut checkpoint).unwrap();
+            manager
+                .propose_onboarding_relays(id, OnboardingStep::InboxRelays, None)
+                .await
+                .unwrap()
+        }
+        _ => panic!("unsupported repair step"),
+    };
+    network.block_publish.store(true, Ordering::SeqCst);
+    let account = id.to_owned();
+    let revision = proposal.revision;
+    let task = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.approve_onboarding_repair(&account, revision).await }
+    });
+    network.publishing.notified().await;
+    (proposal, task)
+}
+
+async fn assert_cancelled_and_fresh(
+    runtime: &MarmotAppRuntime,
+    network: &Network,
+    keys: &nostr::Keys,
+    id: &str,
+    previous_sends: usize,
+) {
+    let manager = runtime.accounts();
+    assert!(manager.onboarding_snapshot(id).unwrap().is_none());
+    assert!(manager.resolve(id).unwrap().signed_out);
+    assert!(!manager.managed_accounts().unwrap()[0].running);
+    assert_eq!(network.attempts.lock().unwrap().len(), previous_sends);
+    let resumed = manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert!(!resumed.ready && !resumed.cancellation_pending && resumed.proposal.is_none());
+    manager.run_onboarding(id).await.unwrap();
+    assert_eq!(network.attempts.lock().unwrap().len(), previous_sends);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_publish_responses_do_not_resurrect_cancelled_repairs() {
+    for (step, zero_acks) in [
+        (OnboardingStep::Profile, false),
+        (OnboardingStep::Follows, true),
+        (OnboardingStep::Relays, false),
+        (OnboardingStep::InboxRelays, true),
+    ] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        network.zero_acks.store(zero_acks, Ordering::SeqCst);
+        let (_proposal, task) = approve_blocked_repair(&runtime, &network, &id, step).await;
+        runtime.accounts().cancel_onboarding(&id).await.unwrap();
+        network.block_publish.store(false, Ordering::SeqCst);
+        network.release_publish.notify_waiters();
+        let _ = task.await.unwrap();
+        let sends = network.attempts.lock().unwrap().len();
+        assert_cancelled_and_fresh(&runtime, &network, &keys, &id, sends).await;
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_publish_does_not_overwrite_a_newer_attempt() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let (_proposal, task) =
+        approve_blocked_repair(&runtime, &network, &id, OnboardingStep::Relays).await;
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    let first_attempt = runtime
+        .accounts()
+        .app
+        .account_home()
+        .cancelled_account_onboarding(&id)
+        .unwrap()
+        .unwrap();
+    let first: OnboardingCheckpoint = serde_json::from_slice(&first_attempt).unwrap();
+    runtime
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    let newer = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(newer.attempt_start_revision, first.attempt_start_revision);
+    network.block_publish.store(false, Ordering::SeqCst);
+    network.release_publish.notify_waiters();
+    let _ = task.await.unwrap();
+    let after = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.attempt_start_revision, newer.attempt_start_revision);
+    assert!(!after.approved && after.signed_repair.is_none());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_during_blocked_publish_releases_begin_without_aborting_caller() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let (_proposal, task) =
+        approve_blocked_repair(&runtime, &network, &id, OnboardingStep::Relays).await;
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    let signed = network.attempts.lock().unwrap()[0].clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.accounts().begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let queued = runtime
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::Profile)
+        .await;
+    assert!(queued.is_err());
+    let archives = {
+        let cancelled = runtime
+            .accounts()
+            .app
+            .account_home()
+            .cancelled_account_onboarding(&id)
+            .unwrap()
+            .unwrap();
+        let archived: OnboardingCheckpoint = serde_json::from_slice(&cancelled).unwrap();
+        archived
+    };
+    assert!(archives.approved);
+    assert_eq!(archives.signed_repair, Some(signed));
+    let _ = task.await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[derive(Clone)]
+struct BlockingSigner {
+    keys: nostr::Keys,
+    block: Arc<AtomicBool>,
+    started: Arc<Notify>,
+}
+
+impl std::fmt::Debug for BlockingSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingSigner").finish_non_exhaustive()
+    }
+}
+
+impl nostr::NostrSigner for BlockingSigner {
+    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
+        self.keys.backend()
+    }
+    fn get_public_key(
+        &self,
+    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
+        self.keys.get_public_key()
+    }
+    fn sign_event(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
+        let keys = self.keys.clone();
+        let block = self.block.clone();
+        let started = self.started.clone();
+        Box::pin(async move {
+            started.notify_one();
+            if block.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            keys.sign_event(unsigned).await
+        })
+    }
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip04_encrypt(public_key, content)
+    }
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        encrypted_content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip04_decrypt(public_key, encrypted_content)
+    }
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip44_encrypt(public_key, content)
+    }
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        payload: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip44_decrypt(public_key, payload)
+    }
+}
+
+impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for BlockingSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match test signer".into());
+        }
+        let event = request.proof_event().and_then(|event| {
+            event
+                .sign_with_keys(&self.keys)
+                .map_err(|err| err.to_string())
+        })?;
+        request.signature_from_signed_event(event)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(directory.path(), network.clone());
+    let keys = nostr::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let block = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(Notify::new());
+    runtime
+        .accounts()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            BlockingSigner {
+                keys: keys.clone(),
+                block: block.clone(),
+                started: started.clone(),
+            },
+            options(),
+        )
+        .await
+        .unwrap();
+    missing_relays(&runtime, &id).await;
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    block.store(true, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let manager = runtime.accounts();
+        let account = id.clone();
+        let revision = proposal.revision;
+        async move { manager.approve_onboarding_repair(&account, revision).await }
+    });
+    started.notified().await;
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.accounts().begin_external_signer_onboarding(
+            id.clone(),
+            BlockingSigner {
+                keys: keys.clone(),
+                block: Arc::new(AtomicBool::new(false)),
+                started: Arc::new(Notify::new()),
+            },
+            options(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let _ = task.await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_between_liveness_and_activation_keeps_account_signed_out() {
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for step in [
+        OnboardingStep::Profile,
+        OnboardingStep::Follows,
+        OnboardingStep::Relays,
+        OnboardingStep::InboxRelays,
+        OnboardingStep::SingleDevice,
+    ] {
+        c.set(step, OnboardingStatus::Passed, vec![]);
+    }
+    manager.save_onboarding(&mut c).unwrap();
+    let hold = manager.install_onboarding_activation_hold();
+    let task = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move { manager.run_onboarding(&account).await }
+    });
+    hold.entered.notified().await;
+    manager.cancel_onboarding(&id).await.unwrap();
+    hold.release.notify_one();
+    let _ = task.await.unwrap();
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(network.attempts.lock().unwrap().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_between_liveness_and_publish_admission_does_not_send() {
+    let (_dir, runtime, network, _keys, id) = fixture().await;
+    missing_relays(&runtime, &id).await;
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    let hold = runtime.accounts().install_onboarding_publication_hold();
+    let task = tokio::spawn({
+        let manager = runtime.accounts();
+        let account = id.clone();
+        let revision = proposal.revision;
+        async move { manager.approve_onboarding_repair(&account, revision).await }
+    });
+    hold.entered.notified().await;
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    hold.release.notify_one();
+    let _ = task.await.unwrap();
+    assert!(network.attempts.lock().unwrap().is_empty());
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(runtime.accounts().resolve(&id).unwrap().signed_out);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_reconcile_during_worker_reap_still_reaps() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, false)
+        .unwrap();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut c).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    let mut pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    pending.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut pending).unwrap();
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let reconcile = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.reconcile().await }
+    });
+    hold.entered.notified().await;
+    reconcile.abort();
+    let _ = reconcile.await;
+    assert!(!manager.onboarding_worker_tracked(&id).await);
+    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    let cancel = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move { manager.cancel_onboarding(&account).await }
+    });
+    hold.release.notify_waiters();
+    cancel.await.unwrap().unwrap();
+    assert!(!manager.onboarding_worker_tracked(&id).await);
+    assert!(!manager.onboarding_worker_reap_in_flight(&id));
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+fn write_cancelled_checkpoint(dir: &std::path::Path, id: &str, value: serde_json::Value) {
+    let path = dir
+        .join("accounts")
+        .join(id)
+        .join("onboarding-cancelled.json");
+    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
+    let (dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut c).unwrap();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, true)
+        .unwrap();
+    manager
+        .app
+        .account_home()
+        .archive_account_onboarding(&id)
+        .unwrap();
+    let mut unsupported = serde_json::to_value(&c).unwrap();
+    unsupported["version"] = serde_json::json!(999);
+    write_cancelled_checkpoint(dir.path(), &id, unsupported);
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    let mut empty = serde_json::to_value(&c).unwrap();
+    empty["snapshot"]["steps"] = serde_json::json!([]);
+    empty["records"] = serde_json::json!([]);
+    write_cancelled_checkpoint(dir.path(), &id, empty);
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_err()
+    );
+    let mut order = serde_json::to_value(&c).unwrap();
+    order["snapshot"]["steps"][0]["step"] = serde_json::json!("Follows");
+    write_cancelled_checkpoint(dir.path(), &id, order);
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_err()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
+    let (dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut c).unwrap();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, true)
+        .unwrap();
+    manager
+        .app
+        .account_home()
+        .archive_account_onboarding(&id)
+        .unwrap();
+    let mut v2 = serde_json::to_value(&c).unwrap();
+    v2["version"] = serde_json::json!(2);
+    write_cancelled_checkpoint(dir.path(), &id, v2);
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_ok()
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    let mut v1 = serde_json::to_value(&c).unwrap();
+    v1["version"] = serde_json::json!(1);
+    v1["snapshot"]["steps"].as_array_mut().unwrap().remove(4);
+    v1["records"].as_array_mut().unwrap().remove(4);
+    write_cancelled_checkpoint(dir.path(), &id, v1);
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_ok()
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    let mut overflow = serde_json::to_value(&c).unwrap();
+    overflow["snapshot"]["revision"] = serde_json::json!(u64::MAX);
+    overflow["attempt_start_revision"] = serde_json::json!(u64::MAX);
+    overflow["snapshot"]["cancellation_pending"] = serde_json::json!(true);
+    write_cancelled_checkpoint(dir.path(), &id, overflow);
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    runtime.shutdown_and_close().await.unwrap();
 }

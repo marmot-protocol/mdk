@@ -1,6 +1,7 @@
 //! Reversible exit from onboarding; no relay deletions or local identity wipe.
 use super::*;
 use crate::APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT;
+use crate::runtime::ManagedAccountWorker;
 
 impl AccountManager {
     /// Cancel an interactive onboarding attempt at any step, including approved
@@ -89,6 +90,10 @@ impl AccountManager {
             step.actions = vec![OnboardingAction::CancelOnboarding];
         }
         self.save_onboarding_locked(&mut checkpoint)?;
+        self.publish_onboarding_retirement(
+            &account.account_id_hex,
+            checkpoint.attempt_start_revision,
+        );
         Ok(Some((account, checkpoint.attempt_start_revision)))
     }
 
@@ -122,6 +127,11 @@ impl AccountManager {
         {
             return existing.outcome.subscribe();
         }
+        if !tasks.accepting {
+            let (sender, receiver) = watch::channel(Some(OnboardingCancelOutcome::Failed));
+            let _ = sender;
+            return receiver;
+        }
         let (sender, receiver) = watch::channel(None);
         tasks.inflight.insert(
             account.account_id_hex.clone(),
@@ -130,32 +140,28 @@ impl AccountManager {
                 outcome: sender.clone(),
             },
         );
-        if tasks.accepting {
-            let manager = self.clone();
-            let account = account.clone();
-            tasks.handles.push(tokio::spawn(async move {
-                let outcome = match manager
-                    .complete_onboarding_cancellation(&account, attempt, false)
-                    .await
-                {
-                    Ok(()) => OnboardingCancelOutcome::Succeeded,
-                    Err(AppError::AccountWorkerResponseTimedOut) => {
-                        OnboardingCancelOutcome::TimedOut
-                    }
-                    Err(_) => OnboardingCancelOutcome::Failed,
-                };
-                let _ = sender.send(Some(outcome));
-                let mut tasks = manager
-                    .onboarding_cancellations
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if let Some(current) = tasks.inflight.get(&account.account_id_hex)
-                    && current.attempt == attempt
-                {
-                    tasks.inflight.remove(&account.account_id_hex);
-                }
-            }));
-        }
+        let manager = self.clone();
+        let account = account.clone();
+        tasks.handles.push(tokio::spawn(async move {
+            let outcome = match manager
+                .complete_onboarding_cancellation(&account, attempt, false)
+                .await
+            {
+                Ok(()) => OnboardingCancelOutcome::Succeeded,
+                Err(AppError::AccountWorkerResponseTimedOut) => OnboardingCancelOutcome::TimedOut,
+                Err(_) => OnboardingCancelOutcome::Failed,
+            };
+            let _ = sender.send(Some(outcome));
+            let mut tasks = manager
+                .onboarding_cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(current) = tasks.inflight.get(&account.account_id_hex)
+                && current.attempt == attempt
+            {
+                tasks.inflight.remove(&account.account_id_hex);
+            }
+        }));
         receiver
     }
 
@@ -208,10 +214,17 @@ impl AccountManager {
         let result = async {
             let worker = self.workers.lock().await.remove(&account.account_id_hex);
             if let Some(worker) = worker {
-                worker
-                    .shutdown_with_timeout(budget.min(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT))
-                    .await;
+                self.start_tracked_worker_reap(
+                    &account.account_id_hex,
+                    worker,
+                    budget.min(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT),
+                );
             }
+            self.await_tracked_worker_reap(
+                &account.account_id_hex,
+                budget.min(APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT),
+            )
+            .await?;
             self.app.drop_account_caches(&account.label);
             let setup = self
                 .app
@@ -262,17 +275,92 @@ impl AccountManager {
         else {
             return Ok(());
         };
-        let previous: OnboardingCheckpoint =
-            serde_json::from_slice(&bytes).map_err(|_| onboarding_error())?;
-        if previous.snapshot.account_id_hex != account.account_id_hex {
-            return Err(onboarding_error());
-        }
+        let previous = decode_onboarding_checkpoint(&bytes, &account.account_id_hex)?;
         if previous.holds_uncertain_publication() {
             self.app
                 .account_home()
                 .retain_account_onboarding_repair_archive(&account.label, &bytes)?;
         }
         Ok(())
+    }
+
+    fn start_tracked_worker_reap(
+        &self,
+        account_id: &str,
+        worker: ManagedAccountWorker,
+        budget: Duration,
+    ) {
+        let mut tasks = self
+            .onboarding_cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if tasks.reaping.contains_key(account_id) {
+            return;
+        }
+        let (sender, _) = watch::channel(false);
+        tasks.reaping.insert(account_id.to_owned(), sender.clone());
+        #[cfg(test)]
+        let hold = self
+            .onboarding_test_holds
+            .worker_reap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        tasks.handles.push(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                hold.entered.notify_one();
+                hold.release.notified().await;
+            }
+            worker.shutdown_with_timeout(budget).await;
+            let _ = sender.send(true);
+        }));
+    }
+
+    async fn await_tracked_worker_reap(
+        &self,
+        account_id: &str,
+        budget: Duration,
+    ) -> Result<(), AppError> {
+        let mut receiver = {
+            let tasks = self
+                .onboarding_cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match tasks.reaping.get(account_id) {
+                Some(sender) => sender.subscribe(),
+                None => return Ok(()),
+            }
+        };
+        match timeout(budget, async {
+            loop {
+                if *receiver.borrow() {
+                    return Ok(());
+                }
+                if receiver.changed().await.is_err() {
+                    return Err(onboarding_error());
+                }
+            }
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                let mut tasks = self
+                    .onboarding_cancellations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if tasks
+                    .reaping
+                    .get(account_id)
+                    .is_some_and(|sender| *sender.borrow())
+                {
+                    tasks.reaping.remove(account_id);
+                }
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(AppError::AccountWorkerResponseTimedOut),
+        }
     }
 
     fn close_onboarding_subscription(&self, account_id: &str, snapshot: &OnboardingSnapshot) {

@@ -236,6 +236,18 @@ mod tests {
         }
     }
 
+    fn patch_onboarding_checkpoint(
+        root: &std::path::Path,
+        id: &str,
+        patch: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let path = root.join("accounts").join(id).join("onboarding.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("checkpoint")).expect("json");
+        patch(&mut value);
+        std::fs::write(path, serde_json::to_vec(&value).expect("serialize")).expect("write");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_onboarding_maps_approved_and_ready_attempts_to_signed_out_unit() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -249,7 +261,18 @@ mod tests {
             .await
             .expect("begin");
         assert!(!snapshot.ready);
-        kit.cancel_onboarding(id.clone()).await.expect("cancel");
+        patch_onboarding_checkpoint(root.path(), &id, |value| {
+            value["approved"] = serde_json::json!(true);
+        });
+        let subscription = kit
+            .subscribe_onboarding(id.clone())
+            .expect("subscribe approved");
+        kit.cancel_onboarding(id.clone())
+            .await
+            .expect("cancel approved");
+        let terminal = subscription.next().await.expect("terminal snapshot");
+        assert!(terminal.cancellation_pending && !terminal.ready);
+        assert!(subscription.next().await.is_none());
         kit.cancel_onboarding(id.clone())
             .await
             .expect("repeat cancel is a no-op");
@@ -259,6 +282,21 @@ mod tests {
             .await
             .expect("explicit restart");
         assert!(!again.ready && !again.cancellation_pending);
+        patch_onboarding_checkpoint(root.path(), &id, |value| {
+            for step in value["snapshot"]["steps"].as_array_mut().expect("steps") {
+                step["status"] = serde_json::json!("Passed");
+            }
+            value["snapshot"]["ready"] = serde_json::json!(true);
+        });
+        let ready = kit
+            .onboarding_snapshot(id.clone())
+            .expect("ready snapshot")
+            .expect("present");
+        assert!(ready.ready);
+        kit.cancel_onboarding(id.clone())
+            .await
+            .expect("cancel ready");
+        assert!(kit.onboarding_snapshot(id.clone()).unwrap().is_none());
         kit.runtime.shutdown().await;
     }
 }

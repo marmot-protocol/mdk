@@ -13,7 +13,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Interactive onboarding cancellation now ends approved, interrupted, or ready
   sign-in attempts, keeps the account signed out, and retains uncertain
-  publication evidence for a later explicit restart.
+  publication evidence for a later explicit restart. Late publication or signer
+  responses cannot revive a cancelled attempt, and a fresh explicit begin no
+  longer waits for the retired operation.
 
 ## [0.9.19] - 2026-09-07
 
