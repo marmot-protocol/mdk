@@ -228,11 +228,12 @@ mod tests {
     use super::*;
     use marmot_app::MarmotApp;
     use nostr::prelude::ToBech32;
+    use nostr_relay_builder::MockRelay;
 
-    fn options() -> OnboardingOptionsFfi {
+    fn options(relay_url: String) -> OnboardingOptionsFfi {
         OnboardingOptionsFfi {
-            default_relays: vec!["wss://default.example".into()],
-            discovery_relays: vec!["wss://index.example".into()],
+            default_relays: vec![relay_url.clone()],
+            discovery_relays: vec![relay_url],
         }
     }
 
@@ -248,22 +249,47 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&value).expect("serialize")).expect("write");
     }
 
+    fn repair_archive_count(root: &std::path::Path, id: &str) -> usize {
+        std::fs::read_dir(
+            root.join("accounts")
+                .join(id)
+                .join("onboarding-repair-archive"),
+        )
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_onboarding_maps_approved_and_ready_attempts_to_signed_out_unit() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
         let root = tempfile::tempdir().expect("tempdir");
-        let app = MarmotApp::with_relay(root.path(), "wss://default.example");
+        let app = MarmotApp::with_relay(root.path(), relay_url.clone());
         let runtime = app.runtime();
         let kit = Marmot { app, runtime };
         let keys = nostr::Keys::generate();
         let id = keys.public_key().to_hex();
         let snapshot = kit
-            .begin_onboarding(keys.secret_key().to_bech32().unwrap(), options())
+            .begin_onboarding(
+                keys.secret_key().to_bech32().unwrap(),
+                options(relay_url.clone()),
+            )
             .await
             .expect("begin");
         assert!(!snapshot.ready);
         patch_onboarding_checkpoint(root.path(), &id, |value| {
-            value["approved"] = serde_json::json!(true);
+            value["snapshot"]["steps"][2]["status"] = serde_json::json!("NeedsInput");
         });
+        let proposal = kit
+            .propose_onboarding_recommended_relays(id.clone(), OnboardingStepFfi::Relays)
+            .await
+            .expect("propose");
+        drop(relay);
+        let approved = kit
+            .approve_onboarding_repair(id.clone(), proposal.revision)
+            .await
+            .expect("approve after the relay is gone");
+        assert!(approved.proposal.is_some());
         let subscription = kit
             .subscribe_onboarding(id.clone())
             .expect("subscribe approved");
@@ -277,11 +303,12 @@ mod tests {
             .await
             .expect("repeat cancel is a no-op");
         assert!(kit.onboarding_snapshot(id.clone()).unwrap().is_none());
+        assert_eq!(repair_archive_count(root.path(), &id), 1);
         let again = kit
-            .begin_onboarding(keys.secret_key().to_bech32().unwrap(), options())
+            .begin_onboarding(keys.secret_key().to_bech32().unwrap(), options(relay_url))
             .await
             .expect("explicit restart");
-        assert!(!again.ready && !again.cancellation_pending);
+        assert!(!again.ready && !again.cancellation_pending && again.proposal.is_none());
         patch_onboarding_checkpoint(root.path(), &id, |value| {
             for step in value["snapshot"]["steps"].as_array_mut().expect("steps") {
                 step["status"] = serde_json::json!("Passed");

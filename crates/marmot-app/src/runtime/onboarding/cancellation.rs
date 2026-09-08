@@ -142,6 +142,7 @@ impl AccountManager {
         );
         let manager = self.clone();
         let account = account.clone();
+        retain_unfinished_onboarding_handles(&mut tasks);
         tasks.handles.push(tokio::spawn(async move {
             let outcome = match manager
                 .complete_onboarding_cancellation(&account, attempt, false)
@@ -306,6 +307,7 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        retain_unfinished_onboarding_handles(&mut tasks);
         tasks.handles.push(tokio::spawn(async move {
             #[cfg(test)]
             if let Some(hold) = hold {
@@ -313,7 +315,7 @@ impl AccountManager {
                 hold.release.notified().await;
             }
             worker.shutdown_with_timeout(budget).await;
-            let _ = sender.send(true);
+            sender.send_replace(true);
         }));
     }
 
@@ -373,6 +375,10 @@ impl AccountManager {
         }
         updates.remove(account_id);
     }
+}
+
+fn retain_unfinished_onboarding_handles(tasks: &mut OnboardingCancellationTasks) {
+    tasks.handles.retain(|handle| !handle.is_finished());
 }
 
 async fn wait_for_cancel_outcome(

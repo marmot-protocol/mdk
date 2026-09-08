@@ -15,7 +15,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   sign-in attempts, keeps the account signed out, and retains uncertain
   publication evidence for a later explicit restart. Late publication or signer
   responses cannot revive a cancelled attempt, and a fresh explicit begin no
-  longer waits for the retired operation.
+  longer waits for the retired operation. Existing pre-generation checkpoints
+  keep working after upgrade, cancelled ready-state cleanup no longer deletes
+  retained setup journals, and a dropped cancellation waiter still observes a
+  finished worker reap.
 
 ## [0.9.19] - 2026-09-07
 

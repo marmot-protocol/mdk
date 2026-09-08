@@ -50,6 +50,7 @@ impl OnboardingTestHold {
 pub(super) struct OnboardingTestHolds {
     pub activation: StdMutex<Option<Arc<OnboardingTestHold>>>,
     pub publication: StdMutex<Option<Arc<OnboardingTestHold>>>,
+    pub setup_cleanup: StdMutex<Option<Arc<OnboardingTestHold>>>,
     pub worker_reap: StdMutex<Option<Arc<OnboardingTestHold>>>,
 }
 
@@ -588,19 +589,19 @@ impl AccountManager {
             .unwrap_or_else(|p| p.into_inner());
         let sender = retirements
             .entry(account_id.to_owned())
-            .or_insert_with(|| watch::channel(0).0);
-        if *sender.borrow() < attempt {
-            sender.send_replace(attempt);
+            .or_insert_with(|| watch::channel(None).0);
+        if sender.borrow().is_none_or(|retired| retired < attempt) {
+            sender.send_replace(Some(attempt));
         }
     }
-    fn subscribe_onboarding_retirement(&self, account_id: &str) -> watch::Receiver<u64> {
+    fn subscribe_onboarding_retirement(&self, account_id: &str) -> watch::Receiver<Option<u64>> {
         let mut retirements = self
             .onboarding_retirements
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         retirements
             .entry(account_id.to_owned())
-            .or_insert_with(|| watch::channel(0).0)
+            .or_insert_with(|| watch::channel(None).0)
             .subscribe()
     }
     fn admit_live_onboarding_mutation<T>(
@@ -612,6 +613,25 @@ impl AccountManager {
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
         self.require_live_onboarding_attempt(checkpoint)?;
         f()
+    }
+    fn finish_live_onboarding_setup_cleanup(
+        &self,
+        checkpoint: &mut OnboardingCheckpoint,
+    ) -> Result<(), AppError> {
+        let state = self.onboarding_state_lock(&checkpoint.snapshot.account_id_hex);
+        let _state = state.lock().unwrap_or_else(|p| p.into_inner());
+        self.require_live_onboarding_attempt(checkpoint)?;
+        let home = self.app.account_home();
+        // A later legacy sign-in may have started after completion was
+        // persisted. Never clear its unfinished setup as housekeeping.
+        if home
+            .account_setup_state(&checkpoint.snapshot.account_id_hex)?
+            .is_none_or(|s| s.phase == AccountSetupPhase::KeyPackagePublicationConfirmed)
+        {
+            home.complete_account_setup(&checkpoint.snapshot.account_id_hex)?;
+        }
+        checkpoint.setup_cleanup_pending = false;
+        self.save_onboarding_locked(checkpoint)
     }
     async fn await_while_onboarding_live<T>(
         &self,
@@ -625,7 +645,9 @@ impl AccountManager {
         let mut retired = self.subscribe_onboarding_retirement(account_id);
         tokio::pin!(fut);
         loop {
-            if *retired.borrow() >= attempt || !self.onboarding_attempt_live(account_id, attempt)? {
+            if retired.borrow().is_some_and(|retired| retired >= attempt)
+                || !self.onboarding_attempt_live(account_id, attempt)?
+            {
                 return Err(onboarding_error());
             }
             tokio::select! {
@@ -668,6 +690,16 @@ impl AccountManager {
         hold
     }
     #[cfg(test)]
+    pub(crate) fn install_onboarding_setup_cleanup_hold(&self) -> Arc<OnboardingTestHold> {
+        let hold = OnboardingTestHold::new();
+        *self
+            .onboarding_test_holds
+            .setup_cleanup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(hold.clone());
+        hold
+    }
+    #[cfg(test)]
     pub(crate) fn install_onboarding_worker_reap_hold(&self) -> Arc<OnboardingTestHold> {
         let hold = OnboardingTestHold::new();
         *self
@@ -676,6 +708,32 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(hold.clone());
         hold
+    }
+    #[cfg(test)]
+    async fn run_captured_onboarding(
+        &self,
+        checkpoint: &mut OnboardingCheckpoint,
+    ) -> Result<(), AppError> {
+        self.run_onboarding_locked(checkpoint).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn await_onboarding_worker_reap_finished(&self, account_id: &str) {
+        loop {
+            let finished = {
+                let tasks = self
+                    .onboarding_cancellations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                tasks
+                    .reaping
+                    .get(account_id)
+                    .is_some_and(|sender| *sender.borrow())
+            };
+            if finished {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
     #[cfg(test)]
     pub(crate) fn onboarding_worker_reap_in_flight(&self, account_id: &str) -> bool {
@@ -735,14 +793,7 @@ impl AccountManager {
                     return Ok(());
                 }
                 Some(_) => {}
-                None => {
-                    if cancelled.as_ref().is_some_and(|archived| {
-                        archived.attempt_start_revision == checkpoint.attempt_start_revision
-                    }) {
-                        return Err(onboarding_error());
-                    }
-                    return Err(onboarding_error());
-                }
+                None => return Err(onboarding_error()),
             },
             OnboardingPersist::CreateAttempt => {
                 if existing.is_some()
@@ -1077,17 +1128,10 @@ impl AccountManager {
             // Completion is checkpointed before journal cleanup; a crash in
             // between must leave only idempotent housekeeping to resume.
             if c.setup_cleanup_pending {
-                let home = self.app.account_home();
-                // A later legacy sign-in may have started after completion was
-                // persisted. Never clear its unfinished setup as housekeeping.
-                if home
-                    .account_setup_state(&c.snapshot.account_id_hex)?
-                    .is_none_or(|s| s.phase == AccountSetupPhase::KeyPackagePublicationConfirmed)
-                {
-                    home.complete_account_setup(&c.snapshot.account_id_hex)?;
-                }
-                c.setup_cleanup_pending = false;
-                self.save_onboarding(c)?;
+                #[cfg(test)]
+                self.await_onboarding_test_hold(&self.onboarding_test_holds.setup_cleanup)
+                    .await;
+                self.finish_live_onboarding_setup_cleanup(c)?;
             }
             return Ok(());
         }
@@ -1149,28 +1193,31 @@ impl AccountManager {
                         vec![finding(OnboardingIssue::SignerUnavailable)],
                     );
                 } else {
-                    if self
-                        .app
-                        .account_home()
-                        .account_setup_state(&account.label)?
-                        .is_none()
-                    {
-                        self.app.account_home().begin_account_setup_with(
-                            &account,
-                            false,
-                            if account.external_signing {
-                                AccountSetupKind::ExternalSigner
-                            } else {
-                                AccountSetupKind::ImportedIdentity
-                            },
-                            AccountSetupPhase::KeyPackagePublicationStarted,
-                        )?;
-                    } else {
-                        self.app.account_home().set_account_setup_phase(
-                            &account.label,
-                            AccountSetupPhase::KeyPackagePublicationStarted,
-                        )?;
-                    }
+                    self.admit_live_onboarding_mutation(c, || {
+                        if self
+                            .app
+                            .account_home()
+                            .account_setup_state(&account.label)?
+                            .is_none()
+                        {
+                            self.app.account_home().begin_account_setup_with(
+                                &account,
+                                false,
+                                if account.external_signing {
+                                    AccountSetupKind::ExternalSigner
+                                } else {
+                                    AccountSetupKind::ImportedIdentity
+                                },
+                                AccountSetupPhase::KeyPackagePublicationStarted,
+                            )?;
+                        } else {
+                            self.app.account_home().set_account_setup_phase(
+                                &account.label,
+                                AccountSetupPhase::KeyPackagePublicationStarted,
+                            )?;
+                        }
+                        Ok(())
+                    })?;
                     if account.external_signing {
                         c.set(step, OnboardingStatus::WaitingForSigner, Vec::new());
                         self.save_onboarding(c)?;
@@ -1187,11 +1234,13 @@ impl AccountManager {
                     })?;
                     match self.publish_initial_key_package_for_account(&account).await {
                         Ok(_) => {
-                            self.require_live_onboarding_attempt(c)?;
-                            self.app.account_home().set_account_setup_phase(
-                                &account.label,
-                                AccountSetupPhase::KeyPackagePublicationConfirmed,
-                            )?;
+                            self.admit_live_onboarding_mutation(c, || {
+                                self.app.account_home().set_account_setup_phase(
+                                    &account.label,
+                                    AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                )?;
+                                Ok(())
+                            })?;
                             c.set(step, OnboardingStatus::Passed, Vec::new());
                         }
                         Err(error) => {
@@ -1242,12 +1291,10 @@ impl AccountManager {
             }
         }
         if c.snapshot.ready {
-            self.require_live_onboarding_attempt(c)?;
-            self.app
-                .account_home()
-                .complete_account_setup(&c.snapshot.account_id_hex)?;
-            c.setup_cleanup_pending = false;
-            self.save_onboarding(c)?;
+            #[cfg(test)]
+            self.await_onboarding_test_hold(&self.onboarding_test_holds.setup_cleanup)
+                .await;
+            self.finish_live_onboarding_setup_cleanup(c)?;
         }
         Ok(())
     }

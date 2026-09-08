@@ -1648,6 +1648,299 @@ async fn dropped_reconcile_during_worker_reap_still_reaps() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+fn write_active_checkpoint(dir: &std::path::Path, id: &str, value: serde_json::Value) {
+    let path = dir.join("accounts").join(id).join("onboarding.json");
+    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+fn omit_attempt_generation(mut value: serde_json::Value) -> serde_json::Value {
+    value
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("attempt_start_revision");
+    value
+}
+
+fn mark_ready(c: &mut OnboardingCheckpoint) {
+    for step in c.snapshot.steps.clone() {
+        c.set(step.step, OnboardingStatus::Passed, vec![]);
+    }
+}
+
+#[tokio::test]
+async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    mark_ready(&mut c);
+    c.setup_cleanup_pending = true;
+    manager
+        .app
+        .account_home()
+        .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
+        .unwrap();
+    manager
+        .app
+        .account_home()
+        .set_account_setup_context(&id, b"retained-setup")
+        .unwrap();
+    manager.save_onboarding(&mut c).unwrap();
+    let stale = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(
+        manager
+            .run_captured_onboarding(&mut stale.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_setup_context(&id)
+            .unwrap()
+            .as_deref(),
+        Some(b"retained-setup".as_slice())
+    );
+    assert!(
+        manager
+            .app
+            .account_home()
+            .account_setup_state(&id)
+            .unwrap()
+            .is_some()
+    );
+    let account = manager.resolve(&id).unwrap();
+    manager
+        .app
+        .account_home()
+        .begin_account_setup_with(
+            &account,
+            false,
+            AccountSetupKind::ImportedIdentity,
+            AccountSetupPhase::KeyPackagePublicationStarted,
+        )
+        .unwrap();
+    manager
+        .app
+        .account_home()
+        .set_account_setup_context(&id, b"later-legacy")
+        .unwrap();
+    assert!(
+        manager
+            .run_captured_onboarding(&mut stale.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_setup_state(&id)
+            .unwrap()
+            .unwrap()
+            .kind,
+        AccountSetupKind::ImportedIdentity
+    );
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_setup_context(&id)
+            .unwrap()
+            .as_deref(),
+        Some(b"later-legacy".as_slice())
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_during_ready_cleanup_hold_retains_setup() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    mark_ready(&mut c);
+    c.setup_cleanup_pending = true;
+    manager
+        .app
+        .account_home()
+        .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
+        .unwrap();
+    manager
+        .app
+        .account_home()
+        .set_account_setup_context(&id, b"cleanup-hold")
+        .unwrap();
+    manager.save_onboarding(&mut c).unwrap();
+    let hold = manager.install_onboarding_setup_cleanup_hold();
+    let running = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move { manager.run_onboarding(&account).await }
+    });
+    hold.entered.notified().await;
+    manager.cancel_onboarding(&id).await.unwrap();
+    hold.release.notify_waiters();
+    assert!(running.await.unwrap().is_err());
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_setup_context(&id)
+            .unwrap()
+            .as_deref(),
+        Some(b"cleanup-hold".as_slice())
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_key_package_setup_after_cancel_does_not_mutate_setup() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let before = manager
+        .app
+        .account_home()
+        .account_setup_state(&id)
+        .unwrap()
+        .unwrap();
+    let mut stale = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for step in [
+        OnboardingStep::Profile,
+        OnboardingStep::Follows,
+        OnboardingStep::Relays,
+        OnboardingStep::InboxRelays,
+        OnboardingStep::SingleDevice,
+    ] {
+        stale.set(step, OnboardingStatus::Passed, vec![]);
+    }
+    manager.save_onboarding(&mut stale).unwrap();
+    let mut stale = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(manager.run_captured_onboarding(&mut stale).await.is_err());
+    let after = manager
+        .app
+        .account_home()
+        .account_setup_state(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.phase, before.phase);
+    assert_ne!(after.kind, AccountSetupKind::InteractiveIdentity);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
+    let (dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut v2_pending = serde_json::to_value(&pending).unwrap();
+    v2_pending["version"] = serde_json::json!(2);
+    write_active_checkpoint(dir.path(), &id, omit_attempt_generation(v2_pending));
+    let discovered = manager.run_onboarding(&id).await.unwrap();
+    assert_ne!(
+        discovered.steps[OnboardingStep::Profile.index()].status,
+        OnboardingStatus::Pending
+    );
+    let mut v1 = serde_json::to_value(&pending).unwrap();
+    v1["version"] = serde_json::json!(1);
+    v1["snapshot"]["steps"].as_array_mut().unwrap().remove(4);
+    v1["records"].as_array_mut().unwrap().remove(4);
+    write_active_checkpoint(dir.path(), &id, omit_attempt_generation(v1));
+    assert_ne!(
+        manager.run_onboarding(&id).await.unwrap().steps[0].status,
+        OnboardingStatus::Pending
+    );
+    missing_relays(&runtime, &id).await;
+    let proposal = manager
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.zero_acks.store(true, Ordering::SeqCst);
+    manager
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    let signed = network.attempts.lock().unwrap()[0].clone();
+    let approved = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    assert!(approved.approved && approved.signed_repair == Some(signed.clone()));
+    let mut v2_approved = serde_json::to_value(&approved).unwrap();
+    v2_approved["version"] = serde_json::json!(2);
+    write_active_checkpoint(dir.path(), &id, omit_attempt_generation(v2_approved));
+    let retried = manager
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(
+        retried.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::Retry)
+    );
+    let attempts = network.attempts.lock().unwrap().clone();
+    assert!(!attempts.is_empty() && attempts.iter().all(|event| event == &signed));
+    manager.cancel_onboarding(&id).await.unwrap();
+    let restarted = manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    let fresh = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    assert_ne!(
+        fresh.attempt_start_revision,
+        approved.attempt_start_revision
+    );
+    assert!(!restarted.ready && restarted.proposal.is_none());
+    assert!(fresh.signed_repair.is_none() && !fresh.approved);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, false)
+        .unwrap();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut c).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let first = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move { manager.cancel_onboarding(&account).await }
+    });
+    hold.entered.notified().await;
+    first.abort();
+    let _ = first.await;
+    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    hold.release.notify_waiters();
+    manager.await_onboarding_worker_reap_finished(&id).await;
+    assert!(!manager.onboarding_worker_reap_in_flight(&id));
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(!manager.onboarding_worker_tracked(&id).await);
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    let restarted = manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert!(!restarted.ready && !restarted.cancellation_pending);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 fn write_cancelled_checkpoint(dir: &std::path::Path, id: &str, value: serde_json::Value) {
     let path = dir
         .join("accounts")
