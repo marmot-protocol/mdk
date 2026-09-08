@@ -40,6 +40,20 @@ impl SeenEventIndex {
 }
 
 impl AppClient {
+    /// Post-readiness repair and active-cache invalidation share this exclusive
+    /// borrow. Even a failed backfill reload leaves durable invalidation available
+    /// to the next receipt view, before any checkpoint or duplicate decision.
+    pub(crate) fn repair_uncertain_transport_receipts(
+        &mut self,
+        limit: usize,
+    ) -> Result<storage_sqlite::TransportReceiptRepairProgress, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        self.synchronize_released_transport_receipts(&storage)?;
+        let progress = storage.repair_uncertain_transport_receipts(limit)?;
+        self.synchronize_released_transport_receipts(&storage)?;
+        Ok(progress)
+    }
+
     pub(crate) fn remember_seen_event(&mut self, event_id: String) {
         if remember_seen_event(&mut self.seen_events_index.0, &mut self.state, event_id) {
             self.pending_seen_event_count = self

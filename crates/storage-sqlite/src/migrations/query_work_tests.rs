@@ -432,3 +432,51 @@ fn branch_origin_hex_matching() {
         [hex::encode(format!("{:032x}", 3)), "abcd".to_owned()]
     );
 }
+
+#[test]
+fn historical_receipt_repair_bounds_examined_history_and_cursor_seek_work() {
+    let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    for count in [256, 16_384] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO account_state(label,updated_at) VALUES ('alice',0);
+                INSERT INTO app_historical_receipt_repair(account_label) VALUES ('alice');
+                INSERT INTO cgka_groups(id,epoch,record) VALUES (x'aa',3,x'00');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cgka_transport_group_routes VALUES (?1,x'aa',2)",
+                [&[1_u8; 32][..]],
+            )
+            .unwrap();
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+                INSERT INTO transport_reconciliation_items SELECT 1,?2,CAST(printf('%032x', x) AS BLOB),?3 FROM n",
+                rusqlite::params![count,&[1_u8;32][..],crate::unix_now_seconds_i64()]).unwrap();
+            conn.execute_batch(
+                "INSERT INTO cgka_processed_transport_ids(id,group_id)
+                SELECT event_id,x'aa' FROM transport_reconciliation_items",
+            )
+            .unwrap();
+        }
+        let first = measured(&store, "first historical repair page", 12_000, || {
+            store.repair_uncertain_transport_receipts(16).unwrap()
+        });
+        assert_eq!(first.examined, 16);
+        assert_eq!(first.repaired, 0);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE app_historical_receipt_repair SET event_after=?1",
+                [format!("{:032x}", count - 16).into_bytes()],
+            )
+            .unwrap();
+        let last = measured(&store, "late historical repair page", 12_000, || {
+            store.repair_uncertain_transport_receipts(16).unwrap()
+        });
+        assert_eq!(last.examined, 16);
+        assert!(!last.has_more);
+    }
+}

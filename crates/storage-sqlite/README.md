@@ -38,6 +38,21 @@ when storage semantics evolve.
 Applied migrations are recorded in `cgka_schema_migrations`. Opening an encrypted database applies any missing
 migrations after SQLCipher keying and before storage handles are exposed.
 
+Migration 0065 schedules a one-time historical transport receipt repair for existing account databases.
+It creates repair metadata and an empty outbound signed-ID index without scanning retained history on open.
+After readiness and group hydration, the app worker inspects at most 32 fanout/inventory rows per maintenance
+pass (the storage API caps a batch at 256). Transactional keyset cursors and fixed high waters allow restart
+and bound each pass, including when every inventory entry is excluded by possession evidence. Old fanout
+signed IDs are indexed before inventory selection; new fanout writes maintain that index atomically.
+
+Only retained group-route inventory entries without raw/message, processed-marker, ingress-dedup, Welcome,
+or outbound-fanout evidence are selected. Inbox claims, protocol state, projections, retention floors and
+reconciliation cursors are preserved. Selected IDs enter the durable release journal and arm epoch backfill;
+the active account invalidates its seen index synchronously before checkpoint or redelivery. Counts describe
+**uncertain-possession repairs**, since pre-0058 accepted wrappers may lack a processed marker. Redelivery
+must still deduplicate canonical messages. Expired epoch keys, retained inventory windows and unavailable
+relay history limit recovery; this repair cannot reconstruct missing relay history.
+
 The three current app database categories have independent histories: `session.sqlite` uses
 `cgka_schema_migrations`, the per-account `app-cache.sqlite3` uses marmot-app's `app_cache_schema_migrations`, and
 installation-wide `shared.sqlite3` uses `shared_schema_migrations`. No runner reads another store's ledger.

@@ -19,7 +19,9 @@ mod prepared_group_image_upload;
 mod shared;
 mod storage;
 mod timeline;
+mod transport_receipt_repair;
 mod transport_reconciliation;
+pub use transport_receipt_repair::TransportReceiptRepairProgress;
 
 pub use account_projection::{
     AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushToken,

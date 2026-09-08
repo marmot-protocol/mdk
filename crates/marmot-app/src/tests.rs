@@ -19217,6 +19217,215 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
     });
 }
 
+fn historical_receipt_fixture_connection(app: &MarmotApp, label: &str) -> rusqlite::Connection {
+    let path = app.account_storage_path(label);
+    let keys = app.account_home().load_signing_keys(label).unwrap();
+    let key = app
+        .sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &conn,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO app_historical_receipt_repair(account_label) VALUES (?1)",
+        [label],
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn historical_receipt_repair_replays_released_input_before_checkpoint_and_after_reopen() {
+    run_composed_app_runtime_test("historical-receipt-replay", || async {
+        use cgka_traits::storage::MessageStorage;
+        for handling in ["live", "reopen", "reload failure"] {
+            let dir = tempfile::tempdir().unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let (app, mut client, route) =
+                undecryptable_probe_route(&dir, &relay, MarmotAppConfig::default()).await;
+            let created_at = crate::unix_now_seconds() - 1_000;
+            let probe = epoch_gap_probe(&route.nostr_group_id_hex, created_at, "historical-repair");
+            let mut delivery = route.probe(created_at, "historical-repair");
+            delivery.message = probe.to_transport_message().unwrap();
+            client
+                .ingest_received_delivery(delivery.clone())
+                .await
+                .unwrap();
+            let storage = app.account_storage("alice").unwrap();
+            // Pre-0060 release: no journal row, stale durable and live claims.
+            storage.delete_message(&delivery.message.id).unwrap();
+            let conn = historical_receipt_fixture_connection(&app, "alice");
+            assert!(
+                storage
+                    .consume_released_transport_receipts()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(client.seen_events_index.contains(&probe.id));
+            if handling == "reopen" {
+                // Crash between the transactional repair and active invalidation.
+                assert_eq!(
+                    storage
+                        .repair_uncertain_transport_receipts(256)
+                        .unwrap()
+                        .repaired,
+                    1
+                );
+                drop(client);
+                client = client_on_app_relay_plane(&app, "alice").await;
+            } else {
+                client.pending_seen_event_count = client.state.seen_events.len();
+                client.fail_next_released_backfill_reload = handling == "reload failure";
+                let result = client.repair_uncertain_transport_receipts(256);
+                if handling == "reload failure" {
+                    assert!(result.is_err());
+                    assert!(!client.seen_events_index.contains(&probe.id));
+                } else {
+                    assert_eq!(result.unwrap().repaired, 1);
+                }
+                client
+                    .save_state_with_pending_local_group_deletion_frontier_clears()
+                    .unwrap();
+            }
+            assert!(!client.seen_events_index.contains(&probe.id));
+            assert!(
+                !app.load_state("alice")
+                    .unwrap()
+                    .seen_events
+                    .contains(&probe.id)
+            );
+            assert!(client.has_pending_epoch_backfill());
+            client.ingest_received_delivery(delivery).await.unwrap();
+            assert_eq!(recorded_ingest_outcomes(&app, &probe.id).len(), 2);
+            assert!(client.seen_events_index.contains(&probe.id));
+            drop(conn);
+        }
+    });
+}
+
+#[tokio::test]
+async fn historical_accepted_wrapper_repair_preserves_exact_once_public_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice
+        .create_group("historical accepted", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group)
+    );
+    alice
+        .send(&group, b"one historical projection")
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        panic!("unexpected overflow");
+    };
+    let id = delivery.message.id.clone();
+    bob_client
+        .ingest_received_delivery(*delivery.clone())
+        .await
+        .unwrap();
+    let conn = historical_receipt_fixture_connection(&app, "bob");
+    // Pre-0058 accepted wrappers had no permanent processed marker; the small
+    // ingress cache can already have churned out. Canonical MLS rows remain.
+    conn.execute(
+        "DELETE FROM cgka_processed_transport_ids WHERE id=?1",
+        [id.as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM cgka_ingress_dedup WHERE id=?1",
+        [id.as_slice()],
+    )
+    .unwrap();
+    let canonical_count: i64 = conn
+        .query_row("SELECT count(*) FROM cgka_messages", [], |r| r.get(0))
+        .unwrap();
+    let before = app
+        .timeline_messages_with_query("bob", storage_sqlite::TimelineMessageQuery::default())
+        .unwrap()
+        .messages;
+    assert_eq!(
+        before
+            .iter()
+            .filter(|row| row.plaintext == "one historical projection")
+            .count(),
+        1
+    );
+    assert!(
+        bob_client
+            .seen_events_index
+            .contains(&hex::encode(id.as_slice()))
+    );
+    assert!(
+        bob_client
+            .repair_uncertain_transport_receipts(256)
+            .unwrap()
+            .repaired
+            >= 1
+    );
+    assert!(
+        !bob_client
+            .seen_events_index
+            .contains(&hex::encode(id.as_slice()))
+    );
+    bob_client
+        .ingest_received_delivery(*delivery.clone())
+        .await
+        .unwrap();
+    bob_client
+        .ingest_received_delivery(*delivery)
+        .await
+        .unwrap();
+    let after = app
+        .timeline_messages_with_query("bob", storage_sqlite::TimelineMessageQuery::default())
+        .unwrap()
+        .messages;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|row| row.plaintext == "one historical projection")
+            .count(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM cgka_messages", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        canonical_count
+    );
+}
+
 #[test]
 fn dev_maintenance_timing_is_honored_only_in_test_policy_builds() {
     assert_eq!(dev_maintenance_timing(&MarmotAppConfig::default()), None);

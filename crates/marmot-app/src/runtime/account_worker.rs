@@ -995,6 +995,7 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
+    let mut historical_receipt_repair_pending = true;
     // Prepare exact Welcome attempts under the serialized owner, then let only
     // relay I/O run independently. The worker stays available for inbound
     // delivery, maintenance, media completions, timers, and commands while a
@@ -1576,6 +1577,7 @@ async fn run_app_runtime_account_worker(
                     &client,
                     &mut legacy_message_promotion,
                 );
+                run_historical_receipt_repair_batch(&mut client, &mut historical_receipt_repair_pending);
                 if client.key_package_maintenance_requires_catch_up() {
                     match timeout(
                         Duration::from_secs(15),
@@ -1956,6 +1958,37 @@ const STARTUP_HYDRATION_COMMAND_BUDGET: usize = 8;
 enum StartupHydrationOutcome {
     Completed,
     Shutdown,
+}
+
+/// A bounded page after startup hydration, before maintenance can backfill.
+/// Retry failures on the next tick; completion survives reopen in SQLite.
+fn run_historical_receipt_repair_batch(client: &mut AppClient, pending: &mut bool) {
+    if !*pending || !client.runtime.session().unhydrated_group_ids().is_empty() {
+        return;
+    }
+    match client.repair_uncertain_transport_receipts(32) {
+        Ok(progress) => {
+            *pending = progress.has_more;
+            if progress.examined != 0 {
+                tracing::info!(
+                    target: "marmot_app::storage_maintenance",
+                    method = "repair_uncertain_transport_receipts",
+                    examined = progress.examined,
+                    uncertain_possession_repairs = progress.repaired,
+                    has_more = progress.has_more,
+                    "processed one bounded historical receipt repair batch"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::storage_maintenance",
+                method = "repair_uncertain_transport_receipts",
+                error_kind = error.privacy_safe_kind(),
+                "historical receipt repair batch failed; retrying on a later maintenance tick"
+            );
+        }
+    }
 }
 
 /// Run one storage-only promotion transaction after account readiness.

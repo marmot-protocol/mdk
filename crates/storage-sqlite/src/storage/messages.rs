@@ -14,7 +14,7 @@ use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
-const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
+pub(crate) const RELEASED_TRANSPORT_RECEIPT_CAPACITY: i64 = 8_192;
 const NORMALIZED_MESSAGE_STORAGE_FORMAT: i64 = 2;
 const MESSAGE_FORMAT_PROMOTION_BATCH_MAX: usize = 256;
 
