@@ -189,6 +189,17 @@ impl AppClient {
         Ok(())
     }
 
+    /// Retry durable invitation work without replacing an already-observed result.
+    pub(crate) async fn recover_superseded_invites_best_effort(&mut self) {
+        if self.recover_superseded_invites().await.is_err() {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "recover_superseded_invites_best_effort",
+                "invitation recovery failed; durable work remains pending"
+            );
+        }
+    }
+
     pub(crate) async fn recover_superseded_invites(&mut self) -> Result<(), AppError> {
         if self.runtime.maintenance_is_paused()
             || self.app.cursor_persistence() == crate::CursorPersistence::Frozen

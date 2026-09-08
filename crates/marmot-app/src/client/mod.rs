@@ -907,8 +907,17 @@ impl AppClient {
             );
         }
         let effects = effects?;
-        self.recover_superseded_invites().await?;
-        self.observe_recovery_evidence_then_summarize_maintenance(&effects)
+        self.finish_maintenance_effects(&effects).await
+    }
+
+    /// Preserve committed maintenance effects before best-effort invite recovery.
+    pub(crate) async fn finish_maintenance_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
+        let result = self.observe_recovery_evidence_then_summarize_maintenance(effects);
+        self.recover_superseded_invites_best_effort().await;
+        result
     }
 
     /// Observe one maintenance tick's recovery evidence, then summarize the

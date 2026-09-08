@@ -8393,6 +8393,63 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     }
 }
 
+/// Fresh reinvites must not resurrect a cached package when relays only return
+/// future-dated records, including when the batch falls back to single authors.
+#[tokio::test]
+async fn fresh_reinvite_resolution_never_falls_back_to_cached_key_packages() {
+    for reject_batch in [false, true] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.clone())
+            .collect::<Vec<_>>();
+        let cached = app
+            .resolve_fresh_reinvite_key_packages(&members)
+            .await
+            .unwrap();
+        for member in &members {
+            assert!(
+                app.directory_entry_for_account_id(member)
+                    .unwrap()
+                    .unwrap()
+                    .key_package
+                    .is_some()
+            );
+        }
+        fetcher
+            .reject_multi_author
+            .store(reject_batch, std::sync::atomic::Ordering::SeqCst);
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == KIND_MARMOT_KEY_PACKAGE {
+                event.created_at = u64::MAX;
+            }
+        }
+        fetcher.requests.lock().unwrap().clear();
+        let error = app
+            .resolve_fresh_reinvite_key_packages(&members)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::MissingKeyPackage(id) if id == members[0]));
+        assert!(
+            fetcher.requests.lock().unwrap().iter().any(|request| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
+            }),
+            "single-author fallback must also reject cached material"
+        );
+        let ordinary = app
+            .resolve_member_key_packages(&members.iter().map(String::as_str).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary, cached,
+            "ordinary resolution still permits cached packages"
+        );
+    }
+}
+
 #[tokio::test]
 async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
@@ -16027,6 +16084,115 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
         1,
         "the arm must leave its durable forensic row even on a failing pass"
     );
+}
+
+/// A corrupt retained intent fails invitation recovery after committed effects
+/// arrive. Both account seams must still observe those effects and preserve the
+/// original result, including a convergence publish failure.
+#[tokio::test]
+async fn invite_recovery_failure_preserves_committed_effects_and_results() {
+    for (maintenance, failed_publish) in [(true, false), (false, false), (false, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://recovery-failure.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("committed effects", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        for n in 0..8 {
+            storage
+                .observe_membership_undecryptable(
+                    &group_id,
+                    &cgka_traits::MessageId::new(vec![n; 32]),
+                    epoch,
+                    8,
+                )
+                .unwrap();
+        }
+        assert!(storage.membership_unconfirmed(&group_id).unwrap());
+        client.pending_group_projection_updates.clear();
+        let mut effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+        if !failed_publish {
+            effects.failures.clear();
+            effects.pending.clear();
+        }
+        effects
+            .events
+            .push(cgka_traits::engine::GroupEvent::GroupJoined {
+                group_id: group_id.clone(),
+                via_welcome: cgka_traits::MessageId::new(vec![0xcd; 32]),
+                welcomer: None,
+                explicitly_confirmed: true,
+            });
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute(
+            "INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(insert_order), 0) + 1 FROM cgka_own_commit_intents), x'ff')",
+            rusqlite::params![vec![0xee_u8; 32], group_id.as_slice()],
+        ).unwrap();
+        assert!(
+            client.recover_superseded_invites().await.is_err(),
+            "the recovery failure must be exercised"
+        );
+        let result = if maintenance {
+            client
+                .finish_maintenance_effects(&effects)
+                .await
+                .map(|_| ())
+        } else {
+            client
+                .finish_scheduled_convergence_effects(&group_id, &effects)
+                .await
+                .map(|summary| {
+                    assert!(
+                        summary.joined_groups.contains(&group_id),
+                        "the committed join must reach the caller"
+                    );
+                })
+        };
+        if failed_publish {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                crate::groups::fail_if_publish_failed(&effects)
+                    .unwrap_err()
+                    .to_string()
+            );
+        } else {
+            result.expect("invite recovery must not replace the committed pass's success");
+        }
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "one-shot recovery evidence must be observed"
+        );
+        assert!(
+            !storage.membership_unconfirmed(&group_id).unwrap(),
+            "committed health evidence must clear the warning"
+        );
+        // Successful scheduled convergence persists the dirty projections;
+        // maintenance and failed convergence leave them queued for the worker.
+        if maintenance || failed_publish {
+            assert!(
+                client
+                    .pending_group_projection_updates
+                    .contains(&hex::encode(group_id.as_slice())),
+                "the warning projection must remain queued"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

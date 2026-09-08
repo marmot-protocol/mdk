@@ -474,6 +474,7 @@ impl MarmotApp {
                 &key_package_unresolved,
                 &mut outcomes,
                 purpose,
+                fresh,
             )
             .await;
         }
@@ -840,6 +841,7 @@ impl MarmotApp {
         unresolved: &[usize],
         outcomes: &mut [Option<Result<KeyPackage, AppError>>],
         purpose: MemberResolutionPurpose,
+        fresh: bool,
     ) {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
@@ -924,10 +926,13 @@ impl MarmotApp {
                     .filter(|record| record.event.pubkey == *account_id)
                     .cloned()
                     .collect::<Vec<_>>();
-                let cached = self
-                    .directory_entry_for_account_id(account_id)
-                    .ok()
-                    .flatten();
+                let cached = if fresh {
+                    None
+                } else {
+                    self.directory_entry_for_account_id(account_id)
+                        .ok()
+                        .flatten()
+                };
                 let selected = latest_fresh_key_package_from_records(
                     account_id,
                     account_records,
@@ -987,7 +992,11 @@ impl MarmotApp {
                             .map_err(|error| {
                                 AppError::RelayDirectory(format!("fetch key packages: {error}"))
                             })?;
-                        let cached = app.directory_entry_for_account_id(&target.account_id_hex)?;
+                        let cached = if fresh {
+                            None
+                        } else {
+                            app.directory_entry_for_account_id(&target.account_id_hex)?
+                        };
                         let mut fetched = fresh_or_cached_key_package(
                             &target.account_id_hex,
                             latest_fresh_key_package_from_records(

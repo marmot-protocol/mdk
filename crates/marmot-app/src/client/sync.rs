@@ -3822,9 +3822,21 @@ impl AppClient {
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
-        self.recover_superseded_invites().await?;
-        self.observe_scheduled_convergence_effects(group_id, &effects)
+        self.finish_scheduled_convergence_effects(group_id, &effects)
             .await
+    }
+
+    /// Preserve committed convergence effects before best-effort invite recovery.
+    pub(crate) async fn finish_scheduled_convergence_effects(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
+        let result = self
+            .observe_scheduled_convergence_effects(group_id, effects)
+            .await;
+        self.recover_superseded_invites_best_effort().await;
+        result
     }
 
     /// Project one scheduled convergence batch's effects, split from the
