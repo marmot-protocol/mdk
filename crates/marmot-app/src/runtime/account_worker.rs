@@ -1991,13 +1991,17 @@ enum StartupHydrationOutcome {
 
 /// Limit each maintenance tick's SQL work and synchronous cache invalidation so
 /// large account histories cannot monopolize the serialized account worker.
-const HISTORICAL_RECEIPT_REPAIR_BATCH_SIZE: usize = 32;
+/// Use the storage cap: 16,384 retained entries need 64 passes (~16 active
+/// minutes at 15 seconds), while each turn still yields after one transaction.
+/// The query-work regression covers this quantum at both ends of a full route.
+const HISTORICAL_RECEIPT_REPAIR_BATCH_SIZE: usize = 256;
 
 /// A bounded page after startup hydration, before maintenance can backfill.
-/// Contention retries next tick; durable failures halt until the next process
-/// start. SQLite retains the unadvanced cursor for diagnosis and a later retry.
+/// Contention, capacity and unclassified backend failures retry next tick;
+/// proven corruption/schema/decode failures halt until the next process start.
+/// Malformed legacy fanouts are counted and skipped by storage itself.
 fn run_historical_receipt_repair_batch(client: &mut AppClient, enabled: &mut bool) {
-    if !*enabled || !client.runtime.session().unhydrated_group_ids().is_empty() {
+    if !client.runtime.session().unhydrated_group_ids().is_empty() {
         return;
     }
     run_historical_receipt_repair_batch_with(enabled, |limit| {
@@ -2022,6 +2026,7 @@ fn run_historical_receipt_repair_batch_with(
                     method = "repair_uncertain_transport_receipts",
                     examined = progress.examined,
                     uncertain_possession_repairs = progress.repaired,
+                    skipped_fanouts = progress.skipped_fanouts,
                     duration_ms = started.elapsed().as_millis() as u64,
                     has_more = progress.has_more,
                     "processed one bounded historical receipt repair batch"
@@ -2029,14 +2034,27 @@ fn run_historical_receipt_repair_batch_with(
             }
         }
         Err(error) => {
-            let transient = matches!(&error, AppError::Storage(error) if error.is_transient());
-            *enabled = transient;
+            use cgka_traits::storage::StorageError;
+            if matches!(&error, AppError::Storage(error) if error.is_closed()) {
+                // Closing is terminal for this handle and expected at shutdown.
+                *enabled = false;
+                return;
+            }
+            let retry = !matches!(
+                &error,
+                AppError::Storage(
+                    StorageError::Serialization(_)
+                        | StorageError::Corruption(_)
+                        | StorageError::UnsupportedSchemaVersion { .. }
+                )
+            );
+            *enabled = retry;
             tracing::warn!(
                 target: "marmot_app::storage_maintenance",
                 method = "repair_uncertain_transport_receipts",
                 error_kind = error.privacy_safe_kind(),
                 duration_ms = started.elapsed().as_millis() as u64,
-                retry_scheduled = transient,
+                retry_scheduled = retry,
                 "historical receipt repair batch failed"
             );
         }
@@ -5369,23 +5387,39 @@ mod tests {
     }
 
     #[test]
-    fn historical_receipt_repair_halts_durable_errors_but_retries_contention() {
+    fn historical_receipt_repair_retries_recoverable_errors_and_stops_terminal_handles() {
         use cgka_traits::storage::StorageError;
-        let mut enabled = true;
-        run_historical_receipt_repair_batch_with(&mut enabled, |_| {
-            Err(StorageError::Busy("test contention".into()).into())
-        });
-        assert!(enabled);
-        run_historical_receipt_repair_batch_with(&mut enabled, |_| {
-            Err(StorageError::Serialization("malformed legacy fanout".into()).into())
-        });
-        assert!(
-            !enabled,
-            "a deterministic failure must halt this process's sweep"
-        );
-        run_historical_receipt_repair_batch_with(&mut enabled, |_| {
-            unreachable!("a halted repair must not call storage again")
-        });
+        for error in [
+            StorageError::Busy("test contention".into()),
+            StorageError::Backend("released transport receipt journal is full".into()),
+            StorageError::Backend("backfill intent reload failed".into()),
+            StorageError::Capacity("test capacity".into()),
+        ] {
+            let mut enabled = true;
+            run_historical_receipt_repair_batch_with(&mut enabled, |_| Err(error.into()));
+            assert!(enabled);
+            run_historical_receipt_repair_batch_with(&mut enabled, |limit| {
+                assert_eq!(limit, 256);
+                Ok(storage_sqlite::TransportReceiptRepairProgress::default())
+            });
+            assert!(!enabled, "the next successful pass can complete the sweep");
+        }
+        for error in [
+            StorageError::Serialization("invalid repair metadata".into()),
+            StorageError::Corruption("test corruption".into()),
+            StorageError::UnsupportedSchemaVersion {
+                found: 100,
+                latest_supported: 66,
+            },
+            StorageError::Closed("test shutdown".into()),
+        ] {
+            let mut enabled = true;
+            run_historical_receipt_repair_batch_with(&mut enabled, |_| Err(error.into()));
+            assert!(!enabled);
+            run_historical_receipt_repair_batch_with(&mut enabled, |_| {
+                unreachable!("a stopped repair must not call storage again")
+            });
+        }
     }
 
     #[test]

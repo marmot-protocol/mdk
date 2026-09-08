@@ -1,5 +1,7 @@
 //! Bounded, one-time repair of advisory claims predating the release journal.
 use crate::connection::{CachedSql, retry_on_busy};
+use crate::storage::messages::{RELEASED_TRANSPORT_RECEIPT_CAPACITY, retire_transport_receipts};
+use crate::transport_reconciliation::GROUP_ROUTE_KIND;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, TRANSPORT_RECONCILIATION_RETENTION_SECS, deserialize,
     unix_now_seconds_i64,
@@ -8,11 +10,9 @@ use cgka_traits::{
     OutboundFanout,
     storage::{StorageError, StorageResult},
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, named_params, params};
 
 const BATCH_MAX: usize = 256;
-use crate::storage::messages::{RELEASED_TRANSPORT_RECEIPT_CAPACITY, retire_transport_receipts};
-use crate::transport_reconciliation::GROUP_ROUTE_KIND;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TransportReceiptRepairProgress {
@@ -20,6 +20,8 @@ pub struct TransportReceiptRepairProgress {
     pub examined: usize,
     /// IDs whose possession is uncertain, not proven releases.
     pub repaired: usize,
+    /// Undecodable pending fanouts skipped without modifying their records.
+    pub skipped_fanouts: usize,
     pub has_more: bool,
 }
 
@@ -30,12 +32,20 @@ impl SqliteAccountStorage {
     /// checkpoint or redelivery. Claim deletion, backfill intent and cursor
     /// advancement deliberately share one commit: a crash cannot leave progress
     /// ahead of repair or allow a stale checkpoint to outlive the journal.
+    /// Storage-only callers see retired claims and persisted backfill immediately;
+    /// journal consumption intentionally repeats those idempotent writes to cover
+    /// engine releases and intervening stale receipt checkpoints as well.
     /// Each account-device database has exactly one account_state owner/job.
     ///
     /// Keyset pages bound *examined* rows, rather than filtering uncertain rows
     /// before LIMIT (which could scan all accepted history). Fixed high waters
     /// cap the traversal; persisted cursors survive deletion and restart. No MLS,
     /// projection, retention floor or reconciliation cursor is modified.
+    /// Malformed fanouts cannot supply a signed alias: count and skip them,
+    /// preserving the row and its exact-ID exclusion. Normal Nostr own echoes
+    /// retain outer-ID Sent rows and stay excluded after fanout settlement.
+    /// Historical accepted wrappers without outer-ID evidence may be refetched;
+    /// retained canonical records still deduplicate their content.
     pub fn repair_uncertain_transport_receipts(
         &self,
         limit: usize,
@@ -125,13 +135,22 @@ impl SqliteAccountStorage {
                     .storage()?;
                 progress.examined += rows.len();
                 for (order, record) in rows {
-                    let fanout: OutboundFanout = deserialize(&record)?;
+                    fanout_after = order;
+                    let fanout: OutboundFanout = match deserialize(&record) {
+                        Ok(fanout) => fanout,
+                        Err(StorageError::Serialization(_)) => {
+                            // No trustworthy alias is recoverable. Preserve the
+                            // record, but do not strand all later repair work.
+                            progress.skipped_fanouts += 1;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if let Some(published) = fanout.published_message_id() {
                         conn.execute_cached("INSERT INTO cgka_outbound_transport_receipt_ids(message_id,published_message_id)
                             VALUES (?1,?2) ON CONFLICT(message_id) DO UPDATE SET published_message_id=excluded.published_message_id",
                             params![fanout.message_id().as_slice(), published.as_slice()]).storage()?;
                     }
-                    fanout_after = order;
                 }
                 fanout_done = progress.examined < limit || fanout_after == fanout_until;
                 conn.execute_cached("UPDATE app_historical_receipt_repair SET fanout_after=?1, fanout_done=?2 WHERE account_label=?3",
@@ -141,12 +160,35 @@ impl SqliteAccountStorage {
                 return Ok(progress);
             }
             let remaining = limit - progress.examined;
-            let rows = conn.prepare_cached("SELECT route_id, event_id, created_at FROM transport_reconciliation_items
-                WHERE route_kind=?6 AND (route_id,event_id) > (?1,?2) AND (route_id,event_id) <= (?3,?4)
-                ORDER BY route_id,event_id LIMIT ?5").storage()?
-                .query_map(params![route_after,event_after,route_until,event_until,remaining as i64,GROUP_ROUTE_KIND], |r| Ok((
-                    r.get::<_, Vec<u8>>(0)?,r.get::<_, Vec<u8>>(1)?,r.get::<_, i64>(2)?)))
-                .storage()?.collect::<Result<Vec<_>,_>>().storage()?;
+            let rows = conn
+                .prepare_cached(
+                    "SELECT route_id, event_id, created_at FROM transport_reconciliation_items
+                 WHERE route_kind = :group_kind
+                   AND (route_id, event_id) > (:route_after, :event_after)
+                   AND (route_id, event_id) <= (:route_until, :event_until)
+                 ORDER BY route_id, event_id LIMIT :limit",
+                )
+                .storage()?
+                .query_map(
+                    named_params! {
+                        ":group_kind": GROUP_ROUTE_KIND,
+                        ":route_after": route_after,
+                        ":event_after": event_after,
+                        ":route_until": route_until,
+                        ":event_until": event_until,
+                        ":limit": remaining as i64,
+                    },
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
             let finished = rows.len() < remaining;
             progress.examined += rows.len();
             let now = unix_now_seconds_i64();
@@ -157,28 +199,50 @@ impl SqliteAccountStorage {
                 event_after = id;
                 let candidate = conn.query_row_cached(
                     "SELECT g.id, g.epoch FROM cgka_transport_group_routes r
-                     JOIN cgka_groups g ON g.id=r.group_id
-                     WHERE r.transport_group_id=?1
-                       AND ?3 >= MAX(?4, COALESCE((SELECT inventory_since FROM transport_reconciliation_route_state
-                           WHERE route_kind=?6 AND route_id=?1), 0))
-                       AND NOT EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_messages WHERE id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_processed_transport_ids WHERE id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_ingress_dedup WHERE id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_outbound_fanout WHERE message_id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_outbound_transport_receipt_ids WHERE published_message_id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM cgka_welcomes WHERE message_id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM transport_reconciliation_items WHERE route_kind=?5 AND route_id=?7 AND event_id=?2)",
-                    params![route_after,event_after,created_at,retention_floor,inbox_kind,GROUP_ROUTE_KIND,inbox_route], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, i64>(1)?)))
-                    .optional().storage()?;
+                     JOIN cgka_groups g ON g.id = r.group_id
+                     WHERE r.transport_group_id = :route_id
+                       AND :created_at >= MAX(:retention_floor, COALESCE((
+                           SELECT inventory_since FROM transport_reconciliation_route_state
+                           WHERE route_kind = :group_kind AND route_id = :route_id), 0))
+                       AND NOT EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM cgka_messages WHERE id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM cgka_processed_transport_ids WHERE id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM cgka_ingress_dedup WHERE id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM cgka_outbound_fanout WHERE message_id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM cgka_outbound_transport_receipt_ids WHERE published_message_id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM cgka_welcomes WHERE message_id = :event_id)
+                       AND NOT EXISTS(SELECT 1 FROM transport_reconciliation_items
+                           WHERE route_kind = :inbox_kind AND route_id = :inbox_route AND event_id = :event_id)",
+                    named_params! {
+                        ":route_id": route_after,
+                        ":event_id": event_after,
+                        ":created_at": created_at,
+                        ":retention_floor": retention_floor,
+                        ":group_kind": GROUP_ROUTE_KIND,
+                        ":inbox_kind": inbox_kind,
+                        ":inbox_route": inbox_route,
+                    },
+                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+                ).optional().storage()?;
                 let Some((group, epoch)) = candidate else {
                     continue;
                 };
                 // The deleted wrapper's epoch is unknowable. Arm recovery at
                 // the current group epoch, the best available progress boundary.
-                let inserted = conn.execute_cached("INSERT INTO cgka_released_transport_receipts(id,group_id,epoch)
-                    SELECT ?1,?2,?3 WHERE (SELECT COUNT(*) FROM cgka_released_transport_receipts) < ?4
-                    ON CONFLICT(id) DO NOTHING", params![event_after,group,epoch,RELEASED_TRANSPORT_RECEIPT_CAPACITY]).storage()?;
+                let inserted = conn
+                    .execute_cached(
+                        "INSERT INTO cgka_released_transport_receipts(id, group_id, epoch)
+                     SELECT :event_id, :group_id, :epoch
+                     WHERE (SELECT COUNT(*) FROM cgka_released_transport_receipts) < :capacity
+                     ON CONFLICT(id) DO NOTHING",
+                        named_params! {
+                            ":event_id": event_after,
+                            ":group_id": group,
+                            ":epoch": epoch,
+                            ":capacity": RELEASED_TRANSPORT_RECEIPT_CAPACITY,
+                        },
+                    )
+                    .storage()?;
                 if inserted == 0 {
                     // Do not advance past an ID that has no durable invalidation.
                     return Err(StorageError::Backend(
@@ -330,8 +394,18 @@ mod tests {
         seed(&store, 10);
         {
             let conn = store.lock().unwrap();
-            // Raw/terminal input and own echoes keep their exact outer ID row.
-            for (id, state) in [(1_u8, 2), (2, 4)] {
+            // Processed input and an own echo with exact outer-ID Sent evidence.
+            // The real settled-send outer-ID relationship is covered at app level.
+            for (id, state) in [
+                (
+                    1_u8,
+                    crate::message_state_to_i64(cgka_traits::MessageState::Processed),
+                ),
+                (
+                    2,
+                    crate::message_state_to_i64(cgka_traits::MessageState::Sent),
+                ),
+            ] {
                 conn.execute(
                     "INSERT INTO cgka_messages(id,group_id,epoch,state,storage_format,payload)
                     VALUES (?1,x'aa',3,?2,2,x'00')",
@@ -575,6 +649,41 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_fanout_does_not_block_inventory_repair_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account.db");
+        let key = crate::SqlCipherKey::new("malformed-fanout-repair").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        seed(&store, 2);
+        store.lock().unwrap().execute(
+            "INSERT INTO cgka_outbound_fanout(message_id,group_id,record) VALUES (?1,x'aa',x'00')",
+            [&[1_u8; 32][..]],
+        ).unwrap();
+        let first = store.repair_uncertain_transport_receipts(1).unwrap();
+        assert_eq!(first.examined, 1);
+        assert_eq!(first.repaired, 0);
+        assert_eq!(first.skipped_fanouts, 1);
+        assert!(first.has_more);
+        store.close().unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(drain(&reopened, 1), 1);
+        let conn = reopened.lock().unwrap();
+        // The undecodable row is preserved and still excludes its exact ID.
+        assert_eq!(
+            conn.query_row("SELECT record FROM cgka_outbound_fanout", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM seen_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

@@ -19373,6 +19373,15 @@ fn historical_receipt_repair_replays_released_input_before_checkpoint_and_after_
 
 #[tokio::test]
 async fn historical_accepted_wrapper_repair_preserves_exact_once_public_projection() {
+    historical_wrapper_repair_preserves_projection("bob").await;
+}
+
+#[tokio::test]
+async fn historical_settled_own_echo_is_excluded_from_receipt_repair() {
+    historical_wrapper_repair_preserves_projection("alice").await;
+}
+
+async fn historical_wrapper_repair_preserves_projection(label: &str) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -19414,14 +19423,46 @@ async fn historical_accepted_wrapper_repair_preserves_exact_once_public_projecti
     let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("unexpected overflow");
     };
+    let mut client = if label == "alice" { alice } else { bob_client };
+    let mut delivery = *delivery;
+    delivery.account_id = client.adapter.account_id().clone();
     let id = delivery.message.id.clone();
-    bob_client
-        .ingest_received_delivery(*delivery.clone())
+    client
+        .ingest_received_delivery(delivery.clone())
         .await
         .unwrap();
-    let conn = historical_receipt_fixture_connection(&app, "bob");
-    // Pre-0058 accepted wrappers had no permanent processed marker; the small
-    // ingress cache can already have churned out. Canonical MLS rows remain.
+    let conn = historical_receipt_fixture_connection(&app, label);
+    // Nostr wrapping happens before the send is stored: a normal settled own
+    // echo retains its exact outer-ID Sent row, while received accepted wrappers
+    // only retain the canonical content ID on pre-0058 databases.
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM cgka_messages WHERE id=?1",
+            [id.as_slice()],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        i64::from(label == "alice"),
+        "only the sender retains an exact outer-ID message row"
+    );
+    if label == "alice" {
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM cgka_outbound_fanout", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM cgka_messages WHERE id=?1",
+                [id.as_slice()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "the exact outer-ID record is Sent"
+        );
+    }
     conn.execute(
         "DELETE FROM cgka_processed_transport_ids WHERE id=?1",
         [id.as_slice()],
@@ -19436,7 +19477,7 @@ async fn historical_accepted_wrapper_repair_preserves_exact_once_public_projecti
         .query_row("SELECT count(*) FROM cgka_messages", [], |r| r.get(0))
         .unwrap();
     let before = app
-        .timeline_messages_with_query("bob", storage_sqlite::TimelineMessageQuery::default())
+        .timeline_messages_with_query(label, storage_sqlite::TimelineMessageQuery::default())
         .unwrap()
         .messages;
     assert_eq!(
@@ -19447,32 +19488,29 @@ async fn historical_accepted_wrapper_repair_preserves_exact_once_public_projecti
         1
     );
     assert!(
-        bob_client
+        client
             .seen_events_index
             .contains(&hex::encode(id.as_slice()))
     );
-    assert!(
-        bob_client
-            .repair_uncertain_transport_receipts(256)
-            .unwrap()
-            .repaired
-            >= 1
-    );
-    assert!(
-        !bob_client
+    let progress = client.repair_uncertain_transport_receipts(256).unwrap();
+    if label == "alice" {
+        assert_eq!(progress.repaired, 0, "settled own echoes stay excluded");
+    } else {
+        assert!(progress.repaired >= 1);
+    }
+    assert_eq!(
+        client
             .seen_events_index
-            .contains(&hex::encode(id.as_slice()))
+            .contains(&hex::encode(id.as_slice())),
+        label == "alice",
     );
-    bob_client
-        .ingest_received_delivery(*delivery.clone())
+    client
+        .ingest_received_delivery(delivery.clone())
         .await
         .unwrap();
-    bob_client
-        .ingest_received_delivery(*delivery)
-        .await
-        .unwrap();
+    client.ingest_received_delivery(delivery).await.unwrap();
     let after = app
-        .timeline_messages_with_query("bob", storage_sqlite::TimelineMessageQuery::default())
+        .timeline_messages_with_query(label, storage_sqlite::TimelineMessageQuery::default())
         .unwrap()
         .messages;
     assert_eq!(

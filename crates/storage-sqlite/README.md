@@ -40,26 +40,34 @@ migrations after SQLCipher keying and before storage handles are exposed.
 
 Migration 0066 schedules a one-time historical transport receipt repair for existing account databases.
 It creates repair metadata and an empty outbound signed-ID index without scanning retained history on open.
-After readiness and group hydration, the app worker inspects at most 32 fanout/inventory rows per maintenance
+After readiness and group hydration, the app worker inspects at most 256 fanout/inventory rows per maintenance
 pass (the storage API caps a batch at 256). Transactional keyset cursors and fixed high waters allow restart
 and bound each pass, including when every inventory entry is excluded by possession evidence. Old fanout
 signed IDs are indexed before inventory selection; new fanout writes maintain that index atomically.
 The index covers retained pending fanouts, including ones written by older versions; it cascades away when
 those fanouts settle. Pending fanouts have no hard per-account count limit, so decoding the entire set on
-every pass would violate the bounded-work requirement. Permanent decode/backend failures halt this process's
-sweep with its durable cursor intact; transient lock contention retries on the next tick.
+every pass would violate the bounded-work requirement even though reconnect/resume paths currently perform
+full fanout scans. This maintenance pass does not inherit those paths' unbounded cost. Undecodable legacy
+fanouts are counted and skipped without changing their rows or exact-ID exclusions, so one malformed record
+cannot strand the inventory sweep. Proven corruption, schema and decode failures elsewhere halt the sweep;
+lock contention, capacity and unclassified backend failures retry on the next tick. Closed handles stop quietly.
 
 Only retained group-route inventory entries without raw/message, processed-marker, ingress-dedup, Welcome,
 or outbound-fanout evidence are selected. Inbox claims, protocol state, projections, retention floors and
 reconciliation cursors are preserved. Selected IDs enter the durable release journal and arm epoch backfill;
 the active account invalidates its seen index synchronously before checkpoint or redelivery. Counts describe
-**uncertain-possession repairs**, since pre-0058 accepted wrappers may lack a processed marker. Redelivery
-must still deduplicate canonical messages. Expired epoch keys, retained inventory windows and unavailable
+**uncertain-possession repairs**, since pre-0058 accepted wrappers may lack a processed marker. Normal Nostr
+own echoes remain excluded after fanout settlement: the engine stores the already-signed outer ID as `Sent`,
+alongside its content-derived marker. The repair never infers possession from author identity or from the
+absence of raw data; wrappers without exact outer-ID evidence remain uncertain and redelivery must still
+deduplicate canonical messages. Expired epoch keys, retained inventory windows and unavailable
 relay history limit recovery; this repair cannot reconstruct missing relay history.
 The scan intentionally has no release-date cutoff on event `created_at`: that is the sender's signed authored
 time, not the local receipt/deletion time, and account upgrades may occur well after a release. The retained
-window and fixed keyset high water define its scope instead. A full route takes roughly two hours of active
-worker time at this conservative pacing; sparse or multi-route histories can require many maintenance ticks.
+window and fixed keyset high water define its scope instead. A full 16,384-entry route needs 64 inventory
+passes (roughly 16 minutes of active worker time at a 15-second cadence, plus any fanout indexing passes).
+The query-work regression checks 256-entry first/last pages against 512 and 16,384 retained entries; it bounds
+SQL work, not device latency. Large or multi-route histories can still require many maintenance ticks.
 
 The three current app database categories have independent histories: `session.sqlite` uses
 `cgka_schema_migrations`, the per-account `app-cache.sqlite3` uses marmot-app's `app_cache_schema_migrations`, and

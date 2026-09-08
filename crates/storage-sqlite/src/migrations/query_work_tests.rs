@@ -453,7 +453,7 @@ fn branch_origin_hex_matching() {
 #[test]
 fn historical_receipt_repair_bounds_examined_history_and_cursor_seek_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
-    for count in [256, 16_384] {
+    for count in [512, 16_384] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         {
             let conn = store.lock().unwrap();
@@ -477,23 +477,27 @@ fn historical_receipt_repair_bounds_examined_history_and_cursor_seek_work() {
             )
             .unwrap();
         }
-        let first = measured(&store, "first historical repair page", 12_000, || {
-            store.repair_uncertain_transport_receipts(16).unwrap()
+        // The trace helper sums cumulative VmStep counters for cached statements,
+        // so repeated probes overcount actual work. Keep the same conservative
+        // ceiling at both history sizes and cursor positions: a history scan
+        // must still fail it, while the full 256-row production quantum passes.
+        let first = measured(&store, "first historical repair page", 2_300_000, || {
+            store.repair_uncertain_transport_receipts(256).unwrap()
         });
-        assert_eq!(first.examined, 16);
+        assert_eq!(first.examined, 256);
         assert_eq!(first.repaired, 0);
         store
             .lock()
             .unwrap()
             .execute(
                 "UPDATE app_historical_receipt_repair SET event_after=?1",
-                [format!("{:032x}", count - 16).into_bytes()],
+                [format!("{:032x}", count - 256).into_bytes()],
             )
             .unwrap();
-        let last = measured(&store, "late historical repair page", 12_000, || {
-            store.repair_uncertain_transport_receipts(16).unwrap()
+        let last = measured(&store, "late historical repair page", 2_300_000, || {
+            store.repair_uncertain_transport_receipts(256).unwrap()
         });
-        assert_eq!(last.examined, 16);
+        assert_eq!(last.examined, 256);
         assert!(!last.has_more);
     }
 }

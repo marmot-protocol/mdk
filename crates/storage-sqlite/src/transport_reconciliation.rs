@@ -7,7 +7,7 @@ use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub(crate) const INBOX_ROUTE_KIND: i64 = 0;
+const INBOX_ROUTE_KIND: i64 = 0;
 pub(crate) const GROUP_ROUTE_KIND: i64 = 1;
 /// A route advertises at most this many exact event ids to NIP-77. When the
 /// bound is crossed, an entire authored-time bucket is retired and the durable
