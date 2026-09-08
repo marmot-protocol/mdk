@@ -116,6 +116,85 @@ fn generation_never_revives() {
     assert!(!p.valid());
     assert!(c.permit().unwrap().valid());
 }
+
+#[tokio::test]
+#[cfg(feature = "product-analytics-export")]
+async fn custom_host_timing_events() {
+    use crate::HostPerformanceOutcome::{Failure, Success};
+
+    let (collector, _) = configured();
+    let mut config = collector.lock().config.clone();
+    config.registry.push(ProductEventSchema {
+        name: "app_inbox_layout".into(),
+        mode: ProductEventMode::Aggregate,
+        properties: vec![
+            ProductPropertySchema {
+                name: "elapsed".into(),
+                rule: ProductPropertyRule::DurationBucket,
+            },
+            ProductPropertySchema {
+                name: "outcome".into(),
+                rule: ProductPropertyRule::Enum(vec!["success".into(), "failure".into()]),
+            },
+        ],
+    });
+    collector
+        .configure(config, "http://127.0.0.1:9876".into())
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut app = MarmotApp::with_relay(root.path(), "wss://relay.example");
+    app.product_analytics = collector.clone();
+    let runtime = app.runtime();
+    let elapsed = Duration::from_millis(250);
+    assert_eq!(
+        runtime
+            .record_host_timing("app_inbox_layout".into(), elapsed, Success)
+            .unwrap(),
+        ProductRecordResult::IgnoredDisabled
+    );
+    grant(&collector);
+    for name in ["app_unregistered", "app_test_view"] {
+        assert!(
+            runtime
+                .record_host_timing(name.into(), elapsed, Success)
+                .is_err()
+        );
+    }
+    for (duration, outcome) in [
+        (elapsed, Success),
+        (elapsed + Duration::from_nanos(1), Failure),
+    ] {
+        assert_eq!(
+            runtime
+                .record_host_timing("app_inbox_layout".into(), duration, outcome)
+                .unwrap(),
+            ProductRecordResult::Recorded
+        );
+    }
+    let rows = collector.test_payloads();
+    let timings: Vec<_> = rows
+        .iter()
+        .filter(|row| row["eventName"] == "app_inbox_layout")
+        .collect();
+    assert_eq!(timings.len(), 2);
+    for (outcome, bucket) in [("success", "le_250ms"), ("failure", "le_500ms")] {
+        let row = timings
+            .iter()
+            .find(|row| row["props"]["outcome"] == outcome)
+            .unwrap();
+        assert_eq!(row["props"]["elapsed"], bucket);
+        assert_eq!(row["props"]["count_bucket"], "1");
+        assert!(collector.valid_payload(&collector.lock().config, row));
+    }
+    collector.set_receipt(UsageDiagnosticsSettings::default(), String::new());
+    assert_eq!(
+        runtime
+            .record_host_timing("app_inbox_layout".into(), elapsed, Success)
+            .unwrap(),
+        ProductRecordResult::IgnoredDisabled
+    );
+    assert!(collector.test_payloads().is_empty());
+}
 #[test]
 fn keys_are_redacted_and_reserved_properties_rejected() {
     let (c, _) = configured();

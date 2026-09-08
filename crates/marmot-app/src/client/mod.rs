@@ -293,6 +293,7 @@ pub(crate) struct GroupRouteRefresh {
 }
 
 pub struct AppClient {
+    pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
     pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
@@ -3519,6 +3520,27 @@ impl AppClient {
                 return Err(err);
             }
         };
+        if should_project_locally {
+            if let Some(duration) = effects.local_accept_duration {
+                record_app_performance(
+                    self.send_telemetry.as_ref(),
+                    AppPerformanceOperation::OutboundMessageLocalAccept,
+                    duration,
+                    true,
+                );
+            }
+            if let Some(duration) = effects.publish_duration {
+                let published = effects.published_app_messages.iter().any(|message| {
+                    message.group_id == *group_id && message.app_event_id == app_event_id
+                });
+                record_app_performance(
+                    self.send_telemetry.as_ref(),
+                    AppPerformanceOperation::OutboundMessagePublish,
+                    duration,
+                    published,
+                );
+            }
+        }
         if let Err(publish_err) = self
             .observe_recovery_evidence_then_gate_send_publish(&effects, group_id, &app_event_id)
             .await

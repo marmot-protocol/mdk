@@ -701,3 +701,98 @@ fn late_cumulative_sources_start_at_zero_and_retain_their_baseline_when_absent()
     assert_eq!(reset.points[0].value, ExportMetricValue::Counter(0));
     assert_eq!(reset.points[1].value, batch(0).points[1].value);
 }
+
+#[test]
+fn message_journey_metric_export() {
+    use crate::app_telemetry::{
+        AppPerformanceOperation, AppPerformanceTelemetry, HostPerformanceOperation,
+        HostPerformanceOutcome,
+    };
+    let telemetry = AppPerformanceTelemetry::default();
+    for operation in [
+        AppPerformanceOperation::OutboundMessageQueueWait,
+        AppPerformanceOperation::OutboundMessageLocalProjection,
+        AppPerformanceOperation::OutboundMessageLocalAccept,
+        AppPerformanceOperation::OutboundMessagePublish,
+        AppPerformanceOperation::OutboundMessageResponse,
+        AppPerformanceOperation::InboundDeliveryProjection,
+    ] {
+        telemetry.record(operation, std::time::Duration::from_millis(60), true);
+        telemetry.record(operation, std::time::Duration::from_millis(120), false);
+    }
+    for operation in [
+        HostPerformanceOperation::OutboundMessageVisible,
+        HostPerformanceOperation::InboundMessageVisible,
+    ] {
+        telemetry.record_host_performance(
+            operation,
+            std::time::Duration::from_millis(60),
+            HostPerformanceOutcome::Success,
+        );
+        telemetry.record_host_performance(
+            operation,
+            std::time::Duration::from_millis(120),
+            HostPerformanceOutcome::Failure,
+        );
+    }
+    let snapshot = telemetry.snapshot();
+    let batch = build_export_batch_with_app_performance(
+        &RelayTelemetryRollup::default(),
+        &RelayLabelResolution::default(),
+        Some(&snapshot),
+    );
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    for (name, operation) in [
+        (
+            "outbound_message_queue_wait",
+            &snapshot.outbound_message_queue_wait,
+        ),
+        (
+            "outbound_message_local_projection",
+            &snapshot.outbound_message_local_projection,
+        ),
+        (
+            "outbound_message_local_accept",
+            &snapshot.outbound_message_local_accept,
+        ),
+        (
+            "outbound_message_publish",
+            &snapshot.outbound_message_publish,
+        ),
+        (
+            "outbound_message_response",
+            &snapshot.outbound_message_response,
+        ),
+        (
+            "inbound_delivery_projection",
+            &snapshot.inbound_delivery_projection,
+        ),
+        (
+            "host_outbound_message_visible",
+            &snapshot.host_outbound_message_visible,
+        ),
+        (
+            "host_inbound_message_visible",
+            &snapshot.host_inbound_message_visible,
+        ),
+    ] {
+        assert_eq!(operation.attempts, 2);
+        assert_eq!(operation.successes, 1);
+        assert_eq!(operation.failures, 1);
+        assert_eq!(operation.duration_ms.sum_ms, 180);
+        for suffix in ["duration_ms", "attempts", "successes", "failures"] {
+            let name = format!("app_{name}_{suffix}");
+            let points = batch
+                .points
+                .iter()
+                .filter(|point| point.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(points.len(), 1, "{name} must be exported exactly once");
+            assert!(points[0].relay.is_none());
+        }
+        legacy.as_object_mut().unwrap().remove(name);
+    }
+    let legacy: AppPerformanceSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.outbound_message_queue_wait.attempts, 0);
+    assert_eq!(legacy.host_inbound_message_visible.attempts, 0);
+}

@@ -286,6 +286,69 @@ pub mod metric_names {
     /// Existing-database opens that skipped the recovery probe via a cached
     /// v2-open verdict (each avoided one passphrase KDF derivation, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_SKIPS: &str = "app_sqlcipher_migration_probe_skips";
+    /// Send command admission and worker queue wait.
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION: &str =
+        "app_outbound_message_queue_wait_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS: &str =
+        "app_outbound_message_queue_wait_attempts";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES: &str =
+        "app_outbound_message_queue_wait_successes";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES: &str =
+        "app_outbound_message_queue_wait_failures";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_DURATION: &str =
+        "app_outbound_message_local_projection_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_ATTEMPTS: &str =
+        "app_outbound_message_local_projection_attempts";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_SUCCESSES: &str =
+        "app_outbound_message_local_projection_successes";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_FAILURES: &str =
+        "app_outbound_message_local_projection_failures";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_DURATION: &str =
+        "app_outbound_message_local_accept_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_ATTEMPTS: &str =
+        "app_outbound_message_local_accept_attempts";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_SUCCESSES: &str =
+        "app_outbound_message_local_accept_successes";
+    pub const APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_FAILURES: &str =
+        "app_outbound_message_local_accept_failures";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_DURATION: &str =
+        "app_outbound_message_publish_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_ATTEMPTS: &str = "app_outbound_message_publish_attempts";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_SUCCESSES: &str =
+        "app_outbound_message_publish_successes";
+    pub const APP_OUTBOUND_MESSAGE_PUBLISH_FAILURES: &str = "app_outbound_message_publish_failures";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_DURATION: &str =
+        "app_outbound_message_response_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_ATTEMPTS: &str =
+        "app_outbound_message_response_attempts";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_SUCCESSES: &str =
+        "app_outbound_message_response_successes";
+    pub const APP_OUTBOUND_MESSAGE_RESPONSE_FAILURES: &str =
+        "app_outbound_message_response_failures";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_DURATION: &str =
+        "app_host_outbound_message_visible_duration_ms";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_ATTEMPTS: &str =
+        "app_host_outbound_message_visible_attempts";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_SUCCESSES: &str =
+        "app_host_outbound_message_visible_successes";
+    pub const APP_HOST_OUTBOUND_MESSAGE_VISIBLE_FAILURES: &str =
+        "app_host_outbound_message_visible_failures";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_DURATION: &str =
+        "app_host_inbound_message_visible_duration_ms";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_ATTEMPTS: &str =
+        "app_host_inbound_message_visible_attempts";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_SUCCESSES: &str =
+        "app_host_inbound_message_visible_successes";
+    pub const APP_HOST_INBOUND_MESSAGE_VISIBLE_FAILURES: &str =
+        "app_host_inbound_message_visible_failures";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_DURATION: &str =
+        "app_inbound_delivery_projection_duration_ms";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_ATTEMPTS: &str =
+        "app_inbound_delivery_projection_attempts";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_SUCCESSES: &str =
+        "app_inbound_delivery_projection_successes";
+    pub const APP_INBOUND_DELIVERY_PROJECTION_FAILURES: &str =
+        "app_inbound_delivery_projection_failures";
     /// One-sided outbound message send duration histogram.
     pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
     /// One-sided outbound message send attempts.
@@ -1175,6 +1238,70 @@ fn append_app_performance_points(
         metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_ATTEMPTS,
         metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_SUCCESSES,
         metric_names::APP_ACCOUNT_SETUP_NETWORK_READY_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_queue_wait,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_local_projection,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_PROJECTION_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_local_accept,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_LOCAL_ACCEPT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_publish,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_response,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_RESPONSE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_outbound_message_visible,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_DURATION,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_ATTEMPTS,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_SUCCESSES,
+        metric_names::APP_HOST_OUTBOUND_MESSAGE_VISIBLE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.host_inbound_message_visible,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_DURATION,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_ATTEMPTS,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_SUCCESSES,
+        metric_names::APP_HOST_INBOUND_MESSAGE_VISIBLE_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.inbound_delivery_projection,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_DURATION,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_ATTEMPTS,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_SUCCESSES,
+        metric_names::APP_INBOUND_DELIVERY_PROJECTION_FAILURES,
     );
     append_app_operation_points(
         points,

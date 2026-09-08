@@ -47,7 +47,16 @@ pub(crate) enum AppPerformanceOperation {
     AccountSetupKeyPackageLocal,
     AccountSetupLocalReadyHandoff,
     AccountSetupNetworkReady,
+    InboundDeliveryProjection,
     OutboundMessageSend,
+    OutboundMessageQueueWait,
+    OutboundMessageLocalProjection,
+    OutboundMessageLocalAccept,
+    OutboundMessagePublish,
+    OutboundMessageResponse,
+    HostOutboundMessageVisible,
+    HostInboundMessageVisible,
+
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
     GroupMemberKeyPackagePrewarm,
@@ -105,6 +114,10 @@ pub(crate) enum AppPerformanceOperation {
 pub enum HostPerformanceOperation {
     SplashReady,
     ForegroundLocalReady,
+    /// From the user send action until the first local bubble is rendered.
+    OutboundMessageVisible,
+    /// From the host receiving a message update until it is rendered.
+    InboundMessageVisible,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,7 +293,24 @@ pub struct AppPerformanceSnapshot {
     /// passphrase KDF derivation (mdk#1439).
     #[serde(default)]
     pub sqlcipher_migration_probe_skips: u64,
+    #[serde(default)]
+    pub inbound_delivery_projection: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_queue_wait: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_local_projection: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_local_accept: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_response: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_outbound_message_visible: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub host_inbound_message_visible: AppPerformanceOperationSnapshot,
+
     #[serde(default)]
     pub group_create_queue_wait: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -405,7 +435,16 @@ struct AppPerformanceTelemetryInner {
     account_setup_key_package_local: AppPerformanceOperationTelemetry,
     account_setup_local_ready_handoff: AppPerformanceOperationTelemetry,
     account_setup_network_ready: AppPerformanceOperationTelemetry,
+    inbound_delivery_projection: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
+    outbound_message_queue_wait: AppPerformanceOperationTelemetry,
+    outbound_message_local_projection: AppPerformanceOperationTelemetry,
+    outbound_message_local_accept: AppPerformanceOperationTelemetry,
+    outbound_message_publish: AppPerformanceOperationTelemetry,
+    outbound_message_response: AppPerformanceOperationTelemetry,
+    host_outbound_message_visible: AppPerformanceOperationTelemetry,
+    host_inbound_message_visible: AppPerformanceOperationTelemetry,
+
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
     group_member_key_package_prewarm: AppPerformanceOperationTelemetry,
@@ -728,6 +767,36 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::AccountSetupNetworkReady => {
                 inner.account_setup_network_ready.record(duration, success)
             }
+            AppPerformanceOperation::OutboundMessageQueueWait => {
+                inner.outbound_message_queue_wait.record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageLocalProjection => {
+                inner
+                    .outbound_message_local_projection
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageLocalAccept => {
+                inner
+                    .outbound_message_local_accept
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessagePublish => {
+                inner.outbound_message_publish.record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageResponse => {
+                inner.outbound_message_response.record(duration, success);
+            }
+            AppPerformanceOperation::HostOutboundMessageVisible => {
+                inner
+                    .host_outbound_message_visible
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::HostInboundMessageVisible => {
+                inner.host_inbound_message_visible.record(duration, success);
+            }
+            AppPerformanceOperation::InboundDeliveryProjection => {
+                inner.inbound_delivery_projection.record(duration, success);
+            }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
             }
@@ -956,6 +1025,12 @@ impl AppPerformanceTelemetry {
         outcome: HostPerformanceOutcome,
     ) {
         let operation = match operation {
+            HostPerformanceOperation::OutboundMessageVisible => {
+                AppPerformanceOperation::HostOutboundMessageVisible
+            }
+            HostPerformanceOperation::InboundMessageVisible => {
+                AppPerformanceOperation::HostInboundMessageVisible
+            }
             HostPerformanceOperation::SplashReady => AppPerformanceOperation::HostSplashReady,
             HostPerformanceOperation::ForegroundLocalReady => {
                 AppPerformanceOperation::HostForegroundLocalReady
@@ -1008,7 +1083,16 @@ impl AppPerformanceTelemetry {
             account_setup_network_ready: inner.account_setup_network_ready.snapshot(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
+            inbound_delivery_projection: inner.inbound_delivery_projection.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
+            outbound_message_queue_wait: inner.outbound_message_queue_wait.snapshot(),
+            outbound_message_local_projection: inner.outbound_message_local_projection.snapshot(),
+            outbound_message_local_accept: inner.outbound_message_local_accept.snapshot(),
+            outbound_message_publish: inner.outbound_message_publish.snapshot(),
+            outbound_message_response: inner.outbound_message_response.snapshot(),
+            host_outbound_message_visible: inner.host_outbound_message_visible.snapshot(),
+            host_inbound_message_visible: inner.host_inbound_message_visible.snapshot(),
+
             group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
             group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
             group_member_key_package_prewarm: inner.group_member_key_package_prewarm.snapshot(),
