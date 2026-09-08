@@ -153,8 +153,8 @@ pub struct AppGroupRecord {
     pub prior_nostr_routes: Vec<AppPriorNostrRoute>,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
-    /// URL-based group avatar. When `present`, it takes precedence over `image`
-    /// for rendering (spec: `marmot.group.avatar-url.v1`).
+    /// URL-based group avatar, used when no valid encrypted `image` is available.
+    /// When both sources are present, encrypted group image material wins.
     #[serde(default)]
     pub avatar_url: AppGroupAvatarUrlComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,

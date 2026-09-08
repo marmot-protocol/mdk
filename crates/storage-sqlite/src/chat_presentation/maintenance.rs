@@ -129,7 +129,43 @@ impl SqliteAccountStorage {
                 .collect()
         })
     }
-    /// Existing legacy row construction is queued only for groups without a chat row.
+
+    /// Refresh and complete one queued initialization in the same transaction.
+    /// Returns false if another operation already completed or removed the work.
+    /// Tolerates queued work overlapping an existing row without depending on
+    /// the INSERT-only completion trigger, including unexpected recovery state.
+    pub fn initialize_chat_presentation_row(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        mention_classifier: &crate::chat_list::MentionClassifier<'_>,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let queued = || -> StorageResult<bool> {
+                self.lock()?.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
+                    [group_id_hex], |row| row.get(0),
+                ).storage()
+            };
+            if !queued()? {
+                return Ok(false);
+            }
+            self.refresh_chat_list_row(local_account_id_hex, group_id_hex, mention_classifier)?;
+            self.lock()?
+                .execute_cached(
+                    "DELETE FROM chat_presentation_row_work WHERE group_id_hex=?1",
+                    [group_id_hex],
+                )
+                .storage()?;
+            if queued()? {
+                return Err(invalid("presentation initialization did not complete"));
+            }
+            Ok(true)
+        })
+    }
+
+    /// Read at most one bounded page of groups needing legacy row initialization.
+    /// A queued group may already have a chat row; initialization also handles upserts.
     pub fn pending_chat_presentation_rows(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         let mut q = conn.prepare_cached(

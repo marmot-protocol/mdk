@@ -116,67 +116,67 @@ pub(crate) fn select_chat_presentation(
         }
         hex::encode(digest.finalize())
     };
-    let (avatar, avatar_source) =
-        if let Some(url) = input.avatar_url.as_deref().and_then(safe_image_url) {
-            (
-                SelectedAvatar::RemoteImage {
-                    cache_key: key(&input.group_id_hex, "group-url", &[&url]),
-                    url,
-                },
-                PresentationSource::Group,
-            )
-        } else if let Some(image) = input.avatar.as_ref().filter(|image| {
-            valid_hex(&image.image_hash_hex, 32)
-                && valid_hex(&image.image_key_hex, 32)
-                && valid_hex(&image.image_nonce_hex, 12)
-                && valid_hex(&image.image_upload_key_hex, 32)
-        }) {
-            (
-                SelectedAvatar::EncryptedGroupImage {
-                    image: image.clone(),
-                    cache_key: key(
-                        &input.group_id_hex,
-                        "group-image",
-                        &[
-                            &image.image_hash_hex,
-                            &image.image_key_hex,
-                            &image.image_nonce_hex,
-                            &image.image_upload_key_hex,
-                            image.media_type.as_deref().unwrap_or(""),
-                        ],
-                    ),
-                },
-                PresentationSource::Group,
-            )
-        } else if let Some((peer, url)) = peer.as_deref().zip(
-            profile
-                .and_then(|p| p.picture.as_deref())
-                .and_then(safe_image_url),
-        ) {
-            (
-                SelectedAvatar::RemoteImage {
-                    cache_key: key(peer, "peer-url", &[&url]),
-                    url,
-                },
-                PresentationSource::PeerProfile,
-            )
-        } else {
-            (
-                SelectedAvatar::Placeholder {
-                    stable_seed: key(
-                        peer.as_deref().unwrap_or(&input.group_id_hex),
-                        match fallback_source {
-                            PresentationSource::PeerFallback => "person",
-                            PresentationSource::GroupFallback => "group",
-                            _ => "unknown",
-                        },
-                        &[],
-                    ),
-                    source: fallback_source,
-                },
-                fallback_source,
-            )
-        };
+    // Valid encrypted group material wins when both group sources are present.
+    let (avatar, avatar_source) = if let Some(image) = input.avatar.as_ref().filter(|image| {
+        valid_hex(&image.image_hash_hex, 32)
+            && valid_hex(&image.image_key_hex, 32)
+            && valid_hex(&image.image_nonce_hex, 12)
+            && valid_hex(&image.image_upload_key_hex, 32)
+    }) {
+        (
+            SelectedAvatar::EncryptedGroupImage {
+                image: image.clone(),
+                cache_key: key(
+                    &input.group_id_hex,
+                    "group-image",
+                    &[
+                        &image.image_hash_hex,
+                        &image.image_key_hex,
+                        &image.image_nonce_hex,
+                        &image.image_upload_key_hex,
+                        image.media_type.as_deref().unwrap_or(""),
+                    ],
+                ),
+            },
+            PresentationSource::Group,
+        )
+    } else if let Some(url) = input.avatar_url.as_deref().and_then(safe_image_url) {
+        (
+            SelectedAvatar::RemoteImage {
+                cache_key: key(&input.group_id_hex, "group-url", &[&url]),
+                url,
+            },
+            PresentationSource::Group,
+        )
+    } else if let Some((peer, url)) = peer.as_deref().zip(
+        profile
+            .and_then(|p| p.picture.as_deref())
+            .and_then(safe_image_url),
+    ) {
+        (
+            SelectedAvatar::RemoteImage {
+                cache_key: key(peer, "peer-url", &[&url]),
+                url,
+            },
+            PresentationSource::PeerProfile,
+        )
+    } else {
+        (
+            SelectedAvatar::Placeholder {
+                stable_seed: key(
+                    peer.as_deref().unwrap_or(&input.group_id_hex),
+                    match fallback_source {
+                        PresentationSource::PeerFallback => "person",
+                        PresentationSource::GroupFallback => "group",
+                        _ => "unknown",
+                    },
+                    &[],
+                ),
+                source: fallback_source,
+            },
+            fallback_source,
+        )
+    };
     let resolution = if matches!(
         title_source,
         PresentationSource::Group | PresentationSource::PeerProfile
@@ -360,8 +360,20 @@ mod tests {
         input.avatar_url = Some("https://example.com/group.png".into());
         assert!(matches!(
             select_chat_presentation(&input, &"aa".repeat(32), None).avatar,
+            SelectedAvatar::EncryptedGroupImage { .. }
+        ));
+        let valid_image = input.avatar.clone();
+        input.avatar.as_mut().unwrap().image_key_hex.clear();
+        assert!(matches!(
+            select_chat_presentation(&input, &"aa".repeat(32), None).avatar,
             SelectedAvatar::RemoteImage { .. }
         ));
+        input.avatar = None;
+        assert!(matches!(
+            select_chat_presentation(&input, &"aa".repeat(32), None).avatar,
+            SelectedAvatar::RemoteImage { .. }
+        ));
+        input.avatar = valid_image;
         input.avatar_url = None;
         input.members = vec!["aa".repeat(32), "cc".repeat(32)];
         assert!(select_chat_presentation(&input, &"aa".repeat(32), None).avatar == p.avatar);

@@ -3,6 +3,9 @@ use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
+    // The INSERT trigger opportunistically clears work created with a new row.
+    // Initialization also explicitly completes UPDATE/upsert work in its refresh
+    // transaction; a queued account group may have a surviving legacy chat row.
     tx.execute_batch("CREATE TABLE chat_presentation_checkpoint (
         id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL DEFAULT 0
             CHECK(typeof(generation)='integer' AND generation>=0), state BLOB);

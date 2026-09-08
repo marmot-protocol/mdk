@@ -100,7 +100,9 @@ PresentedChatListUpdate {
 | Same peer, newer profile awaiting apply | Last usable same-peer selection | Last usable same-peer selection |
 | Peer replaced or roster no longer qualifies | Recompute against new evidence; never carry old peer as current | Recompute or placeholder; never reuse old peer cache key |
 
-An explicit group image wins in every row independently. Terminal lifecycle flags and command restrictions remain
+An explicit group image wins in every row independently. When both group sources are present, valid encrypted
+group image material takes precedence over the group avatar URL; the URL is the fallback when encrypted material is
+absent or invalid. Terminal lifecycle flags and command restrictions remain
 unchanged; a screen record does not authorize a mutation. Current projected membership determines peer eligibility.
 
 ### Names and historical data
@@ -265,7 +267,9 @@ tick recovers missed wakeups. A batch with no checkpoint or row progress stops i
 commit-before-broadcast interruption. These internal invalidations are the P3 subscription input.
 
 Groups missing a legacy chat row use a durable, bounded initialization queue and the existing row projector. This
-first-row construction retains the legacy projector's query cost; profile refresh and steady-state repair do not
+initialization retains the legacy projector's query cost; refresh and queue completion commit atomically even if a
+chat row already exists. Only durable completion counts as initialization progress. Profile refresh and steady-state
+repair do not
 rebuild history. Quarantined rosters lose current peer evidence until live reconciliation supplies it again; existing member counts and direct-conversation reuse indexes remain intact. Two-person roster identities use the same canonical order in memory and storage.
 
 ### Consumer accounting

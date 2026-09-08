@@ -574,3 +574,125 @@ fn catchup_checkpoint_and_batch_roll_back_together_and_fence_old_workers() {
         ChatPresentationRead::Ready(Box::new(value("bb", "Current", 2)))
     );
 }
+
+#[test]
+fn initialization_completes_an_upsert_over_an_existing_chat_row() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    // Inject overlapping queued/existing state defensively. Normal snapshot
+    // pruning cascades the chat row; it does not create this overlap.
+    store
+        .lock()
+        .unwrap()
+        .execute("INSERT INTO chat_presentation_row_work VALUES ('11')", [])
+        .unwrap();
+    store
+        .refresh_chat_list_row(&"aa".repeat(32), "11", &|_, _| false)
+        .unwrap();
+    assert_eq!(
+        store.pending_chat_presentation_rows().unwrap(),
+        ["11"],
+        "an upsert alone does not run the INSERT-only completion trigger"
+    );
+    let row_epoch = store
+        .chat_presentation_input("11")
+        .unwrap()
+        .unwrap()
+        .row_epoch;
+    assert!(
+        store
+            .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+            .unwrap()
+    );
+    assert!(store.pending_chat_presentation_rows().unwrap().is_empty());
+    assert_eq!(
+        store
+            .chat_presentation_input("11")
+            .unwrap()
+            .unwrap()
+            .row_epoch,
+        row_epoch
+    );
+    let row = store.chat_list_row("11").unwrap();
+    assert!(
+        !store
+            .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+            .unwrap()
+    );
+    assert_eq!(store.chat_list_row("11").unwrap(), row);
+}
+
+#[test]
+fn initialization_completion_failure_rolls_back_refresh_and_retries_after_reopen() {
+    for fail_with in ["ABORT, 'injected completion failure'", "IGNORE"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("initialization.db");
+        let key = SqlCipherKey::new("initialization fixture").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        seed(&store, "11");
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO chat_presentation_row_work VALUES ('11');
+             UPDATE account_groups SET profile_name='Changed' WHERE group_id_hex='11';
+             CREATE TRIGGER prevent_completion BEFORE DELETE ON chat_presentation_row_work
+             BEGIN SELECT RAISE({fail_with}); END;"
+            ))
+            .unwrap();
+        let before = store.chat_list_row("11").unwrap();
+        assert!(
+            store
+                .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+                .is_err()
+        );
+        assert_eq!(
+            store.chat_list_row("11").unwrap(),
+            before,
+            "refresh and completion must roll back together"
+        );
+        assert_eq!(store.pending_chat_presentation_rows().unwrap(), ["11"]);
+        drop(store);
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(store.pending_chat_presentation_rows().unwrap(), ["11"]);
+        assert_eq!(store.chat_list_row("11").unwrap(), before);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER prevent_completion")
+            .unwrap();
+        assert!(
+            store
+                .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+                .unwrap()
+        );
+        assert!(store.pending_chat_presentation_rows().unwrap().is_empty());
+        assert_ne!(store.chat_list_row("11").unwrap(), before);
+    }
+}
+
+#[test]
+fn initialization_completes_a_new_row_and_ignores_deleted_work() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,profile_name,updated_at) VALUES ('11','fixture','New',7)", []).unwrap();
+    assert_eq!(store.pending_chat_presentation_rows().unwrap(), ["11"]);
+    assert!(
+        store
+            .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+            .unwrap()
+    );
+    assert!(store.chat_list_row("11").unwrap().is_some());
+    assert!(store.pending_chat_presentation_rows().unwrap().is_empty());
+    store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,profile_name,updated_at) VALUES ('22','fixture','Removed',7)", []).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM account_groups WHERE group_id_hex='22'", [])
+        .unwrap();
+    assert!(
+        !store
+            .initialize_chat_presentation_row(&"aa".repeat(32), "22", &|_, _| false)
+            .unwrap()
+    );
+    assert!(store.chat_list_row("22").unwrap().is_none());
+}
