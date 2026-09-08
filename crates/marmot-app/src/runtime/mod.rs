@@ -1906,6 +1906,42 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Durable recovery snapshot; refresh on GroupStateUpdated. Undecryptable
+    /// evidence is advisory and never grants permission to replace MLS state.
+    pub async fn group_recovery_status(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        self.accounts
+            .group_recovery_status(account_ref, group_id)
+            .await
+    }
+
+    /// Call only after showing the authenticated inviter and receiving an
+    /// explicit user decision to discard the active copy and rejoin. Pass the
+    /// exact offer id and local-state token from the reviewed snapshot.
+    pub async fn confirm_group_rejoin(
+        &self,
+        account_ref: &str,
+        welcome_id: &cgka_traits::MessageId,
+        token: &[u8],
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        self.accounts
+            .confirm_group_rejoin(account_ref, welcome_id, token)
+            .await
+    }
+
+    pub async fn decline_group_rejoin(
+        &self,
+        account_ref: &str,
+        welcome_id: &cgka_traits::MessageId,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .decline_group_rejoin(account_ref, welcome_id)
+            .await
+    }
+
     pub async fn accept_group_invite(
         &self,
         account_ref: &str,

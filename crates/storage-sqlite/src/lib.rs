@@ -11,6 +11,7 @@ mod chat_list;
 mod codec;
 mod connection;
 mod encrypted_media_secrets;
+mod membership_health;
 mod message_drafts;
 mod migrations;
 mod openmls_storage;

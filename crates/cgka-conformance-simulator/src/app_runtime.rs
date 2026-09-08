@@ -489,6 +489,44 @@ impl AppRuntimeHarness {
         }
     }
 
+    /// Read the supported app recovery snapshot for the active scenario group.
+    /// Public account identity, for reproducible ordering of concurrent authors.
+    pub fn account_identity(&self, client: &str) -> Result<&str, SubjectError> {
+        Ok(&self.participant(client)?.account_id)
+    }
+
+    pub async fn group_recovery_status(
+        &self,
+        client: &str,
+    ) -> Result<marmot_app::GroupRecoveryStatus, SubjectError> {
+        let participant = self.participant(client)?;
+        participant
+            .runtime()?
+            .group_recovery_status(&participant.account_id, &self.active_group()?)
+            .await
+            .map_err(app_error)
+    }
+
+    /// Models the recipient's explicit acceptance of one reviewed offer.
+    pub async fn confirm_group_rejoin(
+        &self,
+        client: &str,
+        offer: &marmot_app::GroupRejoinInvitation,
+    ) -> Result<(), SubjectError> {
+        let participant = self.participant(client)?;
+        let id = cgka_traits::MessageId::new(
+            hex::decode(&offer.welcome_id_hex).map_err(|error| app_error(error.into()))?,
+        );
+        let token =
+            hex::decode(&offer.local_state_token).map_err(|error| app_error(error.into()))?;
+        participant
+            .runtime()?
+            .confirm_group_rejoin(&participant.account_id, &id, &token)
+            .await
+            .map_err(app_error)?;
+        Ok(())
+    }
+
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
         let relay_url = self.relay_url.clone();
         let settlement_quiescence_ms = self.settlement_quiescence_ms;

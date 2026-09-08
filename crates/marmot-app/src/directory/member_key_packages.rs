@@ -242,6 +242,18 @@ impl MarmotApp {
             .key_packages)
     }
 
+    /// A superseded invite must not reuse the directory/prewarm package that
+    /// its first Welcome consumed. Fetch through the existing safe discovery path.
+    pub(crate) async fn resolve_fresh_reinvite_key_packages(
+        &self,
+        members: &[String],
+    ) -> Result<Vec<KeyPackage>, AppError> {
+        Ok(self
+            .resolve_member_key_packages_inner(members, MemberResolutionPurpose::Commit, true)
+            .await?
+            .key_packages)
+    }
+
     /// Prewarm group composition without reserving or consuming any package.
     ///
     /// The roster must also resolve a safe Marmot inbox route for every member;
@@ -278,7 +290,7 @@ impl MarmotApp {
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         match tokio::time::timeout(
             MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose),
+            self.resolve_member_key_packages_inner(&member_refs, purpose, false),
         )
         .await
         {
@@ -293,6 +305,7 @@ impl MarmotApp {
         &self,
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
+        fresh: bool,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
@@ -327,6 +340,10 @@ impl MarmotApp {
         let mut fresh_prewarmed_routes = HashSet::new();
         let mut reused_members = 0usize;
         for (index, target) in targets.iter_mut().enumerate() {
+            if fresh {
+                unresolved.push(index);
+                continue;
+            }
             if let Some(label) = &target.local_label
                 && let Some(key_package) = self.validated_current_local_key_package(label)
                 && let Ok(key_package) =

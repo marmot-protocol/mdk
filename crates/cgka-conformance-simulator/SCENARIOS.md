@@ -1117,8 +1117,9 @@ command's return value), fresh traffic flows in every direction, history survive
 within three minutes. Journey 08 is strict by default: a profile edit the runtime reported as saved reaches the settled
 state when the winner left its field untouched; a same-field race is reported to the host as a conflict (#1734). The
 strict 30-second leave regression also runs ordinarily after the SelfRemove deadline scheduling correction (#1736).
-The strict form of journey 09 remains ignored for the stranded-invitee gap (#1735): an invitee excluded by the canonical
-branch must hold no projection, and a losing invite needs recovery beyond the current re-invitation report.
+The strict form of journey 09 now forces the invitation to lose and requires automatic fresh-material recovery,
+recipient-confirmed rejoin, and matching public membership/name plus fresh bidirectional messages. The rejoin offer
+survives reopen before consent, and its accepted projection survives reopen after consent (#1735).
 The manual self-update journey runs with zeroed maintenance windows when built with `test-policy-overrides`
 (`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter
 run on real time.

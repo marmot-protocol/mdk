@@ -126,6 +126,8 @@ mod migration_0062_chat_list_preview_indexes;
 mod migration_0063_query_indexes;
 #[path = "migrations/0064_own_commit_intents.rs"]
 mod migration_0064_own_commit_intents;
+#[path = "migrations/0065_invitation_recovery.rs"]
+mod migration_0065_invitation_recovery;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -464,6 +466,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0064_own_commit_intents",
         apply: migration_0064_own_commit_intents::apply,
     },
+    Migration {
+        version: 65,
+        name: "0065_invitation_recovery",
+        apply: migration_0065_invitation_recovery::apply,
+    },
 ];
 
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
@@ -765,6 +772,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(intent, [0xbb]);
+    }
+
+    #[test]
+    fn invitation_recovery_upgrade_preserves_existing_data_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invitation-recovery.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..64]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 1, x'00');
+            INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
+            VALUES (x'01', x'aa', 1, x'bb');",
+        )
+        .unwrap();
+        run_all(&mut conn).unwrap();
+        conn.execute_batch("INSERT INTO app_group_membership_uncertainty(group_id) VALUES(x'aa');")
+            .unwrap();
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            applied_name(&conn, 65).unwrap().as_deref(),
+            Some("0065_invitation_recovery")
+        );
+        let intent: Vec<u8> = conn
+            .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent, [0xbb]);
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM app_group_membership_uncertainty",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
@@ -1129,7 +1174,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 64,
+                found: 65,
                 latest_supported: 46,
             }
         ));
@@ -1185,7 +1230,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 64,
+                found: 65,
                 latest_supported: 46,
             }
         ));
@@ -1489,7 +1534,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 64,
+                found: 65,
                 latest_supported: 46,
             }
         ));

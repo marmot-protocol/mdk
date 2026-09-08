@@ -34,6 +34,7 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
 use openmls::prelude::{
@@ -803,6 +804,109 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    /// Validated replacement offers, bound to the current local branch.
+    pub fn pending_group_rejoins(&self) -> Result<Vec<PendingWelcome>, EngineError> {
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mut candidates = Vec::new();
+        for mut candidate in self.storage.list_welcomes()? {
+            let Some(rejoin) = &mut candidate.rejoin else {
+                continue;
+            };
+            let Some(group) = MlsGroup::load(
+                provider.storage(),
+                &openmls::group::GroupId::from_slice(candidate.group_id.as_slice()),
+            )
+            .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
+            else {
+                // An unrelated deleted group must not prevent account ingress.
+                continue;
+            };
+            rejoin.local_state_token =
+                Sha256::digest(group.epoch_authenticator().as_slice()).to_vec();
+            candidates.push(candidate);
+        }
+        Ok(candidates)
+    }
+
+    /// Retry owned offers once trusted removal (or Unrecoverable repair) makes
+    /// ordinary joining legal. Hosts call this on their maintenance seam, so
+    /// recovery does not depend on another relay copy passing app deduplication.
+    pub async fn retry_rejoins_after_trusted_removal(&mut self) -> Result<bool, EngineError> {
+        let mut joined = false;
+        for candidate in self.storage.list_welcomes()? {
+            if candidate.rejoin.is_none() {
+                continue;
+            }
+            let Some(group) = self.stored_group_record(&candidate.group_id)? else {
+                continue;
+            };
+            if (!group.removed && !group.unrecoverable) || group.disbanded.is_some() {
+                continue;
+            }
+            self.ensure_hydrated(&candidate.group_id)?;
+            let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
+                .map_err(|error| EngineError::Serialize(error.to_string()))?;
+            match self.do_join_welcome(welcome).await {
+                Ok(_) => joined = true,
+                Err(error) if terminal_welcome_error(&error) => {
+                    self.storage.take_welcome(&candidate.message_id)?;
+                }
+                Err(EngineError::InvalidTransition(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(joined)
+    }
+
+    /// Explicit recipient consent to discard the exact local branch shown by
+    /// the offer. Validation and replacement share a transaction; history stays.
+    pub async fn confirm_group_rejoin(
+        &mut self,
+        welcome_id: &MessageId,
+        local_state_token: &[u8],
+    ) -> Result<GroupId, EngineError> {
+        let candidate = self
+            .pending_group_rejoins()?
+            .into_iter()
+            .find(|candidate| &candidate.message_id == welcome_id)
+            .ok_or(EngineError::InvalidWelcome)?;
+        let rejoin = candidate
+            .rejoin
+            .as_ref()
+            .ok_or(EngineError::InvalidWelcome)?;
+        if rejoin.local_state_token != local_state_token {
+            return Err(rejoin_confirmation_required());
+        }
+        self.ensure_hydrated(&candidate.group_id)?;
+        let welcome: TransportMessage = serde_json::from_slice(&candidate.welcome_bytes)
+            .map_err(|error| EngineError::Serialize(error.to_string()))?;
+        let peeled = self
+            .peeler
+            .peel_welcome(&welcome)
+            .await
+            .map_err(EngineError::Peeler)?;
+        let content_id = welcome_content_dedup_id(&peeled)?;
+        self.join_peeled_welcome_with_consent(
+            welcome,
+            peeled,
+            content_id,
+            Some((&candidate.group_id, local_state_token)),
+        )
+        .await
+    }
+
+    /// Reject only the selected offer. Redelivery cannot re-open it.
+    pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> Result<(), EngineError> {
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                let candidate = storage.take_welcome(welcome_id)?;
+                let rejoin = candidate.rejoin.ok_or(EngineError::InvalidWelcome)?;
+                storage.put_ingress_dedup_marker(welcome_id)?;
+                storage.put_ingress_dedup_marker(&rejoin.content_id)?;
+                Ok(())
+            })
+    }
+
     /// Real implementation of `CgkaEngine::join_welcome`.
     ///
     /// Flow:
@@ -823,7 +927,9 @@ impl<S: StorageProvider> Engine<S> {
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
         // skipped that. Without this check, a re-call would re-stage a
         // Welcome on top of an existing group, which is unsafe.
-        if self.seen_message_ids.contains(&welcome_msg.id) {
+        if self.seen_message_ids.contains(&welcome_msg.id)
+            || self.storage.has_ingress_dedup_marker(&welcome_msg.id)?
+        {
             return Err(EngineError::WelcomeAlreadyProcessed);
         }
         if let Ok(record) = self.storage.get_message(&welcome_msg.id)
@@ -891,6 +997,18 @@ impl<S: StorageProvider> Engine<S> {
         peeled: cgka_traits::ingest::PeeledMessage,
         content_id: MessageId,
     ) -> Result<GroupId, EngineError> {
+        self.join_peeled_welcome_with_consent(welcome_msg, peeled, content_id, None)
+            .await
+    }
+
+    /// The token is supplied only by the explicit recipient-confirmation API.
+    async fn join_peeled_welcome_with_consent(
+        &mut self,
+        welcome_msg: TransportMessage,
+        peeled: cgka_traits::ingest::PeeledMessage,
+        content_id: MessageId,
+        consent: Option<(&GroupId, &[u8])>,
+    ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
         let welcome_bytes = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome { bytes } => bytes,
@@ -939,8 +1057,8 @@ impl<S: StorageProvider> Engine<S> {
         // the retained material a late winning branch needs to roll back a
         // losing removal branch within `max_rewind_commits`); the stale live
         // group is cleared lazily here, only at the moment a re-add arrives, and
-        // only for the group being re-joined. We never clear a group we are
-        // still an active member of.
+        // only for the group being re-joined. Active state requires explicit
+        // recipient consent bound to its current epoch authenticator.
         let join_config = join_config(self.max_past_epochs);
         let joined_at = self.wall_clock.now();
         let sampled_jitter_ms = self.maintenance_random.sample_inclusive(
@@ -952,324 +1070,380 @@ impl<S: StorageProvider> Engine<S> {
         // live-state clearing, that store, every Marmot post-check, the
         // discoverable group record, joined-epoch recovery anchor, capability
         // cache, and both durable Welcome dispositions in one transaction.
-        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) =
-            self.storage.with_transaction(|storage| {
-                let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-                // Match in the same order OpenMLS uses: the first Welcome
-                // KeyPackageRef for which this account-device has a private
-                // bundle. Transport tags are deliberately outside this
-                // selection. Point-query per candidate ref — the same lookup
-                // `ProcessedWelcome::new_from_welcome` performs internally —
-                // rather than enumerating, JSON-decoding, and re-hashing
-                // every stored bundle on each join.
-                let mut consumed_key_package_ref = None;
-                for secret in welcome.secrets() {
-                    let reference = secret.new_member();
-                    let bundle: Option<KeyPackageBundle> =
-                        OpenMlsStorageProvider::key_package(provider.storage(), &reference)
-                            .map_err(|error| {
-                                EngineError::Backend(format!("key_package lookup: {error:?}"))
-                            })?;
-                    if bundle.is_some() {
-                        consumed_key_package_ref = Some(reference.as_slice().to_vec());
-                        break;
-                    }
+        let mut pending_rejoin = None;
+        let result = self.storage.with_transaction(|storage| {
+            let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+            // Match in the same order OpenMLS uses: the first Welcome
+            // KeyPackageRef for which this account-device has a private
+            // bundle. Transport tags are deliberately outside this
+            // selection. Point-query per candidate ref — the same lookup
+            // `ProcessedWelcome::new_from_welcome` performs internally —
+            // rather than enumerating, JSON-decoding, and re-hashing
+            // every stored bundle on each join.
+            let mut consumed_key_package_ref = None;
+            for secret in welcome.secrets() {
+                let reference = secret.new_member();
+                let bundle: Option<KeyPackageBundle> =
+                    OpenMlsStorageProvider::key_package(provider.storage(), &reference).map_err(
+                        |error| EngineError::Backend(format!("key_package lookup: {error:?}")),
+                    )?;
+                if bundle.is_some() {
+                    consumed_key_package_ref = Some(reference.as_slice().to_vec());
+                    break;
                 }
-                let consumed_key_package_ref =
-                    consumed_key_package_ref.ok_or(EngineError::InvalidWelcome)?;
-                let processed = openmls::group::ProcessedWelcome::new_from_welcome(
-                    &provider,
-                    &join_config,
-                    welcome,
-                )
-                .map_err(classify_openmls_welcome_error)?;
-                let group_id = GroupId::new(
-                    processed
-                        .unverified_group_info()
-                        .group_id()
-                        .as_slice()
-                        .to_vec(),
-                );
-                // The epoch is still unverified at this point. It is used only
-                // to decide whether a distinct Welcome is worth attempting as
-                // a replacement for local live state. Every replacement write
-                // remains inside this transaction and is committed only after
-                // OpenMLS verifies the GroupInfo and the Marmot membership,
-                // capability, and admin checks below all succeed.
-                let incoming_epoch = EpochId(processed.unverified_group_info().epoch().as_u64());
-                if storage.disband_tombstone(&group_id)?.is_some() {
-                    return Err(EngineError::InvalidWelcome);
-                }
+            }
+            let consumed_key_package_ref =
+                consumed_key_package_ref.ok_or(EngineError::InvalidWelcome)?;
+            let processed = openmls::group::ProcessedWelcome::new_from_welcome(
+                &provider,
+                &join_config,
+                welcome,
+            )
+            .map_err(classify_openmls_welcome_error)?;
+            let group_id = GroupId::new(
+                processed
+                    .unverified_group_info()
+                    .group_id()
+                    .as_slice()
+                    .to_vec(),
+            );
+            // GroupInfo is still unverified here. Every tentative replacement
+            // write is rolled back unless OpenMLS and Marmot checks succeed
+            // and the local state permits this join.
+            if storage.disband_tombstone(&group_id)?.is_some() {
+                return Err(EngineError::InvalidWelcome);
+            }
 
-                let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
-                let (local_state_is_stale, repaired_unrecoverable) = match storage
-                    .get_group(&group_id)
-                {
-                    Ok(group) => {
-                        let self_is_recorded_member = group
-                            .members
-                            .iter()
-                            .any(|member| &member.id == self.identity.self_id());
-                        if self_is_recorded_member && !group.unrecoverable {
-                            if incoming_epoch <= group.epoch {
-                                // A distinct transport/content id does not make a
-                                // same- or older-epoch Welcome for an already-active
-                                // group a rejoin. Reject before OpenMLS staging and
-                                // let the surrounding transaction restore KeyPackage
-                                // consumption and every tentative write.
-                                return Err(EngineError::WelcomeAlreadyProcessed);
-                            }
-
-                            // Epoch freshness is not branch continuity. A member can
-                            // fork the same group id, advance that fork, rewrite its
-                            // admin component, and issue a cryptographically valid
-                            // newer Welcome. Replacing healthy active state here would
-                            // let that uncorroborated fork destroy the trusted branch.
-                            //
-                            // A legitimate re-entry remains possible after this engine
-                            // processes the current branch's removal, at which point the
-                            // durable record no longer lists this identity. This error is
-                            // deliberately non-terminal so that exact Welcome can be
-                            // retried after the trusted removal arrives. Consulting the
-                            // durable record also closes the cold-start window before the
-                            // epoch manager has been hydrated.
-                            return Err(EngineError::InvalidTransition(
-                                cgka_traits::engine_state::InvalidTransition {
-                                    from: "ActiveMember",
-                                    to: "JoinWelcome",
-                                    reason: "replacement Welcome requires trusted removal evidence",
-                                },
-                            ));
+            let mut superseded: Vec<(MessageId, EpochId)> = Vec::new();
+            let mut confirmation_token = None;
+            let (local_state_is_stale, repaired_unrecoverable) = match storage.get_group(&group_id)
+            {
+                Ok(group) => {
+                    let self_is_recorded_member = group
+                        .members
+                        .iter()
+                        .any(|member| &member.id == self.identity.self_id());
+                    if self_is_recorded_member && !group.unrecoverable {
+                        // A fork can have advanced beyond the replacement epoch.
+                        // Epoch ordering never grants consent: every distinct fully
+                        // validated Welcome only offers explicit branch replacement.
+                        let old = MlsGroup::load(
+                            provider.storage(),
+                            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+                        )
+                        .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
+                        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+                        if old.pending_commit().is_some() {
+                            return Err(rejoin_confirmation_required());
                         }
-                        // Unrecoverable is the explicit exception: a fully
-                        // authenticated replacement Welcome is a protocol-defined
-                        // repair even though the frozen record still lists us as
-                        // a member. The surrounding transaction restores the old
-                        // OpenMLS state and KeyPackage on any later validation
-                        // failure, so clearing the live rows remains tentative.
-                        (true, group.unrecoverable)
+                        let token = Sha256::digest(old.epoch_authenticator().as_slice()).to_vec();
+                        if let Some((expected_group, expected_token)) = consent {
+                            if expected_group != &group_id || expected_token != token {
+                                return Err(rejoin_confirmation_required());
+                            }
+                        } else {
+                            confirmation_token = Some(token);
+                        }
                     }
-                    Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
-                    Err(error) => return Err(EngineError::Storage(error)),
-                };
-                if local_state_is_stale
-                    && let Some(state) = self.epoch_manager.state(&group_id)
-                    && state.is_resolving_local_publish()
-                {
-                    // The held publication belongs to the local group copy
-                    // this replacement would discard. Let its explicit
-                    // confirm/rollback transition finish first; otherwise the
-                    // durable replacement can commit while `set_stable` below
-                    // correctly refuses to overwrite PendingPublish/Merging,
-                    // splitting the epoch manager from the installed group.
-                    // This error is deliberately non-terminal for Welcome
-                    // deduplication, so the identical Welcome can be retried.
-                    return Err(EngineError::InvalidTransition(
-                        cgka_traits::engine_state::InvalidTransition {
-                            from: state.name(),
-                            to: "JoinWelcome",
-                            reason: "replacement Welcome requires the local publication to resolve",
-                        },
-                    ));
+                    if consent.is_some() && (!self_is_recorded_member || group.unrecoverable) {
+                        return Err(rejoin_confirmation_required());
+                    }
+                    // Unrecoverable is the explicit exception: a fully
+                    // authenticated replacement Welcome is a protocol-defined
+                    // repair even though the frozen record still lists us as
+                    // a member. The surrounding transaction restores the old
+                    // OpenMLS state and KeyPackage on any later validation
+                    // failure, so clearing the live rows remains tentative.
+                    (true, group.unrecoverable)
                 }
-                if local_state_is_stale {
-                    self.clear_live_openmls_group_on_storage(storage, &group_id)?;
+                Err(cgka_traits::storage::StorageError::NotFound) if consent.is_some() => {
+                    return Err(rejoin_confirmation_required());
                 }
-
-                let staged = processed
-                    .into_staged_welcome(&provider, None)
-                    .map_err(classify_openmls_welcome_error)?;
-                let welcome_sender = staged
-                    .welcome_sender()
-                    .map_err(|_| EngineError::InvalidWelcome)?;
-                let welcome_sender_id =
-                    crate::identity::validated_member_id_of_leaf(welcome_sender)?;
-                let mls_group = staged
-                    .into_group(&provider)
-                    .map_err(classify_openmls_welcome_error)?;
-
-                debug_assert_eq!(
-                    group_id,
-                    GroupId::new(mls_group.group_id().as_slice().to_vec())
-                );
-
-                // 5b. Reject the Welcome if any member leaf carries an invalid
-                // Marmot credential identity (foundation/identity.md,
-                // joining.md:65).
-                let protocol_profile =
-                    validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
-                if self.new_protocol_profile == ProtocolProfile::Current
-                    && protocol_profile != ProtocolProfile::Current
-                {
-                    return Err(EngineError::InvalidWelcome);
-                }
-                crate::app_components::validate_current_profile_group_invariants(&mls_group)
-                    .map_err(|_| EngineError::InvalidWelcome)?;
-
-                // Validate every known GroupContext component before any joined
-                // state leaves this transaction. Commit ingest validates
-                // AppDataUpdate payloads, but a Welcome installs a complete
-                // dictionary without traversing that seam.
-                crate::app_components::validate_app_component_dictionary(&mls_group).map_err(
-                    |error| match error {
-                        storage @ EngineError::Storage(_) => storage,
-                        _ => EngineError::InvalidWelcome,
+                Err(cgka_traits::storage::StorageError::NotFound) => (false, false),
+                Err(error) => return Err(EngineError::Storage(error)),
+            };
+            if local_state_is_stale
+                && let Some(state) = self.epoch_manager.state(&group_id)
+                && state.is_resolving_local_publish()
+            {
+                // The held publication belongs to the local group copy
+                // this replacement would discard. Let its explicit
+                // confirm/rollback transition finish first; otherwise the
+                // durable replacement can commit while `set_stable` below
+                // correctly refuses to overwrite PendingPublish/Merging,
+                // splitting the epoch manager from the installed group.
+                // This error is deliberately non-terminal for Welcome
+                // deduplication, so the identical Welcome can be retried.
+                return Err(EngineError::InvalidTransition(
+                    cgka_traits::engine_state::InvalidTransition {
+                        from: state.name(),
+                        to: "JoinWelcome",
+                        reason: "replacement Welcome requires the local publication to resolve",
                     },
-                )?;
+                ));
+            }
+            if local_state_is_stale {
+                self.clear_live_openmls_group_on_storage(storage, &group_id)?;
+            }
 
-                // 5c. Reject active required capabilities this client cannot
-                // apply, including required agent-stream roles.
-                let mut group_required =
-                    crate::capability_manager::required_capabilities_from_group(&mls_group);
-                crate::message_processor::merge_capabilities(
-                    &mut group_required,
-                    &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
-                );
-                let had = crate::capabilities::self_supported_capabilities(
-                    &self.registry,
-                    self.ciphersuite,
-                    &self.supported_app_components,
-                );
-                let missing = group_required.missing_from(&had);
-                if !missing.is_empty() {
-                    return Err(EngineError::MissingRequiredCapabilities {
-                        required: Box::new(group_required),
-                        had: Box::new(had),
-                    });
-                }
+            let staged = processed
+                .into_staged_welcome(&provider, None)
+                .map_err(classify_openmls_welcome_error)?;
+            let welcome_sender = staged
+                .welcome_sender()
+                .map_err(|_| EngineError::InvalidWelcome)?;
+            let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+            let mls_group = staged
+                .into_group(&provider)
+                .map_err(classify_openmls_welcome_error)?;
 
-                // 5d. The authenticated Welcome sender must be an admin.
-                crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+            debug_assert_eq!(
+                group_id,
+                GroupId::new(mls_group.group_id().as_slice().to_vec())
+            );
 
-                // 5e. Every advertised admin must have a current member leaf.
-                crate::app_components::reject_admins_without_member_leaf(
-                    &mls_group,
-                    &group_id,
-                    &crate::app_components::admins_of_group(&mls_group)?,
-                )
-                .map_err(|error| match error {
+            // 5b. Reject the Welcome if any member leaf carries an invalid
+            // Marmot credential identity (foundation/identity.md,
+            // joining.md:65).
+            let protocol_profile =
+                validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+            if self.new_protocol_profile == ProtocolProfile::Current
+                && protocol_profile != ProtocolProfile::Current
+            {
+                return Err(EngineError::InvalidWelcome);
+            }
+            crate::app_components::validate_current_profile_group_invariants(&mls_group)
+                .map_err(|_| EngineError::InvalidWelcome)?;
+
+            // Validate every known GroupContext component before any joined
+            // state leaves this transaction. Commit ingest validates
+            // AppDataUpdate payloads, but a Welcome installs a complete
+            // dictionary without traversing that seam.
+            crate::app_components::validate_app_component_dictionary(&mls_group).map_err(
+                |error| match error {
                     storage @ EngineError::Storage(_) => storage,
                     _ => EngineError::InvalidWelcome,
-                })?;
+                },
+            )?;
 
-                // 6. Make the committed OpenMLS group discoverable through the
-                // Marmot record and cache this device's capabilities.
-                let mut group_record = Group {
-                    id: group_id.clone(),
-                    name: String::new(),
-                    description: String::new(),
-                    epoch: EpochId(mls_group.epoch().as_u64()),
-                    members: marmot_members(&mls_group),
-                    required_capabilities:
-                        crate::capability_manager::required_capabilities_from_group(&mls_group),
-                    protocol_profile,
-                    removed: false,
-                    unrecoverable: false,
-                    disbanded: None,
-                    // A first Welcome proves the lower membership bound. A
-                    // rejoin/repair replaces an older local membership
-                    // interval; without durable interval history, treating
-                    // every earlier epoch as pre-membership would incorrectly
-                    // terminalize messages authored during that interval.
-                    // Epoch zero means "unknown — apply no lower bound".
-                    join_epoch: if local_state_is_stale {
-                        EpochId(0)
-                    } else {
-                        EpochId(mls_group.epoch().as_u64())
-                    },
-                };
-                mirror_app_components_into_record(&mls_group, &mut group_record);
-                storage.put_group(&group_record)?;
-                if local_state_is_stale {
-                    // A verified replacement Welcome establishes a new local
-                    // MLS copy. Frozen-pass membership belongs to the discarded
-                    // copy and must not re-halt the repaired group.
-                    storage.delete_convergence_pass(&group_id)?;
-                    storage.delete_deferred_peel_generation(&group_id)?;
-                    // The pass is only half of that residue. Unresolved commits
-                    // retained below the replacement epoch were retained
-                    // against the discarded copy too, and an anchor-less one
-                    // steers every later pass's rewind target into
-                    // `MissingRetainedAnchor` — re-halting the group this
-                    // Welcome just repaired. The epoch bound is the new copy's
-                    // own authenticated epoch, never an inbound claim.
-                    superseded =
-                        crate::openmls_projection::retire_commits_superseded_by_replacement_welcome(
-                            storage,
-                            &group_id,
-                            mls_group.epoch().as_u64(),
-                        )?;
-                }
-                crate::capability_manager::cache_self_capabilities(
-                    storage,
-                    &group_id,
-                    &mls_group,
-                    self.identity.self_id(),
-                    self.ciphersuite,
-                )?;
+            // 5c. Reject active required capabilities this client cannot
+            // apply, including required agent-stream roles.
+            let mut group_required =
+                crate::capability_manager::required_capabilities_from_group(&mls_group);
+            crate::message_processor::merge_capabilities(
+                &mut group_required,
+                &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+            );
+            let had = crate::capabilities::self_supported_capabilities(
+                &self.registry,
+                self.ciphersuite,
+                &self.supported_app_components,
+            );
+            let missing = group_required.missing_from(&had);
+            if !missing.is_empty() {
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(group_required),
+                    had: Box::new(had),
+                });
+            }
 
-                // Direct join callers need the same durable dedup disposition as
-                // the transport-ingest path.
-                let payload = StoredMessagePayload::raw_transport(welcome_msg)
-                    .encode()
-                    .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-                storage.put_message(&MessageRecord {
-                    id: welcome_id.clone(),
-                    group_id: group_id.clone(),
-                    epoch: EpochId(mls_group.epoch().as_u64()),
-                    state: MessageState::Processed,
-                    payload,
-                    deferred_peel: None,
-                })?;
-                storage.put_ingress_dedup_marker(&welcome_id)?;
-                storage.put_ingress_dedup_marker(&content_id)?;
-                storage.put_pending_application_event(
-                    &cgka_traits::engine::GroupEvent::GroupJoined {
-                        group_id: group_id.clone(),
-                        via_welcome: welcome_id.clone(),
-                        welcomer: Some(welcome_sender_id.clone()),
-                    },
-                )?;
+            // 5d. The authenticated Welcome sender must be an admin.
+            crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
 
-                let own_leaf_baseline_hash = mls_group
-                    .own_leaf_node()
-                    .ok_or(EngineError::InvalidWelcome)?
-                    .tls_serialize_detached()
-                    .map(|leaf| Sha256::digest(leaf).to_vec())
-                    .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
-                persist_new_group_maintenance(
-                    storage,
-                    &group_id,
-                    joined_at,
-                    Some((&welcome_id, sampled_jitter_ms)),
-                    Some(own_leaf_baseline_hash),
-                )?;
-                if let Some(maintenance) = storage.maintenance_storage() {
-                    let mut lifecycle = maintenance
-                        .key_package_lifecycle()?
-                        .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
-                    lifecycle.last_consumed_key_package_ref =
-                        Some(consumed_key_package_ref.clone());
-                    lifecycle.last_consumed_at = Some(joined_at);
-                    maintenance.put_key_package_lifecycle(&lifecycle)?;
-                }
-
-                // A Welcome-installed member must retain the joined epoch
-                // before it can safely advance locally. Otherwise a sibling
-                // commit authored from this epoch but delivered after our own
-                // publish cannot be peeled and never enters convergence. Keep
-                // the anchor in this transaction so a snapshot failure also
-                // restores the consumed KeyPackage and every staged join row.
-                self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
-
-                Ok::<_, EngineError>((
-                    group_id,
-                    mls_group,
-                    welcome_sender_id,
-                    repaired_unrecoverable,
-                    superseded,
-                ))
+            // 5e. Every advertised admin must have a current member leaf.
+            crate::app_components::reject_admins_without_member_leaf(
+                &mls_group,
+                &group_id,
+                &crate::app_components::admins_of_group(&mls_group)?,
+            )
+            .map_err(|error| match error {
+                storage @ EngineError::Storage(_) => storage,
+                _ => EngineError::InvalidWelcome,
             })?;
+
+            if let Some(local_state_token) = confirmation_token {
+                pending_rejoin = Some(PendingWelcome {
+                    message_id: welcome_id.clone(),
+                    group_id: group_id.clone(),
+                    welcome_bytes: serde_json::to_vec(&welcome_msg)
+                        .map_err(|error| EngineError::Serialize(error.to_string()))?,
+                    rejoin: Some(RejoinWelcome {
+                        content_id: content_id.clone(),
+                        epoch: EpochId(mls_group.epoch().as_u64()),
+                        welcomer: welcome_sender_id.clone(),
+                        local_state_token,
+                    }),
+                });
+                // Roll back ALL tentative state including KeyPackage consumption.
+                return Err(rejoin_confirmation_required());
+            }
+
+            // 6. Make the committed OpenMLS group discoverable through the
+            // Marmot record and cache this device's capabilities.
+            let mut group_record = Group {
+                id: group_id.clone(),
+                name: String::new(),
+                description: String::new(),
+                epoch: EpochId(mls_group.epoch().as_u64()),
+                members: marmot_members(&mls_group),
+                required_capabilities: crate::capability_manager::required_capabilities_from_group(
+                    &mls_group,
+                ),
+                protocol_profile,
+                removed: false,
+                unrecoverable: false,
+                disbanded: None,
+                // A first Welcome proves the lower membership bound. A
+                // rejoin/repair replaces an older local membership
+                // interval; without durable interval history, treating
+                // every earlier epoch as pre-membership would incorrectly
+                // terminalize messages authored during that interval.
+                // Epoch zero means "unknown — apply no lower bound".
+                join_epoch: if local_state_is_stale {
+                    EpochId(0)
+                } else {
+                    EpochId(mls_group.epoch().as_u64())
+                },
+            };
+            mirror_app_components_into_record(&mls_group, &mut group_record);
+            storage.put_group(&group_record)?;
+            if local_state_is_stale {
+                if consent.is_some() {
+                    // Explicitly discarding a fork also discards its rewind
+                    // anchors, so delayed evidence cannot restore that branch.
+                    // Message history remains in the application ledger.
+                    for snapshot in storage.list_group_snapshots(&group_id)? {
+                        storage.release_group_snapshot(&group_id, &snapshot)?;
+                    }
+                }
+                // A verified replacement Welcome establishes a new local
+                // MLS copy. Frozen-pass membership belongs to the discarded
+                // copy and must not re-halt the repaired group.
+                storage.delete_convergence_pass(&group_id)?;
+                storage.delete_deferred_peel_generation(&group_id)?;
+                // The pass is only half of that residue. Unresolved commits
+                // retained below the replacement epoch were retained
+                // against the discarded copy too, and an anchor-less one
+                // steers every later pass's rewind target into
+                // `MissingRetainedAnchor` — re-halting the group this
+                // Welcome just repaired. The epoch bound is the new copy's
+                // own authenticated epoch, never an inbound claim.
+                superseded =
+                    crate::openmls_projection::retire_commits_superseded_by_replacement_welcome(
+                        storage,
+                        &group_id,
+                        if consent.is_some() {
+                            u64::MAX
+                        } else {
+                            mls_group.epoch().as_u64()
+                        },
+                    )?;
+            }
+            crate::capability_manager::cache_self_capabilities(
+                storage,
+                &group_id,
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
+
+            for candidate in storage.list_welcomes()? {
+                if candidate.group_id == group_id && candidate.rejoin.is_some() {
+                    storage.take_welcome(&candidate.message_id)?;
+                }
+            }
+
+            // Direct join callers need the same durable dedup disposition as
+            // the transport-ingest path.
+            let payload = StoredMessagePayload::raw_transport(welcome_msg)
+                .encode()
+                .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+            storage.put_message(&MessageRecord {
+                id: welcome_id.clone(),
+                group_id: group_id.clone(),
+                epoch: EpochId(mls_group.epoch().as_u64()),
+                state: MessageState::Processed,
+                payload,
+                deferred_peel: None,
+            })?;
+            storage.put_ingress_dedup_marker(&welcome_id)?;
+            storage.put_ingress_dedup_marker(&content_id)?;
+            storage.put_pending_application_event(
+                &cgka_traits::engine::GroupEvent::GroupJoined {
+                    group_id: group_id.clone(),
+                    via_welcome: welcome_id.clone(),
+                    explicitly_confirmed: consent.is_some(),
+                    welcomer: Some(welcome_sender_id.clone()),
+                },
+            )?;
+
+            let own_leaf_baseline_hash = mls_group
+                .own_leaf_node()
+                .ok_or(EngineError::InvalidWelcome)?
+                .tls_serialize_detached()
+                .map(|leaf| Sha256::digest(leaf).to_vec())
+                .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+            persist_new_group_maintenance(
+                storage,
+                &group_id,
+                joined_at,
+                Some((&welcome_id, sampled_jitter_ms)),
+                Some(own_leaf_baseline_hash),
+            )?;
+            if let Some(maintenance) = storage.maintenance_storage() {
+                let mut lifecycle = maintenance
+                    .key_package_lifecycle()?
+                    .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
+                lifecycle.last_consumed_key_package_ref = Some(consumed_key_package_ref.clone());
+                lifecycle.last_consumed_at = Some(joined_at);
+                maintenance.put_key_package_lifecycle(&lifecycle)?;
+            }
+
+            // A Welcome-installed member must retain the joined epoch
+            // before it can safely advance locally. Otherwise a sibling
+            // commit authored from this epoch but delivered after our own
+            // publish cannot be peeled and never enters convergence. Keep
+            // the anchor in this transaction so a snapshot failure also
+            // restores the consumed KeyPackage and every staged join row.
+            self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
+
+            Ok::<_, EngineError>((
+                group_id,
+                mls_group,
+                welcome_sender_id,
+                repaired_unrecoverable,
+                superseded,
+            ))
+        });
+        if let Some(candidate) = pending_rejoin {
+            // Bound stored offers; retain the exact first copy/revision on duplicates.
+            let existing = self.storage.list_welcomes()?;
+            if existing.iter().any(|old| {
+                old.rejoin
+                    .as_ref()
+                    .zip(candidate.rejoin.as_ref())
+                    .is_some_and(|(a, b)| a.content_id == b.content_id)
+            }) {
+                // Keep the first offer without terminally deduplicating its
+                // content: trusted removal may still make it auto-joinable.
+            } else if !existing
+                .iter()
+                .any(|old| old.message_id == candidate.message_id)
+                && existing.len() < 64
+                && existing
+                    .iter()
+                    .filter(|old| old.group_id == candidate.group_id)
+                    .count()
+                    < 4
+            {
+                self.storage.put_welcome(&candidate)?;
+            } else {
+                return Err(EngineError::PendingWelcomeAtCapacity {
+                    group_id: candidate.group_id,
+                });
+            }
+        }
+        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) = result?;
 
         // #740: index this joined group's transport routing id for O(1) inbound
         // resolution (see `Engine::transport_group_id_index`).
@@ -1315,7 +1489,11 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.epoch_manager
                 .set_stable(group_id.clone(), joined_epoch);
-            "join_welcome"
+            if consent.is_some() {
+                "recipient_confirmed_rejoin"
+            } else {
+                "join_welcome"
+            }
         };
         self.audit_group(
             &group_id,
@@ -1344,6 +1522,7 @@ impl<S: StorageProvider> Engine<S> {
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: welcome_id.clone(),
+                explicitly_confirmed: consent.is_some(),
                 welcomer: Some(welcome_sender_id.clone()),
             });
         if let Some(new_seconds) =
@@ -1729,6 +1908,14 @@ impl<S: StorageProvider> Engine<S> {
             .restore_unrecoverable(group_id.clone(), group.epoch);
         true
     }
+}
+
+fn rejoin_confirmation_required() -> EngineError {
+    EngineError::InvalidTransition(cgka_traits::engine_state::InvalidTransition {
+        from: "ActiveMember",
+        to: "JoinWelcome",
+        reason: "replacement Welcome requires trusted removal evidence or explicit recipient confirmation",
+    })
 }
 
 #[cfg(test)]

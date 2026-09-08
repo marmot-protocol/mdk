@@ -105,6 +105,7 @@ async fn invite_lifecycle_chaos_handles_wrong_routes_replays_and_welcome_before_
         vec![GroupEvent::GroupJoined {
             group_id: group_id.clone(),
             via_welcome: welcome_report.message_id,
+            explicitly_confirmed: false,
             welcomer: Some(alice.account_id.clone()),
         }]
     );
@@ -242,6 +243,7 @@ async fn invite_lifecycle_chaos_handles_commit_before_welcome_and_shared_replay(
         vec![GroupEvent::GroupJoined {
             group_id: group_id.clone(),
             via_welcome: welcome_report.message_id,
+            explicitly_confirmed: false,
             welcomer: Some(alice.account_id.clone()),
         }]
     );
@@ -735,6 +737,7 @@ async fn publish_confirm_and_deliver_welcome(
         vec![GroupEvent::GroupJoined {
             group_id: created.group_id,
             via_welcome: welcome_report.message_id,
+            explicitly_confirmed: false,
             welcomer: Some(alice.account_id.clone()),
         }]
     );

@@ -109,12 +109,18 @@ fn complete_catalog_guarantees_reentry_and_high_risk_interactions() {
     let fresh_invite = step_index(
         &|step| matches!(step, ScenarioStep::InviteMembers { pending, .. } if pending == "readd-0"),
     );
-    let refused_fresh_welcome = step_index(&|step| {
-        matches!(
-            step,
-            ScenarioStep::ExpectTickError { error, .. } if error == "invalid_transition"
-        )
-    });
+    let refused_fresh_welcome = case_7_steps
+        .iter()
+        .enumerate()
+        .skip(fresh_invite + 1)
+        .find(|(_, step)| {
+            matches!(step, ScenarioStep::Assert { assertion:
+            cgka_conformance_simulator::ScenarioAssertionV2::Exactly { predicate:
+                cgka_conformance_simulator::ScenarioPredicateV2::ClientState { client, .. } }
+        } if client != "alice")
+        })
+        .map(|(index, _)| index)
+        .expect("an unchanged recipient state assertion follows the offer");
     let trusted_removal = step_index(&|step| {
         matches!(
             step,
@@ -132,19 +138,6 @@ fn complete_catalog_guarantees_reentry_and_high_risk_interactions() {
     assert!(fresh_invite < refused_fresh_welcome);
     assert!(refused_fresh_welcome < trusted_removal);
     assert!(trusted_removal < welcome_retry);
-    assert!(
-        cases[7]
-            .expected_outcomes
-            .iter()
-            .any(|expectation| matches!(
-                expectation,
-                TraceExpectation::ExpectedError {
-                    operation,
-                    error,
-                    ..
-                } if operation == "tick" && error == "invalid_transition"
-            ))
-    );
     assert_eq!(cases[8].scenario.clients.len(), 8);
     assert!(cases[8].scenario.steps.iter().any(|step| matches!(
         step,

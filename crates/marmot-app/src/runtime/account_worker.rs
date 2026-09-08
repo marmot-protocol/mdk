@@ -216,6 +216,19 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
+    GroupRecoveryStatus {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+    },
+    ConfirmGroupRejoin {
+        welcome_id: cgka_traits::MessageId,
+        token: Vec<u8>,
+        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+    },
+    DeclineGroupRejoin {
+        welcome_id: cgka_traits::MessageId,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     AcceptGroupInvite {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupRecord, AppError>>,
@@ -2220,6 +2233,9 @@ async fn handle_startup_hydration_command(
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
+        AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => {
+            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+        }
         AccountWorkerCommand::Members { group_id, respond } => {
             let _ = client
                 .runtime
@@ -3351,6 +3367,40 @@ fn account_worker_command_future<'a>(
             let _ = respond.send(result);
             true
         }),
+        AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => Box::pin(async move {
+            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+            true
+        }),
+        AccountWorkerCommand::ConfirmGroupRejoin {
+            welcome_id,
+            token,
+            respond,
+        } => Box::pin(async move {
+            let result = client.confirm_group_rejoin(&welcome_id, &token).await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            let _ = respond.send(result);
+            true
+        }),
+        AccountWorkerCommand::DeclineGroupRejoin {
+            welcome_id,
+            respond,
+        } => Box::pin(async move {
+            let result = client.decline_group_rejoin(&welcome_id);
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            let _ = respond.send(result);
+            true
+        }),
         AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => Box::pin(async move {
             let result = client.accept_group_invite(&group_id);
             if result.is_ok() {
@@ -3966,6 +4016,17 @@ fn account_worker_command_future<'a>(
             true
         }),
     }
+}
+
+fn group_recovery_after_hydration(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> Result<crate::GroupRecoveryStatus, AppError> {
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(group_id)?;
+    client.group_recovery_status(group_id)
 }
 
 pub(super) fn group_roster_after_hydration(

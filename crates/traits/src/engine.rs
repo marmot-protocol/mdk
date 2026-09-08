@@ -512,6 +512,9 @@ pub enum GroupEvent {
         /// MLS-authenticated Welcome author derived from the GroupInfo signer
         /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
+        /// Local recipient explicitly authorized replacement of an active branch.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        explicitly_confirmed: bool,
     },
     /// A raw transport object was released solely because a local durable
     /// resource budget expired. This is not a protocol validity verdict and

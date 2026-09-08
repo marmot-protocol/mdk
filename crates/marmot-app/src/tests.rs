@@ -13447,6 +13447,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
             group_id: group_id.clone(),
             via_welcome: MessageId::new(vec![0x7a; 32]),
+            explicitly_confirmed: false,
             welcomer: None,
         }],
         ..Default::default()

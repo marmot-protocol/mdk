@@ -389,6 +389,7 @@ async fn invite_group_evolution_publishes_commit_and_welcome_through_stack() {
     assert_eq!(
         carol_joined.effects.events,
         vec![GroupEvent::GroupJoined {
+            explicitly_confirmed: false,
             group_id: created.group_id.clone(),
             via_welcome: welcome_report.message_id,
             welcomer: Some(alice.account_id.clone()),
@@ -509,6 +510,7 @@ async fn publish_confirm_and_deliver_welcome(
     assert_eq!(
         joined.effects.events,
         vec![GroupEvent::GroupJoined {
+            explicitly_confirmed: false,
             group_id: match &confirmed.events[0] {
                 GroupEvent::GroupCreated { group_id } => group_id.clone(),
                 other => panic!("expected GroupCreated event, got {other:?}"),

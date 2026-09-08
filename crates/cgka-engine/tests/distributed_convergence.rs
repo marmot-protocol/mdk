@@ -10471,3 +10471,354 @@ async fn superseded_profile_edit_on_the_same_field_is_reported_as_a_conflict() {
         );
     }
 }
+
+#[tokio::test]
+async fn superseded_invite_retains_recovery_material_after_reporting() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    let (inviter, storage, winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
+        (&mut bob, &bob_storage, &mut alice)
+    } else {
+        (&mut alice, &alice_storage, &mut bob)
+    };
+    let key_package = carol.fresh_key_package().await.unwrap();
+    let invite = SendIntent::Invite {
+        group_id: group_id.clone(),
+        key_packages: vec![key_package],
+        initial_admins: vec![],
+    };
+    let SendResult::GroupEvolution {
+        msg: invite_commit,
+        pending,
+        welcomes,
+        ..
+    } = inviter.send(invite.clone()).await.unwrap()
+    else {
+        panic!("invite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    let (rename, pending) = evolution(
+        winner
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("canonical".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    winner.confirm_published(pending).await.unwrap();
+    for (engine, rival) in [(&mut *inviter, &rename), (&mut *winner, &invite_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        assert_eq!(
+            engine
+                .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+                .unwrap()
+                .convergence_status,
+            ConvergenceStatus::Settled
+        );
+    }
+    assert!(
+        !inviter
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == carol.self_id())
+    );
+    assert!(
+        carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == carol.self_id())
+    );
+    let reports = inviter.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].outcome,
+        SupersededIntentOutcome::ReinviteRequired
+    );
+    let retained = storage.own_commit_intent(&invite_commit.id).unwrap()
+        .expect("fresh-material recovery must retain the original recipients across a lost event/restart");
+    assert_eq!(retained.intent, invite);
+    assert!(
+        inviter
+            .reissue_superseded_own_commits_from_state()
+            .unwrap()
+            .is_empty(),
+        "the same pending recovery must not repeatedly announce supersession"
+    );
+    // Resolving the same cached material cannot replay a consumed invitation.
+    let SendIntent::Invite {
+        key_packages: old_packages,
+        ..
+    } = invite
+    else {
+        unreachable!()
+    };
+    assert!(
+        inviter
+            .reissue_invite_with_key_packages(&invite_commit.id, old_packages)
+            .is_err()
+    );
+    assert!(
+        storage
+            .own_commit_intent(&invite_commit.id)
+            .unwrap()
+            .is_some()
+    );
+    let old_payload = app_payload_for(&carol, b"history on the parked branch");
+    let SendResult::ApplicationMessage {
+        msg: old_message, ..
+    } = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: old_payload,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("old-branch application message");
+    };
+    let old_history = carol_storage.get_message(&old_message.id).unwrap();
+    let fresh = carol.fresh_key_package().await.unwrap();
+    let report = inviter
+        .reissue_invite_with_key_packages(&invite_commit.id, vec![fresh])
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+    let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].reissue_attempts, 1);
+    let mut drained = inviter
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: fresh_commit,
+        pending,
+        welcomes,
+        ..
+    } = drained.remove(0)
+    else {
+        panic!("reinvite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    winner
+        .buffer_openmls_convergence_message_at(&group_id, route(fresh_commit, &group_id), 3_000_000)
+        .unwrap();
+    winner
+        .converge_stored_openmls_messages_at(&group_id, 4_000_000)
+        .unwrap();
+    let replacement = welcome_for(&welcomes, b"carol");
+    let stale_record = carol_storage.get_group(&group_id).unwrap();
+    // Capacity refusal must neither consume the KeyPackage nor poison dedup;
+    // freeing an offer slot makes this identical transport input retryable.
+    use cgka_traits::storage::WelcomeStorage;
+    let mut filler_ids = Vec::new();
+    for n in 0..4u8 {
+        let id = cgka_traits::MessageId::new(vec![0xc0 + n; 32]);
+        carol_storage
+            .put_welcome(&cgka_traits::welcome::PendingWelcome {
+                message_id: id.clone(),
+                group_id: group_id.clone(),
+                welcome_bytes: vec![],
+                rejoin: Some(cgka_traits::welcome::RejoinWelcome {
+                    epoch: stale_record.epoch,
+                    content_id: id.clone(),
+                    welcomer: inviter.self_id(),
+                    local_state_token: vec![0; 32],
+                }),
+            })
+            .unwrap();
+        filler_ids.push(id);
+    }
+    assert!(matches!(
+        carol.ingest(replacement.clone()).await.unwrap(),
+        IngestOutcome::ResourceRefused {
+            resource: cgka_traits::ingest::InboundResourceLimit::PendingWelcomeCapacity,
+            ..
+        }
+    ));
+    assert!(carol.last_ingest_left_object_unpersisted());
+    assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
+    for id in filler_ids {
+        carol_storage.take_welcome(&id).unwrap();
+    }
+    assert!(matches!(
+        carol.join_welcome(replacement.clone()).await,
+        Err(cgka_traits::EngineError::InvalidTransition(_))
+    ));
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap(),
+        stale_record,
+        "an offer is not consent"
+    );
+    let offer = carol.pending_group_rejoins().unwrap().remove(0);
+    let token = offer.rejoin.unwrap().local_state_token;
+    assert!(
+        carol
+            .confirm_group_rejoin(&replacement.id, &[0; 32])
+            .await
+            .is_err()
+    );
+    assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
+    // A consent screen must be refreshed if the local branch changes, even
+    // when that fork advances to the same epoch as the incoming Welcome.
+    let (_, pending) = evolution(
+        carol
+            .send(SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+    );
+    carol.confirm_published(pending).await.unwrap();
+    assert!(
+        carol
+            .confirm_group_rejoin(&replacement.id, &token)
+            .await
+            .is_err()
+    );
+    let token = carol
+        .pending_group_rejoins()
+        .unwrap()
+        .remove(0)
+        .rejoin
+        .unwrap()
+        .local_state_token;
+    // The offer survives reconstruction without consuming its KeyPackage.
+    drop(carol);
+    let mut carol = build_client_with_storage(b"carol", carol_storage.clone());
+    carol
+        .confirm_group_rejoin(&replacement.id, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_storage.get_message(&old_message.id).unwrap().payload,
+        old_history.payload,
+        "explicit rejoin preserves the existing local message history"
+    );
+    assert!(carol.pending_group_rejoins().unwrap().is_empty());
+    assert_eq!(
+        carol.members(&group_id).unwrap(),
+        winner.members(&group_id).unwrap()
+    );
+    assert_eq!(
+        carol_storage.get_group(&group_id).unwrap().name,
+        "canonical"
+    );
+    for reverse in [false, true] {
+        let (sender, receiver, text) = if reverse {
+            (&mut *winner, &mut carol, b"reply".as_slice())
+        } else {
+            (&mut carol, &mut *winner, b"after rejoin".as_slice())
+        };
+        let payload = app_payload_for(sender, text);
+        let sent = sender
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap();
+        let SendResult::ApplicationMessage { msg, .. } = sent else {
+            panic!("application")
+        };
+        assert!(matches!(
+            receiver.ingest(route(msg, &group_id)).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+    }
+}
+
+#[tokio::test]
+async fn reinvite_lookup_budget_and_pacing_survive_restart() {
+    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
+    let (mut client, storage) = build_client(b"reinvite-budget");
+    let (group_id, created) = client
+        .create_group(CreateGroupRequest {
+            name: "retry budget".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        client.confirm_published(pending).await.unwrap();
+    }
+    let commit_id = cgka_traits::MessageId::new(vec![0xa1; 32]);
+    storage
+        .put_own_commit_intent(&OwnCommitIntent {
+            commit_id: commit_id.clone(),
+            group_id: group_id.clone(),
+            source_epoch: EpochId(0),
+            intent: SendIntent::Invite {
+                group_id,
+                key_packages: vec![],
+                initial_admins: vec![],
+            },
+            baseline: OwnCommitBaseline::None,
+            reissue_attempts: 0,
+            created_at_ms: 0,
+            reinvite: Some(ReinviteRetry::default()),
+        })
+        .unwrap();
+    let mut now = 0;
+    for attempt in 1..=8 {
+        assert!(client.reserve_reinvite_lookup(&commit_id, now).unwrap());
+        assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
+        drop(client);
+        client = build_client_with_storage(b"reinvite-budget", storage.clone());
+        let record = client.pending_reinvites().unwrap().remove(0);
+        let retry = record.reinvite.unwrap();
+        assert_eq!(retry.lookup_attempts, attempt);
+        assert!(retry.next_attempt_at_ms > now);
+        now = retry.next_attempt_at_ms;
+    }
+    assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
+    drop(client);
+    let mut client = build_client_with_storage(b"reinvite-budget", storage);
+    assert!(client.pending_reinvites().unwrap().is_empty());
+    assert!(
+        client.reinvite_recovery_records().unwrap()[0]
+            .reinvite
+            .as_ref()
+            .unwrap()
+            .abandoned
+    );
+    assert!(
+        !client
+            .reserve_reinvite_lookup(&commit_id, u64::MAX)
+            .unwrap()
+    );
+}

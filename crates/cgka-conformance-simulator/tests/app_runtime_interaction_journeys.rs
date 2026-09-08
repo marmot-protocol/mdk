@@ -493,16 +493,24 @@ async fn concurrent_invite_and_rename(
     send(subject, "main", "alice", "before").await?;
     expect_timeline(subject, "main", &expected, out, "before.json").await?;
 
+    // Smaller credential identity wins equal-length same-epoch branches.
+    // Always make the invitation lose so this journey exercises recovery.
+    let (inviter, renamer) =
+        if subject.account_identity("alice")? < subject.account_identity("bob")? {
+            ("bob", "alice")
+        } else {
+            ("alice", "bob")
+        };
     let report = subject
         .race_mutations(
             "race-invite-rename",
             &[
                 ConcurrentMutation::InviteMembers {
-                    inviter: "alice",
+                    inviter,
                     invitees: &labels(&["david"]),
                 },
                 ConcurrentMutation::UpdateGroupProfile {
-                    client: "bob",
+                    client: renamer,
                     name: Some("renamed during invite"),
                     description: None,
                 },
@@ -513,16 +521,39 @@ async fn concurrent_invite_and_rename(
     let invite_accepted = report
         .outcomes
         .iter()
-        .any(|outcome| outcome.client == "alice" && outcome.accepted);
+        .any(|outcome| outcome.client == inviter && outcome.accepted);
+    if strict && report.outcomes.iter().any(|outcome| !outcome.accepted) {
+        return Err(
+            "the strict recovery journey requires both competing mutations to be accepted".into(),
+        );
+    }
     // Membership is decided by the founders' settled roster, not by the
     // inviter's success report. The invitee is progressed separately: until a
     // Welcome reaches it, or if the rejected invite never published one, its
     // device holds no group at all, which must not abort the journey.
     subject.tick(&founders).await?;
     tick_possible_non_member(subject, "david").await?;
-    let founders_state = subject
-        .await_observable_settlement(&founders, SETTLEMENT)
-        .await?;
+    let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let founders_state = loop {
+        let states = subject
+            .await_observable_settlement(&founders, SETTLEMENT)
+            .await?;
+        if !invite_accepted
+            || states[0]
+                .protocol
+                .member_identities
+                .iter()
+                .any(|member| member == "david")
+        {
+            break states;
+        }
+        if tokio::time::Instant::now() >= recovery_deadline {
+            return Err("automatic fresh invitation did not restore canonical membership".into());
+        }
+        tick_possible_non_member(subject, "david").await?;
+        subject.run_due_maintenance(&founders).await?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     let david_joined = founders_state[0]
         .protocol
         .member_identities
@@ -553,16 +584,58 @@ async fn concurrent_invite_and_rename(
             }
         }
     }
+    // The first Welcome may have installed a parked branch. Wait for either
+    // matching public state or a validated offer, and model explicit consent.
+    let mut explicitly_rejoined = false;
+    if david_joined {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            tick_possible_non_member(subject, "david").await?;
+            let status = subject.group_recovery_status("david").await?;
+            if let Some(offer) = status.rejoin_invitations.first() {
+                let offer = offer.clone();
+                subject.reopen("david").await?;
+                let restored = subject.group_recovery_status("david").await?;
+                if !restored.rejoin_invitations.contains(&offer) {
+                    return Err("rejoin offer did not survive reopen".into());
+                }
+                subject.confirm_group_rejoin("david", &offer).await?;
+                subject.reopen("david").await?;
+                let joined = subject.observations(&labels(&["david"])).await?;
+                assert!(
+                    !joined[0].application.pending_confirmation,
+                    "explicitly confirmed rejoin must stay accepted after reopen"
+                );
+                explicitly_rejoined = true;
+                break;
+            }
+            let view = subject.observations(&labels(&["david"])).await?;
+            if view[0].protocol.member_identities == founders_state[0].protocol.member_identities
+                && view[0].protocol.group_name == founders_state[0].protocol.group_name
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("invitee neither converged nor received a rejoin offer".into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    if strict && invite_accepted && !explicitly_rejoined {
+        return Err(
+            "the forced losing invitation did not exercise explicit recipient recovery".into(),
+        );
+    }
     let observations = subject
         .await_observable_settlement(&members, SETTLEMENT)
         .await?;
-    let edits = [("bob", "name", "renamed during invite")];
+    let edits = [(renamer, "name", "renamed during invite")];
     let mut settled = settled_edits(&observations, &edits);
     let mut dropped = dropped_accepted_edits(&report, &observations, &edits);
     if david_joined {
-        settled.push("alice:invite".into());
+        settled.push(format!("{inviter}:invite"));
     } else if invite_accepted {
-        dropped.push("alice:invite".into());
+        dropped.push(format!("{inviter}:invite"));
     }
     // An invitee the founders exclude must hold no projection of the group. A
     // device that still reports membership joined a parked branch through a
@@ -1038,11 +1111,10 @@ journey_test!(
 // The strict form additionally requires that an invite or rename the runtime
 // reported as saved reaches the settled public state and that an excluded
 // invitee holds no projection. A losing rename is re-issued since #1734; a
-// losing invite still strands its invitee on a parked branch (#1735), so this
-// documents a known product gap rather than gating CI; see
+// losing invite now obtains fresh material and offers explicit recipient rejoin.
+// This gates durable recovery and matching public state; see
 // APP_PATH_COVERAGE.md.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap: a losing invite or rename is dropped after its caller was told it saved"]
 async fn public_app_09_strict_concurrent_invite_and_rename_are_never_lost() {
     check(Journey::ConcurrentInviteAndRename { strict: true }).await;
 }

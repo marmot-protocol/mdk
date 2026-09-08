@@ -4069,7 +4069,72 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
          tracker even though the arming traffic produced no visible activity",
     );
 
+    let recovery = runtime
+        .group_recovery_status("bob", &group_id)
+        .await
+        .unwrap();
+    assert!(
+        recovery.membership_unconfirmed,
+        "bounded distinct undecryptable traffic must expose advisory membership uncertainty"
+    );
+    let before = app.group("bob", &group_id_hex).unwrap().unwrap();
+    assert!(
+        before.pending_confirmation,
+        "advisory state must not accept an invitation"
+    );
     server.abort();
+    runtime.shutdown_and_close().await.unwrap();
+    drop(runtime);
+    drop(app);
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.start().await.unwrap();
+    assert!(
+        runtime
+            .group_recovery_status("bob", &group_id)
+            .await
+            .unwrap()
+            .membership_unconfirmed
+    );
+    wait_for_account_network_ready(&runtime, "alice").await;
+    wait_for_account_network_ready(&runtime, "bob").await;
+    let mut recovery_events = runtime.subscribe();
+    let sent = runtime
+        .send_message("alice", &group_id, b"authenticated recovery".to_vec())
+        .await
+        .unwrap();
+    let mut received_epochs = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        while let Ok(event) = recovery_events.try_recv() {
+            if let MarmotAppEvent::GroupEvent(event) = event
+                && event.account_label == "bob"
+                && let cgka_traits::engine::GroupEvent::MessageReceived { epoch, .. } = event.event
+            {
+                received_epochs.push(epoch.0);
+            }
+        }
+        if !runtime
+            .group_recovery_status("bob", &group_id)
+            .await
+            .unwrap()
+            .membership_unconfirmed
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "authenticated current-epoch traffic must clear the warning; published={}, received_epochs={received_epochs:?}",
+            sent.published
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
     runtime.shutdown().await;
 }
 

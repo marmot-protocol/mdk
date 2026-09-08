@@ -391,6 +391,7 @@ pub(crate) fn ingest_outcome_event(
             ),
             IngestOutcome::LocalState { state } => Some(
                 match state {
+                    LocalIngestState::RejoinConfirmationRequired => "rejoin_confirmation_required",
                     LocalIngestState::Removed => "removed",
                     LocalIngestState::Quarantined => "quarantined",
                 }
@@ -402,6 +403,7 @@ pub(crate) fn ingest_outcome_event(
             IngestOutcome::TransportDeferred { .. } => Some("transport_deferred".to_string()),
             IngestOutcome::ResourceRefused { resource, .. } => Some(
                 match resource {
+                    InboundResourceLimit::PendingWelcomeCapacity => "pending_welcome_capacity",
                     InboundResourceLimit::TransportDeferredCapacity => {
                         "resource_refused_deferred_capacity"
                     }

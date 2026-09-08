@@ -100,6 +100,7 @@ mod tests {
             message_id: mid(1),
             group_id: gid(1),
             welcome_bytes: vec![1, 2, 3],
+            rejoin: None,
         };
         store.put_welcome(&welcome).unwrap();
         assert_eq!(store.list_welcomes().unwrap(), vec![welcome.clone()]);
@@ -142,6 +143,7 @@ mod tests {
             message_id: mid(2),
             group_id: gid(1),
             welcome_bytes: vec![1, 2, 3],
+            rejoin: None,
         };
         store.put_welcome(&welcome).unwrap();
         store
@@ -166,6 +168,7 @@ mod tests {
             message_id: mid(1),
             group_id: gid(1),
             welcome_bytes: vec![1, 2, 3],
+            rejoin: None,
         };
         store.put_welcome(&welcome).unwrap();
 
@@ -195,6 +198,7 @@ mod tests {
             message_id: mid(1),
             group_id: gid(1),
             welcome_bytes: vec![1, 2, 3],
+            rejoin: None,
         };
         store.put_welcome(&welcome).unwrap();
 

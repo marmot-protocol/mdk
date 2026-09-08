@@ -140,6 +140,9 @@ pub enum EngineError {
     /// by the user once the group recovers, not by a loop.
     #[error("queued outbound retention is at capacity for this group")]
     QueuedOutboundAtCapacity { group_id: GroupId },
+    /// The bounded replacement-Welcome inbox is full. Nothing was consumed.
+    #[error("replacement invitation inbox is at capacity")]
+    PendingWelcomeAtCapacity { group_id: GroupId },
 
     /// The group is halted `Unrecoverable` and refuses new work until a
     /// verified repair returns it to `Stable`. Its one legal exit is an
@@ -235,6 +238,7 @@ impl EngineError {
             EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
             EngineError::ForkedEpoch { .. } => "forked_epoch",
             EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
+            EngineError::PendingWelcomeAtCapacity { .. } => "pending_welcome_at_capacity",
             EngineError::GroupUnrecoverableRepairRequired { .. } => {
                 "group_unrecoverable_repair_required"
             }

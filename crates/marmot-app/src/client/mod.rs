@@ -61,6 +61,7 @@ use crate::{
 
 mod audit;
 pub(crate) mod epoch_stall;
+mod invite_recovery;
 mod projection;
 mod push;
 mod retention;
@@ -735,6 +736,7 @@ impl AppClient {
             return Ok(maintenance_run_summary_from_account(summary));
         }
         let effects = self.runtime.run_due_maintenance().await?;
+        self.recover_superseded_invites().await?;
         self.observe_recovery_evidence_then_summarize_maintenance(&effects)
     }
 
@@ -765,6 +767,7 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
         self.observe_recovery_evidence(effects);
+        self.observe_membership_health(effects)?;
         self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
         Ok(maintenance_run_summary_from_account(summary))
@@ -4500,6 +4503,12 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
+            if report.outcome == cgka_traits::engine::SupersededIntentOutcome::ReinviteRequired {
+                self.mark_group_projection_dirty_hex(hex::encode(report.group_id.as_slice()));
+                // The app owns automatic fresh-material recovery; only terminal
+                // failure should ask the inviter to take manual action.
+                continue;
+            }
             if self
                 .pending_superseded_change_events
                 .iter()

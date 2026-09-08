@@ -486,6 +486,7 @@ mod tests {
                 name: "before".to_owned(),
                 description: "described".to_owned(),
             },
+            reinvite: None,
             reissue_attempts: 1,
             created_at_ms: 42,
         };

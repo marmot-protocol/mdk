@@ -925,6 +925,59 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn group_recovery_status(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn confirm_group_rejoin(
+        &self,
+        account_ref: &str,
+        welcome_id: &cgka_traits::MessageId,
+        token: &[u8],
+    ) -> Result<crate::GroupRecoveryStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ConfirmGroupRejoin {
+                welcome_id: welcome_id.clone(),
+                token: token.to_vec(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn decline_group_rejoin(
+        &self,
+        account_ref: &str,
+        welcome_id: &cgka_traits::MessageId,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DeclineGroupRejoin {
+                welcome_id: welcome_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn accept_group_invite(
         &self,
         account_ref: &str,

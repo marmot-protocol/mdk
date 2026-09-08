@@ -100,7 +100,7 @@ may already have reached the relay, so only accepted publications are correlated
 | `07_two_groups_stay_isolated` | Work and pair groups on one device; the second invite of Bob needs a fresh KeyPackage; a non-member has no projection; a removal and a reopen leave the other group's exact history untouched |
 | `08_concurrent_admin_profile_edits_are_never_lost` | Two admins save name and description at the same instant; members settle on one state in which both edits are present, because the losing commit's edit is re-issued when the winner left its field untouched (#1734; measured on the settled projection, not on the commands' return values); fresh traffic and reopen persistence hold; dropped accepted edits are recorded |
 | `09_concurrent_invite_and_rename_converge` | An invite races a rename; founders settle with at least one edit present; an invitee the founders admitted sends and receives; an excluded invitee's device state is recorded as `no_projection` or `stranded` |
-| `09_strict_concurrent_invite_and_rename_are_never_lost` (ignored, #1735) | As above, an excluded invitee holds no projection, and an invite or rename reported as saved is not lost |
+| `09_strict_concurrent_invite_and_rename_are_never_lost` | Choose the larger-identity inviter so the invitation loses; require automatic fresh invitation, explicit recipient rejoin, offer and acceptance persistence across reopen, canonical roster/name, and fresh bidirectional messaging |
 | `10_member_removed_while_offline_learns_removal` | A closed device is removed; on reconnect it learns the removal from relay history, never decrypts post-removal traffic, keeps its exact pre-removal history across reopen, and its sends are refused as `group_removed` |
 | `11_manual_self_update_advances_every_member` (ignored with production timing) | A manual SelfUpdate advances every member; ordinary test-policy builds zero maintenance windows, while production timing requires an explicit run |
 | `12_leave_with_several_remaining_members_converges` | David leaves a four-member group; within three minutes the survivors apply it, settle, exchange decryptable traffic in every direction, and persist across reopen; the leaver keeps exactly its pre-departure history and nothing it sends afterwards reaches them |
@@ -113,8 +113,8 @@ is present in the settled state, or when fresh traffic or reopen persistence bre
 fork occurred on a given run; real socket timing is not seed-controlled. The three gaps below are tracked in
 [#1734](https://github.com/marmot-protocol/mdk/issues/1734), [#1735](https://github.com/marmot-protocol/mdk/issues/1735),
 and [#1736](https://github.com/marmot-protocol/mdk/issues/1736). The profile-edit never-lost contract is now the default
-journey 08, and the strict 30-second departure regression also runs ordinarily. The strict journey 09 stays ignored
-for the stranded-invitee gap (#1735).
+journey 08. The strict 30-second departure regression and strict journey 09 now also run ordinarily. Journey 09
+requires an actual recipient rejoin, so a run that misses the intended fork cannot silently pass.
 
 Run the default journeys the way the conformance CI job does, or serially with retained evidence:
 
@@ -144,8 +144,8 @@ engine now retains the intent behind every own group evolution together with the
 (`cgka_own_commit_intents`, kept until the group has advanced past the rewind horizon), and when a pass withdraws
 that commit it decides per kind: a profile or component edit is re-queued when the winning branch left the edited
 field untouched and reported as a conflict when it changed it; a removal is re-queued for targets that are still
-members; an invite is reported as needing a fresh invitation (#1735 owns the invitee's side). Re-issue is bounded to
-two attempts. Every decision reaches the host as `MarmotAppEvent::GroupChangeSuperseded { kind, outcome, reason }`
+members; an invite retains durable recovery material while the app obtains fresh KeyPackages and reissues it (#1735). Re-issue is bounded to
+two attempts. Terminal and reissued decisions reach the host as `MarmotAppEvent::GroupChangeSuperseded { kind, outcome, reason }`
 (UniFFI and C ABI mirrors), and `run_due_maintenance` re-derives a missed announcement from the stored disposition.
 Journey 08 now requires both edits in the settled state; `crates/marmot-app/tests/relay_runtime.rs` races two admins
 on a real relay for the re-issued and the conflict outcome, and `crates/cgka-engine/tests/distributed_convergence.rs`
@@ -476,7 +476,7 @@ invite-versus-rename repetitions failed. Two left the invitee on a stranded bran
 but dropped an accepted rename. Inputs and public observations are retained under `target/app-launch-20260907/known-races/`.
 The departure scheduling correction alone did not repair those gaps. The combined reliability branch now also
 includes own-intent recovery for #1734, with strict journey 08 promoted to the ordinary suite. The stranded-invitee
-case (#1735) remains open and its strict regression stays ignored. Intent retention failures roll back staging;
+case (#1735) is now covered by automatic fresh-material recovery plus explicit recipient rejoin; its strict regression runs ordinarily. Intent retention failures roll back staging;
 re-issue transfers the retained intent into the outbound queue atomically, with fault-injection regressions for
 both queue insertion and source deletion. The account dispatcher constructs only the selected command future
 to keep nested MLS work within the configured runtime stack budget.
@@ -526,3 +526,12 @@ satisfy it. The harness pauses unrelated maintenance while checking that the att
 protocol state nor relay publication count, then resumes maintenance and checks ordinary messaging still works.
 The strict admin-handoff canaries execute cases 0–3, including both one- and two-cycle handoffs in both restart
 variants; the saved version-3 inputs retain their earlier contracts.
+
+
+## September 8 invitation recovery
+
+The September 7 stranded-invitee observations above describe the original defect. The strict journey now forces
+its inviter to lose the identity tiebreak and requires recipient-confirmed replacement, including a persisted offer
+before restart and accepted state after another restart. An engine regression independently fixes the exact sibling
+commit schedule and checks consumed-package rejection, stale consent after self-update, and bidirectional decryption.
+See [invitation recovery](../../docs/marmot-architecture/invitation-recovery.md) for the runtime/binding integration contract.

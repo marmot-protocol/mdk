@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-07
+updated: 2026-09-08
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,14 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
+canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
+explicitly confirm replacing that MLS state; local message history remains. `group_recovery_status` exposes offers,
+pending/failed inviter recovery, and a separate advisory `membership_unconfirmed` flag after eight distinct
+undecryptable events. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
+Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
+See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
 
 Deferred transport resource release now preserves app replay eligibility across
 lost engine effects and restart. SQLCipher records release evidence atomically

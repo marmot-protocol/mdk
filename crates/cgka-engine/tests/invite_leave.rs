@@ -2092,6 +2092,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             if error.from == "ActiveMember" && error.to == "JoinWelcome"
     ));
 
+    assert!(
+        cgka_traits::storage::WelcomeStorage::list_welcomes(&carol_storage)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.message_id == fresh_carol_welcome.id),
+        "a validated replacement must remain available for explicit recipient confirmation"
+    );
+
     // Once Carol processes the removal from her trusted epoch-2 branch, the
     // exact same Welcome is a legitimate retry and installs the epoch-4 rejoin.
     let routed_remove = TransportMessage {
@@ -2113,7 +2121,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             .any(|member| member.id == carol_id),
         "trusted removal must clear Carol's active membership before re-entry"
     );
-    carol.join_welcome(fresh_carol_welcome).await.unwrap();
+    assert!(
+        carol.retry_rejoins_after_trusted_removal().await.unwrap(),
+        "owned Welcome must recover without another relay delivery"
+    );
+    assert!(matches!(
+        carol.join_welcome(fresh_carol_welcome).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
     assert_eq!(carol.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         carol.members(&group_id).unwrap(),
@@ -2121,16 +2136,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
     );
 
     // David takes the fresh Welcome first. His still-unconsumed epoch-2
-    // Welcome is distinct valid MLS material, but it must not replace epoch 4.
+    // Welcome is distinct valid MLS material, but cannot replace epoch 4
+    // without explicit recipient consent, even though a lower-epoch offer is retained.
     david.join_welcome(fresh_david_welcome).await.unwrap();
     let downgrade_error = david
         .join_welcome(stale_david_welcome)
         .await
         .expect_err("an older Welcome must not downgrade active group state");
-    assert!(matches!(
-        downgrade_error,
-        EngineError::WelcomeAlreadyProcessed
-    ));
+    assert!(matches!(downgrade_error, EngineError::InvalidTransition(_)));
     assert_eq!(david.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         david.members(&group_id).unwrap(),
@@ -2430,7 +2443,7 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
     );
 
     let error = carol
-        .join_welcome(unauthorized_newer_welcome)
+        .join_welcome(unauthorized_newer_welcome.clone())
         .await
         .expect_err("a newer self-promoted fork must not replace active state");
     assert!(
@@ -2447,6 +2460,20 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
         "failed replacement must restore the original Marmot group record"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), before.epoch);
+    let offer = carol.pending_group_rejoins().unwrap().remove(0);
+    assert_eq!(offer.rejoin.as_ref().unwrap().welcomer, bob.self_id());
+    let mut rewrapped = unauthorized_newer_welcome.clone();
+    rewrapped.id = cgka_traits::MessageId::new(vec![0x91; 32]);
+    assert!(carol.join_welcome(rewrapped.clone()).await.is_err());
+    assert_eq!(carol.pending_group_rejoins().unwrap().len(), 1);
+    carol.decline_group_rejoin(&offer.message_id).unwrap();
+    assert!(carol.pending_group_rejoins().unwrap().is_empty());
+    rewrapped.id = cgka_traits::MessageId::new(vec![0x92; 32]);
+    assert!(matches!(
+        carol.join_welcome(rewrapped).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
+    assert!(carol.pending_group_rejoins().unwrap().is_empty());
     let payload = app_payload_for(&carol, b"original state remains usable");
     carol
         .send(SendIntent::AppMessage { group_id, payload })

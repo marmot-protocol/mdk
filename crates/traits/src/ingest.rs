@@ -107,6 +107,8 @@ pub enum InputRejectionCategory {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboundResourceLimit {
+    /// The bounded replacement-Welcome inbox is full; user decisions free slots.
+    PendingWelcomeCapacity,
     /// The per-group durable transport-deferred row cap is full.
     TransportDeferredCapacity,
     /// A retained transport object exhausted its changed-context retry budget
@@ -119,6 +121,9 @@ pub enum InboundResourceLimit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalIngestState {
+    /// A validated replacement Welcome is durable and awaits explicit local
+    /// consent. It has not changed MLS state and is not convergence work.
+    RejoinConfirmationRequired,
     /// Authenticated MLS state records this account-device's removal. The
     /// engine has already performed the realizing-removal side effects.
     Removed,

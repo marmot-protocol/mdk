@@ -272,6 +272,36 @@ impl<S: StorageProvider> Engine<S> {
                     category: InputRejectionCategory::Duplicate,
                 })
             }
+            Err(EngineError::PendingWelcomeAtCapacity { group_id }) => {
+                self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+                Ok(IngestOutcome::ResourceRefused {
+                    group_id,
+                    resource: cgka_traits::ingest::InboundResourceLimit::PendingWelcomeCapacity,
+                })
+            }
+            Err(EngineError::InvalidTransition(error)) => {
+                // The offer may have arrived under another transport wrapper.
+                // It owns the content but must remain eligible for ordinary
+                // trusted-removal reentry as well as explicit confirmation.
+                let peeled = self
+                    .peeler
+                    .peel_welcome(msg)
+                    .await
+                    .map_err(EngineError::Peeler)?;
+                let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+                if self.storage.list_welcomes()?.iter().any(|candidate| {
+                    candidate
+                        .rejoin
+                        .as_ref()
+                        .is_some_and(|rejoin| rejoin.content_id == content_id)
+                }) {
+                    Ok(IngestOutcome::LocalState {
+                        state: LocalIngestState::RejoinConfirmationRequired,
+                    })
+                } else {
+                    Err(EngineError::InvalidTransition(error))
+                }
+            }
             Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
                 Ok(IngestOutcome::Ignored {

@@ -838,6 +838,50 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Re-read on GroupStateUpdated; display uncertainty separately from whether
+    /// the user accepted the original invitation.
+    pub async fn group_recovery_status(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<crate::conversions::GroupRecoveryStatusFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_recovery_status(&account_ref, &group_id)
+            .await?
+            .into())
+    }
+
+    /// Call only after explicit user consent to replace the active copy. Show
+    /// the offer's authenticated inviter and pass its exact id and state token.
+    pub async fn confirm_group_rejoin(
+        &self,
+        account_ref: String,
+        welcome_id_hex: String,
+        local_state_token: String,
+    ) -> Result<crate::conversions::GroupRecoveryStatusFfi, MarmotKitError> {
+        let welcome_id = cgka_traits::MessageId::new(rejoin_id_bytes(&welcome_id_hex)?);
+        let token = rejoin_id_bytes(&local_state_token)?;
+        Ok(self
+            .runtime
+            .confirm_group_rejoin(&account_ref, &welcome_id, &token)
+            .await?
+            .into())
+    }
+
+    pub async fn decline_group_rejoin(
+        &self,
+        account_ref: String,
+        welcome_id_hex: String,
+    ) -> Result<(), MarmotKitError> {
+        let welcome_id = cgka_traits::MessageId::new(rejoin_id_bytes(&welcome_id_hex)?);
+        Ok(self
+            .runtime
+            .decline_group_rejoin(&account_ref, &welcome_id)
+            .await?)
+    }
+
     pub async fn accept_group_invite(
         &self,
         account_ref: String,
@@ -1291,6 +1335,17 @@ impl Marmot {
     }
 }
 
+fn rejoin_id_bytes(value: &str) -> Result<Vec<u8>, MarmotKitError> {
+    if value.len() != 64 {
+        return Err(MarmotKitError::InvalidHex {
+            details: "rejoin identifier must contain 32 bytes".into(),
+        });
+    }
+    hex::decode(value).map_err(|_| MarmotKitError::InvalidHex {
+        details: "invalid rejoin identifier".into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use cgka_traits::TransportEndpoint;
@@ -1513,6 +1568,22 @@ mod tests {
             ensure_can_demote_admin(&state(false, false), &group_id_hex, absent_member)
                 .expect_err("non-admin demote should fail");
         assert!(matches!(demote_err, MarmotKitError::NotGroupAdmin { .. }));
+    }
+
+    #[test]
+    fn rejoin_identifiers_require_exactly_32_bytes() {
+        assert_eq!(rejoin_id_bytes(&"aa".repeat(32)).unwrap(), vec![0xaa; 32]);
+        for invalid in [
+            String::new(),
+            "aa".repeat(16),
+            "aa".repeat(33),
+            "zz".repeat(32),
+        ] {
+            assert!(matches!(
+                rejoin_id_bytes(&invalid),
+                Err(MarmotKitError::InvalidHex { .. })
+            ));
+        }
     }
 
     #[test]

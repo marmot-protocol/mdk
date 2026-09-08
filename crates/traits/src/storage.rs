@@ -420,6 +420,14 @@ pub enum OwnCommitBaseline {
     AppComponents { components: Vec<AppComponentData> },
 }
 
+/// Durable fresh-KeyPackage lookup state for an invitation withdrawn by convergence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReinviteRetry {
+    pub next_attempt_at_ms: u64,
+    pub lookup_attempts: u32,
+    pub abandoned: bool,
+}
+
 /// The intent behind a commit this device staged. A confirmed commit can still
 /// be parked by convergence for as long as it sits inside the group's rewind
 /// horizon, so the record outlives publication: it is removed when the publish
@@ -436,6 +444,8 @@ pub struct OwnCommitIntent {
     pub source_epoch: EpochId,
     pub intent: SendIntent,
     pub baseline: OwnCommitBaseline,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reinvite: Option<ReinviteRetry>,
     #[serde(default)]
     pub reissue_attempts: u32,
     pub created_at_ms: u64,

@@ -13,9 +13,9 @@
 //!   otherwise reported as a conflict so the winner's value stands;
 //! - a removal is re-queued for the targets that are still members, or
 //!   reported as already satisfied when none remain;
-//! - a lost invite is never replayed, because its KeyPackages were consumed
-//!   by the parked Welcome; the inviter is told to re-invite with fresh
-//!   material (mdk#1735);
+//! - a lost invite retains its recipients while the host resolves fresh
+//!   KeyPackages; consumed material is rejected and recovery survives restart
+//!   (mdk#1735);
 //! - re-issue is bounded by [`MAX_OWN_COMMIT_REISSUE_ATTEMPTS`].
 //!
 //! Re-queued intents flow through the ordinary queued-intent drain, so they
@@ -106,9 +106,12 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         commit_id: &MessageId,
     ) -> Result<Option<SupersededIntentReport>, EngineError> {
-        let Some(record) = self.storage.own_commit_intent(commit_id)? else {
+        let Some(mut record) = self.storage.own_commit_intent(commit_id)? else {
             return Ok(None);
         };
+        if record.reinvite.is_some() {
+            return Ok(None);
+        }
         // Reading canonical state and preparing a replacement must succeed
         // before consuming the only durable copy of the caller's intent.
         let decision = self.prepare_superseded_own_commit(&record)?;
@@ -117,7 +120,14 @@ impl<S: StorageProvider> Engine<S> {
                 if let Some((_, Some(queued))) = &decision {
                     storage.put_queued_outbound_intent(queued)?;
                 }
-                storage.delete_own_commit_intent(commit_id)?;
+                if decision.as_ref().is_some_and(|(report, _)| {
+                    report.outcome == SupersededIntentOutcome::ReinviteRequired
+                }) {
+                    record.reinvite = Some(cgka_traits::storage::ReinviteRetry::default());
+                    storage.put_own_commit_intent(&record)?;
+                } else {
+                    storage.delete_own_commit_intent(commit_id)?;
+                }
                 Ok(())
             })?;
         if let Some((_, Some(queued))) = &decision
@@ -318,6 +328,9 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<SupersededIntentReport>, EngineError> {
         let mut reports = Vec::new();
         for record in self.storage.list_own_commit_intents(None)? {
+            if record.reinvite.is_some() {
+                continue;
+            }
             let state = match self.storage.get_message(&record.commit_id) {
                 Ok(message) => message.state,
                 Err(cgka_traits::storage::StorageError::NotFound) => continue,
@@ -356,6 +369,175 @@ impl<S: StorageProvider> Engine<S> {
         Ok(group.epoch.0 > record.source_epoch.0.saturating_add(max_rewind))
     }
 
+    /// Durable fresh-material recovery records, including exhausted retries.
+    pub fn reinvite_recovery_records(&self) -> Result<Vec<OwnCommitIntent>, EngineError> {
+        Ok(self
+            .storage
+            .list_own_commit_intents(None)?
+            .into_iter()
+            .filter(|record| record.reinvite.is_some())
+            .collect())
+    }
+
+    /// Pending fresh-material recovery is durable and independent of runtime events.
+    pub fn pending_reinvites(&self) -> Result<Vec<OwnCommitIntent>, EngineError> {
+        Ok(self
+            .reinvite_recovery_records()?
+            .into_iter()
+            .filter(|record| {
+                record
+                    .reinvite
+                    .as_ref()
+                    .is_some_and(|retry| !retry.abandoned)
+            })
+            .collect())
+    }
+
+    /// Reserve a bounded lookup before awaiting the network, so cancellation and
+    /// reopen cannot reset either the retry budget or its wall-clock pacing.
+    pub fn reserve_reinvite_lookup(
+        &mut self,
+        commit_id: &MessageId,
+        now_ms: u64,
+    ) -> Result<bool, EngineError> {
+        let Some(mut record) = self.storage.own_commit_intent(commit_id)? else {
+            return Ok(false);
+        };
+        let Some(retry) = record.reinvite.as_mut() else {
+            return Ok(false);
+        };
+        if retry.abandoned || retry.next_attempt_at_ms > now_ms {
+            return Ok(false);
+        }
+        retry.lookup_attempts = retry.lookup_attempts.saturating_add(1);
+        retry.next_attempt_at_ms = now_ms.saturating_add(
+            (5_000u64 << retry.lookup_attempts.saturating_sub(1).min(4)).min(60_000),
+        );
+        if retry.lookup_attempts > 8 {
+            retry.abandoned = true;
+        }
+        let reserved = !retry.abandoned;
+        self.storage.put_own_commit_intent(&record)?;
+        Ok(reserved)
+    }
+
+    /// Transfer a lost invite to the ordinary outbound queue with newly resolved
+    /// packages. Never reuse its consumed packages or change the requested identities.
+    pub fn reissue_invite_with_key_packages(
+        &mut self,
+        commit_id: &MessageId,
+        key_packages: Vec<cgka_traits::engine::KeyPackage>,
+    ) -> Result<Option<SupersededIntentReport>, EngineError> {
+        let Some(mut record) = self.storage.own_commit_intent(commit_id)? else {
+            return Ok(None);
+        };
+        if record.reinvite.as_ref().is_none_or(|retry| retry.abandoned) {
+            return Ok(None);
+        }
+        let SendIntent::Invite {
+            key_packages: old,
+            initial_admins,
+            ..
+        } = &record.intent
+        else {
+            return Ok(None);
+        };
+        let group = self.stored_group_record(&record.group_id)?;
+        let mut expected = std::collections::BTreeSet::new();
+        let mut consumed = std::collections::BTreeSet::new();
+        for package in old {
+            let metadata = crate::key_package::key_package_metadata(package)?;
+            consumed.insert(metadata.key_package_ref_hex);
+            if !group.as_ref().is_some_and(|group| {
+                group.members.iter().any(|member| {
+                    hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
+                })
+            }) {
+                expected.insert(metadata.credential_identity_hex);
+            }
+        }
+        let report = |outcome, reason| SupersededIntentReport {
+            group_id: record.group_id.clone(),
+            commit_id: commit_id.clone(),
+            kind: SupersededIntentKind::Invite,
+            outcome,
+            reason,
+        };
+        if group
+            .as_ref()
+            .is_none_or(|group| group.removed || group.disbanded.is_some())
+        {
+            self.storage.delete_own_commit_intent(commit_id)?;
+            return Ok(Some(report(
+                SupersededIntentOutcome::NotMember,
+                "this device is no longer a member of the group",
+            )));
+        }
+        if expected.is_empty() {
+            self.storage.delete_own_commit_intent(commit_id)?;
+            return Ok(Some(report(
+                SupersededIntentOutcome::AlreadySatisfied,
+                "the requested members are already on the canonical branch",
+            )));
+        }
+        let mls_group = self.load_mls_group(&record.group_id)?;
+        if let Err(error) = crate::app_components::require_admin(
+            &mls_group,
+            &record.group_id,
+            self.identity.self_id(),
+        ) {
+            if !matches!(error, EngineError::NotGroupAdmin { .. }) {
+                return Err(error);
+            }
+            let report = report(
+                SupersededIntentOutcome::Conflict,
+                "the inviter no longer has permission to add members",
+            );
+            if let Some(retry) = &mut record.reinvite {
+                retry.abandoned = true;
+            }
+            self.storage.put_own_commit_intent(&record)?;
+            return Ok(Some(report));
+        }
+        let mut actual = std::collections::BTreeSet::new();
+        for package in &key_packages {
+            let metadata = crate::key_package::key_package_metadata(package)?;
+            if consumed.contains(&metadata.key_package_ref_hex)
+                || !actual.insert(metadata.credential_identity_hex)
+            {
+                return Err(EngineError::InvalidWelcome);
+            }
+        }
+        if actual != expected {
+            return Err(EngineError::InvalidWelcome);
+        }
+        let intent = SendIntent::Invite {
+            group_id: record.group_id.clone(),
+            key_packages,
+            initial_admins: initial_admins
+                .iter()
+                .filter(|id| expected.contains(&hex::encode(id.as_slice())))
+                .cloned()
+                .collect(),
+        };
+        let queued = self.prepare_queued_outbound_intent(
+            record.group_id.clone(),
+            intent,
+            record.reissue_attempts.saturating_add(1),
+        )?;
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                storage.put_queued_outbound_intent(&queued)?;
+                storage.delete_own_commit_intent(commit_id)?;
+                Ok(())
+            })?;
+        self.schedule_pending_convergence_group(&record.group_id);
+        Ok(Some(report(
+            SupersededIntentOutcome::Reissued,
+            "a fresh invitation has been queued against canonical membership",
+        )))
+    }
+
     /// Retain the intent behind a commit this device just staged.
     pub(crate) fn record_own_commit_intent(
         &mut self,
@@ -373,6 +555,7 @@ impl<S: StorageProvider> Engine<S> {
             source_epoch,
             intent,
             baseline,
+            reinvite: None,
             reissue_attempts,
             created_at_ms,
         })?;

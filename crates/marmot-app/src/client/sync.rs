@@ -1230,6 +1230,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        self.observe_membership_health(effects)?;
         self.reconcile_released_transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
@@ -2367,7 +2368,8 @@ impl AppClient {
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
-        let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
+        let source_message_id = delivery.message.id.clone();
+        let source_message_id_hex = hex::encode(source_message_id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
@@ -2375,6 +2377,36 @@ impl AppClient {
             transport_reconciliation_record(self.adapter.account_id(), &delivery);
         self.reconcile_released_transport_receipts()?;
         let effects = self.runtime.ingest_delivery(delivery).await?;
+        self.observe_membership_health(&effects.effects)?;
+        if let IngestOutcome::TransportDeferred { group_id, .. } = &effects.outcome
+            && let Ok(group) = self.runtime.group_record(group_id)
+            && !group.is_terminal()
+            && self
+                .app
+                .account_storage(&self.state.label)?
+                .observe_membership_undecryptable(
+                    group_id,
+                    &source_message_id,
+                    group.epoch,
+                    super::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD,
+                )?
+        {
+            self.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
+        }
+        if matches!(
+            effects.outcome,
+            IngestOutcome::LocalState {
+                state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
+            }
+        ) {
+            for candidate in self.runtime.session().pending_group_rejoins()? {
+                if hex::encode(candidate.message_id.as_slice()) == source_message_id_hex {
+                    self.mark_group_projection_dirty_hex(hex::encode(
+                        candidate.group_id.as_slice(),
+                    ));
+                }
+            }
+        }
         let released = self.reconcile_released_transport_receipts()?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         let must_stay_fetchable =
@@ -3758,6 +3790,7 @@ impl AppClient {
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
+        self.recover_superseded_invites().await?;
         self.observe_scheduled_convergence_effects(group_id, &effects)
             .await
     }
@@ -3770,6 +3803,7 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        self.observe_membership_health(effects)?;
         self.remember_pending_convergence_groups(effects);
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
