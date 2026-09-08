@@ -21,6 +21,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_usage_diagnostics",
         apply: version_2,
     },
+    Migration {
+        version: 3,
+        name: "0003_directory_presentation",
+        apply: |tx| {
+            tx.execute_batch(include_str!("v3.sql"))
+                .map_err(sqlite_error)
+        },
+    },
 ];
 
 fn version_2(tx: &Transaction<'_>) -> StorageResult<()> {

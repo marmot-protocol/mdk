@@ -1,4 +1,6 @@
 //! Shared selected chat presentation policy; no network access or client-specific formatting.
+pub(crate) mod maintenance;
+pub(crate) mod signals;
 use crate::UserProfileMetadata;
 use sha2::{Digest, Sha256};
 use storage_sqlite::{
@@ -6,10 +8,31 @@ use storage_sqlite::{
     PresentationText, SelectedAvatar,
 };
 
+/// Determine the eligible peer without selecting text, avatars, or cache keys.
+fn presentation_peer(input: &ChatPresentationInput, local_id: &str) -> Option<String> {
+    let local_id = canonical_identity(local_id);
+    let members: Option<Vec<_>> = input
+        .members
+        .iter()
+        .map(|s| canonical_identity(s))
+        .collect();
+    match (&local_id, &members) {
+        (Some(local), Some(members))
+            if input.member_count == Some(2)
+                && input.self_membership == storage_sqlite::SelfMembership::Member
+                && members.len() == 2
+                && members[0] != members[1]
+                && members.contains(local) =>
+        {
+            members.iter().find(|id| *id != local).cloned()
+        }
+        _ => None,
+    }
+}
+
 /// Resolve already-cached evidence. Profile subjects must match the current peer.
 /// Remote descriptors do not authorize a download; the media layer still owns dial safety,
 /// including `reject_unsafe_group_avatar_contact_url` and validated-address pinning.
-#[allow(dead_code)] // Internal P1 policy; the P2 account worker supplies the production caller.
 pub(crate) fn select_chat_presentation(
     input: &ChatPresentationInput,
     local_id: &str,
@@ -21,17 +44,7 @@ pub(crate) fn select_chat_presentation(
         .iter()
         .map(|s| canonical_identity(s))
         .collect();
-    let peer = match (&local_id, &members) {
-        (Some(local), Some(members))
-            if input.member_count == Some(2)
-                && members.len() == 2
-                && members[0] != members[1]
-                && members.contains(local) =>
-        {
-            members.iter().find(|id| *id != local).cloned()
-        }
-        _ => None,
-    };
+    let peer = presentation_peer(input, local_id.as_deref().unwrap_or(""));
     let profile = profile
         .filter(|(id, _)| {
             canonical_identity(id)
@@ -103,6 +116,7 @@ pub(crate) fn select_chat_presentation(
         }
         hex::encode(digest.finalize())
     };
+    // Valid encrypted group material wins when both group sources are present.
     let (avatar, avatar_source) = if let Some(image) = input.avatar.as_ref().filter(|image| {
         valid_hex(&image.image_hash_hex, 32)
             && valid_hex(&image.image_key_hex, 32)
@@ -259,6 +273,7 @@ mod tests {
             },
             group_name: name.into(),
             member_count: Some(2),
+            self_membership: storage_sqlite::SelfMembership::Member,
             members: vec!["aa".repeat(32), "bb".repeat(32)],
             avatar_url: None,
             avatar: None,
@@ -342,6 +357,24 @@ mod tests {
             p.avatar,
             SelectedAvatar::EncryptedGroupImage { .. }
         ));
+        input.avatar_url = Some("https://example.com/group.png".into());
+        assert!(matches!(
+            select_chat_presentation(&input, &"aa".repeat(32), None).avatar,
+            SelectedAvatar::EncryptedGroupImage { .. }
+        ));
+        let valid_image = input.avatar.clone();
+        input.avatar.as_mut().unwrap().image_key_hex.clear();
+        assert!(matches!(
+            select_chat_presentation(&input, &"aa".repeat(32), None).avatar,
+            SelectedAvatar::RemoteImage { .. }
+        ));
+        input.avatar = None;
+        assert!(matches!(
+            select_chat_presentation(&input, &"aa".repeat(32), None).avatar,
+            SelectedAvatar::RemoteImage { .. }
+        ));
+        input.avatar = valid_image;
+        input.avatar_url = None;
         input.members = vec!["aa".repeat(32), "cc".repeat(32)];
         assert!(select_chat_presentation(&input, &"aa".repeat(32), None).avatar == p.avatar);
         input.members = vec!["aa".repeat(32), "bb".repeat(32)];

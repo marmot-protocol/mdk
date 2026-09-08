@@ -133,7 +133,7 @@ pub struct PendingGroupInvite {
     pub welcomer: Option<MemberId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRecord {
     pub group_id_hex: String,
     /// Compatibility profile for all profile-gated behavior in this group.
@@ -153,8 +153,8 @@ pub struct AppGroupRecord {
     pub prior_nostr_routes: Vec<AppPriorNostrRoute>,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
-    /// URL-based group avatar. When `present`, it takes precedence over `image`
-    /// for rendering (spec: `marmot.group.avatar-url.v1`).
+    /// URL-based group avatar, used when no valid encrypted `image` is available.
+    /// When both sources are present, encrypted group image material wins.
     #[serde(default)]
     pub avatar_url: AppGroupAvatarUrlComponent,
     pub admin_policy: AppGroupAdminPolicyComponent,
@@ -180,6 +180,9 @@ pub struct AppGroupRecord {
     /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_member_ids_hex: Option<Vec<String>>,
+    /// Current authoritative two-member roster, including explicitly named groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_member_ids_hex: Option<Vec<String>>,
     /// Whether the local account is still a member of this group, and if not,
     /// whether it left voluntarily (`Left`) or was removed (`Removed`).
     #[serde(default)]
@@ -708,6 +711,17 @@ impl Default for AppGroupMessageRetentionComponent {
     }
 }
 
+impl std::fmt::Debug for AppGroupRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupRecord")
+            .field("member_count", &self.member_count)
+            .field("archived", &self.archived)
+            .field("pending_confirmation", &self.pending_confirmation)
+            .field("self_membership", &self.self_membership)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AppGroupRecord {
     pub(crate) fn new(
         group_id_hex: String,
@@ -738,6 +752,7 @@ impl AppGroupRecord {
             pending_confirmation: false,
             member_count: None,
             direct_member_ids_hex: None,
+            presentation_member_ids_hex: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
             disbanding: false,
@@ -831,13 +846,21 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() && members.len() == 2 {
-            Some(
-                members
+        self.presentation_member_ids_hex = (members.len() == 2
+            && members
+                .iter()
+                .all(|member| member.id.as_slice().len() == 32)
+            && members[0].id != members[1].id)
+            .then(|| {
+                let mut ids: Vec<_> = members
                     .iter()
-                    .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
-                    .collect(),
-            )
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            });
+        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
+            self.presentation_member_ids_hex.clone()
         } else {
             None
         };

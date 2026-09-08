@@ -541,6 +541,7 @@ mod tests {
             pending_confirmation: false,
             member_count: None,
             direct_member_ids_hex: None,
+            presentation_member_ids_hex: None,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
             nostr_routing_last_epoch: 0,

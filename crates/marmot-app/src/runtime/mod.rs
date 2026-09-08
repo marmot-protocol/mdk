@@ -63,6 +63,7 @@ mod audit_tracker;
 mod commands;
 mod event_routing;
 mod onboarding;
+mod presentation;
 pub use onboarding::*;
 mod subscriptions;
 
