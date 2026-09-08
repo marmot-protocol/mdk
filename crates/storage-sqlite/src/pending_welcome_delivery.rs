@@ -105,13 +105,20 @@ impl SqliteAccountStorage {
 
     /// Clear the pending welcome delivery for `message_id_hex`, if any.
     pub fn clear_pending_welcome_delivery(&self, message_id_hex: &str) -> StorageResult<()> {
-        self.lock()?
+        self.take_pending_welcome_delivery(message_id_hex)
+            .map(|_| ())
+    }
+
+    /// True only when this call durably removed a pending obligation.
+    pub fn take_pending_welcome_delivery(&self, message_id_hex: &str) -> StorageResult<bool> {
+        let changed = self
+            .lock()?
             .execute_cached(
                 "DELETE FROM app_pending_welcome_delivery WHERE message_id_hex = ?1",
                 params![message_id_hex],
             )
             .storage()?;
-        Ok(())
+        Ok(changed != 0)
     }
 }
 
@@ -198,7 +205,8 @@ mod tests {
             .record_pending_welcome_delivery("dd", "ee", "ff", 2)
             .unwrap();
 
-        store.clear_pending_welcome_delivery("aa").unwrap();
+        assert!(store.take_pending_welcome_delivery("aa").unwrap());
+        assert!(!store.take_pending_welcome_delivery("aa").unwrap());
 
         let records = store.list_pending_welcome_deliveries().unwrap();
         assert_eq!(records.len(), 1);

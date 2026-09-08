@@ -1829,24 +1829,32 @@ async fn stale_key_package_setup_after_cancel_does_not_mutate_setup() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+fn write_legacy_checkpoint(
+    dir: &std::path::Path,
+    id: &str,
+    mut value: serde_json::Value,
+    version: u32,
+) {
+    value["version"] = serde_json::json!(version);
+    if version == 1 {
+        value["snapshot"]["steps"].as_array_mut().unwrap().remove(4);
+        value["records"].as_array_mut().unwrap().remove(4);
+    }
+    write_active_checkpoint(dir, id, omit_attempt_generation(value));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
     let (dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
     let pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-    let mut v2_pending = serde_json::to_value(&pending).unwrap();
-    v2_pending["version"] = serde_json::json!(2);
-    write_active_checkpoint(dir.path(), &id, omit_attempt_generation(v2_pending));
+    write_legacy_checkpoint(dir.path(), &id, serde_json::to_value(&pending).unwrap(), 2);
     let discovered = manager.run_onboarding(&id).await.unwrap();
     assert_ne!(
         discovered.steps[OnboardingStep::Profile.index()].status,
         OnboardingStatus::Pending
     );
-    let mut v1 = serde_json::to_value(&pending).unwrap();
-    v1["version"] = serde_json::json!(1);
-    v1["snapshot"]["steps"].as_array_mut().unwrap().remove(4);
-    v1["records"].as_array_mut().unwrap().remove(4);
-    write_active_checkpoint(dir.path(), &id, omit_attempt_generation(v1));
+    write_legacy_checkpoint(dir.path(), &id, serde_json::to_value(&pending).unwrap(), 1);
     assert_ne!(
         manager.run_onboarding(&id).await.unwrap().steps[0].status,
         OnboardingStatus::Pending
@@ -1864,21 +1872,52 @@ async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
     let signed = network.attempts.lock().unwrap()[0].clone();
     let approved = manager.onboarding_checkpoint(&id).unwrap().unwrap();
     assert!(approved.approved && approved.signed_repair == Some(signed.clone()));
-    let mut v2_approved = serde_json::to_value(&approved).unwrap();
-    v2_approved["version"] = serde_json::json!(2);
-    write_active_checkpoint(dir.path(), &id, omit_attempt_generation(v2_approved));
-    let retried = manager
-        .retry_onboarding_step(&id, OnboardingStep::Relays)
-        .await
-        .unwrap();
-    assert!(
-        retried.steps[OnboardingStep::Relays.index()]
-            .actions
-            .contains(&OnboardingAction::Retry)
+    for version in [2_u32, 1] {
+        write_legacy_checkpoint(
+            dir.path(),
+            &id,
+            serde_json::to_value(&approved).unwrap(),
+            version,
+        );
+        let loaded = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        assert_eq!(loaded.attempt_start_revision, 0);
+        let retried = manager
+            .retry_onboarding_step(&id, OnboardingStep::Relays)
+            .await
+            .unwrap();
+        assert!(
+            retried.steps[OnboardingStep::Relays.index()]
+                .actions
+                .contains(&OnboardingAction::Retry)
+        );
+        let attempts = network.attempts.lock().unwrap().clone();
+        assert!(!attempts.is_empty() && attempts.iter().all(|event| event == &signed));
+    }
+    write_legacy_checkpoint(dir.path(), &id, serde_json::to_value(&approved).unwrap(), 2);
+    assert_eq!(
+        manager
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .attempt_start_revision,
+        0
     );
-    let attempts = network.attempts.lock().unwrap().clone();
-    assert!(!attempts.is_empty() && attempts.iter().all(|event| event == &signed));
-    manager.cancel_onboarding(&id).await.unwrap();
+    network.zero_acks.store(false, Ordering::SeqCst);
+    network.block_publish.store(true, Ordering::SeqCst);
+    let blocked = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move {
+            manager
+                .retry_onboarding_step(&account, OnboardingStep::Relays)
+                .await
+        }
+    });
+    network.publishing.notified().await;
+    tokio::time::timeout(Duration::from_secs(2), manager.cancel_onboarding(&id))
+        .await
+        .expect("cancellation must wake a migrated generation-zero publish wait")
+        .unwrap();
     let restarted = manager
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
@@ -1887,12 +1926,15 @@ async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
         .await
         .unwrap();
     let fresh = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    assert_ne!(fresh.attempt_start_revision, 0);
     assert_ne!(
         fresh.attempt_start_revision,
         approved.attempt_start_revision
     );
     assert!(!restarted.ready && restarted.proposal.is_none());
     assert!(fresh.signed_repair.is_none() && !fresh.approved);
+    network.release_publish.notify_waiters();
+    let _ = blocked.await;
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -1938,6 +1980,108 @@ async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
         .await
         .unwrap();
     assert!(!restarted.ready && !restarted.cancellation_pending);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_reconcile_reap_completes_with_zero_receivers_then_restarts() {
+    let (_dir, runtime, _network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, false)
+        .unwrap();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut c).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    let mut pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    pending.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut pending).unwrap();
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let reconcile = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.reconcile().await }
+    });
+    hold.entered.notified().await;
+    reconcile.abort();
+    let _ = reconcile.await;
+    assert!(!manager.onboarding_worker_tracked(&id).await);
+    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert_eq!(
+        manager.onboarding_worker_reap_watch_state(&id),
+        Some((false, 0))
+    );
+    hold.release.notify_waiters();
+    manager.await_onboarding_owned_handles_finished().await;
+    assert_eq!(
+        manager.onboarding_worker_reap_watch_state(&id),
+        Some((true, 0))
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(!manager.onboarding_worker_tracked(&id).await);
+    assert!(!manager.onboarding_worker_reap_in_flight(&id));
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    let restarted = manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert!(!restarted.ready && !restarted.cancellation_pending);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timed_out_reap_waiter_retains_completion_through_shutdown() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, false)
+        .unwrap();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut c).unwrap();
+    manager.reconcile().await.unwrap();
+    let mut pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    pending.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut pending).unwrap();
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let reconcile = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.reconcile().await }
+    });
+    hold.entered.notified().await;
+    reconcile.abort();
+    let _ = reconcile.await;
+    let timed_out = manager
+        .await_onboarding_worker_reap_with_budget(&id, Duration::from_millis(20))
+        .await;
+    assert!(matches!(
+        timed_out,
+        Err(AppError::AccountWorkerResponseTimedOut)
+    ));
+    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    hold.release.notify_waiters();
+    manager.await_onboarding_owned_handles_finished().await;
+    assert_eq!(
+        manager.onboarding_worker_reap_watch_state(&id),
+        Some((true, 0))
+    );
+    assert!(!manager.onboarding_worker_tracked(&id).await);
     runtime.shutdown_and_close().await.unwrap();
 }
 

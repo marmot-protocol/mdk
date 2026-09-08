@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 installer="$repo_root/scripts/install-hermes-marmot.sh"
 configure_gateway="$repo_root/scripts/hermes_marmot_configure_gateway.py"
 integration_plugin="$repo_root/integrations/hermes/marmot"
-e2e_gateway_auth="$repo_root/integrations/hermes/marmot/tests/e2e_gateway_auth.py"
+e2e_gateway_auth="$repo_root/integrations/hermes/tests/marmot/e2e_gateway_auth.py"
 user_a="$(printf '11%.0s' {1..32})"
 user_b="$(printf '22%.0s' {1..32})"
 user_c="$(printf '33%.0s' {1..32})"
@@ -79,6 +79,7 @@ SCRIPT
         mkdir -p "$plugin_dir"
         cp "$INTEGRATION_PLUGIN_SOURCE/__init__.py" \
             "$INTEGRATION_PLUGIN_SOURCE/adapter.py" \
+            "$INTEGRATION_PLUGIN_SOURCE/agent_control.py" \
             "$INTEGRATION_PLUGIN_SOURCE/plugin.yaml" \
             "$plugin_dir/"
         cp "$CONFIGURE_GATEWAY_SOURCE" "$plugin_dir/configure_gateway.py"

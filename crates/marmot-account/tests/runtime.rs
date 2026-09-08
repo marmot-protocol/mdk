@@ -1014,6 +1014,17 @@ async fn automatic_maintenance_publication_preserves_private_material_ownership(
 
     runtime.run_due_maintenance().await.unwrap();
 
+    let activity = runtime.take_maintenance_activity();
+    assert_eq!(activity.key_package_attempts, 1);
+    assert_eq!(activity.attempt_durations.len(), 1);
+    assert!(activity.attempt_durations[0].key_package);
+    assert!(!activity.attempt_durations[0].failed);
+    assert!(
+        runtime
+            .take_maintenance_activity()
+            .attempt_durations
+            .is_empty()
+    );
     let published = publisher.publications();
     assert_eq!(published.len(), 1);
     assert_eq!(
@@ -4554,7 +4565,18 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
     );
 
     let publishes_before = adapter.publishes().len();
-    runtime.run_due_maintenance().await.unwrap();
+    for _ in 0..60 {
+        runtime.run_due_maintenance().await.unwrap();
+    }
+    let activity = runtime.take_maintenance_activity();
+    assert_eq!(
+        activity.failed_transitions, 0,
+        "restored failure is state, not sixty new edges"
+    );
+    assert_eq!(
+        activity.self_update_attempts, 0,
+        "terminal obligations do not execute"
+    );
 
     assert_eq!(
         sole_evolution(&runtime, &group_id).phase,

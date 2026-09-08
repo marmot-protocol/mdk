@@ -34,3 +34,7 @@ zeroize.workspace = true
 [dev-dependencies]
 nostr-relay-builder.workspace = true
 tempfile.workspace = true
+
+[features]
+otlp-export = ["marmot-app/otlp-export"]
+product-analytics-export = ["marmot-app/product-analytics-export"]

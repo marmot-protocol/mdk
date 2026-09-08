@@ -9,6 +9,7 @@ on:
       - scripts/hermes_marmot_dev_setup.sh
       - scripts/hermes_marmot_verify_persisted_config.sh
       - integrations/hermes/marmot/**
+      - integrations/hermes/tests/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
       - scripts/install-codex-marmot.sh
@@ -100,7 +101,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build wn-agent
-        run: cargo build --locked --release -p agent-connector --bin wn-agent --target "${{ matrix.rust_target }}"
+        run: cargo build --locked --release -p agent-connector --bin wn-agent --features otlp-export,product-analytics-export --target "${{ matrix.rust_target }}"
 
       - name: Smoke test wn-agent
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
@@ -207,6 +208,7 @@ jobs:
           fi
           cp integrations/hermes/marmot/__init__.py "$bundle_dir/"
           cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
+          cp integrations/hermes/marmot/agent_control.py "$bundle_dir/"
           cp integrations/hermes/marmot/README.md "$bundle_dir/"
           cp scripts/hermes_marmot_configure_gateway.py "$bundle_dir/configure_gateway.py"
 
@@ -221,6 +223,7 @@ jobs:
               "plugin.yaml",
               "__init__.py",
               "adapter.py",
+              "agent_control.py",
               "configure_gateway.py",
               "README.md",
               "manifest.json"
@@ -244,9 +247,25 @@ jobs:
           if-no-files-found: error
 
   hermes-marmot-integration:
-    name: Hermes Marmot persisted config
+    name: Hermes Marmot integration (${{ matrix.cohort }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cohort: supported-floor
+            install_mode: wheel
+            hermes_ref: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
+            expected_source_install_mode: monorepo
+          - cohort: current-candidate
+            install_mode: source
+            hermes_ref: 7166071fcaadb36df26f6d753dda97da6b5d699e
+            expected_source_install_mode: monorepo
+          - cohort: media-api-candidate
+            install_mode: source
+            hermes_ref: 672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc
+            expected_source_install_mode: plugin-only
 
     steps:
       - name: Check out repository
@@ -255,10 +274,10 @@ jobs:
           persist-credentials: false
 
       - name: Run Hermes Marmot unit tests
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/marmot/tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
 
       - name: Run Hermes dev-script smoke test
-        run: integrations/hermes/marmot/tests/test_dev_scripts.sh
+        run: integrations/hermes/tests/marmot/test_dev_scripts.sh
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
@@ -267,17 +286,32 @@ jobs:
           enable-cache: false
 
       - name: Prepare isolated Hermes dev root
+        env:
+          HERMES_COHORT_INSTALL_MODE: ${{ matrix.install_mode }}
+          HERMES_COHORT_REF: ${{ matrix.hermes_ref }}
         run: |
           set -euo pipefail
           dev_root="$RUNNER_TEMP/hermes-marmot-integration"
-          ./scripts/hermes_marmot_dev_setup.sh \
-            --root "$dev_root" \
-            --install-pinned-wheel \
-            --no-enable-plugin
+          setup_args=(--root "$dev_root" --no-enable-plugin)
+          if [ "$HERMES_COHORT_INSTALL_MODE" = wheel ]; then
+            setup_args+=(--install-pinned-wheel)
+          else
+            setup_args+=(--hermes-ref "$HERMES_COHORT_REF")
+          fi
+          ./scripts/hermes_marmot_dev_setup.sh "${setup_args[@]}"
           echo "HERMES_MARMOT_DEV_ROOT=$dev_root" >> "$GITHUB_ENV"
 
       - name: Run real Hermes persisted-config probe
         run: ./scripts/hermes_marmot_verify_persisted_config.sh --root "$HERMES_MARMOT_DEV_ROOT"
+
+      - name: Run standard source install and media dispatch probe
+        run: |
+          "$HERMES_MARMOT_DEV_ROOT/hermes-agent/.venv/bin/python" \
+            integrations/hermes/tests/marmot/test_real_hermes_plugin.py \
+            --hermes-source "$HERMES_MARMOT_DEV_ROOT/hermes-agent" \
+            --mdk-source "$GITHUB_WORKSPACE" \
+            --mdk-ref "$GITHUB_SHA" \
+            --expect-source-install-mode "${{ matrix.expected_source_install_mode }}"
 
   openclaw-host-compat:
     name: OpenClaw beta host compatibility

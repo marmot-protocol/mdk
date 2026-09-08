@@ -319,7 +319,7 @@ impl AccountManager {
         }));
     }
 
-    async fn await_tracked_worker_reap(
+    pub(super) async fn await_tracked_worker_reap(
         &self,
         account_id: &str,
         budget: Duration,

@@ -1962,7 +1962,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AuditLogUpload(_)
         | AppError::ExternalSignerUnavailable(_)
         | AppError::BlockingTask(_) => SubjectFailureCategory::Resource,
-        AppError::Json(_)
+        AppError::ProductAnalytics(_)
+        | AppError::Json(_)
         | AppError::Hex(_)
         | AppError::InvalidChatPin(_)
         | AppError::InvalidGroupMembershipPage(_)

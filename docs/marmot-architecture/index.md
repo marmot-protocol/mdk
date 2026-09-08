@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-04
+updated: 2026-09-07
 tags: [marmot, architecture, index]
 ---
 
@@ -147,6 +147,10 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Current implementation inventory for relay telemetry, OTLP export, engine reorg metrics,
     tracing/logging guardrails, local surfaces, and exactly what fields are collected or exported.
 
+- **Doc:** [`usage-diagnostics.md`](./usage-diagnostics.md)
+  - **What it covers:** Combined consent, stock Aptabase privacy disclosure, finite backend and host observations,
+    bounded delivery, host adoption, operator queries, and separate deployment acceptance.
+
 - **Doc:** [`audit-logging.md`](./audit-logging.md)
   - **What it covers:** Current implementation inventory for opt-in forensic JSONL logs, file identity, every event
     kind and metadata field, upload/tracker behavior, and downstream tooling guidance.
@@ -194,6 +198,18 @@ These are longer working documents. Go here when you need depth, not orientation
     `IdentityRemove` design space.
 
 ### Current state — facts and analysis
+
+- **Doc:** [`further-context/chat-projection-inventory.md`](./further-context/chat-projection-inventory.md)
+  - **What it covers:** Source-pinned inventory of chat-list, timeline, group, identity, and subscription projections;
+    durable versus read-time state, update/recovery paths, and inputs to complete chat-screen contracts.
+
+- **Doc:** [`further-context/chat-screen-contract-draft.md`](./further-context/chat-screen-contract-draft.md)
+  - **What it covers:** C1 working recommendations for chat-screen field ownership, bounded responses and update
+    consistency; identifies remaining checks before implementation.
+
+- **Doc:** [`further-context/chat-presentation-first-slice.md`](./further-context/chat-presentation-first-slice.md)
+  - **What it covers:** Implementation-ready first slice for durable resolved chat-row presentation: API contract,
+    recovery/upgrade design, merge sequence and native adoption acceptance criteria.
 
 - **Doc:** [`further-context/codebase-survey.md`](./further-context/codebase-survey.md)
   - **What it covers:** Raw metrics — LOC counts, dependency graphs, module structures.

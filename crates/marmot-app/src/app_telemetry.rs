@@ -154,6 +154,9 @@ pub enum SyncErrorClass {
     Protocol,
     Crypto,
     Storage,
+    StorageBusy,
+    StorageCorruption,
+    StorageCapacity,
     Cancelled,
     Unknown,
 }
@@ -167,6 +170,9 @@ impl SyncErrorClass {
             Self::Protocol => "protocol",
             Self::Crypto => "crypto",
             Self::Storage => "storage",
+            Self::StorageBusy => "storage_busy",
+            Self::StorageCorruption => "storage_corruption",
+            Self::StorageCapacity => "storage_capacity",
             Self::Cancelled => "cancelled",
             Self::Unknown => "unknown",
         }
@@ -369,6 +375,7 @@ pub struct AppPerformanceSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct AppPerformanceTelemetry {
+    product: Option<crate::ProductAnalytics>,
     inner: Arc<Mutex<AppPerformanceTelemetryInner>>,
 }
 
@@ -548,9 +555,94 @@ impl AppPerformanceOperationTelemetry {
 }
 
 impl AppPerformanceTelemetry {
+    pub(crate) fn with_product_analytics(product: crate::ProductAnalytics) -> Self {
+        Self {
+            product: Some(product),
+            ..Self::default()
+        }
+    }
+    fn record_product(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        success: bool,
+    ) {
+        use crate::{ProductFamily as F, ProductUnit as U};
+        use AppPerformanceOperation::*;
+        let Some(product) = &self.product else {
+            return;
+        };
+        let (family, op) = match operation {
+            AppStart => (F::Runtime, "startup"),
+            AccountOpen => (F::Storage, "open"),
+            // The complete local-ready phase owns product reporting; this is only its handoff.
+            AccountSetupNetworkReady => (F::Account, "network_ready"),
+            AccountSetupKeyPackageLocal => (F::KeyPackage, "generate"),
+            AccountDefaultProfilePublish => (F::Account, "profile_update"),
+            AccountSync => (F::Sync, "background"),
+            AccountCatchUp => (F::Sync, "foreground"),
+            // The canonical member resolver owns lookup observations.
+            GroupCreateTotalCallerLatency => (F::Group, "create"),
+            GroupInviteMembers => (F::Group, "invite"),
+            GroupAcceptInvite => (F::Group, "accept_invite"),
+            GroupPromoteAdmin => (F::Group, "promote_admin"),
+            MediaUpload => (F::Media, "upload"),
+            MediaDownload => (F::Media, "download"),
+            GroupCreateImageUpload => (F::Media, "group_image"),
+            AccountWorkerReadiness | HostForegroundLocalReady => (F::Runtime, "readiness"),
+            AccountTransportActivation => (F::Connectivity, "connect"),
+            AccountGroupHydration => (F::Recovery, "hydration"),
+            GroupCreateWelcomePublish | GroupInviteWelcomePublish => (F::Welcome, "publish"),
+            MediaDownloadLocatorFailover => (F::Media, "failover"),
+            MediaDownloadCiphertextVerify | MediaDownloadPlaintextVerify if !success => {
+                (F::Media, "integrity")
+            }
+            MediaDownloadDecrypt if !success => (F::Media, "decrypt"),
+            _ => return,
+        };
+        product.observe(
+            family,
+            op,
+            if success { "success" } else { "failure" },
+            U::Attempt,
+            Some(duration),
+        );
+    }
+
     /// Record one closed, reviewed operation as a process-wide count and
     /// fixed-bucket duration sample without accepting dynamic attributes.
     pub(crate) fn record(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        success: bool,
+    ) {
+        self.record_product(operation, duration, success);
+        self.record_without_product(operation, duration, success);
+    }
+
+    pub(crate) fn record_media(
+        &self,
+        operation: AppPerformanceOperation,
+        duration: Duration,
+        success: bool,
+        media_type: &str,
+    ) {
+        if let Some(product) = &self.product {
+            let name = match operation {
+                AppPerformanceOperation::MediaUpload => Some("upload"),
+                AppPerformanceOperation::MediaDownload => Some("download"),
+                AppPerformanceOperation::GroupCreateImageUpload => Some("group_image"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                product.observe_media(name, duration, success, media_type);
+            }
+        }
+        self.record_without_product(operation, duration, success);
+    }
+
+    fn record_without_product(
         &self,
         operation: AppPerformanceOperation,
         duration: Duration,
@@ -828,6 +920,17 @@ impl AppPerformanceTelemetry {
         duration: Duration,
         failure: Option<SyncFailureClassification>,
     ) {
+        if let Some(product) = &self.product {
+            product.observe_sync(
+                if operation == AppPerformanceOperation::AccountCatchUp {
+                    "foreground"
+                } else {
+                    "background"
+                },
+                duration,
+                failure,
+            );
+        }
         debug_assert!(matches!(
             operation,
             AppPerformanceOperation::AccountSync | AppPerformanceOperation::AccountCatchUp

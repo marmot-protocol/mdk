@@ -7,6 +7,7 @@ publish.workspace = true
 
 [features]
 default = []
+product-analytics-export = []
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.
 test-policy-overrides = [
     "cgka-engine/test-policy-overrides",
@@ -21,6 +22,7 @@ media-benchmarks = []
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 cgka-engine.workspace = true
 cgka-session.workspace = true
 cgka-traits.workspace = true

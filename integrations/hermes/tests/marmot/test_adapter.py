@@ -1,7 +1,9 @@
 import asyncio
 from contextlib import suppress
+import enum
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -11,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1]
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
 
 
@@ -41,7 +43,7 @@ def wire_event(event):
     return flat
 
 
-def install_fake_hermes_modules():
+def install_fake_hermes_modules(*, media_kinds: bool = False):
     gateway = types.ModuleType("gateway")
     gateway_platforms = types.ModuleType("gateway.platforms")
     gateway_base = types.ModuleType("gateway.platforms.base")
@@ -49,6 +51,12 @@ def install_fake_hermes_modules():
 
     class MessageType:
         TEXT = "text"
+
+    class MediaKind(enum.Enum):
+        IMAGE = "image"
+        VIDEO = "video"
+        VOICE = "voice"
+        DOCUMENT = "document"
 
     @dataclass
     class SendResult:
@@ -116,6 +124,10 @@ def install_fake_hermes_modules():
         def enforces_own_access_policy(self):
             return False
 
+        @property
+        def is_connected(self):
+            return self._running
+
         def _mark_connected(self):
             self._running = True
 
@@ -151,6 +163,8 @@ def install_fake_hermes_modules():
     gateway_base.MessageEvent = MessageEvent
     gateway_base.MessageType = MessageType
     gateway_base.SendResult = SendResult
+    if media_kinds:
+        setattr(gateway_base, "MediaKind", MediaKind)
     gateway_config.Platform = Platform
     gateway_config.PlatformConfig = PlatformConfig
 
@@ -161,9 +175,12 @@ def install_fake_hermes_modules():
     return PlatformConfig
 
 
-def load_adapter_module():
+def load_adapter_module(*, media_kinds: bool = False):
     for name in [
         "marmot_hermes_adapter",
+        "marmot_hermes.adapter",
+        "marmot_hermes.agent_control",
+        "marmot_hermes",
         "gateway",
         "gateway.platforms",
         "gateway.platforms.base",
@@ -171,10 +188,13 @@ def load_adapter_module():
         "gateway.stream_events",
     ]:
         sys.modules.pop(name, None)
-    install_fake_hermes_modules()
-    spec = importlib.util.spec_from_file_location("marmot_hermes_adapter", ADAPTER_PATH)
+    install_fake_hermes_modules(media_kinds=media_kinds)
+    package = types.ModuleType("marmot_hermes")
+    package.__path__ = [str(PLUGIN_DIR)]
+    sys.modules["marmot_hermes"] = package
+    spec = importlib.util.spec_from_file_location("marmot_hermes.adapter", ADAPTER_PATH)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["marmot_hermes_adapter"] = module
+    sys.modules["marmot_hermes.adapter"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -372,7 +392,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         attachment = [{"path": "/tmp/a.png", "media_type": "image/png", "file_name": "a.png"}]
 
         with unittest.mock.patch.object(
-            self.adapter,
+            sys.modules["marmot_hermes.agent_control"],
             "SEND_MEDIA_COMPLETION_TIMEOUT_S",
             0.01,
         ):
@@ -555,6 +575,38 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["type"], "account_list")
         self.assertEqual(requests[0]["auth_token"], "test-token")
+
+    async def test_account_list_rejects_malformed_accounts(self):
+        malformed_account_values = (
+            None,
+            {"unexpected": "object"},
+            "not-a-list",
+            ["not-an-object"],
+        )
+        malformed_accounts = iter(malformed_account_values)
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            accounts = next(malformed_accounts)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "account_list",
+                    "accounts": accounts,
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        for accounts in malformed_account_values:
+            with self.subTest(accounts=accounts):
+                with self.assertRaises(self.adapter.AgentControlError) as raised:
+                    await client.account_list()
+                self.assertEqual(raised.exception.code, "protocol_error")
 
     async def test_account_lookup_profile_writes_typed_lookup_request(self):
         requests = []
@@ -799,6 +851,249 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "timeout")
         self.assertTrue(raised.exception.retryable)
+
+    async def test_rejects_malformed_non_object_and_unterminated_frames(self):
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.05)
+        control = sys.modules["marmot_hermes.agent_control"]
+        cases = (
+            (b"\n", "malformed_frame"),
+            (b"{not-json}\n", "malformed_frame"),
+            (b"\xff\n", "malformed_frame"),
+            (b"[]\n", "malformed_frame"),
+            (b'{"marmot_agent_control":"marmot.agent-control.v2"}', "malformed_frame"),
+        )
+        for raw, code in cases:
+            with self.subTest(raw=raw[:24]):
+                reader = asyncio.StreamReader(limit=control.MAX_FRAME_BYTES + 1)
+                reader.feed_data(raw)
+                reader.feed_eof()
+                with self.assertRaises(self.adapter.AgentControlError) as raised:
+                    await client._read_envelope(reader)
+                self.assertEqual(raised.exception.code, code)
+
+    async def test_rejects_oversized_unterminated_frame_without_unbounded_read(self):
+        control = sys.modules["marmot_hermes.agent_control"]
+        reader = asyncio.StreamReader(limit=control.MAX_FRAME_BYTES + 1)
+        reader.feed_data(b"x" * (control.MAX_FRAME_BYTES + 2))
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.05)
+
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client._read_envelope(reader)
+
+        self.assertEqual(raised.exception.code, "frame_too_large")
+
+    async def test_rejects_unexpected_typed_response(self):
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": [],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_list()
+
+        self.assertEqual(raised.exception.code, "unexpected_response")
+
+    async def test_connect_timeout_is_retryable_and_does_not_require_a_writer(self):
+        control = sys.modules["marmot_hermes.agent_control"]
+
+        async def never_connect(*_args, **_kwargs):
+            await asyncio.sleep(1)
+
+        client = self.adapter.MarmotAgentControlClient(self.socket_path, request_timeout=0.01)
+        with unittest.mock.patch.object(control.asyncio, "open_unix_connection", never_connect):
+            with self.assertRaises(self.adapter.AgentControlError) as raised:
+                await client.account_list()
+
+        self.assertEqual(raised.exception.code, "timeout")
+        self.assertTrue(raised.exception.retryable)
+
+    async def test_concurrent_requests_keep_response_ids_isolated(self):
+        request_ids = set()
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            request_ids.add(request["id"])
+            await asyncio.sleep(0 if len(request_ids) % 2 else 0.01)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "account_list",
+                    "accounts": [],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        responses = await asyncio.gather(*(client.account_list() for _ in range(12)))
+
+        self.assertEqual(len(request_ids), 12)
+        self.assertTrue(all(response["type"] == "account_list" for response in responses))
+
+
+class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_enablement_is_distinct_from_live_readiness(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+        config = platform_config(
+            enabled=True,
+            extra={"socket_path": "/tmp/marmot-no-companion-service.sock"},
+        )
+
+        class FakeContext:
+            plugin_settings = {}
+
+            def register_platform(self, **kwargs):
+                self.platform = kwargs
+
+        class UnreachableClient:
+            async def account_list(self):
+                raise adapter.AgentControlError(
+                    "wn-agent unavailable",
+                    code="connect_failed",
+                    retryable=True,
+                )
+
+        ctx = FakeContext()
+        adapter.register(ctx)
+        live_adapter = adapter.MarmotPlatformAdapter(config, client=UnreachableClient())
+
+        # Hermes uses PlatformEntry.is_connected synchronously as a config-only
+        # auto-enablement gate. Runtime connectivity stays on BasePlatformAdapter.
+        self.assertTrue(ctx.platform["is_connected"](config))
+        self.assertFalse(live_adapter.is_connected)
+        readiness = await adapter.probe_readiness(config, client=live_adapter.client)
+        self.assertEqual(readiness["state"], "wn_agent_unreachable")
+        self.assertFalse(readiness["wn_agent_reachable"])
+
+    async def test_probe_distinguishes_disabled_invalid_and_ready(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+
+        disabled = await adapter.probe_readiness(platform_config(enabled=False))
+        self.assertEqual(disabled["state"], "disabled")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"MARMOT_AGENT_SOCKET": "", "MARMOT_HOME": ""},
+            clear=False,
+        ):
+            invalid = await adapter.probe_readiness(platform_config(enabled=True))
+        self.assertEqual(invalid["state"], "invalid_config")
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                self.group_lookup = (account_id_hex, group_id_hex)
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        client = ReadyClient()
+        config = platform_config(
+            enabled=True,
+            extra={
+                "socket_path": "/tmp/passive-probe.sock",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+            },
+        )
+        ready = await adapter.probe_readiness(config, client=client)
+        self.assertEqual(ready["state"], "ready")
+        self.assertTrue(ready["wn_agent_reachable"])
+        self.assertTrue(ready["authenticated"])
+        self.assertTrue(ready["account_selected"])
+        self.assertTrue(ready["home_resolved"])
+        self.assertNotIn("account_id_hex", ready)
+        self.assertNotIn("group_id_hex", ready)
+        self.assertEqual(client.group_lookup, ("11" * 32, "22" * 32))
+
+    async def test_probe_distinguishes_unreachable_and_account_unselected(self):
+        adapter = load_adapter_module()
+        platform_config = getattr(sys.modules["gateway.config"], "PlatformConfig")
+        config = platform_config(
+            enabled=True,
+            extra={"socket_path": "/tmp/passive-probe.sock"},
+        )
+
+        class UnreachableClient:
+            async def account_list(self):
+                raise adapter.AgentControlError(
+                    "wn-agent unavailable",
+                    code="connect_failed",
+                    retryable=True,
+                )
+
+        unreachable = await adapter.probe_readiness(
+            config,
+            client=UnreachableClient(),
+        )
+        self.assertEqual(unreachable["state"], "wn_agent_unreachable")
+
+        class AmbiguousClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True},
+                        {"account_id_hex": "22" * 32, "local_signing": True},
+                    ]
+                }
+
+        ambiguous = await adapter.probe_readiness(
+            config,
+            client=AmbiguousClient(),
+        )
+        self.assertEqual(ambiguous["state"], "account_unselected")
+        self.assertFalse(ambiguous["home_resolved"])
+
+
+class MediaCapabilityContractTests(unittest.TestCase):
+    def test_stable_hermes_keeps_explicit_overrides_without_claiming_host_dispatch(self):
+        adapter = load_adapter_module()
+
+        self.assertNotIn("MEDIA_KINDS", adapter.MarmotPlatformAdapter.__dict__)
+        self.assertEqual(
+            adapter.media_capability_status(),
+            {
+                "inbound": ["document", "image", "video", "voice"],
+                "outbound": ["document", "image", "video", "voice"],
+                "host_outbound_dispatch": False,
+            },
+        )
+
+    def test_candidate_hermes_declares_only_implemented_media_kinds(self):
+        adapter = load_adapter_module(media_kinds=True)
+        media_kind = getattr(sys.modules["gateway.platforms.base"], "MediaKind")
+
+        self.assertEqual(
+            adapter.MarmotPlatformAdapter.MEDIA_KINDS,
+            frozenset(
+                {
+                    media_kind.IMAGE,
+                    media_kind.VIDEO,
+                    media_kind.VOICE,
+                    media_kind.DOCUMENT,
+                }
+            ),
+        )
+        self.assertTrue(adapter.media_capability_status()["host_outbound_dispatch"])
 
 
 class TranscriptTests(unittest.TestCase):
@@ -4705,6 +5000,32 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(image_path.exists())
             self.assertEqual(fake_client.media_sends[0][3], "look")
 
+    async def test_outbound_send_document_rejects_allowed_root_leaf_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_dir = Path(tmpdir) / "allowed"
+            media_dir.mkdir()
+            target = media_dir / "secret.bin"
+            target.write_bytes(b"secret")
+            link = media_dir / "link.bin"
+            link.symlink_to(target)
+            client = unittest.mock.AsyncMock()
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "media_local_roots": [str(media_dir)],
+                    }
+                ),
+                client=client,
+            )
+
+            result = await adapter.send_document("22" * 32, str(link))
+
+            self.assertTrue(link.is_symlink())
+            self.assertFalse(result.success)
+            self.assertIn("not a readable file", result.error or "")
+            client.send_media.assert_not_awaited()
+
     async def test_outbound_send_multiple_images_routes_one_ordered_batch_to_send_media(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             media_dir = Path(tmpdir) / "dev" / "inbound-media"
@@ -5334,7 +5655,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                 object(),
                 "22" * 32,
                 " one caption ",
-                media_files=["first.png", "second.jpg"],
+                media_files=["first.png", ("second.jpg", False)],
             )
             blank_response = await self.adapter_module._standalone_send(
                 object(),
@@ -5352,6 +5673,23 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response["attachment_outcomes"]), 2)
         self.assertIsNone(fake_adapter.batches[1][2])
         self.assertTrue(blank_response["success"])
+
+    async def test_standalone_media_files_reject_empty_sequence_records(self):
+        with unittest.mock.patch.object(
+            self.adapter_module,
+            "MarmotPlatformAdapter",
+        ) as adapter_cls:
+            for media_file in ((), []):
+                with self.subTest(media_file=media_file):
+                    response = await self.adapter_module._standalone_send(
+                        object(),
+                        "22" * 32,
+                        "caption",
+                        media_files=[media_file],
+                    )
+                    self.assertEqual(response, {"error": "Marmot media file path required"})
+
+        adapter_cls.assert_not_called()
 
     async def test_outbound_media_outside_allowlist_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5687,6 +6025,31 @@ class ConfigResolutionTests(unittest.TestCase):
             ["bot", "assistant", "Marvin"],
         )
 
+    def test_manifest_default_allows_socket_derivation_from_home(self):
+        manifest = (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8")
+        socket_schema = manifest.split("  socket_path:\n", 1)[1].split("  home:\n", 1)[0]
+        self.assertIn('    default: ""\n', socket_schema)
+        self.assertEqual(
+            self.adapter_module.resolve_socket_path(
+                {"socket_path": "", "home": "/srv/marmot"}
+            ),
+            "/srv/marmot/dev/wn-agent.sock",
+        )
+
+    def test_documented_install_path_supports_the_hermes_floor(self):
+        readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
+        install_section = readme.split(
+            "Install through Hermes's standard plugin flow", 1
+        )[1].split("## Release Install", 1)[0]
+        self.assertIn("set -eu", install_section)
+        self.assertIn('test "${#MDK_PLUGIN_REF}" -eq 40', install_section)
+        self.assertIn('checkout --detach "$MDK_PLUGIN_REF"', install_section)
+        self.assertIn(
+            '"file://$MDK_PLUGIN_CHECKOUT#integrations/hermes/marmot"',
+            install_section,
+        )
+        self.assertNotIn('--ref "$MDK_PLUGIN_REF"', install_section)
+
 
 class CoalesceInboundTests(unittest.TestCase):
     def setUp(self):
@@ -5891,11 +6254,11 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertIsNone(name)
 
 
-class PluginRegistrationTests(unittest.TestCase):
+class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_marmot_history_and_reactions_as_platform_tools(self):
+    def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -5911,16 +6274,242 @@ class PluginRegistrationTests(unittest.TestCase):
         self.adapter_module.register(ctx)
 
         self.assertEqual([platform["name"] for platform in ctx.platforms], ["marmot"])
+        status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
+        self.assertEqual(status["toolset"], "platform")
+        self.assertEqual(status["schema"]["properties"], {})
+        self.assertTrue(callable(status["handler"]))
+        self.assertTrue(status["is_async"])
         history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])
         self.assertIs(history["handler"], self.adapter_module._marmot_history_tool)
+        self.assertTrue(history["is_async"])
         reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
         self.assertEqual(reaction["toolset"], "platform")
         self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
         self.assertIs(reaction["handler"], self.adapter_module._marmot_reaction_tool)
+        self.assertTrue(reaction["is_async"])
 
-    def test_marmot_history_fetches_one_exact_materialized_message(self):
+    async def test_marmot_status_reports_live_readiness_without_identifiers(self):
+        class FakeClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+
+        class FakeAdapter:
+            config = config_cls(
+                enabled=True,
+                extra={
+                    "socket_path": "/tmp/passive-probe.sock",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                },
+            )
+            client = FakeClient()
+
+        live_adapter = FakeAdapter()
+        self.adapter_module._remember_live_adapter(live_adapter)
+        result = json.loads(await self.adapter_module._marmot_status_tool({}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "ready")
+        self.assertTrue(result["wn_agent_reachable"])
+        self.assertNotIn("11" * 32, json.dumps(result))
+        self.assertNotIn("22" * 32, json.dumps(result))
+
+    async def test_register_bridges_standard_plugin_settings_into_callbacks(self):
+        settings = {
+            "socket_path": "/tmp/marmot-plugin.sock",
+            "account_id_hex": "11" * 32,
+            "group_id_hex": "22" * 32,
+            "home_channel": "33" * 32,
+        }
+
+        class FakeContext:
+            def __init__(self):
+                self.platforms = []
+                self.tools = []
+
+            def get_config(self, key, default=None):
+                return settings.get(key, default)
+
+            def register_platform(self, **kwargs):
+                self.platforms.append(kwargs)
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
+
+        ctx = FakeContext()
+        self.adapter_module.register(ctx)
+        platform = ctx.platforms[0]
+        config = sys.modules["gateway.config"].PlatformConfig(enabled=True)
+
+        self.assertTrue(platform["validate_config"](config))
+        built = platform["adapter_factory"](config)
+        self.assertEqual(built.socket_path, settings["socket_path"])
+        self.assertEqual(built.account_id_hex, settings["account_id_hex"])
+        self.assertEqual(built.group_id_hex, settings["group_id_hex"])
+        self.assertEqual(config.extra, {})
+
+        seed = platform["env_enablement_fn"]()
+        self.assertEqual(seed["socket_path"], settings["socket_path"])
+        self.assertEqual(
+            seed["home_channel"],
+            {"chat_id": settings["home_channel"], "name": "Marmot"},
+        )
+
+        captured = {}
+
+        async def fake_standalone(effective, *args, **kwargs):
+            captured["config"] = effective
+            return {"success": True}
+
+        with unittest.mock.patch.object(
+            self.adapter_module,
+            "_standalone_send",
+            side_effect=fake_standalone,
+        ):
+            result = await platform["standalone_sender_fn"](
+                config,
+                settings["group_id_hex"],
+                "hello",
+            )
+        self.assertTrue(result["success"])
+        effective = captured["config"]
+        self.assertEqual(effective.extra["socket_path"], settings["socket_path"])
+        self.assertEqual(effective.home_channel.chat_id, settings["home_channel"])
+
+        status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
+        observed = {}
+
+        async def fake_probe(probe_config, **_kwargs):
+            observed["config"] = probe_config
+            return {"state": "ready"}
+
+        config_module = sys.modules["gateway.config"]
+        with (
+            unittest.mock.patch.object(
+                self.adapter_module,
+                "_live_adapter",
+                return_value=None,
+            ),
+            unittest.mock.patch.object(
+                config_module,
+                "load_gateway_config",
+                return_value=types.SimpleNamespace(
+                    platforms={self.adapter_module.Platform("marmot"): config}
+                ),
+                create=True,
+            ),
+            unittest.mock.patch.object(
+                self.adapter_module,
+                "probe_readiness",
+                side_effect=fake_probe,
+            ),
+        ):
+            status_result = json.loads(await status["handler"]({}))
+        self.assertTrue(status_result["ok"])
+        self.assertEqual(observed["config"].extra["socket_path"], settings["socket_path"])
+        self.assertEqual(
+            observed["config"].home_channel.chat_id,
+            settings["home_channel"],
+        )
+
+    async def test_marmot_status_probes_loaded_config_without_live_adapter(self):
+        module = self.adapter_module
+        config_module = sys.modules["gateway.config"]
+        config = config_module.PlatformConfig(
+            enabled=True,
+            extra={
+                "socket_path": "/tmp/passive-probe.sock",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+            },
+        )
+
+        class PlatformConfigs:
+            def get(self, platform):
+                return config if platform.value == "marmot" else None
+
+        setattr(
+            config_module,
+            "load_gateway_config",
+            lambda: types.SimpleNamespace(platforms=PlatformConfigs()),
+        )
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        setattr(module, "MarmotAgentControlClient", lambda *_args, **_kwargs: ReadyClient())
+        result = json.loads(await module._marmot_status_tool({}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "ready")
+
+    async def test_marmot_status_reports_staged_failures(self):
+        module = self.adapter_module
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+
+        class MissingConnector:
+            async def account_list(self):
+                raise OSError("missing")
+
+        class Unauthorized:
+            async def account_list(self):
+                raise module.AgentControlError("denied", code="unauthorized")
+
+        class AmbiguousAccount:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True},
+                        {"account_id_hex": "22" * 32, "local_signing": True},
+                    ]
+                }
+
+        class MissingHome:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+        for client, expected in (
+            (MissingConnector(), "wn_agent_unreachable"),
+            (Unauthorized(), "not_authenticated"),
+            (AmbiguousAccount(), "account_unselected"),
+            (MissingHome(), "home_unresolved"),
+        ):
+            with self.subTest(state=expected):
+                live = type("FakeAdapter", (), {})()
+                live.config = config_cls(
+                    enabled=True,
+                    extra={"socket_path": "/tmp/passive-probe.sock"},
+                )
+                live.client = client
+                module._remember_live_adapter(live)
+                status = json.loads(await module._marmot_status_tool({}))
+                self.assertFalse(status["ok"])
+                self.assertEqual(status["state"], expected)
+
+    async def test_marmot_history_fetches_one_exact_materialized_message(self):
         calls = []
 
         class FakeClient:
@@ -5940,37 +6529,22 @@ class PluginRegistrationTests(unittest.TestCase):
             async def _ensure_account_id(self):
                 return "11" * 32
 
-        class AdapterMap:
-            def get(self, _platform):
-                return FakeAdapter()
-
-        gateway_run = types.ModuleType("gateway.run")
-        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
-            adapters=AdapterMap()
-        )
-        model_tools = types.ModuleType("model_tools")
-        model_tools._run_async = asyncio.run
-        sys.modules["gateway.run"] = gateway_run
-        sys.modules["model_tools"] = model_tools
-
-        try:
-            result = json.loads(
-                self.adapter_module._marmot_history_tool(
-                    {
-                        "group_id_hex": "22" * 32,
-                        "message_id_hex": "33" * 32,
-                    }
-                )
+        adapter = FakeAdapter()
+        self.adapter_module._remember_live_adapter(adapter)
+        result = json.loads(
+            await self.adapter_module._marmot_history_tool(
+                {
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                }
             )
-        finally:
-            sys.modules.pop("gateway.run", None)
-            sys.modules.pop("model_tools", None)
+        )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["type"], "timeline_message")
         self.assertEqual(calls, [("11" * 32, "22" * 32, "33" * 32)])
 
-    def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
+    async def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
         calls = []
 
         class FakeAdapter:
@@ -5982,43 +6556,28 @@ class PluginRegistrationTests(unittest.TestCase):
                 calls.append(("remove", group_id_hex, message_id_hex, emoji))
                 return {"success": True, "message_id": message_id_hex}
 
-        class AdapterMap:
-            def get(self, _platform):
-                return FakeAdapter()
-
-        gateway_run = types.ModuleType("gateway.run")
-        gateway_run._gateway_runner_ref = lambda: types.SimpleNamespace(
-            adapters=AdapterMap()
+        adapter = FakeAdapter()
+        self.adapter_module._remember_live_adapter(adapter)
+        added = json.loads(
+            await self.adapter_module._marmot_reaction_tool(
+                {
+                    "action": "add",
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "emoji": "👀",
+                }
+            )
         )
-        model_tools = types.ModuleType("model_tools")
-        model_tools._run_async = asyncio.run
-        sys.modules["gateway.run"] = gateway_run
-        sys.modules["model_tools"] = model_tools
-
-        try:
-            added = json.loads(
-                self.adapter_module._marmot_reaction_tool(
-                    {
-                        "action": "add",
-                        "group_id_hex": "22" * 32,
-                        "message_id_hex": "33" * 32,
-                        "emoji": "👀",
-                    }
-                )
+        removed = json.loads(
+            await self.adapter_module._marmot_reaction_tool(
+                {
+                    "action": "remove",
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "emoji": "👀",
+                }
             )
-            removed = json.loads(
-                self.adapter_module._marmot_reaction_tool(
-                    {
-                        "action": "remove",
-                        "group_id_hex": "22" * 32,
-                        "message_id_hex": "33" * 32,
-                        "emoji": "👀",
-                    }
-                )
-            )
-        finally:
-            sys.modules.pop("gateway.run", None)
-            sys.modules.pop("model_tools", None)
+        )
 
         self.assertTrue(added["ok"])
         self.assertTrue(removed["ok"])

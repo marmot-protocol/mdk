@@ -717,23 +717,69 @@ impl AccountManager {
         self.run_onboarding_locked(checkpoint).await
     }
     #[cfg(test)]
+    pub(crate) fn onboarding_worker_reap_watch_state(
+        &self,
+        account_id: &str,
+    ) -> Option<(bool, usize)> {
+        let tasks = self
+            .onboarding_cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tasks
+            .reaping
+            .get(account_id)
+            .map(|sender| (*sender.borrow(), sender.receiver_count()))
+    }
+    #[cfg(test)]
+    pub(crate) fn onboarding_owned_handles_finished(&self) -> bool {
+        let tasks = self
+            .onboarding_cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        !tasks.handles.is_empty() && tasks.handles.iter().all(JoinHandle::is_finished)
+    }
+    #[cfg(test)]
     pub(crate) async fn await_onboarding_worker_reap_finished(&self, account_id: &str) {
-        loop {
-            let finished = {
-                let tasks = self
-                    .onboarding_cancellations
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                tasks
-                    .reaping
-                    .get(account_id)
-                    .is_some_and(|sender| *sender.borrow())
-            };
-            if finished {
-                return;
+        let finished = timeout(Duration::from_secs(2), async {
+            loop {
+                if self
+                    .onboarding_worker_reap_watch_state(account_id)
+                    .is_some_and(|(completed, _)| completed)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "worker reap did not retain completion within the test bound"
+        );
+    }
+    #[cfg(test)]
+    pub(crate) async fn await_onboarding_owned_handles_finished(&self) {
+        let finished = timeout(Duration::from_secs(2), async {
+            loop {
+                if self.onboarding_owned_handles_finished() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "owned onboarding handles did not finish within the test bound"
+        );
+    }
+    #[cfg(test)]
+    pub(crate) async fn await_onboarding_worker_reap_with_budget(
+        &self,
+        account_id: &str,
+        budget: Duration,
+    ) -> Result<(), AppError> {
+        self.await_tracked_worker_reap(account_id, budget).await
     }
     #[cfg(test)]
     pub(crate) fn onboarding_worker_reap_in_flight(&self, account_id: &str) -> bool {

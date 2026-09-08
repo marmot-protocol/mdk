@@ -7,6 +7,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Changed
+
+- `marmot_cancel_onboarding` documentation now matches the runtime: approved or
+  ready attempts may be cancelled without first resuming a repair.
+
 ## [0.9.16] - 2026-09-01
 
 ### Added

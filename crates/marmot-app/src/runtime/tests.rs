@@ -9,6 +9,47 @@ use super::*;
 use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
 
+#[tokio::test]
+async fn missing_diagnostics_executor_keeps_exporters_stopped() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    let runtime = app.runtime();
+    runtime.start().await.unwrap();
+    runtime.shared.diagnostics_executor.lock().unwrap().take();
+
+    // A broken startup ordering must disable optional delivery, not panic in a host setter.
+    runtime.set_usage_diagnostics_consent(true).unwrap();
+    assert!(runtime.shared.product_worker.lock().unwrap().is_none());
+
+    #[cfg(feature = "otlp-export")]
+    {
+        let config = RelayTelemetryExportConfig {
+            authorization_bearer_token: Some("test-token".into()),
+            resource: Some(crate::RelayTelemetryResource {
+                service_version: "1.0".into(),
+                service_instance_id: app.telemetry_install_id().unwrap(),
+                deployment_environment: "test".into(),
+                tenant: "test".into(),
+                os_type: "test".into(),
+                os_version: "1".into(),
+                device_model_identifier: None,
+            }),
+            ..RelayTelemetryExportConfig::enabled("https://collector.example/v1/metrics")
+        };
+        assert!(config.export_allowed());
+        runtime.shared.configure_relay_telemetry_exporter(config);
+        assert!(
+            runtime
+                .shared
+                .relay_telemetry_exporter
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 fn profile_relay_status(
     publish_relays: &[&str],
     bootstrap_relays: &[&str],
