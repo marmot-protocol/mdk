@@ -1687,12 +1687,7 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
-        let seen_events_index = open
-            .state
-            .seen_events
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
+        let seen_events_index = open.state.seen_events.iter().cloned().collect();
         let checkpointed_transport_timestamp = open.state.last_transport_timestamp;
         // The wedge clock is the one detector threshold a test has to be able
         // to shorten: its production value is an hour, and reading a clock
@@ -1745,7 +1740,7 @@ impl MarmotApp {
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
-            released_backfill_reload_pending: false,
+            released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
@@ -1753,9 +1748,9 @@ impl MarmotApp {
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
-        client.reconcile_released_transport_receipts()?;
-        let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
-        client.restore_persisted_epoch_backfill_intents(persisted_backfills);
+        // Initial access also restores durable backfill work, with or without
+        // new releases, so open does not read the intent table twice.
+        client.transport_receipts()?;
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
         client.restore_persisted_epoch_stall_evidence(persisted_evidence);
         // Reads only the durable terminal guards, never live group state, so it
@@ -3277,16 +3272,6 @@ impl MarmotApp {
         self.account_storage(label)?
             .arm_epoch_backfill_intents(intents)?;
         Ok(())
-    }
-
-    pub(crate) fn pending_epoch_backfill_intents(
-        &self,
-        label: &str,
-    ) -> Result<Vec<storage_sqlite::StoredEpochBackfillIntent>, AppError> {
-        self.ensure_account_state(label)?;
-        Ok(self
-            .account_storage(label)?
-            .pending_epoch_backfill_intents()?)
     }
 
     pub(crate) fn clear_epoch_backfill_intents(

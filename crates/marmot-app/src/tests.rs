@@ -11269,36 +11269,28 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     assert_eq!(stored[0].owner_ts, 1000, "victim's original stamp survives");
 }
 
-#[test]
-fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
-    let local_pubkey = "11".repeat(32);
-
+#[tokio::test]
+async fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
+    let dir = tempfile::tempdir().unwrap();
+    let local_pubkey = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let app = MarmotApp::with_relay(dir.path(), "wss://receipts.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
     let known_local_delivery = relay_delivery("known", local_pubkey.clone());
-    let known_event_ids = HashSet::from([hex::encode(known_local_delivery.message.id.as_slice())]);
-    assert!(client::is_own_relay_echo(
-        &known_local_delivery,
-        &local_pubkey,
-        &known_event_ids
-    ));
+    let known_id = hex::encode(known_local_delivery.message.id.as_slice());
+    client.remember_seen_event(known_id.clone());
+    let receipts = client.transport_receipts().unwrap();
+    assert!(receipts.contains(&known_id));
 
-    let same_pubkey_new_event = relay_delivery("new-cross-device", local_pubkey.clone());
-    assert!(!client::is_own_relay_echo(
-        &same_pubkey_new_event,
-        &local_pubkey,
-        &known_event_ids
-    ));
-
-    // A delivery claiming a known id under another pubkey can no longer come
-    // out of the transport boundary (the id is verified against the event
-    // hash, #351); forge one directly to prove the echo check independently
-    // requires the local pubkey.
-    let mut known_other_pubkey_delivery = relay_delivery("known", "44".repeat(32));
-    known_other_pubkey_delivery.message.id = known_local_delivery.message.id.clone();
-    assert!(!client::is_own_relay_echo(
-        &known_other_pubkey_delivery,
-        &local_pubkey,
-        &known_event_ids
-    ));
+    // Same-account cross-device input is admitted unless this exact signed
+    // outer ID is known. Peer input uses the same synchronized membership rule.
+    let same_pubkey_new_event = relay_delivery("new-cross-device", local_pubkey);
+    assert!(!receipts.contains(&hex::encode(same_pubkey_new_event.message.id.as_slice())));
+    let peer_delivery = relay_delivery("peer", "44".repeat(32));
+    assert!(!receipts.contains(&hex::encode(peer_delivery.message.id.as_slice())));
 }
 
 #[test]
@@ -19077,7 +19069,15 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
 fn released_transport_is_replayed_after_lost_effect_and_reopen() {
     run_composed_app_runtime_test("released-transport-replay", || async {
         use cgka_traits::storage::MessageStorage;
-        for handling in ["checkpoint", "reopen", "failed effects", "unsaved receipts"] {
+        for handling in [
+            "checkpoint",
+            "reopen",
+            "failed effects",
+            "unsaved receipts",
+            "direct ingest",
+            "sdk drain",
+            "receive",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let (app, mut client, route) =
@@ -19114,6 +19114,43 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                 assert!(client.seen_events_index.contains(&probe.id));
             }
             storage.release_message_for_replay(&record).unwrap();
+            if matches!(handling, "direct ingest" | "sdk drain" | "receive") {
+                // Readmit immediately, with no effect observation, explicit
+                // reconcile or unrelated checkpoint to clean up the cache.
+                if handling == "direct ingest" {
+                    client
+                        .ingest_received_delivery(delivery.clone())
+                        .await
+                        .unwrap();
+                } else {
+                    inject_epoch_gap_probe(&app, probe.clone()).await;
+                    if handling == "sdk drain" {
+                        client.sync().await.unwrap();
+                    } else {
+                        let received = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            client.receive_next_delivery(),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) =
+                            received
+                        else {
+                            panic!("unexpected overflow")
+                        };
+                        client.ingest_received_delivery(*delivery).await.unwrap();
+                    }
+                }
+                assert_eq!(
+                    recorded_ingest_outcomes(&app, &probe.id).len(),
+                    2,
+                    "{handling}: released ID never reached engine admission"
+                );
+                assert!(storage.get_message(&delivery.message.id).is_ok());
+                assert!(client.seen_events_index.contains(&probe.id));
+                continue;
+            }
             if handling == "reopen" {
                 drop(client);
                 client = client_on_app_relay_plane(&app, "alice").await;
