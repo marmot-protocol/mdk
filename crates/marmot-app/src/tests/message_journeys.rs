@@ -184,9 +184,15 @@ async fn message_journey_crash_reopen() {
             assert!(message.invalidation_status.is_none());
             let publishes = relay.published_event_ids();
             assert!(publishes.iter().all(|id| id == &attempted.id));
-            assert!(
-                publishes.len() <= 1,
-                "repeated recovery must not create new publications"
+            let expected_publishes = match phase {
+                "response" => 0,
+                "durable" | "relay" => 1,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                publishes.len(),
+                expected_publishes,
+                "{phase}: retry only unconfirmed publications, exactly once"
             );
             if phase == "relay" {
                 let accepted: NostrTransportEvent = serde_json::from_slice(
