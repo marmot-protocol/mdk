@@ -995,7 +995,7 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
-    let mut historical_receipt_repair_pending = true;
+    let mut historical_receipt_repair_enabled = true;
     // Prepare exact Welcome attempts under the serialized owner, then let only
     // relay I/O run independently. The worker stays available for inbound
     // delivery, maintenance, media completions, timers, and commands while a
@@ -1577,7 +1577,7 @@ async fn run_app_runtime_account_worker(
                     &client,
                     &mut legacy_message_promotion,
                 );
-                run_historical_receipt_repair_batch(&mut client, &mut historical_receipt_repair_pending);
+                run_historical_receipt_repair_batch(&mut client, &mut historical_receipt_repair_enabled);
                 if client.key_package_maintenance_requires_catch_up() {
                     match timeout(
                         Duration::from_secs(15),
@@ -1960,32 +1960,55 @@ enum StartupHydrationOutcome {
     Shutdown,
 }
 
+/// Limit each maintenance tick's SQL work and synchronous cache invalidation so
+/// large account histories cannot monopolize the serialized account worker.
+const HISTORICAL_RECEIPT_REPAIR_BATCH_SIZE: usize = 32;
+
 /// A bounded page after startup hydration, before maintenance can backfill.
-/// Retry failures on the next tick; completion survives reopen in SQLite.
-fn run_historical_receipt_repair_batch(client: &mut AppClient, pending: &mut bool) {
-    if !*pending || !client.runtime.session().unhydrated_group_ids().is_empty() {
+/// Contention retries next tick; durable failures halt until the next process
+/// start. SQLite retains the unadvanced cursor for diagnosis and a later retry.
+fn run_historical_receipt_repair_batch(client: &mut AppClient, enabled: &mut bool) {
+    if !*enabled || !client.runtime.session().unhydrated_group_ids().is_empty() {
         return;
     }
-    match client.repair_uncertain_transport_receipts(32) {
+    run_historical_receipt_repair_batch_with(enabled, |limit| {
+        client.repair_uncertain_transport_receipts(limit)
+    });
+}
+
+fn run_historical_receipt_repair_batch_with(
+    enabled: &mut bool,
+    repair: impl FnOnce(usize) -> Result<storage_sqlite::TransportReceiptRepairProgress, AppError>,
+) {
+    if !*enabled {
+        return;
+    }
+    let started = Instant::now();
+    match repair(HISTORICAL_RECEIPT_REPAIR_BATCH_SIZE) {
         Ok(progress) => {
-            *pending = progress.has_more;
+            *enabled = progress.has_more;
             if progress.examined != 0 {
                 tracing::info!(
                     target: "marmot_app::storage_maintenance",
                     method = "repair_uncertain_transport_receipts",
                     examined = progress.examined,
                     uncertain_possession_repairs = progress.repaired,
+                    duration_ms = started.elapsed().as_millis() as u64,
                     has_more = progress.has_more,
                     "processed one bounded historical receipt repair batch"
                 );
             }
         }
         Err(error) => {
+            let transient = matches!(&error, AppError::Storage(error) if error.is_transient());
+            *enabled = transient;
             tracing::warn!(
                 target: "marmot_app::storage_maintenance",
                 method = "repair_uncertain_transport_receipts",
                 error_kind = error.privacy_safe_kind(),
-                "historical receipt repair batch failed; retrying on a later maintenance tick"
+                duration_ms = started.elapsed().as_millis() as u64,
+                retry_scheduled = transient,
+                "historical receipt repair batch failed"
             );
         }
     }
@@ -5186,6 +5209,26 @@ mod tests {
             .expect("worker exit cancels HTTP future")
             .expect("cancellation witness is delivered");
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn historical_receipt_repair_halts_durable_errors_but_retries_contention() {
+        use cgka_traits::storage::StorageError;
+        let mut enabled = true;
+        run_historical_receipt_repair_batch_with(&mut enabled, |_| {
+            Err(StorageError::Busy("test contention".into()).into())
+        });
+        assert!(enabled);
+        run_historical_receipt_repair_batch_with(&mut enabled, |_| {
+            Err(StorageError::Serialization("malformed legacy fanout".into()).into())
+        });
+        assert!(
+            !enabled,
+            "a deterministic failure must halt this process's sweep"
+        );
+        run_historical_receipt_repair_batch_with(&mut enabled, |_| {
+            unreachable!("a halted repair must not call storage again")
+        });
     }
 
     #[test]

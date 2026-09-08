@@ -11,7 +11,8 @@ use cgka_traits::{
 use rusqlite::{OptionalExtension, params};
 
 const BATCH_MAX: usize = 256;
-use crate::storage::messages::RELEASED_TRANSPORT_RECEIPT_CAPACITY;
+use crate::storage::messages::{RELEASED_TRANSPORT_RECEIPT_CAPACITY, retire_transport_receipts};
+use crate::transport_reconciliation::GROUP_ROUTE_KIND;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TransportReceiptRepairProgress {
@@ -26,7 +27,10 @@ impl SqliteAccountStorage {
     /// Run only after readiness and retained-route hydration, at the account's
     /// exclusive mutation boundary. Consume the release journal before and after
     /// this call, synchronously invalidating the active seen index before any
-    /// checkpoint or redelivery. A crash leaves the journal and backfill durable.
+    /// checkpoint or redelivery. Claim deletion, backfill intent and cursor
+    /// advancement deliberately share one commit: a crash cannot leave progress
+    /// ahead of repair or allow a stale checkpoint to outlive the journal.
+    /// Each account-device database has exactly one account_state owner/job.
     ///
     /// Keyset pages bound *examined* rows, rather than filtering uncertain rows
     /// before LIMIT (which could scan all accepted history). Fixed high waters
@@ -39,6 +43,8 @@ impl SqliteAccountStorage {
         let limit = limit.clamp(1, BATCH_MAX);
         let repair = || {
             let conn = self.lock()?;
+            let inbox = crate::TransportReconciliationRoute::Inbox;
+            let (inbox_kind, inbox_route) = inbox.storage_key();
             let job = conn
                 .query_row_cached(
                     "SELECT account_label, fanout_after, fanout_until, fanout_done,
@@ -89,8 +95,8 @@ impl SqliteAccountStorage {
                     )
                     .storage()?;
                 let (route_until, event_until) = conn.query_row_cached(
-                    "SELECT route_id, event_id FROM transport_reconciliation_items WHERE route_kind = 1
-                     ORDER BY route_id DESC, event_id DESC LIMIT 1", [], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, Vec<u8>>(1)?)))
+                    "SELECT route_id, event_id FROM transport_reconciliation_items WHERE route_kind = ?1
+                     ORDER BY route_id DESC, event_id DESC LIMIT 1", [GROUP_ROUTE_KIND], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, Vec<u8>>(1)?)))
                     .optional().storage()?.unwrap_or_default();
                 conn.execute_cached("UPDATE app_historical_receipt_repair SET fanout_until=?1, route_until=?2, event_until=?3 WHERE account_label=?4",
                     params![fanout_until, route_until, event_until, label]).storage()?;
@@ -100,9 +106,10 @@ impl SqliteAccountStorage {
                 has_more: true,
                 ..Default::default()
             };
-            // Old fanouts may be keyed by an inner ID. Backfill their indexed
-            // signed outer ID before candidate selection, without decoding an
-            // unbounded collection for each inventory entry.
+            // Old retained fanouts may be keyed by an inner ID. Their lifetime
+            // ends at settlement, but their per-account count has no hard cap.
+            // Index signed outer IDs in bounded pages before candidate selection
+            // instead of repeatedly decoding the entire pending send set.
             if !fanout_done {
                 let rows = conn
                     .prepare_cached(
@@ -135,9 +142,9 @@ impl SqliteAccountStorage {
             }
             let remaining = limit - progress.examined;
             let rows = conn.prepare_cached("SELECT route_id, event_id, created_at FROM transport_reconciliation_items
-                WHERE route_kind=1 AND (route_id,event_id) > (?1,?2) AND (route_id,event_id) <= (?3,?4)
+                WHERE route_kind=?6 AND (route_id,event_id) > (?1,?2) AND (route_id,event_id) <= (?3,?4)
                 ORDER BY route_id,event_id LIMIT ?5").storage()?
-                .query_map(params![route_after,event_after,route_until,event_until,remaining as i64], |r| Ok((
+                .query_map(params![route_after,event_after,route_until,event_until,remaining as i64,GROUP_ROUTE_KIND], |r| Ok((
                     r.get::<_, Vec<u8>>(0)?,r.get::<_, Vec<u8>>(1)?,r.get::<_, i64>(2)?)))
                 .storage()?.collect::<Result<Vec<_>,_>>().storage()?;
             let finished = rows.len() < remaining;
@@ -153,7 +160,7 @@ impl SqliteAccountStorage {
                      JOIN cgka_groups g ON g.id=r.group_id
                      WHERE r.transport_group_id=?1
                        AND ?3 >= MAX(?4, COALESCE((SELECT inventory_since FROM transport_reconciliation_route_state
-                           WHERE route_kind=1 AND route_id=?1), 0))
+                           WHERE route_kind=?6 AND route_id=?1), 0))
                        AND NOT EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id=?2)
                        AND NOT EXISTS(SELECT 1 FROM cgka_messages WHERE id=?2)
                        AND NOT EXISTS(SELECT 1 FROM cgka_processed_transport_ids WHERE id=?2)
@@ -161,31 +168,27 @@ impl SqliteAccountStorage {
                        AND NOT EXISTS(SELECT 1 FROM cgka_outbound_fanout WHERE message_id=?2)
                        AND NOT EXISTS(SELECT 1 FROM cgka_outbound_transport_receipt_ids WHERE published_message_id=?2)
                        AND NOT EXISTS(SELECT 1 FROM cgka_welcomes WHERE message_id=?2)
-                       AND NOT EXISTS(SELECT 1 FROM transport_reconciliation_items WHERE route_kind=0 AND route_id=x'' AND event_id=?2)",
-                    params![route_after,event_after,created_at,retention_floor], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, i64>(1)?)))
+                       AND NOT EXISTS(SELECT 1 FROM transport_reconciliation_items WHERE route_kind=?5 AND route_id=?7 AND event_id=?2)",
+                    params![route_after,event_after,created_at,retention_floor,inbox_kind,GROUP_ROUTE_KIND,inbox_route], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, i64>(1)?)))
                     .optional().storage()?;
                 let Some((group, epoch)) = candidate else {
                     continue;
                 };
+                // The deleted wrapper's epoch is unknowable. Arm recovery at
+                // the current group epoch, the best available progress boundary.
                 let inserted = conn.execute_cached("INSERT INTO cgka_released_transport_receipts(id,group_id,epoch)
                     SELECT ?1,?2,?3 WHERE (SELECT COUNT(*) FROM cgka_released_transport_receipts) < ?4
                     ON CONFLICT(id) DO NOTHING", params![event_after,group,epoch,RELEASED_TRANSPORT_RECEIPT_CAPACITY]).storage()?;
                 if inserted == 0 {
                     // Do not advance past an ID that has no durable invalidation.
-                    return Err(StorageError::Busy(
-                        "transport receipt repair requires a drained release journal".into(),
+                    return Err(StorageError::Backend(
+                        "released transport receipt journal is full".into(),
                     ));
                 }
-                conn.execute_cached(
-                    "DELETE FROM transport_reconciliation_items WHERE event_id=?1",
-                    [&event_after],
-                )
-                .storage()?;
-                conn.execute_cached(
-                    "DELETE FROM seen_events WHERE event_id=?1",
-                    [hex::encode(&event_after)],
-                )
-                .storage()?;
+                retire_transport_receipts(
+                    &conn,
+                    &cgka_traits::MessageId::new(event_after.clone()),
+                )?;
                 conn.execute_cached("INSERT INTO app_epoch_backfill_intents(group_id,stalled_epoch,updated_at)
                     VALUES (?1,?2,?3) ON CONFLICT(group_id) DO UPDATE SET
                     stalled_epoch=MAX(app_epoch_backfill_intents.stalled_epoch,excluded.stalled_epoch),updated_at=excluded.updated_at",
@@ -205,7 +208,11 @@ impl SqliteAccountStorage {
             }
             Ok(progress)
         };
-        retry_on_busy(|| self.connection.with_transaction(repair))
+        if self.connection.is_current_thread_transaction_owner() {
+            repair()
+        } else {
+            retry_on_busy(|| self.connection.with_transaction(repair))
+        }
     }
 }
 
@@ -365,6 +372,16 @@ mod tests {
             )
             .unwrap();
         }
+        // Authored time is not receipt/deletion time: even a modest future
+        // clock skew can place a pre-journal wrapper past migration 0060's time.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE transport_reconciliation_items SET created_at=?1 WHERE event_id=?2",
+                params![unix_now_seconds_i64() + 60, &[10_u8; 32][..]],
+            )
+            .unwrap();
         assert_eq!(drain(&store, 2), 2);
         let conn = store.lock().unwrap();
         assert_eq!(
@@ -453,6 +470,46 @@ mod tests {
         assert_eq!(
             reopened.repair_uncertain_transport_receipts(1).unwrap(),
             TransportReceiptRepairProgress::default()
+        );
+    }
+
+    #[test]
+    fn full_journal_repair_is_not_lock_contention_and_preserves_progress() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, 1);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < ?1)
+             INSERT INTO cgka_released_transport_receipts
+             SELECT CAST(printf('%032x',x) AS BLOB),x'aa',3 FROM n",
+                [RELEASED_TRANSPORT_RECEIPT_CAPACITY],
+            )
+            .unwrap();
+        let error = store.repair_uncertain_transport_receipts(1).unwrap_err();
+        assert!(
+            matches!(error, StorageError::Backend(_)),
+            "journal capacity is not retryable lock contention: {error:?}"
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT fanout_until IS NULL FROM app_historical_receipt_repair",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        store.consume_released_transport_receipts().unwrap();
+        assert_eq!(
+            store
+                .repair_uncertain_transport_receipts(1)
+                .unwrap()
+                .repaired,
+            1
         );
     }
 

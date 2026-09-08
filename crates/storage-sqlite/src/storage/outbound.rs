@@ -230,7 +230,11 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
             }
             Ok(())
         };
-        retry_on_busy(|| self.connection.with_transaction(write))
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            retry_on_busy(|| self.connection.with_transaction(write))
+        }
     }
 
     fn outbound_fanout(&self, message_id: &MessageId) -> StorageResult<Option<OutboundFanout>> {

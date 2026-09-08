@@ -937,7 +937,10 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
-fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
+pub(crate) fn retire_transport_receipts(
+    conn: &rusqlite::Connection,
+    id: &MessageId,
+) -> StorageResult<()> {
     conn.execute_cached(
         "DELETE FROM seen_events WHERE event_id = ?1",
         params![hex::encode(id.as_slice())],

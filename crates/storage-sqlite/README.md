@@ -44,6 +44,10 @@ After readiness and group hydration, the app worker inspects at most 32 fanout/i
 pass (the storage API caps a batch at 256). Transactional keyset cursors and fixed high waters allow restart
 and bound each pass, including when every inventory entry is excluded by possession evidence. Old fanout
 signed IDs are indexed before inventory selection; new fanout writes maintain that index atomically.
+The index covers retained pending fanouts, including ones written by older versions; it cascades away when
+those fanouts settle. Pending fanouts have no hard per-account count limit, so decoding the entire set on
+every pass would violate the bounded-work requirement. Permanent decode/backend failures halt this process's
+sweep with its durable cursor intact; transient lock contention retries on the next tick.
 
 Only retained group-route inventory entries without raw/message, processed-marker, ingress-dedup, Welcome,
 or outbound-fanout evidence are selected. Inbox claims, protocol state, projections, retention floors and
@@ -52,6 +56,10 @@ the active account invalidates its seen index synchronously before checkpoint or
 **uncertain-possession repairs**, since pre-0058 accepted wrappers may lack a processed marker. Redelivery
 must still deduplicate canonical messages. Expired epoch keys, retained inventory windows and unavailable
 relay history limit recovery; this repair cannot reconstruct missing relay history.
+The scan intentionally has no release-date cutoff on event `created_at`: that is the sender's signed authored
+time, not the local receipt/deletion time, and account upgrades may occur well after a release. The retained
+window and fixed keyset high water define its scope instead. A full route takes roughly two hours of active
+worker time at this conservative pacing; sparse or multi-route histories can require many maintenance ticks.
 
 The three current app database categories have independent histories: `session.sqlite` uses
 `cgka_schema_migrations`, the per-account `app-cache.sqlite3` uses marmot-app's `app_cache_schema_migrations`, and

@@ -7,8 +7,8 @@ use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-const INBOX_ROUTE_KIND: i64 = 0;
-const GROUP_ROUTE_KIND: i64 = 1;
+pub(crate) const INBOX_ROUTE_KIND: i64 = 0;
+pub(crate) const GROUP_ROUTE_KIND: i64 = 1;
 /// A route advertises at most this many exact event ids to NIP-77. When the
 /// bound is crossed, an entire authored-time bucket is retired and the durable
 /// lower bound advances past it, so compacted ids cannot reappear as missing.
@@ -25,7 +25,7 @@ pub enum TransportReconciliationRoute {
 }
 
 impl TransportReconciliationRoute {
-    fn storage_key(&self) -> (i64, &[u8]) {
+    pub(crate) fn storage_key(&self) -> (i64, &[u8]) {
         match self {
             Self::Inbox => (INBOX_ROUTE_KIND, &[]),
             Self::Group(route_id) => (GROUP_ROUTE_KIND, route_id),
