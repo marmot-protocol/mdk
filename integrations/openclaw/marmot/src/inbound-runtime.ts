@@ -13,14 +13,20 @@ import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debo
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/status-helpers";
 
 import { resolveSingleAccount } from "./account.js";
-import { BoundedKeyedAsyncQueue, DEFAULT_INBOUND_QUEUE_MAX_DEPTH } from "./bounded-keyed-async-queue.js";
+import {
+  BoundedKeyedAsyncQueue,
+  DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+  DEFAULT_INBOUND_QUEUE_MAX_TRACKED_GROUPS,
+} from "./bounded-keyed-async-queue.js";
 import { resolveMarmotChannelAccount } from "./channel.js";
 import type { MarmotAgentControlClient } from "./client.js";
 import { clientForAccount, type ResolvedMarmotAccount } from "./config.js";
 import {
   MarmotInboundBridge,
   type MarmotAmbientEvent,
+  type MarmotInboundCompletionOutcome,
   type MarmotInboundMessage,
+  type MarmotInboundSubmission,
 } from "./inbound.js";
 import {
   maybeHandleProfileOnboardingInbound,
@@ -48,19 +54,26 @@ interface CompatibleInboundDebounceFlush {
   completion: Promise<void>;
 }
 
+interface CompatibleInboundDebounceAdmissionLifecycle {
+  onAdopted: () => void | Promise<void>;
+}
+
 type CompatibleInboundDebounceFlushFactory = (params: {
-  dispatch: (lifecycle: unknown) => Promise<void>;
+  dispatch: (lifecycle: CompatibleInboundDebounceAdmissionLifecycle) => Promise<void>;
 }) => CompatibleInboundDebounceFlush;
 
 type CompatibleInboundDebouncerFactory = <T>(params: {
   debounceMs: number;
+  maxTrackedKeys?: number;
   buildKey: (item: T) => string | null | undefined;
   onFlush: (
     items: T[],
     createFlush?: CompatibleInboundDebounceFlushFactory,
   ) => Promise<void> | CompatibleInboundDebounceFlush;
+  onCancel?: (items: T[]) => void;
 }) => {
   enqueue: (item: T) => Promise<void>;
+  cancelKey: (key: string) => boolean;
 };
 
 const createCompatibleInboundDebouncer =
@@ -82,6 +95,8 @@ export interface InboundPluginApi {
 type ClientFactory = (resolved: ResolvedMarmotAccount) => MarmotAgentControlClient;
 const MAX_PENDING_AMBIENT_EVENTS_PER_GROUP = 16;
 const MAX_PENDING_AMBIENT_GROUPS = 256;
+const DEFAULT_INBOUND_DEBOUNCE_MAX_DEPTH_PER_KEY = DEFAULT_INBOUND_QUEUE_MAX_DEPTH;
+const DEFAULT_INBOUND_DEBOUNCE_MAX_TRACKED_KEYS = DEFAULT_INBOUND_QUEUE_MAX_TRACKED_GROUPS;
 
 function resolveAccount(
   api: InboundPluginApi,
@@ -221,6 +236,16 @@ export function startMarmotInbound(
     lastError: null,
   });
   const controller = new AbortController();
+  let stopping = false;
+  let cancelPendingDebounce = (): void => undefined;
+  const stopInbound = (): void => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    cancelPendingDebounce();
+    controller.abort();
+  };
   // Release the guard when the loop is stopped so a clean restart can re-subscribe.
   controller.signal.addEventListener(
     "abort",
@@ -236,12 +261,13 @@ export function startMarmotInbound(
     { once: true },
   );
   // Always drive the loop off the internal controller so the returned stop() is
-  // authoritative; forward an externally-supplied signal into it.
+  // authoritative. Route external aborts through that same idempotent stop path
+  // so startup races also mark the runtime stopping before async setup resumes.
   if (options.signal) {
     if (options.signal.aborted) {
-      controller.abort();
+      stopInbound();
     } else {
-      options.signal.addEventListener("abort", () => controller.abort(), { once: true });
+      options.signal.addEventListener("abort", stopInbound, { once: true });
     }
   }
   const signal = controller.signal;
@@ -314,9 +340,16 @@ export function startMarmotInbound(
     // dispatch for every other group (the previous inline `await dispatch` did).
     const dispatchQueue = new BoundedKeyedAsyncQueue(
       DEFAULT_INBOUND_QUEUE_MAX_DEPTH,
+      (signal) =>
+        api.logger.warn(
+          `marmot: inbound queue overloaded (reason=${signal.reason}, active_groups=${signal.activeGroups}, max_depth_per_group=${signal.maxDepthPerGroup}, max_tracked_groups=${signal.maxTrackedGroups})`,
+        ),
+      undefined,
       (message) => api.logger.warn(message),
     );
-    const handleInbound = async (message: MarmotInboundMessage): Promise<void> => {
+    const handleInbound = async (
+      message: MarmotInboundMessage,
+    ): Promise<MarmotInboundCompletionOutcome> => {
       if (onboardingStore) {
         const intercepted = await maybeHandleProfileOnboardingInbound({
           store: onboardingStore,
@@ -331,7 +364,7 @@ export function startMarmotInbound(
           logger: api.logger,
         }).catch(() => false); // never block dispatch on an onboarding error
         if (intercepted) {
-          return;
+          return "onboarding_intercepted";
         }
       }
       const key = ambientKey(message.accountIdHex, message.groupIdHex);
@@ -345,47 +378,178 @@ export function startMarmotInbound(
         const dispatched = await dispatch({ ...message, ambientContext });
         if (dispatched === false) {
           restorePendingAmbient(key, attachedAmbient);
+          return "not_dispatched";
         }
+        return "dispatched";
       } catch (error) {
         restorePendingAmbient(key, attachedAmbient);
         throw error;
       }
     };
-    const runQueued = (message: MarmotInboundMessage): void => {
-      dispatchQueue.enqueue(message.groupIdHex, () => handleInbound(message));
+    const runQueued = (message: MarmotInboundMessage): MarmotInboundSubmission => {
+      let resolveCompletion!: (outcome: MarmotInboundCompletionOutcome) => void;
+      let rejectCompletion!: (error: unknown) => void;
+      const completion = new Promise<MarmotInboundCompletionOutcome>((resolve, reject) => {
+        resolveCompletion = resolve;
+        rejectCompletion = reject;
+      });
+      void completion.catch(() => undefined);
+      const admission = dispatchQueue.enqueue(message.groupIdHex, async () => {
+        try {
+          resolveCompletion(await handleInbound(message));
+        } catch (error) {
+          rejectCompletion(error);
+          throw error;
+        }
+      });
+      if (admission.outcome === "overloaded") {
+        resolveCompletion("overloaded");
+        return { admission: "overloaded", completion };
+      }
+      return { admission: "admitted", completion };
+    };
+    interface PendingDebounceItem {
+      message: MarmotInboundMessage;
+      resolve: (submission: MarmotInboundSubmission) => void;
+    }
+    const retryableCancellation = (): MarmotInboundSubmission => ({
+      admission: "overloaded",
+      completion: Promise.resolve("overloaded"),
+    });
+    const coalescedSubmission = (
+      completion: Promise<MarmotInboundCompletionOutcome>,
+    ): MarmotInboundSubmission => ({
+      admission: "coalesced",
+      completion: completion.then(() => "coalesced"),
+    });
+    const pendingDebounceDepths = new Map<string, number>();
+    const releasePendingDebounce = (key: string): void => {
+      const next = (pendingDebounceDepths.get(key) ?? 1) - 1;
+      if (next <= 0) {
+        pendingDebounceDepths.delete(key);
+      } else {
+        pendingDebounceDepths.set(key, next);
+      }
+    };
+    const flushInboundBatch = (
+      items: PendingDebounceItem[],
+      lifecycle?: CompatibleInboundDebounceAdmissionLifecycle,
+    ): Promise<void> => {
+      if (items.length === 0) {
+        return Promise.resolve();
+      }
+      if (stopping) {
+        for (const item of items) {
+          item.resolve(retryableCancellation());
+        }
+        return Promise.resolve();
+      }
+      const queued = runQueued(coalesceInboundMessages(items.map((item) => item.message)));
+      if (queued.admission === "overloaded") {
+        for (const item of items) {
+          item.resolve(queued);
+        }
+        return queued.completion.then(() => undefined);
+      }
+      const representativeIndex = items.length - 1;
+      items.forEach((item, index) => {
+        item.resolve(
+          index === representativeIndex ? queued : coalescedSubmission(queued.completion),
+        );
+      });
+      const admission = Promise.resolve(lifecycle?.onAdopted());
+      // Stable uses the returned Promise to serialize this debounce key. Release
+      // that lane once the group queue adopts the batch; each submission keeps
+      // the real turn completion separately. Beta's lifecycle wrapper still
+      // needs this dispatch Promise to represent completion.
+      return lifecycle
+        ? admission.then(() => queued.completion).then(() => undefined)
+        : admission;
     };
     // Optional debounce: coalesce rapid same-sender/group bursts into a single turn.
     const debouncer =
       resolved.debounceMs > 0
-        ? createCompatibleInboundDebouncer<MarmotInboundMessage>({
+        ? createCompatibleInboundDebouncer<PendingDebounceItem>({
             debounceMs: resolved.debounceMs,
-            buildKey: (message) =>
+            maxTrackedKeys: DEFAULT_INBOUND_DEBOUNCE_MAX_TRACKED_KEYS,
+            buildKey: ({ message }) =>
               `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`,
             onFlush: (items, createFlush) => {
-              const dispatchFlush = async (): Promise<void> => {
-                if (items.length > 0) {
-                  runQueued(coalesceInboundMessages(items));
-                }
-              };
-              // Beta completion deliberately means "admitted to Marmot's
-              // bounded per-group queue", not "the agent turn settled". The
-              // outer queue owns turn serialization and failure logging, which
-              // matches stable's fire-and-forget seam, so the factory-provided
-              // lifecycle argument is intentionally ignored.
+              // Stable awaits this Promise directly. Beta's factory publishes
+              // separate admission/completion promises around the same dispatch.
+              // Mark adoption as soon as the group queue accepts the batch so
+              // beta can release this debounce key while the turn completes.
               return createFlush
-                ? createFlush({ dispatch: async (_lifecycle) => dispatchFlush() })
-                : dispatchFlush();
+                ? createFlush({ dispatch: (lifecycle) => flushInboundBatch(items, lifecycle) })
+                : flushInboundBatch(items);
+            },
+            onCancel: (items) => {
+              for (const item of items) {
+                item.resolve(retryableCancellation());
+              }
             },
           })
         : null;
-    const submitInbound = (message: MarmotInboundMessage): void => {
-      if (debouncer) {
-        void debouncer
-          .enqueue(message)
-          .catch(() => api.logger.warn("marmot: inbound debounce failed"));
-      } else {
-        runQueued(message);
+    cancelPendingDebounce = () => {
+      if (!debouncer) {
+        return;
       }
+      for (const key of [...pendingDebounceDepths.keys()]) {
+        debouncer.cancelKey(key);
+      }
+    };
+    const submitInbound = (
+      message: MarmotInboundMessage,
+    ): MarmotInboundSubmission | Promise<MarmotInboundSubmission> => {
+      if (stopping) {
+        return retryableCancellation();
+      }
+      if (debouncer) {
+        const key = `${message.accountIdHex}:${message.groupIdHex}:${message.senderAccountIdHex}`;
+        const depth = pendingDebounceDepths.get(key) ?? 0;
+        const reason =
+          depth >= DEFAULT_INBOUND_DEBOUNCE_MAX_DEPTH_PER_KEY
+            ? "per_key_depth"
+            : depth === 0 &&
+                pendingDebounceDepths.size >= DEFAULT_INBOUND_DEBOUNCE_MAX_TRACKED_KEYS
+              ? "tracked_key_limit"
+              : null;
+        if (reason) {
+          api.logger.warn(
+            `marmot: inbound debounce overloaded (reason=${reason}, active_keys=${pendingDebounceDepths.size}, max_depth_per_key=${DEFAULT_INBOUND_DEBOUNCE_MAX_DEPTH_PER_KEY}, max_tracked_keys=${DEFAULT_INBOUND_DEBOUNCE_MAX_TRACKED_KEYS})`,
+          );
+          return { admission: "overloaded", completion: Promise.resolve("overloaded") };
+        }
+        pendingDebounceDepths.set(key, depth + 1);
+        let resolveSubmission!: (submission: MarmotInboundSubmission) => void;
+        let rejectSubmission!: (error: unknown) => void;
+        const submission = new Promise<MarmotInboundSubmission>((resolve, reject) => {
+          resolveSubmission = resolve;
+          rejectSubmission = reject;
+        });
+        let admissionSettled = false;
+        const settleSubmission = (settled: MarmotInboundSubmission): void => {
+          if (admissionSettled) {
+            return;
+          }
+          admissionSettled = true;
+          releasePendingDebounce(key);
+          resolveSubmission(settled);
+        };
+        void debouncer
+          .enqueue({ message, resolve: settleSubmission })
+          .catch((error: unknown) => {
+            if (admissionSettled) {
+              return;
+            }
+            admissionSettled = true;
+            releasePendingDebounce(key);
+            rejectSubmission(error);
+            api.logger.warn("marmot: inbound debounce failed");
+          });
+        return submission;
+      }
+      return runQueued(message);
     };
 
     const bridge = new MarmotInboundBridge(client, {
@@ -413,7 +577,7 @@ export function startMarmotInbound(
         // MarmotInboundBridge.handle() already ran synchronously before this.
         markMarmotInboundReceived(statusAccountId);
         options.statusSink?.({ lastInboundAt: Date.now() });
-        submitInbound(message);
+        return submitInbound(message);
       },
       onAmbientEvent: (event) => {
         markMarmotInboundReceived(statusAccountId);
@@ -450,6 +614,9 @@ export function startMarmotInbound(
         // group, so no cached is_direct fact can be trusted; drop them all.
         options.clearGroupActivationCache?.();
       },
+      onSubmissionError: () => {
+        api.logger.warn("marmot: inbound submission failed before admission; replay remains retryable");
+      },
       onError: () => {
         markMarmotInboundReconnect(statusAccountId);
         options.statusSink?.({
@@ -463,7 +630,7 @@ export function startMarmotInbound(
     await bridge.run(signal);
   })();
 
-  return () => controller.abort();
+  return stopInbound;
 }
 
 export interface SyncAllowlistOptions {
