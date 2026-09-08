@@ -292,6 +292,27 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failure_classifications: Vec::new(),
             duration_ms: hist(3),
         },
+        account_relay_drain: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(6),
+        },
+        outbound_message_queue_wait: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 2,
+            failures: 0,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(5),
+        },
+        outbound_message_total_caller_latency: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 1,
+            failures: 1,
+            failure_classifications: Vec::new(),
+            duration_ms: hist(8),
+        },
         account_sync: AppPerformanceOperationSnapshot {
             attempts: 1,
             successes: 0,
@@ -347,6 +368,18 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     }));
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_ACCOUNT_RELAY_DRAIN_SUCCESSES
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(2)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_FAILURES
             && point.value == ExportMetricValue::Counter(1)
     }));
     assert!(batch.points.iter().any(|point| {

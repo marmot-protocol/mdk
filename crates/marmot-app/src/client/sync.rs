@@ -1156,7 +1156,16 @@ impl AppClient {
         // drained registration log before draining inbound deliveries.
         self.record_subscription_rebuild(rebuild_since_secs).await;
         let mut counts = DrainCounts::default();
-        let (mut summary, drain_verdict) = self.sync_sdk_relay(&mut counts).await?;
+        let drain_started_at = Instant::now();
+        let drain_result = self.sync_sdk_relay(&mut counts).await;
+        if let Some(telemetry) = telemetry {
+            telemetry.record(
+                AppPerformanceOperation::AccountRelayDrain,
+                drain_started_at.elapsed(),
+                drain_result.is_ok(),
+            );
+        }
+        let (mut summary, drain_verdict) = drain_result?;
         if drain_verdict == DrainVerdict::Overflow || self.delivery_overflow_recovery_pending {
             self.recover_delivery_overflow_and_merge(&mut summary)
                 .await?;

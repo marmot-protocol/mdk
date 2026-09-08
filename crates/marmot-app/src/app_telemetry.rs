@@ -30,6 +30,7 @@ pub(crate) enum AppPerformanceOperation {
     AccountGroupReadSnapshot,
     AccountTransportActivation,
     AccountSubscriptionRegistration,
+    AccountRelayDrain,
     AccountCatchUp,
     AccountSync,
     AccountSetupAdvisoryStep,
@@ -47,7 +48,9 @@ pub(crate) enum AppPerformanceOperation {
     AccountSetupKeyPackageLocal,
     AccountSetupLocalReadyHandoff,
     AccountSetupNetworkReady,
+    OutboundMessageQueueWait,
     OutboundMessageSend,
+    OutboundMessageTotalCallerLatency,
     GroupCreateQueueWait,
     GroupCreateKeyPackageLookup,
     GroupMemberKeyPackagePrewarm,
@@ -243,6 +246,8 @@ pub struct AppPerformanceSnapshot {
     pub account_transport_activation: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub account_subscription_registration: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub account_relay_drain: AppPerformanceOperationSnapshot,
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
     pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
@@ -280,7 +285,11 @@ pub struct AppPerformanceSnapshot {
     /// passphrase KDF derivation (mdk#1439).
     #[serde(default)]
     pub sqlcipher_migration_probe_skips: u64,
+    #[serde(default)]
+    pub outbound_message_queue_wait: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub outbound_message_total_caller_latency: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_create_queue_wait: AppPerformanceOperationSnapshot,
     #[serde(default)]
@@ -392,6 +401,7 @@ struct AppPerformanceTelemetryInner {
     account_group_read_snapshot: AppPerformanceOperationTelemetry,
     account_transport_activation: AppPerformanceOperationTelemetry,
     account_subscription_registration: AppPerformanceOperationTelemetry,
+    account_relay_drain: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
     account_setup_advisory_step: AppPerformanceOperationTelemetry,
@@ -405,7 +415,9 @@ struct AppPerformanceTelemetryInner {
     account_setup_key_package_local: AppPerformanceOperationTelemetry,
     account_setup_local_ready_handoff: AppPerformanceOperationTelemetry,
     account_setup_network_ready: AppPerformanceOperationTelemetry,
+    outbound_message_queue_wait: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
+    outbound_message_total_caller_latency: AppPerformanceOperationTelemetry,
     group_create_queue_wait: AppPerformanceOperationTelemetry,
     group_create_key_package_lookup: AppPerformanceOperationTelemetry,
     group_member_key_package_prewarm: AppPerformanceOperationTelemetry,
@@ -694,6 +706,9 @@ impl AppPerformanceTelemetry {
                     .account_subscription_registration
                     .record(duration, success);
             }
+            AppPerformanceOperation::AccountRelayDrain => {
+                inner.account_relay_drain.record(duration, success);
+            }
             AppPerformanceOperation::AccountCatchUp | AppPerformanceOperation::AccountSync => {}
             AppPerformanceOperation::AccountSetupAdvisoryStep => {
                 inner.account_setup_advisory_step.record(duration, success)
@@ -728,8 +743,16 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::AccountSetupNetworkReady => {
                 inner.account_setup_network_ready.record(duration, success)
             }
+            AppPerformanceOperation::OutboundMessageQueueWait => {
+                inner.outbound_message_queue_wait.record(duration, success);
+            }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
+            }
+            AppPerformanceOperation::OutboundMessageTotalCallerLatency => {
+                inner
+                    .outbound_message_total_caller_latency
+                    .record(duration, success);
             }
             AppPerformanceOperation::GroupCreateQueueWait => {
                 inner.group_create_queue_wait.record(duration, success);
@@ -989,6 +1012,7 @@ impl AppPerformanceTelemetry {
             account_group_read_snapshot: inner.account_group_read_snapshot.snapshot(),
             account_transport_activation: inner.account_transport_activation.snapshot(),
             account_subscription_registration: inner.account_subscription_registration.snapshot(),
+            account_relay_drain: inner.account_relay_drain.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
             account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
@@ -1008,7 +1032,11 @@ impl AppPerformanceTelemetry {
             account_setup_network_ready: inner.account_setup_network_ready.snapshot(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
+            outbound_message_queue_wait: inner.outbound_message_queue_wait.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
+            outbound_message_total_caller_latency: inner
+                .outbound_message_total_caller_latency
+                .snapshot(),
             group_create_queue_wait: inner.group_create_queue_wait.snapshot(),
             group_create_key_package_lookup: inner.group_create_key_package_lookup.snapshot(),
             group_member_key_package_prewarm: inner.group_member_key_package_prewarm.snapshot(),
@@ -1271,6 +1299,21 @@ mod tests {
             Duration::from_millis(250),
             true,
         );
+        telemetry.record(
+            AppPerformanceOperation::AccountRelayDrain,
+            Duration::from_millis(1_500),
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::OutboundMessageQueueWait,
+            Duration::from_millis(100),
+            true,
+        );
+        telemetry.record(
+            AppPerformanceOperation::OutboundMessageTotalCallerLatency,
+            Duration::from_millis(400),
+            false,
+        );
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.app_start.attempts, 2);
@@ -1295,6 +1338,18 @@ mod tests {
                 .duration_ms
                 .sum_ms,
             250
+        );
+        assert_eq!(snapshot.account_relay_drain.successes, 1);
+        assert_eq!(snapshot.account_relay_drain.duration_ms.sum_ms, 1_500);
+        assert_eq!(snapshot.outbound_message_queue_wait.successes, 1);
+        assert_eq!(snapshot.outbound_message_queue_wait.duration_ms.sum_ms, 100);
+        assert_eq!(snapshot.outbound_message_total_caller_latency.failures, 1);
+        assert_eq!(
+            snapshot
+                .outbound_message_total_caller_latency
+                .duration_ms
+                .sum_ms,
+            400
         );
         assert!(
             snapshot

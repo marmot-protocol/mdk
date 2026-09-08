@@ -277,11 +277,13 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendMessage {
+        queued_at: Instant,
         group_id: GroupId,
         payload: Vec<u8>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendAppEvent {
+        queued_at: Instant,
         group_id: GroupId,
         intent: AppMessageIntent,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -3633,10 +3635,16 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::SendMessage {
+            queued_at,
             group_id,
             payload,
             respond,
         } => Box::pin(async move {
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                queued_at.elapsed(),
+                true,
+            );
             let send_started_at = Instant::now();
             let result = client
                 .send_with_local_projection(&group_id, &payload, |update| {
@@ -3657,10 +3665,16 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::SendAppEvent {
+            queued_at,
             group_id,
             intent,
             respond,
         } => Box::pin(async move {
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                queued_at.elapsed(),
+                true,
+            );
             let send_started_at = Instant::now();
             let result = match intent {
                 AppMessageIntent::Reaction {

@@ -88,6 +88,7 @@ c_mirror! {
         rec account_group_read_snapshot: MarmotAppPerformanceOperationSnapshot,
         rec account_transport_activation: MarmotAppPerformanceOperationSnapshot,
         rec account_subscription_registration: MarmotAppPerformanceOperationSnapshot,
+        rec account_relay_drain: MarmotAppPerformanceOperationSnapshot,
         rec account_catch_up: MarmotAppPerformanceOperationSnapshot,
         rec account_sync: MarmotAppPerformanceOperationSnapshot,
         rec account_setup_advisory_step: MarmotAppPerformanceOperationSnapshot,
@@ -109,7 +110,9 @@ c_mirror! {
         /// Existing-database opens that skipped the probe via a cached
         /// verdict since process start.
         copy sqlcipher_migration_probe_skips: u64,
+        rec outbound_message_queue_wait: MarmotAppPerformanceOperationSnapshot,
         rec outbound_message_send: MarmotAppPerformanceOperationSnapshot,
+        rec outbound_message_total_caller_latency: MarmotAppPerformanceOperationSnapshot,
         rec group_create_queue_wait: MarmotAppPerformanceOperationSnapshot,
         rec group_create_key_package_lookup: MarmotAppPerformanceOperationSnapshot,
         rec group_member_key_package_prewarm: MarmotAppPerformanceOperationSnapshot,

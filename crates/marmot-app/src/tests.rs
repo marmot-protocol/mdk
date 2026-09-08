@@ -5204,6 +5204,7 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     .await
     .expect("transport activation should continue after local readiness");
 
+    let telemetry_before_send = runtime.app_performance_snapshot();
     let send_runtime = runtime.clone();
     let send_group_id = group_id.clone();
     let mut send = tokio::spawn(async move {
@@ -5275,6 +5276,44 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     assert!(
         send_result.is_ok(),
         "transport lifecycle state must not become a terminal send error: {send_result:?}"
+    );
+    let telemetry_after_send = runtime.app_performance_snapshot();
+    let queue_wait_attempts = telemetry_after_send.outbound_message_queue_wait.attempts
+        - telemetry_before_send.outbound_message_queue_wait.attempts;
+    let queue_wait_ms = telemetry_after_send
+        .outbound_message_queue_wait
+        .duration_ms
+        .sum_ms
+        - telemetry_before_send
+            .outbound_message_queue_wait
+            .duration_ms
+            .sum_ms;
+    let handler_attempts = telemetry_after_send.outbound_message_send.attempts
+        - telemetry_before_send.outbound_message_send.attempts;
+    let total_attempts = telemetry_after_send
+        .outbound_message_total_caller_latency
+        .attempts
+        - telemetry_before_send
+            .outbound_message_total_caller_latency
+            .attempts;
+    let total_ms = telemetry_after_send
+        .outbound_message_total_caller_latency
+        .duration_ms
+        .sum_ms
+        - telemetry_before_send
+            .outbound_message_total_caller_latency
+            .duration_ms
+            .sum_ms;
+    assert_eq!(queue_wait_attempts, 1);
+    assert!(
+        queue_wait_ms >= 100,
+        "worker queue wait must include the deliberately blocked activation: {queue_wait_ms}ms"
+    );
+    assert_eq!(handler_attempts, 1);
+    assert_eq!(total_attempts, 1);
+    assert!(
+        total_ms >= queue_wait_ms,
+        "total caller latency ({total_ms}ms) must include worker queue wait ({queue_wait_ms}ms)"
     );
 
     relay.release_subscribe();

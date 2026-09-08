@@ -3068,6 +3068,7 @@ typedef struct MarmotAppPerformanceSnapshot {
   struct MarmotAppPerformanceOperationSnapshot account_group_read_snapshot;
   struct MarmotAppPerformanceOperationSnapshot account_transport_activation;
   struct MarmotAppPerformanceOperationSnapshot account_subscription_registration;
+  struct MarmotAppPerformanceOperationSnapshot account_relay_drain;
   struct MarmotAppPerformanceOperationSnapshot account_catch_up;
   struct MarmotAppPerformanceOperationSnapshot account_sync;
   struct MarmotAppPerformanceOperationSnapshot account_setup_advisory_step;
@@ -3095,7 +3096,9 @@ typedef struct MarmotAppPerformanceSnapshot {
    * verdict since process start.
    */
   uint64_t sqlcipher_migration_probe_skips;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_queue_wait;
   struct MarmotAppPerformanceOperationSnapshot outbound_message_send;
+  struct MarmotAppPerformanceOperationSnapshot outbound_message_total_caller_latency;
   struct MarmotAppPerformanceOperationSnapshot group_create_queue_wait;
   struct MarmotAppPerformanceOperationSnapshot group_create_key_package_lookup;
   struct MarmotAppPerformanceOperationSnapshot group_member_key_package_prewarm;

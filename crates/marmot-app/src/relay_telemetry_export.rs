@@ -173,6 +173,11 @@ pub mod metric_names {
         "app_account_subscription_registration_successes";
     pub const APP_ACCOUNT_SUBSCRIPTION_REGISTRATION_FAILURES: &str =
         "app_account_subscription_registration_failures";
+    /// Account-wide relay delivery drain duration, including checkpointing.
+    pub const APP_ACCOUNT_RELAY_DRAIN_DURATION: &str = "app_account_relay_drain_duration_ms";
+    pub const APP_ACCOUNT_RELAY_DRAIN_ATTEMPTS: &str = "app_account_relay_drain_attempts";
+    pub const APP_ACCOUNT_RELAY_DRAIN_SUCCESSES: &str = "app_account_relay_drain_successes";
+    pub const APP_ACCOUNT_RELAY_DRAIN_FAILURES: &str = "app_account_relay_drain_failures";
     /// Multi-account catch-up duration histogram.
     pub const APP_ACCOUNT_CATCH_UP_DURATION: &str = "app_account_catch_up_duration_ms";
     /// Multi-account catch-up attempts.
@@ -286,14 +291,32 @@ pub mod metric_names {
     /// Existing-database opens that skipped the recovery probe via a cached
     /// v2-open verdict (each avoided one passphrase KDF derivation, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_SKIPS: &str = "app_sqlcipher_migration_probe_skips";
-    /// One-sided outbound message send duration histogram.
+    /// Time an outbound message command waits for the account worker.
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION: &str =
+        "app_outbound_message_queue_wait_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS: &str =
+        "app_outbound_message_queue_wait_attempts";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES: &str =
+        "app_outbound_message_queue_wait_successes";
+    pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES: &str =
+        "app_outbound_message_queue_wait_failures";
+    /// Outbound message handler execution duration histogram.
     pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
-    /// One-sided outbound message send attempts.
+    /// Outbound message handler attempts.
     pub const APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS: &str = "app_outbound_message_send_attempts";
-    /// Successful one-sided outbound message sends.
+    /// Successful outbound message handlers.
     pub const APP_OUTBOUND_MESSAGE_SEND_SUCCESSES: &str = "app_outbound_message_send_successes";
-    /// Failed one-sided outbound message sends.
+    /// Failed outbound message handlers.
     pub const APP_OUTBOUND_MESSAGE_SEND_FAILURES: &str = "app_outbound_message_send_failures";
+    /// Total host-call latency for an outbound message.
+    pub const APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_DURATION: &str =
+        "app_outbound_message_total_caller_latency_duration_ms";
+    pub const APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_ATTEMPTS: &str =
+        "app_outbound_message_total_caller_latency_attempts";
+    pub const APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_SUCCESSES: &str =
+        "app_outbound_message_total_caller_latency_successes";
+    pub const APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_FAILURES: &str =
+        "app_outbound_message_total_caller_latency_failures";
     /// Group-create queue wait metrics.
     pub const APP_GROUP_CREATE_QUEUE_WAIT_DURATION: &str =
         "app_group_create_queue_wait_duration_ms";
@@ -1074,6 +1097,14 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.account_relay_drain,
+        metric_names::APP_ACCOUNT_RELAY_DRAIN_DURATION,
+        metric_names::APP_ACCOUNT_RELAY_DRAIN_ATTEMPTS,
+        metric_names::APP_ACCOUNT_RELAY_DRAIN_SUCCESSES,
+        metric_names::APP_ACCOUNT_RELAY_DRAIN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.account_catch_up,
         metric_names::APP_ACCOUNT_CATCH_UP_DURATION,
         metric_names::APP_ACCOUNT_CATCH_UP_ATTEMPTS,
@@ -1178,11 +1209,27 @@ fn append_app_performance_points(
     );
     append_app_operation_points(
         points,
+        &app_performance.outbound_message_queue_wait,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_QUEUE_WAIT_FAILURES,
+    );
+    append_app_operation_points(
+        points,
         &app_performance.outbound_message_send,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_DURATION,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_SUCCESSES,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.outbound_message_total_caller_latency,
+        metric_names::APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_DURATION,
+        metric_names::APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_ATTEMPTS,
+        metric_names::APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_SUCCESSES,
+        metric_names::APP_OUTBOUND_MESSAGE_TOTAL_CALLER_LATENCY_FAILURES,
     );
     append_app_operation_points(
         points,

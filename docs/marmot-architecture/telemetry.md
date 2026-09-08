@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-07
+updated: 2026-09-08
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -21,7 +21,7 @@ runtime. It complements the policy docs:
 | --- | --- | --- | --- |
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
-| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, sync/catch-up, host splash/foreground readiness, one-sided outbound message send, group invite/admin/read/accept operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. Exposed locally via `MarmotAppRuntime::app_performance_snapshot()` and the MarmotKit `appPerformanceSnapshot()` binding. | No by itself. Local getters return the aggregate snapshot to the host process only. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
+| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, local account open, transport activation, subscription registration, account-wide relay drain, sync/catch-up, host splash/foreground readiness, outbound-message worker wait/handler/total caller latency, group invite/admin/read/accept operations, and media upload/download. Process-wide SQLCipher interrupted-migration probe run/skip counters (mdk#1439) are merged into the snapshot from `sqlcipher.rs`. Exposed locally via `MarmotAppRuntime::app_performance_snapshot()` and the MarmotKit `appPerformanceSnapshot()` binding. | No by itself. Local getters return the aggregate snapshot to the host process only. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay metrics may carry only `relay`; account sync/catch-up failure counters carry only the closed `failure_stage` and `error_class` attributes. Other app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Agent connector reconciliation telemetry | Always collected while `wn-agent` runs: process-local cumulative counters for the shared inbound catch-up driver and the invite-policy worker (passes, outcomes, accounts/candidate rows considered), plus one privacy-safe `tracing` event per scheduled pass carrying a `source` label, duration, result, and aggregate counts (mdk#1380). | No. Counters are process-local; tracing events follow the no-ids/no-urls/no-content rules. | [`reconcile_telemetry.rs`](../../crates/agent-connector/src/reconcile_telemetry.rs), [`event_projection.rs`](../../crates/agent-connector/src/event_projection.rs), [`invite_policy.rs`](../../crates/agent-connector/src/invite_policy.rs) |
 | Engine convergence/outbound telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg, convergence-pass, foreground deferred-peel, outbound-phase, and queued-intent counters/histograms. Exposed locally by `Engine::engine_metrics()`. The full `EngineMetricsSnapshot` is device-local only. The relay-plane/export structs accept only an optional `EngineReorgMetrics` projection, and the periodic runtime exporter passes `None`. | No via the runtime exporter today. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
@@ -221,6 +221,7 @@ Collected operations:
 | `account_group_read_snapshot` | The full startup `GroupReadSnapshot` capture after the ready signal. | Scales with groups × members; snapshot answers worker read commands during initial catch-up. |
 | `account_transport_activation` | Initial account signer installation and inbox transport activation after local readiness. | Runs asynchronously after the worker ready signal; includes no caller-supplied relay label. |
 | `account_subscription_registration` | Initial registration of the hydrated account's group subscriptions. | Runs after transport activation and before relay catch-up; a slow registration cannot delay local readiness. |
+| `account_relay_drain` | One `sync_sdk_relay` pass from the start of account-wide delivery draining through its checkpoint. | Separates relay receive/ingest/checkpoint work from transport activation, subscription registration, overflow recovery, and the remaining `account_sync` envelope. |
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
 | `account_sync` | The initial asynchronous account network/bootstrap phase and each later account-worker `client.sync()` catch-up. | The startup sample includes transport preparation, relay data drain, processing, projection/state update, and relay-dependent open maintenance; later samples cover catch-up only. |
 | `account_setup_identity_local` | Generated identity/keychain creation plus durable local account record initialization. | Ends before relay work. |
@@ -231,7 +232,9 @@ Collected operations:
 | `account_initial_key_package_publish` | Initial KeyPackage relay publication and durable confirmation. | Background and retryable from the exact persisted artifact. |
 | `account_setup_local_ready_handoff` | Complete generated-account caller latency through local worker readiness. | The host may render local state but must not claim invite readiness. |
 | `account_setup_network_ready` | Background work from local-ready scheduling through bootstrap and KeyPackage confirmation plus journal completion. | Success is the invite-receivable boundary. |
-| `outbound_message_send` | Worker `SendMessage` and `SendAppEvent` commands until their send call returns a `SendSummary` or error. | One-sided local send/publish confirmation only. It is not end-to-end remote delivery or read latency. |
+| `outbound_message_queue_wait` | Time from enqueueing `SendMessage` or `SendAppEvent` until the account worker begins handling it. | Isolates delay behind startup sync, explicit catch-up, convergence maintenance, or another worker command. |
+| `outbound_message_send` | Account-worker handler execution from the start of the selected conversation's send call until it returns a `SendSummary` or error. | Excludes queue wait. One-sided local send/publish confirmation only; it is not end-to-end remote delivery or read latency. |
+| `outbound_message_total_caller_latency` | Full `AccountManager` host call from method entry through account-worker resolution, queue wait, send execution, and response handoff. | Compare with queue wait and handler execution to locate first-send latency without recording an account, group, or message identifier. |
 | `group_create_key_package_lookup` | Total create-time member KeyPackage lookup from canonicalization through validated result collection. | Preserved aggregate dimension; includes either cache-only reuse or create-time relay resolution below. |
 | `group_member_key_package_prewarm` | Host/runtime composition prewarm for the current member set. | Aggregate duration only. No member count label, account/relay identity, reservation, or package consumption. |
 | `group_create_key_package_cache_reuse` | Successful create-time lookup when every canonical member was satisfied by revalidated local/directory state. | Closed operation name, not a caller-supplied label. A prewarm should shift the later Create wait into this bucket. |
@@ -536,6 +539,10 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_account_subscription_registration_attempts` | none | Counter | `AppPerformanceSnapshot.account_subscription_registration.attempts` |
 | `app_account_subscription_registration_successes` | none | Counter | `AppPerformanceSnapshot.account_subscription_registration.successes` |
 | `app_account_subscription_registration_failures` | none | Counter | `AppPerformanceSnapshot.account_subscription_registration.failures` |
+| `app_account_relay_drain_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_relay_drain.duration_ms` |
+| `app_account_relay_drain_attempts` | none | Counter | `AppPerformanceSnapshot.account_relay_drain.attempts` |
+| `app_account_relay_drain_successes` | none | Counter | `AppPerformanceSnapshot.account_relay_drain.successes` |
+| `app_account_relay_drain_failures` | none | Counter | `AppPerformanceSnapshot.account_relay_drain.failures` |
 | `app_account_catch_up_duration_ms` | none | Histogram | `AppPerformanceSnapshot.account_catch_up.duration_ms` |
 | `app_account_catch_up_attempts` | none | Counter | `AppPerformanceSnapshot.account_catch_up.attempts` |
 | `app_account_catch_up_successes` | none | Counter | `AppPerformanceSnapshot.account_catch_up.successes` |
@@ -544,10 +551,18 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `app_account_sync_attempts` | none | Counter | `AppPerformanceSnapshot.account_sync.attempts` |
 | `app_account_sync_successes` | none | Counter | `AppPerformanceSnapshot.account_sync.successes` |
 | `app_account_sync_failures` | `failure_stage`, `error_class` | Counter | `AppPerformanceSnapshot.account_sync.failure_classifications` (sums to `.failures`) |
+| `app_outbound_message_queue_wait_duration_ms` | none | Histogram | `AppPerformanceSnapshot.outbound_message_queue_wait.duration_ms` |
+| `app_outbound_message_queue_wait_attempts` | none | Counter | `AppPerformanceSnapshot.outbound_message_queue_wait.attempts` |
+| `app_outbound_message_queue_wait_successes` | none | Counter | `AppPerformanceSnapshot.outbound_message_queue_wait.successes` |
+| `app_outbound_message_queue_wait_failures` | none | Counter | `AppPerformanceSnapshot.outbound_message_queue_wait.failures` |
 | `app_outbound_message_send_duration_ms` | none | Histogram | `AppPerformanceSnapshot.outbound_message_send.duration_ms` |
 | `app_outbound_message_send_attempts` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.attempts` |
 | `app_outbound_message_send_successes` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.successes` |
 | `app_outbound_message_send_failures` | none | Counter | `AppPerformanceSnapshot.outbound_message_send.failures` |
+| `app_outbound_message_total_caller_latency_duration_ms` | none | Histogram | `AppPerformanceSnapshot.outbound_message_total_caller_latency.duration_ms` |
+| `app_outbound_message_total_caller_latency_attempts` | none | Counter | `AppPerformanceSnapshot.outbound_message_total_caller_latency.attempts` |
+| `app_outbound_message_total_caller_latency_successes` | none | Counter | `AppPerformanceSnapshot.outbound_message_total_caller_latency.successes` |
+| `app_outbound_message_total_caller_latency_failures` | none | Counter | `AppPerformanceSnapshot.outbound_message_total_caller_latency.failures` |
 | `app_group_conversation_snapshot_read_duration_ms` | none | Histogram | `AppPerformanceSnapshot.group_conversation_snapshot_read.duration_ms` |
 | `app_group_conversation_snapshot_read_attempts` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.attempts` |
 | `app_group_conversation_snapshot_read_successes` | none | Counter | `AppPerformanceSnapshot.group_conversation_snapshot_read.successes` |
