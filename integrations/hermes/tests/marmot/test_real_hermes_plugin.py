@@ -13,18 +13,29 @@ import argparse
 import asyncio
 import importlib
 import inspect
+import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hermes-source", type=Path, required=True)
-    parser.add_argument("--mdk-source", type=Path, required=True)
-    parser.add_argument("--mdk-ref", required=True)
+    parser.add_argument("--hermes-source", type=Path)
+    parser.add_argument("--mdk-source", type=Path)
+    parser.add_argument("--mdk-ref")
+    parser.add_argument(
+        "--internal-mode",
+        choices=("busy-crash-child", "busy-crash-probe"),
+    )
+    parser.add_argument("--test-home", type=Path)
+    parser.add_argument("--spool-path", type=Path)
+    parser.add_argument("--marker", type=Path)
+    parser.add_argument("--followup-id")
     parser.add_argument(
         "--expect-source-install-mode",
         choices=("monorepo", "plugin-only"),
@@ -233,14 +244,21 @@ async def _exercise_media_routes(adapter_module, platform_config, temp_root: Pat
     return {"connector_calls": len(fake.calls), "routes": routes}
 
 
-async def _exercise_busy_session_crash_boundary(adapter_module, platform_config, temp_root: Path):
-    """Use the pinned real BasePlatformAdapter busy path, then lose host memory."""
+async def _run_busy_session_until_killed(
+    adapter_module,
+    platform_config,
+    temp_root: Path,
+    spool_path: Path,
+    marker: Path,
+):
+    """Reach the real busy-session handoff and remain killable at that boundary."""
 
     config = platform_config(
         enabled=True,
         extra={
             "account_id_hex": "11" * 32,
             "home": str(temp_root / "busy-session-marmot-home"),
+            "inbound_spool_path": str(spool_path),
             "group_activation": "always",
             "profile_name_onboarding": False,
         },
@@ -290,28 +308,90 @@ async def _exercise_busy_session_crash_boundary(adapter_module, platform_config,
             f"busy follow-up was not preserved as unknown before crash: {before_crash!r}"
         )
 
-    # Model abrupt process loss: durable storage survives while every in-memory
-    # pending message and host task disappears without a graceful spool release.
-    adapter._inbound_spool.close(graceful=False)
-    adapter._pending_messages.clear()
-    for task in tuple(adapter._session_tasks.values()):
-        task.cancel()
-    await asyncio.gather(*tuple(adapter._session_tasks.values()), return_exceptions=True)
-    adapter._session_tasks.clear()
-    adapter._active_sessions.clear()
+    marker.write_text(followup_id)
+    while True:
+        await asyncio.sleep(3600)
 
-    recovery = adapter._inbound_spool.open()
-    try:
-        after_crash = adapter._inbound_spool.get(followup_id)
-        if after_crash is None or after_crash.state != "unresolved":
+
+def _wait_for_marker(marker: Path, child: subprocess.Popen, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker.is_file():
+            return
+        if child.poll() is not None:
+            stdout, stderr = child.communicate()
             raise AssertionError(
-                f"busy follow-up disappeared or claimed completion after crash: {after_crash!r}"
+                "busy-session crash child exited before the handoff boundary: "
+                f"exit={child.returncode}, stdout={stdout!r}, stderr={stderr!r}"
             )
-        if after_crash.disposition != "host_handoff_outcome_unknown":
-            raise AssertionError(f"unexpected busy follow-up disposition: {after_crash!r}")
-        return {"state": after_crash.state, "recovery": recovery}
+        time.sleep(0.02)
+    raise AssertionError("busy-session crash child did not reach the handoff boundary")
+
+
+def _exercise_busy_session_process_death(
+    hermes_source: Path,
+    home: Path,
+) -> dict:
+    """SIGKILL the real busy-session path, then probe durability in a second process."""
+
+    spool_path = home / "busy-session-spool.sqlite3"
+    marker = home / "busy-session-ready"
+    followup_id = "55" * 32
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            __file__,
+            "--internal-mode",
+            "busy-crash-child",
+            "--hermes-source",
+            str(hermes_source),
+            "--test-home",
+            str(home),
+            "--spool-path",
+            str(spool_path),
+            "--marker",
+            str(marker),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_marker(marker, child)
+        os.kill(child.pid, signal.SIGKILL)
+        if child.wait(timeout=5) != -signal.SIGKILL:
+            raise AssertionError(f"busy-session crash child was not killed: {child.returncode}")
     finally:
-        adapter._inbound_spool.close()
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            __file__,
+            "--internal-mode",
+            "busy-crash-probe",
+            "--test-home",
+            str(home),
+            "--spool-path",
+            str(spool_path),
+            "--followup-id",
+            followup_id,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    result = json.loads(probe.stdout)
+    if result["state"] != "unresolved":
+        raise AssertionError(f"busy follow-up was not retained after SIGKILL: {result!r}")
+    if result["disposition"] != "host_handoff_outcome_unknown":
+        raise AssertionError(f"busy follow-up lost its handoff disposition: {result!r}")
+    if followup_id in result["due_ids"]:
+        raise AssertionError(f"busy follow-up became eligible for duplicate execution: {result!r}")
+    return result
 
 
 def _module_matches_path(module, expected: Path) -> bool:
@@ -399,8 +479,88 @@ def _plugin_only_repository(mdk_source: Path, mdk_ref: str, temp_root: Path) -> 
     return repository
 
 
+def _load_installed_adapter(hermes_source: Path, home: Path):
+    os.environ["HOME"] = str(home)
+    os.environ["HERMES_HOME"] = str(home / ".hermes")
+    if (hermes_source / "hermes_cli" / "plugins_cmd.py").is_file():
+        sys.path.insert(0, str(hermes_source))
+    plugins_module = importlib.import_module("hermes_cli.plugins")
+    manager = plugins_module.PluginManager()
+    manager.discover_and_load(force=True)
+    plugin_dir = home / ".hermes" / "plugins" / "marmot"
+    adapter_file = (plugin_dir / "adapter.py").resolve()
+    adapter_module = next(
+        (
+            module
+            for module in tuple(sys.modules.values())
+            if module is not None and _module_matches_path(module, adapter_file)
+        ),
+        None,
+    )
+    if adapter_module is None:
+        raise AssertionError("crash child could not load installed Marmot adapter")
+    config_module = importlib.import_module("gateway.config")
+    return adapter_module, config_module.PlatformConfig
+
+
+def _run_internal_mode(args: argparse.Namespace) -> int:
+    if args.test_home is None or args.spool_path is None:
+        raise SystemExit("internal mode requires --test-home and --spool-path")
+    if args.internal_mode == "busy-crash-child":
+        if args.hermes_source is None or args.marker is None:
+            raise SystemExit("busy crash child requires --hermes-source and --marker")
+        adapter_module, platform_config = _load_installed_adapter(
+            args.hermes_source.resolve(), args.test_home.resolve()
+        )
+        asyncio.run(
+            _run_busy_session_until_killed(
+                adapter_module,
+                platform_config,
+                args.test_home.resolve(),
+                args.spool_path.resolve(),
+                args.marker.resolve(),
+            )
+        )
+        return 0
+    if args.followup_id is None:
+        raise SystemExit("busy crash probe requires --followup-id")
+    plugin_dir = args.test_home.resolve() / ".hermes" / "plugins" / "marmot"
+    spec = importlib.util.spec_from_file_location(
+        "real_hermes_crash_probe_spool", plugin_dir / "inbound_spool.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("crash probe could not load installed inbound spool")
+    spool_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = spool_module
+    spec.loader.exec_module(spool_module)
+    store = spool_module.InboundSpool(args.spool_path.resolve())
+    recovery = store.open()
+    try:
+        record = store.get(args.followup_id)
+        if record is None:
+            raise AssertionError("busy follow-up disappeared after SIGKILL")
+        print(
+            json.dumps(
+                {
+                    "state": record.state,
+                    "disposition": record.disposition,
+                    "due_ids": [item.message_id for item in store.due()],
+                    "recovery": recovery,
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        store.close()
+    return 0
+
+
 def main() -> int:
     args = _parse_args()
+    if args.internal_mode is not None:
+        return _run_internal_mode(args)
+    if args.hermes_source is None or args.mdk_source is None or args.mdk_ref is None:
+        raise SystemExit("--hermes-source, --mdk-source, and --mdk-ref are required")
     hermes_source = args.hermes_source.resolve()
     mdk_source = args.mdk_source.resolve()
     source_checkout = (hermes_source / "hermes_cli" / "plugins_cmd.py").is_file()
@@ -531,11 +691,7 @@ def main() -> int:
         media_calls = asyncio.run(
             _exercise_media_routes(adapter_module, config_module.PlatformConfig, home)
         )
-        busy_session = asyncio.run(
-            _exercise_busy_session_crash_boundary(
-                adapter_module, config_module.PlatformConfig, home
-            )
-        )
+        busy_session = _exercise_busy_session_process_death(hermes_source, home)
 
         print(
             "real-hermes plugin install/discovery/media passed "
