@@ -755,3 +755,38 @@ fn presented_snapshot_is_complete_read_only_and_clears_replaced_peer() {
         "a new peer must not inherit the old selection"
     );
 }
+
+#[test]
+fn dirty_fallback_remains_fallback_in_both_presentation_reads() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let mut fallback = value("bb", "Peer", 1);
+    fallback.presentation.resolution = PresentationResolution::Fallback;
+    fallback.presentation.title_source = PresentationSource::PeerFallback;
+    store.store_chat_presentation(&input, &fallback).unwrap();
+    store.lock().unwrap().execute(
+        "UPDATE chat_list_rows SET presentation_source_revision = presentation_source_revision + 1",
+        [],
+    ).unwrap();
+    let ChatPresentationRead::Ready(retained) = store.chat_presentation("11").unwrap() else {
+        panic!("same-subject fallback remains renderable");
+    };
+    assert_eq!(
+        retained.presentation.resolution,
+        PresentationResolution::Fallback
+    );
+    let snapshot = store
+        .read_presented_chat_list(
+            crate::ChatListQuery {
+                include_archived: true,
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.rows[0].presentation.resolution,
+        PresentationResolution::Fallback
+    );
+}

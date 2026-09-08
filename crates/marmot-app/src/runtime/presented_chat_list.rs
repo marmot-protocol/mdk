@@ -4,7 +4,7 @@ use super::{
 };
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::{AppError, MarmotApp, PresentedChatListSnapshot, PresentedChatRow};
-use storage_sqlite::ChatListQuery;
+use storage_sqlite::{ChatListQuery, SqliteAccountStorage};
 use tokio::sync::{broadcast, watch};
 
 /// A complete replacement. Sequence orders all row changes, even at equal presentation revisions.
@@ -143,7 +143,8 @@ impl MarmotAppRuntime {
             _ = wait_for_runtime_shutdown(&mut stopping) => return Err(AppError::RuntimeStopping),
             result = prepared_snapshot(self.accounts.app.clone(), account.label.clone(), account.account_id_hex.clone(), include_archived, None) => result?,
         };
-        // Only invalidations are consumed from the legacy handle.
+        // Reusing legacy routing currently costs an extra initial row read. Discard that
+        // snapshot: only its invalidations are consumed, never its display payload.
         legacy.snapshot.clear();
         Ok(RuntimePresentedChatListSubscription {
             current: snapshot.clone(),
@@ -174,58 +175,75 @@ async fn prepared_snapshot(
         let label = label.clone();
         let account_id = account_id.clone();
         let group = group.clone();
-        let (snapshot, progressed) = blocking_app_task(move || {
+        let snapshot = blocking_app_task(move || {
             let account = app.account_home().account(&label)?;
             if account.account_id_hex != account_id {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
             app.ensure_account_state(&label)?;
+            app.ensure_chat_list_projection(&account)?;
             let storage = app.account_storage(&label)?;
-            if let Some(mut snapshot) = storage
-                .read_presented_chat_list(ChatListQuery { include_archived }, group.as_deref())?
-            {
-                // Sender-preview enrichment uses the shared cache after releasing the account
-                // transaction. Revalidate selected identity before publishing that enrichment.
-                let mut rows = snapshot
-                    .rows
-                    .iter()
-                    .map(|r| r.row.clone())
-                    .collect::<Vec<_>>();
-                app.hydrate_chat_list_rows(&mut rows)?;
-                for (selected, row) in snapshot.rows.iter_mut().zip(rows) {
-                    selected.row = row;
-                }
-                if storage.chat_presentation_version()? == snapshot.presentation_version {
-                    return Ok((Some(snapshot), false));
-                }
-                return Ok((None, true));
-            }
-            let classifier = MarmotApp::chat_list_mention_classifier(&account.account_id_hex);
-            let mut progressed = false;
-            for missing in storage.pending_chat_presentation_rows()? {
-                progressed |= storage.initialize_chat_presentation_row(
-                    &account.account_id_hex,
-                    &missing,
-                    &classifier,
-                )?;
-            }
-            progressed |= crate::chat_presentation::maintenance::maintain(
+            let snapshot = read_or_prepare(
                 &storage,
-                &app.shared_storage()?,
-                &account.account_id_hex,
+                ChatListQuery { include_archived },
+                group.as_deref(),
+                || {
+                    let result = crate::chat_presentation::maintenance::prepare_batch(
+                        &storage,
+                        &app.shared_storage()?,
+                        &account.account_id_hex,
+                    );
+                    app.presentation_signals.wake();
+                    result
+                },
             )?;
-            app.presentation_signals.wake();
-            Ok((None, progressed))
+            snapshot
+                .map(|mut snapshot| {
+                    // Rows, selected identity and version are already one atomic snapshot.
+                    // Preview sender/attachment enrichment is independent of that selection.
+                    let mut rows = snapshot
+                        .rows
+                        .iter()
+                        .map(|r| r.row.clone())
+                        .collect::<Vec<_>>();
+                    app.hydrate_chat_list_rows(&mut rows)?;
+                    for (selected, row) in snapshot.rows.iter_mut().zip(rows) {
+                        selected.row = row;
+                    }
+                    Ok(snapshot)
+                })
+                .transpose()
         })
         .await?;
         if let Some(snapshot) = snapshot {
             return Ok(snapshot);
         }
-        if !progressed {
-            return Err(AppError::ChatPresentationNotReady);
-        }
         tokio::task::yield_now().await;
     }
+}
+
+/// A ready read is read-only. First-use preparation also works before account workers start.
+/// The same bounded batch implementation is used by the worker, with storage CAS protecting
+/// concurrent preparers. Re-read before interpreting its progress flag: a lost CAS can mean
+/// another caller completed the result, or advanced a multi-batch preparation.
+fn read_or_prepare(
+    storage: &SqliteAccountStorage,
+    query: ChatListQuery,
+    group: Option<&str>,
+    prepare: impl FnOnce() -> Result<bool, AppError>,
+) -> Result<Option<PresentedChatListSnapshot>, AppError> {
+    if let Some(snapshot) = storage.read_presented_chat_list(query.clone(), group)? {
+        return Ok(Some(snapshot));
+    }
+    let checkpoint = storage.chat_presentation_checkpoint()?;
+    let progressed = prepare()?;
+    if let Some(snapshot) = storage.read_presented_chat_list(query, group)? {
+        return Ok(Some(snapshot));
+    }
+    if progressed || storage.chat_presentation_checkpoint()?.generation != checkpoint.generation {
+        return Ok(None);
+    }
+    Err(AppError::ChatPresentationNotReady)
 }
 
 #[cfg(test)]
@@ -235,6 +253,97 @@ mod tests {
     use marmot_account::AccountHome;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn presented_preparation_observes_worker_progress_and_reports_stalled_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        client.create_group("Pending", &[]).await.unwrap();
+        app.ensure_chat_list_projection(&account).unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let query = ChatListQuery {
+            include_archived: true,
+        };
+        assert!(
+            storage
+                .read_presented_chat_list(query.clone(), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            read_or_prepare(&storage, query.clone(), None, || Ok(false)),
+            Err(AppError::ChatPresentationNotReady)
+        ));
+        // Deterministic interleaving: the owner advances the checkpoint after the reader's
+        // miss, but the reader's own stale CAS reports no progress. The result is not ready
+        // yet, so retry only because the durable checkpoint really advanced.
+        let mut worker = super::super::presentation::PresentationMaintenance::default();
+        let partial = read_or_prepare(&storage, query.clone(), None, || {
+            assert!(worker.run(&client, &account.account_id_hex)?);
+            Ok(false)
+        })
+        .unwrap();
+        assert!(partial.is_none());
+        // The owner completes before the losing preparer returns false. Re-read wins
+        // over that stale progress flag and returns the complete row without an error.
+        let ready = read_or_prepare(&storage, query.clone(), None, || {
+            while worker.run(&client, &account.account_id_hex)? {}
+            Ok(false)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready.rows.len(), 1);
+        let repeat = read_or_prepare(&storage, query, None, || {
+            panic!("ready reads must not prepare")
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready, repeat);
+    }
+
+    #[tokio::test]
+    async fn presented_one_shot_warms_and_refreshes_legacy_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("Before", &[]).await.unwrap();
+        let id = hex::encode(group.as_slice());
+        let runtime = MarmotAppRuntime::new(app.clone());
+        // Neither legacy list reads nor a subscription have warmed the projection.
+        let first = runtime.presented_chat_list("alice", false).await.unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert!(
+            app.chat_list_projection_warmed
+                .lock()
+                .unwrap()
+                .contains("alice")
+        );
+        let mut state = app.load_state("alice").unwrap();
+        state.groups[0].profile.name = "After".into();
+        app.save_state(&state).unwrap();
+        let row = runtime
+            .presented_chat_list_row("alice", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.row.group_name, "After");
+        assert!(
+            !app.chat_list_projection_stale
+                .lock()
+                .unwrap()
+                .contains("alice")
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn presented_list_prepares_offline_and_orders_nonpresentation_updates() {

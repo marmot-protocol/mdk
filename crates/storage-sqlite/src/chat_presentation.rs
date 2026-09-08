@@ -146,6 +146,14 @@ fn decode_envelope(bytes: &[u8]) -> StorageResult<Envelope> {
     }
     Ok(envelope)
 }
+// Preserve the absence of usable evidence while a fallback is dirty.
+fn decode_retained(bytes: &[u8], dirty: bool) -> StorageResult<StoredChatPresentation> {
+    let mut value = decode_envelope(bytes)?.value;
+    if dirty && value.presentation.resolution == PresentationResolution::Cached {
+        value.presentation.resolution = PresentationResolution::LastKnown;
+    }
+    Ok(value)
+}
 fn invalid(detail: &str) -> StorageError {
     StorageError::Serialization(detail.to_owned())
 }
@@ -182,13 +190,9 @@ impl SqliteAccountStorage {
         match row {
             None => Ok(ChatPresentationRead::Missing),
             Some((None, _)) => Ok(ChatPresentationRead::Pending),
-            Some((Some(bytes), dirty)) => {
-                let mut envelope = decode_envelope(&bytes)?;
-                if dirty {
-                    envelope.value.presentation.resolution = PresentationResolution::LastKnown;
-                }
-                Ok(ChatPresentationRead::Ready(Box::new(envelope.value)))
-            }
+            Some((Some(bytes), dirty)) => Ok(ChatPresentationRead::Ready(Box::new(
+                decode_retained(&bytes, dirty)?,
+            ))),
         }
     }
     /// The pending partial index is the durable backfill worklist. Committed rows leave it;
@@ -563,20 +567,32 @@ impl SqliteAccountStorage {
             Some(group) => crate::chat_list::chat_list_row_tx(&tx, group)?
                 .into_iter()
                 .collect(),
-            None => crate::chat_list::chat_list_rows_tx(&tx, query)?,
+            None => crate::chat_list::chat_list_rows_tx(&tx, query.clone())?,
         };
+        // One cached query for all selected envelopes; keyed reads retain an indexed lookup.
+        let mut statement = tx.prepare_cached(match group {
+            Some(_) => "SELECT group_id_hex, presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex = ?1",
+            None if query.include_archived => "SELECT group_id_hex, presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows",
+            None => "SELECT group_id_hex, presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE archived = 0",
+        }).storage()?;
+        let parameters: Vec<&str> = group.into_iter().collect();
+        let mut selections = statement
+            .query_map(rusqlite::params_from_iter(parameters), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, Option<Vec<u8>>>(1)?, r.get::<_, bool>(2)?),
+                ))
+            })
+            .storage()?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+            .storage()?;
+        drop(statement);
         let mut presented = Vec::with_capacity(rows.len());
         for row in rows {
-            let (bytes, dirty): (Option<Vec<u8>>, bool) = tx.query_row(
-                "SELECT presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex = ?1",
-                [&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?))).storage()?;
-            let Some(bytes) = bytes else {
+            let Some((Some(bytes), dirty)) = selections.remove(&row.group_id_hex) else {
                 return Ok(None);
             };
-            let mut presentation = decode_envelope(&bytes)?.value.presentation;
-            if dirty {
-                presentation.resolution = PresentationResolution::LastKnown;
-            }
+            let presentation = decode_retained(&bytes, dirty)?.presentation;
             presented.push(PresentedChatRow { row, presentation });
         }
         let presentation_version = tx

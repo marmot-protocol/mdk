@@ -7,6 +7,22 @@ use storage_sqlite::{
     StoredChatPresentation,
 };
 
+/// One local preparation batch shared by the account worker and offline first reads.
+/// Storage CAS checks make overlapping callers safe; `false` alone does not establish
+/// readiness because another caller may have committed the work in the meantime.
+pub(crate) fn prepare_batch(
+    account: &SqliteAccountStorage,
+    shared: &SqliteSharedStorage,
+    local: &str,
+) -> Result<bool, AppError> {
+    let classifier = crate::MarmotApp::chat_list_mention_classifier(local);
+    let mut initialized = false;
+    for group in account.pending_chat_presentation_rows()? {
+        initialized |= account.initialize_chat_presentation_row(local, &group, &classifier)?;
+    }
+    Ok(maintain(account, shared, local)? || initialized)
+}
+
 fn prepare(
     shared: &SqliteSharedStorage,
     local: &str,
