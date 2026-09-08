@@ -47,7 +47,7 @@ from the existing multi-replay escalation that reports an unrepaired stall. The 
 replace cryptographic state. It does not change `pending_confirmation` or the authoritative membership roster.
 Hosts subscribe to `GroupStateUpdated` and reread the recovery query, including after opening an account.
 
-Migration 65 adds bounded advisory evidence tables and gates the new serialized recovery fields against older writers.
+Migration 66 adds bounded advisory evidence tables and gates the new serialized recovery fields against older writers.
 Existing history and invitation acceptance are preserved on upgrade. An intent already deleted by a previous MDK
 version cannot be reconstructed: an affected existing group can still expose the advisory warning and recover through
 a new invitation plus explicit rejoin. Client applications must adopt the new query and confirmation APIs to render

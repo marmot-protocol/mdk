@@ -8,6 +8,7 @@
 mod account_projection;
 mod agent_stream_sequences;
 mod chat_list;
+mod chat_presentation;
 mod codec;
 mod connection;
 mod encrypted_media_secrets;
@@ -34,6 +35,12 @@ pub use chat_list::{
     AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,
     ChatPinState, ExistingDirectConversation, select_reusable_direct_conversation,
+};
+pub use chat_presentation::{
+    CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationInput, ChatPresentationRead,
+    ChatPresentationVersion, ChatPresentationWrite, ConversationPresentation,
+    PresentationResolution, PresentationSource, PresentationText, SelectedAvatar,
+    StoredChatPresentation,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;

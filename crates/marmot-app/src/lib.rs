@@ -79,6 +79,7 @@ mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;
 mod audit_log;
+mod chat_presentation;
 mod client;
 mod config;
 mod conversions;

@@ -29,6 +29,7 @@ use crypto::{
     canonical_media_type_v1, canonical_media_type_v2, derive_media_file_key, media_aad,
     media_hash_from_reference, media_nonce_from_reference, validate_sha256_hex,
 };
+pub(crate) use host_safety::parse_profile_image_fetch_url;
 use host_safety::validate_locator;
 
 pub use blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
