@@ -94,6 +94,8 @@ pub(crate) enum AuditUploadAttempt {
 
 /// Retry-After accepts either delta seconds or an HTTP date. Bound untrusted
 /// deadlines to five minutes so one response cannot silence incident evidence for a day.
+/// `None` means the header was absent. A header we cannot parse is still a
+/// request to retry, so it yields a zero minimum instead of disappearing.
 fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
     let value = value?.trim();
     let delay = value
@@ -104,7 +106,8 @@ fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
             httpdate::parse_http_date(value)
                 .ok()
                 .map(|date| date.duration_since(now).unwrap_or_default())
-        })?;
+        })
+        .unwrap_or_default();
     Some(delay.min(Duration::from_secs(5 * 60)))
 }
 
@@ -150,9 +153,14 @@ impl AuditUploadSnapshot {
 pub(crate) enum AuditUploadOutcome {
     /// The endpoint accepted the file's whole content.
     Uploaded,
-    /// The file is larger than the endpoint's per-request ceiling, so no
-    /// automatic upload can ever accept it. Recorded so the tracker reports it
-    /// once instead of re-attempting on every trigger.
+    /// The tracker will not re-post this file's content: it is over the local
+    /// `AUDIT_LOG_UPLOAD_MAX_BYTES` ceiling, or the endpoint answered `413`
+    /// without `Retry-After` (RFC 9110 15.5.14 has a server send that header
+    /// when the refusal is temporary). Recorded so the tracker reports it once
+    /// instead of re-attempting on every trigger. Like every checkpoint entry
+    /// it is keyed on the file's size and mtime, so deleting the sidecar clears
+    /// it, and a manual per-file upload never consults it. A `413` that
+    /// carries `Retry-After` is a cooldown, not this outcome.
     TooLargeToUpload,
 }
 
@@ -606,7 +614,7 @@ impl MarmotApp {
                     response
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok()),
+                        .map(|value| value.to_str().unwrap_or_default()),
                     SystemTime::now(),
                 ),
             });
@@ -911,8 +919,13 @@ mod tests {
             audit_retry_after(Some("18446744073709551615"), now),
             Some(Duration::from_secs(300))
         );
-        for value in [None, Some("nonsense"), Some("-1")] {
-            assert_eq!(audit_retry_after(value, now), None);
+        assert_eq!(audit_retry_after(None, now), None);
+        for malformed in ["nonsense", "-1", ""] {
+            assert_eq!(
+                audit_retry_after(Some(malformed), now),
+                Some(Duration::ZERO),
+                "a malformed Retry-After is still a request to retry"
+            );
         }
     }
 

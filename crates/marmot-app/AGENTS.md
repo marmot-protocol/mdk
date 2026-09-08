@@ -58,7 +58,13 @@ App runtime bridge for the first real Marmot app surfaces.
   minutes; authentication failures wait at least five minutes, and Retry-After can extend the delay up to five minutes.
   Stop automatic passes on endpoint-wide failures
   (authentication, rate limits, server/transport failures); file-specific failures and oversized files must not block
-  the files behind them. Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
+  the files behind them.
+  Treat a `413` with no `Retry-After` as the endpoint's verdict on that file (RFC 9110 15.5.14 has a server send the
+  header when the refusal is temporary): acknowledge it as too-large so it is reported once and never re-posted. Unlike
+  the local ceiling this verdict is escapable: it is keyed on the file's size and mtime, deleting the sidecar clears it,
+  and a manual per-file upload never consults it. A `413` carrying any `Retry-After`, parseable or not, is a cooldown
+  and retries like any other rejection.
+  Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
   Retention/deletion of sealed segments is mdk#1014, not this contract.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`

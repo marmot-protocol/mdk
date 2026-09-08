@@ -174,53 +174,78 @@ async fn shutdown_cancels_pending_and_in_flight_passes() {
 
 /// Real HTTP path: endpoint-wide failures stop automatic passes, but the manual
 /// API remains immediate and continues through the retained files.
+/// Answers every request with `status` and reports each one on the returned
+/// channel. The response carries `Retry-After` only when one is given.
+async fn status_server(
+    status: u16,
+    retry_after: Option<&'static str>,
+) -> (JoinHandle<()>, String, mpsc::UnboundedReceiver<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/ingest", listener.local_addr().unwrap());
+    let (requests, observed) = mpsc::unbounded_channel();
+    let retry_after =
+        retry_after.map_or(String::new(), |value| format!("Retry-After: {value}\r\n"));
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0; 2048];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n")
+                    && bytes.len() >= end + 4 + 3
+                {
+                    break;
+                }
+            }
+            requests.send(()).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\n{retry_after}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    (server, endpoint, observed)
+}
+
+fn two_file_audit_app(root: &std::path::Path) -> MarmotApp {
+    let home = marmot_account::AccountHome::open(root);
+    home.create_account("alice").unwrap();
+    for name in ["audit-a.jsonl", "audit-b.jsonl"] {
+        std::fs::write(home.account_dir("alice").join(name), b"{}\n").unwrap();
+    }
+    let app = MarmotApp::with_relay(root, "wss://relay.example");
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    app
+}
+
+fn tracker_config(endpoint: String) -> AuditLogTrackerConfig {
+    AuditLogTrackerConfig {
+        endpoint: Some(endpoint),
+        authorization_bearer_token: Some("test-token".into()),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for status in [401, 403, 429, 503, 400] {
+    // 400 and 413 are the file-specific controls: with Retry-After present,
+    // both are ordinary rejections, so the pass continues and the cooldown
+    // applies. The bare-413 latch is pinned separately below.
+    for status in [401, 403, 429, 503, 400, 413] {
         let tmp = tempfile::tempdir().unwrap();
-        let home = marmot_account::AccountHome::open(tmp.path());
-        home.create_account("alice").unwrap();
-        for name in ["audit-a.jsonl", "audit-b.jsonl"] {
-            std::fs::write(home.account_dir("alice").join(name), b"{}\n").unwrap();
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let config = AuditLogTrackerConfig {
-            endpoint: Some(format!("http://{}/ingest", listener.local_addr().unwrap())),
-            authorization_bearer_token: Some("test-token".into()),
-            ..Default::default()
-        };
-        let (requests, mut observed) = mpsc::unbounded_channel();
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let mut buf = [0; 2048];
-                loop {
-                    let n = stream.read(&mut buf).await.unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n")
-                        && bytes.len() >= end + 4 + 3
-                    {
-                        break;
-                    }
-                }
-                requests.send(()).unwrap();
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
-        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-            .unwrap();
+        let app = two_file_audit_app(tmp.path());
+        let (server, endpoint, mut observed) = status_server(status, Some("120")).await;
+        let config = tracker_config(endpoint);
         let mut schedule = AuditPassSchedule::default();
         post_audit_log_tracker_update(&app, config.clone(), true, &mut schedule)
             .await
             .unwrap();
-        let count = if status == 400 { 2 } else { 1 };
+        let count = if matches!(status, 400 | 413) { 2 } else { 1 };
         for _ in 0..count {
             observed.try_recv().unwrap();
         }
@@ -240,6 +265,39 @@ async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
             observed.try_recv().unwrap();
         }
         assert!(observed.try_recv().is_err());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn bare_413_latches_the_file_while_any_retry_after_keeps_it_retryable() {
+    // "\u{e9}" is obs-text: hyper accepts it, but `HeaderValue::to_str` does
+    // not, so the header must count as present even without a readable value.
+    for (retry_after, latched) in [(None, true), (Some("soon"), false), (Some("\u{e9}"), false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = two_file_audit_app(tmp.path());
+        let (server, endpoint, mut observed) = status_server(413, retry_after).await;
+        let config = tracker_config(endpoint);
+        let mut schedule = AuditPassSchedule::default();
+        post_audit_log_tracker_update(&app, config.clone(), true, &mut schedule)
+            .await
+            .unwrap();
+        // A refusal never blocks the file behind it.
+        for _ in 0..2 {
+            observed.try_recv().unwrap();
+        }
+        assert!(observed.try_recv().is_err());
+        assert_eq!(
+            schedule.retry_after.is_none(),
+            latched,
+            "only a bare 413 leaves the retry timer unarmed"
+        );
+
+        post_audit_log_tracker_update_for_app(&app, config)
+            .await
+            .unwrap();
+        let re_posted = std::iter::from_fn(|| observed.try_recv().ok()).count();
+        assert_eq!(re_posted, if latched { 0 } else { 2 });
         server.abort();
     }
 }
