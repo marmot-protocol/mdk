@@ -3969,15 +3969,6 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
 /// case the field-evidence loop needs to observe.
 #[tokio::test]
 async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
-    membership_warning_recovery(false).await;
-}
-
-#[tokio::test]
-async fn membership_warning_clears_after_peer_epoch_recovery_without_chat() {
-    membership_warning_recovery(true).await;
-}
-
-async fn membership_warning_recovery(commit_only: bool) {
     // Mirrors `EPOCH_STALL_BACKFILL_THRESHOLD` (crate-private): the distinct
     // undecryptable messages at one stalled epoch that arm a backfill.
     const BACKFILL_THRESHOLD: usize = 8;
@@ -4078,67 +4069,21 @@ async fn membership_warning_recovery(commit_only: bool) {
          tracker even though the arming traffic produced no visible activity",
     );
 
-    let recovery = runtime
-        .group_recovery_status("bob", &group_id)
-        .await
-        .unwrap();
     assert!(
-        recovery.membership_unconfirmed,
-        "bounded distinct undecryptable traffic must expose advisory membership uncertainty"
-    );
-    let before = app.group("bob", &group_id_hex).unwrap().unwrap();
-    assert!(
-        before.pending_confirmation,
-        "advisory state must not accept an invitation"
-    );
-    server.abort();
-    runtime.shutdown_and_close().await.unwrap();
-    drop(runtime);
-    drop(app);
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        url.clone(),
-        MarmotAppConfig::default()
-            .with_allow_loopback_blob_endpoints(true)
-            .with_allow_loopback_relay_endpoints(true),
-    );
-    let runtime = MarmotAppRuntime::new(app);
-    runtime.start().await.unwrap();
-    assert!(
-        runtime
+        !runtime
             .group_recovery_status("bob", &group_id)
             .await
             .unwrap()
-            .membership_unconfirmed
+            .automatic_recovery_failed,
+        "an undecryptable burst and initial backfill arm must not claim recovery failed"
     );
-    wait_for_account_network_ready(&runtime, "alice").await;
-    wait_for_account_network_ready(&runtime, "bob").await;
-    // A peer commit can repair the epoch without any current-epoch chat.
-    // The advisory must reset even if the group goes quiet after the rename.
-    if commit_only {
-        runtime
-            .update_group_profile("alice", &group_id, Some("recovered epoch".into()), None)
-            .await
-            .unwrap();
-    } else {
-        runtime
-            .send_message("alice", &group_id, b"authenticated recovery".to_vec())
-            .await
-            .unwrap();
-    }
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while runtime
-        .group_recovery_status("bob", &group_id)
-        .await
-        .unwrap()
-        .membership_unconfirmed
-    {
-        assert!(
-            Instant::now() < deadline,
-            "a recovered epoch must reset the old warning without chat traffic"
-        );
-        sleep(Duration::from_millis(100)).await;
-    }
+    assert!(
+        app.group("bob", &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .pending_confirmation
+    );
+    server.abort();
     runtime.shutdown().await;
 }
 

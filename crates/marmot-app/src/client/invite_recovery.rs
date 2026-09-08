@@ -11,6 +11,13 @@ use cgka_traits::{GroupId, MessageId};
 use std::collections::{HashMap, HashSet};
 
 impl AppClient {
+    /// Queue the host notification independently from the storage projection delta.
+    pub(crate) fn mark_recovery_status_changed(&mut self, group_id: &GroupId) {
+        self.mark_group_projection_dirty(group_id);
+        self.pending_recovery_status_updates
+            .insert(group_id.clone());
+    }
+
     /// Read only bounded offer metadata, without loading any MLS group.
     pub(crate) fn rejoin_offer_snapshot(&self) -> Result<HashMap<MessageId, GroupId>, AppError> {
         Ok(self
@@ -35,7 +42,7 @@ impl AppClient {
             .map(|(_, group)| group.clone())
             .collect();
         for group in changed {
-            self.mark_group_projection_dirty_hex(hex::encode(group.as_slice()));
+            self.mark_recovery_status_changed(&group);
         }
         Ok(())
     }
@@ -94,10 +101,10 @@ impl AppClient {
             pending_reinvites,
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
-            membership_unconfirmed: self
+            automatic_recovery_failed: self
                 .app
                 .account_storage(&self.state.label)?
-                .membership_unconfirmed(group_id)?,
+                .automatic_recovery_failed(group_id)?,
             rejoin_invitations,
         })
     }
@@ -118,7 +125,7 @@ impl AppClient {
         self.pending_applied_sync_summary.merge(summary);
         self.app
             .account_storage(&self.state.label)?
-            .clear_membership_uncertainty(&group_id)?;
+            .clear_recovery_failure(&group_id)?;
         self.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
         self.group_recovery_status(&group_id)
     }
@@ -143,25 +150,13 @@ impl AppClient {
         Ok(())
     }
 
-    pub(crate) fn observe_membership_health(
+    pub(crate) fn observe_recovery_health(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         for event in &effects.events {
             let group = match event {
                 cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } => Some(group_id),
-                // The warning describes evidence at one local epoch. Advancing
-                // retires that evidence; further failures can arm a new warning.
-                // This never confirms membership or authorizes a rejoin.
-                cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to }
-                    if to > from
-                        && self
-                            .runtime
-                            .group_record(group_id)
-                            .is_ok_and(|group| group.epoch == *to) =>
-                {
-                    Some(group_id)
-                }
                 cgka_traits::engine::GroupEvent::MessageReceived {
                     group_id,
                     sender,
@@ -177,13 +172,15 @@ impl AppClient {
                 }
                 _ => None,
             };
-            if let Some(group_id) = group
-                && self
+            if let Some(group_id) = group {
+                let changed = self
                     .app
                     .account_storage(&self.state.label)?
-                    .clear_membership_uncertainty(group_id)?
-            {
-                self.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
+                    .clear_recovery_failure(group_id)?;
+                self.epoch_stall.clear_recovered_group(group_id);
+                if changed {
+                    self.mark_recovery_status_changed(group_id);
+                }
             }
         }
         Ok(())

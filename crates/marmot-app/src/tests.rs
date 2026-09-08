@@ -2528,6 +2528,136 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
     });
 }
 
+/// Only confirmed failed replays earn a warning; local progress cannot erase
+/// it, while authenticated peer recovery clears durable and in-memory evidence.
+#[test]
+fn recovery_warning_requires_confirmed_replays_and_survives_local_commits_and_reopen() {
+    run_composed_app_runtime_test("recovery-warning-policy", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        assert_eq!(
+            client.epoch_stall.observe_resource_refusal(
+                group_id.clone(),
+                epoch,
+                epoch_stall_test_now_ms(),
+            ),
+            BackfillDecision::Arm
+        );
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        // A transport failure is not a confirmed, fruitless replay.
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap();
+        client.test_finish_epoch_backfill_execution(execution, false);
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        for completed in 1..=3 {
+            if !client.has_pending_epoch_backfill() {
+                client.apply_backfill_decision(
+                    &group_id,
+                    epoch.0,
+                    BackfillDecision::Arm,
+                    marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+                );
+            }
+            let execution = client
+                .begin_epoch_backfill_execution(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+                )
+                .unwrap();
+            client.test_complete_epoch_backfill_execution(execution, 0, 0);
+            assert_eq!(
+                client
+                    .group_recovery_status(&group_id)
+                    .unwrap()
+                    .automatic_recovery_failed,
+                completed == 3
+            );
+        }
+        assert!(
+            client
+                .pending_group_projection_updates
+                .contains(&hex::encode(group_id.as_slice()))
+        );
+        // Exercise an actual locally authored epoch advance, not just a fabricated event.
+        let self_update = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+        client
+            .finish_maintenance_effects(&self_update)
+            .await
+            .unwrap();
+        assert!(client.runtime.group_record(&group_id).unwrap().epoch > epoch);
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        drop(client);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        let current = client.runtime.group_record(&group_id).unwrap().epoch;
+        let mut effects = marmot_account::AccountDeviceEffects::default();
+        effects
+            .events
+            .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id: group_id.clone(),
+                message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
+                sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
+                epoch: current,
+                payload: Vec::new(),
+                retention: None,
+            });
+        client.observe_recovery_health(&effects).unwrap();
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .epoch_stall_evidence()
+                .unwrap()
+                .is_empty()
+        );
+        client.persist_epoch_stall_evidence([&group_id]);
+        drop(client);
+        let client = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+    });
+}
+
 /// A tracked group stalled below the arm threshold, so `mark_replayed` is the
 /// only thing that can stop it from arming when its next undecryptable lands.
 ///
@@ -16104,17 +16234,19 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let group_id = client.create_group("committed effects", &[]).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-        for n in 0..8 {
-            storage
-                .observe_membership_undecryptable(
-                    &group_id,
-                    &cgka_traits::MessageId::new(vec![n; 32]),
-                    epoch,
-                    8,
-                )
-                .unwrap();
-        }
-        assert!(storage.membership_unconfirmed(&group_id).unwrap());
+        storage
+            .record_recovery_evidence(
+                &[storage_sqlite::StoredEpochStallEvidence {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    stalled_epoch: epoch.0,
+                    fruitless_completions: 3,
+                    fruitless_reported: true,
+                    last_arm_at_ms: 1,
+                }],
+                3,
+            )
+            .unwrap();
+        assert!(storage.automatic_recovery_failed(&group_id).unwrap());
         client.pending_group_projection_updates.clear();
         let mut effects = a_refusal_riding_a_rolled_back_publish(&group_id);
         if !failed_publish {
@@ -16181,7 +16313,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
             "one-shot recovery evidence must be observed"
         );
         assert!(
-            !storage.membership_unconfirmed(&group_id).unwrap(),
+            !storage.automatic_recovery_failed(&group_id).unwrap(),
             "committed health evidence must clear the warning"
         );
         // Successful scheduled convergence persists the dirty projections;

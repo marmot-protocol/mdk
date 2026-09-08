@@ -1006,7 +1006,9 @@ fn normalized_relays(relays: &[String]) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupRecoveryStatus {
     pub group_id_hex: String,
-    pub membership_unconfirmed: bool,
+    /// Repeated relay-confirmed full-history replays recovered nothing.
+    /// Hosts may show "Unable to restore group synchronization"; this is not removal evidence.
+    pub automatic_recovery_failed: bool,
     /// Lost invitations awaiting fresh material on this inviter device.
     pub pending_reinvites: u32,
     /// Exhausted recovery attempts requiring a new user-initiated invitation.

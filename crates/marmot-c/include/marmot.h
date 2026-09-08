@@ -1395,7 +1395,7 @@ typedef struct MarmotGroupRejoinInvitation {
  */
 typedef struct MarmotGroupRecoveryStatus {
   char *group_id_hex;
-  bool membership_unconfirmed;
+  bool automatic_recovery_failed;
   uint32_t pending_reinvites;
   uint32_t failed_reinvites;
   struct MarmotGroupRejoinInvitation *rejoin_invitations;

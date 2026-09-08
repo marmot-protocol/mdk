@@ -39,15 +39,26 @@ restart replays the join event without asking the user to accept the same rejoin
 selected offer and records both transport and content dedup markers, including against a new wrapper of that Welcome.
 Trusted-removal reentry and the existing Unrecoverable repair exception retain their automatic behavior.
 
-Eight distinct transport-deferred events at one local epoch set the durable advisory `membership_unconfirmed` flag.
-Duplicate deliveries do not advance the count. Authenticated current-epoch application traffic from another member,
-or a successful join, clears the evidence and warning. Advancing to a new local epoch retires old-epoch evidence
-and its warning too; failures at the new epoch can raise it again. This early advisory is intentionally distinct
-from the existing multi-replay escalation that reports an unrepaired stall. The warning is neither proof of removal nor authorization to
-replace cryptographic state. It does not change `pending_confirmation` or the authoritative membership roster.
-Hosts subscribe to `GroupStateUpdated` and reread the recovery query, including after opening an account.
+The durable `automatic_recovery_failed` flag is raised only after three relay-confirmed full-history replays
+complete without recovering anything. It reuses the existing confirmed-fruitless-replay evidence and its threshold,
+not the undecryptable-message threshold or the less conservative arm-count escalation. Initial backfill arms,
+transport errors, timeouts, and unconfirmed drains cannot raise this warning. Any kept delivery or observed epoch
+progress during a replay suppresses that replay's failure evidence for all tracked groups; this intentionally
+favors delayed warnings on busy accounts over false alarms.
 
-Migration 66 adds bounded advisory evidence tables and gates the new serialized recovery fields against older writers.
+Hosts may describe the flag as **"Unable to restore group synchronization."** It is neither proof of removal nor
+authorization to replace cryptographic state. Authenticated current-epoch application traffic from another member,
+or a successful join, clears the warning and saved replay evidence. Local self-updates and other epoch advances
+alone do not clear a latched warning. A quiet group can therefore retain the warning until authenticated peer
+traffic arrives. Evidence collected before a local epoch change is no longer counted toward a future warning,
+so repeated local movement may delay detection; it cannot erase an already-reported failure. Recovery continues
+under the existing backoff policy after the warning is shown. The warning never changes `pending_confirmation`
+or the authoritative roster. Hosts subscribe to `GroupStateUpdated` and reread the recovery query after account open.
+
+Migration 66 gates the new serialized recovery fields against older writers. Migration 67 removes the superseded
+early-warning evidence tables and adds the recovery-failure latch; old early warnings are discarded, not promoted
+into failure claims. Replay evidence and newly earned warnings are written atomically. Authenticated recovery also
+clears persisted replay evidence so reopening cannot resurrect a resolved warning.
 Existing history and invitation acceptance are preserved on upgrade. An intent already deleted by a previous MDK
 version cannot be reconstructed: an affected existing group can still expose the advisory warning and recover through
 a new invitation plus explicit rejoin. Client applications must adopt the new query and confirmation APIs to render

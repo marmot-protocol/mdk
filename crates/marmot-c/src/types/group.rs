@@ -362,7 +362,7 @@ mod tests {
         let start = crate::memory::audit::live_allocations();
         let mirror: MarmotGroupRecoveryStatus = GroupRecoveryStatusFfi {
             group_id_hex: "01".repeat(16),
-            membership_unconfirmed: true,
+            automatic_recovery_failed: true,
             pending_reinvites: 2,
             failed_reinvites: 1,
             rejoin_invitations: vec![GroupRejoinInvitationFfi {
@@ -373,7 +373,7 @@ mod tests {
             }],
         }
         .into();
-        assert!(mirror.membership_unconfirmed);
+        assert!(mirror.automatic_recovery_failed);
         assert_eq!((mirror.pending_reinvites, mirror.failed_reinvites), (2, 1));
         assert_eq!(mirror.rejoin_invitations_len, 1);
         assert_eq!(unsafe { (*mirror.rejoin_invitations).epoch }, 4);
@@ -656,7 +656,7 @@ c_mirror! {
     MarmotGroupRecoveryStatus from GroupRecoveryStatusFfi,
     free marmot_group_recovery_status_free {
         str group_id_hex,
-        copy membership_unconfirmed: bool,
+        copy automatic_recovery_failed: bool,
         copy pending_reinvites: u32,
         copy failed_reinvites: u32,
         vec rejoin_invitations/rejoin_invitations_len: MarmotGroupRejoinInvitation,

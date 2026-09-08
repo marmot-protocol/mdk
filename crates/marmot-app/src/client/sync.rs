@@ -1215,7 +1215,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
-        self.observe_membership_health(effects)?;
+        self.observe_recovery_health(effects)?;
         // Retire released receipts even when the drain emitted no app events.
         self.transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
@@ -2416,22 +2416,7 @@ impl AppClient {
             });
         }
         let effects = ingest?;
-        client.observe_membership_health(&effects.effects)?;
-        if let IngestOutcome::TransportDeferred { group_id, .. } = &effects.outcome
-            && let Ok(group) = client.runtime.group_record(group_id)
-            && !group.is_terminal()
-            && client
-                .app
-                .account_storage(&client.state.label)?
-                .observe_membership_undecryptable(
-                    group_id,
-                    &source_message_id,
-                    group.epoch,
-                    super::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD,
-                )?
-        {
-            client.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
-        }
+        client.observe_recovery_health(&effects.effects)?;
         if let Some(before) = rejoin_offers_before {
             // Account-wide eviction may remove an offer for a different group.
             // Invalidate every changed group's host projection, not just the
@@ -2804,16 +2789,21 @@ impl AppClient {
                 })
             })
             .collect::<Vec<_>>();
-        if let Err(error) = self
-            .app
-            .record_epoch_stall_evidence(&self.state.label, &evidence)
-        {
-            tracing::warn!(
-                target: "marmot_app::epoch_stall",
-                method = "persist_epoch_stall_evidence",
-                error_kind = error.privacy_safe_kind(),
-                "frozen-epoch recovery evidence is live in memory but was not made durable"
-            );
+        match self.app.record_epoch_stall_evidence(
+            &self.state.label,
+            &evidence,
+            self.epoch_stall.fruitless_completion_threshold(),
+        ) {
+            Ok(changed) => {
+                for group_id in changed {
+                    self.mark_recovery_status_changed(&group_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "marmot_app::epoch_stall", method = "persist_epoch_stall_evidence",
+                    error_kind = error.privacy_safe_kind(),
+                    "recovery evidence and warning remain pending persistence");
+            }
         }
     }
 
@@ -3847,7 +3837,7 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
-        self.observe_membership_health(effects)?;
+        self.observe_recovery_health(effects)?;
         self.remember_pending_convergence_groups(effects);
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.

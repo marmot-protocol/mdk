@@ -5075,6 +5075,9 @@ fn publish_client_pending_projection_updates(
     for update in client.take_pending_projection_updates() {
         publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
     }
+    for group_id in client.pending_recovery_status_updates.drain() {
+        publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
     // Superseded own commits ride the same drain: every worker seam that can
     // observe convergence effects already flushes projection updates here.
     for report in client.take_pending_superseded_change_events() {
@@ -5241,6 +5244,101 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_warning_notifications_survive_projection_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("recovery notifications", &[])
+            .await
+            .unwrap();
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        let (events, mut received) = broadcast::channel(16);
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        while received.try_recv().is_ok() {}
+        assert_eq!(
+            client
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), epoch, 1),
+            BackfillDecision::Arm
+        );
+        for _ in 0..3 {
+            let _ = client.epoch_stall.observe_fruitless_completion([&group_id]);
+        }
+        client.persist_epoch_stall_evidence([&group_id]);
+        client
+            .finish_scheduled_convergence_effects(
+                &group_id,
+                &marmot_account::AccountDeviceEffects::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.pending_group_projection_updates.is_empty(),
+            "the checkpoint consumed the storage delta"
+        );
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id)
+        );
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a status transition is broadcast once"
+        );
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
+                group_id: group_id.clone(),
+                via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
+                welcomer: None,
+                explicitly_confirmed: true,
+            }],
+            ..Default::default()
+        };
+        client.observe_recovery_health(&effects).unwrap();
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id)
+        );
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
     }
 
     #[tokio::test]

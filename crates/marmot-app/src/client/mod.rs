@@ -326,6 +326,8 @@ pub struct AppClient {
     /// Live saves replace only these groups; full snapshot replacement is
     /// reserved for import/rebuild paths outside the account worker.
     pub(crate) pending_group_projection_updates: HashSet<String>,
+    /// Recovery status has its own notification queue; saving a projection must not consume it.
+    pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
@@ -948,7 +950,7 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
         self.observe_recovery_evidence(effects);
-        self.observe_membership_health(effects)?;
+        self.observe_recovery_health(effects)?;
         self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
         // The summary includes this pass's failed executions. Backlog counts only

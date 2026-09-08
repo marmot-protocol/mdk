@@ -832,7 +832,8 @@ pub struct GroupRejoinInvitationFfi {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct GroupRecoveryStatusFfi {
     pub group_id_hex: String,
-    pub membership_unconfirmed: bool,
+    /// Repeated completed replays failed to restore synchronization; not membership evidence.
+    pub automatic_recovery_failed: bool,
     /// Lost invitations awaiting fresh material on this inviter device.
     pub pending_reinvites: u32,
     /// Exhausted recovery attempts requiring a new user-initiated invitation.
@@ -844,7 +845,7 @@ impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
     fn from(value: marmot_app::GroupRecoveryStatus) -> Self {
         Self {
             group_id_hex: value.group_id_hex,
-            membership_unconfirmed: value.membership_unconfirmed,
+            automatic_recovery_failed: value.automatic_recovery_failed,
             pending_reinvites: value.pending_reinvites,
             failed_reinvites: value.failed_reinvites,
             rejoin_invitations: value

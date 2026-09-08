@@ -22,8 +22,8 @@ status: overview
 Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
 canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
 explicitly confirm replacing that MLS state; local message history remains. `group_recovery_status` exposes offers,
-pending/failed inviter recovery, and a separate advisory `membership_unconfirmed` flag after eight distinct
-undecryptable events. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
+pending/failed inviter recovery, and an `automatic_recovery_failed` warning after repeated relay-confirmed full-history
+replays recover nothing. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
 Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
 See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
 
