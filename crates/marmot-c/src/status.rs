@@ -98,6 +98,9 @@ pub enum MarmotStatus {
     GroupRemoved = 63,
     OnboardingActionUnavailable = 64,
     OnboardingRequired = 65,
+    ConsentRequired = 66,
+    InvalidProductAnalyticsConfiguration = 67,
+    InvalidProductObservation = 68,
 }
 
 thread_local! {
@@ -118,6 +121,11 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ConsentRequired => MarmotStatus::ConsentRequired,
+        MarmotKitError::InvalidProductAnalyticsConfiguration => {
+            MarmotStatus::InvalidProductAnalyticsConfiguration
+        }
+        MarmotKitError::InvalidProductObservation => MarmotStatus::InvalidProductObservation,
         MarmotKitError::DuplicateIdentity { .. } => MarmotStatus::DuplicateIdentity,
         MarmotKitError::UnknownAccount { .. } => MarmotStatus::UnknownAccount,
         MarmotKitError::UnknownGroup { .. } => MarmotStatus::UnknownGroup,
@@ -280,6 +288,9 @@ mod tests {
             },
             MarmotKitError::ExternalSignerMismatch,
             MarmotKitError::ExternalSignerRejected,
+            MarmotKitError::ConsentRequired,
+            MarmotKitError::InvalidProductAnalyticsConfiguration,
+            MarmotKitError::InvalidProductObservation,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {

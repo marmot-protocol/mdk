@@ -52,6 +52,13 @@ pub enum StorageError {
     /// it as a transient (not fatal) error.
     #[error("backend busy: {0}")]
     Busy(String),
+    /// The backend reported a verified corruption code. A wrong encryption key
+    /// or an unrecognized database format is not sufficient to classify this.
+    #[error("backend corruption: {0}")]
+    Corruption(String),
+    /// The backend cannot persist because its storage capacity is exhausted.
+    #[error("backend capacity exhausted: {0}")]
+    Capacity(String),
     /// The backend has been closed and will not serve further operations.
     ///
     /// Distinct from [`StorageError::Backend`] because it is an *expected*

@@ -21,8 +21,9 @@ App runtime bridge for the first real Marmot app surfaces.
   send commands, and the lifecycle helpers and encrypted-media helpers they share), `sync.rs` (transport sync: `sync`,
   `next_event`, `sync_sdk_relay`, `ingest_delivery`, `sync_runtime_groups`, the relay-echo/transport-cursor helpers, and
   the cursor unit tests), `projection.rs` (timeline/group projection accessors, the `*_for_group` component reads, the
-  kind-1210 group-system row synthesis, and the local-send projection helpers), `push.rs` (push-token registration and
-  notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
+  kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
+  transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
+  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
   per-group outcome orchestration, and classifier tests), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
   are widened to `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
@@ -129,7 +130,7 @@ App runtime bridge for the first real Marmot app surfaces.
   opt-in and off by default: `MarmotRelayPlane::telemetry_exporter` is the single construction gate, relay-identity
   resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
-  build. Keep per-attempt collector DNS validation and pinning in `relay_telemetry_export/host_safety.rs`: validate
+  build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/proxies, and retain TLS verification. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. See
   `docs/marmot-architecture/relay-observability.md` and `overview/dial-safety.md`.

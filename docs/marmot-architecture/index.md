@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-04
+updated: 2026-09-07
 tags: [marmot, architecture, index]
 ---
 
@@ -146,6 +146,10 @@ These are longer working documents. Go here when you need depth, not orientation
 - **Doc:** [`telemetry.md`](./telemetry.md)
   - **What it covers:** Current implementation inventory for relay telemetry, OTLP export, engine reorg metrics,
     tracing/logging guardrails, local surfaces, and exactly what fields are collected or exported.
+
+- **Doc:** [`usage-diagnostics.md`](./usage-diagnostics.md)
+  - **What it covers:** Combined consent, stock Aptabase privacy disclosure, finite backend and host observations,
+    bounded delivery, host adoption, operator queries, and separate deployment acceptance.
 
 - **Doc:** [`audit-logging.md`](./audit-logging.md)
   - **What it covers:** Current implementation inventory for opt-in forensic JSONL logs, file identity, every event

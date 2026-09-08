@@ -11,7 +11,8 @@ same transaction that queues it; publication uses the ordinary outbound queue an
 
 One lookup is reserved durably before each network attempt. Each attempt uses the ordinary 50-second
 member-resolution deadline. Eight attempts are allowed, with delays of 5 seconds, 30 seconds, 2 minutes, 10 minutes,
-1 hour, 6 hours, then 24 hours twice; this leaves sleeping recipients more than two days to replenish material. Restart and cancellation preserve the budget. At most two
+1 hour, 6 hours, then 24 hours twice. The last lookup occurs about 31 hours after the first; exhaustion is recorded
+after the final 24-hour wait. The later delays allow sleeping recipients time to replenish material. Restart and cancellation preserve the budget. At most two
 successive supersessions are reissued, matching the existing own-intent policy. `GroupRecoveryStatus` exposes pending
 and failed fresh-material recovery counts; exhausted recovery requires a new user-initiated invitation. Network
 availability and fresh recipient material remain prerequisites, not outcomes this mechanism can guarantee.

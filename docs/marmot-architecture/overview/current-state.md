@@ -267,3 +267,8 @@ explicit loopback-test endpoint contract remains local-only; see [Dial Safety](d
 - Canonicalization contract:
   [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalization-contract.md)
 - Distributed convergence: [`../distributed-convergence.md`](../distributed-convergence.md)
+
+Usage and diagnostics now has a shared consent receipt and independent OTLP and
+stock-Aptabase exporter paths; see [the host contract](../usage-diagnostics.md).
+Native consent UI adoption and deployed Aptabase retention verification remain
+separate rollout work.

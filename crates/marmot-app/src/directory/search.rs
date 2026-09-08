@@ -230,11 +230,31 @@ impl MarmotApp {
         &self,
         params: UserSearchParams,
     ) -> Result<UserSearchSubscription, AppError> {
-        let searcher_account_id_hex = params.validate()?;
+        let observation = self.product_analytics.begin(
+            crate::ProductFamily::Directory,
+            "search",
+            crate::ProductUnit::Action,
+        );
+        let searcher_account_id_hex = match params.validate() {
+            Ok(id) => id,
+            Err(error) => {
+                if let Some(observation) = observation {
+                    observation.finish("rejected");
+                }
+                return Err(error);
+            }
+        };
         let (updates_tx, updates) = mpsc::channel(SEARCH_UPDATE_CHANNEL_CAPACITY);
         let app = self.clone();
         tokio::spawn(async move {
-            run_search(app, searcher_account_id_hex, params, updates_tx).await;
+            run_search(
+                app,
+                searcher_account_id_hex,
+                params,
+                updates_tx,
+                observation,
+            )
+            .await;
         });
         Ok(UserSearchSubscription { updates })
     }
@@ -247,7 +267,17 @@ async fn run_search(
     searcher_account_id_hex: String,
     params: UserSearchParams,
     updates_tx: mpsc::Sender<UserSearchUpdate>,
+    observation: Option<crate::ProductObservation>,
 ) {
+    let source_observation = app
+        .product_analytics
+        .begin(
+            crate::ProductFamily::Directory,
+            "profile",
+            crate::ProductUnit::Attempt,
+        )
+        .map(crate::ProductObservation::counts_only);
+    let mut failed = false;
     let mut emitter = SearchEmitter::new(updates_tx);
     // An empty query would match every candidate through `contains`, so it
     // finds nobody by definition rather than everybody.
@@ -284,6 +314,7 @@ async fn run_search(
             ),
         );
         if let Err(error) = graph_result {
+            failed = true;
             emitter
                 .emit(SearchUpdateTrigger::Error {
                     message: error.to_string(),
@@ -318,8 +349,31 @@ async fn run_search(
             }
         }
     }
+    let cancelled = emitter.is_cancelled();
     emitter.emit(SearchUpdateTrigger::SearchCompleted).await;
     emitter.report_tally(&params);
+    if let Some(observation) = source_observation {
+        observation.directory_sample("success", "cache", emitter.tally.from_cache as u64);
+        observation.directory_sample(
+            "success",
+            "network",
+            (emitter.tally.from_relays
+                + emitter.tally.from_write_relays
+                + emitter.tally.from_open_ranking) as u64,
+        );
+        observation.directory_sample("empty", "network", emitter.tally.unresolved as u64);
+    }
+    if let Some(observation) = observation {
+        observation.finish(if cancelled {
+            "cancelled"
+        } else if failed {
+            "failure"
+        } else if emitter.total_result_count == 0 {
+            "empty"
+        } else {
+            "success"
+        });
+    }
 }
 
 /// Fetch ranked identities from Vertex without exposing failures to the graph

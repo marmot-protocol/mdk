@@ -254,6 +254,7 @@ impl AgentConnector {
                 .with_allow_loopback_relay_endpoints(config.allow_loopback_relays),
         )?;
         let runtime = MarmotAppRuntime::new(app.clone());
+        marmot_app::configure_product_analytics_from_environment(&runtime, "agent");
         let reconcile_telemetry =
             std::sync::Arc::new(reconcile_telemetry::ReconcileTelemetry::default());
         let inbound_catch_up =
@@ -296,7 +297,20 @@ impl AgentConnector {
         self.spawn_invite_policy_worker();
         self.spawn_stream_session_sweeper();
         self.spawn_media_temp_sweeper();
-        self.ensure_agent_accounts_ready().await?;
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Agent,
+            "readiness",
+            marmot_app::ProductUnit::Attempt,
+        );
+        let readiness = self.ensure_agent_accounts_ready().await;
+        if let Some(observation) = observation {
+            observation.finish(if readiness.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        readiness?;
         Ok(())
     }
 
@@ -363,7 +377,17 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     )?;
     let socket_path = config.socket.clone();
     let max_connections = config.max_connections;
+    let management_home = config.home.clone();
     let connector = AgentConnector::open(config)?;
+    let mut management_tasks = tokio::task::JoinSet::new();
+    match usage_diagnostics::bind(&management_home) {
+        Ok(listener) => {
+            let runtime = connector.runtime.clone();
+            management_tasks.spawn(usage_diagnostics::serve(listener, runtime));
+        }
+        Err(_) => tracing::warn!(target: "agent_connector", method = "serve_socket",
+            error_code = "usage_diagnostics_bind_failed", "local diagnostics controls unavailable"),
+    }
     let link_loss = wait_control_socket_link_loss(&socket_path, link_identity);
     tokio::pin!(link_loss);
     // Losing the published path makes this process unreachable, so cancellation
@@ -471,3 +495,8 @@ async fn wait_control_socket_link_loss(
         }
     }
 }
+
+mod usage_diagnostics;
+pub use usage_diagnostics::{
+    UsageDiagnosticsCommand, UsageDiagnosticsReport, manage_usage_diagnostics,
+};

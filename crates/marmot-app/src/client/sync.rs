@@ -13,7 +13,6 @@ use tokio::time::timeout;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrReconciliationItem as AdapterReconciliationItem,
 };
-use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
 use crate::groups::{
@@ -521,6 +520,17 @@ impl AppClient {
             }
             woken_targets += woken;
         }
+        self.app.product_analytics.observe(
+            crate::ProductFamily::Connectivity,
+            "reconnect",
+            if woken_targets > 0 {
+                "performed"
+            } else {
+                "no_work_due"
+            },
+            crate::ProductUnit::Attempt,
+            None,
+        );
         Ok(woken_targets)
     }
 
@@ -631,6 +641,24 @@ impl AppClient {
             return;
         }
         for event in &effects.events {
+            use cgka_traits::engine::GroupEvent;
+            let transition = match event {
+                GroupEvent::GroupStateInvalidated { .. } => Some(("invalidation", "performed")),
+                GroupEvent::GroupStateRevalidated { .. } => Some(("revalidation", "success")),
+                GroupEvent::GroupUnrecoverable { .. } => Some(("unrecoverable", "failure")),
+                GroupEvent::PendingCommitRecovered { .. } => Some(("pending_commit", "success")),
+                GroupEvent::GroupHydrationRecovered { .. } => Some(("hydration", "success")),
+                _ => None,
+            };
+            if let Some((operation, outcome)) = transition {
+                self.app.product_analytics.observe(
+                    crate::ProductFamily::Recovery,
+                    operation,
+                    outcome,
+                    crate::ProductUnit::Transition,
+                    None,
+                );
+            }
             match event {
                 cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
                     self.epoch_stall.observe_epoch_passage(group_id, *from, *to);
@@ -694,54 +722,6 @@ impl AppClient {
         }
     }
 
-    /// Repair durable release evidence independently of lossy engine effects.
-    pub(crate) fn reconcile_released_transport_receipts(
-        &mut self,
-    ) -> Result<Vec<String>, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        let released = storage.consume_released_transport_receipts()?;
-        self.released_backfill_reload_pending |= !released.is_empty();
-        if !self.released_backfill_reload_pending {
-            return Ok(Vec::new());
-        }
-        let released = released
-            .into_iter()
-            .map(|id| hex::encode(id.as_slice()))
-            .collect::<HashSet<_>>();
-        // No await or fallible operation between acknowledging the durable
-        // journal and removing its ids from memory. Never checkpoint stale ids
-        // back over the transactional deletion, including unsaved ring entries.
-        let unsaved_start = self
-            .state
-            .seen_events
-            .len()
-            .saturating_sub(self.pending_seen_event_count);
-        self.pending_seen_event_count = self.state.seen_events[unsaved_start..]
-            .iter()
-            .filter(|id| !released.contains(*id))
-            .count();
-        self.seen_events_index.retain(|id| !released.contains(id));
-        self.state.seen_events.retain(|id| !released.contains(id));
-        if !released.is_empty() {
-            tracing::info!(
-                target: "marmot_app::relay_plane",
-                method = "reconcile_released_transport_receipts",
-                released_count = released.len(),
-                "retired released transport receipt claims and restored replay eligibility"
-            );
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_released_backfill_reload) {
-            return Err(cgka_traits::storage::StorageError::Busy(
-                "injected released backfill intent read failure".into(),
-            )
-            .into());
-        }
-        self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
-        self.released_backfill_reload_pending = false;
-        Ok(released.into_iter().collect())
-    }
-
     /// Apply the publish gate to `effects`, observing the same batch's
     /// epoch-gap recovery evidence first.
     ///
@@ -767,7 +747,8 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        self.reconcile_released_transport_receipts()?;
+        // Retire released receipts even when this effects batch makes no receipt read.
+        self.transport_receipts()?;
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
@@ -831,8 +812,10 @@ impl AppClient {
     /// Each route reconciles against the exact event-id set retained in this
     /// account's SQLCipher database, so traffic in one busy group cannot move
     /// or evict another route's completeness state.
+    /// Synchronize before each inventory read, since routes await network I/O.
+    /// With no routes there is no receipt decision to synchronize; this is not
+    /// a standalone release-repair tick.
     async fn reconcile_transport_history(&mut self, reconcile_until: u64) -> Result<(), AppError> {
-        self.reconcile_released_transport_receipts()?;
         let storage = self.app.account_storage(&self.state.label)?;
         let routing = self.routing.snapshot();
         let mut work = Vec::with_capacity(routing.group_routes.len().saturating_add(1));
@@ -876,7 +859,9 @@ impl AppClient {
             // defer this route until the next rotation, but cannot pin every
             // subsequent route behind it on each restart.
             storage.advance_transport_reconciliation_route_cursor(&route)?;
-            let inventory = storage.transport_reconciliation_inventory(&route, reconcile_until)?;
+            let inventory = self
+                .transport_receipts()?
+                .inventory(&route, reconcile_until)?;
             if inventory.since > reconcile_until {
                 continue;
             }
@@ -1231,7 +1216,8 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
         self.observe_membership_health(effects)?;
-        self.reconcile_released_transport_receipts()?;
+        // Retire released receipts even when the drain emitted no app events.
+        self.transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
         // events; the worker drains this set immediately after startup sync.
@@ -1553,12 +1539,6 @@ impl AppClient {
     pub(crate) async fn receive_next_delivery(
         &mut self,
     ) -> Result<crate::relay_plane::AccountDeliveryReceive, AppError> {
-        let local_account_id_hex = self
-            .app
-            .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
-
         loop {
             let received = self
                 .adapter
@@ -1574,13 +1554,8 @@ impl AppClient {
                     ));
                 }
             };
-            self.reconcile_released_transport_receipts()?;
             let event_id = hex::encode(delivery.message.id.as_slice());
-            if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index) {
-                self.record_durable_transport_reconciliation_delivery(&delivery);
-                continue;
-            }
-            if self.seen_events_index.contains(&event_id) {
+            if self.transport_receipts()?.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 continue;
             }
@@ -1598,9 +1573,13 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let event_id = hex::encode(delivery.message.id.as_slice());
-        let ingested = self
-            .ingest_delivery(delivery, &display_names, &mut summary)
-            .await?;
+        let ingested = Self::ingest_delivery(
+            self.transport_receipts()?,
+            delivery,
+            &display_names,
+            &mut summary,
+        )
+        .await?;
         if self.adapter.pending_delivery_overflow().is_some() {
             // `record_drop` publishes this process-local fence at the exact
             // omission, before marker I/O or the reserved control record can
@@ -1699,6 +1678,30 @@ impl AppClient {
     /// can clear the marker, and a second queue overflow during the replay
     /// makes the compare-and-clear fail so another attempt remains required.
     pub(crate) async fn recover_delivery_overflow(
+        &mut self,
+    ) -> Result<DeliveryOverflowRecoveryOutcome, ClassifiedSyncFailure> {
+        if !self.delivery_overflow_recovery_pending {
+            return Ok(DeliveryOverflowRecoveryOutcome::Completed(
+                SyncSummary::default(),
+            ));
+        }
+        let observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Recovery,
+            "overflow",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self.recover_delivery_overflow_unobserved().await;
+        if let Some(observation) = observation {
+            observation.finish(match &result {
+                Ok(DeliveryOverflowRecoveryOutcome::Completed(_)) => "success",
+                Ok(DeliveryOverflowRecoveryOutcome::Incomplete(_)) => "partial",
+                Err(_) => "failure",
+            });
+        }
+        result
+    }
+
+    async fn recover_delivery_overflow_unobserved(
         &mut self,
     ) -> Result<DeliveryOverflowRecoveryOutcome, ClassifiedSyncFailure> {
         if !self.delivery_overflow_recovery_pending {
@@ -1948,18 +1951,6 @@ impl AppClient {
                 SyncFailureStage::Unknown,
             )
         })?;
-        let local_account_id_hex = self
-            .app
-            .account_home()
-            .account(&self.state.label)
-            .map_err(|source| {
-                ClassifiedSyncFailure::at_stage(
-                    SyncSummary::default(),
-                    AppError::from(source),
-                    SyncFailureStage::Unknown,
-                )
-            })?
-            .account_id_hex;
         let mut summary = SyncSummary::default();
         let mut first_wait = true;
         // Forensic drain accounting: wall-clock span, deliveries actually
@@ -2069,22 +2060,31 @@ impl AppClient {
             // Any delivery proves the stream is alive, including one this drain
             // goes on to skip as an echo or a duplicate.
             silence_started = std::time::Instant::now();
-            if let Err(error) = self.reconcile_released_transport_receipts() {
-                return Err(self
-                    .finish_failed_sync_drain(
-                        summary,
-                        routes_dirty,
-                        counts.clone(),
-                        StagedSyncError::new(error, SyncFailureStage::StatePersist),
-                        drain_started,
-                        cursor_before_secs,
-                    )
-                    .await);
-            }
+            // Evaluate before the exclusive receipt borrow; counts.deliveries
+            // stays unchanged until admission (duplicates only bump skipped).
+            let fail_before_delivery = cfg!(feature = "test-policy-overrides")
+                && self
+                    .app
+                    .config
+                    .dev_fail_sync_before_delivery
+                    .is_some_and(|limit| counts.deliveries >= limit);
+            let receipts = match self.transport_receipts() {
+                Ok(receipts) => receipts,
+                Err(error) => {
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            counts.clone(),
+                            StagedSyncError::new(error, SyncFailureStage::StatePersist),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            };
             let event_id = hex::encode(delivery.message.id.as_slice());
-            if is_own_relay_echo(&delivery, &local_account_id_hex, &self.seen_events_index)
-                || self.seen_events_index.contains(&event_id)
-            {
+            if receipts.contains(&event_id) {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 counts.skipped = counts.skipped.saturating_add(1);
                 // Liveness, but not progress. It must not outlast the moment
@@ -2097,13 +2097,7 @@ impl AppClient {
                 }
                 continue;
             }
-            if cfg!(feature = "test-policy-overrides")
-                && self
-                    .app
-                    .config
-                    .dev_fail_sync_before_delivery
-                    .is_some_and(|limit| counts.deliveries >= limit)
-            {
+            if fail_before_delivery {
                 return Err(self
                     .finish_failed_sync_drain(
                         summary,
@@ -2119,9 +2113,13 @@ impl AppClient {
                     .await);
             }
             let mut delivery_summary = SyncSummary::default();
-            let ingested = match self
-                .ingest_delivery(*delivery, &display_names, &mut delivery_summary)
-                .await
+            let ingested = match Self::ingest_delivery(
+                receipts,
+                *delivery,
+                &display_names,
+                &mut delivery_summary,
+            )
+            .await
             {
                 Ok(ingested) => ingested,
                 Err(error) => {
@@ -2362,28 +2360,64 @@ impl AppClient {
         }
     }
 
+    /// Consume the exclusive receipt view used for admission. The SDK drain
+    /// shares it with its duplicate decision, while direct ingestion opens one.
     async fn ingest_delivery(
-        &mut self,
+        receipts: super::receipts::SynchronizedTransportReceipts<'_>,
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
+        let client = receipts.into_client();
         let source_message_id = delivery.message.id.clone();
         let source_message_id_hex = hex::encode(source_message_id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
-            transport_reconciliation_record(self.adapter.account_id(), &delivery);
-        self.reconcile_released_transport_receipts()?;
-        let effects = self.runtime.ingest_delivery(delivery).await?;
-        self.observe_membership_health(&effects.effects)?;
+            transport_reconciliation_record(client.adapter.account_id(), &delivery);
+        let welcome = matches!(
+            &delivery.message.envelope,
+            TransportEnvelope::Welcome { .. }
+        );
+        let observation = client.app.product_analytics.begin(
+            if welcome {
+                crate::ProductFamily::Welcome
+            } else {
+                crate::ProductFamily::MessageProcessing
+            },
+            if welcome { "process" } else { "receive" },
+            crate::ProductUnit::Attempt,
+        );
+        let ingest = client.runtime.ingest_delivery(delivery).await;
+        if let Some(observation) = observation {
+            observation.finish(match &ingest {
+                Ok(effects) => match &effects.outcome {
+                    IngestOutcome::Processed => "success",
+                    IngestOutcome::Ignored {
+                        category:
+                            cgka_traits::InputRejectionCategory::Duplicate
+                            | cgka_traits::InputRejectionCategory::OwnEcho,
+                    } => "duplicate",
+                    IngestOutcome::Buffered { .. }
+                    | IngestOutcome::TransportDeferred { .. }
+                    | IngestOutcome::LocalState { .. } => "deferred",
+                    IngestOutcome::ResourceRefused { .. } => "capacity",
+                    IngestOutcome::Ignored { .. }
+                    | IngestOutcome::Stale { .. }
+                    | IngestOutcome::Rejected { .. } => "rejected",
+                },
+                Err(_) => "failure",
+            });
+        }
+        let effects = ingest?;
+        client.observe_membership_health(&effects.effects)?;
         if let IngestOutcome::TransportDeferred { group_id, .. } = &effects.outcome
-            && let Ok(group) = self.runtime.group_record(group_id)
+            && let Ok(group) = client.runtime.group_record(group_id)
             && !group.is_terminal()
-            && self
+            && client
                 .app
-                .account_storage(&self.state.label)?
+                .account_storage(&client.state.label)?
                 .observe_membership_undecryptable(
                     group_id,
                     &source_message_id,
@@ -2391,7 +2425,7 @@ impl AppClient {
                     super::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD,
                 )?
         {
-            self.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
+            client.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
         }
         if matches!(
             effects.outcome,
@@ -2399,28 +2433,29 @@ impl AppClient {
                 state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
             }
         ) {
-            for candidate in self.runtime.session().pending_group_rejoins()? {
+            for candidate in client.runtime.session().pending_group_rejoins()? {
                 if hex::encode(candidate.message_id.as_slice()) == source_message_id_hex {
-                    self.mark_group_projection_dirty_hex(hex::encode(
+                    client.mark_group_projection_dirty_hex(hex::encode(
                         candidate.group_id.as_slice(),
                     ));
                 }
             }
         }
-        let released = self.reconcile_released_transport_receipts()?;
+        let source_released = client
+            .transport_receipts()?
+            .was_released(&source_message_id_hex);
         let publish_error = fail_if_publish_failed(&effects.effects).err();
-        let must_stay_fetchable =
-            effects.left_object_unpersisted || released.contains(&source_message_id_hex);
+        let must_stay_fetchable = effects.left_object_unpersisted || source_released;
         if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
-            self.record_transport_reconciliation_item(route, item);
+            client.record_transport_reconciliation_item(route, item);
         }
         let refused_group = match &effects.outcome {
             IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
             _ => None,
         };
-        self.remember_buffered_convergence_outcome(&effects.outcome);
-        self.remember_pending_convergence_groups(&effects.effects);
-        self.observe_recovery_evidence(&effects.effects);
+        client.remember_buffered_convergence_outcome(&effects.outcome);
+        client.remember_pending_convergence_groups(&effects.effects);
+        client.observe_recovery_evidence(&effects.effects);
         // The cursor is held back only by a resource refusal, which is
         // narrower than `must_stay_fetchable` on purpose.
         //
@@ -2440,9 +2475,9 @@ impl AppClient {
         // should instead hold the floor back until it converges is the separate
         // since-floor design item, not this seam's call.
         if refused_group.is_none() {
-            self.remember_transport_cursor(outer_transport_at);
+            client.remember_transport_cursor(outer_transport_at);
         }
-        self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
+        client.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         // A delivery can contain several application events. If projection
         // fails after an earlier event staged its acknowledgement, keep that
         // event in the durable engine outbox so a retained or reopened client
@@ -2462,9 +2497,9 @@ impl AppClient {
                 }
                 _ => None,
             })
-            .filter(|event_id| !self.pending_application_event_acks.contains(event_id))
+            .filter(|event_id| !client.pending_application_event_acks.contains(event_id))
             .collect::<Vec<_>>();
-        let routes_dirty = match self
+        let routes_dirty = match client
             .observe_account_device_effects(
                 &effects.effects,
                 display_names,
@@ -2477,7 +2512,7 @@ impl AppClient {
             Ok(routes_dirty) => routes_dirty,
             Err(error) => {
                 for event_id in new_application_event_ack_candidates {
-                    self.pending_application_event_acks.remove(&event_id);
+                    client.pending_application_event_acks.remove(&event_id);
                 }
                 return Err(error);
             }
@@ -4080,7 +4115,7 @@ impl AppClient {
         &mut self,
         created_group_id_hex: Option<&str>,
     ) -> Result<Option<crate::ChatListRow>, AppError> {
-        self.reconcile_released_transport_receipts()?;
+        let seen_events = self.transport_receipts()?.pending_seen_events();
         let frontiers_to_clear = self
             .pending_local_group_deletion_frontier_clears
             .iter()
@@ -4091,14 +4126,9 @@ impl AppClient {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let seen_start = self
-            .state
-            .seen_events
-            .len()
-            .saturating_sub(self.pending_seen_event_count);
         let delta = AccountState {
             label: self.state.label.clone(),
-            seen_events: self.state.seen_events[seen_start..].to_vec(),
+            seen_events,
             last_transport_timestamp: self.checkpointed_transport_timestamp,
             groups: self
                 .state
@@ -4435,20 +4465,6 @@ impl AppClient {
             TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
         );
     }
-}
-
-pub(crate) fn is_own_relay_echo(
-    delivery: &cgka_traits::TransportDelivery,
-    local_account_id_hex: &str,
-    known_event_ids: &HashSet<String>,
-) -> bool {
-    let event_id = hex::encode(delivery.message.id.as_slice());
-    if !known_event_ids.contains(&event_id) {
-        return false;
-    }
-    NostrTransportEvent::from_transport_message(&delivery.message)
-        .ok()
-        .is_some_and(|event| event.pubkey == local_account_id_hex)
 }
 
 /// Apply the runtime's [`CursorPersistence`] policy to a candidate inbound
@@ -5558,7 +5574,11 @@ mod tests {
             .queued_epoch_backfills
             .push_back(armed_backfill(&queued, 0));
         client.clear_epoch_backfill_intent(&completed).unwrap();
-        let remaining = app.pending_epoch_backfill_intents("alice").unwrap();
+        let remaining = app
+            .account_storage("alice")
+            .unwrap()
+            .pending_epoch_backfill_intents()
+            .unwrap();
         assert_eq!(remaining.len(), 2);
         assert!(
             !remaining

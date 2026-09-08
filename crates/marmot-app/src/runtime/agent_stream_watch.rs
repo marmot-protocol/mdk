@@ -41,6 +41,26 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         options: AgentStreamWatchOptions,
     ) -> Result<RuntimeAgentStreamWatch, AppError> {
+        let observation = self.shared.product_analytics.begin(
+            crate::ProductFamily::Stream,
+            "watch",
+            crate::ProductUnit::Action,
+        );
+        let result = self
+            .watch_agent_text_stream_unobserved(account_ref, group_id, options)
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    async fn watch_agent_text_stream_unobserved(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        options: AgentStreamWatchOptions,
+    ) -> Result<RuntimeAgentStreamWatch, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let app = self.accounts.app.clone();
@@ -93,6 +113,7 @@ impl MarmotAppRuntime {
         let mut runtime_events = self.subscribe();
         let invalidation_group_id = group_id.clone();
         let invalidation_start_id = start_message_id_hex.clone();
+        let product = self.shared.product_analytics.clone();
         let handle = tokio::spawn(async move {
             let watch = watch_broker_candidates(
                 BrokerWatch {
@@ -105,6 +126,7 @@ impl MarmotAppRuntime {
                     policy_max_plaintext_frame_len,
                 },
                 updates_tx.clone(),
+                product,
             );
             tokio::pin!(watch);
             let final_update = tokio::select! {
@@ -380,7 +402,18 @@ struct BrokerWatch {
 async fn watch_broker_candidates(
     watch: BrokerWatch,
     updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
+    product: crate::product_analytics::ProductAnalytics,
 ) -> RuntimeAgentStreamUpdate {
+    let mut first_preview = product.begin(
+        crate::ProductFamily::Stream,
+        "first_preview",
+        crate::ProductUnit::Attempt,
+    );
+    let lifetime = product.begin(
+        crate::ProductFamily::Stream,
+        "disconnect",
+        crate::ProductUnit::Attempt,
+    );
     // Receive validation uses the group policy frame cap when the component
     // is present; the app-profile constant stays the ceiling and fallback.
     let mut limits = AgentTextStreamReceiveLimits::default();
@@ -417,10 +450,15 @@ async fn watch_broker_candidates(
                 let chunk_tx = updates_tx.clone();
                 match subscribe_text_from_broker_with_resume(config, &mut receiver_state, |chunk| {
                     let update = match chunk.record_type {
-                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
-                            seq: chunk.seq,
-                            text: chunk.text.clone(),
-                        },
+                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => {
+                            if let Some(observation) = first_preview.take() {
+                                observation.finish("success");
+                            }
+                            RuntimeAgentStreamUpdate::Chunk {
+                                seq: chunk.seq,
+                                text: chunk.text.clone(),
+                            }
+                        }
                         AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
                             seq: chunk.seq,
                             status: chunk.text.clone(),
@@ -437,7 +475,17 @@ async fn watch_broker_candidates(
                             text: chunk.text.clone(),
                         },
                     };
-                    match chunk_tx.try_send(update) {
+                    let sent = chunk_tx.try_send(update);
+                    if matches!(&sent, Err(mpsc::error::TrySendError::Full(_))) {
+                        product.observe(
+                            crate::ProductFamily::Stream,
+                            "overflow",
+                            "capacity",
+                            crate::ProductUnit::Attempt,
+                            None,
+                        );
+                    }
+                    match sent {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_))
                             if chunk.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA =>
@@ -463,17 +511,41 @@ async fn watch_broker_candidates(
                 .await
                 {
                     Ok(received) => {
+                        if let Some(lifetime) = lifetime {
+                            lifetime.finish("success");
+                        }
                         return RuntimeAgentStreamUpdate::Finished {
                             text: received.text,
                             transcript_hash_hex: hex::encode(received.transcript_hash),
                             chunk_count: received.chunk_count,
                         };
                     }
-                    Err(err) => last_error = Some(err.to_string()),
+                    Err(err) => {
+                        if matches!(
+                            &err,
+                            transport_quic_broker::QuicBrokerError::StreamCrypto(_)
+                                | transport_quic_broker::QuicBrokerError::Record(_)
+                        ) {
+                            product.observe(
+                                crate::ProductFamily::Stream,
+                                "integrity",
+                                "failure",
+                                crate::ProductUnit::Attempt,
+                                None,
+                            );
+                        }
+                        last_error = Some(err.to_string());
+                    }
                 }
             }
             Err(err) => last_error = Some(err.to_string()),
         }
+    }
+    if let Some(lifetime) = lifetime {
+        lifetime.finish("failure");
+    }
+    if let Some(first_preview) = first_preview {
+        first_preview.finish("failure");
     }
     RuntimeAgentStreamUpdate::Failed {
         message: last_error.unwrap_or_else(|| AppError::AgentStreamMissingCandidate.to_string()),

@@ -4,6 +4,12 @@ use marmot_app::AppError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
+    #[error("usage and diagnostics consent required")]
+    ConsentRequired,
+    #[error("invalid product analytics configuration")]
+    InvalidProductAnalyticsConfiguration,
+    #[error("unregistered or invalid product observation")]
+    InvalidProductObservation,
     #[error("identity already exists: {account}")]
     DuplicateIdentity { account: String },
     #[error("unknown account: {account_ref}")]
@@ -246,6 +252,15 @@ impl From<AppError> for MarmotKitError {
             return Self::from_engine_error(err);
         }
         match value {
+            AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
+                Self::ConsentRequired
+            }
+            AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::InvalidConfiguration) => {
+                Self::InvalidProductAnalyticsConfiguration
+            }
+            AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::InvalidEvent) => {
+                Self::InvalidProductObservation
+            }
             AppError::AccountHome(AccountHomeError::UnknownAccount(account_ref)) => {
                 Self::UnknownAccount { account_ref }
             }

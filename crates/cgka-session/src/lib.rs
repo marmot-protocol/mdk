@@ -670,6 +670,11 @@ impl AccountDeviceSession {
         self.engine.quarantined_groups()
     }
 
+    /// Number of currently quarantined groups without cloning their identities.
+    pub fn quarantined_group_count(&self) -> usize {
+        self.engine.quarantined_group_count()
+    }
+
     /// Re-attempt hydration of a single quarantined group. Returns `Ok(true)`
     /// if the group recovered and is now live, `Ok(false)` if it is still
     /// unhealthy and stays quarantined. Errors with `UnknownGroup` if the id is

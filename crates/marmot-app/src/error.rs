@@ -35,6 +35,8 @@ impl std::fmt::Display for AccountCatchUpFailure {
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    ProductAnalytics(#[from] crate::ProductAnalyticsError),
+    #[error(transparent)]
     Account(#[from] marmot_account::AccountError),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
@@ -250,6 +252,7 @@ impl AppError {
 
     pub(crate) fn privacy_safe_kind(&self) -> &'static str {
         match self {
+            Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),
             Self::AccountHome(error) => account_home_error_kind(error),
             Self::Session(error) => session_error_kind(error),
@@ -257,7 +260,14 @@ impl AppError {
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
             Self::Json(_) => "json",
-            Self::Sqlite(_) => "sqlite",
+            Self::Sqlite(error) => match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    "storage_busy"
+                }
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => "storage_corruption",
+                Some(rusqlite::ErrorCode::DiskFull) => "storage_capacity",
+                _ => "sqlite",
+            },
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
@@ -330,7 +340,16 @@ impl AppError {
     /// Broad, bounded cause derived only from typed variants.
     pub(crate) fn sync_error_class(&self) -> SyncErrorClass {
         match self {
-            Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) => SyncErrorClass::Storage,
+            Self::Storage(error) => storage_error_class(error),
+            Self::Sqlite(error) => match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    SyncErrorClass::StorageBusy
+                }
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => SyncErrorClass::StorageCorruption,
+                Some(rusqlite::ErrorCode::DiskFull) => SyncErrorClass::StorageCapacity,
+                _ => SyncErrorClass::Storage,
+            },
+            Self::Io(_) => SyncErrorClass::Storage,
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
@@ -384,7 +403,7 @@ fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
 
 fn session_error_class(error: &cgka_session::SessionError) -> SyncErrorClass {
     match error {
-        cgka_session::SessionError::Storage(_) => SyncErrorClass::Storage,
+        cgka_session::SessionError::Storage(error) => storage_error_class(error),
         cgka_session::SessionError::Engine(error) => engine_error_class(error),
     }
 }
@@ -393,7 +412,7 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
     use cgka_traits::error::{EngineError, PeelerError};
 
     match error {
-        EngineError::Storage(_) => SyncErrorClass::Storage,
+        EngineError::Storage(error) => storage_error_class(error),
         EngineError::Peeler(
             PeelerError::DecryptFailed
             | PeelerError::MissingContext { .. }
@@ -481,6 +500,15 @@ fn session_error_kind(error: &cgka_session::SessionError) -> &'static str {
     }
 }
 
+fn storage_error_class(error: &StorageError) -> SyncErrorClass {
+    match error {
+        StorageError::Busy(_) => SyncErrorClass::StorageBusy,
+        StorageError::Corruption(_) => SyncErrorClass::StorageCorruption,
+        StorageError::Capacity(_) => SyncErrorClass::StorageCapacity,
+        _ => SyncErrorClass::Storage,
+    }
+}
+
 fn storage_error_kind(error: &StorageError) -> &'static str {
     match error {
         StorageError::NotFound => "storage_not_found",
@@ -488,6 +516,8 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
         StorageError::TimelineCursorExpired => "storage_timeline_cursor_expired",
         StorageError::Busy(_) => "storage_busy",
+        StorageError::Corruption(_) => "storage_corruption",
+        StorageError::Capacity(_) => "storage_capacity",
         StorageError::Closed(_) => "storage_closed",
         StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
         StorageError::Backend(_) => "storage_backend",

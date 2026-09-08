@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-08-19
+updated: 2026-09-07
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -104,3 +104,15 @@ Relay identity is the sole identifier permitted to leave the device, and only as
 identifier of the reporter. This carve-out applies to the export channel alone and never to logs or traces. The full
 contract, metric catalogue, and architecture live in
 [`../relay-observability.md`](../relay-observability.md).
+
+## Optional usage analytics
+
+The [usage and diagnostics collector](../usage-diagnostics.md) is a second explicit
+export boundary. Product observations use approved finite schemas, coarse metadata,
+bucketed counts/durations, temporary IDs, and memory-only queues under the shared
+revocable permission. No content, account/group IDs, or persistent installation ID
+enters product payloads. Stock Aptabase still receives source IP information and
+performs daily grouping and country/region enrichment. Temporary IDs do not remove
+rare-event or timing risks; preserve existing relay dashboard safeguards. Audit
+logging retains its separate consent. Native UI adoption and deployed logging and
+retention verification are separate from MDK implementation evidence.

@@ -6469,3 +6469,57 @@ async fn bench_idle_reconciliation_scaling() {
     invite_worker.abort();
     connector.runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn optional_management_socket_cannot_interrupt_regular_control() {
+    for blocked_bind in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix(".mdk-mgmt-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        let socket = dir.path().join("dev/wn-agent.sock");
+        let management = dir.path().join("dev/usage-diagnostics.sock");
+        if blocked_bind {
+            fs_private::create_dir_all_private(&management).unwrap();
+        }
+        let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+        let server = tokio::spawn(serve_socket(config));
+        let response = send_control_request(
+            &socket,
+            "management-start",
+            AgentControlRequest::AccountList,
+        )
+        .await;
+        assert!(matches!(
+            response.payload,
+            AgentControlResponse::AccountList { .. }
+        ));
+        let _stalled = if !blocked_bind {
+            let mut malformed = tokio::net::UnixStream::connect(&management).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut malformed, &[255])
+                .await
+                .unwrap();
+            let stalled = tokio::net::UnixStream::connect(&management).await.unwrap();
+            Some(stalled)
+        } else {
+            None
+        };
+        let response = timeout(
+            Duration::from_secs(1),
+            send_control_request(
+                &socket,
+                "management-stalled",
+                AgentControlRequest::AccountList,
+            ),
+        )
+        .await
+        .expect("management peers must not consume the normal control loop's two-second budget");
+        assert!(matches!(
+            response.payload,
+            AgentControlResponse::AccountList { .. }
+        ));
+        assert!(!server.is_finished());
+        server.abort();
+        let _ = server.await;
+    }
+}
