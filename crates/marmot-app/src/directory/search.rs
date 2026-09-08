@@ -1244,6 +1244,8 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::AccountRelayListStatus;
     use crate::ids::npub_for_account_id_lossy;
@@ -1471,19 +1473,14 @@ mod tests {
         assert_eq!(matched.matched_field, MatchedField::Name);
     }
 
-    /// A profile resolved from a relay to answer a search is kept, so the next
-    /// search for the same person is warm -- and it is kept in the un-promoted
-    /// tier only. Caching a stranger must never turn them into a directory
-    /// entry, because that is what feeds live per-author subscriptions
-    /// (mdk#418). The `entry` assertion is the guard on that.
+    /// Hostile kind:0 extensions on a relay-resolved stranger must inherit the
+    /// shared ingest bounds in both the streamed result and the un-promoted
+    /// search-graph cache. The stranger must not be promoted into directory_users
+    /// or its per-author subscriptions (mdk#418).
     #[tokio::test]
     async fn a_profile_resolved_from_a_relay_is_cached_without_promoting_the_stranger() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let relay_url = relay.url().await.to_string();
-
-        // The stranger publishes a profile from their own device. This needs a
-        // real signing identity, not a bare account row -- the profile is a
-        // signed kind:0 the searcher will fetch back off the relay.
         let endpoint = cgka_traits::TransportEndpoint(relay_url.clone());
         let stranger_dir = tempfile::tempdir().unwrap();
         let stranger_app = MarmotApp::with_relay(stranger_dir.path(), relay_url.clone());
@@ -1504,14 +1501,24 @@ mod tests {
                 &stranger.account_id_hex,
                 UserProfileMetadata {
                     name: Some("needle".to_owned()),
+                    extra: BTreeMap::from([
+                        (
+                            "website".to_owned(),
+                            serde_json::json!("https://example.test"),
+                        ),
+                        ("bot".to_owned(), serde_json::json!(false)),
+                        (
+                            "custom_blob".to_owned(),
+                            serde_json::json!("x".repeat(8000)),
+                        ),
+                    ]),
                     ..UserProfileMetadata::default()
                 },
                 crate::AccountRelayListBootstrap::new(vec![endpoint.clone()], Vec::new()),
             )
             .await
-            .expect("publish the stranger's profile");
+            .expect("publish the stranger's hostile profile");
 
-        // The searcher follows them but has never cached their profile.
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let account = home.create_account("alice").unwrap();
@@ -1529,23 +1536,32 @@ mod tests {
             .await
             .unwrap();
         let updates = drain(subscription).await;
-        assert!(
-            updates
-                .iter()
-                .flat_map(|update| &update.new_results)
-                .any(|result| result.account_id_hex == stranger.account_id_hex),
-            "the search must resolve the stranger from the relay: {updates:?}"
+        let matched = updates
+            .iter()
+            .flat_map(|update| &update.new_results)
+            .find(|result| result.account_id_hex == stranger.account_id_hex)
+            .expect("the search must resolve the stranger from the relay");
+        let result_profile = matched.profile.as_ref().expect("search result profile");
+        assert_eq!(result_profile.name.as_deref(), Some("needle"));
+        assert_eq!(
+            result_profile.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
         );
+        assert_eq!(
+            result_profile.extra.get("bot"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(!result_profile.extra.contains_key("custom_blob"));
+        assert_eq!(result_profile.extra.len(), 2);
 
         let now = crate::unix_now_seconds() as i64;
         let cached = cache
             .search_record(&stranger.account_id_hex, now)
             .unwrap()
             .expect("the resolved profile must be cached for the next search");
-        assert_eq!(
-            cached.profile.and_then(|profile| profile.name),
-            Some("needle".to_owned())
-        );
+        let cached_profile = cached.profile.expect("un-promoted cached profile");
+        assert_eq!(cached_profile.extra, result_profile.extra);
+        assert!(!cached_profile.extra.contains_key("custom_blob"));
         assert!(
             cache.entry(&stranger.account_id_hex).unwrap().is_none(),
             "caching a search result must not promote them into directory_users"

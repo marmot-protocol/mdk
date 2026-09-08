@@ -1,9 +1,10 @@
+manifest_version: 1
 name: marmot
 label: Marmot
 kind: platform
-version: 0.9.3
-description: Hermes platform adapter for Marmot through the local wn-agent control socket
-author: Marmot Protocol
+version: 0.1.0
+description: Marmot group-chat platform adapter backed by the local wn-agent control socket
+author: marmot-protocol
 requires_env: []
 optional_env:
   - name: MARMOT_HOME
@@ -66,3 +67,52 @@ optional_env:
   - name: MARMOT_PROFILE_ONBOARDING_STATE
     description: "Path to the profile onboarding state file; defaults to $MARMOT_HOME/dev/profile-onboarding.json"
     password: false
+license: MIT
+homepage: https://github.com/marmot-protocol/mdk/tree/master/integrations/hermes/marmot
+tags:
+  - marmot
+  - nostr
+  - messaging
+  - privacy
+api_version: 1
+config_schema:
+  socket_path:
+    type: string
+    default: ""
+    description: Unix socket exposed by wn-agent serve --enable-agent-control
+  home:
+    type: string
+    default: ""
+    description: wn-agent home directory used to derive the default control socket
+  account_id_hex:
+    type: string
+    default: ""
+    description: Optional exact account pubkey; empty requires exactly one local signing account
+  group_id_hex:
+    type: string
+    default: ""
+    description: Optional Marmot home group ID
+  home_channel:
+    type: string
+    default: ""
+    description: Default Marmot group ID for Hermes home and cron delivery
+hermes:
+  minimum_version: 0.19.0
+  floor_source_ref: 3ef6bbd201263d354fd83ec55b3c306ded2eb72a
+  current_source_ref: 7166071fcaadb36df26f6d753dda97da6b5d699e
+  outbound_media_api_candidate_ref: 672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc
+companion:
+  binary: wn-agent
+  minimum_version: 0.9.18
+media:
+  inbound:
+    - image
+    - document
+    - video
+    - voice
+  outbound:
+    - image
+    - document
+    - video
+    - voice
+  host_dispatch: feature-detected

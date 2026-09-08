@@ -23,20 +23,67 @@ reaction content of at most 64 Unicode scalar values. Adds are idempotent;
 removal can target exact content or clear all active own reactions atomically;
 processing-status reaction policy remains a separate host concern.
 
+The model-callable `marmot_status` tool exposes the plugin's passive readiness
+probe on a supported Hermes operator surface. It reports staged booleans for
+plugin discovery, enablement, configuration, `wn-agent` reachability,
+authentication, account selection, home-group resolution, and media capability.
+It never returns account or group identifiers. `state: ready` is the only fully
+ready result; `gateway_inactive` means no live Marmot adapter is available to
+probe in that Hermes process.
+
+Hermes's `PlatformEntry.is_connected` callback is a synchronous configuration
+and auto-enablement gate, so this plugin deliberately keeps that callback free
+of socket I/O: it means "configured", not "the companion service is live".
+Operational `BasePlatformAdapter.is_connected` remains false until `connect()`
+successfully reaches `wn-agent`; `marmot_status` is the authoritative staged
+health readback. A configured plugin with no companion service is therefore not
+reported as operationally connected.
+
+On current Hermes releases, non-secret values from
+`plugins.entries.marmot.settings` are merged into the effective platform config
+before validation, adapter construction, standalone delivery, and readiness
+checks. Legacy `platforms.marmot.extra` values take precedence when both forms
+are present; environment variables remain available for legacy cohorts and
+secret-bearing configuration.
+
 For live previews, the plugin retries `stream_begin` with one stable v2 request
 id and retains the returned stream capability in memory for subsequent append,
 status, finalize, and cancel calls. The capability is a bearer secret and must
 not be logged or persisted.
 
-For a real Hermes install, install it by copying or symlinking this directory to:
+Install through Hermes's standard plugin flow from one reviewed MDK revision.
+Hermes 0.19.0 does not expose `plugins install --ref`, so the portable immutable
+path is to check out the exact commit first and install its plugin subdirectory
+from that local repository. Keep the full 40-character commit explicit; do not
+install a moving branch for production:
 
 ```sh
-~/.hermes/plugins/marmot
+set -eu
+MDK_PLUGIN_REF=<40-character-reviewed-MDK-commit>
+case "$MDK_PLUGIN_REF" in
+  *[!0-9a-f]*|'') printf '%s\n' "MDK_PLUGIN_REF must be lowercase hexadecimal" >&2; exit 1 ;;
+esac
+test "${#MDK_PLUGIN_REF}" -eq 40
+MDK_PLUGIN_CHECKOUT="$(mktemp -d)"
+trap 'rm -rf "$MDK_PLUGIN_CHECKOUT"' EXIT HUP INT TERM
+git clone --filter=blob:none --no-checkout \
+  https://github.com/marmot-protocol/mdk.git "$MDK_PLUGIN_CHECKOUT"
+git -C "$MDK_PLUGIN_CHECKOUT" fetch --depth=1 origin "$MDK_PLUGIN_REF"
+git -C "$MDK_PLUGIN_CHECKOUT" checkout --detach "$MDK_PLUGIN_REF"
+test "$(git -C "$MDK_PLUGIN_CHECKOUT" rev-parse HEAD)" = "$MDK_PLUGIN_REF"
+hermes plugins install \
+  "file://$MDK_PLUGIN_CHECKOUT#integrations/hermes/marmot"
+hermes plugins enable marmot
 ```
 
-The current Hermes plugin loader expects platform plugins as directories directly
-under `~/.hermes/plugins/<name>/` with `plugin.yaml`, `__init__.py`, and
-adapter implementation files.
+Hermes clones the detached exact-commit checkout and copies only this plugin
+subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
+workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
+installed plugin. Hermes versions that expose `plugins install --ref` may use it
+as a shorter equivalent. The release installer below consumes an archive built
+from these same files. A community-index entry should pin an immutable commit
+or release tag; until such an entry is published, use the exact-checkout source
+command above.
 
 ## Release Install (Hermes Already Installed)
 
@@ -50,6 +97,22 @@ Prerequisites:
   validates the existing host and never installs or upgrades Hermes.
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
+
+### Hermes compatibility
+
+| Cohort | Immutable source | Required result |
+| --- | --- | --- |
+| Supported floor | Hermes Agent `0.19.0` (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) | Plugin install, discovery, explicit media methods, and standalone sender work. Hermes has no generic outbound-media capability contract, so the plugin does not claim one. |
+| Current candidate | `7166071fcaadb36df26f6d753dda97da6b5d699e` | Same compatibility surface as the floor, tested from source. |
+| Outbound-media API candidate | `672f2493502b6ed7d5d0c9f520bfb9c2f6ee39bc` from Hermes PR 36817 | The plugin feature-detects `MediaKind` and declares image, document, video, and voice routing through `MEDIA_KINDS`. |
+
+Inbound and outbound capabilities are reported separately by
+`adapter.media_capability_status()`. Inbound attachments use bounded local
+copies provided by `wn-agent`; outbound attachments are restaged and revalidated
+before publication. Operators may continue using the explicit `send_image`,
+`send_document`, `send_video`, and `send_voice` methods on every supported
+cohort. Generic Hermes media dispatch is advertised only when the host exports
+its candidate capability API.
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 
@@ -538,5 +601,5 @@ not a disk-streaming or low-memory-mobile transfer mode.
 Run the shim tests with:
 
 ```sh
-python3 -m unittest discover -s integrations/hermes/marmot/tests
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/tests/marmot
 ```

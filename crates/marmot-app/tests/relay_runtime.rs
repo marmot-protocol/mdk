@@ -2116,6 +2116,101 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
 }
 
 #[tokio::test]
+async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser() {
+    let dir_fetch = tempfile::tempdir().unwrap();
+    let (_relay, fetch_app, url) = mock_app(&dir_fetch).await;
+    let fetch_runtime = MarmotAppRuntime::new(fetch_app.clone());
+    let _fetch_account = create_network_ready_identity(
+        &fetch_runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+
+    let publisher = Keys::generate();
+    let mut content = serde_json::json!({
+        "name": "hostile",
+        "website": "https://example.test",
+        "bot": false,
+        "custom_blob": "x".repeat(8000),
+        "created_at": 42,
+        "source_relays": ["wss://spoof.example"]
+    });
+    let signed = EventBuilder::new(Kind::Metadata, content.to_string())
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_867))
+        .sign_with_keys(&publisher)
+        .expect("sign hostile kind:0");
+    let transport_event =
+        NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed kind:0");
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(&[endpoint(&url)], &transport_event, 1)
+        .await
+        .expect("publish hostile kind:0 from a separate publisher");
+
+    let publisher_hex = publisher.public_key().to_hex();
+    let fetched = fetch_app
+        .fetch_current_user_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
+        .await
+        .unwrap()
+        .expect("profile on relay");
+    assert_eq!(fetched.name.as_deref(), Some("hostile"));
+    assert_eq!(
+        fetched.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
+    assert!(!fetched.extra.contains_key("custom_blob"));
+    assert!(!fetched.extra.contains_key("created_at"));
+    assert!(!fetched.extra.contains_key("source_relays"));
+    assert_eq!(fetched.created_at, 1_700_000_867);
+    assert!(
+        fetched
+            .source_relays
+            .iter()
+            .all(|relay| !relay.contains("spoof")),
+        "provenance must stay endpoint-derived"
+    );
+
+    // A newer event makes refresh prove it fetched and filtered new content,
+    // rather than passing against the profile already cached by fetch.
+    content["name"] = serde_json::json!("refreshed");
+    content["bot"] = serde_json::json!(true);
+    let newer = EventBuilder::new(Kind::Metadata, content.to_string())
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_868))
+        .sign_with_keys(&publisher)
+        .unwrap();
+    relay_client
+        .publish_event(
+            &[endpoint(&url)],
+            &NostrTransportEvent::from_nostr_event(&newer).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    fetch_app
+        .refresh_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let refreshed = fetch_app
+        .directory_entry_for_account_id(&publisher_hex)
+        .unwrap()
+        .expect("refresh cached the inbound profile")
+        .profile
+        .expect("refreshed profile");
+    assert_eq!(refreshed.name.as_deref(), Some("refreshed"));
+    let mut expected_extra = fetched.extra;
+    expected_extra.insert("bot".into(), serde_json::json!(true));
+    assert_eq!(refreshed.extra, expected_extra);
+    assert_eq!(refreshed.created_at, 1_700_000_868);
+
+    fetch_runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_republish_key_package_resends_exact_current_event() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -6083,9 +6178,9 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 /// his own send — not a receive — applied it.
 ///
 /// This regression uses explicit test-policy overrides to create the precise
-/// post-cutoff/pre-scheduler state. `update_group_profile` completes its
-/// cross-account catch-up before returning, proving bob has ingested the
-/// rename. The test then lets the 100ms engine cutoff elapse while holding the
+/// post-cutoff/pre-scheduler state. Cross-account catch-up is best-effort, so
+/// the test witnesses the rename's commit edge in bob's durable active
+/// pass before allowing its engine cutoff to elapse while holding the
 /// scheduled worker for 60s. The send is therefore the only operation that can
 /// move bob's durable row from the old name to the new one, and the
 /// subscription must update within 5s, well before scheduled convergence can
@@ -6141,17 +6236,18 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
         .await
         .unwrap();
 
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
     let renamed = "renamed during retained send".to_owned();
-    runtime
+    let rename_summary = runtime
         .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
         .await
         .unwrap();
-    assert_ne!(
-        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
-        Some(renamed.as_str()),
-        "bob's completed catch-up must retain the rename without applying it"
-    );
-    sleep(Duration::from_millis(250)).await;
+    assert!(rename_summary.published > 0, "the rename must be published");
+    wait_for_retained_commit_cutoff(&app, &bob.account.label, &group_id, source_epoch).await;
     assert_ne!(
         row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
         Some(renamed.as_str()),
@@ -6248,17 +6344,18 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
         .await
         .unwrap();
 
+    let source_epoch = runtime
+        .group_mls_state(&bob_id, &group_id)
+        .await
+        .unwrap()
+        .epoch;
     let renamed = "renamed during rejected send".to_owned();
-    runtime
+    let rename_summary = runtime
         .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
         .await
         .unwrap();
-    assert_ne!(
-        row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
-        Some(renamed.as_str()),
-        "bob's completed catch-up must retain the rename without applying it"
-    );
-    sleep(Duration::from_millis(250)).await;
+    assert!(rename_summary.published > 0, "the rename must be published");
+    wait_for_retained_commit_cutoff(&app, &bob.account.label, &group_id, source_epoch).await;
     assert_ne!(
         row_title(&app, &bob.account.label, &group_id_hex).as_deref(),
         Some(renamed.as_str()),
@@ -6492,6 +6589,48 @@ where
     })
     .await
     .expect("runtime chat update")
+}
+
+/// Witness a rename admitted at the receiver's current epoch before waiting
+/// out its cutoff. A completed best-effort catch-up and an unchanged title do
+/// not prove delivery. Passive reads leave the send as the only settling seam.
+#[cfg(feature = "test-policy-overrides")]
+async fn wait_for_retained_commit_cutoff(
+    app: &MarmotApp,
+    label: &str,
+    group_id: &GroupId,
+    source_epoch: u64,
+) {
+    use cgka_traits::convergence_pass::{ConvergencePassMemberRole, ConvergencePassPhase};
+
+    let pass = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pass) = app.convergence_pass_for_test(label, group_id).unwrap()
+                && matches!(
+                    pass.phase,
+                    ConvergencePassPhase::Collecting | ConvergencePassPhase::Frozen
+                )
+                && pass.base_epoch.0 == source_epoch
+                && pass.members.iter().any(|member| {
+                    member.role == ConvergencePassMemberRole::CommitEdge
+                        && member.source_epoch == source_epoch
+                })
+            {
+                break pass;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receiver must retain the rename in its active pass");
+    // Wait a full observed pass window using a monotonic timer, avoiding any
+    // assumption about how long publication/catch-up took or wall-clock phase.
+    sleep(Duration::from_millis(
+        pass.cutoff_monotonic_ms()
+            .saturating_sub(pass.opened_monotonic_ms)
+            .saturating_add(1),
+    ))
+    .await;
 }
 
 /// Current chat-list row title for one group, read fresh from the projection

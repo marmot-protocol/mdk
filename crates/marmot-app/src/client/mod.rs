@@ -56,24 +56,21 @@ use crate::{
     AppTransportRouting, CanonicalCreatedGroup, GroupInviteDeclineResult, MarmotApp,
     MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    SelfMembership, SendSummary, unix_now_seconds,
 };
 
 mod audit;
 pub(crate) mod epoch_stall;
 mod projection;
 mod push;
+mod receipts;
 mod retention;
 mod sync;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
-// Re-exported so the crate's `tests` module can keep calling
-// `client::is_own_relay_echo`; the function itself lives in `client::sync`.
 #[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
-#[cfg(test)]
-pub(crate) use sync::is_own_relay_echo;
 pub(crate) use sync::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
 };
@@ -310,10 +307,14 @@ pub struct AppClient {
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
     /// `remember_seen_event` (which removes pruned ring entries from it).
+    /// Receipt decisions use `transport_receipts`; the index exposes no raw
+    /// production membership lookup.
+    /// The persisted `state.seen_events` ring remains accessible for checkpoint
+    /// bookkeeping; reading it for receipt decisions would bypass synchronization.
     /// Derived state: rebuilt from the ordered ring at construction and never
     /// persisted. Before this index existed, every inbound delivery and every
     /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.
-    pub(crate) seen_events_index: HashSet<String>,
+    pub(crate) seen_events_index: receipts::SeenEventIndex,
     /// Number of ids at the tail of `state.seen_events` observed since the last
     /// successful account-projection checkpoint. The count saturates at the
     /// bounded ring length, so even a catch-up batch larger than the window
@@ -411,9 +412,9 @@ pub struct AppClient {
     pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
-    /// Release consumption durably armed recovery, but loading its intents
-    /// failed. Retry on this client even though the journal is already empty;
-    /// account open independently restores these intents after a restart.
+    /// Initial account open or release consumption requires a backfill reload.
+    /// Keep this armed after a failed read even if the journal is already empty;
+    /// the next synchronized receipt access retries on this same client.
     pub(crate) released_backfill_reload_pending: bool,
     /// One-shot storage-read failure after durable release consumption.
     #[cfg(test)]
@@ -5070,15 +5071,6 @@ impl AppClient {
         for report in &effects.reports {
             let event_id = hex::encode(report.message_id.as_slice());
             self.remember_seen_event(event_id);
-        }
-    }
-
-    pub(crate) fn remember_seen_event(&mut self, event_id: String) {
-        if remember_seen_event(&mut self.seen_events_index, &mut self.state, event_id) {
-            self.pending_seen_event_count = self
-                .pending_seen_event_count
-                .saturating_add(1)
-                .min(self.state.seen_events.len());
         }
     }
 

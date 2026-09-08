@@ -225,7 +225,7 @@ sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
 bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
-integrations/hermes/marmot/tests/test_dev_scripts.sh
+integrations/hermes/tests/marmot/test_dev_scripts.sh
 just codex-installer-test
 just opencode-installer-test
 just pi-installer-test

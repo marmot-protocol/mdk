@@ -10360,6 +10360,105 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 }
 
 #[test]
+fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let author = format!("{:064x}", 867);
+    let mut event = NostrTransportEvent::new_unsigned(
+        author.clone(),
+        KIND_NOSTR_METADATA,
+        Vec::new(),
+        serde_json::json!({
+            "name": "alice",
+            "banner": "https://example.test/banner.png",
+            "website": "https://example.test",
+            "bot": false,
+            "nested": {"ok": true, "tags": ["a"]},
+            "custom_blob": "x".repeat(8000),
+            "created_at": 42,
+            "source_relays": ["wss://spoof.example"]
+        })
+        .to_string(),
+    );
+    event.created_at = 1_700_000_867;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+        event,
+    })
+    .unwrap();
+
+    let assert_bounded_extra = |profile: &UserProfileMetadata| {
+        assert_eq!(profile.name.as_deref(), Some("alice"));
+        assert_eq!(
+            profile.banner.as_deref(),
+            Some("https://example.test/banner.png")
+        );
+        assert_eq!(profile.created_at, 1_700_000_867);
+        assert_eq!(
+            profile.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert_eq!(profile.extra.get("bot"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            profile.extra.get("nested"),
+            Some(&serde_json::json!({"ok": true, "tags": ["a"]}))
+        );
+        assert!(!profile.extra.contains_key("custom_blob"));
+        assert!(!profile.extra.contains_key("created_at"));
+        assert!(!profile.extra.contains_key("source_relays"));
+        assert_eq!(profile.extra.len(), 3);
+    };
+
+    let cached = app
+        .directory_entry_for_account_id(&author)
+        .unwrap()
+        .expect("ingested profile is cached");
+    let cached_profile = cached.profile.expect("cached profile");
+    assert_bounded_extra(&cached_profile);
+    assert_eq!(
+        cached_profile.source_relays,
+        vec!["wss://profiles.example".to_owned()]
+    );
+
+    let shared = app
+        .shared_storage()
+        .unwrap()
+        .public_directory_user(&author)
+        .unwrap()
+        .expect("shared directory row");
+    let shared_profile: UserProfileMetadata =
+        serde_json::from_str(shared.profile_json.as_ref().expect("profile_json")).unwrap();
+    assert_bounded_extra(&shared_profile);
+    assert_eq!(shared_profile.extra, cached_profile.extra);
+    assert!(
+        !shared
+            .profile_json
+            .as_ref()
+            .unwrap()
+            .contains("custom_blob")
+    );
+
+    drop(app);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let reopened = app
+        .directory_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.account_id_hex == author)
+        .expect("reopened directory_entries still lists the author")
+        .profile
+        .expect("reopened profile");
+    assert_bounded_extra(&reopened);
+    assert_eq!(reopened.extra, cached_profile.extra);
+    assert_eq!(
+        reopened.source_relays,
+        vec!["wss://profiles.example".to_owned()]
+    );
+}
+
+#[test]
 fn local_account_directory_refresh_still_promotes_follows() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -11191,36 +11290,28 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     assert_eq!(stored[0].owner_ts, 1000, "victim's original stamp survives");
 }
 
-#[test]
-fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
-    let local_pubkey = "11".repeat(32);
-
+#[tokio::test]
+async fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
+    let dir = tempfile::tempdir().unwrap();
+    let local_pubkey = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap()
+        .account_id_hex;
+    let app = MarmotApp::with_relay(dir.path(), "wss://receipts.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
     let known_local_delivery = relay_delivery("known", local_pubkey.clone());
-    let known_event_ids = HashSet::from([hex::encode(known_local_delivery.message.id.as_slice())]);
-    assert!(client::is_own_relay_echo(
-        &known_local_delivery,
-        &local_pubkey,
-        &known_event_ids
-    ));
+    let known_id = hex::encode(known_local_delivery.message.id.as_slice());
+    client.remember_seen_event(known_id.clone());
+    let receipts = client.transport_receipts().unwrap();
+    assert!(receipts.contains(&known_id));
 
-    let same_pubkey_new_event = relay_delivery("new-cross-device", local_pubkey.clone());
-    assert!(!client::is_own_relay_echo(
-        &same_pubkey_new_event,
-        &local_pubkey,
-        &known_event_ids
-    ));
-
-    // A delivery claiming a known id under another pubkey can no longer come
-    // out of the transport boundary (the id is verified against the event
-    // hash, #351); forge one directly to prove the echo check independently
-    // requires the local pubkey.
-    let mut known_other_pubkey_delivery = relay_delivery("known", "44".repeat(32));
-    known_other_pubkey_delivery.message.id = known_local_delivery.message.id.clone();
-    assert!(!client::is_own_relay_echo(
-        &known_other_pubkey_delivery,
-        &local_pubkey,
-        &known_event_ids
-    ));
+    // Same-account cross-device input is admitted unless this exact signed
+    // outer ID is known. Peer input uses the same synchronized membership rule.
+    let same_pubkey_new_event = relay_delivery("new-cross-device", local_pubkey);
+    assert!(!receipts.contains(&hex::encode(same_pubkey_new_event.message.id.as_slice())));
+    let peer_delivery = relay_delivery("peer", "44".repeat(32));
+    assert!(!receipts.contains(&hex::encode(peer_delivery.message.id.as_slice())));
 }
 
 #[test]
@@ -19042,7 +19133,15 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
 fn released_transport_is_replayed_after_lost_effect_and_reopen() {
     run_composed_app_runtime_test("released-transport-replay", || async {
         use cgka_traits::storage::MessageStorage;
-        for handling in ["checkpoint", "reopen", "failed effects", "unsaved receipts"] {
+        for handling in [
+            "checkpoint",
+            "reopen",
+            "failed effects",
+            "unsaved receipts",
+            "direct ingest",
+            "sdk drain",
+            "receive",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let (app, mut client, route) =
@@ -19079,6 +19178,43 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                 assert!(client.seen_events_index.contains(&probe.id));
             }
             storage.release_message_for_replay(&record).unwrap();
+            if matches!(handling, "direct ingest" | "sdk drain" | "receive") {
+                // Readmit immediately, with no effect observation, explicit
+                // reconcile or unrelated checkpoint to clean up the cache.
+                if handling == "direct ingest" {
+                    client
+                        .ingest_received_delivery(delivery.clone())
+                        .await
+                        .unwrap();
+                } else {
+                    inject_epoch_gap_probe(&app, probe.clone()).await;
+                    if handling == "sdk drain" {
+                        client.sync().await.unwrap();
+                    } else {
+                        let received = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            client.receive_next_delivery(),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) =
+                            received
+                        else {
+                            panic!("unexpected overflow")
+                        };
+                        client.ingest_received_delivery(*delivery).await.unwrap();
+                    }
+                }
+                assert_eq!(
+                    recorded_ingest_outcomes(&app, &probe.id).len(),
+                    2,
+                    "{handling}: released ID never reached engine admission"
+                );
+                assert!(storage.get_message(&delivery.message.id).is_ok());
+                assert!(client.seen_events_index.contains(&probe.id));
+                continue;
+            }
             if handling == "reopen" {
                 drop(client);
                 client = client_on_app_relay_plane(&app, "alice").await;
