@@ -34,8 +34,8 @@ mod tests {
     use rusqlite::{Connection, params};
 
     #[test]
-    fn populated_pre_0058_and_pre_0060_upgrade_defers_repair_without_erasing_history() {
-        for version in [57, 59] {
+    fn populated_pre_journal_and_chat_presentation_upgrade_preserves_history() {
+        for version in [57, 59, 65] {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
             migrations::run(&mut conn, &migrations::MIGRATIONS[..version]).unwrap();
@@ -67,6 +67,10 @@ mod tests {
                     VALUES (x'cc',x'aa',3,2,2,x'00');
                 INSERT INTO app_events(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at)
                     VALUES ('aa','cc','received','sender','accepted historical message',9,'[]',1,1);").unwrap();
+            if version == 65 {
+                conn.execute("UPDATE chat_presentation_meta SET revision = 7", [])
+                    .unwrap();
+            }
             let store = SqliteAccountStorage::from_connection_with_options(
                 conn,
                 SqliteStorageOptions::default(),
@@ -99,6 +103,29 @@ mod tests {
                 1
             );
             store.consume_released_transport_receipts().unwrap();
+            assert_eq!(
+                migrations::applied_name(&store.lock().unwrap(), 65)
+                    .unwrap()
+                    .as_deref(),
+                Some("0065_chat_presentation")
+            );
+            assert_eq!(
+                migrations::applied_name(&store.lock().unwrap(), 66)
+                    .unwrap()
+                    .as_deref(),
+                Some("0066_historical_receipt_repair")
+            );
+            if version == 65 {
+                assert_eq!(
+                    store
+                        .lock()
+                        .unwrap()
+                        .query_row("SELECT revision FROM chat_presentation_meta", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    7
+                );
+            }
             let conn = store.lock().unwrap();
             assert_eq!(
                 conn.query_row("SELECT count(*) FROM cgka_messages", [], |r| r

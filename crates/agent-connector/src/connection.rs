@@ -174,6 +174,59 @@ impl AgentConnector {
         request_id: Option<&str>,
         request: AgentControlRequest,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        // Classify only reviewed commands; arguments and response contents never enter analytics.
+        let operation = match &request {
+            AgentControlRequest::AccountCreate { .. } => Some("bootstrap"),
+            AgentControlRequest::AccountList
+            | AgentControlRequest::TimelineMessageGet { .. }
+            | AgentControlRequest::TimelineList { .. }
+            | AgentControlRequest::AccountProfileLookup { .. }
+            | AgentControlRequest::GroupInfo { .. }
+            | AgentControlRequest::MaintenanceStatus { .. }
+            | AgentControlRequest::KeyPackageMaintenanceStatus { .. }
+            | AgentControlRequest::MaintenanceGetPolicy { .. }
+            | AgentControlRequest::AllowlistList { .. }
+            | AgentControlRequest::InvitePolicyGet { .. } => Some("control_read"),
+            AgentControlRequest::StreamBegin { .. }
+            | AgentControlRequest::StreamFinalize { .. }
+            | AgentControlRequest::StreamCancel { .. } => Some("control_preview"),
+            AgentControlRequest::SendFinal { .. }
+            | AgentControlRequest::DeleteMessage { .. }
+            | AgentControlRequest::SendReaction { .. }
+            | AgentControlRequest::RemoveReaction { .. }
+            | AgentControlRequest::AccountPublishKeyPackage { .. }
+            | AgentControlRequest::AccountPublishProfile { .. }
+            | AgentControlRequest::SendMedia { .. }
+            | AgentControlRequest::DownloadMedia { .. }
+            | AgentControlRequest::MaintenanceScheduleSelfUpdate { .. }
+            | AgentControlRequest::MaintenanceSetPolicy { .. }
+            | AgentControlRequest::MaintenancePause { .. }
+            | AgentControlRequest::MaintenanceResume { .. }
+            | AgentControlRequest::MaintenanceRun { .. }
+            | AgentControlRequest::AllowlistAdd { .. }
+            | AgentControlRequest::AllowlistRemove { .. }
+            | AgentControlRequest::InvitePolicySet { .. } => Some("control_write"),
+            _ => None,
+        };
+        let observation = operation.and_then(|operation| {
+            self.runtime.begin_product_operation(
+                marmot_app::ProductFamily::Agent,
+                operation,
+                marmot_app::ProductUnit::Attempt,
+            )
+        });
+        let result = self.handle_request_unobserved(request_id, request).await;
+        if let Some(observation) = observation {
+            observation.finish(if result.is_ok() { "success" } else { "failure" });
+        }
+        result
+    }
+
+    async fn handle_request_unobserved(
+        &self,
+        request_id: Option<&str>,
+        request: AgentControlRequest,
+    ) -> Result<AgentControlResponse, ConnectorError> {
         match request {
             AgentControlRequest::AccountList => self.account_list_response(),
             AgentControlRequest::TimelineMessageGet {

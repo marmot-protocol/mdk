@@ -7102,6 +7102,54 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
 }
 
 #[test]
+fn usage_diagnostics_show_preserves_saved_permission_without_export_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    let execute = |action: &str, configured: bool| {
+        let mut command = wn_without_relay(home.path());
+        for name in [
+            "MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT",
+            "MARMOT_PRODUCT_ANALYTICS_APP_KEY",
+            "MARMOT_PRODUCT_ANALYTICS_OPERATOR",
+            "MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT",
+            "MARMOT_PRODUCT_ANALYTICS_ALLOW_LOOPBACK",
+        ] {
+            command.env_remove(name);
+        }
+        if configured {
+            command
+                .env(
+                    "MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT",
+                    "https://analytics.example/api/v0/events",
+                )
+                .env("MARMOT_PRODUCT_ANALYTICS_APP_KEY", "A-SH-synthetic")
+                .env("MARMOT_PRODUCT_ANALYTICS_OPERATOR", "test_operator")
+                .env("MARMOT_PRODUCT_ANALYTICS_ENVIRONMENT", "staging");
+        }
+        let output = command
+            .args(["usage-diagnostics", action])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            command_output_summary(&output)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["ok"], true);
+        response["result"].clone()
+    };
+    let granted = execute("enable", true);
+    assert_eq!(granted["settings"]["decision"], "Granted");
+    let shown = execute("show", false);
+    assert_eq!(shown["settings"], granted["settings"]);
+    assert_eq!(shown["status"]["telemetry"], "Disabled");
+    assert_eq!(shown["status"]["product_analytics"], "Disabled");
+    let declined = execute("disable", false);
+    assert_eq!(declined["settings"]["decision"], "Declined");
+    assert_eq!(execute("show", false)["settings"], declined["settings"]);
+}
+
+#[test]
 fn plain_human_output_sanitizes_untrusted_remote_text_without_mutating_json_or_storage() {
     let home = tempfile::tempdir().expect("tempdir");
     const HOSTILE_TEXT: &str = "hello\u{1b}]52;c;YXR0YWNr\u{7}world\u{1b}[2J";

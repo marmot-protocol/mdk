@@ -8,6 +8,7 @@
 mod account_projection;
 mod agent_stream_sequences;
 mod chat_list;
+mod chat_presentation;
 mod codec;
 mod connection;
 mod encrypted_media_secrets;
@@ -36,6 +37,12 @@ pub use chat_list::{
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow, ChatPinError,
     ChatPinState, ExistingDirectConversation, select_reusable_direct_conversation,
 };
+pub use chat_presentation::{
+    CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationInput, ChatPresentationRead,
+    ChatPresentationVersion, ChatPresentationWrite, ConversationPresentation,
+    PresentationResolution, PresentationSource, PresentationText, SelectedAvatar,
+    StoredChatPresentation,
+};
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{
@@ -56,7 +63,7 @@ pub use prepared_group_image_upload::{
 };
 pub use shared::{
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
-    StoredRelayTelemetrySettings,
+    StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
 };
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]

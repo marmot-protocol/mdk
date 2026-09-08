@@ -26,3 +26,5 @@ pub mod telemetry;
 pub mod timeline;
 
 pub mod onboarding;
+
+pub mod product_analytics;

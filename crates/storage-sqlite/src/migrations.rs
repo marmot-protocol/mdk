@@ -126,8 +126,10 @@ mod migration_0062_chat_list_preview_indexes;
 mod migration_0063_query_indexes;
 #[path = "migrations/0064_own_commit_intents.rs"]
 mod migration_0064_own_commit_intents;
-#[path = "migrations/0065_historical_receipt_repair.rs"]
-mod migration_0065_historical_receipt_repair;
+#[path = "migrations/0065_chat_presentation.rs"]
+mod migration_0065_chat_presentation;
+#[path = "migrations/0066_historical_receipt_repair.rs"]
+mod migration_0066_historical_receipt_repair;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -468,21 +470,32 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 65,
-        name: "0065_historical_receipt_repair",
-        apply: migration_0065_historical_receipt_repair::apply,
+        name: "0065_chat_presentation",
+        apply: migration_0065_chat_presentation::apply,
+    },
+    Migration {
+        version: 66,
+        name: "0066_historical_receipt_repair",
+        apply: migration_0066_historical_receipt_repair::apply,
     },
 ];
 
-pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
-    run(connection, MIGRATIONS)
+pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
+    run_with_summary(connection, MIGRATIONS)
 }
 
+#[cfg(test)]
 pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<()> {
+    run_with_summary(connection, migrations).map(|_| ())
+}
+
+fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
     ensure_migration_table(connection)?;
     ensure_ordered(migrations)?;
     reconcile_legacy_migration_names(connection, migrations)?;
     reject_unknown_future_migrations(connection, migrations)?;
 
+    let mut applied = 0;
     for migration in migrations {
         match applied_name(connection, migration.version)? {
             Some(name) if name == migration.name => continue,
@@ -492,11 +505,14 @@ pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> Stor
                     migration.version, migration.name
                 )));
             }
-            None => apply_migration(connection, migration)?,
+            None => {
+                apply_migration(connection, migration)?;
+                applied += 1;
+            }
         }
     }
 
-    Ok(())
+    Ok(applied)
 }
 
 fn ensure_migration_table(connection: &Connection) -> StorageResult<()> {
@@ -695,6 +711,54 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
+
+    #[test]
+    fn presentation_upgrade_adds_durable_storage_without_rewriting_group_names() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..64]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at)
+                            VALUES ('aa', 'fixture', 'Deliberately chosen name', 7);
+             INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at) VALUES ('aa', 19, 7);
+             INSERT INTO direct_conversation_members VALUES ('aa', 'bb'), ('aa', 'cc');",
+        )
+        .unwrap();
+        // Simulate interruption after the DDL/data work but before commit.
+        {
+            let tx = conn.transaction().unwrap();
+            super::migration_0065_chat_presentation::apply(&tx).unwrap();
+            tx.rollback().unwrap();
+        }
+        let columns: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('chat_list_rows') WHERE name = 'presentation_json'", [], |r| r.get(0)).unwrap();
+        assert_eq!(columns, 0);
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_list_rows') WHERE name = 'presentation_json')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            present,
+            "chat rows must persist selected presentation in the account database"
+        );
+        let name: String = conn
+            .query_row(
+                "SELECT profile_name FROM account_groups WHERE group_id_hex = 'aa'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Deliberately chosen name");
+        let preserved: (i64, i64, bool) = conn.query_row("SELECT activity_sort_at, length(presentation_row_epoch), presentation_json IS NULL FROM chat_list_rows WHERE group_id_hex = 'aa'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(preserved, (19, 16, true));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM chat_presentation_members", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn preview_indexes_are_repeatable() {
@@ -1136,7 +1200,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 65,
+                found: 66,
                 latest_supported: 46,
             }
         ));
@@ -1192,7 +1256,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 65,
+                found: 66,
                 latest_supported: 46,
             }
         ));
@@ -1496,7 +1560,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 65,
+                found: 66,
                 latest_supported: 46,
             }
         ));

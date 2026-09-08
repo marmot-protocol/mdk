@@ -74,7 +74,12 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod agent_streams;
 mod app_telemetry;
+#[cfg(any(feature = "otlp-export", feature = "product-analytics-export"))]
+mod collector_host_safety;
+pub mod product_analytics;
+pub use product_analytics::*;
 mod audit_log;
+mod chat_presentation;
 mod client;
 mod config;
 mod conversions;
@@ -621,6 +626,7 @@ pub struct MarmotApp {
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    product_analytics: ProductAnalytics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
     /// account worker share this client so the worker can reuse the same relay
@@ -1330,17 +1336,32 @@ impl MarmotApp {
         self.relay_plane.relay_telemetry().await
     }
 
+    /// Effective settings for this app instance, including its active consent permit.
+    /// An unstarted instance reports export disabled even if a grant is persisted.
+    /// Read `usage_diagnostics_settings` for the consent decision before startup.
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
-        normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
-            self.shared_storage()?.relay_telemetry_settings()?,
-        ))
+        let mut settings =
+            normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
+                self.shared_storage()?.relay_telemetry_settings()?,
+            ))?;
+        settings.export_enabled = self.product_analytics.permit().is_some();
+        Ok(settings)
     }
 
+    /// Deprecated consent control: use `set_usage_diagnostics_consent` instead.
+    /// Disable revokes both exporters; enable requires an existing combined grant.
+    /// Retained for interval configuration and source compatibility.
     pub fn set_relay_telemetry_settings(
         &self,
         settings: RelayTelemetrySettings,
     ) -> Result<RelayTelemetrySettings, AppError> {
         let settings = normalize_relay_telemetry_settings(settings)?;
+        if settings.export_enabled && self.product_analytics.permit().is_none() {
+            return Err(ProductAnalyticsError::ConsentRequired.into());
+        }
+        if !settings.export_enabled {
+            self.set_usage_diagnostics_consent(false)?;
+        }
         self.shared_storage()?
             .set_relay_telemetry_settings(&relay_telemetry_settings_to_storage(settings.clone()))?;
         Ok(settings)
@@ -1379,13 +1400,12 @@ impl MarmotApp {
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
-        let storage = self.shared_storage()?;
-        if let Some(install_id) = storage.telemetry_install_id()? {
-            return Ok(install_id);
+        if self.product_analytics.permit().is_none() {
+            return Err(ProductAnalyticsError::ConsentRequired.into());
         }
-        let install_id = generate_telemetry_install_id();
-        storage.set_telemetry_install_id(&install_id)?;
-        Ok(install_id)
+        self.shared_storage()?
+            .telemetry_install_id()?
+            .ok_or_else(|| ProductAnalyticsError::ConsentRequired.into())
     }
 
     pub fn with_relay_and_config(
@@ -1436,6 +1456,11 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
+        let product_analytics = ProductAnalytics::default();
+        product_analytics.silence(
+            config.usage_diagnostics_silent
+                || config.cursor_persistence == CursorPersistence::Frozen,
+        );
         Self {
             account_home: AccountHome::open(&root),
             root,
@@ -1469,6 +1494,7 @@ impl MarmotApp {
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1510,6 +1536,11 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
+        let product_analytics = ProductAnalytics::default();
+        product_analytics.silence(
+            config.usage_diagnostics_silent
+                || config.cursor_persistence == CursorPersistence::Frozen,
+        );
         Self {
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
@@ -1543,6 +1574,7 @@ impl MarmotApp {
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            product_analytics,
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1702,8 +1734,10 @@ impl MarmotApp {
         } else {
             crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
+        let _ = open.runtime.take_maintenance_activity();
         let mut client = AppClient {
             app: self.clone(),
+            maintenance_observation_generation: self.product_analytics.permit(),
             runtime: open.runtime,
             _session_guard: open.session_guard,
             adapter: open.adapter,
@@ -1737,6 +1771,7 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
+            maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
@@ -5216,6 +5251,16 @@ impl MarmotApp {
     }
 
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        let permit = self.product_analytics.permit();
+        let result = self.account_storage_unobserved(label);
+        if let Err(error) = &result {
+            self.product_analytics
+                .storage_failure(permit.as_ref(), error);
+        }
+        result
+    }
+
+    fn account_storage_unobserved(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         self.ensure_storage_open("account storage")?;
         if let Some(storage) = self
             .account_storages
@@ -5246,7 +5291,24 @@ impl MarmotApp {
                 SqlcipherDatabaseKind::Session,
             )?
         };
-        let storage = SqliteAccountStorage::open_encrypted(&path, &key)?;
+        let migration_observation =
+            self.product_analytics
+                .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        let opened = SqliteAccountStorage::open_encrypted(&path, &key);
+        if let Some(observation) = migration_observation {
+            match &opened {
+                Ok(storage) if storage.migration_summary().0 > 0 => {
+                    let (applied, duration) = storage.migration_summary();
+                    observation.count("success", ProductUnit::Transition, applied as u64);
+                    observation.finish_with_duration("success", duration);
+                }
+                Err(cgka_traits::StorageError::UnsupportedSchemaVersion { .. }) => {
+                    observation.finish("unsupported")
+                }
+                _ => observation.discard(),
+            }
+        }
+        let storage = opened?;
         // Publishing under `_lifecycle` is what keeps this connection reachable
         // by a later `close_storage`; see `begin_storage_open`.
         let mut storages = self
@@ -5315,8 +5377,16 @@ impl MarmotApp {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let observation = self
+            .product_analytics
+            .begin(
+                ProductFamily::MessageAction,
+                "publication",
+                ProductUnit::Transition,
+            )
+            .map(ProductObservation::counts_only);
         let storage = self.account_storage(label)?;
-        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             storage
                 .finalize_app_event_source_retention(
                     group_id_hex,
@@ -5327,7 +5397,13 @@ impl MarmotApp {
                 )?
                 .map(|update| self.app_projection_update(label, update))
                 .transpose()
-        })
+        })?;
+        if update.is_some()
+            && let Some(observation) = observation
+        {
+            observation.count("confirmed", ProductUnit::Transition, 1);
+        }
+        Ok(update)
     }
 
     pub(crate) fn invalidate_timeline_source_message(

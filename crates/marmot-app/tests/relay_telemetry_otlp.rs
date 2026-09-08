@@ -224,6 +224,7 @@ async fn export_once_pushes_otlp_metrics_over_http() {
             .telemetry_exporter(
                 RelayTelemetryExportConfig::enabled(endpoint.clone())
                     .with_runtime_config(runtime_config(endpoint)),
+                consent_permit(),
             )
             .expect("opted-in exporter is constructed");
 
@@ -274,6 +275,7 @@ async fn export_retries_transient_collector_failures_within_interval() {
             RelayTelemetryExportConfig::enabled(endpoint.clone())
                 .with_interval(Duration::from_secs(1))
                 .with_runtime_config(runtime_config(endpoint)),
+            consent_permit(),
         )
         .expect("opted-in exporter is constructed");
 
@@ -318,6 +320,7 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     runtime
         .set_relay_telemetry_runtime_config(runtime_config(format!("http://{addr}/v1/metrics")))
         .expect("runtime telemetry metadata is accepted");
+    runtime.set_usage_diagnostics_consent(true).unwrap();
     runtime
         .set_relay_telemetry_settings(RelayTelemetrySettings {
             export_enabled: true,
@@ -366,6 +369,7 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
     runtime
         .set_relay_telemetry_runtime_config(runtime_config_without_endpoint())
         .expect("runtime telemetry metadata is accepted");
+    runtime.set_usage_diagnostics_consent(true).unwrap();
     runtime
         .set_relay_telemetry_settings(RelayTelemetrySettings {
             export_enabled: true,
@@ -400,6 +404,7 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     let tmp = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let app = MarmotApp::with_relay(tmp.path(), relay.url().await.to_string());
+    app.set_usage_diagnostics_consent(true).unwrap();
     app.set_relay_telemetry_settings(RelayTelemetrySettings {
         export_enabled: true,
         export_interval_seconds: 10,
@@ -410,6 +415,7 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     runtime
         .set_relay_telemetry_runtime_config(runtime_config(format!("http://{addr}/v1/metrics")))
         .expect("runtime telemetry metadata is accepted");
+    runtime.set_usage_diagnostics_consent(true).unwrap();
     runtime.start().await.expect("runtime starts");
 
     let captured = tokio::time::timeout(Duration::from_secs(5), rx)
@@ -449,6 +455,7 @@ async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
         .telemetry_exporter(
             RelayTelemetryExportConfig::enabled(endpoint.clone())
                 .with_runtime_config(runtime_config(endpoint)),
+            consent_permit(),
         )
         .unwrap();
     let result = exporter.export_once(None).await;
@@ -481,6 +488,7 @@ async fn relay_telemetry_host_safety_stalled_push_keeps_export_window_deadline()
             RelayTelemetryExportConfig::enabled(endpoint.clone())
                 .with_interval(Duration::from_millis(250))
                 .with_runtime_config(runtime_config(endpoint)),
+            consent_permit(),
         )
         .unwrap();
     let result = tokio::time::timeout(
@@ -495,4 +503,11 @@ async fn relay_telemetry_host_safety_stalled_push_keeps_export_window_deadline()
     ));
     let received = rx.await.unwrap();
     assert_eq!(received.authorization.as_deref(), Some("Bearer test-token"));
+}
+
+fn consent_permit() -> marmot_app::DiagnosticsPermit {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    app.set_usage_diagnostics_consent(true).unwrap();
+    app.usage_diagnostics_permit().unwrap()
 }

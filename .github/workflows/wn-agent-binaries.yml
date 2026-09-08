@@ -101,7 +101,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build wn-agent
-        run: cargo build --locked --release -p agent-connector --bin wn-agent --target "${{ matrix.rust_target }}"
+        run: cargo build --locked --release -p agent-connector --bin wn-agent --features otlp-export,product-analytics-export --target "${{ matrix.rust_target }}"
 
       - name: Smoke test wn-agent
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help

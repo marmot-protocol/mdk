@@ -4415,6 +4415,8 @@ async fn eviction_projects_removed_from_group_notification() {
     };
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup).await;
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -4427,9 +4429,32 @@ async fn eviction_projects_removed_from_group_notification() {
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
+    // Catch-up is best-effort, and GroupJoined precedes installation of the
+    // temporary post-join history subscription. Establish an actually live
+    // receiver before testing a live eviction notification; otherwise the
+    // removal can race initial Welcome/history processing on a loaded runner.
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob_id && joined == &group_id)
+    })
+    .await;
+    runtime
+        .send_message(
+            &alice.account.account_id_hex,
+            &group_id,
+            b"ready before eviction".to_vec(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(message)
+            if message.account_id_hex == bob_id
+                && message.message.group_id == group_id
+                && message.message.plaintext == "ready before eviction")
+    })
+    .await;
 
     let mut subscription = runtime.subscribe_notifications().unwrap();
-    let bob_id = bob.account.account_id_hex.clone();
     runtime
         .remove_members(
             &alice.account.account_id_hex,

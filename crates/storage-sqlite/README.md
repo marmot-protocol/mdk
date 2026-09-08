@@ -38,7 +38,7 @@ when storage semantics evolve.
 Applied migrations are recorded in `cgka_schema_migrations`. Opening an encrypted database applies any missing
 migrations after SQLCipher keying and before storage handles are exposed.
 
-Migration 0065 schedules a one-time historical transport receipt repair for existing account databases.
+Migration 0066 schedules a one-time historical transport receipt repair for existing account databases.
 It creates repair metadata and an empty outbound signed-ID index without scanning retained history on open.
 After readiness and group hydration, the app worker inspects at most 32 fanout/inventory rows per maintenance
 pass (the storage API caps a batch at 256). Transactional keyset cursors and fixed high waters allow restart
