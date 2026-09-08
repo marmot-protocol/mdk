@@ -19,6 +19,14 @@ status: overview
 
 # Current State — Implementations & Spec
 
+Superseded invitations now retain their recipients while the app resolves fresh KeyPackages and queues a new
+canonical invitation. A recipient already active on the discarded branch receives a durable rejoin offer and must
+explicitly confirm replacing that MLS state; local message history remains. `group_recovery_status` exposes offers,
+pending/failed inviter recovery, and an `automatic_recovery_failed` warning after repeated relay-confirmed full-history
+replays recover nothing. Local self-updates cannot clear a latched warning. Rust runtime, UniFFI, and C expose query, confirm, and decline commands. Hosts must display the
+Welcome author and request explicit consent; these commands do not infer consent from ordinary invite acceptance.
+See [invitation recovery](../invitation-recovery.md) for persistence, retry, and integration contracts.
+
 The additive presented-chat-list contract exposes complete existing rows plus durable MDK-selected title/avatar
 through Rust, UniFFI and C. An attached initial snapshot and ordered replacement updates cover both presentation and
 ordinary row changes. Android/iOS adoption remains separate; see the

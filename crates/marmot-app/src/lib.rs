@@ -185,8 +185,9 @@ pub use groups::{
     AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
     AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
     AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
-    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
-    PendingGroupInvite, group_system_event_from_message,
+    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
+    GroupRejoinInvitation, MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite,
+    group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -1758,6 +1759,7 @@ impl MarmotApp {
             seen_events_index,
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
+            pending_recovery_status_updates: std::collections::HashSet::new(),
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -3334,11 +3336,12 @@ impl MarmotApp {
         &self,
         label: &str,
         evidence: &[storage_sqlite::StoredEpochStallEvidence],
-    ) -> Result<(), AppError> {
+        fruitless_threshold: u32,
+    ) -> Result<Vec<GroupId>, AppError> {
         self.ensure_account_state(label)?;
-        self.account_storage(label)?
-            .record_epoch_stall_evidence(evidence)?;
-        Ok(())
+        Ok(self
+            .account_storage(label)?
+            .record_recovery_evidence(evidence, fruitless_threshold)?)
     }
 
     pub(crate) fn epoch_stall_evidence(

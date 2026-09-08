@@ -4069,6 +4069,20 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
          tracker even though the arming traffic produced no visible activity",
     );
 
+    assert!(
+        !runtime
+            .group_recovery_status("bob", &group_id)
+            .await
+            .unwrap()
+            .automatic_recovery_failed,
+        "an undecryptable burst and initial backfill arm must not claim recovery failed"
+    );
+    assert!(
+        app.group("bob", &group_id_hex)
+            .unwrap()
+            .unwrap()
+            .pending_confirmation
+    );
     server.abort();
     runtime.shutdown().await;
 }
@@ -13873,16 +13887,22 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
         )
         .await
         .unwrap();
-    for member in [&bob_id, &carol_id] {
-        wait_for_event(&mut events, |event| {
+    // Either recipient can join first; do not discard the other recipient's event.
+    let mut awaiting = std::collections::HashSet::from([bob_id.clone(), carol_id.clone()]);
+    while !awaiting.is_empty() {
+        let event = wait_for_event(&mut events, |event| {
             matches!(
                 event,
                 MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
-                    if account_id_hex == member && joined == &group_id
+                    if awaiting.contains(account_id_hex) && joined == &group_id
             )
         })
         .await;
-        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+        let MarmotAppEvent::GroupJoined { account_id_hex, .. } = event else {
+            unreachable!("wait_for_event matched GroupJoined");
+        };
+        awaiting.remove(&account_id_hex);
+        accept_group_invite_retrying_busy(&runtime, &account_id_hex, &group_id)
             .await
             .unwrap();
     }

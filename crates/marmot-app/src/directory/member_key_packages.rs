@@ -166,6 +166,7 @@ impl MemberKeyPackagePrewarmCache {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemberResolutionPurpose {
     Commit,
+    CommitFresh,
     Prewarm,
 }
 
@@ -238,6 +239,21 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         Ok(self
             .resolve_member_key_packages_with_stats(member_refs)
+            .await?
+            .key_packages)
+    }
+
+    /// A superseded invite must not reuse the directory/prewarm package that
+    /// its first Welcome consumed. Fetch through the existing safe discovery path.
+    pub(crate) async fn resolve_fresh_reinvite_key_packages(
+        &self,
+        members: &[String],
+    ) -> Result<Vec<KeyPackage>, AppError> {
+        Ok(self
+            .resolve_member_key_packages_for_purpose(
+                members.to_vec(),
+                MemberResolutionPurpose::CommitFresh,
+            )
             .await?
             .key_packages)
     }
@@ -349,6 +365,10 @@ impl MarmotApp {
         let mut fresh_prewarmed_routes = HashSet::new();
         let mut reused_members = 0usize;
         for (index, target) in targets.iter_mut().enumerate() {
+            if purpose == MemberResolutionPurpose::CommitFresh {
+                unresolved.push(index);
+                continue;
+            }
             if let Some(label) = &target.local_label
                 && let Some(key_package) = self.validated_current_local_key_package(label)
                 && let Ok(key_package) =
@@ -468,7 +488,7 @@ impl MarmotApp {
             }
         }
         match purpose {
-            MemberResolutionPurpose::Commit => {
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
                 for target in &targets {
                     if !target.relay_lists.nip65.relays.is_empty()
                         || !target.relay_lists.inbox.relays.is_empty()
@@ -543,7 +563,9 @@ impl MarmotApp {
             fetched.key_package.clone(),
         )?;
         match purpose {
-            MemberResolutionPurpose::Commit => self.remember_directory_key_package(&fetched)?,
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
+                self.remember_directory_key_package(&fetched)?
+            }
             MemberResolutionPurpose::Prewarm => self
                 .member_key_package_prewarm_cache
                 .lock()
@@ -894,10 +916,13 @@ impl MarmotApp {
                     .filter(|record| record.event.pubkey == *account_id)
                     .cloned()
                     .collect::<Vec<_>>();
-                let cached = self
-                    .directory_entry_for_account_id(account_id)
-                    .ok()
-                    .flatten();
+                let cached = if purpose == MemberResolutionPurpose::CommitFresh {
+                    None
+                } else {
+                    self.directory_entry_for_account_id(account_id)
+                        .ok()
+                        .flatten()
+                };
                 let selected = latest_fresh_key_package_from_records(
                     account_id,
                     account_records,
@@ -957,7 +982,11 @@ impl MarmotApp {
                             .map_err(|error| {
                                 AppError::RelayDirectory(format!("fetch key packages: {error}"))
                             })?;
-                        let cached = app.directory_entry_for_account_id(&target.account_id_hex)?;
+                        let cached = if purpose == MemberResolutionPurpose::CommitFresh {
+                            None
+                        } else {
+                            app.directory_entry_for_account_id(&target.account_id_hex)?
+                        };
                         let mut fetched = fresh_or_cached_key_package(
                             &target.account_id_hex,
                             latest_fresh_key_package_from_records(

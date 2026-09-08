@@ -1403,6 +1403,28 @@ typedef struct MarmotSendSummary {
 } MarmotSendSummary;
 
 /**
+ * Embedded replacement offer; show the authenticated inviter before confirmation.
+ */
+typedef struct MarmotGroupRejoinInvitation {
+  char *welcome_id_hex;
+  char *welcomer_account_id_hex;
+  uint64_t epoch;
+  char *local_state_token;
+} MarmotGroupRejoinInvitation;
+
+/**
+ * Durable advisory membership health and explicit rejoin offers.
+ */
+typedef struct MarmotGroupRecoveryStatus {
+  char *group_id_hex;
+  bool automatic_recovery_failed;
+  uint32_t pending_reinvites;
+  uint32_t failed_reinvites;
+  struct MarmotGroupRejoinInvitation *rejoin_invitations;
+  uintptr_t rejoin_invitations_len;
+} MarmotGroupRecoveryStatus;
+
+/**
  * The updated group record plus the decline publish summary.
  */
 typedef struct MarmotGroupInviteDeclineResult {
@@ -4680,6 +4702,49 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
                                              const char *group_id_hex,
                                              uint64_t disappearing_message_secs,
                                              struct MarmotSendSummary **out);
+
+/**
+ * Query advisory membership health and pending rejoin offers.
+ * Free with `marmot_group_recovery_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_recovery_status(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          struct MarmotGroupRecoveryStatus **out);
+
+/**
+ * Only after explicit recipient consent. Free with marmot_group_recovery_status_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_confirm_group_rejoin(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *welcome_id_hex,
+                                         const char *local_state_token,
+                                         struct MarmotGroupRecoveryStatus **out);
+
+/**
+ * Decline the selected replacement offer without changing active group state.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_decline_group_rejoin(const struct MarmotClient *client,
+                                         const char *account_ref,
+                                         const char *welcome_id_hex);
 
 /**
  * Accept a pending group invite; writes the now-confirmed group
@@ -8227,6 +8292,16 @@ void marmot_prepared_group_image_upload_free(struct MarmotPreparedGroupImageUplo
  * library.
  */
 void marmot_prepared_group_image_upload_list_free(struct MarmotPreparedGroupImageUploadList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

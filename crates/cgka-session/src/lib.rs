@@ -1089,6 +1089,57 @@ impl AccountDeviceSession {
         Ok(self.engine.reissue_superseded_own_commits_from_state()?)
     }
 
+    pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
+        Ok(self.engine.retry_rejoins_after_trusted_removal().await?)
+    }
+
+    pub fn pending_group_rejoins_for(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
+        Ok(self.engine.pending_group_rejoins_for(Some(group_id))?)
+    }
+
+    pub async fn confirm_group_rejoin(
+        &mut self,
+        welcome_id: &MessageId,
+        token: &[u8],
+    ) -> SessionResult<GroupId> {
+        Ok(self.engine.confirm_group_rejoin(welcome_id, token).await?)
+    }
+
+    pub fn decline_group_rejoin(&mut self, welcome_id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.decline_group_rejoin(welcome_id)?)
+    }
+
+    pub fn reinvite_recovery_records(
+        &self,
+    ) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        Ok(self.engine.reinvite_recovery_records()?)
+    }
+
+    pub fn pending_reinvites(&self) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        Ok(self.engine.pending_reinvites()?)
+    }
+
+    pub fn reserve_reinvite_lookup(
+        &mut self,
+        commit_id: &MessageId,
+        now_ms: u64,
+    ) -> SessionResult<bool> {
+        Ok(self.engine.reserve_reinvite_lookup(commit_id, now_ms)?)
+    }
+
+    pub fn reissue_invite_with_key_packages(
+        &mut self,
+        commit_id: &MessageId,
+        packages: Vec<KeyPackage>,
+    ) -> SessionResult<Option<SupersededIntentReport>> {
+        Ok(self
+            .engine
+            .reissue_invite_with_key_packages(commit_id, packages)?)
+    }
+
     /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.
     pub fn scheduled_self_remove_auto_commit_delay_ms(
         &mut self,

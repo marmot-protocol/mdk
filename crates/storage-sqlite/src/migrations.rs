@@ -130,6 +130,8 @@ mod migration_0064_own_commit_intents;
 mod migration_0065_chat_presentation;
 #[path = "migrations/0066_chat_presentation_maintenance.rs"]
 mod migration_0066_chat_presentation_maintenance;
+#[path = "migrations/0067_invitation_recovery.rs"]
+mod migration_0067_invitation_recovery;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
@@ -477,6 +479,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 66,
         name: "0066_chat_presentation_maintenance",
         apply: migration_0066_chat_presentation_maintenance::apply,
+    },
+    Migration {
+        version: 67,
+        name: "0067_invitation_recovery",
+        apply: migration_0067_invitation_recovery::apply,
     },
 ];
 
@@ -836,6 +843,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(intent, [0xbb]);
+    }
+
+    #[test]
+    fn invitation_recovery_upgrade_preserves_existing_data_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invitation-recovery.db");
+        let mut conn = keyed_connection(&path);
+        run(&mut conn, &MIGRATIONS[..66]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES (x'aa', 1, x'00');
+            INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
+            VALUES (x'01', x'aa', 1, x'bb');",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "UPDATE chat_presentation_checkpoint SET generation=7, state=x'cafe' WHERE id=1;",
+        )
+        .unwrap();
+        run_all(&mut conn).unwrap();
+        drop(conn);
+        let mut conn = keyed_connection(&path);
+        run_all(&mut conn).unwrap();
+        assert_eq!(
+            applied_name(&conn, 67).unwrap().as_deref(),
+            Some("0067_invitation_recovery")
+        );
+        let intent: Vec<u8> = conn
+            .query_row("SELECT record FROM cgka_own_commit_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent, [0xbb]);
+        let checkpoint: (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT generation, state FROM chat_presentation_checkpoint WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, (7, vec![0xca, 0xfe]));
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM app_group_recovery_failures",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "upgrading must not invent recovery failures");
     }
 
     fn applied_migrations(store: &SqliteAccountStorage) -> Vec<(i64, String)> {
@@ -1200,7 +1255,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 66,
+                found: 67,
                 latest_supported: 46,
             }
         ));
@@ -1256,7 +1311,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 66,
+                found: 67,
                 latest_supported: 46,
             }
         ));
@@ -1560,7 +1615,7 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::UnsupportedSchemaVersion {
-                found: 66,
+                found: 67,
                 latest_supported: 46,
             }
         ));

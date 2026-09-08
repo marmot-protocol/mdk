@@ -287,6 +287,7 @@ jobs:
 
       - name: Prepare isolated Hermes dev root
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HERMES_COHORT_INSTALL_MODE: ${{ matrix.install_mode }}
           HERMES_COHORT_REF: ${{ matrix.hermes_ref }}
         run: |

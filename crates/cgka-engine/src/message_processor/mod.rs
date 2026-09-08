@@ -621,7 +621,15 @@ impl<S: StorageProvider> Engine<S> {
         // seen-cache insertion is also what it reports to callers holding a
         // dedup index of their own.
         self.last_ingest_left_object_unpersisted = retryable_unpersisted;
-        if !retryable_unpersisted && self.should_remember_ingested_message(&msg.id)? {
+        if !retryable_unpersisted
+            && !matches!(
+                outcome,
+                IngestOutcome::LocalState {
+                    state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
+                }
+            )
+            && self.should_remember_ingested_message(&msg.id)?
+        {
             // Successful group-message peel seams persist exact wrapper ids
             // with their canonical content admission before reaching this
             // epilogue. Keep only the bounded hot-process fallback here: doing

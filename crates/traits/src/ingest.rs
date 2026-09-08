@@ -119,6 +119,9 @@ pub enum InboundResourceLimit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalIngestState {
+    /// A validated replacement Welcome is durable and awaits explicit local
+    /// consent. It has not changed MLS state and is not convergence work.
+    RejoinConfirmationRequired,
     /// Authenticated MLS state records this account-device's removal. The
     /// engine has already performed the realizing-removal side effects.
     Removed,

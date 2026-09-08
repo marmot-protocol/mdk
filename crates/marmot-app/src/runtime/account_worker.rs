@@ -216,6 +216,19 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
+    GroupRecoveryStatus {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+    },
+    ConfirmGroupRejoin {
+        welcome_id: cgka_traits::MessageId,
+        token: Vec<u8>,
+        respond: oneshot::Sender<Result<crate::GroupRecoveryStatus, AppError>>,
+    },
+    DeclineGroupRejoin {
+        welcome_id: cgka_traits::MessageId,
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     AcceptGroupInvite {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupRecord, AppError>>,
@@ -776,6 +789,12 @@ async fn run_app_runtime_account_worker(
                                     AccountWorkerCommand::QuarantinedGroups { respond },
                                 ))),
                             }
+                        }
+                        Some(AccountWorkerCommand::ConfirmGroupRejoin { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                        }
+                        Some(AccountWorkerCommand::DeclineGroupRejoin { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
                         }
                         Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) => {
                             // `initial_sync` owns `&mut client`, so the command
@@ -1872,6 +1891,12 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(Ok(snapshot.quarantined_groups()));
                 }
+                AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
+                AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
                 AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
                     // The pinned sync exclusively owns the live client. This
                     // mutation was definitely not started, so a caller may
@@ -2285,6 +2310,37 @@ async fn handle_startup_hydration_command(
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
     match command {
+        AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => {
+            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+        }
+        AccountWorkerCommand::ConfirmGroupRejoin {
+            welcome_id,
+            token,
+            respond,
+        } => {
+            let result = client.confirm_group_rejoin(&welcome_id, &token).await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeclineGroupRejoin {
+            welcome_id,
+            respond,
+        } => {
+            let result = client.decline_group_rejoin(&welcome_id);
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            let _ = respond.send(result);
+        }
         AccountWorkerCommand::Members { group_id, respond } => {
             let _ = client
                 .runtime
@@ -3477,6 +3533,40 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
+        AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => Box::pin(async move {
+            let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+            true
+        }),
+        AccountWorkerCommand::ConfirmGroupRejoin {
+            welcome_id,
+            token,
+            respond,
+        } => Box::pin(async move {
+            let result = client.confirm_group_rejoin(&welcome_id, &token).await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            let _ = respond.send(result);
+            true
+        }),
+        AccountWorkerCommand::DeclineGroupRejoin {
+            welcome_id,
+            respond,
+        } => Box::pin(async move {
+            let result = client.decline_group_rejoin(&welcome_id);
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            let _ = respond.send(result);
+            true
+        }),
         AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => Box::pin(async move {
             let result = client.accept_group_invite(&group_id);
             if result.is_ok() {
@@ -4164,6 +4254,17 @@ fn account_worker_command_future<'a>(
             true
         }),
     }
+}
+
+fn group_recovery_after_hydration(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> Result<crate::GroupRecoveryStatus, AppError> {
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(group_id)?;
+    client.group_recovery_status(group_id)
 }
 
 pub(super) fn group_roster_after_hydration(
@@ -4992,6 +5093,9 @@ fn publish_client_pending_projection_updates(
     for update in client.take_pending_projection_updates() {
         publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
     }
+    for group_id in client.pending_recovery_status_updates.drain() {
+        publish_app_runtime_group_state_updated(events, account_id_hex, account_label, &group_id);
+    }
     // Superseded own commits ride the same drain: every worker seam that can
     // observe convergence effects already flushes projection updates here.
     for report in client.take_pending_superseded_change_events() {
@@ -5158,6 +5262,161 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_warning_notifications_survive_projection_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client
+            .create_group("recovery notifications", &[])
+            .await
+            .unwrap();
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        let (events, mut received) = broadcast::channel(16);
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        while received.try_recv().is_ok() {}
+        assert_eq!(
+            client
+                .epoch_stall
+                .observe_resource_refusal(group_id.clone(), epoch, 1),
+            BackfillDecision::Arm
+        );
+        for _ in 0..3 {
+            let _ = client.epoch_stall.observe_fruitless_completion([&group_id]);
+        }
+        client.persist_epoch_stall_evidence([&group_id]);
+        client
+            .finish_scheduled_convergence_effects(
+                &group_id,
+                &marmot_account::AccountDeviceEffects::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.pending_group_projection_updates.is_empty(),
+            "the checkpoint consumed the storage delta"
+        );
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id)
+        );
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a status transition is broadcast once"
+        );
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
+                group_id: group_id.clone(),
+                via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
+                welcomer: None,
+                explicitly_confirmed: true,
+            }],
+            ..Default::default()
+        };
+        client.observe_recovery_health(&effects).unwrap();
+        publish_client_pending_projection_updates(
+            &mut client,
+            &events,
+            &account.account_id_hex,
+            "alice",
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), MarmotAppEvent::GroupStateUpdated { group_id: updated, .. } if updated == group_id)
+        );
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoin_decisions_answer_during_startup_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let (events, _) = broadcast::channel(16);
+        let mut deferred = Vec::new();
+        let mut setup = None;
+        let id = cgka_traits::MessageId::new(vec![0x75; 32]);
+        let (respond, mut confirm) = oneshot::channel();
+        handle_startup_hydration_command(
+            &mut client,
+            AccountWorkerCommand::ConfirmGroupRejoin {
+                welcome_id: id.clone(),
+                token: vec![0; 32],
+                respond,
+            },
+            &mut deferred,
+            &events,
+            "",
+            "alice",
+            &mut setup,
+        )
+        .await;
+        assert!(
+            confirm
+                .try_recv()
+                .expect("confirm must answer without deferral")
+                .is_err()
+        );
+        let (respond, mut decline) = oneshot::channel();
+        handle_startup_hydration_command(
+            &mut client,
+            AccountWorkerCommand::DeclineGroupRejoin {
+                welcome_id: id,
+                respond,
+            },
+            &mut deferred,
+            &events,
+            "",
+            "alice",
+            &mut setup,
+        )
+        .await;
+        assert!(
+            decline
+                .try_recv()
+                .expect("decline must answer without deferral")
+                .is_err()
+        );
+        assert!(
+            deferred.is_empty(),
+            "unrelated hydration must not retain rejoin decisions"
+        );
     }
 
     #[test]

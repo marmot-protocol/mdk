@@ -46,9 +46,9 @@ use crate::types::group::{
     MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
     MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest,
     MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
-    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRoster,
-    MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef,
-    MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
+    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
+    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
 use crate::types::maintenance::{
     MarmotGroupMaintenanceStatus, MarmotKeyPackageMaintenanceStatus, MarmotMaintenanceRunSummary,
@@ -659,6 +659,16 @@ c_cmd! {
     /// `disappearing_message_secs` of `0` disables expiry. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_update_message_retention(account_ref: str, group_id_hex: str, disappearing_message_secs: val u64) -> rec(MarmotSendSummary) = update_message_retention;
+
+    /// Query advisory membership health and pending rejoin offers.
+    /// Free with `marmot_group_recovery_status_free`.
+    async fn marmot_group_recovery_status(account_ref: str, group_id_hex: str) -> rec(MarmotGroupRecoveryStatus) = group_recovery_status;
+
+    /// Only after explicit recipient consent. Free with marmot_group_recovery_status_free.
+    async fn marmot_confirm_group_rejoin(account_ref: str, welcome_id_hex: str, local_state_token: str) -> rec(MarmotGroupRecoveryStatus) = confirm_group_rejoin;
+
+    /// Decline the selected replacement offer without changing active group state.
+    async fn marmot_decline_group_rejoin(account_ref: str, welcome_id_hex: str) -> unit = decline_group_rejoin;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.

@@ -684,13 +684,11 @@ impl SqliteAccountStorage {
 
     /// Every group's frozen-epoch evidence, for account-open restore.
     ///
-    /// Rows are written when evidence is gathered, never when it is voided:
-    /// nothing persists the resets, because they happen on the delivery hot
-    /// path and a group that recovers has no further reason to touch storage.
-    /// A recovered group therefore leaves its last row behind. That is bounded
-    /// and inert by construction — one row per group, cascading with the
-    /// protocol group — and the restore path discards it on the first
-    /// observation at any other epoch.
+    /// Epoch movement alone need not persist a reset: restore discards stale
+    /// per-epoch evidence on the first observation at another epoch. The app
+    /// explicitly clears this row alongside a recovery-failure warning when
+    /// authenticated peer activity or a join resolves that recovery run, so a
+    /// same-epoch restart cannot resurrect evidence already cleared by a peer.
     pub fn epoch_stall_evidence(&self) -> StorageResult<Vec<StoredEpochStallEvidence>> {
         let conn = self.lock()?;
         let mut statement = conn

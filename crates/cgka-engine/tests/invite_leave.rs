@@ -2092,6 +2092,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             if error.from == "ActiveMember" && error.to == "JoinWelcome"
     ));
 
+    assert!(
+        cgka_traits::storage::WelcomeStorage::list_welcomes(&carol_storage)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.message_id == fresh_carol_welcome.id),
+        "a validated replacement must remain available for explicit recipient confirmation"
+    );
+
     // Once Carol processes the removal from her trusted epoch-2 branch, the
     // exact same Welcome is a legitimate retry and installs the epoch-4 rejoin.
     let routed_remove = TransportMessage {
@@ -2113,7 +2121,48 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
             .any(|member| member.id == carol_id),
         "trusted removal must clear Carol's active membership before re-entry"
     );
-    carol.join_welcome(fresh_carol_welcome).await.unwrap();
+    // A malformed offer and an unhydratable removed group precede the valid
+    // recovery in storage order. Neither may abort the account-wide sweep.
+    use cgka_traits::storage::WelcomeStorage;
+    let owned_offer = carol_storage.take_welcome(&fresh_carol_welcome.id).unwrap();
+    let mut malformed = owned_offer.clone();
+    malformed.message_id = cgka_traits::MessageId::new(vec![0xe1; 32]);
+    malformed.welcome_bytes = vec![0xff];
+    carol_storage.put_welcome(&malformed).unwrap();
+    let mut missing_mls_group = carol_storage.get_group(&group_id).unwrap();
+    missing_mls_group.id = GroupId::new(vec![0xe2; 16]);
+    carol_storage.put_group(&missing_mls_group).unwrap();
+    let mut blocked = owned_offer.clone();
+    blocked.message_id = cgka_traits::MessageId::new(vec![0xe3; 32]);
+    blocked.group_id = missing_mls_group.id.clone();
+    carol_storage.put_welcome(&blocked).unwrap();
+    carol_storage.put_welcome(&owned_offer).unwrap();
+    carol.hydrate_stable_groups_from_storage().unwrap();
+    assert!(
+        carol.retry_rejoins_after_trusted_removal().await.unwrap(),
+        "owned Welcome must recover past bad candidates without another relay delivery"
+    );
+    let retained_offers = carol_storage.list_welcomes().unwrap();
+    assert!(
+        !retained_offers
+            .iter()
+            .any(|offer| offer.message_id == malformed.message_id),
+        "undecodable bytes must not poison every later maintenance pass"
+    );
+    assert!(
+        retained_offers
+            .iter()
+            .any(|offer| offer.message_id == blocked.message_id),
+        "an unhydratable group's otherwise valid material stays owned for repair"
+    );
+    assert!(
+        !carol.retry_rejoins_after_trusted_removal().await.unwrap(),
+        "an already quarantined group must remain isolated on later sweeps too"
+    );
+    assert!(matches!(
+        carol.join_welcome(fresh_carol_welcome).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
     assert_eq!(carol.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         carol.members(&group_id).unwrap(),
@@ -2121,16 +2170,14 @@ async fn readd_welcome_waits_for_trusted_removal_across_pending_publish_restart(
     );
 
     // David takes the fresh Welcome first. His still-unconsumed epoch-2
-    // Welcome is distinct valid MLS material, but it must not replace epoch 4.
+    // Welcome is distinct valid MLS material, but cannot replace epoch 4
+    // without explicit recipient consent, even though a lower-epoch offer is retained.
     david.join_welcome(fresh_david_welcome).await.unwrap();
     let downgrade_error = david
         .join_welcome(stale_david_welcome)
         .await
         .expect_err("an older Welcome must not downgrade active group state");
-    assert!(matches!(
-        downgrade_error,
-        EngineError::WelcomeAlreadyProcessed
-    ));
+    assert!(matches!(downgrade_error, EngineError::InvalidTransition(_)));
     assert_eq!(david.epoch(&group_id).unwrap().0, 4);
     assert_eq!(
         david.members(&group_id).unwrap(),
@@ -2430,7 +2477,7 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
     );
 
     let error = carol
-        .join_welcome(unauthorized_newer_welcome)
+        .join_welcome(unauthorized_newer_welcome.clone())
         .await
         .expect_err("a newer self-promoted fork must not replace active state");
     assert!(
@@ -2447,6 +2494,39 @@ async fn active_group_rejects_newer_welcome_from_self_promoted_fork() {
         "failed replacement must restore the original Marmot group record"
     );
     assert_eq!(carol.epoch(&group_id).unwrap(), before.epoch);
+    let offer = carol
+        .pending_group_rejoins_for(Some(&group_id))
+        .unwrap()
+        .remove(0);
+    assert_eq!(offer.rejoin.as_ref().unwrap().welcomer, bob.self_id());
+    let mut rewrapped = unauthorized_newer_welcome.clone();
+    rewrapped.id = cgka_traits::MessageId::new(vec![0x91; 32]);
+    assert!(carol.join_welcome(rewrapped.clone()).await.is_err());
+    assert_eq!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .len(),
+        1
+    );
+    carol.decline_group_rejoin(&offer.message_id).unwrap();
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
+    rewrapped.id = cgka_traits::MessageId::new(vec![0x92; 32]);
+    assert!(matches!(
+        carol.join_welcome(rewrapped).await,
+        Err(EngineError::WelcomeAlreadyProcessed)
+    ));
+    assert!(
+        carol
+            .pending_group_rejoins_for(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
     let payload = app_payload_for(&carol, b"original state remains usable");
     carol
         .send(SendIntent::AppMessage { group_id, payload })

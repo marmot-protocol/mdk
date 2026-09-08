@@ -55,6 +55,110 @@ fn one_pixel_png() -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() {
+    use cgka_traits::storage::WelcomeStorage;
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let old_group = client.create_group("old offer", &[]).await.unwrap();
+    let new_group = client.create_group("new offer", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let old = PendingWelcome {
+        message_id: cgka_traits::MessageId::new(vec![0xe1; 32]),
+        group_id: old_group.clone(),
+        welcome_bytes: vec![],
+        rejoin: Some(RejoinWelcome {
+            epoch: cgka_traits::EpochId(0),
+            content_id: cgka_traits::MessageId::new(vec![0xe2; 32]),
+            welcomer: client.runtime.session().self_id(),
+            local_state_token: vec![],
+        }),
+    };
+    storage.put_welcome(&old).unwrap();
+    let before = client.rejoin_offer_snapshot().unwrap();
+    client.pending_group_projection_updates.clear();
+    storage.take_welcome(&old.message_id).unwrap();
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: cgka_traits::MessageId::new(vec![0xe3; 32]),
+            group_id: new_group.clone(),
+            ..old
+        })
+        .unwrap();
+    client.reconcile_rejoin_offer_changes(before).unwrap();
+    assert_eq!(
+        client.pending_group_projection_updates,
+        [
+            hex::encode(old_group.as_slice()),
+            hex::encode(new_group.as_slice())
+        ]
+        .into_iter()
+        .collect()
+    );
+    client.pending_group_projection_updates.clear();
+    let unchanged = client.rejoin_offer_snapshot().unwrap();
+    client.reconcile_rejoin_offer_changes(unchanged).unwrap();
+    assert!(
+        client.pending_group_projection_updates.is_empty(),
+        "unchanged offer metadata must not emit redundant host updates"
+    );
+}
+
+#[tokio::test]
+async fn rejoin_decline_does_not_require_live_mls_state() {
+    use cgka_traits::storage::{GroupStorage, MessageStorage, WelcomeStorage};
+    use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let template_id = client.create_group("offer", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    // Keep a real Marmot record but deliberately omit its corresponding MLS rows.
+    let group_id = cgka_traits::GroupId::new(vec![0xf1; 16]);
+    let mut group = storage.get_group(&template_id).unwrap();
+    group.id = group_id.clone();
+    storage.put_group(&group).unwrap();
+    let welcome_id = cgka_traits::MessageId::new(vec![0xe1; 16]);
+    let content_id = cgka_traits::MessageId::new(vec![0xe2; 32]);
+    storage
+        .put_welcome(&PendingWelcome {
+            message_id: welcome_id.clone(),
+            group_id: group_id.clone(),
+            welcome_bytes: vec![],
+            rejoin: Some(RejoinWelcome {
+                epoch: cgka_traits::EpochId(0),
+                content_id: content_id.clone(),
+                welcomer: client.runtime.session().self_id(),
+                local_state_token: vec![],
+            }),
+        })
+        .unwrap();
+    assert!(
+        client
+            .runtime
+            .session()
+            .pending_group_rejoins_for(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    client.pending_recovery_status_updates.clear();
+    client.decline_group_rejoin(&welcome_id).unwrap();
+    assert!(storage.list_welcomes().unwrap().is_empty());
+    assert!(storage.has_ingress_dedup_marker(&welcome_id).unwrap());
+    assert!(storage.has_ingress_dedup_marker(&content_id).unwrap());
+    assert!(client.pending_recovery_status_updates.contains(&group_id));
+}
+
+#[tokio::test]
 async fn send_finalizes_once() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -2471,6 +2575,196 @@ fn epoch_backfill_without_relay_end_of_stored_events_stays_pending() {
         assert_eq!(failed[0]["kind"]["retry_ordinal"], 0);
         assert_eq!(failed[1]["kind"]["retry_ordinal"], 1);
     });
+}
+
+/// Only confirmed failed replays earn a warning; local progress cannot erase
+/// it, while authenticated peer recovery clears durable and in-memory evidence.
+#[test]
+fn recovery_warning_requires_confirmed_replays_and_survives_local_commits_and_reopen() {
+    run_composed_app_runtime_test("recovery-warning-policy", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        assert_eq!(
+            client.epoch_stall.observe_resource_refusal(
+                group_id.clone(),
+                epoch,
+                epoch_stall_test_now_ms(),
+            ),
+            BackfillDecision::Arm
+        );
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        // A transport failure is not a confirmed, fruitless replay.
+        let execution = client
+            .begin_epoch_backfill_execution(
+                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+            )
+            .unwrap();
+        client.test_finish_epoch_backfill_execution(execution, false);
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        for completed in 1..=3 {
+            if !client.has_pending_epoch_backfill() {
+                client.apply_backfill_decision(
+                    &group_id,
+                    epoch.0,
+                    BackfillDecision::Arm,
+                    marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
+                );
+            }
+            let execution = client
+                .begin_epoch_backfill_execution(
+                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
+                )
+                .unwrap();
+            client.test_complete_epoch_backfill_execution(execution, 0, 0);
+            assert_eq!(
+                client
+                    .group_recovery_status(&group_id)
+                    .unwrap()
+                    .automatic_recovery_failed,
+                completed == 3
+            );
+        }
+        assert!(
+            client
+                .pending_group_projection_updates
+                .contains(&hex::encode(group_id.as_slice()))
+        );
+        // Exercise an actual locally authored epoch advance, not just a fabricated event.
+        let self_update = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap();
+        client
+            .finish_maintenance_effects(&self_update)
+            .await
+            .unwrap();
+        assert!(client.runtime.group_record(&group_id).unwrap().epoch > epoch);
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        drop(client);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        let current = client.runtime.group_record(&group_id).unwrap().epoch;
+        let mut effects = marmot_account::AccountDeviceEffects::default();
+        effects
+            .events
+            .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                group_id: group_id.clone(),
+                message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
+                sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
+                epoch: current,
+                payload: Vec::new(),
+                retention: None,
+            });
+        client.observe_recovery_health(&effects).unwrap();
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .epoch_stall_evidence()
+                .unwrap()
+                .is_empty()
+        );
+        client.persist_epoch_stall_evidence([&group_id]);
+        drop(client);
+        let client = client_on_app_relay_plane(&app, "alice").await;
+        assert!(
+            !client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed
+        );
+    });
+}
+
+#[tokio::test]
+async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_groups() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("recovery status", &[]).await.unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let original = storage.get_group(&group_id).unwrap();
+    storage
+        .record_recovery_evidence(
+            &[storage_sqlite::StoredEpochStallEvidence {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch: original.epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            }],
+            3,
+        )
+        .unwrap();
+    assert!(
+        client
+            .group_recovery_status(&group_id)
+            .unwrap()
+            .automatic_recovery_failed
+    );
+    for state in ["removed", "disbanded", "unrecoverable"] {
+        let mut group = original.clone();
+        match state {
+            "removed" => group.removed = true,
+            "disbanded" => {
+                group.disbanded = Some(cgka_traits::group::DisbandTombstone {
+                    epoch: original.epoch,
+                    actor: client.runtime.session().self_id(),
+                    origin_commit_id: None,
+                    commit_digest: [0; 32],
+                    local_was_committer_leaf: true,
+                    former_members: original.members.clone(),
+                    announced: true,
+                })
+            }
+            _ => group.unrecoverable = true,
+        }
+        storage.put_group(&group).unwrap();
+        assert_eq!(
+            client
+                .group_recovery_status(&group_id)
+                .unwrap()
+                .automatic_recovery_failed,
+            state == "unrecoverable",
+            "terminal verdicts suppress the warning; repairable halts do not"
+        );
+    }
 }
 
 /// A tracked group stalled below the arm threshold, so `mark_replayed` is the
@@ -5029,6 +5323,23 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
         .expect("accept must answer promptly while catch-up is pinned")
         .expect_err("accept cannot start while catch-up owns the account client");
         assert!(matches!(accept_error, AppError::AccountWorkerBusy));
+        let unknown_offer = cgka_traits::MessageId::new(vec![0x75; 32]);
+        let confirm_error = tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.confirm_group_rejoin("bob", &unknown_offer, &[0; 32]),
+        )
+        .await
+        .expect("confirm must answer promptly during catch-up")
+        .expect_err("confirm must not start during catch-up");
+        assert!(matches!(confirm_error, AppError::AccountWorkerBusy));
+        let decline_error = tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.decline_group_rejoin("bob", &unknown_offer),
+        )
+        .await
+        .expect("decline must answer promptly during catch-up")
+        .expect_err("decline must not start during catch-up");
+        assert!(matches!(decline_error, AppError::AccountWorkerBusy));
         assert!(
             app.group("bob", &group_id_hex)
                 .unwrap()
@@ -8319,6 +8630,63 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
             client.group_mls_state(&group_id).unwrap().member_count,
             1 + ((batch_index + 1) * batch.len()),
             "each successful incremental batch must be reflected in the canonical roster"
+        );
+    }
+}
+
+/// Fresh reinvites must not resurrect a cached package when relays only return
+/// future-dated records, including when the batch falls back to single authors.
+#[tokio::test]
+async fn fresh_reinvite_resolution_never_falls_back_to_cached_key_packages() {
+    for reject_batch in [false, true] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        let members = accounts
+            .iter()
+            .map(|account| account.account_id_hex.clone())
+            .collect::<Vec<_>>();
+        let cached = app
+            .resolve_fresh_reinvite_key_packages(&members)
+            .await
+            .unwrap();
+        for member in &members {
+            assert!(
+                app.directory_entry_for_account_id(member)
+                    .unwrap()
+                    .unwrap()
+                    .key_package
+                    .is_some()
+            );
+        }
+        fetcher
+            .reject_multi_author
+            .store(reject_batch, std::sync::atomic::Ordering::SeqCst);
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == KIND_MARMOT_KEY_PACKAGE {
+                event.created_at = u64::MAX;
+            }
+        }
+        fetcher.requests.lock().unwrap().clear();
+        let error = app
+            .resolve_fresh_reinvite_key_packages(&members)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::MissingKeyPackage(id) if id == members[0]));
+        assert!(
+            fetcher.requests.lock().unwrap().iter().any(|request| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
+            }),
+            "single-author fallback must also reject cached material"
+        );
+        let ordinary = app
+            .resolve_member_key_packages(&members.iter().map(String::as_str).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary, cached,
+            "ordinary resolution still permits cached packages"
         );
     }
 }
@@ -13467,6 +13835,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
             group_id: group_id.clone(),
             via_welcome: MessageId::new(vec![0x7a; 32]),
+            explicitly_confirmed: false,
             welcomer: None,
         }],
         ..Default::default()
@@ -15956,6 +16325,117 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
         1,
         "the arm must leave its durable forensic row even on a failing pass"
     );
+}
+
+/// A corrupt retained intent fails invitation recovery after committed effects
+/// arrive. Both account seams must still observe those effects and preserve the
+/// original result, including a convergence publish failure.
+#[tokio::test]
+async fn invite_recovery_failure_preserves_committed_effects_and_results() {
+    for (maintenance, failed_publish) in [(true, false), (false, false), (false, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://recovery-failure.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group_id = client.create_group("committed effects", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+        storage
+            .record_recovery_evidence(
+                &[storage_sqlite::StoredEpochStallEvidence {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    stalled_epoch: epoch.0,
+                    fruitless_completions: 3,
+                    fruitless_reported: true,
+                    last_arm_at_ms: 1,
+                }],
+                3,
+            )
+            .unwrap();
+        assert!(storage.automatic_recovery_failed(&group_id).unwrap());
+        client.pending_group_projection_updates.clear();
+        let mut effects = a_refusal_riding_a_rolled_back_publish(&group_id);
+        if !failed_publish {
+            effects.failures.clear();
+            effects.pending.clear();
+        }
+        effects
+            .events
+            .push(cgka_traits::engine::GroupEvent::GroupJoined {
+                group_id: group_id.clone(),
+                via_welcome: cgka_traits::MessageId::new(vec![0xcd; 32]),
+                welcomer: None,
+                explicitly_confirmed: true,
+            });
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute(
+            "INSERT INTO cgka_own_commit_intents(commit_id, group_id, insert_order, record)
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(insert_order), 0) + 1 FROM cgka_own_commit_intents), x'ff')",
+            rusqlite::params![vec![0xee_u8; 32], group_id.as_slice()],
+        ).unwrap();
+        assert!(
+            client.recover_superseded_invites().await.is_err(),
+            "the recovery failure must be exercised"
+        );
+        let result = if maintenance {
+            client
+                .finish_maintenance_effects(&effects)
+                .await
+                .map(|_| ())
+        } else {
+            client
+                .finish_scheduled_convergence_effects(&group_id, &effects)
+                .await
+                .map(|summary| {
+                    assert!(
+                        summary.joined_groups.contains(&group_id),
+                        "the committed join must reach the caller"
+                    );
+                })
+        };
+        if failed_publish {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                crate::groups::fail_if_publish_failed(&effects)
+                    .unwrap_err()
+                    .to_string()
+            );
+        } else {
+            result.expect("invite recovery must not replace the committed pass's success");
+        }
+        assert!(
+            client.has_pending_epoch_backfill(),
+            "one-shot recovery evidence must be observed"
+        );
+        assert!(
+            !storage.automatic_recovery_failed(&group_id).unwrap(),
+            "committed health evidence must clear the warning"
+        );
+        // Successful scheduled convergence persists the dirty projections;
+        // maintenance and failed convergence leave them queued for the worker.
+        if maintenance || failed_publish {
+            assert!(
+                client
+                    .pending_group_projection_updates
+                    .contains(&hex::encode(group_id.as_slice())),
+                "the warning projection must remain queued"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

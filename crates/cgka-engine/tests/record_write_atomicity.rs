@@ -2005,6 +2005,7 @@ async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
                     name: "intent retention".into(),
                     description: String::new(),
                 },
+                reinvite: None,
                 reissue_attempts: 0,
                 created_at_ms: 0,
             })

@@ -3141,6 +3141,7 @@ async fn two_engine_happy_path_create_and_join() {
     assert!(matches!(
         &events[0],
         cgka_traits::engine::GroupEvent::GroupJoined {
+            explicitly_confirmed: false,
             welcomer: Some(welcomer),
             ..
         } if *welcomer == alice_id && *welcomer != transport_claimed_sender

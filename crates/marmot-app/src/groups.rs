@@ -958,7 +958,8 @@ impl AppGroupRecord {
                 self.pending_confirmation = false;
                 self.archived = false;
             }
-            GroupConfirmationProjection::Pending {
+            GroupConfirmationProjection::Welcome {
+                explicitly_confirmed,
                 via_welcome_message_id_hex,
                 welcomer_account_id_hex,
             } => {
@@ -975,7 +976,7 @@ impl AppGroupRecord {
                 {
                     return;
                 }
-                self.pending_confirmation = true;
+                self.pending_confirmation = !explicitly_confirmed;
                 self.archived = false;
                 self.via_welcome_message_id_hex = Some(via_welcome_message_id_hex);
                 self.welcomer_account_id_hex = welcomer_account_id_hex;
@@ -1021,6 +1022,31 @@ fn normalized_relays(relays: &[String]) -> Vec<String> {
     relays.sort();
     relays.dedup();
     relays
+}
+
+/// Advisory recovery state, separate from user invite acceptance and MLS membership.
+/// Subscribe to GroupStateUpdated, then re-read this durable snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRecoveryStatus {
+    pub group_id_hex: String,
+    /// Repeated relay-confirmed full-history replays recovered nothing.
+    /// Hosts may show "Unable to restore group synchronization"; this is not removal evidence.
+    pub automatic_recovery_failed: bool,
+    /// Lost invitations awaiting fresh material on this inviter device.
+    pub pending_reinvites: u32,
+    /// Exhausted recovery attempts requiring a new user-initiated invitation.
+    pub failed_reinvites: u32,
+    pub rejoin_invitations: Vec<GroupRejoinInvitation>,
+}
+
+/// A fully validated Welcome awaiting a recipient's explicit decision to
+/// replace their existing active group copy. The sender must be shown to the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRejoinInvitation {
+    pub welcome_id_hex: String,
+    pub welcomer_account_id_hex: String,
+    pub epoch: u64,
+    pub local_state_token: String,
 }
 
 #[cfg(test)]
@@ -1858,7 +1884,8 @@ pub(crate) struct EventGroupProjection<'a> {
 pub(crate) enum GroupConfirmationProjection {
     Preserve,
     Accepted,
-    Pending {
+    Welcome {
+        explicitly_confirmed: bool,
         via_welcome_message_id_hex: String,
         welcomer_account_id_hex: Option<String>,
     },
@@ -2079,8 +2106,10 @@ pub(crate) fn observe_event(
                         GroupEvent::GroupJoined {
                             via_welcome,
                             welcomer,
+                            explicitly_confirmed,
                             ..
-                        } => GroupConfirmationProjection::Pending {
+                        } => GroupConfirmationProjection::Welcome {
+                            explicitly_confirmed: *explicitly_confirmed,
                             via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
                             welcomer_account_id_hex: welcomer
                                 .as_ref()
@@ -2446,7 +2475,8 @@ mod confirmation_state_tests {
     }
 
     fn pending(via_welcome: &str, welcomer: Option<&str>) -> GroupConfirmationProjection {
-        GroupConfirmationProjection::Pending {
+        GroupConfirmationProjection::Welcome {
+            explicitly_confirmed: false,
             via_welcome_message_id_hex: via_welcome.to_owned(),
             welcomer_account_id_hex: welcomer.map(str::to_owned),
         }

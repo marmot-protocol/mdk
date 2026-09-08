@@ -61,6 +61,7 @@ use crate::{
 
 mod audit;
 pub(crate) mod epoch_stall;
+mod invite_recovery;
 mod projection;
 mod push;
 mod receipts;
@@ -325,6 +326,8 @@ pub struct AppClient {
     /// Live saves replace only these groups; full snapshot replacement is
     /// reserved for import/rebuild paths outside the account worker.
     pub(crate) pending_group_projection_updates: HashSet<String>,
+    /// Recovery status has its own notification queue; saving a projection must not consume it.
+    pub(crate) pending_recovery_status_updates: HashSet<GroupId>,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
@@ -906,7 +909,18 @@ impl AppClient {
                 },
             );
         }
-        self.observe_recovery_evidence_then_summarize_maintenance(&effects?)
+        let effects = effects?;
+        self.finish_maintenance_effects(&effects).await
+    }
+
+    /// Preserve committed maintenance effects before best-effort invite recovery.
+    pub(crate) async fn finish_maintenance_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
+        let result = self.observe_recovery_evidence_then_summarize_maintenance(effects);
+        self.recover_superseded_invites_best_effort().await;
+        result
     }
 
     /// Observe one maintenance tick's recovery evidence, then summarize the
@@ -936,6 +950,7 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
         self.observe_recovery_evidence(effects);
+        self.observe_recovery_health(effects)?;
         self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
         // The summary includes this pass's failed executions. Backlog counts only
@@ -5059,6 +5074,12 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
+            if report.outcome == cgka_traits::engine::SupersededIntentOutcome::ReinviteRequired {
+                self.mark_group_projection_dirty_hex(hex::encode(report.group_id.as_slice()));
+                // The app owns automatic fresh-material recovery; only terminal
+                // failure should ask the inviter to take manual action.
+                continue;
+            }
             if self
                 .pending_superseded_change_events
                 .iter()

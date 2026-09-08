@@ -65,8 +65,11 @@
 //! the client. The compatibility `sync()` API instead leaves it stashed after
 //! an error so a caller retaining that client receives it on the next successful
 //! seam. A caller that discards such a client also discards the detector run;
-//! the opt-in `epoch_stall_backfill_escalated` audit row is then the only durable
-//! trace.
+//! the opt-in `epoch_stall_backfill_escalated` audit row retains that event.
+//! Separately, confirmed fruitless replay evidence earns the app
+//! `automatic_recovery_failed` warning, persisted atomically with that evidence.
+//! The warning survives local epoch movement until authenticated peer recovery
+//! or a join clears it; arm-count escalation alone cannot set it.
 //!
 //! A discarded run is re-earned from zero rather than re-raised: escalating
 //! again costs a whole fresh run of [`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`]
@@ -1038,6 +1041,12 @@ impl EpochStallDetector {
                 })
             })
             .collect()
+    }
+
+    /// Authenticated current-epoch peer traffic or a join ends the failed
+    /// recovery run; a local epoch advance alone never calls this method.
+    pub(crate) fn clear_recovered_group(&mut self, group: &GroupId) {
+        self.groups.remove(group);
     }
 
     /// The durable frozen-epoch evidence for `group`, for the storage row that

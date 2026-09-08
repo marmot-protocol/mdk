@@ -820,3 +820,44 @@ mod group_roster_tests {
         assert_eq!(ffi.admin_ids_hex, vec!["02".repeat(32)]);
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupRejoinInvitationFfi {
+    pub welcome_id_hex: String,
+    pub welcomer_account_id_hex: String,
+    pub epoch: u64,
+    pub local_state_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupRecoveryStatusFfi {
+    pub group_id_hex: String,
+    /// Repeated completed replays failed to restore synchronization; not membership evidence.
+    pub automatic_recovery_failed: bool,
+    /// Lost invitations awaiting fresh material on this inviter device.
+    pub pending_reinvites: u32,
+    /// Exhausted recovery attempts requiring a new user-initiated invitation.
+    pub failed_reinvites: u32,
+    pub rejoin_invitations: Vec<GroupRejoinInvitationFfi>,
+}
+
+impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
+    fn from(value: marmot_app::GroupRecoveryStatus) -> Self {
+        Self {
+            group_id_hex: value.group_id_hex,
+            automatic_recovery_failed: value.automatic_recovery_failed,
+            pending_reinvites: value.pending_reinvites,
+            failed_reinvites: value.failed_reinvites,
+            rejoin_invitations: value
+                .rejoin_invitations
+                .into_iter()
+                .map(|offer| GroupRejoinInvitationFfi {
+                    welcome_id_hex: offer.welcome_id_hex,
+                    welcomer_account_id_hex: offer.welcomer_account_id_hex,
+                    epoch: offer.epoch,
+                    local_state_token: offer.local_state_token,
+                })
+                .collect(),
+        }
+    }
+}

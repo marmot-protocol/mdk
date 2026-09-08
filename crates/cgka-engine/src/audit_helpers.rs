@@ -391,6 +391,7 @@ pub(crate) fn ingest_outcome_event(
             ),
             IngestOutcome::LocalState { state } => Some(
                 match state {
+                    LocalIngestState::RejoinConfirmationRequired => "rejoin_confirmation_required",
                     LocalIngestState::Removed => "removed",
                     LocalIngestState::Quarantined => "quarantined",
                 }

@@ -683,6 +683,7 @@ fn snapshot_group_events() {
         GroupEvent::GroupJoined {
             group_id: gid(),
             via_welcome: mid(),
+            explicitly_confirmed: false,
             welcomer: Some(mem_id()),
         }
     );

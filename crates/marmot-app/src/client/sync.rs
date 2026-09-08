@@ -1215,6 +1215,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        self.observe_recovery_health(effects)?;
         // Retire released receipts even when the drain emitted no app events.
         self.transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
@@ -2368,7 +2369,8 @@ impl AppClient {
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
         let client = receipts.into_client();
-        let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
+        let source_message_id = delivery.message.id.clone();
+        let source_message_id_hex = hex::encode(source_message_id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
@@ -2378,6 +2380,11 @@ impl AppClient {
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
+        let rejoin_offers_before = if welcome {
+            Some(client.rejoin_offer_snapshot()?)
+        } else {
+            None
+        };
         let observation = client.app.product_analytics.begin(
             if welcome {
                 crate::ProductFamily::Welcome
@@ -2409,6 +2416,13 @@ impl AppClient {
             });
         }
         let effects = ingest?;
+        client.observe_recovery_health(&effects.effects)?;
+        if let Some(before) = rejoin_offers_before {
+            // Account-wide eviction may remove an offer for a different group.
+            // Invalidate every changed group's host projection, not just the
+            // incoming Welcome's group. This scan reads bounded metadata only.
+            client.reconcile_rejoin_offer_changes(before)?;
+        }
         let source_released = client
             .transport_receipts()?
             .was_released(&source_message_id_hex);
@@ -2775,16 +2789,21 @@ impl AppClient {
                 })
             })
             .collect::<Vec<_>>();
-        if let Err(error) = self
-            .app
-            .record_epoch_stall_evidence(&self.state.label, &evidence)
-        {
-            tracing::warn!(
-                target: "marmot_app::epoch_stall",
-                method = "persist_epoch_stall_evidence",
-                error_kind = error.privacy_safe_kind(),
-                "frozen-epoch recovery evidence is live in memory but was not made durable"
-            );
+        match self.app.record_epoch_stall_evidence(
+            &self.state.label,
+            &evidence,
+            self.epoch_stall.fruitless_completion_threshold(),
+        ) {
+            Ok(changed) => {
+                for group_id in changed {
+                    self.mark_recovery_status_changed(&group_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "marmot_app::epoch_stall", method = "persist_epoch_stall_evidence",
+                    error_kind = error.privacy_safe_kind(),
+                    "recovery evidence and warning remain pending persistence");
+            }
         }
     }
 
@@ -3793,8 +3812,21 @@ impl AppClient {
         // The account worker refreshes transport groups once for the scheduled
         // convergence batch before calling this per-group path.
         let effects = self.runtime.advance_convergence(group_id).await?;
-        self.observe_scheduled_convergence_effects(group_id, &effects)
+        self.finish_scheduled_convergence_effects(group_id, &effects)
             .await
+    }
+
+    /// Preserve committed convergence effects before best-effort invite recovery.
+    pub(crate) async fn finish_scheduled_convergence_effects(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<SyncSummary, AppError> {
+        let result = self
+            .observe_scheduled_convergence_effects(group_id, effects)
+            .await;
+        self.recover_superseded_invites_best_effort().await;
+        result
     }
 
     /// Project one scheduled convergence batch's effects, split from the
@@ -3805,6 +3837,7 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        self.observe_recovery_health(effects)?;
         self.remember_pending_convergence_groups(effects);
         // Observe before the publish gate, for the reason spelled out in
         // `observe_drained_session_events`.
