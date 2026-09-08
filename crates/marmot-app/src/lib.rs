@@ -1737,6 +1737,7 @@ impl MarmotApp {
         };
         let _ = open.runtime.take_maintenance_activity();
         let mut client = AppClient {
+            send_telemetry: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             runtime: open.runtime,

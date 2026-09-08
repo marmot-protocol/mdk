@@ -1287,17 +1287,28 @@ impl AccountManager {
         group_id: &GroupId,
         payload: Vec<u8>,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::SendMessage {
-                group_id: group_id.clone(),
-                payload,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let enqueued_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::SendMessage {
+                    enqueued_at,
+                    group_id: group_id.clone(),
+                    payload,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::OutboundMessageResponse,
+            enqueued_at.elapsed(),
+            result.is_ok(),
+        );
+        let summary = result?;
         self.schedule_audit_log_tracker_update("send_message");
         Ok(summary)
     }
@@ -1429,17 +1440,28 @@ impl AccountManager {
         group_id: &GroupId,
         intent: AppMessageIntent,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::SendAppEvent {
-                group_id: group_id.clone(),
-                intent,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
+        let enqueued_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::SendAppEvent {
+                    enqueued_at,
+                    group_id: group_id.clone(),
+                    intent,
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::OutboundMessageResponse,
+            enqueued_at.elapsed(),
+            result.is_ok(),
+        );
+        let summary = result?;
         self.schedule_audit_log_tracker_update("send_app_event");
         Ok(summary)
     }

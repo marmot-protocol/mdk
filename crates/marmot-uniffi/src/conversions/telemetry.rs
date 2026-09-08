@@ -4,6 +4,8 @@
 pub enum HostPerformanceOperationFfi {
     SplashReady,
     ForegroundLocalReady,
+    OutboundMessageVisible,
+    InboundMessageVisible,
 }
 
 /// One fixed-bucket duration histogram bucket.
@@ -107,7 +109,16 @@ pub struct AppPerformanceSnapshotFfi {
     /// Existing-database opens that skipped the recovery probe via a cached
     /// verdict since process start.
     pub sqlcipher_migration_probe_skips: u64,
+    pub inbound_delivery_projection: AppPerformanceOperationSnapshotFfi,
     pub outbound_message_send: AppPerformanceOperationSnapshotFfi,
+    pub outbound_message_queue_wait: AppPerformanceOperationSnapshotFfi,
+    pub outbound_message_local_projection: AppPerformanceOperationSnapshotFfi,
+    pub outbound_message_local_accept: AppPerformanceOperationSnapshotFfi,
+    pub outbound_message_publish: AppPerformanceOperationSnapshotFfi,
+    pub outbound_message_response: AppPerformanceOperationSnapshotFfi,
+    pub host_outbound_message_visible: AppPerformanceOperationSnapshotFfi,
+    pub host_inbound_message_visible: AppPerformanceOperationSnapshotFfi,
+
     pub group_create_queue_wait: AppPerformanceOperationSnapshotFfi,
     pub group_create_key_package_lookup: AppPerformanceOperationSnapshotFfi,
     pub group_member_key_package_prewarm: AppPerformanceOperationSnapshotFfi,
@@ -189,7 +200,16 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             account_setup_network_ready,
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
+            inbound_delivery_projection,
             outbound_message_send,
+            outbound_message_queue_wait,
+            outbound_message_local_projection,
+            outbound_message_local_accept,
+            outbound_message_publish,
+            outbound_message_response,
+            host_outbound_message_visible,
+            host_inbound_message_visible,
+
             group_create_queue_wait,
             group_create_key_package_lookup,
             group_member_key_package_prewarm,
@@ -265,7 +285,16 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
             account_setup_network_ready: account_setup_network_ready.into(),
             sqlcipher_migration_probe_runs,
             sqlcipher_migration_probe_skips,
+            inbound_delivery_projection: inbound_delivery_projection.into(),
             outbound_message_send: outbound_message_send.into(),
+            outbound_message_queue_wait: outbound_message_queue_wait.into(),
+            outbound_message_local_projection: outbound_message_local_projection.into(),
+            outbound_message_local_accept: outbound_message_local_accept.into(),
+            outbound_message_publish: outbound_message_publish.into(),
+            outbound_message_response: outbound_message_response.into(),
+            host_outbound_message_visible: host_outbound_message_visible.into(),
+            host_inbound_message_visible: host_inbound_message_visible.into(),
+
             group_create_queue_wait: group_create_queue_wait.into(),
             group_create_key_package_lookup: group_create_key_package_lookup.into(),
             group_member_key_package_prewarm: group_member_key_package_prewarm.into(),
@@ -320,6 +349,8 @@ impl From<marmot_app::AppPerformanceSnapshot> for AppPerformanceSnapshotFfi {
 impl From<HostPerformanceOperationFfi> for marmot_app::HostPerformanceOperation {
     fn from(value: HostPerformanceOperationFfi) -> Self {
         match value {
+            HostPerformanceOperationFfi::OutboundMessageVisible => Self::OutboundMessageVisible,
+            HostPerformanceOperationFfi::InboundMessageVisible => Self::InboundMessageVisible,
             HostPerformanceOperationFfi::SplashReady => Self::SplashReady,
             HostPerformanceOperationFfi::ForegroundLocalReady => Self::ForegroundLocalReady,
         }
@@ -346,6 +377,27 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn message_journey_host_metrics() {
+        let telemetry = marmot_app::AppPerformanceTelemetry::default();
+        for operation in [
+            HostPerformanceOperationFfi::OutboundMessageVisible,
+            HostPerformanceOperationFfi::InboundMessageVisible,
+        ] {
+            telemetry.record_host_performance(
+                operation.into(),
+                Duration::from_millis(75),
+                marmot_app::HostPerformanceOutcome::Success,
+            );
+        }
+        let snapshot: AppPerformanceSnapshotFfi = telemetry.snapshot().into();
+        assert_eq!(
+            snapshot.host_outbound_message_visible.duration_ms.sum_ms,
+            75
+        );
+        assert_eq!(snapshot.host_inbound_message_visible.successes, 1);
+    }
 
     #[test]
     fn app_performance_snapshot_ffi_mirrors_counts_and_histogram_buckets() {

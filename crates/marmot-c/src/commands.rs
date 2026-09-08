@@ -2601,6 +2601,38 @@ pub unsafe extern "C" fn marmot_record_product_event(
     })
 }
 
+/// Record an app-defined timing through the consent-gated product exporter.
+/// Register `name` with `elapsed: DurationBucket` and `outcome: Enum` choices
+/// `success`/`failure`. Milliseconds are bucketed before recording.
+/// # Safety
+/// Client and borrowed name must be valid; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_record_host_timing(
+    client: *const MarmotClient,
+    name: *const c_char,
+    duration_ms: u64,
+    outcome: u32,
+    out: *mut MarmotProductRecordResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::check_out(out) });
+        unsafe {
+            *out = MarmotProductRecordResult::IgnoredDisabled;
+        }
+        let client = try_arg!(unsafe { client_ref(client) });
+        let name = try_arg!(unsafe { required_str(name) });
+        let outcome = try_arg!(MarmotHostPerformanceOutcome::from_c(outcome));
+        unsafe {
+            deliver_enum(
+                client
+                    .marmot
+                    .record_host_timing(name, duration_ms, outcome.into()),
+                out,
+            )
+        }
+    })
+}
+
 /// Signal host activity. Discriminants are validated before conversion.
 /// # Safety
 /// Client must be a live handle.

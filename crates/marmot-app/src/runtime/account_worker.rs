@@ -290,11 +290,13 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendMessage {
+        enqueued_at: Instant,
         group_id: GroupId,
         payload: Vec<u8>,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     SendAppEvent {
+        enqueued_at: Instant,
         group_id: GroupId,
         intent: AppMessageIntent,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -1307,6 +1309,8 @@ async fn run_app_runtime_account_worker(
                 // delivery has been claimed, finish ingest + incidental
                 // publish + projection as one uncancelled worker operation;
                 // commands remain queued until that durable sequence lands.
+                let delivery_started = matches!(&received, Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(_)))
+                    .then(Instant::now);
                 let (result, overflow_recovery_incomplete) = match received {
                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                         (client.ingest_received_delivery(*delivery).await, false)
@@ -1341,6 +1345,13 @@ async fn run_app_runtime_account_worker(
                     }
                     Err(err) => (Err(err), false),
                 };
+                if result.is_err() && let Some(started) = delivery_started {
+                    shared.app_performance_telemetry().record(
+                        AppPerformanceOperation::InboundDeliveryProjection,
+                        started.elapsed(),
+                        false,
+                    );
+                }
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();
@@ -1355,6 +1366,13 @@ async fn run_app_runtime_account_worker(
                             &account_id_hex,
                             &account_label,
                         );
+                        if let Some(started) = delivery_started {
+                            shared.app_performance_telemetry().record(
+                                AppPerformanceOperation::InboundDeliveryProjection,
+                                started.elapsed(),
+                                true,
+                            );
+                        }
                         start_post_join_history_after_visibility(
                             &mut client,
                             &summary,
@@ -3723,13 +3741,29 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::SendMessage {
+            enqueued_at,
             group_id,
             payload,
             respond,
         } => Box::pin(async move {
             let send_started_at = Instant::now();
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                enqueued_at.elapsed(),
+                true,
+            );
+            let mut first_projection = true;
+            client.send_telemetry = Some(shared.app_performance_telemetry());
             let result = client
                 .send_with_local_projection(&group_id, &payload, |update| {
+                    if first_projection {
+                        shared.app_performance_telemetry().record(
+                            AppPerformanceOperation::OutboundMessageLocalProjection,
+                            enqueued_at.elapsed(),
+                            true,
+                        );
+                        first_projection = false;
+                    }
                     publish_app_runtime_projection_update(
                         events,
                         account_id_hex,
@@ -3738,6 +3772,7 @@ fn account_worker_command_future<'a>(
                     );
                 })
                 .await;
+            client.send_telemetry = None;
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),
@@ -3747,11 +3782,19 @@ fn account_worker_command_future<'a>(
             true
         }),
         AccountWorkerCommand::SendAppEvent {
+            enqueued_at,
             group_id,
             intent,
             respond,
         } => Box::pin(async move {
             let send_started_at = Instant::now();
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageQueueWait,
+                enqueued_at.elapsed(),
+                true,
+            );
+            let mut first_projection = true;
+            client.send_telemetry = Some(shared.app_performance_telemetry());
             let result = match intent {
                 AppMessageIntent::Reaction {
                     target_message_id,
@@ -3763,6 +3806,14 @@ fn account_worker_command_future<'a>(
                             &target_message_id,
                             &emoji,
                             |update| {
+                                if first_projection {
+                                    shared.app_performance_telemetry().record(
+                                        AppPerformanceOperation::OutboundMessageLocalProjection,
+                                        enqueued_at.elapsed(),
+                                        true,
+                                    );
+                                    first_projection = false;
+                                }
                                 publish_app_runtime_projection_update(
                                     events,
                                     account_id_hex,
@@ -3775,6 +3826,14 @@ fn account_worker_command_future<'a>(
                 }
                 intent => client
                     .send_app_event_with_local_projection(&group_id, intent, |update| {
+                        if first_projection {
+                            shared.app_performance_telemetry().record(
+                                AppPerformanceOperation::OutboundMessageLocalProjection,
+                                enqueued_at.elapsed(),
+                                true,
+                            );
+                            first_projection = false;
+                        }
                         publish_app_runtime_projection_update(
                             events,
                             account_id_hex,
@@ -3785,6 +3844,7 @@ fn account_worker_command_future<'a>(
                     .await
                     .map(|(_event, summary)| summary),
             };
+            client.send_telemetry = None;
             shared.app_performance_telemetry().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),

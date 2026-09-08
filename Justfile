@@ -53,6 +53,10 @@ test-default:
 test-otlp:
     cargo nextest run --workspace --features {{diagnostics-features}},{{test-features}}
 
+# Message latency boundaries, abrupt exits, caller cancellation, and replay recovery.
+test-message-journeys:
+    cargo nextest run -p marmot-app -p marmot-uniffi --features marmot-app/test-policy-overrides -E 'test(message_journey) | test(unavailable_send_retries_the_exact_event_after_transport_recovers) | test(connectivity_restored_wakes_a_retained_send_before_the_retry_timer) | test(connectivity_restored_during_reconnect_wakes_the_retained_send)'
+
 # Startup scaling benchmarks (mdk#1161, mdk#1413): builds stores with
 # 0/10/100/1000 groups, 8/64-member rosters, and a message-heavy case;
 # reports the SQLCipher database footprint, cold-reopens each, and prints

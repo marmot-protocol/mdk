@@ -122,8 +122,9 @@ UTC quarter-hour windows get fresh UUIDs. First/background/shutdown windows may 
 partial. Counts use `1`, `2`, `3_5`, `6_10`, `11_20`, `21_50`, `51_100`, `101_250`,
 `251_1000`, and `1001_plus`. Zero is reserved for backlog/coverage, not empty
 activity. Product duration upper bounds are inclusive: 10/25/50/100/250/500 ms;
-1/2/5/10/30 seconds; 1/5/15/60 minutes; overflow. Product and OTLP receive separate
-histograms from the same durations. Product sends neither raw durations nor sums.
+1/2/5/10/30 seconds; 1/5/15/60 minutes; overflow. Built-in operations feed product
+and OTLP separately from the same durations. Custom host events feed product only.
+Product sends neither raw durations nor sums.
 
 OTLP lifetime counters stay local. Each export collection period subtracts a
 counter/histogram baseline, retains cumulative temporality with the period's
@@ -137,6 +138,50 @@ nonacceptance permits bounded retries; ambiguous post-send failures are dropped.
 Authentication/configuration rejection suspends the affected exporter. Both
 exporters validate every resolved address, pin it, preserve configured-host TLS
 trust, disable redirects/proxies, and bound DNS/connect/request time.
+
+## Custom host timings
+
+Register app-specific stages before requesting consent, then call
+`record_host_timing(name, duration, outcome)` with a monotonic elapsed duration.
+For example, add this schema to `ProductAnalyticsRuntimeConfig.registry`:
+
+```rust
+ProductEventSchema {
+    name: "app_inbox_layout".into(),
+    mode: ProductEventMode::Aggregate,
+    properties: vec![
+        ProductPropertySchema {
+            name: "elapsed".into(),
+            rule: ProductPropertyRule::DurationBucket,
+        },
+        ProductPropertySchema {
+            name: "outcome".into(),
+            rule: ProductPropertyRule::Enum(vec!["success".into(), "failure".into()]),
+        },
+    ],
+}
+```
+
+Measure each stage with the host's monotonic clock. Rust accepts `Duration`;
+Swift/Kotlin and `marmot_record_host_timing` accept unsigned milliseconds plus
+`HostPerformanceOutcome` (`Success`/`Failure`). For example, Swift calls
+`try marmot.recordHostTiming(name: "app_inbox_layout", durationMs: 250, outcome: .success)`.
+Use static stage names such as `app_inbox_layout` or `app_attachment_decode`,
+never names derived from messages, accounts, files, or user input. Existing app
+metadata and separate operator app keys distinguish app versions and surfaces.
+
+The helper records exactly `elapsed` and `outcome`, validating the registered
+schema through `record_product_event`. Aggregate mode counts matching stage,
+duration bucket, and outcome combinations per window; Journey mode records each
+foreground observation. Disabled/unconfigured collection returns the existing
+ignored result; unregistered names or incompatible schemas return an error while
+collection is enabled. Consent revocation clears pending events. Extra registered
+dimensions can use `record_product_event` directly with a duration bucket value.
+
+These events reach Aptabase under their registered names and do not enter OTLP
+or `app_performance_snapshot`. Compare `elapsed` buckets by stage, outcome, app
+version, and OS; a 250 ms sample is `le_250ms`, and 251 ms is `le_500ms`. They do not
+provide exact percentiles, raw durations, or per-message trace correlation.
 
 ## Operator reports
 
