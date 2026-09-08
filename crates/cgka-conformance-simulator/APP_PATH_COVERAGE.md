@@ -476,7 +476,8 @@ invite-versus-rename repetitions failed. Two left the invitee on a stranded bran
 but dropped an accepted rename. Inputs and public observations are retained under `target/app-launch-20260907/known-races/`.
 The departure scheduling correction alone did not repair those gaps. The combined reliability branch now also
 includes own-intent recovery for #1734, with strict journey 08 promoted to the ordinary suite. The stranded-invitee
-case (#1735) is now covered by automatic fresh-material recovery plus explicit recipient rejoin; its strict regression runs ordinarily. Intent retention failures roll back staging;
+case (#1735) is now covered by automatic fresh-material recovery plus explicit recipient rejoin; its strict real-socket regression is opt-in because socket scheduling cannot guarantee the same-epoch race.
+The deterministic engine regression is required; an opt-in run that misses the race is inconclusive evidence. Intent retention failures roll back staging;
 re-issue transfers the retained intent into the outbound queue atomically, with fault-injection regressions for
 both queue insertion and source deletion. The account dispatcher constructs only the selected command future
 to keep nested MLS work within the configured runtime stack budget.

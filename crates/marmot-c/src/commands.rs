@@ -648,15 +648,18 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_update_message_retention(account_ref: str, group_id_hex: str, disappearing_message_secs: val u64) -> rec(MarmotSendSummary) = update_message_retention;
 
-    /// Accept a pending group invite; writes the now-confirmed group
-    /// record. Free with `marmot_app_group_record_free`.
+    /// Query advisory membership health and pending rejoin offers.
+    /// Free with `marmot_group_recovery_status_free`.
     async fn marmot_group_recovery_status(account_ref: str, group_id_hex: str) -> rec(MarmotGroupRecoveryStatus) = group_recovery_status;
 
     /// Only after explicit recipient consent. Free with marmot_group_recovery_status_free.
     async fn marmot_confirm_group_rejoin(account_ref: str, welcome_id_hex: str, local_state_token: str) -> rec(MarmotGroupRecoveryStatus) = confirm_group_rejoin;
 
+    /// Decline the selected replacement offer without changing active group state.
     async fn marmot_decline_group_rejoin(account_ref: str, welcome_id_hex: str) -> unit = decline_group_rejoin;
 
+    /// Accept a pending group invite; writes the now-confirmed group
+    /// record. Free with `marmot_app_group_record_free`.
     async fn marmot_accept_group_invite(account_ref: str, group_id_hex: str) -> rec(MarmotAppGroupRecord) = accept_group_invite;
 
     /// Decline a pending group invite; writes the updated group record

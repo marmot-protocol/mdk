@@ -27,18 +27,38 @@ impl SqliteAccountStorage {
         threshold: usize,
     ) -> StorageResult<bool> {
         self.with_transaction(|storage| {
-            if storage.membership_unconfirmed(group_id)? { return Ok(false); }
+            if storage.membership_unconfirmed(group_id)? {
+                return Ok(false);
+            }
             let conn = storage.lock()?;
             let epoch = crate::epoch_to_i64(epoch)?;
-            conn.execute("DELETE FROM app_group_membership_evidence WHERE group_id = ?1 AND epoch != ?2",
-                params![group_id.as_slice(), epoch]).storage()?;
-            conn.execute("INSERT OR IGNORE INTO app_group_membership_evidence (group_id, message_id, epoch) VALUES (?1, ?2, ?3)",
-                params![group_id.as_slice(), message_id.as_slice(), epoch]).storage()?;
-            let count: i64 = conn.query_row("SELECT count(*) FROM app_group_membership_evidence WHERE group_id = ?1",
-                [group_id.as_slice()], |row| row.get(0)).storage()?;
+            conn.execute(
+                "DELETE FROM app_group_membership_evidence
+                 WHERE group_id = ?1 AND epoch != ?2",
+                params![group_id.as_slice(), epoch],
+            )
+            .storage()?;
+            conn.execute(
+                "INSERT OR IGNORE INTO app_group_membership_evidence
+                 (group_id, message_id, epoch) VALUES (?1, ?2, ?3)",
+                params![group_id.as_slice(), message_id.as_slice(), epoch],
+            )
+            .storage()?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM app_group_membership_evidence
+                 WHERE group_id = ?1",
+                    [group_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .storage()?;
             if count >= threshold.clamp(1, 64) as i64 {
-                conn.execute("INSERT OR IGNORE INTO app_group_membership_uncertainty (group_id) VALUES (?1)",
-                    [group_id.as_slice()]).storage()?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO app_group_membership_uncertainty
+                     (group_id) VALUES (?1)",
+                    [group_id.as_slice()],
+                )
+                .storage()?;
                 return Ok(true);
             }
             Ok(false)

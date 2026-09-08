@@ -812,14 +812,19 @@ impl<S: StorageProvider> Engine<S> {
             let Some(rejoin) = &mut candidate.rejoin else {
                 continue;
             };
-            let Some(group) = MlsGroup::load(
+            let group = match MlsGroup::load(
                 provider.storage(),
                 &openmls::group::GroupId::from_slice(candidate.group_id.as_slice()),
-            )
-            .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
-            else {
-                // An unrelated deleted group must not prevent account ingress.
-                continue;
+            ) {
+                Ok(Some(group)) => group,
+                Ok(None) => continue,
+                Err(_) => {
+                    // Hydration owns quarantine and repair. One damaged group's
+                    // offer must not hide healthy groups' offers or block ingress.
+                    tracing::debug!(target: "cgka_engine::group_lifecycle",
+                        method = "pending_group_rejoins", "skipping an unreadable group");
+                    continue;
+                }
             };
             rejoin.local_state_token =
                 Sha256::digest(group.epoch_authenticator().as_slice()).to_vec();
@@ -1348,8 +1353,12 @@ impl<S: StorageProvider> Engine<S> {
             )?;
 
             for candidate in storage.list_welcomes()? {
-                if candidate.group_id == group_id && candidate.rejoin.is_some() {
+                if candidate.group_id == group_id
+                    && let Some(rejoin) = candidate.rejoin
+                {
                     storage.take_welcome(&candidate.message_id)?;
+                    storage.put_ingress_dedup_marker(&candidate.message_id)?;
+                    storage.put_ingress_dedup_marker(&rejoin.content_id)?;
                 }
             }
 
@@ -1426,21 +1435,38 @@ impl<S: StorageProvider> Engine<S> {
             }) {
                 // Keep the first offer without terminally deduplicating its
                 // content: trusted removal may still make it auto-joinable.
-            } else if !existing
-                .iter()
-                .any(|old| old.message_id == candidate.message_id)
-                && existing.len() < 64
-                && existing
-                    .iter()
-                    .filter(|old| old.group_id == candidate.group_id)
-                    .count()
-                    < 4
-            {
-                self.storage.put_welcome(&candidate)?;
             } else {
-                return Err(EngineError::PendingWelcomeAtCapacity {
-                    group_id: candidate.group_id,
-                });
+                // Retire the oldest unconsented offer when full. User decisions
+                // must not pin the account transport cursor; a stale screen's
+                // confirmation safely fails because the selected id is gone.
+                self.storage
+                    .with_transaction(|storage| -> Result<(), EngineError> {
+                        let group_full = existing
+                            .iter()
+                            .filter(|old| {
+                                old.group_id == candidate.group_id && old.rejoin.is_some()
+                            })
+                            .count()
+                            >= 4;
+                        let account_full =
+                            existing.iter().filter(|old| old.rejoin.is_some()).count() >= 64;
+                        if group_full || account_full {
+                            let oldest = existing
+                                .iter()
+                                .find(|old| {
+                                    old.rejoin.is_some()
+                                        && (!group_full || old.group_id == candidate.group_id)
+                                })
+                                .ok_or(EngineError::InvalidWelcome)?;
+                            storage.take_welcome(&oldest.message_id)?;
+                            storage.put_ingress_dedup_marker(&oldest.message_id)?;
+                            if let Some(rejoin) = &oldest.rejoin {
+                                storage.put_ingress_dedup_marker(&rejoin.content_id)?;
+                            }
+                        }
+                        storage.put_welcome(&candidate)?;
+                        Ok(())
+                    })?;
             }
         }
         let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable, superseded) = result?;

@@ -3969,6 +3969,15 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
 /// case the field-evidence loop needs to observe.
 #[tokio::test]
 async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
+    membership_warning_recovery(false).await;
+}
+
+#[tokio::test]
+async fn membership_warning_clears_after_peer_epoch_recovery_without_chat() {
+    membership_warning_recovery(true).await;
+}
+
+async fn membership_warning_recovery(commit_only: bool) {
     // Mirrors `EPOCH_STALL_BACKFILL_THRESHOLD` (crate-private): the distinct
     // undecryptable messages at one stalled epoch that arm a backfill.
     const BACKFILL_THRESHOLD: usize = 8;
@@ -4104,34 +4113,29 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     );
     wait_for_account_network_ready(&runtime, "alice").await;
     wait_for_account_network_ready(&runtime, "bob").await;
-    let mut recovery_events = runtime.subscribe();
-    let sent = runtime
-        .send_message("alice", &group_id, b"authenticated recovery".to_vec())
-        .await
-        .unwrap();
-    let mut received_epochs = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        while let Ok(event) = recovery_events.try_recv() {
-            if let MarmotAppEvent::GroupEvent(event) = event
-                && event.account_label == "bob"
-                && let cgka_traits::engine::GroupEvent::MessageReceived { epoch, .. } = event.event
-            {
-                received_epochs.push(epoch.0);
-            }
-        }
-        if !runtime
-            .group_recovery_status("bob", &group_id)
+    // A peer commit can repair the epoch without any current-epoch chat.
+    // The advisory must reset even if the group goes quiet after the rename.
+    if commit_only {
+        runtime
+            .update_group_profile("alice", &group_id, Some("recovered epoch".into()), None)
             .await
-            .unwrap()
-            .membership_unconfirmed
-        {
-            break;
-        }
+            .unwrap();
+    } else {
+        runtime
+            .send_message("alice", &group_id, b"authenticated recovery".to_vec())
+            .await
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while runtime
+        .group_recovery_status("bob", &group_id)
+        .await
+        .unwrap()
+        .membership_unconfirmed
+    {
         assert!(
             Instant::now() < deadline,
-            "authenticated current-epoch traffic must clear the warning; published={}, received_epochs={received_epochs:?}",
-            sent.published
+            "a recovered epoch must reset the old warning without chat traffic"
         );
         sleep(Duration::from_millis(100)).await;
     }

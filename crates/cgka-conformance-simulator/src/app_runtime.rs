@@ -519,12 +519,22 @@ impl AppRuntimeHarness {
         );
         let token =
             hex::decode(&offer.local_state_token).map_err(|error| app_error(error.into()))?;
-        participant
-            .runtime()?
-            .confirm_group_rejoin(&participant.account_id, &id, &token)
-            .await
-            .map_err(app_error)?;
-        Ok(())
+        // A busy response guarantees the decision did not start. Reuse the
+        // exact consent token; never refresh it silently after a branch change.
+        for _ in 0..500 {
+            match participant
+                .runtime()?
+                .confirm_group_rejoin(&participant.account_id, &id, &token)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(AppError::AccountWorkerBusy) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(app_error(error)),
+            }
+        }
+        Err(app_error(AppError::AccountWorkerBusy))
     }
 
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {

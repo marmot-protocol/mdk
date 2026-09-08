@@ -410,8 +410,13 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         }
         retry.lookup_attempts = retry.lookup_attempts.saturating_add(1);
+        // Keep fast initial recovery, but leave a sleeping recipient time to
+        // replenish its consumed package without exhausting the durable budget.
+        const RETRY_DELAYS_MS: [u64; 8] = [
+            5_000, 30_000, 120_000, 600_000, 3_600_000, 21_600_000, 86_400_000, 86_400_000,
+        ];
         retry.next_attempt_at_ms = now_ms.saturating_add(
-            (5_000u64 << retry.lookup_attempts.saturating_sub(1).min(4)).min(60_000),
+            RETRY_DELAYS_MS[retry.lookup_attempts.saturating_sub(1).min(7) as usize],
         );
         if retry.lookup_attempts > 8 {
             retry.abandoned = true;

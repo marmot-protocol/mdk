@@ -403,7 +403,6 @@ pub(crate) fn ingest_outcome_event(
             IngestOutcome::TransportDeferred { .. } => Some("transport_deferred".to_string()),
             IngestOutcome::ResourceRefused { resource, .. } => Some(
                 match resource {
-                    InboundResourceLimit::PendingWelcomeCapacity => "pending_welcome_capacity",
                     InboundResourceLimit::TransportDeferredCapacity => {
                         "resource_refused_deferred_capacity"
                     }

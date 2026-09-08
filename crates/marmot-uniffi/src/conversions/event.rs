@@ -232,7 +232,6 @@ fn app_message_invalidation_reason_tag(reason: &AppMessageInvalidationReason) ->
 /// Stable, low-cardinality tag for an [`InboundResourceLimit`].
 fn inbound_resource_limit_tag(resource: &InboundResourceLimit) -> &'static str {
     match resource {
-        InboundResourceLimit::PendingWelcomeCapacity => "pending_welcome_capacity",
         InboundResourceLimit::TransportDeferredCapacity => "transport_deferred_capacity",
         InboundResourceLimit::TransportDeferredRetryBudget => "transport_deferred_retry_budget",
         InboundResourceLimit::TransportDeferredResidenceBudget => {

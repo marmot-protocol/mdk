@@ -117,6 +117,18 @@ impl AppClient {
         for event in &effects.events {
             let group = match event {
                 cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } => Some(group_id),
+                // The warning describes evidence at one local epoch. Advancing
+                // retires that evidence; further failures can arm a new warning.
+                // This never confirms membership or authorizes a rejoin.
+                cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to }
+                    if to > from
+                        && self
+                            .runtime
+                            .group_record(group_id)
+                            .is_ok_and(|group| group.epoch == *to) =>
+                {
+                    Some(group_id)
+                }
                 cgka_traits::engine::GroupEvent::MessageReceived {
                     group_id,
                     sender,
@@ -226,7 +238,7 @@ impl AppClient {
                     vec![]
                 } else {
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        crate::directory::MEMBER_RESOLUTION_DEADLINE,
                         self.app.resolve_fresh_reinvite_key_packages(&members),
                     )
                     .await
@@ -251,10 +263,9 @@ impl AppClient {
                 ))) => {
                     return Err(error.into());
                 }
-                Err(error) => {
+                Err(_) => {
                     tracing::debug!(target: "marmot_app::client", method = "recover_superseded_invites",
                         "fresh invitation recovery remains pending");
-                    let _ = error;
                 }
             }
             break;

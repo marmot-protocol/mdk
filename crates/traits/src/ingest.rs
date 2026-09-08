@@ -107,8 +107,6 @@ pub enum InputRejectionCategory {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboundResourceLimit {
-    /// The bounded replacement-Welcome inbox is full; user decisions free slots.
-    PendingWelcomeCapacity,
     /// The per-group durable transport-deferred row cap is full.
     TransportDeferredCapacity,
     /// A retained transport object exhausted its changed-context retry budget

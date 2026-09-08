@@ -4447,8 +4447,8 @@ MarmotStatus marmot_update_message_retention(const struct MarmotClient *client,
                                              struct MarmotSendSummary **out);
 
 /**
- * Accept a pending group invite; writes the now-confirmed group
- * record. Free with `marmot_app_group_record_free`.
+ * Query advisory membership health and pending rejoin offers.
+ * Free with `marmot_group_recovery_status_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4477,6 +4477,7 @@ MarmotStatus marmot_confirm_group_rejoin(const struct MarmotClient *client,
                                          struct MarmotGroupRecoveryStatus **out);
 
 /**
+ * Decline the selected replacement offer without changing active group state.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -4489,6 +4490,8 @@ MarmotStatus marmot_decline_group_rejoin(const struct MarmotClient *client,
                                          const char *welcome_id_hex);
 
 /**
+ * Accept a pending group invite; writes the now-confirmed group
+ * record. Free with `marmot_app_group_record_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

@@ -788,6 +788,12 @@ async fn run_app_runtime_account_worker(
                                 ))),
                             }
                         }
+                        Some(AccountWorkerCommand::ConfirmGroupRejoin { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                        }
+                        Some(AccountWorkerCommand::DeclineGroupRejoin { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                        }
                         Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) => {
                             // `initial_sync` owns `&mut client`, so the command
                             // cannot start here. Report that fact explicitly
@@ -1820,6 +1826,12 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(Ok(snapshot.quarantined_groups()));
                 }
+                AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
+                AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
                 AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
                     // The pinned sync exclusively owns the live client. This
                     // mutation was definitely not started, so a caller may
@@ -2235,6 +2247,34 @@ async fn handle_startup_hydration_command(
     match command {
         AccountWorkerCommand::GroupRecoveryStatus { group_id, respond } => {
             let _ = respond.send(group_recovery_after_hydration(client, &group_id));
+        }
+        AccountWorkerCommand::ConfirmGroupRejoin {
+            welcome_id,
+            token,
+            respond,
+        } => {
+            let result = client.confirm_group_rejoin(&welcome_id, &token).await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeclineGroupRejoin {
+            welcome_id,
+            respond,
+        } => {
+            let result = client.decline_group_rejoin(&welcome_id);
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            let _ = respond.send(result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
             let _ = client
@@ -4986,6 +5026,66 @@ mod tests {
             kind,
             phase,
         }
+    }
+
+    #[tokio::test]
+    async fn rejoin_decisions_answer_during_startup_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let (events, _) = broadcast::channel(16);
+        let mut deferred = Vec::new();
+        let mut setup = None;
+        let id = cgka_traits::MessageId::new(vec![0x75; 32]);
+        let (respond, mut confirm) = oneshot::channel();
+        handle_startup_hydration_command(
+            &mut client,
+            AccountWorkerCommand::ConfirmGroupRejoin {
+                welcome_id: id.clone(),
+                token: vec![0; 32],
+                respond,
+            },
+            &mut deferred,
+            &events,
+            "",
+            "alice",
+            &mut setup,
+        )
+        .await;
+        assert!(
+            confirm
+                .try_recv()
+                .expect("confirm must answer without deferral")
+                .is_err()
+        );
+        let (respond, mut decline) = oneshot::channel();
+        handle_startup_hydration_command(
+            &mut client,
+            AccountWorkerCommand::DeclineGroupRejoin {
+                welcome_id: id,
+                respond,
+            },
+            &mut deferred,
+            &events,
+            "",
+            "alice",
+            &mut setup,
+        )
+        .await;
+        assert!(
+            decline
+                .try_recv()
+                .expect("decline must answer without deferral")
+                .is_err()
+        );
+        assert!(
+            deferred.is_empty(),
+            "unrelated hydration must not retain rejoin decisions"
+        );
     }
 
     #[test]

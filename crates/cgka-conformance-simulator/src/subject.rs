@@ -2278,7 +2278,6 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         // bound (ledger E9), the same class of observation as a storage failure.
         EngineError::Backend(_)
         | EngineError::Storage(_)
-        | EngineError::PendingWelcomeAtCapacity { .. }
         | EngineError::QueuedOutboundAtCapacity { .. } => SubjectFailureCategory::Resource,
         EngineError::InvalidTransition(_)
         | EngineError::Other(_)
@@ -2376,7 +2375,6 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",
         EngineError::QueuedOutboundAtCapacity { .. } => "queued_outbound_at_capacity",
-        EngineError::PendingWelcomeAtCapacity { .. } => "pending_welcome_at_capacity",
     }
     .into()
 }

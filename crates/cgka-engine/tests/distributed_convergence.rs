@@ -10638,8 +10638,8 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         .unwrap();
     let replacement = welcome_for(&welcomes, b"carol");
     let stale_record = carol_storage.get_group(&group_id).unwrap();
-    // Capacity refusal must neither consume the KeyPackage nor poison dedup;
-    // freeing an offer slot makes this identical transport input retryable.
+    // A full offer inbox retires its oldest offer without pinning the account
+    // cursor or consuming the replacement KeyPackage before consent.
     use cgka_traits::storage::WelcomeStorage;
     let mut filler_ids = Vec::new();
     for n in 0..4u8 {
@@ -10661,16 +10661,18 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     }
     assert!(matches!(
         carol.ingest(replacement.clone()).await.unwrap(),
-        IngestOutcome::ResourceRefused {
-            resource: cgka_traits::ingest::InboundResourceLimit::PendingWelcomeCapacity,
-            ..
+        IngestOutcome::LocalState {
+            state: cgka_traits::ingest::LocalIngestState::RejoinConfirmationRequired,
         }
     ));
-    assert!(carol.last_ingest_left_object_unpersisted());
+    assert!(!carol.last_ingest_left_object_unpersisted());
+    assert_eq!(carol_storage.list_welcomes().unwrap().len(), 4);
+    assert!(
+        carol_storage
+            .has_ingress_dedup_marker(&filler_ids[0])
+            .unwrap()
+    );
     assert_eq!(carol_storage.get_group(&group_id).unwrap(), stale_record);
-    for id in filler_ids {
-        carol_storage.take_welcome(&id).unwrap();
-    }
     assert!(matches!(
         carol.join_welcome(replacement.clone()).await,
         Err(cgka_traits::EngineError::InvalidTransition(_))
@@ -10680,7 +10682,12 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         stale_record,
         "an offer is not consent"
     );
-    let offer = carol.pending_group_rejoins().unwrap().remove(0);
+    let offer = carol
+        .pending_group_rejoins()
+        .unwrap()
+        .into_iter()
+        .find(|offer| offer.message_id == replacement.id)
+        .unwrap();
     let token = offer.rejoin.unwrap().local_state_token;
     assert!(
         carol
@@ -10709,7 +10716,9 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     let token = carol
         .pending_group_rejoins()
         .unwrap()
-        .remove(0)
+        .into_iter()
+        .find(|offer| offer.message_id == replacement.id)
+        .unwrap()
         .rejoin
         .unwrap()
         .local_state_token;
@@ -10726,6 +10735,12 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
         "explicit rejoin preserves the existing local message history"
     );
     assert!(carol.pending_group_rejoins().unwrap().is_empty());
+    for id in filler_ids {
+        assert!(
+            carol_storage.has_ingress_dedup_marker(&id).unwrap(),
+            "confirmation terminally retires sibling offers as well as the selected one"
+        );
+    }
     assert_eq!(
         carol.members(&group_id).unwrap(),
         winner.members(&group_id).unwrap()
@@ -10805,6 +10820,10 @@ async fn reinvite_lookup_budget_and_pacing_survive_restart() {
         assert!(retry.next_attempt_at_ms > now);
         now = retry.next_attempt_at_ms;
     }
+    assert!(
+        now > 48 * 60 * 60 * 1_000,
+        "eight attempts must leave sleeping recipients more than two days to replenish material"
+    );
     assert!(!client.reserve_reinvite_lookup(&commit_id, now).unwrap());
     drop(client);
     let mut client = build_client_with_storage(b"reinvite-budget", storage);

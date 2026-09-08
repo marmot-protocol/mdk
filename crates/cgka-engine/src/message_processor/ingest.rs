@@ -272,13 +272,6 @@ impl<S: StorageProvider> Engine<S> {
                     category: InputRejectionCategory::Duplicate,
                 })
             }
-            Err(EngineError::PendingWelcomeAtCapacity { group_id }) => {
-                self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
-                Ok(IngestOutcome::ResourceRefused {
-                    group_id,
-                    resource: cgka_traits::ingest::InboundResourceLimit::PendingWelcomeCapacity,
-                })
-            }
             Err(EngineError::InvalidTransition(error)) => {
                 // The offer may have arrived under another transport wrapper.
                 // It owns the content but must remain eligible for ordinary

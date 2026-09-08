@@ -5027,6 +5027,23 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
         .expect("accept must answer promptly while catch-up is pinned")
         .expect_err("accept cannot start while catch-up owns the account client");
         assert!(matches!(accept_error, AppError::AccountWorkerBusy));
+        let unknown_offer = cgka_traits::MessageId::new(vec![0x75; 32]);
+        let confirm_error = tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.confirm_group_rejoin("bob", &unknown_offer, &[0; 32]),
+        )
+        .await
+        .expect("confirm must answer promptly during catch-up")
+        .expect_err("confirm must not start during catch-up");
+        assert!(matches!(confirm_error, AppError::AccountWorkerBusy));
+        let decline_error = tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.decline_group_rejoin("bob", &unknown_offer),
+        )
+        .await
+        .expect("decline must answer promptly during catch-up")
+        .expect_err("decline must not start during catch-up");
+        assert!(matches!(decline_error, AppError::AccountWorkerBusy));
         assert!(
             app.group("bob", &group_id_hex)
                 .unwrap()

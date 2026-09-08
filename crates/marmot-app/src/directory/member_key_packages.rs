@@ -37,7 +37,7 @@ const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
 // Three network stages, each with a bounded single-author retry, can each
 // consume a 5s connection budget plus a 3s fetch budget. Keep enough time for
 // those stages and local validation while retaining one overall deadline.
-const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
+pub(crate) const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
 const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
