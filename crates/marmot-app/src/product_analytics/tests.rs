@@ -1032,6 +1032,13 @@ async fn unreadable_optional_consent_does_not_abort_runtime_start() {
         DiagnosticsExporterStatus::Disabled
     );
     assert!(runtime.usage_diagnostics_settings().is_err());
+    assert!(
+        runtime
+            .set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig::default())
+            .is_err(),
+        "explicit reconfiguration must report the unreadable consent record"
+    );
+    assert!(app.usage_diagnostics_permit().is_err());
     runtime.shutdown_and_close().await.unwrap();
 }
 

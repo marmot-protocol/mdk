@@ -238,28 +238,27 @@ impl MarmotApp {
             "relay_list",
             crate::ProductUnit::Attempt,
         );
-        let mut source = "network";
         let result = self
             .fetch_current_account_relay_list_status_for_account_id_unobserved(
                 account_id_hex,
                 bootstrap_relays,
                 required_list_kind,
-                &mut source,
             )
             .await;
         if let Some(observation) = observation {
             observation.directory_sample(
                 match &result {
-                    Ok(Some(_)) => "success",
-                    Ok(None) => "empty",
+                    Ok((Some(_), _)) => "success",
+                    Ok((None, _)) => "empty",
                     Err(_) => "failure",
                 },
-                source,
+                // Failed fetches have no result provenance; classify the network attempt.
+                result.as_ref().map_or("network", |(_, source)| *source),
                 1,
             );
             observation.discard();
         }
-        result
+        result.map(|(status, _)| status)
     }
 
     async fn fetch_current_account_relay_list_status_for_account_id_unobserved(
@@ -267,8 +266,7 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
         required_list_kind: Option<&str>,
-        source: &mut &'static str,
-    ) -> Result<Option<AccountRelayListStatus>, AppError> {
+    ) -> Result<(Option<AccountRelayListStatus>, &'static str), AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let account_id_hex = public_key.to_hex();
@@ -309,7 +307,7 @@ impl MarmotApp {
             None => observed_nip65 || observed_inbox,
         };
         if !has_required_list {
-            return Ok(None);
+            return Ok((None, "network"));
         }
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
@@ -319,15 +317,17 @@ impl MarmotApp {
             blocking_app_task(move || app.account_relay_list_status_for_account_id(&account_id))
                 .await?
         };
-        if (!observed_nip65 && cached.nip65.created_at > 0)
+        let source = if (!observed_nip65 && cached.nip65.created_at > 0)
             || (!observed_inbox && cached.inbox.created_at > 0)
             || cached
                 .bootstrap_relays
                 .iter()
                 .any(|relay| !status.bootstrap_relays.contains(relay))
         {
-            *source = "mixed";
-        }
+            "mixed"
+        } else {
+            "network"
+        };
         if !observed_nip65 {
             status.nip65 = cached.nip65;
         }
@@ -349,7 +349,7 @@ impl MarmotApp {
             blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
                 .await?;
         }
-        Ok(Some(status))
+        Ok((Some(status), source))
     }
 
     /// Fetch the account's own current published kind:0 profile metadata from
@@ -435,13 +435,8 @@ impl MarmotApp {
             "key_package",
             crate::ProductUnit::Attempt,
         );
-        let mut source = "network";
         let result = self
-            .fetch_latest_key_package_for_account_id_unobserved(
-                account_id_hex,
-                bootstrap_relays,
-                &mut source,
-            )
+            .fetch_latest_key_package_for_account_id_unobserved(account_id_hex, bootstrap_relays)
             .await;
         if let Some(observation) = observation {
             observation.directory_sample(
@@ -451,20 +446,20 @@ impl MarmotApp {
                     Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
                     Err(_) => "failure",
                 },
-                source,
+                // Failed fetches have no result provenance; classify the network attempt.
+                result.as_ref().map_or("network", |(_, source)| *source),
                 1,
             );
             observation.discard();
         }
-        result
+        result.map(|(fetched, _)| fetched)
     }
 
     async fn fetch_latest_key_package_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
-        source: &mut &'static str,
-    ) -> Result<FetchedKeyPackage, AppError> {
+    ) -> Result<(FetchedKeyPackage, &'static str), AppError> {
         // Normalize the identifier to canonical hex up front. The relay *queries*
         // below re-parse internally, but the KeyPackage record filter compares
         // `event.pubkey` (always hex) against this string verbatim — so an npub
@@ -534,16 +529,15 @@ impl MarmotApp {
         )?;
         let from_cache = selection.value.is_none();
         let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;
-        if from_cache {
-            *source = "cache";
-        }
+        // Without a fresh selection, only a successful cache fallback reaches this point.
+        let source = if from_cache { "cache" } else { "network" };
         fetched.relay_lists = relay_lists;
         {
             let app = self.clone();
             let remembered = fetched.clone();
             blocking_app_task(move || app.remember_directory_key_package(&remembered)).await?;
         }
-        Ok(fetched)
+        Ok((fetched, source))
     }
 
     pub async fn refresh_directory_entry_for_account_id(

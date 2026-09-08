@@ -220,8 +220,11 @@ runner, while the storage-open measurement covers the surrounding open operation
 ### Optional exporter lifecycle
 
 An unreadable consent record disables diagnostics and is reported by explicit
-settings reads; it does not prevent the app runtime from starting. Synchronous
-host setters restart exporters on the executor captured during runtime startup.
+settings reads; it does not prevent the app runtime from starting. Explicit
+configuration updates still return the consent-read error and keep delivery
+disabled, so hosts can surface the failed reconfiguration. Synchronous host
+setters restart exporters on the executor captured during runtime startup. If
+that executor is unavailable, exporters stay stopped and log a fixed warning.
 The legacy telemetry settings getter reports the effective in-memory export
 state, so an unstarted instance reports export disabled. Read the combined
 consent settings to inspect the saved decision before starting the runtime.

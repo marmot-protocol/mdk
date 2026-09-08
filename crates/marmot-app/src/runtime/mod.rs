@@ -428,6 +428,22 @@ impl RuntimeSharedServices {
         self.lifecycle.clone()
     }
 
+    fn diagnostics_executor(&self) -> Option<tokio::runtime::Handle> {
+        let executor = self
+            .diagnostics_executor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if executor.is_none() {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "diagnostics_executor",
+                "diagnostics executor unavailable; exporter not started"
+            );
+        }
+        executor
+    }
+
     fn configure_relay_telemetry_exporter(&self, config: RelayTelemetryExportConfig) {
         self.stop_relay_telemetry_exporter();
         #[cfg(feature = "otlp-export")]
@@ -435,15 +451,12 @@ impl RuntimeSharedServices {
             let Some(permit) = self.product_analytics.permit() else {
                 return;
             };
+            let Some(executor) = self.diagnostics_executor() else {
+                return;
+            };
             if let Some(exporter) = self.relay_plane.telemetry_exporter(config, permit) {
                 let shutdown = self.lifecycle.subscribe_shutdown();
                 let app_performance_telemetry = self.app_performance_telemetry.clone();
-                let executor = self
-                    .diagnostics_executor
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-                    .expect("running runtime captured its diagnostics executor");
                 let handle = executor
                     .spawn(exporter.run_with_app_performance(shutdown, app_performance_telemetry));
                 *self
@@ -2366,13 +2379,9 @@ impl MarmotAppRuntime {
         }
         if self.shared.lifecycle().is_running() && self.shared.product_analytics.permit().is_some()
         {
-            let executor = self
-                .shared
-                .diagnostics_executor
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .expect("running runtime captured its diagnostics executor");
+            let Some(executor) = self.shared.diagnostics_executor() else {
+                return;
+            };
             *worker = Some(
                 executor.spawn(
                     self.shared
@@ -2405,6 +2414,9 @@ impl MarmotAppRuntime {
         Ok(())
     }
 
+    /// Update the in-memory product configuration and refresh consent/exporters.
+    /// On a running runtime, unreadable consent is returned as an error and
+    /// delivery stays disabled; optional startup's error suppression does not apply.
     pub fn set_product_analytics_runtime_config(
         &self,
         mut config: crate::ProductAnalyticsRuntimeConfig,

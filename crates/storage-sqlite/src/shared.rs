@@ -76,13 +76,24 @@ pub struct StoredUsageDiagnosticsSettings {
 
 impl SqliteSharedStorage {
     pub fn usage_diagnostics_settings(&self) -> StorageResult<StoredUsageDiagnosticsSettings> {
-        self.lock()?.query_row_cached(
-            "SELECT decision, policy_revision, registry_revision, scope_revision, updated_at_ms, previously_enabled FROM usage_diagnostics_settings WHERE id = 1", [],
-            |r| Ok(StoredUsageDiagnosticsSettings {
-                decision: r.get(0)?, policy_revision: r.get(1)?, registry_revision: r.get(2)?,
-                scope_revision: r.get(3)?, updated_at_ms: r.get(4)?, previously_enabled: r.get(5)?,
-            }),
-        ).storage()
+        self.lock()?
+            .query_row_cached(
+                "SELECT decision, policy_revision, registry_revision, scope_revision,
+                        updated_at_ms, previously_enabled
+                 FROM usage_diagnostics_settings WHERE id = 1",
+                [],
+                |r| {
+                    Ok(StoredUsageDiagnosticsSettings {
+                        decision: r.get(0)?,
+                        policy_revision: r.get(1)?,
+                        registry_revision: r.get(2)?,
+                        scope_revision: r.get(3)?,
+                        updated_at_ms: r.get(4)?,
+                        previously_enabled: r.get(5)?,
+                    })
+                },
+            )
+            .storage()
     }
 
     /// Consent and diagnostic identity change in one transaction. No key is stored here.
@@ -96,11 +107,28 @@ impl SqliteSharedStorage {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
-            tx.execute("UPDATE usage_diagnostics_settings SET decision=?1, policy_revision=?2, registry_revision=?3, scope_revision=?4, updated_at_ms=?5 WHERE id=1",
-                params![settings.decision, settings.policy_revision, settings.registry_revision, settings.scope_revision, settings.updated_at_ms]).storage()?;
+            tx.execute(
+                "UPDATE usage_diagnostics_settings
+                 SET decision=?1, policy_revision=?2, registry_revision=?3,
+                     scope_revision=?4, updated_at_ms=?5
+                 WHERE id=1",
+                params![
+                    settings.decision,
+                    settings.policy_revision,
+                    settings.registry_revision,
+                    settings.scope_revision,
+                    settings.updated_at_ms
+                ],
+            )
+            .storage()?;
             tx.execute("DELETE FROM telemetry_install", []).storage()?;
             if let Some(id) = install_id {
-                tx.execute("INSERT INTO telemetry_install (id, install_id, updated_at_ms) VALUES (1, ?1, ?2)", params![id, settings.updated_at_ms]).storage()?;
+                tx.execute(
+                    "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
+                     VALUES (1, ?1, ?2)",
+                    params![id, settings.updated_at_ms],
+                )
+                .storage()?;
             }
             tx.commit().storage()
         })
