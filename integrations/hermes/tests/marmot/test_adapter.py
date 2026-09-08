@@ -6388,7 +6388,7 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter_module = load_adapter_module()
 
-    def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
+    async def test_register_exposes_status_history_and_reactions_as_platform_tools(self):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
@@ -6409,6 +6409,15 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["schema"]["properties"], {})
         self.assertTrue(callable(status["handler"]))
         self.assertTrue(status["is_async"])
+        status_result = json.loads(
+            await status["handler"](
+                {},
+                task_id="status-task",
+                session_id="status-session",
+                user_task="status-user-task",
+            )
+        )
+        self.assertIn("state", status_result)
         history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
         self.assertEqual(history["toolset"], "platform")
         self.assertEqual(history["schema"]["required"], ["group_id_hex"])

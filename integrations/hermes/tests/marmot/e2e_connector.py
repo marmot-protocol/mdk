@@ -55,22 +55,39 @@ def register_marmot_platform(module) -> None:
     )
 
 
-async def read_stream_tail(stream: asyncio.StreamReader | None) -> str:
+async def drain_stream_tail(
+    stream: asyncio.StreamReader | None,
+    tail: bytearray,
+    *,
+    max_bytes: int = 65536,
+) -> None:
+    """Continuously drain a child stream while retaining a bounded tail."""
+
     if stream is None:
-        return ""
-    try:
-        data = await asyncio.wait_for(stream.read(), timeout=1.0)
-    except asyncio.TimeoutError:
-        return ""
-    return data.decode("utf-8", errors="replace")
+        return
+    while chunk := await stream.read(4096):
+        tail.extend(chunk)
+        if len(tail) > max_bytes:
+            del tail[:-max_bytes]
 
 
-async def wait_for_connector(socket_path: Path, client, proc: asyncio.subprocess.Process) -> None:
+def decode_stream_tail(tail: bytearray) -> str:
+    return bytes(tail).decode("utf-8", errors="replace")
+
+
+async def wait_for_connector(
+    socket_path: Path,
+    client,
+    proc: asyncio.subprocess.Process,
+    stderr_tail: bytearray,
+) -> None:
     deadline = asyncio.get_running_loop().time() + CONNECTOR_START_TIMEOUT_SECONDS
     while asyncio.get_running_loop().time() < deadline:
         if proc.returncode is not None:
-            stderr = await read_stream_tail(proc.stderr)
-            raise RuntimeError(f"wn-agent exited before socket was ready:\n{stderr}")
+            raise RuntimeError(
+                "wn-agent exited before socket was ready:\n"
+                f"{decode_stream_tail(stderr_tail)}"
+            )
         try:
             await client.request({"type": "debug_recorded_finals"}, request_id=uuid.uuid4().hex)
             return
@@ -149,15 +166,17 @@ async def run() -> None:
             str(socket_path),
             "--debug-controls",
             cwd=str(mdk_repo),
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
+        stderr_tail = bytearray()
+        stderr_task = asyncio.create_task(drain_stream_tail(proc.stderr, stderr_tail))
         prior_socket = os.environ.get("MARMOT_AGENT_SOCKET")
         os.environ["MARMOT_AGENT_SOCKET"] = str(socket_path)
         adapter = None
         try:
             client = module.MarmotAgentControlClient(socket_path, request_timeout=5.0)
-            await wait_for_connector(socket_path, client, proc)
+            await wait_for_connector(socket_path, client, proc, stderr_tail)
 
             config = PlatformConfig(
                 enabled=True,
@@ -198,6 +217,7 @@ async def run() -> None:
             else:
                 os.environ["MARMOT_AGENT_SOCKET"] = prior_socket
             await stop_process(proc)
+            await stderr_task
 
     print("deterministic Hermes/Marmot connector E2E passed")
     print(f"socket: {socket_path}")

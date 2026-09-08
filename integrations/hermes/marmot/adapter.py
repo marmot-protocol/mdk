@@ -4090,8 +4090,12 @@ def register(ctx):
     def enablement_seed():
         return _enablement_seed(plugin_settings)
 
-    async def status_handler(args):
-        return await _marmot_status_tool(args, effective_config=effective)
+    async def status_handler(args, **kwargs):
+        return await _marmot_status_tool(
+            args,
+            effective_config=effective,
+            **kwargs,
+        )
 
     async def standalone_sender(
         config,
