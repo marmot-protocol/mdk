@@ -48,10 +48,160 @@ impl Marmot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversions::PresentationTextFfi;
+    use crate::conversions::{
+        PresentationResolutionFfi, PresentationSourceFfi, PresentationTextFfi, SelectedAvatarFfi,
+    };
     use cgka_traits::TransportEndpoint;
     use marmot_app::{AccountSetupRequest, MarmotApp};
     use nostr_relay_builder::MockRelay;
+
+    #[tokio::test]
+    async fn presented_peer_and_fallback_survive_native_offline_reopen() {
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relays(dir.path(), vec![relay_url.clone()]);
+        let kit = Marmot {
+            runtime: app.runtime(),
+            app,
+        };
+        let request = || AccountSetupRequest {
+            default_relays: vec![TransportEndpoint(relay_url.clone())],
+            bootstrap_relays: vec![TransportEndpoint(relay_url.clone())],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..Default::default()
+        };
+        let alice = kit
+            .runtime
+            .create_identity(request())
+            .await
+            .unwrap()
+            .account
+            .account_id_hex;
+        let bob = kit
+            .runtime
+            .create_identity(request())
+            .await
+            .unwrap()
+            .account
+            .account_id_hex;
+        kit.runtime
+            .publish_user_profile(
+                &bob,
+                marmot_app::UserProfileMetadata {
+                    display_name: Some("Cached peer".into()),
+                    picture: Some("https://example.com/peer.png".into()),
+                    ..Default::default()
+                },
+                marmot_app::AccountRelayListBootstrap::new(
+                    vec![TransportEndpoint(relay_url.clone())],
+                    vec![TransportEndpoint(relay_url.clone())],
+                ),
+            )
+            .await
+            .unwrap();
+        kit.refresh_profile(bob.clone(), vec![relay_url.clone()])
+            .await
+            .unwrap();
+        let direct = kit
+            .create_group(alice.clone(), String::new(), vec![bob.clone()], None)
+            .await
+            .unwrap();
+        let named = kit
+            .create_group(alice.clone(), "Custom pair".into(), vec![bob.clone()], None)
+            .await
+            .unwrap();
+        let fallback = kit
+            .create_group(alice.clone(), String::new(), vec![], None)
+            .await
+            .unwrap();
+        kit.runtime.shutdown_and_close().await.unwrap();
+        drop(kit);
+        drop(relay);
+
+        // No runtime workers or relay are started on reopen: this is the cached first read.
+        let app = MarmotApp::with_relays(dir.path(), vec![relay_url]);
+        let kit = Marmot {
+            runtime: app.runtime(),
+            app,
+        };
+        let list = kit.presented_chat_list(alice.clone(), false).await.unwrap();
+        assert_eq!(list.rows.len(), 3);
+        let peer = &list
+            .rows
+            .iter()
+            .find(|r| r.row.group_id_hex == direct)
+            .unwrap()
+            .presentation;
+        assert!(
+            matches!(&peer.title, PresentationTextFfi::Literal { text } if text == "Cached peer")
+        );
+        assert_eq!(peer.peer_id.as_deref(), Some(bob.as_str()));
+        assert!(matches!(
+            peer.title_source,
+            PresentationSourceFfi::PeerProfile
+        ));
+        assert!(matches!(
+            peer.avatar_source,
+            PresentationSourceFfi::PeerProfile
+        ));
+        assert!(matches!(peer.resolution, PresentationResolutionFfi::Cached));
+        let SelectedAvatarFfi::RemoteImage { url, cache_key } = &peer.avatar else {
+            panic!("cached peer avatar descriptor");
+        };
+        assert_eq!(url, "https://example.com/peer.png");
+        assert_eq!(cache_key.len(), 64);
+        let key = cache_key.clone();
+        let pair = kit
+            .presented_chat_list_row(alice.clone(), named)
+            .await
+            .unwrap()
+            .unwrap()
+            .presentation;
+        assert!(
+            matches!(&pair.title, PresentationTextFfi::Literal { text } if text == "Custom pair")
+        );
+        assert!(matches!(pair.title_source, PresentationSourceFfi::Group));
+        assert!(matches!(
+            pair.avatar_source,
+            PresentationSourceFfi::PeerProfile
+        ));
+        assert_eq!(pair.peer_id.as_deref(), Some(bob.as_str()));
+        let empty = &list
+            .rows
+            .iter()
+            .find(|r| r.row.group_id_hex == fallback)
+            .unwrap()
+            .presentation;
+        assert!(matches!(
+            empty.title,
+            PresentationTextFfi::UnnamedGroup {
+                member_count: Some(1)
+            }
+        ));
+        assert!(matches!(
+            empty.resolution,
+            PresentationResolutionFfi::Fallback
+        ));
+        assert!(empty.peer_id.is_none());
+        assert!(
+            matches!(&empty.avatar, SelectedAvatarFfi::Placeholder { stable_seed, source: PresentationSourceFfi::GroupFallback } if !stable_seed.is_empty())
+        );
+        let sub = kit.open_presented_chat_list(alice, false).await.unwrap();
+        let attached = sub.snapshot().unwrap();
+        let peer = &attached
+            .snapshot
+            .rows
+            .iter()
+            .find(|r| r.row.group_id_hex == direct)
+            .unwrap()
+            .presentation;
+        assert!(
+            matches!(&peer.avatar, SelectedAvatarFfi::RemoteImage { cache_key, .. } if cache_key == &key)
+        );
+        kit.runtime.shutdown_and_close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn presented_contract_round_trips_snapshot_and_updates_to_native() {

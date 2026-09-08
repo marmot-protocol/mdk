@@ -44,6 +44,9 @@ impl RuntimePresentedChatListSubscription {
     pub async fn recv(&mut self) -> Result<Option<PresentedChatListUpdate>, AppError> {
         loop {
             if self.dirty {
+                // These payloads are invalidations, not deltas to apply. The upcoming read
+                // includes all committed changes already queued and cancellation keeps dirty.
+                self.legacy.discard_pending_invalidations();
                 let snapshot = tokio::select! {
                     biased;
                     _ = wait_for_runtime_shutdown(&mut self.stopping) => return Ok(None),
@@ -218,7 +221,10 @@ async fn prepared_snapshot(
         if let Some(snapshot) = snapshot {
             return Ok(snapshot);
         }
-        tokio::task::yield_now().await;
+        // First-use preparation shares CAS-protected batches with the account worker.
+        // Pace retries (including lost CAS attempts) instead of immediately contending
+        // for the same connection again. Ready reads never enter this delay.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -253,6 +259,47 @@ mod tests {
     use marmot_account::AccountHome;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn dropping_legacy_list_releases_pump_and_expired_mutes_read_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("Muted", &[]).await.unwrap();
+        let id = hex::encode(group.as_slice());
+        let runtime = MarmotAppRuntime::new(app.clone());
+        runtime.set_chat_muted("alice", &id, None).unwrap();
+        let before = runtime.events.receiver_count();
+        let sub = runtime.subscribe_chat_list("alice", false).await.unwrap();
+        assert!(sub.snapshot[0].muted);
+        assert_eq!(runtime.events.receiver_count(), before + 1);
+        drop(sub);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.events.receiver_count() != before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the handle must release the idle pump without another event");
+        // Install an already-expired preference directly: there is no pump to refresh
+        // the materialized row. Read-time derivation must still unmute it correctly.
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .set_chat_muted(&id, Some(crate::notifications::unix_now_ms() - 1))
+            .unwrap();
+        let row = runtime
+            .presented_chat_list_row("alice", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.row.muted);
+        assert!(row.row.muted_until_ms.is_none());
+        runtime.shutdown_and_close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn presented_preparation_observes_worker_progress_and_reports_stalled_work() {

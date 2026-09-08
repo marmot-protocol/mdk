@@ -830,7 +830,6 @@ c_cmd! {
     /// Keyed complete row; missing groups return NULL. Free with marmot_presented_chat_row_free.
     async fn marmot_presented_chat_list_row(account_ref: str, group_id_hex: str) -> opt_rec(MarmotPresentedChatRow) = presented_chat_list_row;
 
-
     /// Initialize read state for a conversation being opened; writes the
     /// refreshed row, or NULL with `MARMOT_STATUS_OK` when the group has
     /// no row. Free with `marmot_chat_list_row_free`.

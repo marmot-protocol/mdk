@@ -715,6 +715,16 @@ fn change_advances_chat_list(
 }
 
 impl RuntimeChatListSubscription {
+    /// Used only when the caller will replace its entire list from current storage.
+    /// Drain the queue as it stood at entry, so continuous producers cannot starve the read.
+    pub(super) fn discard_pending_invalidations(&mut self) {
+        for _ in 0..self.updates.len() {
+            if self.updates.try_recv().is_err() {
+                break;
+            }
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<RuntimeChatListUpdate> {
         tokio::select! {
             update = self.updates.recv() => update,
@@ -2028,4 +2038,39 @@ pub(crate) async fn send_atomic_chat_list_snapshot(
         .send(RuntimeChatListUpdate::Snapshot { trigger, rows })
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod presented_invalidation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replacement_read_discards_queued_invalidations_but_keeps_future_updates() {
+        let (tx, rx) = mpsc::channel(8);
+        let (_stopping, stopping) = watch::channel(false);
+        let mut sub = RuntimeChatListSubscription {
+            snapshot: vec![],
+            updates: rx,
+            stopping,
+        };
+        for id in ["01", "02", "03"] {
+            tx.send(RuntimeChatListUpdate::RemoveRow {
+                trigger: ChatListUpdateTrigger::SnapshotRefresh,
+                group_id_hex: id.into(),
+            })
+            .await
+            .unwrap();
+        }
+        sub.discard_pending_invalidations();
+        assert!(sub.updates.is_empty());
+        tx.send(RuntimeChatListUpdate::RemoveRow {
+            trigger: ChatListUpdateTrigger::SnapshotRefresh,
+            group_id_hex: "04".into(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(sub.recv().await, Some(RuntimeChatListUpdate::RemoveRow { group_id_hex, .. }) if group_id_hex == "04")
+        );
+    }
 }

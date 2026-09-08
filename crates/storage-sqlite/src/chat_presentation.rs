@@ -553,6 +553,10 @@ impl SqliteAccountStorage {
         group: Option<&str>,
     ) -> StorageResult<Option<PresentedChatListSnapshot>> {
         let conn = self.lock()?;
+        // Keep this guard until the read transaction ends and use only `tx` below:
+        // never release/reacquire the account lock or call another storage method here.
+        // A deferred read snapshot avoids with_transaction's BEGIN IMMEDIATE write
+        // reservation, while the guard excludes interleaving users of this connection.
         let tx = conn.unchecked_transaction().storage()?;
         let pending: bool = match group {
             Some(group) => tx.query_row(

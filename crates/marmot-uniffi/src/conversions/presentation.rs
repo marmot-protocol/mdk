@@ -180,3 +180,59 @@ impl From<app::PresentedChatListUpdate> for PresentedChatListUpdateFfi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_and_encrypted_last_known_presentation_preserve_native_fields() {
+        let value = ConversationPresentationFfi::from(app::ConversationPresentation {
+            title: app::PresentationText::UnavailableConversation,
+            avatar: app::SelectedAvatar::EncryptedGroupImage {
+                image: app::ChatListAvatar {
+                    image_hash_hex: "11".repeat(32),
+                    image_key_hex: "22".repeat(32),
+                    image_nonce_hex: "33".repeat(12),
+                    image_upload_key_hex: "44".repeat(32),
+                    media_type: Some("image/png".into()),
+                },
+                cache_key: "encrypted-cache-key".into(),
+            },
+            title_source: app::PresentationSource::UnknownFallback,
+            avatar_source: app::PresentationSource::Group,
+            peer_id: None,
+            resolution: app::PresentationResolution::LastKnown,
+        });
+        assert!(matches!(
+            value.title,
+            PresentationTextFfi::UnavailableConversation
+        ));
+        assert!(matches!(
+            value.title_source,
+            PresentationSourceFfi::UnknownFallback
+        ));
+        assert!(matches!(value.avatar_source, PresentationSourceFfi::Group));
+        assert!(matches!(
+            value.resolution,
+            PresentationResolutionFfi::LastKnown
+        ));
+        assert!(value.peer_id.is_none());
+        let SelectedAvatarFfi::EncryptedGroupImage { image, cache_key } = value.avatar else {
+            panic!("encrypted descriptor must retain its native variant");
+        };
+        assert_eq!(cache_key, "encrypted-cache-key");
+        assert_eq!(image.image_hash_hex, "11".repeat(32));
+        assert_eq!(image.image_key_hex, "22".repeat(32));
+        assert_eq!(image.image_nonce_hex, "33".repeat(12));
+        assert_eq!(image.image_upload_key_hex, "44".repeat(32));
+        assert_eq!(image.media_type.as_deref(), Some("image/png"));
+        let peer = SelectedAvatarFfi::from(app::SelectedAvatar::Placeholder {
+            stable_seed: "peer-seed".into(),
+            source: app::PresentationSource::PeerFallback,
+        });
+        assert!(
+            matches!(peer, SelectedAvatarFfi::Placeholder { stable_seed, source: PresentationSourceFfi::PeerFallback } if stable_seed == "peer-seed")
+        );
+    }
+}
