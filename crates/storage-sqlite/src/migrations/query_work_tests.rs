@@ -381,9 +381,11 @@ fn query_indexes_upgrade() {
     .collect();
     let contents = |conn: &rusqlite::Connection| {
         let mut rows = Vec::new();
-        for (table, columns) in &tables {
+        for (table, column_names) in &tables {
             let mut stmt = conn
-                .prepare(&format!("SELECT {columns} FROM {table} ORDER BY rowid"))
+                .prepare(&format!(
+                    "SELECT {column_names} FROM {table} ORDER BY rowid"
+                ))
                 .unwrap();
             let columns = stmt.column_count();
             rows.extend(

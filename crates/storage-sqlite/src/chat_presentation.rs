@@ -111,8 +111,12 @@ pub enum ChatPresentationRead {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatPresentationWrite {
+    /// Durable row/dependency/progress work committed; the selected value may be identical.
+    /// Compare `chat_presentation_version()` to decide whether a notification is needed.
     Applied,
+    /// The same value and source revision were already committed; no write was needed.
     Unchanged,
+    /// The captured source/store/row or profile revision no longer permits this write.
     Stale,
 }
 #[derive(Serialize, Deserialize)]
@@ -371,7 +375,9 @@ impl SqliteAccountStorage {
                 return Ok(ChatPresentationWrite::Unchanged);
             }
             // Strict reads expose a redacted decode error, but a valid current-generation
-            // write can repair this derived cache. Schema migrations own format transitions.
+            // write can repair this derived cache. Format transitions MUST advance the account
+            // schema: its open-time compatibility gate prevents older binaries from reaching
+            // newer-format rows. An unknown envelope within a supported schema is repairable.
             let old = existing
                 .as_deref()
                 .and_then(|bytes| decode_envelope(bytes).ok());

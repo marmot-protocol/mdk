@@ -229,9 +229,14 @@ it, and each read returns at most 50. This avoids skipping newly inserted or inv
 Ordinary reads distinguish missing, pending and ready without repair writes. Profile bookkeeping alone does not advance
 the selected-presentation notification revision. Same-subject name/image changes keep the committed value and
 dependencies renderable as `LastKnown` until refresh; membership changes clear invalid old-subject display immediately.
+Explicit name/image removal also clears the selected value immediately, including the canonical absent avatar
+component and component deletion. Replacement keeps last-known display; removal must not expose the removed source.
 The read-time freshness annotation does not itself advance the committed-value revision, and identical recomputation
 does not notify. Corrupt/unsupported envelopes return redacted read errors but a current-generation write can replace
-them. Future format changes must migrate or invalidate old envelopes, rather than relying on a decode failure to queue work.
+them. Future format changes must advance the account schema and migrate or invalidate old envelopes; the schema
+compatibility gate prevents an older binary from opening those newer-format rows. Decode failure alone does not queue work.
+`ChatPresentationWrite::Applied` reports committed row/dependency/progress work, including an identical refresh;
+notifications use the committed presentation revision rather than this write result.
 
 P1 seeds only roster evidence already available in the direct-member index. P2 must supply authoritative two-person
 rosters for named groups too before draining backfill, wire every source mutation, and run bounded hydration/catch-up

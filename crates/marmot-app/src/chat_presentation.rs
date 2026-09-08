@@ -126,9 +126,7 @@ pub(crate) fn select_chat_presentation(
             },
             PresentationSource::Group,
         )
-    } else if let Some(url) = input.avatar_url.as_deref().and_then(|raw| {
-        cgka_traits::app_components::validate_and_normalize_group_avatar_url(raw).ok()
-    }) {
+    } else if let Some(url) = input.avatar_url.as_deref().and_then(safe_image_url) {
         (
             SelectedAvatar::RemoteImage {
                 cache_key: key(&input.group_id_hex, "group-url", &[&url]),
@@ -209,7 +207,7 @@ fn safe_name(raw: &str) -> Option<String> {
 fn safe_image_url(raw: &str) -> Option<String> {
     let normalized =
         cgka_traits::app_components::validate_and_normalize_group_avatar_url(raw).ok()?;
-    // Also match the existing profile-image loader's contact/port policy, without DNS or I/O.
+    // Both remote-image sources match the existing loader's contact/port policy, without DNS or I/O.
     crate::media::parse_profile_image_fetch_url(&normalized)
         .ok()
         .map(|url| url.to_string())
@@ -220,16 +218,18 @@ mod tests {
     use super::*;
     use storage_sqlite::{ChatListAvatar, ChatPresentationVersion};
     #[test]
-    fn peer_images_use_the_shared_usable_https_policy() {
+    fn remote_images_use_the_same_usable_https_policy_for_group_and_peer() {
         for picture in [
             "http://example.com/avatar".to_owned(),
             "https://example.com/avatar#fragment".to_owned(),
             "https://example.com:8443/avatar".to_owned(),
             "https://user:pass@example.com/avatar".to_owned(),
+            "https://10.0.0.5/avatar".to_owned(),
+            "https://127.0.0.1/avatar".to_owned(),
             format!("https://example.com/{}", "a".repeat(2048)),
         ] {
             let profile = UserProfileMetadata {
-                picture: Some(picture),
+                picture: Some(picture.clone()),
                 ..Default::default()
             };
             assert!(matches!(
@@ -239,6 +239,12 @@ mod tests {
                     Some((&"bb".repeat(32), &profile))
                 )
                 .avatar,
+                SelectedAvatar::Placeholder { .. }
+            ));
+            let mut group_input = input("");
+            group_input.avatar_url = Some(picture);
+            assert!(matches!(
+                select_chat_presentation(&group_input, &"aa".repeat(32), None).avatar,
                 SelectedAvatar::Placeholder { .. }
             ));
         }

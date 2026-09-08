@@ -363,9 +363,12 @@ fn same_subject_source_changes_reopen_as_last_known_and_identical_repair_does_no
     assert_eq!(store.chat_presentation_version().unwrap(), version);
     let pending = store.pending_chat_presentation_inputs().unwrap();
     assert_eq!(pending.len(), 1);
-    store
-        .store_chat_presentation(&pending[0], &selected)
-        .unwrap();
+    assert_eq!(
+        store
+            .store_chat_presentation(&pending[0], &selected)
+            .unwrap(),
+        ChatPresentationWrite::Applied
+    ); // Applied can mean only that durable source progress became clean.
     assert!(store.pending_chat_presentation_inputs().unwrap().is_empty());
     assert_eq!(store.chat_presentation_version().unwrap(), version);
     assert_eq!(
@@ -389,4 +392,135 @@ fn malformed_member_identity_clears_peer_evidence() {
             .members
             .is_empty()
     );
+}
+
+fn save_selected(store: &SqliteAccountStorage, selected: &StoredChatPresentation) {
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    store.store_chat_presentation(&input, selected).unwrap();
+}
+fn put_avatar_component(store: &SqliteAccountStorage, url: &str) {
+    use cgka_traits::app_components::{GroupAvatarUrlV1, encode_group_avatar_url_v1};
+    let bytes = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
+        url: url.into(),
+        dim: Vec::new(),
+        thumbhash: Vec::new(),
+    })
+    .unwrap();
+    store.lock().unwrap().execute(
+        "INSERT INTO account_group_app_components
+            (group_id_hex, component_id, component_name, component_data_hex, updated_at)
+         VALUES ('11', ?1, 'avatar fixture', ?2, 1)
+         ON CONFLICT(group_id_hex, component_id) DO UPDATE SET component_data_hex=excluded.component_data_hex",
+        params![GROUP_AVATAR_URL_COMPONENT_ID, hex::encode(bytes)],
+    ).unwrap();
+}
+#[test]
+fn avatar_component_insert_replace_clear_and_delete_keep_work_and_display_consistent() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    let peer = value("bb", "Peer", 1);
+    save_selected(&store, &peer);
+    let initial = store.chat_presentation_version().unwrap();
+    put_avatar_component(&store, "https://example.com/first.png");
+    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+    let ChatPresentationRead::Ready(retained) = store.chat_presentation("11").unwrap() else {
+        panic!("lost peer display");
+    };
+    assert_eq!(
+        retained.presentation.resolution,
+        PresentationResolution::LastKnown
+    );
+    assert_eq!(store.chat_presentation_version().unwrap(), initial);
+    let mut group = peer.clone();
+    group.presentation.avatar_source = PresentationSource::Group;
+    group.presentation.avatar = SelectedAvatar::RemoteImage {
+        url: "https://example.com/first.png".into(),
+        cache_key: "group fixture".into(),
+    };
+    save_selected(&store, &group);
+    let ready = store.chat_presentation_version().unwrap();
+    put_avatar_component(&store, "https://example.com/first.png");
+    assert!(store.pending_chat_presentation_inputs().unwrap().is_empty());
+    put_avatar_component(&store, "https://example.com/second.png");
+    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+    assert_eq!(store.chat_presentation_version().unwrap(), ready);
+    let ChatPresentationRead::Ready(retained) = store.chat_presentation("11").unwrap() else {
+        panic!("lost replacement display");
+    };
+    assert!(retained.presentation.avatar == group.presentation.avatar);
+    group.presentation.avatar = SelectedAvatar::RemoteImage {
+        url: "https://example.com/second.png".into(),
+        cache_key: "second fixture".into(),
+    };
+    save_selected(&store, &group);
+    // Clearing uses a valid encoded absent component, not just deletion of its row.
+    put_avatar_component(&store, "");
+    assert_eq!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Pending
+    );
+    assert!(
+        store
+            .chat_presentation_dependents(&"bb".repeat(32), None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+    save_selected(&store, &peer);
+    put_avatar_component(&store, "https://example.com/second.png");
+    save_selected(&store, &group);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM account_group_app_components WHERE group_id_hex='11' AND component_id=?1",
+            [GROUP_AVATAR_URL_COMPONENT_ID],
+        )
+        .unwrap();
+    assert_eq!(
+        store.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Pending
+    );
+    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+}
+#[test]
+fn removing_group_name_or_required_image_material_never_returns_removed_display() {
+    for column in [
+        "profile_name",
+        "image_hash_hex",
+        "image_key_hex",
+        "image_nonce_hex",
+        "image_upload_key_hex",
+    ] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, "11");
+        store.lock().unwrap().execute(
+            "UPDATE account_groups SET profile_name='Custom', image_hash_hex=?1, image_key_hex=?2,
+                image_nonce_hex=?3, image_upload_key_hex=?4 WHERE group_id_hex='11'",
+            params!["01".repeat(32), "02".repeat(32), "03".repeat(12), "04".repeat(32)],
+        ).unwrap();
+        let input = store.chat_presentation_input("11").unwrap().unwrap();
+        let mut selected = value("bb", "Custom", 1);
+        selected.presentation.title_source = PresentationSource::Group;
+        selected.presentation.avatar_source = PresentationSource::Group;
+        selected.presentation.avatar = SelectedAvatar::EncryptedGroupImage {
+            image: input.avatar.unwrap(),
+            cache_key: "group fixture".into(),
+        };
+        save_selected(&store, &selected);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                &format!("UPDATE account_groups SET {column}='' WHERE group_id_hex='11'"),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.chat_presentation("11").unwrap(),
+            ChatPresentationRead::Pending,
+            "{column}"
+        );
+        assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+    }
 }

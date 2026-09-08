@@ -43,6 +43,7 @@ CREATE INDEX chat_presentation_by_member
 CREATE TRIGGER chat_presentation_value_changed AFTER UPDATE OF presentation_json ON chat_list_rows
 WHEN OLD.presentation_json IS NOT NULL AND NEW.presentation_json IS NULL BEGIN
     UPDATE chat_presentation_meta SET revision = revision + 1 WHERE id = 1;
+    DELETE FROM chat_presentation_dependencies WHERE group_id_hex = NEW.group_id_hex;
 END;
 CREATE TRIGGER chat_presentation_value_removed AFTER DELETE ON chat_list_rows
 WHEN OLD.presentation_json IS NOT NULL BEGIN
@@ -60,6 +61,11 @@ WHEN OLD.profile_name IS NOT NEW.profile_name
 BEGIN
     UPDATE chat_list_rows SET presentation_json = CASE
             WHEN OLD.member_count IS NOT NEW.member_count OR OLD.self_membership IS NOT NEW.self_membership
+              OR (trim(OLD.profile_name) != '' AND trim(NEW.profile_name) = '')
+              OR (OLD.image_hash_hex != '' AND coalesce(NEW.image_hash_hex, '') = '')
+              OR (OLD.image_key_hex != '' AND coalesce(NEW.image_key_hex, '') = '')
+              OR (OLD.image_nonce_hex != '' AND coalesce(NEW.image_nonce_hex, '') = '')
+              OR (OLD.image_upload_key_hex != '' AND coalesce(NEW.image_upload_key_hex, '') = '')
             THEN NULL ELSE presentation_json END,
         presentation_source_revision = presentation_source_revision + 1
         WHERE group_id_hex = NEW.group_id_hex;
@@ -71,19 +77,27 @@ END;
 "#,
     ).storage()?;
     // Component bytes can carry the group avatar URL independently of the name/image columns.
-    for (operation, reference, condition) in [
-        ("INSERT", "NEW", "NEW.component_id = 32775"),
+    // 000000 is the frozen v1 encoding of three empty fields (explicit absent avatar).
+    for (operation, reference, condition, removed) in [
+        ("INSERT", "NEW", "NEW.component_id = 32775", "0"),
         (
             "UPDATE",
             "NEW",
             "NEW.component_id = 32775 AND OLD.component_data_hex IS NOT NEW.component_data_hex",
+            "OLD.component_data_hex NOT IN ('', '000000') AND NEW.component_data_hex IN ('', '000000')",
         ),
-        ("DELETE", "OLD", "OLD.component_id = 32775"),
+        (
+            "DELETE",
+            "OLD",
+            "OLD.component_id = 32775",
+            "OLD.component_data_hex NOT IN ('', '000000')",
+        ),
     ] {
         tx.execute_batch(&format!(
             "CREATE TRIGGER chat_presentation_avatar_{operation} AFTER {operation} ON account_group_app_components
              WHEN {condition} BEGIN
-                UPDATE chat_list_rows SET presentation_source_revision = presentation_source_revision + 1
+                UPDATE chat_list_rows SET presentation_json = CASE WHEN {removed} THEN NULL ELSE presentation_json END,
+                    presentation_source_revision = presentation_source_revision + 1
                     WHERE group_id_hex = {reference}.group_id_hex;
              END;"
         )).storage()?;
