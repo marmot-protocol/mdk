@@ -68,12 +68,12 @@ pub struct PresentedChatListUpdateFfi {
     pub snapshot: PresentedChatListSnapshotFfi,
 }
 
-macro_rules! redacted_debug {
+macro_rules! impl_redacted_fmt {
     ($($ty:ty),* $(,)?) => {$(impl std::fmt::Debug for $ty {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct(stringify!($ty)).finish_non_exhaustive() }
     })*};
 }
-redacted_debug!(
+impl_redacted_fmt!(
     PresentationTextFfi,
     SelectedAvatarFfi,
     ConversationPresentationFfi,
