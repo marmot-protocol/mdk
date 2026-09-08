@@ -665,6 +665,10 @@ enum MarmotRelayPolicy
  {
   MARMOT_RELAY_POLICY_PUBLIC_ONLY = 0,
   MARMOT_RELAY_POLICY_ALLOW_LOOPBACK = 1,
+  /**
+   * Also permit loopback blob endpoints for local media fixtures.
+   */
+  MARMOT_RELAY_POLICY_ALLOW_LOOPBACK_RELAYS_AND_BLOBS = 2,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

@@ -43,6 +43,8 @@ use types::notification::MarmotCursorPersistence;
 pub enum MarmotRelayPolicy {
     PublicOnly = 0,
     AllowLoopback = 1,
+    /// Also permit loopback blob endpoints for local media fixtures.
+    AllowLoopbackRelaysAndBlobs = 2,
 }
 
 /// Create a client with an explicit relay policy and optional host secret store.
@@ -71,6 +73,7 @@ pub unsafe extern "C" fn marmot_client_new_with_options(
         let policy = match relay_policy {
             0 => marmot_uniffi::RelayPolicyFfi::PublicOnly,
             1 => marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            2 => marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
             _ => {
                 set_last_error("invalid relay policy");
                 return MarmotStatus::InvalidArgument;

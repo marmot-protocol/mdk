@@ -57,6 +57,8 @@ uniffi::setup_scaffolding!();
 pub enum RelayPolicyFfi {
     PublicOnly,
     AllowLoopback,
+    /// Explicit development opt-in for both relay and blob loopback endpoints.
+    AllowLoopbackRelaysAndBlobs,
 }
 
 pub use commands::{
@@ -189,10 +191,15 @@ impl Marmot {
         relay_policy: RelayPolicyFfi,
         secret_store: Option<Arc<dyn SecretStore>>,
     ) -> Result<Arc<Self>, MarmotKitError> {
-        let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(matches!(
-            relay_policy,
-            RelayPolicyFfi::AllowLoopback
-        ));
+        let config = MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(matches!(
+                relay_policy,
+                RelayPolicyFfi::AllowLoopback | RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
+            ))
+            .with_allow_loopback_blob_endpoints(matches!(
+                relay_policy,
+                RelayPolicyFfi::AllowLoopbackRelaysAndBlobs
+            ));
         let store = secret_store.map(|store| {
             Arc::new(secret_store::ForeignSecretStore::new(store))
                 as Arc<dyn marmot_account::AccountSecretStore>
