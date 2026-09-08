@@ -305,6 +305,8 @@ pub struct AppClient {
     /// `remember_seen_event` (which removes pruned ring entries from it).
     /// Receipt decisions use `transport_receipts`; the index exposes no raw
     /// production membership lookup.
+    /// The persisted `state.seen_events` ring remains accessible for checkpoint
+    /// bookkeeping; reading it for receipt decisions would bypass synchronization.
     /// Derived state: rebuilt from the ordered ring at construction and never
     /// persisted. Before this index existed, every inbound delivery and every
     /// publish-report batch rebuilt a `HashSet` from the full 16k-entry ring.

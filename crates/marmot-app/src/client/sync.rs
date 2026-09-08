@@ -718,6 +718,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
+        // Retire released receipts even when this effects batch makes no receipt read.
         self.transport_receipts()?;
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
@@ -782,6 +783,9 @@ impl AppClient {
     /// Each route reconciles against the exact event-id set retained in this
     /// account's SQLCipher database, so traffic in one busy group cannot move
     /// or evict another route's completeness state.
+    /// Synchronize before each inventory read, since routes await network I/O.
+    /// With no routes there is no receipt decision to synchronize; this is not
+    /// a standalone release-repair tick.
     async fn reconcile_transport_history(&mut self, reconcile_until: u64) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let routing = self.routing.snapshot();
@@ -1182,6 +1186,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        // Retire released receipts even when the drain emitted no app events.
         self.transport_receipts()?;
         // Session open seeds this list from durable queued/convergence input.
         // Preserve that scheduling edge even when hydration emitted no app
@@ -2001,6 +2006,8 @@ impl AppClient {
             // Any delivery proves the stream is alive, including one this drain
             // goes on to skip as an echo or a duplicate.
             silence_started = std::time::Instant::now();
+            // Evaluate before the exclusive receipt borrow; counts.deliveries
+            // stays unchanged until admission (duplicates only bump skipped).
             let fail_before_delivery = cfg!(feature = "test-policy-overrides")
                 && self
                     .app

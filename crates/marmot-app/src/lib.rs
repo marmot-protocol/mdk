@@ -101,6 +101,8 @@ mod relay_telemetry_export;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
+#[cfg(feature = "test-policy-overrides")]
+mod test_support;
 
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,

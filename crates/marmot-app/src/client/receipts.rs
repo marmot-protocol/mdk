@@ -13,7 +13,7 @@ use crate::{AppError, remember_seen_event};
 pub(crate) struct SynchronizedTransportReceipts<'a> {
     client: &'a mut AppClient,
     storage: SqliteAccountStorage,
-    released: Vec<String>,
+    released: HashSet<String>,
 }
 
 /// Production membership reads are available only through the synchronized
@@ -53,11 +53,11 @@ impl AppClient {
     fn synchronize_released_transport_receipts(
         &mut self,
         storage: &SqliteAccountStorage,
-    ) -> Result<Vec<String>, AppError> {
+    ) -> Result<HashSet<String>, AppError> {
         let released = storage.consume_released_transport_receipts()?;
         self.released_backfill_reload_pending |= !released.is_empty();
         if !self.released_backfill_reload_pending {
-            return Ok(Vec::new());
+            return Ok(HashSet::new());
         }
         let released = released
             .into_iter()
@@ -94,14 +94,14 @@ impl AppClient {
         }
         self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
         self.released_backfill_reload_pending = false;
-        Ok(released.into_iter().collect())
+        Ok(released)
     }
 
     #[cfg(test)]
     pub(crate) fn reconcile_released_transport_receipts(
         &mut self,
     ) -> Result<Vec<String>, AppError> {
-        Ok(self.transport_receipts()?.released)
+        Ok(self.transport_receipts()?.released.into_iter().collect())
     }
 
     /// Synchronize at the account's exclusive mutation boundary. Storage-only
@@ -129,7 +129,7 @@ impl<'a> SynchronizedTransportReceipts<'a> {
     }
 
     pub(crate) fn was_released(&self, event_id: &str) -> bool {
-        self.released.iter().any(|id| id == event_id)
+        self.released.contains(event_id)
     }
 
     pub(crate) fn contains(&self, event_id: &str) -> bool {
@@ -312,17 +312,12 @@ mod tests {
             client.fail_next_released_backfill_reload = true;
             let ring_ptr = client.state.seen_events.as_ptr();
             let index_capacity = client.seen_events_index.0.capacity();
-            let started = std::time::Instant::now();
             for _ in 0..1024 {
                 let receipts = client.transport_receipts().unwrap();
                 std::hint::black_box(receipts.contains("absent"));
                 assert!(receipts.pending_seen_events().is_empty());
                 assert!(!receipts.was_released("absent"));
             }
-            eprintln!(
-                "MDK_BENCH receipt_empty_journal ring_size={ring_size} accesses=1024 elapsed_us={}",
-                started.elapsed().as_micros()
-            );
             assert_eq!(client.state.seen_events.as_ptr(), ring_ptr);
             assert_eq!(client.seen_events_index.0.capacity(), index_capacity);
             assert_eq!(client.seen_events_index.len(), ring_size);
