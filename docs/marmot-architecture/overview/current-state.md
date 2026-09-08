@@ -19,6 +19,11 @@ status: overview
 
 # Current State — Implementations & Spec
 
+The additive presented-chat-list contract exposes complete existing rows plus durable MDK-selected title/avatar
+through Rust, UniFFI and C. An attached initial snapshot and ordered replacement updates cover both presentation and
+ordinary row changes. Android/iOS adoption remains separate; see the
+[native integration contract](../../../crates/marmot-uniffi/README.md#selected-chat-list-presentation).
+
 Deferred transport resource release now preserves app replay eligibility across
 lost engine effects and restart. SQLCipher records release evidence atomically
 with raw-byte deletion; app recovery retires both inventory and duplicate

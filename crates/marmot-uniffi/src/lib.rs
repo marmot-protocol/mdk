@@ -350,6 +350,8 @@ impl Marmot {
     }
 }
 
+pub use subscriptions::PresentedChatListSubscription;
+
 #[cfg(test)]
 mod tests {
     use super::*;

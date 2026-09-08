@@ -39,8 +39,8 @@ pub use chat_presentation::{
     CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,
     ChatPresentationCheckpoint, ChatPresentationInput, ChatPresentationRead,
     ChatPresentationVersion, ChatPresentationWrite, ConversationPresentation,
-    PresentationResolution, PresentationSource, PresentationText, SelectedAvatar,
-    StoredChatPresentation,
+    PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
+    PresentedChatRow, SelectedAvatar, StoredChatPresentation,
 };
 #[allow(deprecated)]
 pub use connection::SqliteStorage;

@@ -135,9 +135,12 @@ pub use runtime::{
     SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
     default_directory_discovery_relays,
 };
+pub use runtime::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
-    ChatPinState, TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
+    ChatPinState, ChatPresentationVersion, ConversationPresentation, PresentationResolution,
+    PresentationSource, PresentationText, PresentedChatListSnapshot, PresentedChatRow,
+    SelectedAvatar, TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
 };
 
 pub use agent_streams::{

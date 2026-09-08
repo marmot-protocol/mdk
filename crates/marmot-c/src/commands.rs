@@ -15,6 +15,7 @@
 //! Commands with struct/byte inputs are written by hand below the macro
 //! block.
 
+use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
 
 use marmot_uniffi::MarmotKitError;
@@ -835,6 +836,10 @@ c_cmd! {
     /// The account's chat list rows. Free with
     /// `marmot_chat_list_row_list_free`.
     sync fn marmot_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotChatListRowList) = chat_list;
+    /// Complete local rows with selected title/avatar. Free with marmot_presented_chat_list_snapshot_free.
+    async fn marmot_presented_chat_list(account_ref: str, include_archived: flag) -> rec(MarmotPresentedChatListSnapshot) = presented_chat_list;
+    /// Keyed complete row; missing groups return NULL. Free with marmot_presented_chat_row_free.
+    async fn marmot_presented_chat_list_row(account_ref: str, group_id_hex: str) -> opt_rec(MarmotPresentedChatRow) = presented_chat_list_row;
 
     /// Initialize read state for a conversation being opened; writes the
     /// refreshed row, or NULL with `MARMOT_STATUS_OK` when the group has

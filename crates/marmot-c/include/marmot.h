@@ -133,6 +133,7 @@ enum MarmotStatus
   MARMOT_STATUS_CONSENT_REQUIRED = 66,
   MARMOT_STATUS_INVALID_PRODUCT_ANALYTICS_CONFIGURATION = 67,
   MARMOT_STATUS_INVALID_PRODUCT_OBSERVATION = 68,
+  MARMOT_STATUS_CHAT_PRESENTATION_NOT_READY = 69,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -415,6 +416,20 @@ typedef enum MarmotChatConversationKind {
   MARMOT_CHAT_CONVERSATION_KIND_DIRECT,
   MARMOT_CHAT_CONVERSATION_KIND_GROUP,
 } MarmotChatConversationKind;
+
+typedef enum MarmotPresentationSource {
+  MARMOT_PRESENTATION_SOURCE_GROUP,
+  MARMOT_PRESENTATION_SOURCE_PEER_PROFILE,
+  MARMOT_PRESENTATION_SOURCE_PEER_FALLBACK,
+  MARMOT_PRESENTATION_SOURCE_GROUP_FALLBACK,
+  MARMOT_PRESENTATION_SOURCE_UNKNOWN_FALLBACK,
+} MarmotPresentationSource;
+
+typedef enum MarmotPresentationResolution {
+  MARMOT_PRESENTATION_RESOLUTION_CACHED,
+  MARMOT_PRESENTATION_RESOLUTION_LAST_KNOWN,
+  MARMOT_PRESENTATION_RESOLUTION_FALLBACK,
+} MarmotPresentationResolution;
 
 /**
  * How far an account's setup has progressed.
@@ -772,6 +787,12 @@ typedef struct MarmotNotificationsSubscription MarmotNotificationsSubscription;
  * A current onboarding snapshot followed by durable progress updates.
  */
 typedef struct MarmotOnboardingSubscription MarmotOnboardingSubscription;
+
+/**
+ * Account-bound complete chat-list snapshots. Free before the parent client.
+ * This fallible stream uses blocking next so storage errors retain their typed status.
+ */
+typedef struct MarmotPresentedChatListSubscription MarmotPresentedChatListSubscription;
 
 /**
  * Opaque handle to one conversation's materialized timeline window.
@@ -1973,6 +1994,91 @@ typedef struct MarmotChatListRowList {
   struct MarmotChatListRow *items;
   uintptr_t len;
 } MarmotChatListRowList;
+
+/**
+ * Typed text; hosts localize the fallback cases.
+ */
+typedef enum MarmotPresentationText_Tag {
+  MARMOT_PRESENTATION_TEXT_LITERAL,
+  MARMOT_PRESENTATION_TEXT_UNNAMED_GROUP,
+  MARMOT_PRESENTATION_TEXT_UNAVAILABLE_CONVERSATION,
+} MarmotPresentationText_Tag;
+
+typedef struct MarmotPresentationText_Literal_Body {
+  char *text;
+} MarmotPresentationText_Literal_Body;
+
+typedef struct MarmotPresentationText_UnnamedGroup_Body {
+  bool has_member_count;
+  uint64_t member_count;
+} MarmotPresentationText_UnnamedGroup_Body;
+
+typedef struct MarmotPresentationText {
+  MarmotPresentationText_Tag tag;
+  union {
+    MarmotPresentationText_Literal_Body LITERAL;
+    MarmotPresentationText_UnnamedGroup_Body UNNAMED_GROUP;
+  };
+} MarmotPresentationText;
+
+/**
+ * Descriptor only. Group image material remains owned by the containing result.
+ */
+typedef enum MarmotSelectedAvatar_Tag {
+  MARMOT_SELECTED_AVATAR_REMOTE_IMAGE,
+  MARMOT_SELECTED_AVATAR_ENCRYPTED_GROUP_IMAGE,
+  MARMOT_SELECTED_AVATAR_PLACEHOLDER,
+} MarmotSelectedAvatar_Tag;
+
+typedef struct MarmotSelectedAvatar_RemoteImage_Body {
+  char *url;
+  char *cache_key;
+} MarmotSelectedAvatar_RemoteImage_Body;
+
+typedef struct MarmotSelectedAvatar_EncryptedGroupImage_Body {
+  struct MarmotChatListAvatar image;
+  char *cache_key;
+} MarmotSelectedAvatar_EncryptedGroupImage_Body;
+
+typedef struct MarmotSelectedAvatar_Placeholder_Body {
+  char *stable_seed;
+  enum MarmotPresentationSource source;
+} MarmotSelectedAvatar_Placeholder_Body;
+
+typedef struct MarmotSelectedAvatar {
+  MarmotSelectedAvatar_Tag tag;
+  union {
+    MarmotSelectedAvatar_RemoteImage_Body REMOTE_IMAGE;
+    MarmotSelectedAvatar_EncryptedGroupImage_Body ENCRYPTED_GROUP_IMAGE;
+    MarmotSelectedAvatar_Placeholder_Body PLACEHOLDER;
+  };
+} MarmotSelectedAvatar;
+
+typedef struct MarmotConversationPresentation {
+  struct MarmotPresentationText title;
+  struct MarmotSelectedAvatar avatar;
+  enum MarmotPresentationSource title_source;
+  enum MarmotPresentationSource avatar_source;
+  char *peer_id;
+  enum MarmotPresentationResolution resolution;
+} MarmotConversationPresentation;
+
+typedef struct MarmotPresentedChatRow {
+  struct MarmotChatListRow row;
+  struct MarmotConversationPresentation presentation;
+} MarmotPresentedChatRow;
+
+typedef struct MarmotPresentationVersion {
+  uint8_t *account_store_epoch;
+  uintptr_t account_store_epoch_len;
+  uint64_t revision;
+} MarmotPresentationVersion;
+
+typedef struct MarmotPresentedChatListSnapshot {
+  struct MarmotPresentedChatRow *rows;
+  uintptr_t rows_len;
+  struct MarmotPresentationVersion presentation_version;
+} MarmotPresentedChatListSnapshot;
 
 /**
  * The account's pinned chats, in display order.
@@ -3864,6 +3970,12 @@ typedef void (*MarmotUserSearchUpdateCallback)(const struct MarmotUserSearchUpda
 typedef void (*MarmotOnboardingCallback)(const struct MarmotOnboardingSnapshot *item,
                                          void *user_data);
 
+typedef struct MarmotPresentedChatListUpdate {
+  char *subscription_generation;
+  uint64_t sequence;
+  struct MarmotPresentedChatListSnapshot snapshot;
+} MarmotPresentedChatListUpdate;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -5208,6 +5320,34 @@ MarmotStatus marmot_chat_list(const struct MarmotClient *client,
                               const char *account_ref,
                               uint8_t include_archived,
                               struct MarmotChatListRowList **out);
+
+/**
+ * Complete local rows with selected title/avatar. Free with marmot_presented_chat_list_snapshot_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_presented_chat_list(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        uint8_t include_archived,
+                                        struct MarmotPresentedChatListSnapshot **out);
+
+/**
+ * Keyed complete row; missing groups return NULL. Free with marmot_presented_chat_row_free.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_presented_chat_list_row(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            struct MarmotPresentedChatRow **out);
 
 /**
  * Initialize read state for a conversation being opened; writes the
@@ -7552,6 +7692,44 @@ MarmotStatus marmot_onboarding_subscription_snapshot(const struct MarmotOnboardi
                                                      struct MarmotOnboardingSnapshot **out);
 
 /**
+ * Open a complete chat list with both invalidation sources already attached.
+ * Take the initial snapshot once, then call next. Free with marmot_presented_chat_list_subscription_free.
+ * # Safety
+ * Client and string must be valid; out_sub must be writable.
+ */
+MarmotStatus marmot_open_presented_chat_list(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             uint8_t include_archived,
+                                             struct MarmotPresentedChatListSubscription **out_sub);
+
+/**
+ * Take the initial snapshot with sequence zero. A second call returns CLOSED and NULL.
+ * Free the result with marmot_presented_chat_list_update_free.
+ * # Safety
+ * sub must be live; out must be writable.
+ */
+MarmotStatus marmot_presented_chat_list_subscription_snapshot(const struct MarmotPresentedChatListSubscription *sub,
+                                                              struct MarmotPresentedChatListUpdate **out);
+
+/**
+ * Read a whole replacement. timeout_ms zero waits indefinitely. Timeout/closed/error leave
+ * out NULL; timeout or a storage error does not discard the pending refresh. Retry according
+ * to the typed status. Free results with marmot_presented_chat_list_update_free.
+ * # Safety
+ * sub must be live; out must be writable.
+ */
+MarmotStatus marmot_presented_chat_list_subscription_next(const struct MarmotPresentedChatListSubscription *sub,
+                                                          uint32_t timeout_ms,
+                                                          struct MarmotPresentedChatListUpdate **out);
+
+/**
+ * Cancel and free a presented-list handle. NULL is a no-op.
+ * # Safety
+ * sub must be NULL or a live library-owned handle not in use by another call.
+ */
+void marmot_presented_chat_list_subscription_free(struct MarmotPresentedChatListSubscription *sub);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -8363,6 +8541,36 @@ void marmot_usage_diagnostics_settings_free(struct MarmotUsageDiagnosticsSetting
  * this library.
  */
 void marmot_usage_diagnostics_status_free(struct MarmotUsageDiagnosticsStatus *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_presented_chat_row_free(struct MarmotPresentedChatRow *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_presented_chat_list_snapshot_free(struct MarmotPresentedChatListSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_presented_chat_list_update_free(struct MarmotPresentedChatListUpdate *ptr);
 
 #ifdef __cplusplus
 }  // extern "C"

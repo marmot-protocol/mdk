@@ -95,3 +95,16 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
+
+## Selected chat-list presentation
+
+The additive `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
+plus MDK-selected title/avatar descriptors. Existing struct layouts and functions are unchanged.
+`marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
+whole-list replacements. The initial item has sequence zero. A repeated snapshot call returns CLOSED with NULL.
+
+This fallible subscription offers blocking next with timeout and typed storage/preparation errors. It has no callback
+pump: hosts drive next on their own worker and decide how to retry errors. Timeouts preserve the refresh obligation.
+Free each result with `marmot_presented_chat_list_update_free` and the handle with
+`marmot_presented_chat_list_subscription_free`. See the [shared native contract](../marmot-uniffi/README.md#selected-chat-list-presentation)
+for version ordering, localization, readiness, and account-switch behavior.

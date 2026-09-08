@@ -108,6 +108,17 @@ int main(int argc, char **argv) {
     marmot_string_free(NULL);
     marmot_account_summary_list_free(NULL);
     marmot_markdown_document_free(NULL);
+    marmot_presented_chat_row_free(NULL);
+    marmot_presented_chat_list_snapshot_free(NULL);
+    marmot_presented_chat_list_update_free(NULL);
+    marmot_presented_chat_list_subscription_free(NULL);
+    check(marmot_presented_chat_list_subscription_next(NULL, 5000, NULL) ==
+              MARMOT_STATUS_NULL_POINTER,
+          "presented next validates output before reading");
+    check(marmot_open_presented_chat_list(NULL, NULL, 0, NULL) ==
+              MARMOT_STATUS_NULL_POINTER,
+          "presented open validates output before subscribing");
+
     ok("NULL frees are no-ops");
 
     /* ---- construct + lifecycle ---------------------------------------- */

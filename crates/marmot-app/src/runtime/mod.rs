@@ -64,7 +64,9 @@ mod commands;
 mod event_routing;
 mod onboarding;
 mod presentation;
+mod presented_chat_list;
 pub use onboarding::*;
+pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
 mod subscriptions;
 
 // Re-export the public surface so `crate::runtime::Item` and the
