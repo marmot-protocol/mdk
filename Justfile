@@ -38,6 +38,12 @@ clippy-default:
 clippy-otlp:
     cargo clippy --workspace --all-targets --features {{otlp-features}} -- -D warnings
 
+# Compile the browser-capable library boundary. The target and a WASM-capable
+# C compiler must already be installed; override CC_wasm32_unknown_unknown
+# when the system clang does not advertise a wasm32 backend.
+wasm-check:
+    RUSTFLAGS='-D warnings' CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-clang}" cargo build --locked --target wasm32-unknown-unknown -p cgka-traits -p cgka-engine -p transport-nostr-peeler
+
 test: test-default test-otlp
 
 test-default:
@@ -326,6 +332,13 @@ simulator-smoke:
 simulator-full: simulator-filter-contract
     cargo nextest run -p cgka-conformance-simulator --features conformance-slow --locked --profile ci -E '{{simulator-dedicated-filter}}'
 
+# Deliberately test-filtered: `test-policy-overrides` also switches the
+# harness's default constructor to marmot-app's instant-settlement test
+# default, so the crate must not run wholesale under this feature.
+# Public app self-update journey with the maintenance quiet window and jitter zeroed.
+simulator-fast-maintenance:
+    cargo nextest run -p cgka-conformance-simulator --features test-policy-overrides --locked --profile ci --test app_runtime_interaction_journeys -E 'test(=public_app_11_manual_self_update_advances_every_member)'
+
 # Prove that the generic nightly lane restores exactly the generated batches
 # intentionally removed from the PR smoke lane.
 simulator-filter-contract:
@@ -391,7 +404,7 @@ focused-convergence-regressions:
 
 # Capability-level entry points used by the scheduled workflows. PR checks
 # remain split into separately named steps for useful failure attribution.
-convergence-nightly-lane: convergence-lane-policy convergence-failure-corpus simulator-full adversarial-reliability-ci convergence-verification-ci
+convergence-nightly-lane: convergence-lane-policy convergence-failure-corpus simulator-full simulator-fast-maintenance adversarial-reliability-ci convergence-verification-ci
     cargo nextest run -p cgka-conformance-simulator --test process_orchestrator --locked
     cargo nextest run -p convergence-campaign-runner --locked
 

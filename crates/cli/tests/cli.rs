@@ -261,8 +261,14 @@ fn relay_pair_json(first: &TestRelay, second: &TestRelay) -> Value {
 }
 
 fn wn(home: &std::path::Path) -> Command {
+    let mut command = wn_plain(home);
+    command.arg("--json");
+    command
+}
+
+fn wn_plain(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
-    command.arg("--home").arg(home).arg("--json");
+    command.arg("--home").arg(home);
     command.env("WN_SECRET_STORE", "file");
     command.env("WN_RELAY", test_relay_url());
     // CLI tests exercise encrypted media against a loopback Blossom server,
@@ -276,6 +282,19 @@ fn wn(home: &std::path::Path) -> Command {
         command.env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
     }
     command
+}
+
+fn run_plain(home: &std::path::Path, args: &[&str]) -> String {
+    let output = wn_plain(home)
+        .args(args)
+        .output()
+        .expect("wn command should start");
+    assert!(
+        output.status.success(),
+        "wn failed\nargs={args:?}\n{}",
+        command_output_summary(&output)
+    );
+    String::from_utf8(output.stdout).expect("plain stdout should be UTF-8")
 }
 
 fn wn_without_relay(home: &std::path::Path) -> Command {
@@ -6936,15 +6955,23 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
         ],
     );
     // A copy whose canonical state records our own removal is terminal for
-    // outbound work: the engine rejects the send with a deterministic
-    // InvalidTransition (from: "Removed") instead of an opaque backend error
-    // (#376 realization semantics).
-    assert_eq!(bob_send_error["code"], "invalid_transition");
+    // outbound work (#376 realization semantics). The app-layer send preflight
+    // now refuses it before any optimistic projection, so the deterministic
+    // contract is the typed `group_removed` code rather than the engine's
+    // untyped `invalid_transition` from its own gate behind it.
+    assert_eq!(bob_send_error["code"], "group_removed");
+    assert_eq!(bob_send_error["group_id"], group_id);
     let message = bob_send_error["message"].as_str().expect("error message");
     assert!(
-        message.contains("marked removed"),
+        message.contains("removed from the group"),
         "removed-copy send should explain the terminal state; got {message}"
     );
+    // Refused before projection: the failed send left no optimistic row behind.
+    let bob_messages = run_json(
+        home.path(),
+        &["--account", &bob, "message", "list", "--group", group_id],
+    );
+    assert_no_message_plaintext(&bob_messages, "removed sender");
 }
 
 #[test]
@@ -7072,4 +7099,391 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     assert_message_plaintexts(&messages, &[&body]);
 
     let _ = wn(home.path()).args(["daemon", "stop"]).output();
+}
+
+#[test]
+fn plain_human_output_sanitizes_untrusted_remote_text_without_mutating_json_or_storage() {
+    let home = tempfile::tempdir().expect("tempdir");
+    const HOSTILE_TEXT: &str = "hello\u{1b}]52;c;YXR0YWNr\u{7}world\u{1b}[2J";
+    const SANITIZED_TEXT: &str = "hello]52;c;YXR0YWNrworld[2J";
+    const HOSTILE_NAME: &str = "ops\u{202e}chat";
+    const SANITIZED_NAME: &str = "opschat";
+    const HOSTILE_DISPLAY: &str = "Ali\u{202e}ce";
+    const SANITIZED_DISPLAY: &str = "Alice";
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    run_json_with_relay(
+        home.path(),
+        test_relay_url(),
+        &[
+            "--account",
+            &alice,
+            "profile",
+            "update",
+            "--display-name",
+            HOSTILE_DISPLAY,
+        ],
+    );
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", HOSTILE_NAME, &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    assert_eq!(created_group["name"], HOSTILE_NAME);
+    assert_eq!(created_group["profile"]["name"], HOSTILE_NAME);
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let invites_json = run_json(home.path(), &["--account", &bob, "groups", "invites"]);
+    assert_eq!(invites_json["invites"][0]["profile"]["name"], HOSTILE_NAME);
+    let invites_plain = run_plain(home.path(), &["--account", &bob, "groups", "invites"]);
+    assert!(
+        invites_plain.contains(SANITIZED_NAME),
+        "pending invite plain output should sanitize the group name: {invites_plain:?}"
+    );
+    assert!(
+        !invites_plain.contains('\u{202e}'),
+        "pending invite plain output must drop BiDi controls: {invites_plain:?}"
+    );
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            HOSTILE_TEXT,
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &bob, HOSTILE_TEXT);
+
+    let listed_plain = run_plain(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(
+        listed_plain.contains(SANITIZED_TEXT),
+        "message list plain output should sanitize the body: {listed_plain:?}"
+    );
+    assert!(
+        !listed_plain.contains('\u{1b}'),
+        "message list plain output must drop ESC: {listed_plain:?}"
+    );
+    assert!(
+        listed_plain.ends_with('\n'),
+        "formatter-owned trailing newline must remain: {listed_plain:?}"
+    );
+    assert_eq!(
+        listed_plain.matches('\n').count(),
+        listed_plain.trim_end_matches('\n').matches('\n').count() + 1,
+        "formatter-owned trailing newline must remain"
+    );
+
+    let timeline_plain = run_plain(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "timeline",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(timeline_plain.contains(SANITIZED_TEXT));
+    assert!(!timeline_plain.contains('\u{1b}'));
+
+    let search_plain = run_plain(
+        home.path(),
+        &["--account", &bob, "messages", "search", group_id, "hello"],
+    );
+    assert!(search_plain.contains(SANITIZED_TEXT));
+
+    let groups_plain = run_plain(home.path(), &["--account", &alice, "groups", "list"]);
+    assert!(
+        groups_plain.contains(SANITIZED_NAME),
+        "groups list should sanitize the profile name: {groups_plain:?}"
+    );
+    assert!(!groups_plain.contains('\u{202e}'));
+
+    let chats_plain = run_plain(home.path(), &["--account", &alice, "chats", "list"]);
+    assert!(chats_plain.contains(SANITIZED_NAME));
+
+    let accounts_plain = run_plain(home.path(), &["account", "list"]);
+    assert!(
+        accounts_plain.contains(SANITIZED_DISPLAY),
+        "accounts list should sanitize the display name: {accounts_plain:?}"
+    );
+    assert!(!accounts_plain.contains('\u{1b}'));
+    let whoami_plain = run_plain(home.path(), &["--account", &alice, "whoami"]);
+    let whoami_json = run_json(home.path(), &["--account", &alice, "whoami"]);
+    assert!(
+        !whoami_plain.contains('\u{1b}'),
+        "whoami pretty dump must not emit raw ESC: {whoami_plain:?}"
+    );
+    assert_eq!(whoami_json["account_id"], alice);
+
+    let listed_json = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert_message_plaintexts(&listed_json, &[HOSTILE_TEXT]);
+    let reread = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert_eq!(reread, listed_json);
+
+    let groups_json = run_json(home.path(), &["--account", &alice, "groups", "list"]);
+    assert_eq!(groups_json["groups"][0]["profile"]["name"], HOSTILE_NAME);
+
+    let socket = home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let daemon_list = {
+        let output = wn_plain(home.path())
+            .arg("--socket")
+            .arg(&socket)
+            .args([
+                "--account",
+                &bob,
+                "messages",
+                "list",
+                group_id,
+                "--limit",
+                "20",
+            ])
+            .output()
+            .expect("daemon-backed list should start");
+        assert!(
+            output.status.success(),
+            "daemon-backed list failed\n{}",
+            command_output_summary(&output)
+        );
+        String::from_utf8(output.stdout).expect("plain stdout")
+    };
+    assert!(daemon_list.contains(SANITIZED_TEXT));
+    assert!(!daemon_list.contains('\u{1b}'));
+
+    let json_subscription = spawn_json_subscription(
+        home.path(),
+        &[
+            "--socket",
+            socket.to_str().expect("socket utf8"),
+            "--account",
+            &bob,
+            "messages",
+            "subscribe",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    let json_event = json_subscription.wait_for(Duration::from_secs(20), |line| {
+        line["result"]["type"] == "message"
+            && line["result"]["message"]["plaintext"] == HOSTILE_TEXT
+    });
+    assert_eq!(json_event["result"]["message"]["plaintext"], HOSTILE_TEXT);
+
+    let mut plain_child = wn_plain(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .args([
+            "--account",
+            &bob,
+            "messages",
+            "subscribe",
+            group_id,
+            "--limit",
+            "20",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("plain subscription should start");
+    let stdout = plain_child.stdout.take().expect("subscription stdout");
+    let (tx, rx) = std_mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_sanitized = false;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) if line.contains(SANITIZED_TEXT) => {
+                saw_sanitized = true;
+                assert!(!line.contains('\u{1b}'));
+                break;
+            }
+            Ok(_) => {}
+            Err(std_mpsc::RecvTimeoutError::Timeout | std_mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    let _ = plain_child.kill();
+    let _ = plain_child.wait();
+    let _ = reader.join();
+    assert!(
+        saw_sanitized,
+        "plain subscription should emit sanitized text"
+    );
+
+    drop(json_subscription);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn daemon_human_startup_errors_sanitize_hostile_relays_without_changing_json() {
+    let home = tempfile::tempdir().expect("tempdir");
+    const HOSTILE_RELAY: &str = "not-a-relay\u{1b}]52;c;YXR0YWNr\u{7}\u{202e}";
+    const SANITIZED_WN: &str = "error: invalid relay URL: not-a-relay]52;c;YXR0YWNr\n";
+    const SANITIZED_WND: &str = "wnd: invalid relay URL: not-a-relay]52;c;YXR0YWNr\n";
+
+    let ordinary = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--relay")
+        .arg(HOSTILE_RELAY)
+        .arg("--secret-store")
+        .arg("file")
+        .env_remove("WN_RELAY")
+        .args(["account", "list"])
+        .output()
+        .expect("ordinary wn should run");
+    assert_eq!(ordinary.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&ordinary.stderr),
+        SANITIZED_WN,
+        "ordinary wn errors must stay sanitized"
+    );
+
+    let start = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--secret-store")
+        .arg("file")
+        .env_remove("WN_RELAY")
+        .args(["daemon", "start", "--discovery-relays", HOSTILE_RELAY])
+        .output()
+        .expect("wn daemon start should run");
+    assert_eq!(
+        start.status.code(),
+        Some(1),
+        "{}",
+        command_output_summary(&start)
+    );
+    assert_eq!(String::from_utf8_lossy(&start.stderr), SANITIZED_WN);
+    assert!(!String::from_utf8_lossy(&start.stderr).contains('\u{1b}'));
+    assert!(!String::from_utf8_lossy(&start.stderr).contains('\u{7}'));
+    assert!(!String::from_utf8_lossy(&start.stderr).contains('\u{202e}'));
+    assert!(start.stdout.is_empty());
+
+    let wnd = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--discovery-relays")
+        .arg(HOSTILE_RELAY)
+        .env_remove("WN_RELAY")
+        .output()
+        .expect("wnd should run");
+    assert_eq!(
+        wnd.status.code(),
+        Some(1),
+        "{}",
+        command_output_summary(&wnd)
+    );
+    assert_eq!(String::from_utf8_lossy(&wnd.stderr), SANITIZED_WND);
+    assert!(!String::from_utf8_lossy(&wnd.stderr).contains('\u{1b}'));
+    assert!(!String::from_utf8_lossy(&wnd.stderr).contains('\u{7}'));
+    assert!(!String::from_utf8_lossy(&wnd.stderr).contains('\u{202e}'));
+    assert!(wnd.stdout.is_empty());
+
+    let start_json = Command::new(env!("CARGO_BIN_EXE_wn"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--secret-store")
+        .arg("file")
+        .arg("--json")
+        .env_remove("WN_RELAY")
+        .args(["daemon", "start", "--discovery-relays", HOSTILE_RELAY])
+        .output()
+        .expect("wn daemon start --json should run");
+    assert_eq!(
+        start_json.status.code(),
+        Some(1),
+        "{}",
+        command_output_summary(&start_json)
+    );
+    assert!(start_json.stderr.is_empty());
+    let value: Value =
+        serde_json::from_slice(&start_json.stdout).expect("daemon start JSON should parse");
+    assert_eq!(value["ok"], false);
+    assert_eq!(
+        value["error"],
+        serde_json::json!({
+            "code": "invalid_relay_url",
+            "message": format!("invalid relay URL: {HOSTILE_RELAY}"),
+        })
+    );
+    let message = value["error"]["message"].as_str().expect("error message");
+    assert!(message.contains(HOSTILE_RELAY));
+    assert!(message.contains('\u{1b}'));
+    assert!(message.contains('\u{7}'));
+    assert!(message.contains('\u{202e}'));
 }

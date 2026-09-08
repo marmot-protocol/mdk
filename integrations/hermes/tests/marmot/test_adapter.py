@@ -6367,7 +6367,7 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
         self.assertEqual(status["toolset"], "platform")
         self.assertEqual(status["schema"]["properties"], {})
-        self.assertIs(status["handler"], self.adapter_module._marmot_status_tool)
+        self.assertTrue(callable(status["handler"]))
         self.assertTrue(status["is_async"])
         history = next(tool for tool in ctx.tools if tool["name"] == "marmot_history")
         self.assertEqual(history["toolset"], "platform")
@@ -6426,12 +6426,16 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         class FakeContext:
             def __init__(self):
                 self.platforms = []
+                self.tools = []
 
             def get_config(self, key, default=None):
                 return settings.get(key, default)
 
             def register_platform(self, **kwargs):
                 self.platforms.append(kwargs)
+
+            def register_tool(self, **kwargs):
+                self.tools.append(kwargs)
 
         ctx = FakeContext()
         self.adapter_module.register(ctx)
@@ -6444,6 +6448,13 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(built.account_id_hex, settings["account_id_hex"])
         self.assertEqual(built.group_id_hex, settings["group_id_hex"])
         self.assertEqual(config.extra, {})
+
+        seed = platform["env_enablement_fn"]()
+        self.assertEqual(seed["socket_path"], settings["socket_path"])
+        self.assertEqual(
+            seed["home_channel"],
+            {"chat_id": settings["home_channel"], "name": "Marmot"},
+        )
 
         captured = {}
 
@@ -6465,6 +6476,81 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         effective = captured["config"]
         self.assertEqual(effective.extra["socket_path"], settings["socket_path"])
         self.assertEqual(effective.home_channel.chat_id, settings["home_channel"])
+
+        status = next(tool for tool in ctx.tools if tool["name"] == "marmot_status")
+        observed = {}
+
+        async def fake_probe(probe_config, **_kwargs):
+            observed["config"] = probe_config
+            return {"state": "ready"}
+
+        config_module = sys.modules["gateway.config"]
+        with (
+            unittest.mock.patch.object(
+                self.adapter_module,
+                "_live_adapter",
+                return_value=None,
+            ),
+            unittest.mock.patch.object(
+                config_module,
+                "load_gateway_config",
+                return_value=types.SimpleNamespace(
+                    platforms={self.adapter_module.Platform("marmot"): config}
+                ),
+                create=True,
+            ),
+            unittest.mock.patch.object(
+                self.adapter_module,
+                "probe_readiness",
+                side_effect=fake_probe,
+            ),
+        ):
+            status_result = json.loads(await status["handler"]({}))
+        self.assertTrue(status_result["ok"])
+        self.assertEqual(observed["config"].extra["socket_path"], settings["socket_path"])
+        self.assertEqual(
+            observed["config"].home_channel.chat_id,
+            settings["home_channel"],
+        )
+
+    async def test_marmot_status_probes_loaded_config_without_live_adapter(self):
+        module = self.adapter_module
+        config_module = sys.modules["gateway.config"]
+        config = config_module.PlatformConfig(
+            enabled=True,
+            extra={
+                "socket_path": "/tmp/passive-probe.sock",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+            },
+        )
+
+        class PlatformConfigs:
+            def get(self, platform):
+                return config if platform.value == "marmot" else None
+
+        setattr(
+            config_module,
+            "load_gateway_config",
+            lambda: types.SimpleNamespace(platforms=PlatformConfigs()),
+        )
+
+        class ReadyClient:
+            async def account_list(self):
+                return {
+                    "accounts": [
+                        {"account_id_hex": "11" * 32, "local_signing": True}
+                    ]
+                }
+
+            async def group_info(self, account_id_hex, group_id_hex):
+                return {"group": {"group_id_hex": group_id_hex}}
+
+        setattr(module, "MarmotAgentControlClient", lambda *_args, **_kwargs: ReadyClient())
+        result = json.loads(await module._marmot_status_tool({}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "ready")
 
     async def test_marmot_status_reports_staged_failures(self):
         module = self.adapter_module

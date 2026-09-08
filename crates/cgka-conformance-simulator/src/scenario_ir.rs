@@ -588,10 +588,38 @@ fn validate_predicate(
     predicate: &crate::ScenarioPredicateV2,
     clients: &BTreeSet<&String>,
 ) -> Result<(), ScenarioRunError> {
+    if let crate::ScenarioPredicateV2::PublicGroupState {
+        clients: observers,
+        members,
+        admins,
+        ..
+    } = predicate
+    {
+        for labels in [observers, members, admins] {
+            validate_clients(step_index, labels, clients, "public group state")?;
+            if labels.iter().collect::<BTreeSet<_>>().len() != labels.len() {
+                return Err(compile_error(
+                    Some(step_index),
+                    "public group state repeats a client".into(),
+                ));
+            }
+        }
+        if observers
+            .iter()
+            .chain(admins)
+            .any(|client| !members.contains(client))
+        {
+            return Err(compile_error(
+                Some(step_index),
+                "public group observers and admins must be expected members".into(),
+            ));
+        }
+    }
     let labels = match predicate {
         crate::ScenarioPredicateV2::ClientState { client, .. }
         | crate::ScenarioPredicateV2::PayloadCount { client, .. } => std::slice::from_ref(client),
         crate::ScenarioPredicateV2::ClientsExactlyEquivalent { clients }
+        | crate::ScenarioPredicateV2::PublicGroupState { clients, .. }
         | crate::ScenarioPredicateV2::NoPendingWork { clients } => clients.as_slice(),
     };
     if labels.is_empty() {

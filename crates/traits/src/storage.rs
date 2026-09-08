@@ -9,6 +9,7 @@
 //! future backend needs async I/O (e.g. a remote KV), it can wrap sync
 //! methods in `tokio::task::spawn_blocking`.
 
+use crate::app_components::AppComponentData;
 use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
 use crate::convergence_pass::DurableConvergencePass;
 use crate::engine::{GroupEvent, SendIntent};
@@ -17,7 +18,7 @@ use crate::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
     MaintenanceObligation, PeriodicMaintenancePolicy,
 };
-use crate::message::{MessageRecord, MessageState};
+use crate::message::{DeferredMessageMetadata, MessageRecord, MessageState};
 use crate::transport_adapter::OutboundFanout;
 use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
@@ -210,6 +211,15 @@ pub trait MessageStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()>;
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord>;
     fn delete_message(&self, id: &MessageId) -> StorageResult<()>;
+
+    /// Release retained transport bytes without a terminal deduplication verdict.
+    /// Backends with host receipt bookkeeping must atomically retain evidence
+    /// that those receipts are obsolete, so losing the engine event cannot
+    /// prevent exact-id redelivery. Backends without such bookkeeping may delete.
+    fn release_message_for_replay(&self, record: &MessageRecord) -> StorageResult<()> {
+        self.delete_message(&record.id)
+    }
+
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()>;
     fn list_messages(
         &self,
@@ -250,6 +260,21 @@ pub trait MessageStorage {
             .list_messages(group_id, at_or_after_epoch)?
             .into_iter()
             .filter(|record| states.contains(&record.state))
+            .collect())
+    }
+
+    /// Deferred rows in the same stable order as `list_messages_in_states`,
+    /// without copying payload bytes when the backend supports separate metadata.
+    /// This is a complete metadata enumeration: callers must still discover work
+    /// behind an already-attempted prefix. Legacy backends may use the fallback.
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DeferredMessageMetadata>> {
+        Ok(self
+            .list_messages_in_states(group_id, &[MessageState::PeelDeferred], EpochId(0))?
+            .into_iter()
+            .map(DeferredMessageMetadata::from)
             .collect())
     }
 
@@ -372,6 +397,48 @@ pub struct QueuedOutboundIntent {
     pub group_id: GroupId,
     pub intent: SendIntent,
     pub created_at_ms: u64,
+    /// How many times convergence has already superseded a commit carrying
+    /// this intent and re-queued it (mdk#1734). Bounded by the engine so a
+    /// perpetually losing edit cannot re-issue forever.
+    #[serde(default)]
+    pub reissue_attempts: u32,
+}
+
+/// The group state an own commit's intent was authored against, so a later
+/// supersession can tell "the winner left my field alone" from "the winner
+/// changed the same field" (mdk#1734).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnCommitBaseline {
+    /// Membership intents carry no value to compare; validity is whether the
+    /// targets are still members.
+    None,
+    /// The profile as it stood before an `UpdateGroupData` commit.
+    GroupProfile { name: String, description: String },
+    /// The exact bytes of every component an `UpdateAppComponents` commit
+    /// replaced, as they stood before it.
+    AppComponents { components: Vec<AppComponentData> },
+}
+
+/// The intent behind a commit this device staged. A confirmed commit can still
+/// be parked by convergence for as long as it sits inside the group's rewind
+/// horizon, so the record outlives publication: it is removed when the publish
+/// is rolled back, when a supersession has been decided, or once the commit's
+/// source epoch falls below the horizon. When convergence parks the commit, the
+/// record is what lets the engine re-issue the intent against the canonical
+/// state or report why it cannot (mdk#1734).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnCommitIntent {
+    /// Transport `MessageId` of the staged commit.
+    pub commit_id: MessageId,
+    pub group_id: GroupId,
+    /// Epoch the commit was staged from.
+    pub source_epoch: EpochId,
+    pub intent: SendIntent,
+    pub baseline: OwnCommitBaseline,
+    #[serde(default)]
+    pub reissue_attempts: u32,
+    pub created_at_ms: u64,
 }
 
 pub trait OutboundIntentStorage {
@@ -381,6 +448,18 @@ pub trait OutboundIntentStorage {
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>>;
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()>;
+
+    /// Record or replace the intent behind a staged own commit.
+    fn put_own_commit_intent(&self, record: &OwnCommitIntent) -> StorageResult<()>;
+    fn own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<Option<OwnCommitIntent>>;
+    /// Every retained own-commit intent, or only one group's when `group_id`
+    /// is given, in staging order.
+    fn list_own_commit_intents(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> StorageResult<Vec<OwnCommitIntent>>;
+    /// Idempotent: a commit that never recorded an intent is not an error.
+    fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()>;
 }
 
 // ── OutboundFanoutStorage ──────────────────────────────────────────────────
@@ -737,23 +816,23 @@ pub trait ConvergencePassStorage {
 
 // ── DeferredPeelGenerationStorage ────────────────────────────────────────
 
-/// Durable barrier for one contested deferred-peel evidence generation.
+/// Durable barrier for one deferred-peel evidence generation.
 ///
-/// A contested sweep may recover several messages before it has examined the
-/// complete deferred set. Applying convergence to that prefix can freeze a
-/// verdict that later evidence would have changed. The engine therefore
-/// persists this marker before buffering the first recovered contested row and
+/// A sweep may recover several messages before it has examined the complete
+/// deferred set. Applying convergence to that prefix can freeze an incomplete
+/// branch verdict or prune an epoch before its raw application rows are peeled.
+/// The engine therefore persists this marker before buffering recovered rows and
 /// clears it only after every row has received a definitive result under the
 /// final peel-context fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredPeelGeneration {
-    /// MLS group whose deferred rows belong to this contested generation.
+    /// MLS group whose deferred rows belong to this generation.
     pub group_id: GroupId,
     /// Complete peel-context fingerprint that defines this generation.
     pub context_fingerprint: [u8; 32],
 }
 
-/// Persistence for the contested deferred-peel generation barrier.
+/// Persistence for the deferred-peel generation barrier.
 pub trait DeferredPeelGenerationStorage {
     /// Return the active generation barrier for `group_id`, if any.
     fn deferred_peel_generation(

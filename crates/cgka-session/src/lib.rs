@@ -14,7 +14,7 @@ use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage,
-    SendIntent, SendResult,
+    SendIntent, SendResult, SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -1067,6 +1067,31 @@ impl AccountDeviceSession {
         group_id: &GroupId,
     ) -> SessionResult<Option<u64>> {
         Ok(self.engine.deferred_peel_cutoff_delay_ms(group_id)?)
+    }
+
+    /// See `Engine::reissue_superseded_own_commit` (mdk#1734).
+    pub fn reissue_superseded_own_commit(
+        &mut self,
+        commit_id: &MessageId,
+    ) -> SessionResult<Option<SupersededIntentReport>> {
+        Ok(self.engine.reissue_superseded_own_commit(commit_id)?)
+    }
+
+    /// See `Engine::reissue_superseded_own_commits_from_state` (mdk#1734).
+    pub fn reissue_superseded_own_commits_from_state(
+        &mut self,
+    ) -> SessionResult<Vec<SupersededIntentReport>> {
+        Ok(self.engine.reissue_superseded_own_commits_from_state()?)
+    }
+
+    /// See `Engine::scheduled_self_remove_auto_commit_delay_ms`.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<u64>> {
+        Ok(self
+            .engine
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
     }
 
     pub fn confirm_regenerated_queued_intent(

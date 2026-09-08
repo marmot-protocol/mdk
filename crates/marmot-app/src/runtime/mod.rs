@@ -57,11 +57,13 @@ use crate::{
     default_profile_pseudonym, unix_now_seconds,
 };
 
-mod account_worker;
+pub(crate) mod account_worker;
 mod agent_stream_watch;
 mod audit_tracker;
 mod commands;
 mod event_routing;
+mod onboarding;
+pub use onboarding::*;
 mod subscriptions;
 
 // Re-export the public surface so `crate::runtime::Item` and the
@@ -182,6 +184,8 @@ pub struct AccountManager {
     tearing_down: Arc<StdMutex<HashSet<String>>>,
     worker_transactions: Arc<Mutex<()>>,
     generated_setup_local_transaction: Arc<Mutex<()>>,
+    onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
+    onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
@@ -200,6 +204,9 @@ struct GeneratedSetupTasks {
 }
 
 const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
+// Existing-account discovery includes two relay-list hops and an advisory
+// profile read, each bounded by connection and fetch budgets (5s + 3s).
+const ACCOUNT_DIRECTORY_PREFLIGHT_WAIT: Duration = Duration::from_secs(26);
 const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
@@ -223,6 +230,10 @@ pub struct RuntimeSharedServices {
     /// scheduler timing. Consulted only with the `test-policy-overrides`
     /// feature; always `None` in production.
     create_group_catch_up_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    next_startup_sync_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    next_scheduled_convergence_barrier: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
@@ -301,6 +312,10 @@ impl Default for RuntimeSharedServices {
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -327,6 +342,10 @@ impl RuntimeSharedServices {
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
+            #[cfg(any(test, feature = "test-policy-overrides"))]
+            next_scheduled_convergence_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -353,6 +372,36 @@ impl RuntimeSharedServices {
 
     fn create_group_catch_up_barrier(&self) -> Option<Arc<tokio::sync::Notify>> {
         self.create_group_catch_up_barrier.lock().unwrap().clone()
+    }
+
+    /// Test-only hook: rendezvous once when the next worker reaches initial
+    /// sync, then again to release it after read assertions. Consumed once so
+    /// later restarts cannot inherit it.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub fn set_next_startup_sync_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.next_startup_sync_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    fn take_next_startup_sync_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.next_startup_sync_barrier.lock().unwrap().take()
+    }
+
+    /// Test-only hook: hold the next scheduled convergence pass between two
+    /// rendezvous so public read responsiveness can be checked deterministically.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    #[doc(hidden)]
+    pub fn set_next_scheduled_convergence_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.next_scheduled_convergence_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    fn take_next_scheduled_convergence_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.next_scheduled_convergence_barrier
+            .lock()
+            .unwrap()
+            .take()
     }
 
     pub(crate) fn lifecycle(&self) -> RuntimeLifecycle {
@@ -1108,6 +1157,22 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
         stalled_epoch: u64,
         arms: u32,
+    },
+    /// Convergence superseded a commit this device authored after its command
+    /// had already returned success (mdk#1734). `outcome` says what became of
+    /// the change: re-queued and about to be re-issued, or dropped for the
+    /// stated `reason` (the winner changed the same field, the request is
+    /// already satisfied, an invite needs fresh material, or the engine gave
+    /// up). Hosts should tell the user when a change they saw saved was not
+    /// re-applied.
+    GroupChangeSuperseded {
+        account_id_hex: String,
+        account_label: String,
+        group_id: GroupId,
+        commit_id_hex: String,
+        kind: cgka_traits::engine::SupersededIntentKind,
+        outcome: cgka_traits::engine::SupersededIntentOutcome,
+        reason: &'static str,
     },
 }
 
@@ -2258,6 +2323,14 @@ impl MarmotAppRuntime {
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
         let config = self.shared.audit_log_tracker_config();
         post_audit_log_tracker_update_for_app(&self.accounts.app, config).await
+    }
+
+    /// Test-only per-runtime window override; production keeps the 30-second default.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub fn set_audit_log_batch_window_for_test(&self, duration: Duration) {
+        if let Some(uploader) = &self.shared.audit_log_tracker_uploader {
+            uploader.set_batch_window_for_test(duration);
+        }
     }
 
     /// Test seam: fire one tracker trigger through the same scheduling path
@@ -3980,6 +4053,13 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         if self
             .accounts
+            .onboarding_snapshot(account_ref)?
+            .is_some_and(|s| !s.ready)
+        {
+            return Ok(AccountSetupReadiness::Initializing);
+        }
+        if self
+            .accounts
             .app
             .legacy_incomplete_setup_requires_recovery(&account.label)?
         {
@@ -4699,6 +4779,8 @@ impl AccountManager {
             tearing_down: Arc::new(StdMutex::new(HashSet::new())),
             worker_transactions: Arc::new(Mutex::new(())),
             generated_setup_local_transaction: Arc::new(Mutex::new(())),
+            onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
+            onboarding_updates: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
@@ -4827,6 +4909,10 @@ impl AccountManager {
             // account live, and a live external-signer account still needs its
             // signer to reconcile.
             self.app.forget_external_signer(&account.account_id_hex);
+            self.onboarding_updates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&account.account_id_hex);
             Ok(())
         }
         .await;
@@ -4999,6 +5085,20 @@ impl AccountManager {
                                 && !account.signed_out
                                 && self.app.has_external_signer(&account.account_id_hex)))
                 })
+                .collect::<Vec<_>>();
+            let accounts = accounts
+                .into_iter()
+                .filter(
+                    |account| match self.onboarding_worker_allowed(&account.label) {
+                        Ok(allowed) => allowed,
+                        Err(error) => {
+                            tracing::warn!(target: "marmot_app::runtime", method = "reconcile",
+                                error_kind = error.privacy_safe_kind(),
+                                "gated one account with an unreadable onboarding checkpoint");
+                            false
+                        }
+                    },
+                )
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -5336,6 +5436,22 @@ impl AccountManager {
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
+        self.require_onboarding_complete_for(&account)?;
+        self.worker_commands_for_account(account).await
+    }
+
+    async fn worker_commands_for_setup(
+        &self,
+        account_ref: &str,
+    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        self.worker_commands_for_account(account).await
+    }
+    async fn worker_commands_for_account(
+        &self,
+        account: AccountSummary,
+    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
@@ -5374,6 +5490,16 @@ impl AccountManager {
             .map(|value| value.as_str())
             .or(request.identity.as_deref());
         let (mut account, private_key_import) = if let Some(identity) = identity_key {
+            let account_id = if crate::is_nostr_secret(identity) {
+                AccountHome::account_id_for_secret(identity)?
+            } else {
+                AccountHome::account_id_for_public_key(identity)?
+            };
+            match self.app.account_home().account(&account_id) {
+                Ok(account) => self.require_onboarding_complete(&account.label)?,
+                Err(AccountHomeError::UnknownAccount(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
             match self.signed_out_account_for_identity(identity)? {
                 Some(account) => (account, None),
                 None => self.create_nostr_account_from_setup(&request)?,
@@ -5392,7 +5518,7 @@ impl AccountManager {
                 // reactivation, exactly like the external-signer login path.
                 bounded_advisory_step(
                     &self.shared.app_performance_telemetry(),
-                    ACCOUNT_SETUP_ADVISORY_WAIT,
+                    ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                     "import_directory_preflight",
                     self.preflight_existing_account_directory(
                         &account.account_id_hex,
@@ -5594,6 +5720,9 @@ impl AccountManager {
             return Err(AppError::ExternalSignerMismatch);
         }
         let existing_account = self.app.account_home().account(&account_id_hex).ok();
+        if let Some(account) = existing_account.as_ref() {
+            self.require_onboarding_complete(&account.label)?;
+        }
         let created_account = existing_account.is_none();
         // add_external_signer_account below promotes a pre-existing tracked
         // (public) account to external_signing, so a later setup failure must
@@ -5640,7 +5769,7 @@ impl AccountManager {
         // so a stalled indexer must not hold the whole login hostage.
         let recent_relay_lists = bounded_advisory_step(
             &self.shared.app_performance_telemetry(),
-            ACCOUNT_SETUP_ADVISORY_WAIT,
+            ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
             "login_directory_preflight",
             self.preflight_existing_account_directory(
                 &account.account_id_hex,
@@ -5706,7 +5835,7 @@ impl AccountManager {
             None
         };
 
-        // Advisory refresh, same bound as the preflight above.
+        // Single-hop advisory refresh keeps the shorter profile-refresh bound.
         let _ = bounded_advisory_step(
             &self.shared.app_performance_telemetry(),
             ACCOUNT_SETUP_ADVISORY_WAIT,
@@ -5759,7 +5888,7 @@ impl AccountManager {
     ) -> Option<AccountRelayListStatus> {
         let status = match self
             .app
-            .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
+            .resolve_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
             .await
         {
             Ok(status) => status,
@@ -5953,11 +6082,11 @@ impl AccountManager {
                 } else {
                     match bounded_advisory_step(
                         &self.shared.app_performance_telemetry(),
-                        ACCOUNT_SETUP_ADVISORY_WAIT,
+                        ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
-                        self.app.fetch_account_relay_list_status_for_account_id(
+                        self.app.resolve_account_relay_list_status_for_account_id(
                             &account.account_id_hex,
-                            bootstrap.bootstrap_relays.clone(),
+                            directory_discovery_relays_for_setup(request),
                         ),
                     )
                     .await
@@ -5970,10 +6099,18 @@ impl AccountManager {
                                 error_kind = error.privacy_safe_kind(),
                                 "import relay-list discovery failed; refusing to publish defaults"
                             );
-                            return self.complete_cached_relay_list_status(&account.label);
+                            return self
+                                .complete_cached_relay_list_status(&account.label)
+                                .or(Err(error));
                         }
                         None => {
-                            return self.complete_cached_relay_list_status(&account.label);
+                            return self
+                                .complete_cached_relay_list_status(&account.label)
+                                .map_err(|_| {
+                                    AppError::RelayDirectory(
+                                        "relay-list discovery timed out".to_owned(),
+                                    )
+                                });
                         }
                     }
                 };
@@ -6018,7 +6155,7 @@ impl AccountManager {
                 return Err(AppError::MissingDefaultRelays);
             }
             self.app
-                .fetch_account_relay_list_status_for_account_id(
+                .resolve_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     bootstrap_relays,
                 )
@@ -6344,6 +6481,10 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        self.onboarding_updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let generated_setup_tasks = {
             let mut tasks = self
                 .generated_setup_tasks

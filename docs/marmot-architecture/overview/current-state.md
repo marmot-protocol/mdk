@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-06
+updated: 2026-09-07
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,20 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+Deferred transport resource release now preserves app replay eligibility across
+lost engine effects and restart. SQLCipher records release evidence atomically
+with raw-byte deletion; app recovery retires both inventory and duplicate
+receipts before readmission. See [released transport receipts](../storage-format-v2.md#released-transport-receipts).
+The production retention and retry limits remain unchanged.
+
+MDK now exposes opt-in durable onboarding for imported identities, with per-step
+validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
+It requires single-device acknowledgment before KeyPackage publication and offers
+advisory detection of packages that may belong to another installation.
+Account onboarding gates normal worker commands until required checks and
+KeyPackage publication complete. Host apps still need to adopt the identity-only
+entry points and render the screen; see the [binding integration contract](../../../crates/marmot-uniffi/README.md#interactive-account-onboarding).
 
 Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the
 unifying bump above the previous `0.8.0` release), Marmot-TS gives us an independent TypeScript implementation, and the
@@ -38,6 +52,10 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 
 - **Distributed convergence** — deterministic branch selection for unordered transport input, including the durable
   frozen-pass boundary, in [`../distributed-convergence.md`](../distributed-convergence.md)
+- **Bounded offline recovery** — background deferred peeling shares a row/time budget and reuses historical
+  contexts within each sweep. The local public app regression recovers all 1,024 backlog messages, exchanges fresh
+  traffic and preserves the timeline after restart; see
+  [`APP_PATH_COVERAGE.md`](../../../crates/cgka-conformance-simulator/APP_PATH_COVERAGE.md) for scope and evidence.
 
 **In PR / design:**
 
@@ -55,6 +73,12 @@ one-second selection-relevant quiescence window and five-second absolute cap, re
 only its digest-bound membership set, and uses independent runtime deadlines so traffic in one group cannot postpone
 another group.
 
+Relay reconciliation replay progress is owned by each account's encrypted route state. It survives
+subscription rebuilds and empty or failed comparisons, and advances before fetch I/O independently
+of admitted event inventory. Retired routes are counted separately from reconciliation failures.
+The SDK requires a route-scoped progress store instead of evicting cursors from a shared cache;
+see [reconciliation progress ownership](../../../crates/transport-nostr-adapter/README.md#reconciliation-progress-ownership).
+
 ## Protocol implementations
 
 ### MDK (this repository)
@@ -68,6 +92,12 @@ idempotent Blossom upload, and canonical group creation are separate host-visibl
 uploaded founding metadata and performs no media transfer; the older all-in-one founding-image API keeps its existing
 uploaded-before-success semantics while also enforcing the new group-image byte, dimension, pixel, and format limits
 before canonical creation.
+
+The workspace maintains a compile-only browser WASM boundary for `cgka-traits`, `cgka-engine`, and
+`transport-nostr-peeler` on `wasm32-unknown-unknown`. Required CI keeps those three libraries compiling with
+warnings denied, and `just wasm-check` provides the matching local gate. This is a portability boundary, not a
+browser-runtime acceptance claim: SQLCipher storage, `marmot-app`, UniFFI/C bindings, the CLI, and daemons remain
+outside its scope, and browser execution still requires downstream acceptance coverage.
 
 Hosts can also send app-defined custom events: any non-reserved application event kind with verbatim tags and content,
 through `marmot-app`, the MarmotKit bindings, or `wn messages send-event`. Stored events are queryable by kind on

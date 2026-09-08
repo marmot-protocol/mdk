@@ -189,6 +189,32 @@ impl RelayControl {
         before: usize,
         expectation: RelayActionExpectation<'_>,
     ) -> Result<(), RelayControlError> {
+        self.wait_for_action_events_inner(action_events, action_id, before, expectation, false)
+            .await
+    }
+
+    /// Correlate an action with a complete set of public transport identities.
+    /// Other runtime work can publish in the same interval; those events stay
+    /// on the relay but must never become targets of this action's selectors.
+    pub async fn wait_for_exact_action_events(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+    ) -> Result<(), RelayControlError> {
+        self.wait_for_action_events_inner(action_events, action_id, before, expectation, true)
+            .await
+    }
+
+    async fn wait_for_action_events_inner(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+        exact_identity: bool,
+    ) -> Result<(), RelayControlError> {
         let RelayActionExpectation {
             include_welcomes,
             expected_publications,
@@ -202,11 +228,26 @@ impl RelayControl {
             });
         }
         let expected_event_ids = expected_event_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if exact_identity && expected_event_ids.len() != expected_publications {
+            return Err(RelayControlError {
+                code: "relay_action_publication_identity_count_mismatch",
+                message: "exact action correlation requires every publication identity",
+            });
+        }
         let deadline = Instant::now() + timeout;
         loop {
-            let recorded = self
-                .record_action_events(action_events, action_id, before, include_welcomes)
+            self.record_action_events(action_events, action_id, before, include_welcomes)
                 .await?;
+            if exact_identity {
+                let mut seen = BTreeSet::new();
+                if let Some(events) = action_events.get_mut(action_id) {
+                    events.retain(|event| {
+                        expected_event_ids.contains(&event.event.id.to_hex())
+                            && seen.insert(event.event.id)
+                    });
+                }
+            }
+            let recorded = action_events.get(action_id).map_or(0, Vec::len);
             let observed_event_ids = action_events
                 .get(action_id)
                 .into_iter()
@@ -233,6 +274,58 @@ impl RelayControl {
                     code: "relay_action_publication_count_mismatch",
                     message: "the process action published more retained relay events than expected",
                 });
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayControlError {
+                    code: "relay_action_publication_timeout",
+                    message: "the action's expected retained relay publications were not admitted before the deadline",
+                });
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Like [`Self::wait_for_action_events`], but admitted events beyond the
+    /// expected count are tolerated and the admitted count is returned. Use it
+    /// for concurrently issued commands: convergence may legitimately publish
+    /// recovery commits inside the window, and a rejected command may have
+    /// reached the relay before failing, so an exact count is not a meaningful
+    /// correlation there. The accepted publications must still all appear.
+    pub async fn wait_for_at_least_action_events(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        expectation: RelayActionExpectation<'_>,
+    ) -> Result<usize, RelayControlError> {
+        let RelayActionExpectation {
+            include_welcomes,
+            expected_publications,
+            expected_event_ids,
+            timeout,
+        } = expectation;
+        if expected_event_ids.len() > expected_publications {
+            return Err(RelayControlError {
+                code: "relay_action_publication_identity_count_mismatch",
+                message: "the action's expected relay event ids do not match its publication count",
+            });
+        }
+        let expected_event_ids = expected_event_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let recorded = self
+                .record_action_events(action_events, action_id, before, include_welcomes)
+                .await?;
+            let observed_event_ids = action_events
+                .get(action_id)
+                .into_iter()
+                .flatten()
+                .map(|event| event.event.id.to_hex())
+                .collect::<BTreeSet<_>>();
+            if recorded >= expected_publications
+                && expected_event_ids.is_subset(&observed_event_ids)
+            {
+                return Ok(recorded);
             }
             if Instant::now() >= deadline {
                 return Err(RelayControlError {
@@ -440,6 +533,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_action_identity_waits_for_its_event_and_excludes_concurrent_work() {
+        let control = RelayControl::new();
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&control.publication_log),
+            hidden_event_ids: Arc::clone(&control.hidden_event_ids),
+        };
+        let keys = nostr::Keys::generate();
+        let maintenance = nostr::EventBuilder::new(Kind::MlsGroupMessage, "queued maintenance")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let current = nostr::EventBuilder::new(Kind::MlsGroupMessage, "current action")
+            .sign_with_keys(&keys)
+            .unwrap();
+        database.save_event(&maintenance).await.unwrap();
+        let expected_ids = [current.id.to_hex()];
+        let expectation = || RelayActionExpectation {
+            include_welcomes: false,
+            expected_publications: 1,
+            expected_event_ids: &expected_ids,
+            timeout: Duration::ZERO,
+        };
+        let mut actions = RelayActionEvents::new();
+        let error = control
+            .wait_for_exact_action_events(&mut actions, "current", 0, expectation())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "relay_action_publication_timeout");
+        assert!(actions["current"].is_empty());
+
+        database.save_event(&current).await.unwrap();
+        control
+            .wait_for_exact_action_events(&mut actions, "current", 0, expectation())
+            .await
+            .unwrap();
+        assert_eq!(actions["current"].len(), 1);
+        assert_eq!(actions["current"][0].event.id, current.id);
+        assert_eq!(actions["current"][0].publication_sequence, 1);
+        let selector = ScenarioMessageSelectorV2 {
+            action_id: Some("current".into()),
+            occurrence: 0,
+            ..Default::default()
+        };
+        control
+            .set_action_event_visibility(&actions, &selector, false)
+            .await
+            .unwrap();
+        assert!(database.event_by_id(&current.id).await.unwrap().is_none());
+        assert!(
+            database
+                .event_by_id(&maintenance.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let error = control
+            .wait_for_exact_action_events(
+                &mut actions,
+                "incomplete",
+                0,
+                RelayActionExpectation {
+                    include_welcomes: false,
+                    expected_publications: 1,
+                    expected_event_ids: &[],
+                    timeout: Duration::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            "relay_action_publication_identity_count_mismatch"
+        );
+    }
+
+    #[tokio::test]
     async fn action_identity_rejects_a_delayed_publication_from_an_earlier_action() {
         let control = RelayControl::new();
         let database = RecordingRelayDatabase {
@@ -481,5 +654,105 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "relay_action_publication_identity_mismatch");
+    }
+
+    #[tokio::test]
+    async fn at_least_waiter_requires_accepted_ids_but_tolerates_additional_admissions() {
+        let control = RelayControl::new();
+        let database = RecordingRelayDatabase {
+            inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
+                events: true,
+                max_events: None,
+            }),
+            publication_log: Arc::clone(&control.publication_log),
+            hidden_event_ids: Arc::clone(&control.hidden_event_ids),
+        };
+        let keys = nostr::Keys::generate();
+        let accepted = nostr::EventBuilder::new(Kind::MlsGroupMessage, "accepted commit")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let recovery = nostr::EventBuilder::new(Kind::MlsGroupMessage, "convergence recovery")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let welcome = nostr::EventBuilder::new(Kind::GiftWrap, "early welcome")
+            .sign_with_keys(&keys)
+            .unwrap();
+        for event in [&recovery, &welcome] {
+            assert!(database.save_event(event).await.unwrap().is_success());
+        }
+        let accepted_ids = [accepted.id.to_hex()];
+        let expectation = || RelayActionExpectation {
+            include_welcomes: true,
+            expected_publications: 1,
+            expected_event_ids: &accepted_ids,
+            timeout: Duration::from_millis(200),
+        };
+
+        // Two unrelated admissions do not satisfy the wait: the accepted
+        // command's own event must appear.
+        let mut action_events = RelayActionEvents::new();
+        let missing = control
+            .wait_for_at_least_action_events(&mut action_events, "race", 0, expectation())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "relay_action_publication_timeout");
+
+        // Once it does, the additional admissions are counted, not rejected,
+        // where the exact waiter would report a count mismatch.
+        assert!(database.save_event(&accepted).await.unwrap().is_success());
+        let admitted = control
+            .wait_for_at_least_action_events(&mut action_events, "race", 0, expectation())
+            .await
+            .unwrap();
+        assert_eq!(admitted, 3);
+        let exact = control
+            .wait_for_action_events(&mut action_events, "race-exact", 0, expectation())
+            .await
+            .unwrap_err();
+        assert_eq!(exact.code, "relay_action_publication_identity_mismatch");
+
+        // A chat plus queued maintenance has two publications but only the
+        // chat's known identity. Count correlation must still require that id.
+        for (id, succeeds) in [(accepted.id.to_hex(), true), ("missing".to_owned(), false)] {
+            let result = control
+                .wait_for_action_events(
+                    &mut RelayActionEvents::new(),
+                    "chat-and-maintenance",
+                    0,
+                    RelayActionExpectation {
+                        include_welcomes: false,
+                        expected_publications: 2,
+                        expected_event_ids: &[id],
+                        timeout: Duration::from_millis(50),
+                    },
+                )
+                .await;
+            if succeeds {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code, "relay_action_publication_timeout");
+            }
+        }
+
+        // Both waiters refuse an id list longer than the publication count.
+        let two_ids = [accepted.id.to_hex(), recovery.id.to_hex()];
+        let inconsistent = control
+            .wait_for_at_least_action_events(
+                &mut action_events,
+                "race-inconsistent",
+                0,
+                RelayActionExpectation {
+                    include_welcomes: true,
+                    expected_publications: 1,
+                    expected_event_ids: &two_ids,
+                    timeout: Duration::from_millis(50),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            inconsistent.code,
+            "relay_action_publication_identity_count_mismatch"
+        );
     }
 }

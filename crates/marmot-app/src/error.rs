@@ -83,6 +83,15 @@ pub enum AppError {
     InvalidChatPin(String),
     #[error("group is disbanding or disbanded; outbound work is blocked")]
     GroupDisbanding(String),
+    /// This device is out of a group that goes on without it: an admin's
+    /// removal (or a realized self-eviction) has been adopted locally, so no
+    /// further outbound work can ever be published for it.
+    ///
+    /// Deliberately distinct from [`AppError::GroupDisbanding`]: the group
+    /// still exists for its remaining members, and a host that reports
+    /// "disbanding" for it tells the user something false.
+    #[error("this device was removed from the group; outbound work is blocked")]
+    GroupRemoved(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
@@ -202,6 +211,10 @@ pub enum AppError {
     AccountSetupRecoveryRequired,
     #[error("durable account setup can be resumed by retrying the original operation")]
     AccountSetupRetryRequired,
+    #[error("onboarding action is unavailable or stale")]
+    OnboardingActionUnavailable,
+    #[error("account must complete interactive onboarding")]
+    OnboardingRequired,
     #[error("account is not in the legacy incomplete-setup reset state")]
     AccountSetupResetNotApplicable,
     #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
@@ -256,6 +269,7 @@ impl AppError {
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
+            Self::GroupRemoved(_) => "group_removed",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
@@ -300,6 +314,8 @@ impl AppError {
             Self::AccountWorkerBusy => "account_worker_busy",
             Self::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
             Self::AccountSetupRecoveryRequired => "account_setup_recovery_required",
+            Self::OnboardingActionUnavailable => "onboarding_action_unavailable",
+            Self::OnboardingRequired => "onboarding_required",
             Self::AccountSetupRetryRequired => "account_setup_retry_required",
             Self::AccountSetupResetNotApplicable => "account_setup_reset_not_applicable",
             Self::AccountSetupKeyPackageRecoveryAvailable => {

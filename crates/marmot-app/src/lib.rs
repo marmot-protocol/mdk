@@ -102,22 +102,30 @@ mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
 
+pub use cgka_traits::engine::{
+    SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
+pub use marmot_account::MaintenanceTiming;
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountManager, AccountSetupReadiness, AccountSetupRequest, AccountSetupResult,
     AgentStreamWatchOptions, AgentTextStreamCryptoContext, CatchUpAccountsSummary,
     ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport, ManagedAccount, MarmotAppEvent,
-    MarmotAppRuntime, RelayFailure, RuntimeAccountError, RuntimeAgentStreamMessage,
-    RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
-    RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
-    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
-    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
-    RuntimeSharedServices, RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription,
-    SignOutOptions, SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    MarmotAppRuntime, OnboardingAction, OnboardingDeviceDiscovery, OnboardingDevicePackage,
+    OnboardingFinding, OnboardingIssue, OnboardingOptions, OnboardingRepairProposal,
+    OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
+    OnboardingStepState, OnboardingSubscription, RelayFailure, RuntimeAccountError,
+    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
+    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
+    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
+    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
     default_directory_discovery_relays,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
@@ -1731,16 +1739,21 @@ impl MarmotApp {
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
+            pending_superseded_change_events: Vec::new(),
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
             epoch_backfill_retry_not_before: None,
             pending_epoch_backfill: None,
+            released_backfill_reload_pending: false,
+            #[cfg(test)]
+            fail_next_released_backfill_reload: false,
             queued_epoch_backfills: std::collections::VecDeque::new(),
             post_join_maintenance_subscriptions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };
+        client.reconcile_released_transport_receipts()?;
         let persisted_backfills = self.pending_epoch_backfill_intents(&client.state.label)?;
         client.restore_persisted_epoch_backfill_intents(persisted_backfills);
         let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
@@ -3210,8 +3223,24 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        self.account_storage(&account.label)?
-            .set_group_self_membership(group_id_hex, membership)?;
+        let storage = self.account_storage(&account.label)?;
+        // A voluntary departure stays voluntary. `Left` is written the moment
+        // this device publishes its leave; the commit that later realizes it
+        // is authored by a peer, and the roster-derived classification of
+        // that commit reads as an eviction. Now that peers apply a leave
+        // within seconds (mdk#1736) the two writes land back to back, so the
+        // eviction must never overwrite the recorded intent.
+        if membership == SelfMembership::Removed
+            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        {
+            tracing::debug!(
+                target: "marmot_app",
+                method = "set_group_self_membership",
+                "keeping voluntary Left classification over a realized removal"
+            );
+            return Ok(());
+        }
+        storage.set_group_self_membership(group_id_hex, membership)?;
         Ok(())
     }
 
@@ -3647,8 +3676,11 @@ impl MarmotApp {
             signer: signer.clone(),
         };
         let routing = self.routing_for(&state)?;
-        let runtime =
+        let mut runtime =
             AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+        if let Some(timing) = dev_maintenance_timing(&self.config) {
+            runtime = runtime.with_maintenance_timing(timing);
+        }
         Ok(OpenAppAccount {
             runtime,
             session_guard,
@@ -3725,6 +3757,11 @@ impl MarmotApp {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
+            // Live MLS state is deleted on disband, so the app-owned tombstone
+            // is the only readable terminal marker here: at a deferred open
+            // (mdk#1161) every engine group record answers `GroupNotHydrated`.
+            // Departures are reconciled against the engine record instead, in
+            // `reconcile_hydrated_account_state`.
             if disbanded_group_ids.contains(&hex::encode(group_id.as_slice())) {
                 continue;
             }
@@ -5249,13 +5286,16 @@ impl MarmotApp {
         message: &AppMessageProjection,
         received_at: u64,
     ) -> Result<AppProjectionUpdate, AppError> {
-        let storage_update = self
-            .account_storage(label)?
-            .record_app_event_with_retention(
+        // Keep source/retention and chat-list refresh atomic: a refresh failure
+        // must leave the accepted fanout able to reconstruct its completion.
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage.record_app_event_with_retention(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
             )?;
-        self.app_projection_update(label, storage_update)
+            self.app_projection_update(label, storage_update)
+        })
     }
 
     /// As [`Self::record_account_app_event`], but a conflicting row's
@@ -5268,13 +5308,15 @@ impl MarmotApp {
         message: &AppMessageProjection,
     ) -> Result<AppProjectionUpdate, AppError> {
         let now = unix_now_seconds();
-        let storage_update = self
-            .account_storage(label)?
-            .record_app_event_refreshing_moderation_grant_with_retention(
-                &stored_app_event_from_projection(message, now),
-                message.retention,
-            )?;
-        self.app_projection_update(label, storage_update)
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage
+                .record_app_event_refreshing_moderation_grant_with_retention(
+                    &stored_app_event_from_projection(message, now),
+                    message.retention,
+                )?;
+            self.app_projection_update(label, storage_update)
+        })
     }
 
     pub(crate) fn finalize_account_app_event_source_retention(
@@ -5286,16 +5328,19 @@ impl MarmotApp {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
-        self.account_storage(label)?
-            .finalize_app_event_source_retention(
-                group_id_hex,
-                message_id_hex,
-                source_message_id_hex,
-                source_epoch,
-                retention,
-            )?
-            .map(|update| self.app_projection_update(label, update))
-            .transpose()
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .finalize_app_event_source_retention(
+                    group_id_hex,
+                    message_id_hex,
+                    source_message_id_hex,
+                    source_epoch,
+                    retention,
+                )?
+                .map(|update| self.app_projection_update(label, update))
+                .transpose()
+        })
     }
 
     pub(crate) fn invalidate_timeline_source_message(
@@ -5912,6 +5957,24 @@ pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -
         AppError::ExternalSignerRejected
     } else {
         AppError::from(error)
+    }
+}
+
+/// The maintenance scheduling override a runtime should apply, if any.
+/// Production always runs [`MaintenanceTiming::default`]: the knob is honored
+/// only in explicit `test-policy-overrides` builds, and a configured value in
+/// any other build is reported and ignored.
+fn dev_maintenance_timing(config: &MarmotAppConfig) -> Option<MaintenanceTiming> {
+    let timing = config.dev_maintenance_timing?;
+    if cfg!(feature = "test-policy-overrides") {
+        Some(timing)
+    } else {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "open_account",
+            "ignoring dev_maintenance_timing without test-policy-overrides; production maintenance windows required"
+        );
+        None
     }
 }
 

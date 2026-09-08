@@ -24,3 +24,5 @@ pub mod push;
 pub mod relay;
 pub mod telemetry;
 pub mod timeline;
+
+pub mod onboarding;

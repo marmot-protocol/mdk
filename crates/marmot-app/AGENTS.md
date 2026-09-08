@@ -12,7 +12,7 @@ App runtime bridge for the first real Marmot app surfaces.
   `account_worker.rs` (the per-account worker: command enum, worker loop, reconnect backoff, runtime-event publishers),
   `subscriptions.rs` (the `Runtime*Subscription` handles and the materialized-timeline window), `commands.rs` (the
   `AccountManager` command-RPC wrappers that send a worker command and await its oneshot reply), `agent_stream_watch.rs`
-  (agent-text-stream discovery and the brokered-QUIC watch machinery), `audit_tracker.rs` (the forensic audit-log
+  (agent-text-stream discovery and the brokered-QUIC watch machinery), `onboarding.rs` and `onboarding/` (durable preflight, cancellation, and advisory installation detection), `audit_tracker.rs` (the forensic audit-log
   tracker upload worker), and `event_routing.rs` (pure `MarmotAppEvent` classification/routing helpers). Keep `mod.rs`
   re-exporting the moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
@@ -49,9 +49,17 @@ App runtime bridge for the first real Marmot app surfaces.
   unit tests live in its own `#[cfg(test)] mod tests`.
 - Keep audit uploads incremental (mdk#1181). An audit file whose size and mtime still match its checkpoint entry is
   never re-read or re-posted; only the growing active file re-transfers, bounded by the recorder's segment threshold.
-  Do not add a trigger path that bypasses the size-1 coalescing queue in `runtime/audit_tracker.rs`, and do not let one
-  oversized or failing file block the files behind it. Retention/deletion of sealed segments is mdk#1014, not this
-  contract.
+  Checkpoint only complete immutable upload snapshots after successful upload.
+  Defer an unfinished trailing JSONL row and preserve it for a later upload; an HTTP length limit alone is insufficient.
+  Automatic triggers use a fixed 30-second window and the size-1 coalescing queue in `runtime/audit_tracker.rs`.
+  Later triggers cannot postpone that window or shorten a failure cooldown. Manual upload APIs remain immediate.
+  Incomplete snapshots wait for the next trigger. Automatic failures retry after 60 seconds, doubling up to five
+  minutes; authentication failures wait at least five minutes, and Retry-After can extend the delay up to five minutes.
+  Stop automatic passes on endpoint-wide failures
+  (authentication, rate limits, server/transport failures); file-specific failures and oversized files must not block
+  the files behind them. Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
+  Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
+  Retention/deletion of sealed segments is mdk#1014, not this contract.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
   prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
   segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and

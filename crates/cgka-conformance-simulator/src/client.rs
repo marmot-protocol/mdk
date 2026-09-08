@@ -165,6 +165,7 @@ impl ScriptedConvergenceDrain {
             current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
             lifecycle: cgka_traits::engine_state::GroupLifecycleState::Stable,
             pending_work,
+            deferred_peel_completed_context_attempts: 0,
             pass_generation: Some(self.generation),
             pass_phase: Some(ConvergencePassPhase::Resolving),
             earliest_next_wake_monotonic_ms: None,
@@ -270,6 +271,9 @@ pub(crate) fn merge_engine_metrics(
     target.deferred_peel_sweeps = target
         .deferred_peel_sweeps
         .saturating_add(source.deferred_peel_sweeps);
+    target.deferred_lineage_classifications = target
+        .deferred_lineage_classifications
+        .saturating_add(source.deferred_lineage_classifications);
     target.deferred_peel_candidate_enumerations = target
         .deferred_peel_candidate_enumerations
         .saturating_add(source.deferred_peel_candidate_enumerations);
@@ -339,7 +343,8 @@ fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
 
 /// Rejects only an exact full-slice repeat of scheduled structural state.
 ///
-/// A durable pass-generation change counts as progress. More complex cycles
+/// A durable pass-generation or retained-row context-attempt change counts as
+/// progress. More complex cycles
 /// remain the scenario fixed-point driver's responsibility; this local guard
 /// exists to catch a scheduler that repeatedly re-arms the same state without
 /// turning the per-tick work bound into a convergence deadline.
@@ -374,6 +379,7 @@ fn convergence_drain_progress_key(
         current_epoch: snapshot.current_epoch,
         lifecycle: snapshot.lifecycle,
         pending_work,
+        deferred_peel_completed_context_attempts: snapshot.deferred_peel_completed_context_attempts,
         pass_generation: snapshot.pass_generation,
         pass_phase: snapshot.pass_phase,
         terminal_unrecoverable: snapshot.terminal_unrecoverable,
@@ -386,6 +392,7 @@ struct ConvergenceDrainProgressKey {
     current_epoch: u64,
     lifecycle: cgka_traits::engine_state::GroupLifecycleState,
     pending_work: cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot,
+    deferred_peel_completed_context_attempts: u64,
     pass_generation: Option<u64>,
     pass_phase: Option<ConvergencePassPhase>,
     terminal_unrecoverable: bool,
@@ -433,6 +440,7 @@ mod tests {
             foreground_deferred_errors: 43,
             foreground_deferred_budget_overrun_ms: histogram(44, 45, 46),
             deferred_peel_sweeps: 47,
+            deferred_lineage_classifications: 69,
             deferred_peel_candidate_enumerations: 48,
             deferred_peel_candidate_contexts: 49,
             deferred_peel_candidate_context_depth: histogram(50, 51, 52),
@@ -523,6 +531,31 @@ mod tests {
             &current,
         )
         .expect("a later pass generation is structural progress");
+    }
+
+    /// Trying more rows under the current context is durable progress even
+    /// when all of them remain opaque and the backlog count is unchanged.
+    #[test]
+    fn completed_deferred_context_attempts_count_as_convergence_drain_progress() {
+        let mut previous = structural_progress(7);
+        previous.pending_work.stored_transport_deferred_messages = 1_024;
+        previous.deferred_peel_completed_context_attempts = 1_086;
+        let mut current = previous.clone();
+        current.deferred_peel_completed_context_attempts = 1_598;
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &previous,
+            &current,
+        )
+        .expect("512 completed distinct-context attempts are useful work");
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &current,
+            &current,
+        )
+        .expect_err("retained rows without new attempts still cannot spin");
     }
 
     /// Twelve retained-history rounds can span an eight- plus four-pass slice.
@@ -662,6 +695,7 @@ mod tests {
             current_monotonic_ms: HARNESS_CONVERGENCE_SETTLED_AT_MS,
             lifecycle: GroupLifecycleState::Stable,
             pending_work: ConformancePendingWorkSnapshot::default(),
+            deferred_peel_completed_context_attempts: 0,
             pass_generation: Some(pass_generation),
             pass_phase: Some(ConvergencePassPhase::Resolving),
             earliest_next_wake_monotonic_ms: None,
@@ -2028,9 +2062,42 @@ impl HarnessClient {
     /// Drain the bus mailbox into the engine and simulate due convergence
     /// timer work. Returns ingest outcomes for each message in order.
     pub async fn tick(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
+        self.tick_with_transport_redelivery(false).await
+    }
+
+    /// A retained transport owns capacity-refused inputs and retries them on
+    /// its next turn. Do not spend that turn repeatedly advancing the engine
+    /// before the transport can offer the missing history again.
+    pub(crate) async fn tick_with_transport_redelivery(
+        &mut self,
+        redelivery_available: bool,
+    ) -> Vec<Result<IngestOutcome, EngineError>> {
         let mut outcomes = self.tick_ingest_only().await;
-        if let Some(gid) = self.default_group.clone() {
-            let now_ms = self.harness_convergence_now_ms();
+        let needs_redelivery = redelivery_available
+            && outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    Ok(IngestOutcome::ResourceRefused {
+                        resource:
+                            cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
+                        ..
+                    })
+                )
+            });
+        // A multi-group scenario selects the same group for every client,
+        // including clients outside its membership. Ingest still drains their
+        // other groups, but there is no selected group state to settle here.
+        if let Some(gid) = self.default_group.clone()
+            && self.has_active_group()
+        {
+            let now_ms = match self.harness_convergence_now_ms() {
+                Ok(now_ms) => now_ms,
+                Err(error) => {
+                    outcomes.push(Err(error));
+                    return outcomes;
+                }
+            };
+            let initial_epoch = self.engine().epoch(&gid).ok();
             // The legacy harness shortcut represents both sides of a timer
             // boundary in one tick. Give newly peeled inputs an explicit
             // pre-cutoff admission point before the far-future settlement
@@ -2045,6 +2112,11 @@ impl HarnessClient {
                 outcomes.push(Err(EngineError::Backend(format!(
                     "prepare buffered group: {e}"
                 ))));
+                return outcomes;
+            }
+            if needs_redelivery && self.engine().epoch(&gid).ok() != initial_epoch {
+                self.capture_engine_events();
+                self.drain_auto_publish().await;
                 return outcomes;
             }
             match self
@@ -2062,7 +2134,9 @@ impl HarnessClient {
             }
             self.capture_engine_events();
         }
-        self.drive_due_convergence(&mut outcomes).await;
+        if !needs_redelivery {
+            self.drive_due_convergence(&mut outcomes).await;
+        }
         self.drain_auto_publish().await;
         outcomes
     }
@@ -2197,7 +2271,13 @@ impl HarnessClient {
         &mut self,
         outcomes: &mut Vec<Result<IngestOutcome, EngineError>>,
     ) {
-        let now_ms = self.harness_convergence_now_ms();
+        let now_ms = match self.harness_convergence_now_ms() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                outcomes.push(Err(error));
+                return;
+            }
+        };
         let mut successful_attempts =
             HashMap::<GroupId, (usize, Option<ConformanceStructuralProgressSnapshot>)>::new();
         let mut encountered_error = false;
@@ -2272,15 +2352,27 @@ impl HarnessClient {
     /// A subject switches to its injected clock on the first virtual-time
     /// advance. Other harness clients retain the historical far-future
     /// settlement shortcut.
-    fn harness_convergence_now_ms(&self) -> u64 {
+    fn harness_convergence_now_ms(&self) -> Result<u64, EngineError> {
         if self.virtual_time_tick_enabled {
-            self.convergence_clock
+            return Ok(self
+                .convergence_clock
                 .as_ref()
                 .map(|clock| clock.now().monotonic_ms)
-                .unwrap_or(HARNESS_CONVERGENCE_SETTLED_AT_MS)
-        } else {
-            HARNESS_CONVERGENCE_SETTLED_AT_MS
+                .unwrap_or(HARNESS_CONVERGENCE_SETTLED_AT_MS));
         }
+        // A bounded catch-up can open another collection pass after the
+        // original far-future point. Reusing that fixed timestamp forever
+        // strands its later cutoff. Legacy ticks model due convergence,
+        // so include pending pass cutoffs, never retention/residence timers.
+        let mut now_ms = HARNESS_CONVERGENCE_SETTLED_AT_MS;
+        for group_id in self.engine().live_group_ids()? {
+            if let Some(pass) = self.storage().convergence_pass(&group_id)?
+                && pass.phase == ConvergencePassPhase::Collecting
+            {
+                now_ms = now_ms.max(pass.cutoff_monotonic_ms());
+            }
+        }
+        Ok(now_ms)
     }
 
     async fn publish_send_result(&mut self, result: SendResult) -> Result<(), EngineError> {

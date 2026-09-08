@@ -386,6 +386,9 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
+    /// (mdk#1734). Deduplicated by commit id across effect batches.
+    pub(crate) pending_superseded_change_events: Vec<cgka_traits::engine::SupersededIntentReport>,
     /// Canonical create/invite work whose Welcome fanout has not run yet.
     /// The managed account worker replies first, then drives this delivery.
     pub(crate) unpublished_welcome_delivery: Option<UnpublishedWelcomeDelivery>,
@@ -402,6 +405,13 @@ pub struct AppClient {
     pub(crate) epoch_backfill_retry_not_before: Option<Instant>,
     /// Armed epoch-gap recovery intent awaiting its account-wide replay.
     pub(crate) pending_epoch_backfill: Option<epoch_stall::PendingEpochBackfill>,
+    /// Release consumption durably armed recovery, but loading its intents
+    /// failed. Retry on this client even though the journal is already empty;
+    /// account open independently restores these intents after a restart.
+    pub(crate) released_backfill_reload_pending: bool,
+    /// One-shot storage-read failure after durable release consumption.
+    #[cfg(test)]
+    pub(crate) fail_next_released_backfill_reload: bool,
     /// Additional armed intents queued behind [`Self::pending_epoch_backfill`]
     /// when a replay failure must not overwrite a newer arm minted in flight.
     pub(crate) queued_epoch_backfills:
@@ -595,6 +605,19 @@ impl ObservedHumanActionAudit {
         self.to_epoch = to_epoch;
         self
     }
+}
+
+/// Whether the engine record marks this device terminal in the group (removed
+/// or disbanded), so no route for it may stay installed.
+///
+/// Only readable after hydration: at a deferred open (mdk#1161) every engine
+/// record answers `GroupNotHydrated`, which is why `routing_for` filters on the
+/// app-owned disband tombstone instead. Takes the runtime rather than the whole
+/// client so callers can hold a mutable borrow of the projection alongside it.
+pub(crate) fn group_is_terminal(runtime: &AppRuntime, group_id: &GroupId) -> bool {
+    runtime
+        .group_record(group_id)
+        .is_ok_and(|group| group.is_terminal())
 }
 
 fn record_app_performance(
@@ -3058,11 +3081,6 @@ impl AppClient {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
-        // Discarded deliberately, unlike on the convergence-retry path: the
-        // re-record below reprojects the same row with its new source id and
-        // hands that update to `on_local_projection`, so forwarding these too
-        // would emit the flip twice.
-        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let published = effects.published_app_messages.iter().find(|published| {
             published.group_id == *group_id && published.app_event_id == app_event_id
         });
@@ -3074,17 +3092,33 @@ impl AppClient {
         let source_state =
             published.map(|published| (published.source_epoch.0, published.retention));
         if should_project_locally {
-            let update = self.record_local_app_event_projection(
-                group_id,
-                &sender,
-                &event,
-                source_message_id_hex,
-                source_state,
-                published.is_some(),
-            )?;
-            on_local_projection(update);
-            self.prune_plaintext_retention_for_group(group_id)?;
+            let projection = (|| {
+                let update = self.record_local_app_event_projection(
+                    group_id,
+                    &sender,
+                    &event,
+                    source_message_id_hex,
+                    source_state,
+                    published.is_some(),
+                )?;
+                on_local_projection(update);
+                self.prune_plaintext_retention_for_group(group_id)
+            })();
+            if let Err(error) = projection {
+                self.pending_convergence_groups.insert(group_id.clone());
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "send_app_event_with_local_projection",
+                    error_kind = error.privacy_safe_kind(),
+                    "accepted application-message projection deferred",
+                );
+            }
         }
+        // Finalization skips an already-completed local projection, repairs
+        // failed source writes, and forwards sibling updates before retiring
+        // the accepted fanouts.
+        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        self.pending_projection_updates.extend(finalize_updates);
         // A send that lands while inbound convergence input is retained folds
         // those commits before publishing, so `effects.events` can carry peer
         // state changes (e.g. a mid-window group rename). Observe them through
@@ -3917,11 +3951,9 @@ impl AppClient {
         self.remember_published_reports(effects);
         // This is the path that releases sends the engine had retained, so its
         // finalize updates carry the pending -> delivered flip for each of them.
-        // Unlike the send path — which drops the same updates because it
-        // immediately re-records the row and hands that update to the caller —
-        // there is nothing here to re-emit them, so buffer them for the account
-        // worker to broadcast. Dropping them leaves storage delivered while
-        // every timeline and chat-list subscriber still shows pending.
+        // Buffer these updates for the account worker, as the direct send path
+        // does for sibling completions and deferred source repairs. Dropping
+        // them leaves subscribers pending even though storage is delivered.
         let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
         self.pending_projection_updates.extend(finalize_updates);
         let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
@@ -4017,12 +4049,22 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<(), AppError> {
         self.ensure_group(group_id)?;
-        let terminal = self
-            .runtime
-            .group_record(group_id)
-            .map(|group| group.disbanded.is_some())
-            .unwrap_or(false);
-        if terminal || self.runtime.disbanding_in_progress(group_id)? {
+        // One `is_terminal` gate, two errors. Both terminal reasons block the
+        // send, but they are not the same news for the user: disbanded means
+        // the group is gone for everyone, removed means it goes on without
+        // this device. Reporting "disbanding" for a removal claims a group no
+        // longer exists when it does.
+        if let Ok(group) = self.runtime.group_record(group_id)
+            && group.is_terminal()
+        {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            return Err(if group.removed {
+                AppError::GroupRemoved(group_id_hex)
+            } else {
+                AppError::GroupDisbanding(group_id_hex)
+            });
+        }
+        if self.runtime.disbanding_in_progress(group_id)? {
             return Err(AppError::GroupDisbanding(hex::encode(group_id.as_slice())));
         }
         Ok(())
@@ -4396,11 +4438,7 @@ impl AppClient {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            if self
-                .runtime
-                .group_record(&group_id)
-                .is_ok_and(|group| group.disbanded.is_some())
-            {
+            if group_is_terminal(&self.runtime, &group_id) {
                 if self.routing.replace_group_routes(&group_id, Vec::new()) {
                     refresh.routing_changed = true;
                 }
@@ -4437,14 +4475,57 @@ impl AppClient {
         Ok(refresh)
     }
 
+    /// Rebuild the whole routing table and install it.
+    ///
+    /// The rebuild reseeds every projected group, including ones this device is
+    /// terminal in: `routing_for` can only filter disband tombstones. Prune
+    /// those routes before the table goes live, because every caller hands it
+    /// straight to the adapter (`activate_transport` / `sync_runtime_groups`),
+    /// which would re-subscribe the removed group.
     fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
         self.preserve_local_deleted_group_routes(&routing)?;
-        self.routing.replace(routing.snapshot());
+        let mut snapshot = routing.snapshot();
+        snapshot
+            .group_routes
+            .retain(|route| !group_is_terminal(&self.runtime, &route.group_id));
+        self.routing.replace(snapshot);
         Ok(())
     }
 
+    /// Queue this batch's superseded own commits for the runtime worker to
+    /// broadcast as `GroupChangeSuperseded` events (mdk#1734).
+    pub(crate) fn note_superseded_intent_reports(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        for report in &effects.superseded_intents {
+            if self
+                .pending_superseded_change_events
+                .iter()
+                .any(|pending| pending.commit_id == report.commit_id)
+            {
+                continue;
+            }
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "note_superseded_intent_reports",
+                kind = report.kind.as_str(),
+                outcome = report.outcome.as_str(),
+                "convergence superseded an own commit"
+            );
+            self.pending_superseded_change_events.push(report.clone());
+        }
+    }
+
+    pub(crate) fn take_pending_superseded_change_events(
+        &mut self,
+    ) -> Vec<cgka_traits::engine::SupersededIntentReport> {
+        std::mem::take(&mut self.pending_superseded_change_events)
+    }
+
     fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+        self.note_superseded_intent_reports(effects);
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
         if effects.reports.is_empty() {

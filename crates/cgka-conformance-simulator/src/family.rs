@@ -205,6 +205,15 @@ pub fn generate_family_case(
     case_index: u64,
 ) -> Result<GeneratedScenarioCase, UnsupportedGeneratedFamily> {
     let case = match family {
+        crate::PUBLIC_APP_ADMIN_CHURN_FAMILY | crate::PUBLIC_APP_LATE_JOIN_FAMILY => {
+            crate::generate_public_app_pressure_case(family, seed, case_index)
+        }
+        crate::PUBLIC_APP_SEND_LEAVE_FAMILY
+        | crate::PUBLIC_APP_ADMIN_HANDOFF_FAMILY
+        | crate::PUBLIC_APP_MEMBERSHIP_REENTRY_FAMILY
+        | crate::PUBLIC_APP_OFFLINE_RECOVERY_FAMILY => {
+            crate::generate_public_app_journey_case(family, seed, case_index)
+        }
         "send-leave/v1" => generate_send_leave_case(seed, case_index),
         "convergence-e2e-delivery/v1" => generate_convergence_e2e_delivery_case(seed, case_index),
         "convergence-chaos/v1" => generate_convergence_chaos_case(seed, case_index),

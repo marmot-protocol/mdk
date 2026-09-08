@@ -210,11 +210,7 @@ impl AppClient {
                 change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
                 ..
             }
-        ) || self
-            .runtime
-            .group_record(group_id)
-            .ok()
-            .is_some_and(|group| group.removed || group.disbanded.is_some());
+        ) || super::group_is_terminal(&self.runtime, group_id);
         if terminal {
             return Ok(Some(self.routing.replace_group_routes(
                 group_id,
@@ -314,12 +310,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<TransportGroupSubscription>, AppError> {
-        if self
-            .runtime
-            .group_record(group_id)
-            .map_err(AppError::from)
-            .is_ok_and(|group| group.removed || group.disbanded.is_some())
-        {
+        if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(Vec::new());
         }
         let routing = self.nostr_routing_for_group(group_id)?;
@@ -527,6 +518,19 @@ impl AppClient {
         if self.reconcile_live_engine_groups()? {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
+        // Route seeding at open reads persisted group state, which carries no
+        // departure marker; the engine record does. This is the first point on
+        // either open path where that record is readable, and on an eager open
+        // it still precedes the first subscription, so a group this device has
+        // left is never re-subscribed. Only the routing table changes unless a
+        // prior route retired, which is the one case that persists.
+        //
+        // A quarantined group is the deliberate exception: `ensure_group_live`
+        // makes its record unreadable, so its route survives this seam and is
+        // reconciled on the next hydration that admits the group.
+        if self.refresh_group_routes()?.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
         self.reconcile_disband_drafts();
         self.backfill_self_membership_once()?;
         self.backfill_direct_conversation_members_once()
@@ -639,15 +643,32 @@ impl AppClient {
         for published in &effects.published_app_messages {
             let group_id_hex = hex::encode(published.group_id.as_slice());
             let source_message_id_hex = hex::encode(published.message_id.as_slice());
-            if let Some(update) = self.app.finalize_account_app_event_source_retention(
+            let finalized = self.app.finalize_account_app_event_source_retention(
                 &self.state.label,
                 &group_id_hex,
                 &published.app_event_id,
                 Some(source_message_id_hex.as_str()),
                 published.source_epoch.0,
                 published.retention,
-            )? {
-                updates.push(update);
+            );
+            match finalized {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) => {}
+                Err(error) => {
+                    // Keep the accepted fanouts durable until projection can
+                    // be repaired. Replaying them does not publish again.
+                    for published in &effects.published_app_messages {
+                        self.pending_convergence_groups
+                            .insert(published.group_id.clone());
+                    }
+                    tracing::warn!(
+                        target: "marmot_app::client::projection",
+                        method = "finalize_published_app_message_source_retention",
+                        error_kind = error.privacy_safe_kind(),
+                        "published application-message projection deferred",
+                    );
+                    return Ok(updates);
+                }
             }
         }
         let fail_acknowledgement = cfg!(feature = "test-policy-overrides")
@@ -1096,6 +1117,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
+        AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
         AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
         AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
         AppError::AgentStreamStartNotConfirmed => {
@@ -1156,6 +1178,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::AccountSetupRecoveryRequired => {
             "read_marker_failed:account_setup_recovery_required"
         }
+        AppError::OnboardingActionUnavailable => "read_marker_failed:onboarding_action_unavailable",
+        AppError::OnboardingRequired => "read_marker_failed:onboarding_required",
         AppError::AccountSetupRetryRequired => "read_marker_failed:account_setup_retry_required",
         AppError::AccountSetupResetNotApplicable => {
             "read_marker_failed:account_setup_reset_not_applicable"

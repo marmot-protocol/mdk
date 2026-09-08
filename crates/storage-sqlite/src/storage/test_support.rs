@@ -66,5 +66,6 @@ pub(crate) fn sample_queued_intent(id: MessageId, group_id: GroupId) -> QueuedOu
             payload: b"queued".to_vec(),
         },
         created_at_ms: 42,
+        reissue_attempts: 0,
     }
 }

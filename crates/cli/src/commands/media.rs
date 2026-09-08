@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     CommandOutput, MediaCommand, WnError, ensure_local_signing, normalize_group_id_hex,
-    npub_for_account_id, resolve_account, write_private_file,
+    npub_for_account_id, resolve_account, terminal_safe_text, write_private_file,
 };
 
 pub(crate) async fn media_command(
@@ -73,9 +73,15 @@ pub(crate) async fn media_command_with_runtime(
             })?;
             Ok(CommandOutput {
                 plain: if upload.sent.is_some() {
-                    format!("uploaded and sent {}", first.reference.file_name)
+                    format!(
+                        "uploaded and sent {}",
+                        terminal_safe_text(&first.reference.file_name)
+                    )
                 } else {
-                    format!("uploaded {}", first.reference.file_name)
+                    format!(
+                        "uploaded {}",
+                        terminal_safe_text(&first.reference.file_name)
+                    )
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
@@ -116,7 +122,7 @@ pub(crate) async fn media_command_with_runtime(
                 .await?;
             write_private_file(&output_path, &download.plaintext)?;
             Ok(CommandOutput {
-                plain: output_path.display().to_string(),
+                plain: terminal_safe_text(&output_path.display().to_string()),
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
@@ -148,6 +154,7 @@ pub(crate) async fn media_command_with_runtime(
                     media
                         .iter()
                         .filter_map(|item| item.get("file_name").and_then(Value::as_str))
+                        .map(terminal_safe_text)
                         .collect::<Vec<_>>()
                         .join("\n")
                 },
@@ -462,5 +469,16 @@ mod tests {
         let later = media_attachment_for_hash(vec![message], &hex::encode([0x23; 32]), false)
             .expect("download lookup must reach the later valid sibling");
         assert_eq!(later.file_name, "also-ok.png");
+    }
+
+    #[test]
+    fn media_list_plain_sanitizes_file_names_and_keeps_row_separators() {
+        let names = ["ok\u{1b}[2J.png".to_owned(), "also\nforged.png".to_owned()];
+        let plain = names
+            .iter()
+            .map(|name| crate::terminal_safe_text(name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(plain, "ok[2J.png\nalsoforged.png");
     }
 }

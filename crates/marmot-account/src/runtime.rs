@@ -12,6 +12,7 @@ use cgka_session::{
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
+    SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -65,6 +66,64 @@ const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// Keep this aligned with the adapter's fixed reconnect interval so restoring
 /// connectivity does not leave a user send behind the ambiguity backoff.
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
+
+/// Local scheduling windows for own-leaf maintenance rotations.
+///
+/// These are anti-contention and catch-up delays, not protocol policy. A
+/// rotation waits until the group has been free of valid state-bearing input
+/// for `quiet`, then a sampled delay of up to `contention_jitter_max` spreads
+/// simultaneous rotations apart so freshly joined devices do not all commit in
+/// the same second. Production always runs the defaults. Test harnesses that
+/// drive [`AccountDeviceRuntime::run_due_maintenance`] explicitly may shorten
+/// them through [`AccountDeviceRuntime::with_maintenance_timing`]. Periodic
+/// rotation scheduling, its 24 to 36 day cadence and 15 minute jitter, is not
+/// covered by this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceTiming {
+    /// Minimum time a group must stay free of valid commits and proposals
+    /// before an obligation may rotate.
+    pub quiet: Duration,
+    /// Upper bound of the sampled post-quiet delay for post-join and manual
+    /// rotations. Persisted deadlines have whole-second granularity.
+    pub contention_jitter_max: Duration,
+    /// How long a post-join obligation waits for the retained-history
+    /// subscription's end-of-stored-events marker before giving up on it.
+    pub eose_timeout: Duration,
+    /// Grace after end-of-stored-events, or its timeout, before the quiet
+    /// window starts.
+    pub post_eose_grace: Duration,
+}
+
+impl MaintenanceTiming {
+    /// Every window zero: a manual or post-join rotation publishes within a
+    /// few consecutive maintenance sweeps. For harnesses that call
+    /// `run_due_maintenance` directly, never for production runtimes.
+    pub const fn immediate() -> Self {
+        Self {
+            quiet: Duration::ZERO,
+            contention_jitter_max: Duration::ZERO,
+            eose_timeout: Duration::ZERO,
+            post_eose_grace: Duration::ZERO,
+        }
+    }
+
+    fn contention_jitter_max_ms(self) -> u64 {
+        u64::try_from(self.contention_jitter_max.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Default for MaintenanceTiming {
+    fn default() -> Self {
+        Self {
+            quiet: Duration::from_secs(MAINTENANCE_QUIET_SECS),
+            contention_jitter_max: Duration::from_millis(
+                cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
+            ),
+            eose_timeout: Duration::from_secs(MAINTENANCE_EOSE_TIMEOUT_SECS),
+            post_eose_grace: Duration::from_secs(MAINTENANCE_POST_EOSE_GRACE_SECS),
+        }
+    }
+}
 
 /// Run independent async work with fixed fan-out while returning results in
 /// input order. Completion order therefore cannot reorder reports or select a
@@ -270,6 +329,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     wall_clock: Arc<dyn WallClock>,
     monotonic_clock: Arc<dyn MonotonicClock>,
     maintenance_random: Arc<dyn MaintenanceRandom>,
+    maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Exact Welcome events whose relay-only publish phase currently runs
@@ -298,6 +358,7 @@ where
             wall_clock: Arc::new(SystemWallClock),
             monotonic_clock: Arc::new(SystemMonotonicClock::default()),
             maintenance_random: Arc::new(OsMaintenanceRandom),
+            maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
             maintenance_quiet_monotonic: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
@@ -323,6 +384,17 @@ where
         self.monotonic_clock = monotonic_clock;
         self.maintenance_random = maintenance_random;
         self
+    }
+
+    /// Replace the maintenance scheduling windows. Production runtimes keep
+    /// [`MaintenanceTiming::default`]; this exists for test harnesses only.
+    pub fn with_maintenance_timing(mut self, timing: MaintenanceTiming) -> Self {
+        self.maintenance_timing = timing;
+        self
+    }
+
+    pub fn maintenance_timing(&self) -> MaintenanceTiming {
+        self.maintenance_timing
     }
 
     pub fn session(&self) -> &AccountDeviceSession {
@@ -1181,10 +1253,9 @@ where
             grace_until: None,
             quiet_since: Some(now),
             own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
-            sampled_jitter_ms: self.maintenance_random.sample_inclusive(
-                0,
-                cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
-            ),
+            sampled_jitter_ms: self
+                .maintenance_random
+                .sample_inclusive(0, self.maintenance_timing.contention_jitter_max_ms()),
             not_before: None,
             attempt_count: 0,
             semantic_rearm_count: 0,
@@ -1206,7 +1277,8 @@ where
                 && obligation.eose_deadline_at.is_none()
             {
                 obligation.eose_deadline_at = Some(Timestamp(
-                    now.0.saturating_add(MAINTENANCE_EOSE_TIMEOUT_SECS),
+                    now.0
+                        .saturating_add(self.maintenance_timing.eose_timeout.as_secs()),
                 ));
                 self.session.put_maintenance_obligation(&obligation)?;
             }
@@ -1225,7 +1297,8 @@ where
             {
                 obligation.phase = MaintenancePhase::Grace;
                 obligation.grace_until = Some(Timestamp(
-                    now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                    now.0
+                        .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                 ));
                 self.session.put_maintenance_obligation(&obligation)?;
             }
@@ -1282,7 +1355,8 @@ where
         // supersessions whose announcement never reached
         // `reconcile_superseded_maintenance`. This is the maintenance sweep, so
         // it is where a stranded evolution would otherwise do its damage.
-        self.reconcile_superseded_maintenance_from_state(now)?;
+        let superseded = self.reconcile_superseded_maintenance_from_state(now)?;
+        output.superseded_intents.extend(superseded);
         // Fanout of an already-acknowledged exact event is publication
         // recovery, not a new preparation, so it continues while paused.
         if self.key_package_has_pending_fanout()?
@@ -1441,7 +1515,8 @@ where
                     {
                         obligation.phase = MaintenancePhase::EoseTimeout;
                         obligation.grace_until = Some(Timestamp(
-                            now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                            now.0
+                                .saturating_add(self.maintenance_timing.post_eose_grace.as_secs()),
                         ));
                     }
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
@@ -1468,11 +1543,12 @@ where
                         .get(&obligation.id)
                         .map(|started| {
                             self.monotonic_clock.elapsed().saturating_sub(*started)
-                                >= Duration::from_secs(MAINTENANCE_QUIET_SECS)
+                                >= self.maintenance_timing.quiet
                         })
                         .unwrap_or_else(|| {
                             obligation.quiet_since.is_some_and(|started| {
-                                now.0.saturating_sub(started.0) >= MAINTENANCE_QUIET_SECS
+                                now.0.saturating_sub(started.0)
+                                    >= self.maintenance_timing.quiet.as_secs()
                             })
                         });
                     if !quiet_long_enough {
@@ -1482,7 +1558,17 @@ where
                         )?;
                         continue;
                     }
-                    let jitter_secs = obligation.sampled_jitter_ms.saturating_add(999) / 1_000;
+                    // Periodic rotations keep their own wide spread; only the
+                    // contention jitter of post-join and manual rotations is
+                    // bounded by the configured window.
+                    let jitter_ms = if obligation.trigger == MaintenanceTrigger::Periodic {
+                        obligation.sampled_jitter_ms
+                    } else {
+                        obligation
+                            .sampled_jitter_ms
+                            .min(self.maintenance_timing.contention_jitter_max_ms())
+                    };
+                    let jitter_secs = jitter_ms.saturating_add(999) / 1_000;
                     obligation.phase = MaintenancePhase::Jitter;
                     obligation.not_before = Some(Timestamp(now.0.saturating_add(jitter_secs)));
                     self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
@@ -1867,7 +1953,8 @@ where
         output.absorb_session_effects(rollback_effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok(output)
     }
 
@@ -2128,6 +2215,17 @@ where
         Ok(self.session.deferred_peel_cutoff_delay_ms(group_id)?)
     }
 
+    /// Milliseconds until a scheduled SelfRemove auto-commit for this group is
+    /// due; schedulers must keep a wakeup armed while this is `Some`.
+    pub fn scheduled_self_remove_auto_commit_delay_ms(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<u64>> {
+        Ok(self
+            .session
+            .scheduled_self_remove_auto_commit_delay_ms(group_id)?)
+    }
+
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
     }
@@ -2206,7 +2304,8 @@ where
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok(output)
     }
 
@@ -2380,7 +2479,8 @@ where
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
         self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
-        self.reconcile_superseded_maintenance(&output.events)?;
+        let superseded = self.reconcile_superseded_maintenance(&output.events)?;
+        output.superseded_intents.extend(superseded);
         Ok((output, blocked_groups))
     }
 
@@ -2448,7 +2548,13 @@ where
         Ok(())
     }
 
-    fn reconcile_superseded_maintenance(&mut self, events: &[GroupEvent]) -> AccountResult<()> {
+    /// Retire the evolutions behind commits this batch announced as
+    /// superseded, and decide what becomes of the intent behind each own
+    /// commit (mdk#1734). Returns the per-commit decisions for the effects.
+    fn reconcile_superseded_maintenance(
+        &mut self,
+        events: &[GroupEvent],
+    ) -> AccountResult<Vec<SupersededIntentReport>> {
         let superseded = events
             .iter()
             .filter_map(|event| match event {
@@ -2461,10 +2567,11 @@ where
             })
             .collect::<Vec<_>>();
         if superseded.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let now = self.wall_clock.now();
+        let mut reports = Vec::new();
         for (group_id, invalidated_commit_id) in superseded {
             let evolutions = self.session.group_evolutions_for_group(&group_id)?;
             for evolution in evolutions.into_iter().filter(|evolution| {
@@ -2473,8 +2580,14 @@ where
             }) {
                 self.mark_evolution_superseded(evolution, now)?;
             }
+            if let Some(report) = self
+                .session
+                .reissue_superseded_own_commit(&invalidated_commit_id)?
+            {
+                reports.push(report);
+            }
         }
-        Ok(())
+        Ok(reports)
     }
 
     /// Re-derive a supersession whose `GroupStateInvalidated` announcement was
@@ -2512,7 +2625,10 @@ where
     /// here — and the event path never un-marks a superseded evolution, so
     /// neither does this. It is therefore a fixed point: a converged account
     /// writes nothing, and a flipped evolution is skipped on every later run.
-    fn reconcile_superseded_maintenance_from_state(&mut self, now: Timestamp) -> AccountResult<()> {
+    fn reconcile_superseded_maintenance_from_state(
+        &mut self,
+        now: Timestamp,
+    ) -> AccountResult<Vec<SupersededIntentReport>> {
         for evolution in self.session.group_evolutions()? {
             if evolution.phase == GroupEvolutionPhase::SupersededByConvergence {
                 continue;
@@ -2528,7 +2644,9 @@ where
             }
             self.mark_evolution_superseded(evolution, now)?;
         }
-        Ok(())
+        // Own commits carry their intent separately from evolutions; derive
+        // their supersession from the same stored dispositions (mdk#1734).
+        Ok(self.session.reissue_superseded_own_commits_from_state()?)
     }
 
     /// Retire an evolution that branch selection superseded, and settle the
@@ -4453,6 +4571,11 @@ pub struct AccountDeviceEffects {
     /// group so the caller can re-deliver the stored welcome via
     /// [`AccountDeviceRuntime::redeliver_welcome`] without re-committing.
     pub welcome_failures: Vec<WelcomeDeliveryFailure>,
+    /// Own commits that convergence superseded during this batch, with what
+    /// became of the intent behind each: re-queued for the next drain, or
+    /// dropped with a stated reason (mdk#1734). Hosts surface these to the
+    /// user; the original command already returned success.
+    pub superseded_intents: Vec<SupersededIntentReport>,
     pub pending: Vec<PendingResolution>,
     pub maintenance_disposition: SendMaintenanceDisposition,
 }
@@ -4507,6 +4630,8 @@ impl AccountDeviceEffects {
         self.published_app_messages
             .append(&mut other.published_app_messages);
         self.welcome_failures.append(&mut other.welcome_failures);
+        self.superseded_intents
+            .append(&mut other.superseded_intents);
         self.pending.append(&mut other.pending);
         if other.maintenance_disposition
             == SendMaintenanceDisposition::PostJoinRotationPendingRetryable

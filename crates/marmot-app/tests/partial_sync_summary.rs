@@ -466,6 +466,7 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
         tracker_listener,
         tracker_observed,
     ));
+    runtime_bob_boot2.set_audit_log_batch_window_for_test(Duration::ZERO);
     runtime_bob_boot2
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{tracker_addr}/api/v1/audit-logs/")),

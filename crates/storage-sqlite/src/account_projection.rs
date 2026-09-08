@@ -1091,10 +1091,10 @@ impl SqliteAccountStorage {
             if replace_group_snapshot || inserted_seen_event {
                 conn.execute_cached(
                     "DELETE FROM seen_events
-                     WHERE event_id NOT IN (
-                        SELECT event_id FROM seen_events
+                     WHERE rowid IN (
+                        SELECT rowid FROM seen_events
                         ORDER BY seen_at DESC, rowid DESC
-                        LIMIT ?1
+                        LIMIT -1 OFFSET ?1
                      )",
                     params![usize_to_i64(max_seen_events)?],
                 )

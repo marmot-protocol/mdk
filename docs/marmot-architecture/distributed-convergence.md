@@ -79,6 +79,12 @@ Late commits are handled by their source epoch:
 - If the commit source epoch is older than the retained anchor, the commit is dropped with `BeyondAnchor` and persisted
   as invalidated.
 
+An anchor for epoch E MUST capture the state of E **as the device left E**, including proposals received at E. A rival
+commit may name its proposals by reference, and once the branch this device adopted merges, that proposal is consumed
+locally and stops being a canonicalization input — the anchor is then its only surviving record. An anchor captured
+before those proposals arrived restores a proposal store the rival's references cannot resolve, so a rival that should
+win selection instead fails to replay and the device silently keeps whichever branch reached it first.
+
 This rule is the local storage boundary for the forward-secrecy tradeoff. A client cannot be forced to replay commits
 older than the pinned protocol policy says it will retain.
 

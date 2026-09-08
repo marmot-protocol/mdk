@@ -157,6 +157,7 @@ mod tests {
                 payload: vec![id],
             },
             created_at_ms: u64::from(id),
+            reissue_attempts: 0,
         }
     }
 

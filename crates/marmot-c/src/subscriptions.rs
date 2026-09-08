@@ -41,7 +41,7 @@
 //! Lifetime rule: free every subscription handle before freeing the
 //! `MarmotClient` that created it.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -51,6 +51,7 @@ use marmot_uniffi::subscriptions::{
     GroupStateSubscription, MessagesSubscription, NotificationsSubscription,
     TimelineMessagesSubscription, UserSearchSubscription,
 };
+use marmot_uniffi::{MarmotKitError, OnboardingSubscription};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -69,6 +70,7 @@ use crate::types::event::MarmotEvent;
 use crate::types::group::MarmotAppGroupRecord;
 use crate::types::message::{MarmotAppMessageRecordList, MarmotMessageUpdate};
 use crate::types::notification::MarmotNotificationUpdate;
+use crate::types::onboarding::MarmotOnboardingSnapshot;
 use crate::types::timeline::{MarmotTimelinePage, MarmotTimelineSubscriptionUpdate};
 use crate::{MarmotClient, block_on_handle, client_ref, ffi_guard, preflight_out_ptr, write_out};
 
@@ -100,6 +102,7 @@ unsafe impl Send for MarmotChatListRow {}
 unsafe impl Send for MarmotMessageUpdate {}
 unsafe impl Send for MarmotAgentStreamUpdate {}
 unsafe impl Send for MarmotUserSearchUpdate {}
+unsafe impl Send for MarmotOnboardingSnapshot {}
 
 /// Shared body of every subscription handle: the runtime that drives it
 /// and the slot holding an installed callback task.
@@ -1154,5 +1157,61 @@ pub unsafe extern "C" fn marmot_search_users(
             },
             Err(err) => status_from_error(&err),
         }
+    })
+}
+
+c_subscription! {
+    /// A current onboarding snapshot followed by durable progress updates.
+    MarmotOnboardingSubscription(OnboardingSubscription),
+    item MarmotOnboardingSnapshot from marmot_uniffi::OnboardingSnapshotFfi,
+    item_free "marmot_onboarding_snapshot_free",
+    callback MarmotOnboardingCallback,
+    read next,
+    next marmot_onboarding_subscription_next,
+    set_callback marmot_onboarding_subscription_set_callback,
+    clear_callback marmot_onboarding_subscription_clear_callback,
+    free marmot_onboarding_subscription_free
+}
+/// Subscribe to durable onboarding state for an account.
+///
+/// # Safety
+/// Client and account_ref must be valid; out_sub must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_subscribe_onboarding(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out_sub: *mut *mut MarmotOnboardingSubscription,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out_sub) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        match client.marmot.subscribe_onboarding(account_ref) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotOnboardingSubscription {
+                        core: SubscriptionCore::new(client.runtime.handle().clone()),
+                        inner,
+                    },
+                    out_sub,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
+}
+/// Return the initial snapshot. Free with marmot_onboarding_snapshot_free.
+///
+/// # Safety
+/// Sub must be live and out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_onboarding_subscription_snapshot(
+    sub: *const MarmotOnboardingSubscription,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let sub = try_arg!(unsafe { sub_ref(sub) });
+        unsafe { deliver(Ok::<_, MarmotKitError>(sub.inner.snapshot()), out) }
     })
 }

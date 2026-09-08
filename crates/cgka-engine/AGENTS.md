@@ -143,7 +143,9 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 
 - **Module:** `conformance_snapshot.rs` (feature `test-conformance-snapshot`)
   - **Owns:** privacy-safe exact canonical-state (live MLS state or authenticated terminal disband tombstone) and
-    aggregate pending-work projections consumed only by the conformance simulator. Terminal equality excludes
+    aggregate pending-work projections consumed only by the conformance simulator. Structural progress includes
+    completed distinct-context attempts on retained raw rows, so bounded retry work is visible even when row counts
+    are unchanged. Terminal equality excludes
     device-local authorship metadata. These diagnostics never feed protocol selection or production telemetry.
 
 - **Module:** `distributed_convergence.rs`
@@ -368,11 +370,27 @@ whether the graph is contested, and `CandidateBranchPeel` carries it independent
 every path after it — released anchor, missing own-commit checkpoint, exhausted budget, fewer than two surviving
 candidate paths, no tip captured — loses contexts without saying anything about whether the graph is split. Reading
 contested-ness off an empty context set would report a fork as healed exactly when this device stopped being able to
-see it. The two then drive different decisions and must stay split: `DeferredPeelSweep::is_contested` gates only the
-drain policy (a contested sweep's recovered rows are one evidence set, so the drain waits for the whole batch), while
-routing live-readable application traffic into the convergence seam keys on `has_branch_contexts` — a sweep holding no
+see it. Routing live-readable application traffic into the convergence seam keys on `has_branch_contexts` — a sweep holding no
 rival state would only feed evidence to a pass that, having halted on the same checkpoint or the same budget, almost
 certainly cannot read the rival branch either.
+
+**Every deferred-peel generation drains as a complete batch.** Contested and uncontested sweeps both persist a
+`DeferredPeelGeneration` barrier before recovering rows. It survives bounded slices, cancellation, and restart, and
+clears only once every retained row has tried the final context fingerprint. Uncontested per-row convergence can
+advance commits and prune the only epoch state that decrypts later raw application rows. Live ingest retains its
+immediate drain behavior; application routing still depends on captured branch contexts. The Current-profile saved
+368-message regression and its natural-order control live in the simulator's `tests/offline_catchup_regression.rs`.
+
+**Background recovery responsiveness.** One host background advance shares a 64-row allowance and a cooperative
+500-ms budget across its reprocessing loop. Explicit-time engine entry points keep the row allowance without an
+elapsed wall deadline; queued outbound foreground preflight keeps its existing budget. Return pending at complete operation boundaries; do not cancel a
+snapshot guard or advance a partially tried generation. Foreground send budgets retain their separate semantics.
+Historical anchor peel contexts are materialized lazily once per bounded sweep and dropped with it; they preserve
+snapshot provenance and historical retention policy. Restore live state before awaiting a peeler. The sweep stops
+when canonical/candidate context is invalidated; never persist this secret-bearing cache or extend epoch retention.
+Tests: `tests/deferred_peel_lifecycle.rs` covers host budget yield, explicit-time row determinism, restart and eventual
+completion. Readiness queries all deferred rows using the storage state filter; never hide unattempted rows by
+limiting readiness to an already-attempted prefix.
 
 **Provenance rule.** A message readable *only* under a candidate branch context belongs to a lineage this device has
 not adopted, so `ingest_group_message` routes it to the convergence seam and never to the direct apply — canonical
@@ -497,6 +515,29 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   announced once — it durably flips its record to `EpochInvalidated`, so a later pass no longer sees it as previously
   applied. That half of the hole predates announce-once. Both repairs flip forward only; `GroupStateRevalidated` has no
   account-layer consumer and neither reconciler un-marks a supersession.
+- **Every own group evolution keeps its intent until the commit is beyond the rewind horizon.** `do_send_ready`
+  records an `OwnCommitIntent` (kind, the pre-staging baseline of the edited fields, source epoch, attempt count) for
+  `Invite`, `RemoveMembers`, `UpdateGroupData`, and `UpdateAppComponents` before dispatch, keyed by the commit's
+  message id; `publish_failed` deletes it, confirmation does not, and
+  `reissue_superseded_own_commits_from_state` garbage-collects a `Processed` record once `group.epoch` exceeds
+  `source_epoch + max_rewind_commits`. When branch selection withdraws the commit, `reissue_superseded_own_commit`
+  (event path: the account layer's `GroupStateInvalidated` reconciler; derived path: `run_due_maintenance`) decides
+  from the record, never from the losing branch's bytes: re-queue an edit only when the canonical value of every field
+  the intent changed still equals the baseline, report `Conflict` otherwise; re-queue a removal for targets still on
+  the roster; an invite is `ReinviteRequired` (mdk#1735 owns the invitee); at most `MAX_OWN_COMMIT_REISSUE_ATTEMPTS`
+  re-issues, then `Abandoned`. The decision is returned as a `SupersededIntentReport` so the runtime can announce it
+  (mdk#1734). Tests: `tests/distributed_convergence.rs::superseded_profile_edit_*`.
+- **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`
+  therefore runs both before an advance past E and immediately after a replayed proposal enters the store at E
+  (`openmls_projection::process_openmls_messages_inner`, the `ProposalMessage` arm, under the same
+  `retain_replayed_anchors` gate as the post-merge retain). A rival at E may name its proposals *by reference* — the
+  SelfRemove auto-commit shape, where every peer that sees one `Leave` commits the same `ProposalRef` — and once the
+  branch this device adopted merges, that proposal record is `Processed`, which `record_state_is_canonicalization_input`
+  excludes, so the seeder never re-supplies it. The anchor is the only surviving copy. Capture it before the proposal
+  arrives and the rewind restores a proposal store the rival cannot resolve: OpenMLS answers
+  `InvalidCommit(MissingProposal)`, the rival never becomes a candidate, and the device keeps whichever branch arrived
+  first while reporting `Settled`. Tests: `tests/distributed_convergence.rs::by_reference_rival_that_wins_the_tiebreak_displaces_the_adopted_branch`
+  and its losing-direction control.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **`EpochManager::set_stable` only overwrites `Stable` and `Recovering`.** Every other state owes its exit to a

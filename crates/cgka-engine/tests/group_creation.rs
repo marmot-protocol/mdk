@@ -2412,6 +2412,291 @@ async fn create_group_rejects_relabelled_legacy_key_package_profile() {
 }
 
 #[tokio::test]
+async fn fresh_key_packages_omit_default_mls_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let mut alice = build_profile_client_on_storage(
+            b"alice",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let kp = alice.fresh_key_package().await.unwrap();
+        let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+        let key_package = match message.extract() {
+            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+            other => panic!("expected KeyPackage, got {other:?}"),
+        }
+        .validate(
+            &openmls_rust_crypto::RustCrypto::default(),
+            ProtocolVersion::Mls10,
+        )
+        .unwrap();
+        assert_non_default_mls_capabilities(key_package.leaf_node().capabilities());
+        assert_eq!(
+            key_package
+                .leaf_node()
+                .capabilities()
+                .extensions()
+                .contains(&ExtensionType::from(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)),
+            profile == ProtocolProfile::Legacy,
+        );
+    }
+}
+
+#[tokio::test]
+async fn registry_defaults_are_implicit_for_key_packages_and_group_membership() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let mut registry = FeatureRegistry::new();
+        for (index, name) in [
+            "application-id",
+            "ratchet-tree",
+            "required-capabilities",
+            "external-pub",
+            "external-senders",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            registry.register(
+                Feature(name),
+                CapabilityRequirement {
+                    requires: Capability::Extension(index as u16 + 1),
+                    level: RequirementLevel::Required,
+                    description: "implicit MLS extension support",
+                },
+            );
+        }
+        for (index, name) in [
+            "add",
+            "update",
+            "remove",
+            "psk",
+            "reinit",
+            "external-init",
+            "group-context-extensions",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            registry.register(
+                Feature(name),
+                CapabilityRequirement {
+                    requires: Capability::Proposal(index as u16 + 1),
+                    level: RequirementLevel::Required,
+                    description: "implicit MLS proposal support",
+                },
+            );
+        }
+        for (name, capability) in [
+            ("custom-extension", Capability::Extension(0xff01)),
+            ("custom-proposal", Capability::Proposal(0xff02)),
+        ] {
+            registry.register(
+                Feature(name),
+                CapabilityRequirement {
+                    requires: capability,
+                    level: RequirementLevel::Optional,
+                    description: "non-default advertisement control",
+                },
+            );
+        }
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let builder = EngineBuilder::new(storage.clone())
+            .identity(pad32(b"alice"))
+            .account_identity_proof_signer(proof_signer(b"alice"))
+            .protocol_profile(profile)
+            .feature_registry(registry)
+            .peeler(Box::new(MockPeeler::default()));
+        let builder = if profile == ProtocolProfile::Legacy {
+            builder.legacy_compatibility_profile()
+        } else {
+            builder
+        };
+        let mut alice = builder.build().unwrap();
+        let kp = alice.fresh_key_package().await.unwrap();
+        let metadata = key_package_metadata(&kp).unwrap();
+        assert!(
+            metadata
+                .mls_extensions
+                .iter()
+                .all(|id| !(1..=5).contains(id))
+        );
+        assert!(
+            metadata
+                .mls_proposals
+                .iter()
+                .all(|id| !(1..=7).contains(id))
+        );
+        assert!(metadata.mls_extensions.contains(&0xff01));
+        assert!(metadata.mls_proposals.contains(&0xff02));
+        let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+        let MlsMessageBodyIn::KeyPackage(kp) = message.extract() else {
+            panic!("expected KeyPackage")
+        };
+        let kp = kp
+            .validate(
+                &openmls_rust_crypto::RustCrypto::default(),
+                ProtocolVersion::Mls10,
+            )
+            .unwrap();
+        assert_non_default_mls_capabilities(kp.leaf_node().capabilities());
+
+        // Peers have no registry entries for defaults and do not advertise
+        // them, but must be accepted when GroupContext explicitly requires them.
+        let mut bob = build_profile_client_on_storage(
+            b"bob",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let constructable = alice
+            .constructable_capabilities(std::slice::from_ref(&bob_kp))
+            .unwrap();
+        assert!((1..=5).all(|id| constructable.extensions.contains(&id)));
+        assert!((1..=7).all(|id| constructable.proposals.contains(&id)));
+        let (group_id, result) = alice
+            .create_group(CreateGroupRequest {
+                name: "explicit default requirements".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let welcomes = match result {
+            SendResult::FoundingGroupCreated { welcomes } => welcomes,
+            SendResult::GroupCreated { welcomes, pending } => {
+                alice.confirm_published(pending).await.unwrap();
+                welcomes
+            }
+            other => panic!("expected founding result, got {other:?}"),
+        };
+        bob.join_welcome(welcomes.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        let group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_non_default_mls_capabilities(group.own_leaf_node().unwrap().capabilities());
+        let required = group.extensions().required_capabilities().unwrap();
+        assert!((1..=5).all(|id| {
+            required
+                .extension_types()
+                .contains(&ExtensionType::from(id))
+        }));
+        assert!((1..=7).all(|id| {
+            required
+                .proposal_types()
+                .contains(&openmls::prelude::ProposalType::from(id))
+        }));
+        let mut carol = build_profile_client_on_storage(
+            b"carol",
+            SqliteAccountStorage::in_memory().unwrap(),
+            profile,
+        );
+        let result = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![carol.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupEvolution {
+            welcomes, pending, ..
+        } = result
+        else {
+            panic!("expected invite")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        carol
+            .join_welcome(welcomes.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(carol.members(&group_id).unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn founding_leaves_omit_default_mls_capabilities() {
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut alice = build_profile_client_on_storage(b"alice", storage.clone(), profile);
+        let (group_id, _) = alice
+            .create_group(CreateGroupRequest {
+                name: "capability advertisement".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group = openmls::group::MlsGroup::load(
+            storage.mls_storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_non_default_mls_capabilities(group.own_leaf_node().unwrap().capabilities());
+        assert_eq!(
+            group
+                .own_leaf_node()
+                .unwrap()
+                .capabilities()
+                .extensions()
+                .contains(&ExtensionType::from(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)),
+            profile == ProtocolProfile::Legacy,
+        );
+        // RequiredCapabilities remains a valid GroupContext extension even
+        // though its default type must not be advertised in LeafNode capabilities.
+        let required = group.extensions().required_capabilities().unwrap();
+        assert!(
+            required
+                .extension_types()
+                .contains(&ExtensionType::AppDataDictionary)
+        );
+        assert!(
+            required
+                .proposal_types()
+                .contains(&openmls::prelude::ProposalType::AppDataUpdate)
+        );
+    }
+}
+
+fn assert_non_default_mls_capabilities(capabilities: &Capabilities) {
+    // RFC 9420 section 7.2: default extension ids 1..=5 and proposal ids
+    // 1..=7 MUST NOT appear in the signed LeafNode capability lists.
+    for extension in capabilities.extensions() {
+        assert!(
+            !(1..=5).contains(&u16::from(*extension)),
+            "default extension {extension:?}"
+        );
+    }
+    for proposal in capabilities.proposals() {
+        assert!(
+            !(1..=7).contains(&u16::from(*proposal)),
+            "default proposal {proposal:?}"
+        );
+    }
+    assert!(
+        capabilities
+            .extensions()
+            .contains(&ExtensionType::AppDataDictionary)
+    );
+    assert!(
+        capabilities
+            .proposals()
+            .contains(&openmls::prelude::ProposalType::AppDataUpdate)
+    );
+}
+
+#[tokio::test]
 async fn fresh_key_package_uses_draft10_last_resort_component() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();

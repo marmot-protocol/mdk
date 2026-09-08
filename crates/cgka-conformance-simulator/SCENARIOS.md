@@ -670,7 +670,41 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   selected subject adapter and expectations. `--generated-input FILE` reexecutes it through the same report path; the
   ordinary report, promotable vector candidate, and any failure capsule remain separate artifacts.
 
+### Public app journey families
+
+`public-app-send-leave/v1`, `public-app-membership-reentry/v1`, `public-app-offline-recovery/v1`,
+and `public-app-admin-handoff/v1`
+use `generate_public_app_journey_case` (generator version `4`) and the shared stateful journey model.
+They default to `AppRuntimeHarness`: public Marmot app operations, real local Nostr relay sockets, and separate
+SQLCipher databases. Existing engine families and private oracles are unchanged.
+
+- **Send/leave:** seed chooses the departing member; even indices reopen it before leaving. The remaining admin
+  must process departure, update the profile, and exchange fresh messages among all survivors. The departed member's
+  exact history excludes later traffic.
+- **Membership re-entry:** even/odd indices remove and freshly invite the same member once/twice. Traffic while
+  absent must remain absent after re-entry; traffic before departure must persist. Indices 0/1 modulo 4 reopen the
+  removed participant before the fresh invitation. The returning member sends after each admission.
+- **Offline recovery:** indices modulo 3 select 4/8/12 offline messages with 1/2/3 interleaved profile changes;
+  indices 3 through 5 modulo 6 repeat the offline/reconnect cycle. Bob remains offline for each entire batch.
+- **Admin handoff:** seed chooses a non-founder who is granted admin rights, edits the group profile, then loses
+  admin rights while retaining membership and messaging. Even/odd indices run one/two grant-revoke cycles;
+  indices 0/1 modulo 4 reopen the delegate before exercising the grant, while 2/3 reopen after revocation.
+  After every revocation (including reopen), the delegate attempts to promote itself and must receive
+  `not_group_admin` without a relay publication or public-state change, then still sends an ordinary message.
+  The final profile must match the delegate's edit and the final admin set must contain only the founder.
+- **Shared oracle:** bounded checkpoints require all online members to agree on epoch, exact roster identities,
+  admin identities and expected profile, with an epoch lower bound covering the requested mutations. Automatic app
+  maintenance may advance beyond that lower bound. Visible payload-count
+  checkpoints, exact terminal payload multisets for all four participants, expected active profile/admin state,
+  fresh sends by every survivor, and history persistence across reopen followed by another send. These are serialized
+  recovery journeys, not crash races or a proof of engine-private quiescence. Real relay timing is not seed-controlled.
+- **Maintained tests:** `tests/public_app_families.rs` pins determinism, prefix stability, required interactions,
+  capability rejection for private assertions, and explicit socket canaries whose oracles reject missing/duplicate
+  messages and incorrect public state. Run and campaign commands are in `APP_PATH_COVERAGE.md`.
+
 ### `send-leave/v1`
+
+See also the separate public companions below; they do not replace this engine oracle.
 
 - Generator: `generate_send_leave_family` (generator version `2`)
 - Setup: three clients start in one group. The generator emits app sends and self-remove leaves.
@@ -739,6 +773,34 @@ regression, covers a new semantic edge, or is the smallest readable example of a
   `no_pending_work_except_retained_join_commit` assertion: a welcome-joined member currently retains exactly its own
   join commit as a permanently deferred transport input, and any other pending work still fails the case. The
   retained join commit itself is tracked as a harness coverage gap.
+### Public admin churn and late joining after commit history
+
+`public-app-admin-churn/v1` and `public-app-late-join/v1` use
+`generate_public_app_pressure_case` (generator version `1`). Both select the full app runtime, real local Nostr
+relay and per-participant SQLCipher databases. They are public companions to the serialized administration and
+latecomer motifs in `admin-churn/v1`; the original engine scenarios and private assertions retain their meaning.
+
+- **Admin churn:** indices modulo three select 4/8/16 rounds of alternating profile and admin-policy changes,
+  after an initial delegation. Seeds choose the delegate, authorized editor, policy target and message sender.
+  Every round includes a message, with a participant reopen halfway through the workload.
+- **Late join:** two founders accumulate 4/12/36 profile commits and one message per four commits before inviting
+  the other participants individually. Each admission is followed by another profile commit and a joiner send.
+  Indices 0–2 reopen the founder before admission; indices 3–5 reopen each joiner after admission. The largest
+  arm starts admission after a long history; a fresh Welcome must establish the current state. This is serialized admission after commit
+  pressure, not a claim to reproduce the engine arm's forced same-flight Welcome/commit delivery or a commit race.
+
+Every mutation must reach the modeled roster, admins and profile jointly among the online members. All active
+members send after the workload; complete histories must persist across another reopen. The late joiners' exact
+payload multisets exclude all pre-admission messages, including the first joiner's send at the second joiner.
+The adapter can catch up an account before it has a group projection, while explicit observation of a missing
+group remains an error. These companions do not claim private MLS equivalence, internal input closure, or forced
+relay ordering. Socket timing and cryptographic randomness are not controlled by the seed.
+
+The six-case catalogs repeat at higher indices; distinct seeds vary legal actors and join order. Use a 900-second
+isolated-worker deadline for the 36-commit history. The ordinary generator tests check replay/prefix stability,
+capability preflight, exact admission histories and workload depth. Explicit strict socket canaries include the
+same loss/duplication/state oracle mutations as the original public families.
+
 ### `bounded-convergence-pressure/v1`
 
 - Generator: `generate_bounded_convergence_pressure_family` (generator version `2`). Version 2 adds the confirmed
@@ -939,6 +1001,23 @@ resource error instead of spinning.
 eight-round `seed=9101`, `case_index=11` regression from mdk#1671. The latter requires a selected path that spans
 several epochs to leave every intermediate retained anchor available to the next frozen convergence generation.
 
+`tests/offline_catchup_regression.rs` replays a fixed 368-message reduction and the original 1,024-message workload
+from generator 1, seed 17001, case 19, retaining all 16 commit rounds. Each uses `ProtocolProfile::Current` and
+encrypted file-backed storage, with reverse history and a natural-order control. The smaller reverse case previously
+stranded 125 messages after state converged because commit replay ran before the retained peel generation completed.
+The larger case also exercises capacity refusal: background engine work yields after epoch advancement and the
+retained-relay scheduler retries refused history before draining further epochs. The input and full payload
+multiplicity, exact state, fresh decryption probes, and no-pending-work assertions remain unchanged. Current founding
+acknowledgement omits only the Legacy pending-create filter and expectation. The shared test builder in
+`tests/support/offline_catchup.rs` reproduces both checkpoint inputs exactly, with hashes over the complete
+serialized metadata, actions and expected outcomes. The expanded JSON is retained in checkpoint `9282a643`;
+the large public app journey also writes `backlog-input.json` alongside its run evidence. Set
+`MDK_OFFLINE_REGRESSION_ARTIFACTS` to retain expanded inputs and full engine reports in fresh private directories.
+The active decryptability probe drains bounded transport turns for messages published during convergence and
+requires publication evidence plus exact recipient delivery. Queued admission alone remains a failed probe.
+Run with `cargo test --release --locked -p cgka-conformance-simulator --test offline_catchup_regression`.
+This engine-and-retained-relay regression does not establish app queue, SDK delivery, or relay pagination behavior.
+
 ### General Simulator Integrity Checks
 
 These tests keep the simulator machinery honest.
@@ -1007,6 +1086,47 @@ These tests keep the simulator machinery honest.
   recipient checkpoint plus exact mailbox bytes and that both the replay API and report CLI reproduce its fingerprint.
 - `tests/generated_policy_cases.rs` checks that Tamarin-derived branch selector cases match the Rust selector across
   candidate orderings.
+
+## Public app-path acceptance journeys
+
+`tests/app_runtime_journeys.rs` starts the public-runtime companion coverage with creation/bidirectional messaging,
+profile edits, late join, removal, reopen/continued messaging, and a 12-message offline catch-up. Each uses a real
+local Nostr relay, encrypted participant databases, exact public payload multisets, shared public state, fresh
+messaging, and recipient restart persistence. These are ordinary smoke tests.
+
+The same file maintains `public_app_1024_message_backlog_recovers_completely`, an explicitly ignored slow
+full-recovery regression using all sends and 16 profile updates from the pinned 1,024-message input. It uses native
+relay order and public app operations, not the engine fixture's forced reverse schedule or private oracles. Skipping
+it is not a passing catch-up result. Its companion
+`public_app_1024_message_backlog_with_extra_epochs_recovers_completely` prepends two public profile updates
+while the recipient is offline, pinning the workload that exposed released transport objects being suppressed
+by app deduplication (#1721). Both run in the required public recovery CI job.
+Commands, limits, and remaining coverage gaps are in
+[`APP_PATH_COVERAGE.md`](APP_PATH_COVERAGE.md).
+
+`tests/app_runtime_interaction_journeys.rs` adds interaction journeys the serialized public families cannot express:
+two groups on one device (traffic, a removal, and a reopen must not leak across groups, and the second invitation of the
+same member exercises a fresh KeyPackage), two admins saving different profile fields at the same instant, an invite
+racing a rename, a member removed while its device is closed (it must learn the removal from relay history, keep
+its pre-removal history exactly, and have its own sends refused), and a voluntary leave from a four-member group.
+`AppRuntimeHarness::race_mutations` issues the concurrent commands.
+
+The default forms run in the ordinary crate test and gate only what the product delivers today: members settle on one
+public state, at least one racing edit is present in that settled state (measured on the projection, never on the
+command's return value), fresh traffic flows in every direction, history survives reopen, and survivors apply a leave
+within three minutes. Journey 08 is strict by default: a profile edit the runtime reported as saved reaches the settled
+state when the winner left its field untouched; a same-field race is reported to the host as a conflict (#1734). The
+strict 30-second leave regression also runs ordinarily after the SelfRemove deadline scheduling correction (#1736).
+The strict form of journey 09 remains ignored for the stranded-invitee gap (#1735): an invitee excluded by the canonical
+branch must hold no projection, and a losing invite needs recovery beyond the current re-invitation report.
+The manual self-update journey runs with zeroed maintenance windows when built with `test-policy-overrides`
+(`just simulator-fast-maintenance`) and is ignored in ordinary builds, where the protocol's quiet window and jitter
+run on real time.
+
+`cgka-conformance-app-inventory` inventories unchanged generated inputs against the actual public adapter's action
+capabilities before spending runtime budget. Its bounded selection covers twelve engine families and six public
+companions, and `--vectors DIR` recursively inventories fixed scenario fixtures and saved generated inputs.
+It records unsupported cases explicitly; it does not rewrite scenarios, remove assertions, or count preflight as a pass.
 
 ## Byte Fixtures
 

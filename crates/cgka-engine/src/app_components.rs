@@ -1261,18 +1261,16 @@ fn validate_resulting_leaf_capabilities<'a>(
     })?;
     for leaf in leaves {
         let capabilities = leaf.capabilities();
-        let supports_required = required
-            .extension_types()
+        let supports_required = required.extension_types().iter().all(|required| {
+            crate::capabilities::DEFAULT_MLS_EXTENSION_TYPES.contains(&u16::from(*required))
+                || capabilities.extensions().contains(required)
+        }) && required.proposal_types().iter().all(|required| {
+            crate::capabilities::DEFAULT_MLS_PROPOSAL_TYPES.contains(&u16::from(*required))
+                || capabilities.proposals().contains(required)
+        }) && required
+            .credential_types()
             .iter()
-            .all(|required| capabilities.extensions().contains(required))
-            && required
-                .proposal_types()
-                .iter()
-                .all(|required| capabilities.proposals().contains(required))
-            && required
-                .credential_types()
-                .iter()
-                .all(|required| capabilities.credentials().contains(required));
+            .all(|required| capabilities.credentials().contains(required));
         if !supports_required {
             return Err(EngineError::Other(
                 "invalid current-profile resulting state: member lacks a required MLS capability"

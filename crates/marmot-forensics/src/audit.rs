@@ -24,7 +24,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -1285,6 +1287,10 @@ pub struct JsonlRecorder {
     /// very path the reopen would recreate.
     #[cfg(test)]
     fail_segment_reopen: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_segment_restore: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    disable_segment_rotation: std::sync::atomic::AtomicBool,
 }
 
 struct JsonlInner {
@@ -1296,19 +1302,10 @@ struct JsonlInner {
     health: AuditRecorderHealthSnapshot,
     /// Bytes in the file the writer currently owns, driving segment rolls.
     active_bytes: u64,
-    /// Set when a segment roll fails, so a persistently unwritable directory
-    /// cannot make every subsequent `record` re-attempt (and re-scan the
-    /// directory).
-    ///
-    /// Its lifetime is the *directory-unwritable episode*, not the recorder's:
-    /// it is cleared by anything that proves the directory writable again — a
-    /// fresh recorder open, and [`JsonlRecorder::swap_to_fresh_file`], which
-    /// cannot succeed unless it created and renamed a sibling in that same
-    /// directory. Latching it for the whole recorder lifetime instead would
-    /// mean one transient `ENOSPC`/`EMFILE` stops rotation for the rest of the
-    /// session and lets the active file grow back past the app's upload
-    /// ceiling — the permanent-failure cliff mdk#1181 exists to close.
-    segment_roll_failed: bool,
+    /// Retry deadline after a failed roll; recording continues during backoff.
+    segment_retry_after: Option<Instant>,
+    /// The writer may remain at a segment path if compensation also failed.
+    writer_path: PathBuf,
     /// Lower-bound hint for the next unclaimed segment index, so a roll does
     /// not `read_dir` the account directory on the engine hot path once per
     /// segment. Scanned once when absent and advanced after each sealed
@@ -1352,7 +1349,7 @@ impl JsonlRecorder {
         let active_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         let recorder_session_id = generate_recorder_session_id();
         let recorder = Self {
-            path,
+            path: path.clone(),
             inner: Mutex::new(JsonlInner {
                 writer: BufWriter::new(file),
                 seq: 0,
@@ -1361,11 +1358,16 @@ impl JsonlRecorder {
                 recorder_session_id,
                 health: AuditRecorderHealthSnapshot::default(),
                 active_bytes,
-                segment_roll_failed: false,
+                segment_retry_after: None,
+                writer_path: path.clone(),
                 next_segment_index: None,
             }),
             #[cfg(test)]
             fail_segment_reopen: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_segment_restore: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            disable_segment_rotation: std::sync::atomic::AtomicBool::new(false),
         };
         // Upgrade path: a file left over-threshold by a build without segment
         // rotation — including one already past the app's upload ceiling, which
@@ -1380,9 +1382,7 @@ impl JsonlRecorder {
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if recorder.roll_into_segment(&mut inner).is_err() {
-                inner.segment_roll_failed = true;
-            }
+            recorder.try_roll_segment(&mut inner, Instant::now());
         }
         recorder.record(AuditRecord::new(None, recorder_started_kind()));
         Ok(recorder)
@@ -1451,45 +1451,8 @@ impl ForensicRecorder for JsonlRecorder {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let seq = inner.seq;
-        inner.seq = seq.wrapping_add(1);
-        let kind = record.kind;
-        let context = stamp_system_human_action(record.context, &kind);
-        let event = AuditEvent {
-            schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
-            seq,
-            wall_time_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            recorder_session_id: Some(inner.recorder_session_id.clone()),
-            account_ref: inner.account_ref.clone(),
-            engine_id: inner.engine_id.clone(),
-            group_ref: record.group_ref,
-            context,
-            kind,
-        };
-        if let Ok(line) = serde_json::to_string(&event) {
-            if writeln!(inner.writer, "{line}").is_err() {
-                inner.health.write_failures = inner.health.write_failures.saturating_add(1);
-                return;
-            }
-            inner.active_bytes = inner
-                .active_bytes
-                .saturating_add(line.len() as u64)
-                .saturating_add(1);
-            if inner.writer.flush().is_err() {
-                inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
-            }
-            if !inner.segment_roll_failed
-                && inner.active_bytes >= AUDIT_LOG_SEGMENT_MAX_BYTES
-                && self.roll_into_segment(&mut inner).is_err()
-            {
-                inner.segment_roll_failed = true;
-            }
-        } else {
-            inner.health.serialization_failures =
-                inner.health.serialization_failures.saturating_add(1);
+        if Self::write_record(&mut inner, record) {
+            self.try_roll_segment(&mut inner, Instant::now());
         }
     }
 
@@ -1522,6 +1485,65 @@ impl ForensicRecorder for JsonlRecorder {
 }
 
 impl JsonlRecorder {
+    fn write_record(inner: &mut JsonlInner, record: AuditRecord) -> bool {
+        let seq = inner.seq;
+        inner.seq = seq.wrapping_add(1);
+        let kind = record.kind;
+        let context = stamp_system_human_action(record.context, &kind);
+        let event = AuditEvent {
+            schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
+            seq,
+            wall_time_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            recorder_session_id: Some(inner.recorder_session_id.clone()),
+            account_ref: inner.account_ref.clone(),
+            engine_id: inner.engine_id.clone(),
+            group_ref: record.group_ref,
+            context,
+            kind,
+        };
+        if let Ok(line) = serde_json::to_string(&event) {
+            if writeln!(inner.writer, "{line}").is_err() {
+                inner.health.write_failures = inner.health.write_failures.saturating_add(1);
+                return false;
+            }
+            inner.active_bytes = inner
+                .active_bytes
+                .saturating_add(line.len() as u64)
+                .saturating_add(1);
+            if inner.writer.flush().is_err() {
+                inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+                return false;
+            }
+        } else {
+            inner.health.serialization_failures =
+                inner.health.serialization_failures.saturating_add(1);
+            return false;
+        }
+        true
+    }
+
+    fn try_roll_segment(&self, inner: &mut JsonlInner, now: Instant) {
+        #[cfg(test)]
+        if self.disable_segment_rotation.load(Ordering::Relaxed) {
+            return;
+        }
+        if inner.active_bytes < AUDIT_LOG_SEGMENT_MAX_BYTES
+            || inner
+                .segment_retry_after
+                .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        inner.segment_retry_after = if self.roll_into_segment(inner).is_err() {
+            Some(now + Duration::from_secs(30))
+        } else {
+            None
+        };
+    }
+
     /// Atomically replace the backing file with a fresh empty one at the same
     /// path, resetting the sequence, recorder session id, and health counters.
     /// The fresh file is staged as an owner-only sibling and renamed over the
@@ -1529,6 +1551,11 @@ impl JsonlRecorder {
     /// session id, and health state untouched and still recording. The caller
     /// must hold the inner lock.
     fn swap_to_fresh_file(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
+        if inner.writer_path != self.path {
+            return Err(std::io::Error::other(
+                "audit writer must recover its active path before destructive rotation",
+            ));
+        }
         // Best-effort flush of whatever is buffered into the file we are about
         // to discard.
         let _ = inner.writer.flush();
@@ -1563,14 +1590,8 @@ impl JsonlRecorder {
         inner.recorder_session_id = generate_recorder_session_id();
         inner.health = AuditRecorderHealthSnapshot::default();
         inner.active_bytes = 0;
-        // The latch's lifetime is the directory-unwritable episode, not the
-        // recorder's: reaching here means a sibling was created and renamed
-        // over the live path, which proves the directory writable again. Left
-        // set, one transient roll failure would stop rotation for the rest of
-        // the session and let the active file grow back past the upload
-        // ceiling (mdk#1181). Counter-lifetime hazard: every per-episode field
-        // reset here must be enumerated against every site that sets one.
-        inner.segment_roll_failed = false;
+        inner.segment_retry_after = None;
+        inner.writer_path = self.path.clone();
         Ok(())
     }
 
@@ -1598,26 +1619,39 @@ impl JsonlRecorder {
     /// segment is renamed back so the still-open writer fd and the active path
     /// agree again.
     fn roll_into_segment(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
-        // Best-effort flush so the sealed segment holds everything recorded so
-        // far; the fd survives the rename either way.
-        let _ = inner.writer.flush();
+        // A failed flush must not seal a segment or discard buffered bytes.
+        inner.writer.flush().inspect_err(|_| {
+            inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+        })?;
         let (segment, index) = self.next_segment_path(inner)?;
-        std::fs::rename(&self.path, &segment)?;
+        let previous_path = inner.writer_path.clone();
+        std::fs::rename(&previous_path, &segment)?;
         match self.reopen_active() {
             Ok(file) => {
                 inner.writer = BufWriter::new(file);
                 inner.active_bytes = 0;
                 inner.next_segment_index = Some(index.saturating_add(1));
+                inner.writer_path = self.path.clone();
                 Ok(())
             }
             Err(err) => {
                 // Compensate the one applied step. If even this fails the data
                 // is still on disk under the segment name and the writer keeps
                 // appending to it, so no forensic line is lost.
-                let _ = std::fs::rename(&segment, &self.path);
+                if self.restore_segment(&segment, &previous_path).is_err() {
+                    inner.writer_path = segment;
+                }
                 Err(err)
             }
         }
+    }
+
+    fn restore_segment(&self, segment: &Path, previous: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_segment_restore.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::other("forced segment restore failure"));
+        }
+        std::fs::rename(segment, previous)
     }
 
     /// Reopen the active path after a seal.
@@ -1633,7 +1667,7 @@ impl JsonlRecorder {
     }
 
     /// Make the *next* segment reopen fail, so a test can drive the
-    /// compensating rename-back and the `segment_roll_failed` latch it sets.
+    /// compensating rename-back and the retry backoff it starts.
     /// One-shot, so a test can also observe recovery afterwards.
     #[cfg(test)]
     fn fail_next_segment_reopen(&self) {

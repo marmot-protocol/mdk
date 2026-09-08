@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_traits::{GroupId, TransportEndpoint};
+use marmot_account::MaintenanceTiming;
 use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime,
@@ -72,6 +73,10 @@ pub struct AppRuntimeLocalDiagnosticsV1 {
     pub database_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_kind: Option<String>,
+    /// Bounded public runtime errors; command success does not imply that
+    /// independently scheduled account work also succeeded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +86,55 @@ pub struct AppRuntimeObservationV1 {
     pub protocol: AppRuntimeProtocolProjectionV1,
     pub application: AppRuntimeApplicationProjectionV1,
     pub local: AppRuntimeLocalDiagnosticsV1,
+}
+
+/// One public group mutation issued at the same instant as its siblings by
+/// [`AppRuntimeHarness::race_mutations`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConcurrentMutation<'a> {
+    UpdateGroupProfile {
+        client: &'a str,
+        name: Option<&'a str>,
+        description: Option<&'a str>,
+    },
+    InviteMembers {
+        inviter: &'a str,
+        invitees: &'a [String],
+    },
+}
+
+impl ConcurrentMutation<'_> {
+    pub fn client(&self) -> &str {
+        match self {
+            Self::UpdateGroupProfile { client, .. } => client,
+            Self::InviteMembers { inviter, .. } => inviter,
+        }
+    }
+}
+
+/// Public result of one concurrently issued mutation. `accepted` means the
+/// runtime reported the command as saved to its caller; a rejected command
+/// carries only a privacy-safe error classification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrentMutationOutcome {
+    pub client: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+}
+
+/// Everything [`AppRuntimeHarness::race_mutations`] learned at the command
+/// boundary. Relay events admitted beyond the accepted commands' own
+/// publications are counted, not rejected: they are how convergence recovery
+/// or a rejected command's early publication become visible to a scenario.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrentMutationReport {
+    pub outcomes: Vec<ConcurrentMutationOutcome>,
+    /// Retained relay events the accepted commands reported publishing.
+    pub expected_publications: usize,
+    /// Retained relay events admitted after the race started, once every
+    /// accepted publication had appeared.
+    pub admitted_publications: usize,
 }
 
 struct Participant {
@@ -95,6 +149,7 @@ struct Participant {
     retryable_failures: u64,
     terminal_failures: u64,
     last_error_kind: Option<String>,
+    background_errors: Vec<String>,
     runtime_events_observed: usize,
     cached_members: BTreeMap<String, Vec<String>>,
     cached_epochs: BTreeMap<String, u64>,
@@ -128,22 +183,40 @@ pub struct AppRuntimeHarness {
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
     relay_action_events: RelayActionEvents,
     settlement_quiescence_ms: Option<u64>,
+    maintenance_timing: Option<MaintenanceTiming>,
 }
 
 impl AppRuntimeHarness {
     pub async fn new(clients: &[String]) -> Result<Self, SubjectError> {
-        Self::new_with_settlement_quiescence(clients, None).await
+        Self::new_with_policy(clients, None, None).await
     }
 
     /// Build the retained-history regression harness with the protocol-pinned
     /// settlement window even when the workspace enables test-policy overrides.
     pub async fn new_with_pinned_settlement(clients: &[String]) -> Result<Self, SubjectError> {
-        Self::new_with_settlement_quiescence(clients, Some(1_000)).await
+        Self::new_with_policy(clients, Some(1_000), None).await
     }
 
-    async fn new_with_settlement_quiescence(
+    /// Build a harness whose participants run own-leaf maintenance with every
+    /// scheduling window set to zero, so a manual or post-join self-update
+    /// publishes within a few explicit [`Self::run_due_maintenance`] sweeps.
+    /// The protocol-pinned settlement window is kept. The override is honored
+    /// only when this crate is built with `test-policy-overrides`; in any other
+    /// build the runtimes keep production maintenance windows and report the
+    /// ignored knob through tracing.
+    pub async fn new_with_immediate_maintenance(clients: &[String]) -> Result<Self, SubjectError> {
+        Self::new_with_policy(clients, Some(1_000), Some(MaintenanceTiming::immediate())).await
+    }
+
+    /// Whether this build can honor maintenance timing overrides at all.
+    pub const fn honors_maintenance_timing_override() -> bool {
+        cfg!(feature = "test-policy-overrides")
+    }
+
+    async fn new_with_policy(
         clients: &[String],
         settlement_quiescence_ms: Option<u64>,
+        maintenance_timing: Option<MaintenanceTiming>,
     ) -> Result<Self, SubjectError> {
         let relay_control = RelayControl::new();
         let relay = LocalRelay::new(relay_control.relay_builder());
@@ -157,7 +230,12 @@ impl AppRuntimeHarness {
                 .tempdir()
                 .map_err(environment_error)?;
             fs_private::create_dir_all_private(root.path()).map_err(environment_error)?;
-            let app = app_for_root(root.path(), &relay_url, settlement_quiescence_ms);
+            let app = app_for_root(
+                root.path(),
+                &relay_url,
+                settlement_quiescence_ms,
+                maintenance_timing,
+            );
             let runtime = MarmotAppRuntime::new(app.clone());
             runtime.start().await.map_err(app_error)?;
             let setup = runtime
@@ -185,6 +263,7 @@ impl AppRuntimeHarness {
                     retryable_failures: 0,
                     terminal_failures: 0,
                     last_error_kind: None,
+                    background_errors: Vec::new(),
                     runtime_events_observed: 0,
                     cached_members: BTreeMap::new(),
                     cached_epochs: BTreeMap::new(),
@@ -202,11 +281,19 @@ impl AppRuntimeHarness {
             accepted_publications: BTreeMap::new(),
             relay_action_events: BTreeMap::new(),
             settlement_quiescence_ms,
+            maintenance_timing,
         })
     }
 
     async fn relay_publication_cursor(&self) -> usize {
         self.relay_control.publication_cursor().await
+    }
+
+    /// Number of events the shared relay has admitted so far. A scenario can
+    /// difference two readings to prove that a command reached the relay at
+    /// all, independently of any participant's projection.
+    pub async fn relay_admitted_events(&self) -> usize {
+        self.relay_publication_cursor().await
     }
 
     async fn set_all_maintenance_paused(&self, paused: bool) -> Result<(), SubjectError> {
@@ -256,25 +343,35 @@ impl AppRuntimeHarness {
         expected_event_ids: &[String],
     ) -> Result<(), SubjectError> {
         self.participant(actor)?;
-        // Scenario commands execute serially. Where the public app API exposes
-        // transport message ids, validate those exact relay events; chat sends
-        // expose only application-event ids, so they retain the bounded count
-        // fallback at this command boundary. Kind-445 outer authors are
-        // intentionally ephemeral and cannot identify the actor.
-        self.relay_control
-            .wait_for_action_events(
-                &mut self.relay_action_events,
-                action_id,
-                before,
-                RelayActionExpectation {
-                    include_welcomes,
-                    expected_publications,
-                    expected_event_ids,
-                    timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
-                },
-            )
-            .await
-            .map_err(relay_control_error)
+        // Maintenance and queued work can publish alongside a serial scenario
+        // command. Complete public transport identities distinguish that work
+        // from the action without relying on ephemeral kind-445 outer authors.
+        let expectation = RelayActionExpectation {
+            include_welcomes,
+            expected_publications,
+            expected_event_ids,
+            timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
+        };
+        let result = if expected_event_ids.len() == expected_publications {
+            self.relay_control
+                .wait_for_exact_action_events(
+                    &mut self.relay_action_events,
+                    action_id,
+                    before,
+                    expectation,
+                )
+                .await
+        } else {
+            self.relay_control
+                .wait_for_action_events(
+                    &mut self.relay_action_events,
+                    action_id,
+                    before,
+                    expectation,
+                )
+                .await
+        };
+        result.map_err(relay_control_error)
     }
 
     async fn set_shared_relay_event_presence(
@@ -395,13 +492,19 @@ impl AppRuntimeHarness {
     pub async fn reopen(&mut self, client: &str) -> Result<(), SubjectError> {
         let relay_url = self.relay_url.clone();
         let settlement_quiescence_ms = self.settlement_quiescence_ms;
+        let maintenance_timing = self.maintenance_timing;
         let participant = self.participant_mut(client)?;
         if participant.online
             && let Some(runtime) = participant.runtime.take()
         {
             runtime.shutdown_and_close().await.map_err(app_error)?;
         }
-        participant.app = app_for_root(participant.root(), &relay_url, settlement_quiescence_ms);
+        participant.app = app_for_root(
+            participant.root(),
+            &relay_url,
+            settlement_quiescence_ms,
+            maintenance_timing,
+        );
         let runtime = MarmotAppRuntime::new(participant.app.clone());
         runtime.start().await.map_err(app_error)?;
         participant.events = Some(runtime.subscribe());
@@ -471,6 +574,143 @@ impl AppRuntimeHarness {
         }
     }
 
+    /// Advance every named online participant's durable maintenance state once
+    /// through the public runtime, publishing work whose safety windows have
+    /// elapsed. Scenarios poll this instead of waiting for the worker's own
+    /// fifteen-second timer; deadlines and jitter still run on real time.
+    pub async fn run_due_maintenance(&mut self, clients: &[String]) -> Result<(), SubjectError> {
+        for label in clients {
+            let participant = self.participant_mut(label)?;
+            if !participant.online {
+                continue;
+            }
+            let account_id = participant.account_id.clone();
+            if let Err(error) = participant
+                .runtime()?
+                .run_due_maintenance(&account_id)
+                .await
+            {
+                record_failure(participant, &error);
+                return Err(app_error(error));
+            }
+        }
+        self.refresh_cached_members(clients).await
+    }
+
+    /// Issue several mutations from different participants at the same instant
+    /// against the active scenario group, then wait until the shared relay has
+    /// admitted every accepted publication. Each participant commits against
+    /// its own current epoch, so accepted siblings may compete for one epoch;
+    /// the caller asserts the public outcome. Convergence may publish recovery
+    /// commits inside the window and a rejected command may have reached the
+    /// relay before failing, so additional admitted events are reported rather
+    /// than treated as a correlation failure.
+    pub async fn race_mutations(
+        &mut self,
+        action_id: &str,
+        mutations: &[ConcurrentMutation<'_>],
+    ) -> Result<ConcurrentMutationReport, SubjectError> {
+        if mutations.is_empty() {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "empty_concurrent_mutation_set",
+                "a concurrent mutation set needs at least one mutation",
+            ));
+        }
+        let group_id = self.active_group()?;
+        let before = self.relay_publication_cursor().await;
+        let include_welcomes = mutations
+            .iter()
+            .any(|mutation| matches!(mutation, ConcurrentMutation::InviteMembers { .. }));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, mutation) in mutations.iter().enumerate() {
+            let participant = self.participant(mutation.client())?;
+            let runtime = participant.runtime()?.clone();
+            let account_id = participant.account_id.clone();
+            let group_id = group_id.clone();
+            match mutation {
+                ConcurrentMutation::UpdateGroupProfile {
+                    name, description, ..
+                } => {
+                    let name = name.map(str::to_owned);
+                    let description = description.map(str::to_owned);
+                    tasks.spawn(async move {
+                        let result = runtime
+                            .update_group_profile(&account_id, &group_id, name, description)
+                            .await;
+                        (index, result)
+                    });
+                }
+                ConcurrentMutation::InviteMembers { invitees, .. } => {
+                    let invitees = self.account_ids(invitees)?;
+                    tasks.spawn(async move {
+                        let result = runtime
+                            .invite_members(&account_id, &group_id, &invitees)
+                            .await;
+                        (index, result)
+                    });
+                }
+            }
+        }
+        let mut results = (0..mutations.len()).map(|_| None).collect::<Vec<_>>();
+        while let Some(joined) = tasks.join_next().await {
+            let (index, result) = joined.map_err(|_| {
+                SubjectError::classified(
+                    SubjectFailureCategory::Environment,
+                    "concurrent_mutation_task_failed",
+                    "a concurrently issued app-runtime mutation did not complete",
+                )
+            })?;
+            results[index] = Some(result);
+        }
+        let mut outcomes = Vec::with_capacity(mutations.len());
+        let mut expected_publications = 0;
+        let mut expected_event_ids = Vec::new();
+        for (mutation, result) in mutations.iter().zip(results) {
+            let result = result.expect("every spawned mutation reports exactly once");
+            let client = mutation.client().to_owned();
+            outcomes.push(match result {
+                Ok(summary) => {
+                    expected_publications += summary.published;
+                    expected_event_ids.extend(summary.message_ids);
+                    ConcurrentMutationOutcome {
+                        client,
+                        accepted: true,
+                        error_kind: None,
+                    }
+                }
+                Err(error) => ConcurrentMutationOutcome {
+                    client,
+                    accepted: false,
+                    error_kind: Some(app_error_kind(&error).to_owned()),
+                },
+            });
+        }
+        let admitted_publications = self
+            .relay_control
+            .wait_for_at_least_action_events(
+                &mut self.relay_action_events,
+                action_id,
+                before,
+                RelayActionExpectation {
+                    include_welcomes,
+                    expected_publications,
+                    expected_event_ids: &expected_event_ids,
+                    timeout: RELAY_ACTION_PUBLICATION_TIMEOUT,
+                },
+            )
+            .await
+            .map_err(relay_control_error)?;
+        for outcome in outcomes.iter().filter(|outcome| outcome.accepted) {
+            self.record_accepted_publication(&outcome.client, action_id);
+        }
+        Ok(ConcurrentMutationReport {
+            outcomes,
+            expected_publications,
+            admitted_publications,
+        })
+    }
+
     fn active_group(&self) -> Result<GroupId, SubjectError> {
         let label = self.active_scenario_group.as_ref().ok_or_else(|| {
             SubjectError::new("scenario_group_missing", "no scenario group is selected")
@@ -527,11 +767,31 @@ impl AppRuntimeHarness {
             if !participant.online {
                 continue;
             }
+            // A future invitee can repair its account before it has this
+            // group's projection. Keep it on the real relay, but don't query
+            // MLS state for a group it has never joined. Explicit observation
+            // of that absent group still fails instead of inventing a state.
+            if participant
+                .app
+                .group(&participant.account_id, &hex::encode(group_id.as_slice()))
+                .map_err(app_error)?
+                .is_none()
+            {
+                participant.cached_members.remove(&group_label);
+                participant.cached_epochs.remove(&group_label);
+                drain_runtime_events(participant);
+                continue;
+            }
             let members = participant
                 .runtime()?
                 .group_members(&participant.account_id, &group_id)
                 .await
-                .map_err(app_error)?;
+                .map_err(|error| {
+                    record_failure(participant, &error);
+                    let mut error = app_error(error);
+                    error.message = format!("reading group members: {}", error.message);
+                    error
+                })?;
             participant.cached_members.insert(
                 group_label.clone(),
                 members
@@ -543,7 +803,12 @@ impl AppRuntimeHarness {
                 .runtime()?
                 .group_mls_state(&participant.account_id, &group_id)
                 .await
-                .map_err(app_error)?;
+                .map_err(|error| {
+                    record_failure(participant, &error);
+                    let mut error = app_error(error);
+                    error.message = format!("reading group MLS state: {}", error.message);
+                    error
+                })?;
             participant
                 .cached_epochs
                 .insert(group_label.clone(), state.epoch);
@@ -713,6 +978,7 @@ impl AppRuntimeHarness {
                 database_encrypted: status.projections.account.encrypted,
                 database_bytes,
                 last_error_kind: participant.last_error_kind.clone(),
+                background_errors: participant.background_errors.clone(),
             },
         })
     }
@@ -762,6 +1028,8 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 SubjectCapability::ApplicationMessaging,
                 SubjectCapability::TransportDelivery,
                 SubjectCapability::EventObservation,
+                SubjectCapability::AssertionEvaluation,
+                SubjectCapability::PublicGroupStateObservation,
                 SubjectCapability::AdminPolicyObservation,
                 SubjectCapability::CrashReopen,
                 SubjectCapability::OutboundPublication,
@@ -819,6 +1087,9 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 .active_scenario_group
                 .clone()
                 .unwrap_or_else(|| "default".into());
+            // Single-group IR omits InGroup. Keep the implicit group selected
+            // for subsequent public reads and commands, just like explicit IR.
+            self.active_scenario_group = Some(group_label.clone());
             self.scenario_groups.insert(group_label, group_id.clone());
             let message_ids = self
                 .apply_admin_set(action.creator, &group_id, action.initial_admins)
@@ -847,82 +1118,103 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectInviteMembers<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let invitees = self.account_ids(action.invitees)?;
-        let participant = self.participant(action.inviter)?;
-        let summary = participant
-            .runtime()?
-            .invite_members(&participant.account_id, &group_id, &invitees)
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.inviter,
-            before,
-            true,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        self.record_accepted_publication(action.inviter, action.pending);
-        Ok(())
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let invitees = self.account_ids(action.invitees)?;
+            let participant = self.participant(action.inviter)?;
+            let summary = participant
+                .runtime()?
+                .invite_members(&participant.account_id, &group_id, &invitees)
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.inviter,
+                before,
+                true,
+                summary.published,
+                &summary.message_ids,
+            )
+            .await?;
+            self.record_accepted_publication(action.inviter, action.pending);
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     async fn update_group_data(
         &mut self,
         action: SubjectUpdateGroupData<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let participant = self.participant(action.client)?;
-        let summary = participant
-            .runtime()?
-            .update_group_profile(
-                &participant.account_id,
-                &group_id,
-                action.name.map(str::to_owned),
-                action.description.map(str::to_owned),
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let participant = self.participant(action.client)?;
+            let summary = participant
+                .runtime()?
+                .update_group_profile(
+                    &participant.account_id,
+                    &group_id,
+                    action.name.map(str::to_owned),
+                    action.description.map(str::to_owned),
+                )
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.client,
+                before,
+                false,
+                summary.published,
+                &summary.message_ids,
             )
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.client,
-            before,
-            false,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        self.record_accepted_publication(action.client, action.pending);
-        Ok(())
+            .await?;
+            self.record_accepted_publication(action.client, action.pending);
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     async fn remove_members(
         &mut self,
         action: SubjectRemoveMembers<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let members = self.account_ids(action.members)?;
-        let participant = self.participant(action.remover)?;
-        let summary = participant
-            .runtime()?
-            .remove_members(&participant.account_id, &group_id, &members)
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action.action_id,
-            action.remover,
-            before,
-            false,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        self.record_accepted_publication(action.remover, action.pending);
-        Ok(())
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let members = self.account_ids(action.members)?;
+            let participant = self.participant(action.remover)?;
+            let summary = participant
+                .runtime()?
+                .remove_members(&participant.account_id, &group_id, &members)
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action.action_id,
+                action.remover,
+                before,
+                false,
+                summary.published,
+                &summary.message_ids,
+            )
+            .await?;
+            self.record_accepted_publication(action.remover, action.pending);
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     async fn self_update(&mut self, action: SubjectSelfUpdate<'_>) -> Result<(), SubjectError> {
@@ -941,26 +1233,36 @@ impl ConvergenceSubject for AppRuntimeHarness {
         &mut self,
         action: SubjectUpdateAdminPolicy<'_>,
     ) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let message_ids = self
-            .apply_admin_set(action.client, &group_id, action.admins)
-            .await?;
-        if let Some(action_id) = action.action_id {
-            self.record_relay_action_events(
-                action_id,
-                action.client,
-                before,
-                false,
-                message_ids.len(),
-                &message_ids,
-            )
-            .await?;
+        if action.action_id.is_none() {
+            return self.probe_admin_policy_refusal(action).await;
         }
-        if let Some(pending) = action.pending {
-            self.record_accepted_publication(action.client, pending);
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let message_ids = self
+                .apply_admin_set(action.client, &group_id, action.admins)
+                .await?;
+            if let Some(action_id) = action.action_id {
+                self.record_relay_action_events(
+                    action_id,
+                    action.client,
+                    before,
+                    false,
+                    message_ids.len(),
+                    &message_ids,
+                )
+                .await?;
+            }
+            if let Some(pending) = action.pending {
+                self.record_accepted_publication(action.client, pending);
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     fn scenario_publication_already_accepted(&self, client: &str, publication: &str) -> bool {
@@ -1019,13 +1321,41 @@ impl ConvergenceSubject for AppRuntimeHarness {
                 )
                 .await
                 .map_err(app_error)?;
+            // SendSummary names application events. Resolve their published
+            // transport identity through the public timeline projection, which
+            // the send completes before returning. The same engine pass may
+            // also publish an older queued maintenance operation.
+            let mut transport_ids = Vec::new();
+            if summary.published > 0 {
+                for app_event_id in &summary.message_ids {
+                    let transport_id = participant
+                        .runtime()?
+                        .timeline_message(
+                            &participant.account_id,
+                            &hex::encode(group_id.as_slice()),
+                            app_event_id,
+                        )
+                        .map_err(app_error)?
+                        .and_then(|message| message.source_message_id_hex)
+                        .ok_or_else(|| {
+                            SubjectError::classified(
+                                SubjectFailureCategory::Protocol,
+                                "published_message_transport_identity_missing",
+                                "a published chat message has no public transport identity",
+                            )
+                        })?;
+                    transport_ids.push(transport_id);
+                }
+                // Queued maintenance can increase the total beyond chat ids.
+                // The recorder checks the total and every known identity.
+            }
             self.record_relay_action_events(
                 action.action_id,
                 action.sender,
                 before,
                 false,
                 summary.published,
-                &[],
+                &transport_ids,
             )
             .await
         }
@@ -1038,24 +1368,31 @@ impl ConvergenceSubject for AppRuntimeHarness {
     }
 
     async fn leave(&mut self, action_id: &str, client: &str) -> Result<(), SubjectError> {
-        let before = self.relay_publication_cursor().await;
-        let group_id = self.active_group()?;
-        let participant = self.participant(client)?;
-        let summary = participant
-            .runtime()?
-            .leave_group(&participant.account_id, &group_id)
-            .await
-            .map_err(app_error)?;
-        self.record_relay_action_events(
-            action_id,
-            client,
-            before,
-            false,
-            summary.published,
-            &summary.message_ids,
-        )
-        .await?;
-        Ok(())
+        // Keep maintenance publications outside this action's relay cursor.
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let before = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let participant = self.participant(client)?;
+            let summary = participant
+                .runtime()?
+                .leave_group(&participant.account_id, &group_id)
+                .await
+                .map_err(app_error)?;
+            self.record_relay_action_events(
+                action_id,
+                client,
+                before,
+                false,
+                summary.published,
+                &summary.message_ids,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        let resume = self.set_all_maintenance_paused(false).await;
+        result.and(resume)
     }
 
     fn deliver_all(&mut self) -> Result<(), SubjectError> {
@@ -1070,6 +1407,78 @@ impl ConvergenceSubject for AppRuntimeHarness {
 
     fn observe(&mut self, clients: &[String]) -> Result<Vec<ClientObservation>, SubjectError> {
         self.legacy_observations(clients)
+    }
+
+    fn evaluate_predicate(
+        &mut self,
+        predicate: &crate::ScenarioPredicateV2,
+    ) -> Result<crate::ScenarioPredicateObservationV2, SubjectError> {
+        use crate::ScenarioPredicateV2;
+        let (matched, actual) = match predicate {
+            ScenarioPredicateV2::PublicGroupState {
+                clients,
+                members,
+                admins,
+                name,
+                description,
+                minimum_epoch,
+            } => {
+                let states = clients
+                    .iter()
+                    .map(|client| Ok((client.clone(), self.layered_observation(client)?.protocol)))
+                    .collect::<Result<BTreeMap<_, _>, SubjectError>>()?;
+                let matched = public_group_states_match(
+                    &states.values().cloned().collect::<Vec<_>>(),
+                    members,
+                    admins,
+                    name,
+                    description,
+                    *minimum_epoch,
+                );
+                (matched, serde_json::json!(states))
+            }
+            ScenarioPredicateV2::ClientState {
+                client,
+                epoch,
+                member_count,
+            } => {
+                let observation = self.layered_observation(client)?;
+                let state = observation.protocol;
+                (
+                    epoch.is_none_or(|expected| state.epoch == expected)
+                        && member_count.is_none_or(|expected| state.member_count == expected),
+                    serde_json::json!({
+                        "client": client,
+                        "epoch": state.epoch,
+                        "member_count": state.member_count,
+                    }),
+                )
+            }
+            ScenarioPredicateV2::PayloadCount {
+                client,
+                payload,
+                count,
+            } => {
+                let observation = self.layered_observation(client)?;
+                let actual_count = observation
+                    .application
+                    .visible_plaintexts
+                    .iter()
+                    .filter(|value| *value == payload)
+                    .count();
+                (
+                    actual_count == *count,
+                    serde_json::json!({"count": actual_count}),
+                )
+            }
+            ScenarioPredicateV2::ClientsExactlyEquivalent { .. }
+            | ScenarioPredicateV2::NoPendingWork { .. } => {
+                return Err(SubjectError::unsupported(
+                    SubjectCapability::ExactConformanceObservation,
+                ));
+            }
+        };
+        Ok(crate::ScenarioPredicateObservationV2 { matched, actual })
     }
 
     fn observe_admin_policy(
@@ -1159,6 +1568,40 @@ impl ConvergenceSubject for AppRuntimeHarness {
 }
 
 impl AppRuntimeHarness {
+    // Expected-error steps must observe the real command's refusal, including
+    // its side effects. Pause unrelated maintenance while comparing public
+    // state and relay publications, and always resume before returning.
+    async fn probe_admin_policy_refusal(
+        &mut self,
+        action: SubjectUpdateAdminPolicy<'_>,
+    ) -> Result<(), SubjectError> {
+        self.set_all_maintenance_paused(true).await?;
+        let result = async {
+            let clients = vec![action.client.to_owned()];
+            self.refresh_cached_members(&clients).await?;
+            let before = self.layered_observation(action.client)?.protocol;
+            let publications = self.relay_publication_cursor().await;
+            let group_id = self.active_group()?;
+            let result = self
+                .apply_admin_set(action.client, &group_id, action.admins)
+                .await;
+            self.refresh_cached_members(&clients).await?;
+            let after = self.layered_observation(action.client)?.protocol;
+            if result.is_err()
+                && (before != after || publications != self.relay_publication_cursor().await)
+            {
+                return Err(SubjectError::new(
+                    "admin_refusal_changed_state_or_published",
+                    "expected admin refusal changed public state or published a relay event",
+                ));
+            }
+            result.map(|_| ())
+        }
+        .await;
+        self.set_all_maintenance_paused(false).await?;
+        result
+    }
+
     async fn apply_admin_set(
         &self,
         actor: &str,
@@ -1308,10 +1751,43 @@ async fn compensate_admin_changes(
     app_error(original)
 }
 
-fn app_for_root(root: &Path, relay_url: &str, settlement_quiescence_ms: Option<u64>) -> MarmotApp {
+fn public_group_states_match(
+    states: &[AppRuntimeProtocolProjectionV1],
+    members: &[String],
+    admins: &[String],
+    name: &str,
+    description: &str,
+    minimum_epoch: u64,
+) -> bool {
+    let mut members = members.to_vec();
+    let mut admins = admins.to_vec();
+    members.sort();
+    admins.sort();
+    states.first().is_some_and(|first| {
+        first.epoch >= minimum_epoch
+            && states.iter().all(|state| {
+                state.epoch == first.epoch
+                    && state.member_count == members.len()
+                    && state.member_identities == members
+                    && state.admin_identities == admins
+                    && state.group_name == name
+                    && state.group_description == description
+            })
+    })
+}
+
+fn app_for_root(
+    root: &Path,
+    relay_url: &str,
+    settlement_quiescence_ms: Option<u64>,
+    maintenance_timing: Option<MaintenanceTiming>,
+) -> MarmotApp {
     let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
     if let Some(ms) = settlement_quiescence_ms {
         config = config.with_dev_settlement_quiescence_ms(ms);
+    }
+    if let Some(timing) = maintenance_timing {
+        config = config.with_dev_maintenance_timing(timing);
     }
     MarmotApp::with_relay_and_config(root, relay_url.to_owned(), config)
 }
@@ -1364,7 +1840,18 @@ fn drain_runtime_events(participant: &mut Participant) {
     let Some(events) = participant.events.as_mut() else {
         return;
     };
-    while events.try_recv().is_ok() {
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        };
+        if let MarmotAppEvent::AccountError(error) = event {
+            if participant.background_errors.len() == 8 {
+                participant.background_errors.remove(0);
+            }
+            participant.background_errors.push(error.message);
+        }
         participant.runtime_events_observed = participant.runtime_events_observed.saturating_add(1);
     }
 }
@@ -1406,8 +1893,10 @@ pub(crate) async fn accept_group_invite_retrying_busy(
     Err(last_retryable)
 }
 
-fn record_failure(participant: &mut Participant, error: &AppError) {
-    let kind = match error {
+/// Privacy-safe classification of a public runtime error: a fixed label per
+/// variant family, never the variant's inner details.
+fn app_error_kind(error: &AppError) -> &'static str {
+    match error {
         AppError::AccountSessionBusy => "account_session_busy",
         AppError::AccountWorkerBusy => "account_worker_busy",
         AppError::AccountWorkerResponseTimedOut => "account_worker_response_timed_out",
@@ -1420,10 +1909,18 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "storage"
         }
+        AppError::UnknownGroup(_) => "unknown_group",
+        AppError::GroupRemoved(_) => "group_removed",
+        AppError::GroupDisbanding(_) => "group_disbanding",
+        AppError::GroupInviteNotPending => "group_invite_not_pending",
+        AppError::MissingKeyPackage(_) => "missing_key_package",
+        AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         _ => "app_runtime_operation",
     }
-    .to_owned();
-    participant.last_error_kind = Some(kind);
+}
+
+fn record_failure(participant: &mut Participant, error: &AppError) {
+    participant.last_error_kind = Some(app_error_kind(error).to_owned());
     if matches!(
         error,
         AppError::AccountSessionBusy
@@ -1439,6 +1936,16 @@ fn record_failure(participant: &mut Participant, error: &AppError) {
 }
 
 fn app_error(error: AppError) -> SubjectError {
+    if matches!(
+        error.as_engine_error(),
+        Some(cgka_traits::error::EngineError::NotGroupAdmin { .. })
+    ) {
+        return SubjectError::classified(
+            SubjectFailureCategory::ExpectedRefusal,
+            "not_group_admin",
+            "local identity is not a group administrator",
+        );
+    }
     let category = match error {
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
@@ -1484,6 +1991,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
         | AppError::GroupDisbanding(_)
+        | AppError::GroupRemoved(_)
         | AppError::AgentStreamMissingStart
         | AppError::AgentStreamStartNotConfirmed
         | AppError::AgentStreamUnsupportedRoute
@@ -1497,6 +2005,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::NotificationsDisabled
         | AppError::AccountSetupRecoveryRequired
         | AppError::AccountSetupRetryRequired
+        | AppError::OnboardingActionUnavailable
+        | AppError::OnboardingRequired
         | AppError::AccountSetupResetNotApplicable
         | AppError::AccountSetupKeyPackageRecoveryAvailable
         | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,
@@ -1513,7 +2023,10 @@ fn app_error(error: AppError) -> SubjectError {
     SubjectError::classified(
         category,
         "app_runtime_operation_failed",
-        "application runtime operation failed",
+        format!(
+            "application runtime operation failed: {}",
+            app_error_kind(&error)
+        ),
     )
 }
 
@@ -1574,6 +2087,95 @@ fn walk_file_bytes(root: &Path) -> Vec<u64> {
 mod tests {
     use super::*;
 
+    /// Even a pre-publication validation error must release maintenance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_error_resumes_work() {
+        let clients = vec!["alice".to_owned()];
+        let mut subject = AppRuntimeHarness::new(&clients).await.unwrap();
+        subject
+            .create_group(SubjectCreateGroup {
+                action_id: "create",
+                creator: "alice",
+                name: "maintenance cleanup",
+                invitees: &[],
+                required_features: &[],
+                initial_admins: &clients,
+                pending: "create",
+            })
+            .await
+            .unwrap();
+        let group = subject.active_group().unwrap();
+        subject.set_all_maintenance_paused(true).await.unwrap();
+        let participant = subject.participant("alice").unwrap();
+        let account = participant.account_id.clone();
+        let runtime = participant.runtime().unwrap();
+        assert!(
+            runtime
+                .maintenance_status(&account, &group)
+                .await
+                .unwrap()
+                .paused
+        );
+
+        // Fail after entering the command's paused region, before publishing.
+        let selected = subject.active_scenario_group.take();
+        let result = subject
+            .update_group_data(SubjectUpdateGroupData {
+                action_id: "invalid-profile",
+                client: "alice",
+                name: Some("renamed"),
+                description: None,
+                pending: "invalid-profile",
+            })
+            .await;
+        subject.active_scenario_group = selected;
+        assert_eq!(result.unwrap_err().code, "scenario_group_missing");
+        let runtime = subject.participant("alice").unwrap().runtime().unwrap();
+        let paused = runtime
+            .maintenance_status(&account, &group)
+            .await
+            .unwrap()
+            .paused;
+        subject.shutdown().await;
+        assert!(!paused, "maintenance must resume after the failed command");
+    }
+
+    #[test]
+    fn public_group_checkpoint_allows_maintenance_epochs_but_rejects_semantic_drift() {
+        let members = vec!["alice".into(), "bob".into()];
+        let admins = vec!["alice".into()];
+        let state = public_protocol_projection(
+            7,
+            members.clone(),
+            admins.clone(),
+            "name".into(),
+            "description".into(),
+            2,
+        );
+        let states = vec![state.clone(), state];
+        let matches = |states: &[AppRuntimeProtocolProjectionV1]| {
+            public_group_states_match(states, &members, &admins, "name", "description", 3)
+        };
+        assert!(matches(&states)); // Additional epochs do not change the requested state.
+        assert!(!matches(&[]));
+        for mutation in 0..7 {
+            let mut wrong = states.clone();
+            match mutation {
+                0 => wrong[1].member_identities[1] = "carol".into(), // Same count, wrong person.
+                1 => wrong[1].admin_identities[0] = "bob".into(),
+                2 => wrong[1].group_name.push_str("-stale"),
+                3 => wrong[1].group_description.clear(),
+                4 => wrong[1].member_count = 3,
+                5 => wrong[1].epoch += 1, // Must agree at the same checkpoint.
+                _ => wrong.iter_mut().for_each(|state| state.epoch = 2),
+            }
+            assert!(
+                !matches(&wrong),
+                "mutation {mutation} escaped the public oracle"
+            );
+        }
+    }
+
     #[test]
     fn public_commitment_preserves_a_reported_zero_member_count() {
         let projection = public_protocol_projection(
@@ -1598,8 +2200,23 @@ mod tests {
         assert_eq!(protocol.category, SubjectFailureCategory::Protocol);
         assert!(!protocol.message.contains(marker));
 
-        let resource = app_error(AppError::RuntimeBusy);
-        assert_eq!(resource.category, SubjectFailureCategory::Resource);
+        let denied = app_error(AppError::Account(marmot_account::AccountError::Engine(
+            cgka_traits::error::EngineError::NotGroupAdmin {
+                group_id: GroupId::new(marker.as_bytes().to_vec()),
+            },
+        )));
+        assert_eq!(denied.category, SubjectFailureCategory::ExpectedRefusal);
+        assert_eq!(denied.code, "not_group_admin");
+        assert!(!denied.message.contains(marker));
+        for failure in [
+            AppError::RuntimeBusy,
+            AppError::AccountWorkerResponseTimedOut,
+        ] {
+            let resource = app_error(failure);
+            assert_eq!(resource.category, SubjectFailureCategory::Resource);
+            assert_ne!(resource.code, denied.code);
+        }
+        assert_ne!(environment.code, denied.code);
 
         let refusal = app_error(AppError::GroupInviteNotPending);
         assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);

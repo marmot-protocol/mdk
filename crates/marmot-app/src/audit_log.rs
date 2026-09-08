@@ -19,7 +19,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio_util::io::ReaderStream;
+use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
@@ -71,6 +71,77 @@ pub struct AuditLogTrackerUpdateResult {
     pub enabled: bool,
     pub uploaded: Vec<AuditLogUploadResult>,
     pub skipped_reason: Option<String>,
+}
+
+/// Internal receipt: only a complete snapshot of the enumerated file may be
+/// checkpointed. The public upload result describes bytes actually sent.
+pub(crate) struct AuditUploadReceipt {
+    pub result: AuditLogUploadResult,
+    pub observed_bytes: u64,
+    pub modified_at_ms: Option<u64>,
+    pub complete: bool,
+}
+
+pub(crate) enum AuditUploadAttempt {
+    Uploaded(AuditUploadReceipt),
+    Deferred,
+    FileFailure(AppError),
+    Rejected {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Retry-After accepts either delta seconds or an HTTP date. Bound untrusted
+/// deadlines to five minutes so one response cannot silence incident evidence for a day.
+fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    let delay = value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .map(|date| date.duration_since(now).unwrap_or_default())
+        })?;
+    Some(delay.min(Duration::from_secs(5 * 60)))
+}
+
+struct AuditUploadSnapshot {
+    body: Vec<u8>,
+    observed_bytes: u64,
+    modified_at_ms: Option<u64>,
+    complete: bool,
+}
+
+impl AuditUploadSnapshot {
+    async fn capture(file: tokio::fs::File) -> Result<Self, AppError> {
+        let metadata = file.metadata().await?;
+        let observed_bytes = metadata.len();
+        if observed_bytes > AUDIT_LOG_UPLOAD_MAX_BYTES {
+            return Err(AppError::AuditLogUpload(format!(
+                "audit log exceeds {} byte upload limit",
+                AUDIT_LOG_UPLOAD_MAX_BYTES
+            )));
+        }
+        let mut body = Vec::with_capacity(observed_bytes as usize);
+        // Opening once preserves identity across rename/replacement. Bounding
+        // the read excludes later appends, but is not sufficient by itself:
+        // metadata can have sampled the middle of a JSONL write/flush.
+        file.take(observed_bytes).read_to_end(&mut body).await?;
+        let end = body
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |i| i + 1);
+        body.truncate(end);
+        Ok(Self {
+            complete: body.len() as u64 == observed_bytes,
+            body,
+            observed_bytes,
+            modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
+        })
+    }
 }
 
 /// What the tracker already did with one audit file.
@@ -128,18 +199,8 @@ impl AuditUploadCheckpoint {
             .map(|entry| entry.outcome)
     }
 
-    /// Record `outcome` for `file`. `acknowledged_bytes` is the length actually
-    /// handed to the endpoint, re-stat'd inside the upload and therefore taken
-    /// *after* `file` was enumerated — so for an append-only audit file it is
-    /// greater than or equal to `file.size_bytes`, never less.
-    ///
-    /// Pairing it with the enumerated `modified_at_ms` is what makes that safe.
-    /// Size only grows and mtime only moves forward, so if the recorder
-    /// appended between enumeration and upload, the stored pair describes no
-    /// state the file will ever be in again and every later run re-uploads.
-    /// The identity can therefore cost a redundant transfer, which the
-    /// endpoint's `file_sha256` short-circuit absorbs, but it cannot claim
-    /// unsent bytes were acknowledged.
+    /// Record the observed oversized-file verdict or an accepted complete snapshot.
+    /// Successful uploads are checked against enumeration before checkpointing.
     pub(crate) fn acknowledge(
         &mut self,
         file: &AuditLogFile,
@@ -471,7 +532,28 @@ impl MarmotApp {
         path: &str,
         config: &config::AuditLogTrackerConfig,
     ) -> Result<AuditLogUploadResult, AppError> {
-        let path = self.validate_audit_log_path(path)?;
+        match self.post_audit_log_snapshot(path, config).await? {
+            AuditUploadAttempt::Uploaded(receipt) => Ok(receipt.result),
+            AuditUploadAttempt::Deferred => Err(AppError::AuditLogUpload(
+                "audit snapshot has no complete lines".into(),
+            )),
+            AuditUploadAttempt::FileFailure(error) => Err(error),
+            AuditUploadAttempt::Rejected { status, .. } => Err(AppError::AuditLogUpload(format!(
+                "upload returned HTTP {status}"
+            ))),
+        }
+    }
+
+    /// An empty complete-line prefix is deferred without an HTTP request.
+    pub(crate) async fn post_audit_log_snapshot(
+        &self,
+        path: &str,
+        config: &config::AuditLogTrackerConfig,
+    ) -> Result<AuditUploadAttempt, AppError> {
+        let path = match self.validate_audit_log_path(path) {
+            Ok(path) => path,
+            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
+        };
         let config = config
             .clone()
             .normalize()
@@ -485,20 +567,24 @@ impl MarmotApp {
                     config.authorization_bearer_token.as_deref(),
                 )
             })?;
-        let file = tokio::fs::File::open(&path).await?;
-        let bytes_sent = file.metadata().await?.len();
-        if bytes_sent > AUDIT_LOG_UPLOAD_MAX_BYTES {
-            return Err(AppError::AuditLogUpload(format!(
-                "audit log exceeds {} byte upload limit",
-                AUDIT_LOG_UPLOAD_MAX_BYTES
-            )));
+        let snapshot = match async {
+            let file = tokio::fs::File::open(&path).await?;
+            AuditUploadSnapshot::capture(file).await
         }
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
+        };
+        if snapshot.body.is_empty() {
+            return Ok(AuditUploadAttempt::Deferred);
+        }
+        let bytes_sent = snapshot.body.len() as u64;
         let mut request = AUDIT_LOG_UPLOAD_CLIENT
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
             .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
-            .body(body);
+            .body(snapshot.body);
         if let Some(token) = config.authorization_bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
@@ -514,16 +600,27 @@ impl MarmotApp {
         let response = request.send().await.map_err(audit_log_reqwest_error)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(AppError::AuditLogUpload(format!(
-                "upload returned HTTP {}",
-                status.as_u16()
-            )));
+            return Ok(AuditUploadAttempt::Rejected {
+                status: status.as_u16(),
+                retry_after: audit_retry_after(
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                    SystemTime::now(),
+                ),
+            });
         }
-        Ok(AuditLogUploadResult {
-            path: path.to_string_lossy().into_owned(),
-            status: status.as_u16(),
-            bytes_sent,
-        })
+        Ok(AuditUploadAttempt::Uploaded(AuditUploadReceipt {
+            observed_bytes: snapshot.observed_bytes,
+            modified_at_ms: snapshot.modified_at_ms,
+            complete: snapshot.complete,
+            result: AuditLogUploadResult {
+                path: path.to_string_lossy().into_owned(),
+                status: status.as_u16(),
+                bytes_sent,
+            },
+        }))
     }
 
     /// Open the file-backed forensic recorder for `label`, or `None` if it
@@ -796,6 +893,74 @@ impl MarmotApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_after_supports_seconds_dates_and_bounded_invalid_input() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(
+            audit_retry_after(Some("120"), now),
+            Some(Duration::from_secs(120))
+        );
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(180));
+        assert_eq!(
+            audit_retry_after(Some(&date), now),
+            Some(Duration::from_secs(180))
+        );
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(1));
+        assert_eq!(audit_retry_after(Some(&past), now), Some(Duration::ZERO));
+        assert_eq!(
+            audit_retry_after(Some("18446744073709551615"), now),
+            Some(Duration::from_secs(300))
+        );
+        for value in [None, Some("nonsense"), Some("-1")] {
+            assert_eq!(audit_retry_after(value, now), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_snapshot_excludes_unfinished_tail_and_recovers_it_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit-active.jsonl");
+        let prefix = b"{\"seq\":1}\n";
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(b"{\"seq\":2,\"value\":\"part");
+        fs::write(&path, &bytes).unwrap();
+        let snapshot = AuditUploadSnapshot::capture(tokio::fs::File::open(&path).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.body, prefix);
+        assert!(!snapshot.complete);
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"ial\"}\n").unwrap();
+        let complete = AuditUploadSnapshot::capture(tokio::fs::File::open(&path).await.unwrap())
+            .await
+            .unwrap();
+        assert!(complete.complete);
+        let rows: Vec<serde_json::Value> = std::str::from_utf8(&complete.body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["value"], "partial");
+        assert_eq!(
+            snapshot.body, prefix,
+            "later appends cannot mutate the captured request"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_snapshot_keeps_the_opened_file_across_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit-active.jsonl");
+        fs::write(&path, b"{\"seq\":1}\n").unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        fs::rename(&path, dir.path().join("audit-segment.jsonl")).unwrap();
+        fs::write(&path, b"{\"seq\":2}\n").unwrap();
+        let snapshot = AuditUploadSnapshot::capture(file).await.unwrap();
+        assert_eq!(snapshot.body, b"{\"seq\":1}\n");
+        assert!(snapshot.complete);
+    }
+
     use super::*;
 
     use marmot_account::AccountHome;

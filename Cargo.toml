@@ -31,7 +31,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.9.18"
+version = "0.9.19"
 license = "MIT"
 publish = false
 
@@ -59,7 +59,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
-getrandom = "0.3"
+httpdate = "1.0"
+getrandom = "0.4"
+web-time = "1.1"
 hmac = "0.12"
 libc = "0.2"
 hkdf = "0.12"

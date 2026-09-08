@@ -43,8 +43,8 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tls_codec::Serialize as _;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -3136,9 +3136,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<SendResult>, EngineError> {
-        let now_ms = self.convergence_now_ms();
-        self.converge_and_drain_queued_outbound_intents(group_id, now_ms)
-            .await
+        self.advance_convergence_and_drain_queued(group_id).await
     }
 
     fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError> {

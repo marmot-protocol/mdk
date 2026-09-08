@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use crate::{
     CommandOutput, MessageCommand, MessageTimelineCommand, WnError,
     agent_text_stream_payload_value, display_name_for_sender, ensure_local_signing,
-    normalize_group_id_hex, npub_for_account_id, resolve_account,
+    normalize_group_id_hex, npub_for_account_id, resolve_account, terminal_safe_text,
 };
 
 fn message_target_and_text(
@@ -555,7 +555,9 @@ fn message_list_plain(messages: &[AppMessageRecord]) -> String {
         .map(|message| {
             format!(
                 "group={} from={}: {}",
-                message.group_id_hex, message.sender, message.plaintext
+                terminal_safe_text(&message.group_id_hex),
+                terminal_safe_text(&message.sender),
+                terminal_safe_text(&message.plaintext)
             )
         })
         .collect::<Vec<_>>()
@@ -615,14 +617,18 @@ fn timeline_message_list_plain(messages: &[Value]) -> String {
             };
             format!(
                 "group={} from={}: {}{}",
-                message
-                    .get("group_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>"),
-                message
-                    .get("from")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>"),
+                terminal_safe_text(
+                    message
+                        .get("group_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>")
+                ),
+                terminal_safe_text(
+                    message
+                        .get("from")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>")
+                ),
                 timeline_message_display_text(message),
                 deleted
             )
@@ -698,13 +704,17 @@ pub(crate) fn timeline_message_display_text(message: &Value) -> String {
             .and_then(Value::as_str)
             .filter(|summary| !summary.trim().is_empty())
     {
-        return summary.to_owned();
+        let sanitized = terminal_safe_text(summary);
+        if !sanitized.trim().is_empty() {
+            return sanitized;
+        }
     }
-    message
-        .get("plaintext")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    terminal_safe_text(
+        message
+            .get("plaintext")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
 }
 
 fn timeline_group_system_json(
@@ -955,5 +965,58 @@ mod tests {
         });
 
         assert_eq!(timeline_message_display_text(&message), "fallback text");
+    }
+
+    #[test]
+    fn timeline_message_display_text_treats_sanitized_blank_summary_as_absent() {
+        let message = json!({
+            "kind": MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            "plaintext": "fallback\u{1b}[2J text",
+            "group_system": {
+                "summary": "\u{1b}\u{7}\u{202e}"
+            }
+        });
+
+        assert_eq!(timeline_message_display_text(&message), "fallback[2J text");
+    }
+
+    #[test]
+    fn message_and_timeline_plain_rows_sanitize_untrusted_fields() {
+        let hostile = AppMessageRecord {
+            message_id_hex: "11".repeat(32),
+            direction: "received".to_owned(),
+            group_id_hex: "aa\u{1b}]8;;https://evil.example\u{7}bb".to_owned(),
+            sender: "alice\u{202e}eve".to_owned(),
+            plaintext: "hi\u{1b}[2J\nbob\t".to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            source_epoch: None,
+            retention: None,
+            recorded_at: 1,
+            received_at: 2,
+            insert_order: 0,
+            invalidated: false,
+            moderation_grant: false,
+        };
+        let listed = message_list_plain(&[hostile.clone(), hostile]);
+        assert_eq!(
+            listed,
+            "group=aa]8;;https://evil.examplebb from=aliceeve: hi[2Jbob\ngroup=aa]8;;https://evil.examplebb from=aliceeve: hi[2Jbob"
+        );
+        assert_eq!(listed.matches('\n').count(), 1);
+        assert!(!listed.contains('\u{1b}'));
+        assert!(!listed.contains('\n') || listed == listed.replace('\r', ""));
+
+        let timeline = json!({
+            "group_id": "aa\u{1b}[Hbb",
+            "from": "alice\u{9b}31m",
+            "plaintext": "row\rforged",
+            "deleted": true,
+            "kind": 9
+        });
+        assert_eq!(
+            timeline_message_list_plain(&[timeline.clone(), timeline]),
+            "group=aa[Hbb from=alice31m: rowforged deleted=true\ngroup=aa[Hbb from=alice31m: rowforged deleted=true"
+        );
     }
 }

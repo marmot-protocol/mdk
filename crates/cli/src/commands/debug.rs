@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::{
     CommandOutput, DebugCommand, WnError, npub_for_account_id, relay_lists_json, resolve_account,
+    terminal_safe_json_display,
 };
 
 pub(crate) fn debug_command(
@@ -32,8 +33,10 @@ pub(crate) fn debug_command(
                 })
                 .collect::<Result<Vec<_>, WnError>>()?;
             Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&statuses)
-                    .expect("JSON response serialization cannot fail"),
+                plain: terminal_safe_json_display(
+                    &serde_json::to_string_pretty(&statuses)
+                        .expect("JSON response serialization cannot fail"),
+                ),
                 json: json!({ "accounts": statuses }),
             })
         }

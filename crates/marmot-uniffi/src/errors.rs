@@ -85,6 +85,10 @@ pub enum MarmotKitError {
     AccountSetupRecoveryRequired,
     #[error("durable account setup can be resumed by retrying")]
     AccountSetupRetryRequired,
+    #[error("onboarding action is unavailable or stale")]
+    OnboardingActionUnavailable,
+    #[error("account must complete interactive onboarding")]
+    OnboardingRequired,
     #[error("account is not eligible for incomplete-setup reset")]
     AccountSetupResetNotApplicable,
     #[error("recoverable KeyPackage setup state exists; retry instead of resetting")]
@@ -119,6 +123,11 @@ pub enum MarmotKitError {
     DisbandingNotEnabled { group_id_hex: String },
     #[error("group {group_id_hex} is disbanding or disbanded")]
     GroupDisbanding { group_id_hex: String },
+    /// This device was removed from the group; it goes on without us. Kept
+    /// distinct from `GroupDisbanding` so a host does not tell the user a live
+    /// group was disbanded.
+    #[error("this device was removed from group {group_id_hex}")]
+    GroupRemoved { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -290,6 +299,7 @@ impl From<AppError> for MarmotKitError {
             },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin { details },
             AppError::GroupDisbanding(group_id_hex) => Self::GroupDisbanding { group_id_hex },
+            AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved { group_id_hex },
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
             // Encrypted-media validation failures are always media-boundary
             // errors; map them to the typed variant so send/upload/download
@@ -319,6 +329,8 @@ impl From<AppError> for MarmotKitError {
             AppError::AccountWorkerBusy => Self::AccountWorkerBusy,
             AppError::AccountWorkerResponseTimedOut => Self::AccountWorkerResponseTimedOut,
             AppError::AccountSetupRecoveryRequired => Self::AccountSetupRecoveryRequired,
+            AppError::OnboardingActionUnavailable => Self::OnboardingActionUnavailable,
+            AppError::OnboardingRequired => Self::OnboardingRequired,
             AppError::AccountSetupRetryRequired => Self::AccountSetupRetryRequired,
             AppError::AccountSetupResetNotApplicable => Self::AccountSetupResetNotApplicable,
             AppError::AccountSetupKeyPackageRecoveryAvailable => {

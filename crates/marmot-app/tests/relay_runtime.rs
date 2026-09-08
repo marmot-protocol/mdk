@@ -16,8 +16,8 @@ use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
-    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
-    MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
+    AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, ChatListRow, MarmotApp,
+    MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime, MediaAttachmentReference, MediaLocator,
     MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
     NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
     RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
@@ -25,11 +25,11 @@ use marmot_app::{
 };
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
+use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, QueryPolicy, WritePolicy};
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
-    Timestamp as NostrTimestamp,
+    Alphabet, Client as NostrSdkClient, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag,
+    TagKind, Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,8 +41,150 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
-const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "test-policy-overrides")]
+const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(feature = "test-policy-overrides"))]
+const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn use_fast_audit_batches(runtime: &MarmotAppRuntime) {
+    #[cfg(feature = "test-policy-overrides")]
+    runtime.set_audit_log_batch_window_for_test(Duration::ZERO);
+    #[cfg(not(feature = "test-policy-overrides"))]
+    let _ = runtime;
+}
+
 const AUDIT_TRACKER_NON_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[ignore = "diagnostic active-group send and publication timing matrix"]
+async fn active_group_send_timings() {
+    for member_count in [2, 5, 9] {
+        eprintln!("starting members={member_count}");
+        let dir = tempfile::tempdir().unwrap();
+        let (_relay, url) = timeout(Duration::from_secs(5), mock_relay())
+            .await
+            .expect("local relay starts");
+        eprintln!("local relay ready");
+        let mut runtimes = Vec::new();
+        let mut accounts = Vec::new();
+        for index in 0..member_count {
+            let app = MarmotApp::with_relay_and_config(
+                dir.path().join(index.to_string()),
+                url.clone(),
+                MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            );
+            let runtime = MarmotAppRuntime::new(app);
+            let account = timeout(
+                Duration::from_secs(45),
+                create_network_ready_identity(
+                    &runtime,
+                    AccountSetupRequest {
+                        default_relays: vec![endpoint(&url)],
+                        bootstrap_relays: vec![endpoint(&url)],
+                        publish_initial_key_package: true,
+                        ..AccountSetupRequest::default()
+                    },
+                ),
+            )
+            .await
+            .expect("identity setup completes");
+            eprintln!("created member={index}");
+            accounts.push(account.account.account_id_hex);
+            runtimes.push(runtime);
+        }
+        let group = timeout(
+            Duration::from_secs(45),
+            runtimes[0].create_group(&accounts[0], "active latency probe", &accounts[1..], None),
+        )
+        .await
+        .expect("group setup completes")
+        .unwrap();
+        eprintln!("created group members={member_count}");
+        for index in 1..member_count {
+            accept_group_invite_retrying_busy(&runtimes[index], &accounts[index], &group)
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_secs(2)).await;
+        let group_hex = hex::encode(group.as_slice());
+        for round in 0..7 {
+            // Contrast ordinary traffic with sends during a group-state change.
+            if round >= 5 {
+                runtimes[0]
+                    .update_group_profile(
+                        &accounts[0],
+                        &group,
+                        Some(format!("epoch round {round}")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let sends = runtimes.iter().zip(&accounts).map(|(runtime, account)| {
+                let group = &group;
+                let group_hex = &group_hex;
+                async move {
+                    let before = runtime
+                        .app_performance_snapshot()
+                        .outbound_message_send
+                        .duration_ms
+                        .sum_ms;
+                    let started = Instant::now();
+                    let result = runtime
+                        .send_message(account, group, format!("active round {round}").into_bytes())
+                        .await
+                        .unwrap();
+                    let elapsed = started.elapsed().as_millis();
+                    let worker_ms = runtime
+                        .app_performance_snapshot()
+                        .outbound_message_send
+                        .duration_ms
+                        .sum_ms
+                        - before;
+                    let visible = timeout(Duration::from_secs(30), async {
+                        loop {
+                            let row = runtime
+                                .timeline_message(account, group_hex, &result.message_ids[0])
+                                .unwrap();
+                            if row.is_some_and(|row| row.source_message_id_hex.is_some()) {
+                                break;
+                            }
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    assert!(visible, "accepted message must obtain a published source");
+                    (
+                        elapsed,
+                        worker_ms,
+                        result.published,
+                        started.elapsed().as_millis(),
+                        visible,
+                    )
+                }
+            });
+            let timings = futures::future::join_all(sends).await;
+            eprintln!(
+                "members={member_count} round={round} total_ms_worker_ms_published_visible_ms_visible={timings:?}"
+            );
+        }
+        sleep(Duration::from_secs(2)).await;
+        let started = Instant::now();
+        let result = runtimes[0]
+            .send_message(&accounts[0], &group, b"idle probe".to_vec())
+            .await
+            .unwrap();
+        eprintln!(
+            "members={member_count} idle_ms={} published={}",
+            started.elapsed().as_millis(),
+            result.published
+        );
+        for runtime in runtimes {
+            runtime.shutdown_and_close().await.unwrap();
+        }
+    }
+}
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -188,6 +330,34 @@ impl WritePolicy for RejectKeyPackagesWhileArmed {
             {
                 PolicyResult::Reject("injected key package rejection".into())
             } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RejectMultiAuthorQueries {
+    rejected: Arc<AtomicUsize>,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl QueryPolicy for RejectMultiAuthorQueries {
+    fn admit_query<'a>(
+        &'a self,
+        query: &'a Filter,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if query
+                .authors
+                .as_ref()
+                .is_some_and(|authors| authors.len() > 1)
+            {
+                self.rejected.fetch_add(1, Ordering::SeqCst);
+                PolicyResult::Reject("multi-author queries unsupported".into())
+            } else {
+                self.accepted.fetch_add(1, Ordering::SeqCst);
                 PolicyResult::Accept
             }
         })
@@ -1058,7 +1228,25 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     });
 
     use nostr::prelude::ToBech32;
-    let secret = nostr::Keys::generate().secret_key().to_bech32().unwrap();
+    let keys = nostr::Keys::generate();
+    let secret = keys.secret_key().to_bech32().unwrap();
+    let relay_client =
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    for (kind, tag) in [
+        (10002, vec!["r".to_owned(), url.clone(), "write".to_owned()]),
+        (10050, vec!["relay".to_owned(), url.clone()]),
+    ] {
+        let event = NostrTransportEvent::new_unsigned(
+            keys.public_key().to_hex(),
+            kind,
+            vec![tag],
+            String::new(),
+        );
+        relay_client
+            .publish_event(&[endpoint(&url)], &event, 1)
+            .await
+            .unwrap();
+    }
     let imported = timeout(
         Duration::from_secs(40),
         runtime.create_or_import_account(AccountSetupRequest {
@@ -1075,15 +1263,15 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
     .expect("import must not hang on a stalled discovery endpoint")
     .expect("import should succeed without the advisory preflight");
     assert!(imported.account.local_signing);
-    assert_eq!(
+    assert!(
         runtime
             .shared_services()
             .relay_plane()
             .relay_health()
             .await
-            .directory_failed_fetches,
-        0,
-        "a stalled peer must not fail a directory fetch that has one connected relay"
+            .directory_failed_fetches
+            > 0,
+        "partial reads must remain visible even when known metadata permits login"
     );
     assert_eq!(
         runtime
@@ -1925,6 +2113,101 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
     assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser() {
+    let dir_fetch = tempfile::tempdir().unwrap();
+    let (_relay, fetch_app, url) = mock_app(&dir_fetch).await;
+    let fetch_runtime = MarmotAppRuntime::new(fetch_app.clone());
+    let _fetch_account = create_network_ready_identity(
+        &fetch_runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+
+    let publisher = Keys::generate();
+    let mut content = serde_json::json!({
+        "name": "hostile",
+        "website": "https://example.test",
+        "bot": false,
+        "custom_blob": "x".repeat(8000),
+        "created_at": 42,
+        "source_relays": ["wss://spoof.example"]
+    });
+    let signed = EventBuilder::new(Kind::Metadata, content.to_string())
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_867))
+        .sign_with_keys(&publisher)
+        .expect("sign hostile kind:0");
+    let transport_event =
+        NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed kind:0");
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(&[endpoint(&url)], &transport_event, 1)
+        .await
+        .expect("publish hostile kind:0 from a separate publisher");
+
+    let publisher_hex = publisher.public_key().to_hex();
+    let fetched = fetch_app
+        .fetch_current_user_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
+        .await
+        .unwrap()
+        .expect("profile on relay");
+    assert_eq!(fetched.name.as_deref(), Some("hostile"));
+    assert_eq!(
+        fetched.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
+    assert!(!fetched.extra.contains_key("custom_blob"));
+    assert!(!fetched.extra.contains_key("created_at"));
+    assert!(!fetched.extra.contains_key("source_relays"));
+    assert_eq!(fetched.created_at, 1_700_000_867);
+    assert!(
+        fetched
+            .source_relays
+            .iter()
+            .all(|relay| !relay.contains("spoof")),
+        "provenance must stay endpoint-derived"
+    );
+
+    // A newer event makes refresh prove it fetched and filtered new content,
+    // rather than passing against the profile already cached by fetch.
+    content["name"] = serde_json::json!("refreshed");
+    content["bot"] = serde_json::json!(true);
+    let newer = EventBuilder::new(Kind::Metadata, content.to_string())
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_868))
+        .sign_with_keys(&publisher)
+        .unwrap();
+    relay_client
+        .publish_event(
+            &[endpoint(&url)],
+            &NostrTransportEvent::from_nostr_event(&newer).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    fetch_app
+        .refresh_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
+        .await
+        .unwrap();
+    let refreshed = fetch_app
+        .directory_entry_for_account_id(&publisher_hex)
+        .unwrap()
+        .expect("refresh cached the inbound profile")
+        .profile
+        .expect("refreshed profile");
+    assert_eq!(refreshed.name.as_deref(), Some("refreshed"));
+    let mut expected_extra = fetched.extra;
+    expected_extra.insert("bot".into(), serde_json::json!(true));
+    assert_eq!(refreshed.extra, expected_extra);
+    assert_eq!(refreshed.created_at, 1_700_000_868);
+
+    fetch_runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -3026,6 +3309,108 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
 }
 
 #[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_dev_settlement_quiescence_ms(100),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "scheduled reads",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+            if account_id_hex == &bob_id && joined == &group_id)
+    })
+    .await;
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let mut group_state = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_scheduled_convergence_barrier(barrier.clone());
+
+    // A real inbound commit arms the scheduled pass. Its work cannot finish
+    // until every public read below has completed; no sleep creates the window.
+    let rename = runtime.update_group_profile(
+        &alice_id,
+        &group_id,
+        Some("recovered profile".to_owned()),
+        None,
+    );
+    let read_during_recovery = async {
+        timeout(Duration::from_secs(10), barrier.wait())
+            .await
+            .expect("inbound commit must reach scheduled convergence");
+        for account_id in [&alice_id, &bob_id] {
+            let members = timeout(
+                Duration::from_secs(2),
+                runtime.group_members(account_id, &group_id),
+            )
+            .await
+            .expect("member reads must not wait for scheduled recovery")
+            .unwrap();
+            let mut member_ids = members
+                .into_iter()
+                .map(|member| member.member_id_hex)
+                .collect::<Vec<_>>();
+            member_ids.sort();
+            let mut expected = vec![alice_id.clone(), bob_id.clone()];
+            expected.sort();
+            assert_eq!(member_ids, expected);
+            let roster = timeout(
+                Duration::from_secs(2),
+                runtime.group_roster(account_id, &group_id),
+            )
+            .await
+            .expect("roster reads must not wait for scheduled recovery")
+            .unwrap();
+            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+            assert_eq!(roster.self_membership, SelfMembership::Member);
+            assert_eq!(roster.members.len(), 2);
+        }
+        timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("scheduled recovery must remain held throughout the reads");
+    };
+    let (renamed, ()) = tokio::join!(rename, read_during_recovery);
+    renamed.unwrap();
+    wait_for_group_state_update(&mut group_state, |group| {
+        group.profile.name == "recovered profile"
+    })
+    .await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
 async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     // Regression: the account worker must answer read commands as soon as the
     // session is hydrated, WITHOUT blocking on the initial relay catch-up. On
@@ -3047,11 +3432,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     let bob_id = bob.account.account_id_hex.clone();
     let mut events = runtime.subscribe();
 
-    // Alice creates a group with Bob. Waiting for Bob's GroupJoined guarantees
-    // Bob received the welcome over the relay (an inbound delivery), so his
-    // persisted transport cursor is advanced to ~now: his next worker startup
-    // re-subscribes from there and the catch-up genuinely has to wait
-    // (SDK_FIRST_SYNC_WAIT / drain) rather than short-circuiting.
+    // Establish a real group over the relay before restarting Bob's worker.
     let group_id = runtime
         .create_group(&alice_id, "fast reads", std::slice::from_ref(&bob_id), None)
         .await
@@ -3065,33 +3446,24 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     })
     .await;
 
-    // `AccountSync` is recorded only when a worker's catch-up sync COMPLETES.
-    let account_sync_attempts = || {
-        runtime
-            .shared_services()
-            .app_performance_telemetry()
-            .snapshot()
-            .account_sync
-            .attempts
-    };
-    let before_restart = account_sync_attempts();
+    // Finish the existing workers' startup before arming the one-shot gate.
+    // A global sync counter includes Alice and detached post-create work, and
+    // a relay drain duration does not establish ordering across task polls.
+    runtime.catch_up_accounts().await.unwrap();
+    let startup_sync_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup_sync_barrier.clone());
 
-    // Foreground-resume analog: tear down and rebuild Bob's worker.
-    runtime.restart_account(&bob_id).await.unwrap();
-
-    // Deterministic discriminator: in the fixed code `restart_account` returns
-    // once the worker is hydrated and command-ready, BEFORE the background
-    // catch-up completes — so no new `AccountSync` has been recorded yet. (The
-    // catch-up has a >=250ms drain floor, so it cannot have finished in the
-    // synchronous gap between `restart_account` returning and this read.) In the
-    // pre-fix code, `restart_account`/`reconcile` blocked on the startup sync,
-    // so a new `AccountSync` would already be recorded here. No `.await` runs
-    // between `restart_account` and this read.
-    assert_eq!(
-        account_sync_attempts(),
-        before_restart,
-        "restart must become command-ready before the initial catch-up completes",
-    );
+    // Foreground-resume analog: Bob must become command-ready while his
+    // initial sync is unable to finish, regardless of scheduler timing.
+    timeout(Duration::from_secs(5), runtime.restart_account(&bob_id))
+        .await
+        .expect("restart must not wait for initial catch-up")
+        .unwrap();
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("restarted worker must reach initial sync");
 
     // The bounded chat-list companion read uses the same snapshot during the
     // detached catch-up, so batching does not reintroduce a readiness wait.
@@ -3113,16 +3485,8 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         !member_ids_page[0].admin_ids_hex.contains(&bob_id),
         "invited member must not be reported as an admin"
     );
-    assert_eq!(
-        account_sync_attempts(),
-        before_restart,
-        "member-id page must complete before the initial catch-up finishes",
-    );
-
-    // The combined roster read is answered with a session-consistent group
-    // record, member list, and MLS state while (or right after) catch-up runs.
-    // During the catch-up window it comes from the post-hydration snapshot;
-    // afterwards it comes from the live session. Either way it must not block.
+    // The combined roster read must also use the post-hydration snapshot
+    // while the startup sync is held behind the barrier.
     let roster = timeout(
         Duration::from_secs(2),
         runtime.group_roster(&bob_id, &group_id),
@@ -3159,19 +3523,15 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         "snapshot/live read must report the full roster",
     );
 
-    // The catch-up is not dropped — it still runs in the background and records
-    // its completion.
-    let catch_up_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if account_sync_attempts() > before_restart {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < catch_up_deadline,
-            "background catch-up must still complete after readiness",
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    // Release Bob's initial sync and await the real catch-up result so the
+    // test also proves this work is not dropped.
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("initial sync must remain at the release barrier during reads");
+    timeout(Duration::from_secs(5), runtime.catch_up_accounts())
+        .await
+        .expect("background catch-up must complete after release")
+        .unwrap();
 
     runtime.shutdown().await;
 }
@@ -3424,6 +3784,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let (tx, rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3497,6 +3858,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_create_group_welcome()
     let (tx, rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3559,6 +3921,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let (tx, rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let server = tokio::spawn(capture_delayed_audit_upload(listener, tx, release_rx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3581,7 +3944,7 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     })
     .await;
 
-    let captured = timeout(Duration::from_secs(5), rx)
+    let captured = timeout(AUDIT_TRACKER_REQUEST_TIMEOUT, rx)
         .await
         .expect("audit tracker should receive inbound-triggered upload")
         .unwrap();
@@ -3629,6 +3992,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(forward_audit_upload_bodies(listener, body_tx));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -3681,7 +4045,7 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
 
     // Wait, across uploads, for the one carrying the armed row. Earlier uploads
     // (e.g. the welcome-join schedule) are drained and ignored.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + AUDIT_TRACKER_REQUEST_TIMEOUT;
     let mut carried_armed_row = false;
     while Instant::now() < deadline {
         match timeout(
@@ -3742,6 +4106,7 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
     let server = tokio::spawn(capture_delayed_audit_upload_with_overlap_probe(
         listener, tx, overlap_tx, release_rx,
     ));
+    use_fast_audit_batches(&runtime);
     runtime
         .set_audit_log_tracker_config(AuditLogTrackerConfig {
             endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -5663,12 +6028,23 @@ async fn app_runtime_message_subscription_kinds_filter_applies_to_live_updates()
 
 async fn wait_for_event<F>(
     events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    matches_event: F,
+) -> MarmotAppEvent
+where
+    F: FnMut(&MarmotAppEvent) -> bool,
+{
+    wait_for_event_within(events, Duration::from_secs(5), matches_event).await
+}
+
+async fn wait_for_event_within<F>(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    budget: Duration,
     mut matches_event: F,
 ) -> MarmotAppEvent
 where
     F: FnMut(&MarmotAppEvent) -> bool,
 {
-    timeout(Duration::from_secs(5), async {
+    timeout(budget, async {
         loop {
             let event = events.recv().await.unwrap();
             if matches_event(&event) {
@@ -8056,6 +8432,120 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
     assert_eq!(missing_from_seed_b.bootstrap_relays, vec![seed_b_url]);
 }
 
+// Investigation-only regression: metadata is split across discovery and the
+// identity's advertised outbox, with a third relay owning Welcome delivery.
+async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale_first_hop: bool) {
+    use nostr::prelude::ToBech32;
+
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(publisher_dir.path());
+    let keys = Keys::generate();
+    home.import_account("publisher", &keys.secret_key().to_secret_hex())
+        .unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    let created_at = test_unix_now_seconds().saturating_sub(60);
+    if stale_first_hop {
+        publish_nostr_event_at(
+            &home,
+            "publisher",
+            &discovery_url,
+            10050,
+            vec![vec!["relay".into(), discovery_url.clone()]],
+            String::new(),
+            created_at.saturating_sub(60),
+        )
+        .await;
+    }
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &outbox_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+
+    let app_dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        app_dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = if external_signer {
+        runtime
+            .login_external_signer(
+                keys.public_key().to_hex(),
+                TestExternalAccountSigner { keys },
+                request,
+            )
+            .await
+    } else {
+        runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                ..request
+            })
+            .await
+    };
+    runtime.shutdown().await;
+    let result = result.expect("existing account setup must resolve its advertised inbox");
+    assert_eq!(result.relay_lists.nip65.relays, vec![outbox_url]);
+    assert_eq!(
+        result.relay_lists.inbox.relays,
+        vec![inbox_url],
+        "login must discover kind 10050 on the advertised outbox and preserve its inbox instead of publishing defaults"
+    );
+    assert_eq!(
+        result.relay_lists.inbox.created_at, created_at,
+        "login must preserve the existing inbox advertisement timestamp"
+    );
+}
+
+#[tokio::test]
+async fn import_preserves_inbox_metadata_only_on_discovered_outbox() {
+    existing_login_preserves_outbox_only_inbox(false, false).await;
+}
+
+#[tokio::test]
+async fn external_signer_preserves_inbox_metadata_only_on_discovered_outbox() {
+    existing_login_preserves_outbox_only_inbox(true, false).await;
+}
+
+#[tokio::test]
+async fn import_stale_first_hop_inbox_does_not_mask_newer_outbox_inbox() {
+    existing_login_preserves_outbox_only_inbox(false, true).await;
+}
+
+#[tokio::test]
+async fn external_signer_stale_first_hop_inbox_does_not_mask_newer_outbox_inbox() {
+    existing_login_preserves_outbox_only_inbox(true, true).await;
+}
+
 #[tokio::test]
 async fn relay_list_empty_fetch_keeps_cached_lists() {
     let dir = tempfile::tempdir().unwrap();
@@ -9861,7 +10351,8 @@ async fn create_group_returns_before_blocked_founding_welcome() {
 }
 
 /// mdk#1487: the detailed create response carries the exact durable chat-list
-/// row that subscribers and ordinary queries observe at the response boundary.
+/// row emitted to subscribers at the response boundary. Ordinary queries keep
+/// its content, while projection maintenance may advance `updated_at`.
 #[tokio::test]
 async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -9903,7 +10394,28 @@ async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
         .chat_list_row(&alice.account.label, &created.chat_list_row.group_id_hex)
         .unwrap()
         .expect("created chat-list row is queryable immediately");
-    assert_eq!(created.chat_list_row, queried);
+    // Race: `updated_at` is the projection's maintenance stamp, not durable
+    // conversation content. Storage fences it against the source tables'
+    // timestamps in `chat_list_projection_complete_tx`, so every rebuild
+    // re-stamps it to wall-clock now even when the row is otherwise
+    // identical. This is the account's first chat-list query, so
+    // `ensure_chat_list_projection` rebuilds the whole projection (a fresh
+    // database starts at projection version 0, and an earlier account-state
+    // save may already have marked it stale) instead of serving the row the
+    // create tail wrote. When a wall-clock second boundary falls between that
+    // write and this query, the stamp moves forward by one. The durable-row
+    // contract is every other field; the stamp may only advance.
+    assert!(
+        queried.updated_at >= created.chat_list_row.updated_at,
+        "projection maintenance may only advance updated_at"
+    );
+    assert_eq!(
+        ChatListRow {
+            updated_at: queried.updated_at,
+            ..created.chat_list_row.clone()
+        },
+        queried
+    );
 
     let emitted = wait_for_event(&mut events, |event| {
         matches!(
@@ -10896,6 +11408,410 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     runtime.shutdown().await;
 }
 
+/// mdk#1703: the recipient's KeyPackage may be found on discovery while its
+/// current inbox declaration lives only on the advertised outbox. The resolved
+/// third-relay route must survive restart and deliver one Welcome.
+#[tokio::test]
+async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol_keys = Keys::generate();
+    let carol_nsec = carol_keys.secret_key().to_bech32().unwrap();
+    let carol = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec.clone())),
+            ..setup
+        })
+        .await
+        .unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let home = AccountHome::open(dir.path());
+    let created_at = test_unix_now_seconds();
+    publish_nostr_event_at(
+        &home,
+        &carol.account.label,
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        &carol.account.label,
+        &outbox_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+
+    runtime
+        .sign_out(
+            &carol_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
+            default_relays: vec![endpoint(&discovery_url)],
+            bootstrap_relays: vec![endpoint(&discovery_url)],
+            discovery_relays: vec![endpoint(&discovery_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .expect("reactivation must resolve kind 10050 from the advertised outbox");
+
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "outbox persisted invite route",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    app.resolve_member_key_packages(&[carol_id.as_str()])
+        .await
+        .expect("KeyPackage and outbox-hosted inbox route should resolve before restart");
+    assert!(
+        app.directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&inbox_url))
+    );
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    assert!(
+        app.directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&inbox_url)),
+        "the outbox-resolved inbox route must survive process restart"
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let mut restarted_events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut restarted_events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &carol_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+    assert_eq!(members.len(), 3);
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == carol_id)
+            .count(),
+        1,
+        "the persisted outbox-resolved route must deliver exactly one Welcome"
+    );
+    runtime.shutdown().await;
+}
+
+async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool) {
+    use nostr::prelude::ToBech32;
+
+    let sender_dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    // R is receiver setup infrastructure, never a sender discovery source.
+    // This keeps the missing-D case free of setup-created kind 10050 on D.
+    let (_receiver_setup, receiver_setup_url) = mock_relay().await;
+    let config = || MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let receiver =
+        MarmotApp::with_relay_and_config(receiver_dir.path(), receiver_setup_url.clone(), config());
+    let receiver_runtime = MarmotAppRuntime::new(receiver.clone());
+    let carol_keys = Keys::generate();
+    let carol_nsec = carol_keys.secret_key().to_bech32().unwrap();
+    let carol = receiver_runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec.clone())),
+            default_relays: vec![endpoint(&receiver_setup_url)],
+            bootstrap_relays: vec![endpoint(&receiver_setup_url)],
+            discovery_relays: vec![endpoint(&receiver_setup_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let carol_id = carol.account.account_id_hex.clone();
+    let carol_label = carol.account.label.clone();
+
+    // Publish metadata newer than the receiver's initial R-only setup.
+    sleep(Duration::from_secs(1)).await;
+    let created_at = test_unix_now_seconds();
+    let receiver_home = AccountHome::open(receiver_dir.path());
+    publish_nostr_event_at(
+        &receiver_home,
+        &carol_label,
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    if stale_discovery {
+        publish_nostr_event_at(
+            &receiver_home,
+            &carol_label,
+            &discovery_url,
+            10050,
+            vec![vec!["relay".into(), receiver_setup_url]],
+            String::new(),
+            created_at.saturating_sub(60),
+        )
+        .await;
+    }
+    publish_nostr_event_at(
+        &receiver_home,
+        &carol_label,
+        &outbox_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    receiver_runtime
+        .sign_out(
+            &carol_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    receiver_runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
+            default_relays: vec![endpoint(&discovery_url)],
+            bootstrap_relays: vec![endpoint(&discovery_url)],
+            discovery_relays: vec![endpoint(&discovery_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    // Reuse the receiver-owned private MLS material and republish its public
+    // KeyPackage to the now-known W route; no lost-device recovery assumption.
+    receiver_runtime
+        .publish_key_package(&carol_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .account_relay_list_status(&carol_label)
+            .unwrap()
+            .inbox
+            .relays,
+        vec![inbox_url.clone()]
+    );
+
+    let sender =
+        MarmotApp::with_relay_and_config(sender_dir.path(), discovery_url.clone(), config());
+    let sender_runtime = MarmotAppRuntime::new(sender.clone());
+    let sender_setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice =
+        create_network_ready_identity(&sender_runtime, sender_setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&sender_runtime, sender_setup).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let group_id = sender_runtime
+        .create_group(
+            &alice_id,
+            "independent outbox invitation",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        sender
+            .directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .is_none_or(|entry| entry.relay_lists.inbox.relays.is_empty()),
+        "sender must not inherit the receiver's already-resolved inbox cache"
+    );
+    sender
+        .resolve_member_key_packages(&[carol_id.as_str()])
+        .await
+        .unwrap();
+    assert_eq!(
+        sender
+            .directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .unwrap()
+            .relay_lists
+            .inbox
+            .relays,
+        vec![inbox_url.clone()],
+        "fresh sender must resolve D -> W -> I before invitation"
+    );
+    sender_runtime.shutdown().await;
+    receiver_runtime.shutdown().await;
+    drop(sender_runtime);
+    drop(receiver_runtime);
+    drop(sender);
+    drop(receiver);
+    drop(receiver_home);
+
+    let sender =
+        MarmotApp::with_relay_and_config(sender_dir.path(), discovery_url.clone(), config());
+    let receiver =
+        MarmotApp::with_relay_and_config(receiver_dir.path(), discovery_url.clone(), config());
+    assert_eq!(
+        sender
+            .directory_entry_for_account_id(&carol_id)
+            .unwrap()
+            .unwrap()
+            .relay_lists
+            .inbox
+            .relays,
+        vec![inbox_url.clone()]
+    );
+    assert_eq!(
+        receiver
+            .account_relay_list_status(&carol_label)
+            .unwrap()
+            .inbox
+            .relays,
+        vec![inbox_url]
+    );
+    let sender_runtime = MarmotAppRuntime::new(sender.clone());
+    let receiver_runtime = MarmotAppRuntime::new(receiver.clone());
+    let mut receiver_events = receiver_runtime.subscribe();
+    receiver_runtime.reconcile_accounts().await.unwrap();
+    sender_runtime.reconcile_accounts().await.unwrap();
+    sender_runtime
+        .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
+        .await
+        .unwrap();
+    wait_for_event(&mut receiver_events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+            if account_id_hex == &carol_id && joined_group == &group_id)
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let pending = receiver
+        .group(&carol_label, &group_id_hex)
+        .unwrap()
+        .unwrap();
+    assert!(pending.pending_confirmation && !pending.archived);
+    assert!(pending.via_welcome_message_id_hex.is_some());
+    assert_eq!(
+        pending.welcomer_account_id_hex.as_deref(),
+        Some(alice_id.as_str())
+    );
+    let members = sender_runtime
+        .group_members(&alice_id, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        members
+            .iter()
+            .filter(|member| member.member_id_hex == carol_id)
+            .count(),
+        1
+    );
+    sender_runtime.shutdown().await;
+    receiver_runtime.shutdown().await;
+    drop(sender_runtime);
+    drop(receiver_runtime);
+    drop(sender);
+    drop(receiver);
+    // The invite must still be visible in the persisted projection after a
+    // second receiver restart, without an accept action or another Welcome.
+    let reopened = MarmotApp::with_relay_and_config(receiver_dir.path(), discovery_url, config());
+    let still_pending = reopened
+        .group(&carol_label, &group_id_hex)
+        .unwrap()
+        .unwrap();
+    assert!(still_pending.pending_confirmation && !still_pending.archived);
+    assert_eq!(
+        still_pending.via_welcome_message_id_hex,
+        pending.via_welcome_message_id_hex
+    );
+}
+
+#[tokio::test]
+async fn independent_sender_outbox_only_inbox_invite_survives_restart() {
+    independent_sender_outbox_invite_survives_restart(false).await;
+}
+
+#[tokio::test]
+async fn independent_sender_stale_discovery_inbox_invite_survives_restart() {
+    independent_sender_outbox_invite_survives_restart(true).await;
+}
+
 /// mdk#352 review follow-up: the welcome re-delivery surface is reachable end
 /// to end through the runtime worker. A create whose welcome delivered leaves
 /// nothing pending, and re-delivering an unknown welcome id is a clean error
@@ -10996,6 +11912,20 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
     })
     .await;
 
+    // Keep the only remaining committer offline while inspecting the pending
+    // request. A live Alice can now apply SelfRemove before the command replies
+    // are observed, legitimately clearing the request this test wants to inspect.
+    // The separate peer-leave regression covers that automatic completion path.
+    runtime
+        .sign_out(
+            &alice_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+
     // Both leaves are in flight before either worker command runs, so neither
     // can benefit from the other having recorded the request.
     let (first, second) = tokio::join!(
@@ -11037,6 +11967,7 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
             .is_some(),
         "the winning leave leaves exactly one durable request behind"
     );
+    runtime.shutdown().await;
 }
 
 /// Convergence remediation-plan liveness guard: successive inbound commits,
@@ -11157,5 +12088,1771 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
         }
     }
 
+    runtime.shutdown().await;
+}
+
+#[derive(Clone, Debug)]
+struct CountUncertainSetupRelayListPublications(Arc<AtomicUsize>);
+
+impl WritePolicy for CountUncertainSetupRelayListPublications {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr::Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind == Kind::from(10002) || event.kind == Kind::from(10050) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            PolicyResult::Accept
+        })
+    }
+}
+
+async fn assert_required_discovery_failure_does_not_publish_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
+    let bootstrap = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    bootstrap.run().await.unwrap();
+    let bootstrap_url = bootstrap.url().await.to_string();
+
+    // D accepts TCP but never completes the websocket handshake or discovery.
+    // B completes an empty query. Retrying B alone cannot settle what D knows.
+    let discovery = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let discovery_url = format!("ws://{}", discovery.local_addr().unwrap());
+    let held_discovery = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = discovery.accept().await {
+            held.push(socket);
+        }
+    });
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        bootstrap_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&bootstrap_url)],
+        bootstrap_relays: vec![endpoint(&bootstrap_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = timeout(Duration::from_secs(40), async {
+        if external_signer {
+            runtime
+                .login_external_signer(
+                    keys.public_key().to_hex(),
+                    TestExternalAccountSigner { keys },
+                    request,
+                )
+                .await
+        } else {
+            runtime
+                .create_or_import_account(AccountSetupRequest {
+                    import_nsec: Some(zeroize::Zeroizing::new(
+                        keys.secret_key().to_bech32().unwrap(),
+                    )),
+                    ..request
+                })
+                .await
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    held_discovery.abort();
+    let _ = held_discovery.await;
+
+    let result = result.expect("uncertain discovery must retain the bounded setup deadline");
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        0,
+        "an incomplete required discovery read must not publish replacement relay lists"
+    );
+    assert!(
+        result.is_err(),
+        "an uncached existing identity cannot become network-ready from unconfirmed absence"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_required_discovery_failure_does_not_publish_defaults() {
+    assert_required_discovery_failure_does_not_publish_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_required_discovery_failure_does_not_publish_defaults() {
+    assert_required_discovery_failure_does_not_publish_defaults(true).await;
+}
+
+async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
+    let discovery = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    discovery.run().await.unwrap();
+    let discovery_url = discovery.url().await.to_string();
+    let healthy = LocalRelay::new(RelayBuilder::default().write_policy(
+        CountUncertainSetupRelayListPublications(publications.clone()),
+    ));
+    healthy.run().await.unwrap();
+    let healthy_url = healthy.url().await.to_string();
+    // W1 reaches EOSE with no inbox declaration. W2 never completes its
+    // handshake: W1's absence cannot establish what W2 may hold.
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_url = format!("ws://{}", unavailable.local_addr().unwrap());
+    let held_outbox = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = unavailable.accept().await {
+            held.push(socket);
+        }
+    });
+    let keys = Keys::generate();
+    let publisher =
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+    publisher
+        .publish_event(
+            &[endpoint(&discovery_url)],
+            &NostrTransportEvent::new_unsigned(
+                keys.public_key().to_hex(),
+                10002,
+                vec![
+                    vec!["r".into(), healthy_url.clone(), "write".into()],
+                    vec!["r".into(), unavailable_url, "write".into()],
+                ],
+                String::new(),
+            ),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(publications.swap(0, Ordering::SeqCst), 1);
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    ));
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&healthy_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = timeout(Duration::from_secs(40), async {
+        if external_signer {
+            runtime
+                .login_external_signer(
+                    keys.public_key().to_hex(),
+                    TestExternalAccountSigner { keys },
+                    request,
+                )
+                .await
+        } else {
+            runtime
+                .create_or_import_account(AccountSetupRequest {
+                    import_nsec: Some(zeroize::Zeroizing::new(
+                        keys.secret_key().to_bech32().unwrap(),
+                    )),
+                    ..request
+                })
+                .await
+        }
+    })
+    .await;
+    runtime.shutdown().await;
+    held_outbox.abort();
+    let _ = held_outbox.await;
+    assert!(matches!(
+        result.expect("partial outbox discovery must remain bounded"),
+        Err(AppError::RelayDirectory(_))
+    ));
+    assert_eq!(
+        publications.load(Ordering::SeqCst),
+        0,
+        "a healthy-empty outbox must not authorize overwriting an unavailable sibling's metadata"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_partial_outbox_failure_does_not_publish_defaults() {
+    partial_outbox_failure_does_not_publish_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_partial_outbox_failure_does_not_publish_defaults() {
+    partial_outbox_failure_does_not_publish_defaults(true).await;
+}
+
+async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empty_outbox: bool) {
+    use nostr::prelude::ToBech32;
+
+    let publisher_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(publisher_dir.path());
+    let keys = Keys::generate();
+    home.import_account("publisher", &keys.secret_key().to_secret_hex())
+        .unwrap();
+    let (_discovery, discovery_url) = mock_relay().await;
+    let (_outbox, outbox_url) = mock_relay().await;
+    let (_inbox, inbox_url) = mock_relay().await;
+    let created_at = test_unix_now_seconds().saturating_sub(60);
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &discovery_url,
+        10050,
+        vec![vec!["relay".into(), inbox_url.clone()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &discovery_url,
+        10002,
+        vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+        String::new(),
+        created_at,
+    )
+    .await;
+    publish_nostr_event_at(
+        &home,
+        "publisher",
+        &outbox_url,
+        10050,
+        if empty_outbox {
+            Vec::new()
+        } else {
+            vec![vec!["relay".into(), outbox_url.clone()]]
+        },
+        String::new(),
+        created_at.saturating_sub(60),
+    )
+    .await;
+
+    let app_dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        app_dir.path(),
+        discovery_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let request = AccountSetupRequest {
+        default_relays: vec![endpoint(&discovery_url)],
+        bootstrap_relays: vec![endpoint(&discovery_url)],
+        discovery_relays: vec![endpoint(&discovery_url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: false,
+        ..AccountSetupRequest::default()
+    };
+    let result = if external_signer {
+        runtime
+            .login_external_signer(
+                keys.public_key().to_hex(),
+                TestExternalAccountSigner { keys },
+                request,
+            )
+            .await
+    } else {
+        runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                ..request
+            })
+            .await
+    };
+    runtime.shutdown().await;
+    let result = result.expect("existing account setup must resolve its advertised inbox");
+    assert_eq!(result.relay_lists.nip65.relays, vec![outbox_url]);
+    assert_eq!(
+        result.relay_lists.inbox.relays,
+        vec![inbox_url],
+        "an older outbox record, including explicit empty, must not replace the newer discovery inbox"
+    );
+    assert_eq!(
+        result.relay_lists.inbox.created_at, created_at,
+        "login must preserve the existing inbox advertisement timestamp"
+    );
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_newer_discovery_inbox_survives_older_outbox() {
+    newer_discovery_inbox_survives_older_outbox(false, false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_newer_discovery_inbox_survives_older_empty_outbox() {
+    newer_discovery_inbox_survives_older_outbox(false, true).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_newer_discovery_inbox_survives_older_outbox() {
+    newer_discovery_inbox_survives_older_outbox(true, false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_newer_discovery_inbox_survives_older_empty_outbox() {
+    newer_discovery_inbox_survives_older_outbox(true, true).await;
+}
+
+async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer: bool) {
+    use nostr::prelude::ToBech32;
+
+    // A read-only NIP-65 declaration also must not be rewritten write-enabled.
+    for (empty_kind, read_only) in [(10002, false), (10050, false), (10002, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let publications = Arc::new(AtomicUsize::new(0));
+        let relay = LocalRelay::new(RelayBuilder::default().write_policy(
+            CountUncertainSetupRelayListPublications(publications.clone()),
+        ));
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let keys = Keys::generate();
+        let publisher =
+            NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build());
+        for kind in [10002, 10050] {
+            let tags = if kind == 10002 && read_only {
+                vec![vec!["r".into(), url.clone(), "read".into()]]
+            } else if kind == empty_kind {
+                Vec::new()
+            } else if kind == 10002 {
+                vec![vec!["r".into(), url.clone(), "write".into()]]
+            } else {
+                vec![vec!["relay".into(), url.clone()]]
+            };
+            publisher
+                .publish_event(
+                    &[endpoint(&url)],
+                    &NostrTransportEvent::new_unsigned(
+                        keys.public_key().to_hex(),
+                        kind,
+                        tags,
+                        String::new(),
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(publications.swap(0, Ordering::SeqCst), 2);
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+            dir.path(),
+            url.clone(),
+            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        ));
+        let request = AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            discovery_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        };
+        let result = timeout(Duration::from_secs(30), async {
+            if external_signer {
+                runtime
+                    .login_external_signer(
+                        keys.public_key().to_hex(),
+                        TestExternalAccountSigner { keys },
+                        request,
+                    )
+                    .await
+            } else {
+                runtime
+                    .create_or_import_account(AccountSetupRequest {
+                        import_nsec: Some(zeroize::Zeroizing::new(
+                            keys.secret_key().to_bech32().unwrap(),
+                        )),
+                        ..request
+                    })
+                    .await
+            }
+        })
+        .await
+        .expect("explicit-empty setup must remain bounded");
+        runtime.shutdown().await;
+        assert!(
+            matches!(result, Err(AppError::MissingRelayLists(_))),
+            "an intentionally empty relay list cannot become network-ready using app defaults"
+        );
+        assert_eq!(
+            publications.load(Ordering::SeqCst),
+            0,
+            "login must not replace a signed empty kind {empty_kind} list"
+        );
+    }
+}
+
+#[tokio::test]
+async fn outbox_acceptance_import_preserves_explicit_empty_metadata() {
+    explicit_empty_outbox_metadata_never_publishes_defaults(false).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_external_signer_preserves_explicit_empty_metadata() {
+    explicit_empty_outbox_metadata_never_publishes_defaults(true).await;
+}
+
+#[tokio::test]
+async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
+    use nostr::prelude::ToBech32;
+
+    let discovery_policy = RejectMultiAuthorQueries::default();
+    let discovery = LocalRelay::new(RelayBuilder::default().query_policy(discovery_policy.clone()));
+    discovery.run().await.unwrap();
+    let discovery_url = discovery.url().await.to_string();
+    let query_policy = RejectMultiAuthorQueries::default();
+    let outbox = LocalRelay::new(RelayBuilder::default().query_policy(query_policy.clone()));
+    outbox.run().await.unwrap();
+    let outbox_url = outbox.url().await.to_string();
+
+    let mut member_dirs = Vec::new();
+    let mut member_ids = Vec::new();
+    for _ in 0..2 {
+        let member_dir = tempfile::tempdir().unwrap();
+        let keys = Keys::generate();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+            member_dir.path(),
+            outbox_url.clone(),
+            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        ));
+        let setup = runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(zeroize::Zeroizing::new(
+                    keys.secret_key().to_bech32().unwrap(),
+                )),
+                default_relays: vec![endpoint(&outbox_url)],
+                bootstrap_relays: vec![endpoint(&outbox_url)],
+                discovery_relays: vec![endpoint(&outbox_url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            })
+            .await
+            .expect("member setup must publish relay metadata and a KeyPackage");
+        runtime.shutdown().await;
+
+        NostrSdkRelayClient::new(NostrSdkClient::builder().signer(keys.clone()).build())
+            .publish_event(
+                &[endpoint(&discovery_url)],
+                &NostrTransportEvent::new_unsigned(
+                    keys.public_key().to_hex(),
+                    KIND_NIP65_RELAY_LIST,
+                    vec![vec!["r".into(), outbox_url.clone(), "write".into()]],
+                    String::new(),
+                ),
+                1,
+            )
+            .await
+            .unwrap();
+        member_ids.push(setup.account.account_id_hex);
+        member_dirs.push(member_dir);
+    }
+
+    let reader_dir = tempfile::tempdir().unwrap();
+    discovery_policy.accepted.store(0, Ordering::SeqCst);
+    discovery_policy.rejected.store(0, Ordering::SeqCst);
+    query_policy.accepted.store(0, Ordering::SeqCst);
+    query_policy.rejected.store(0, Ordering::SeqCst);
+    let reader = MarmotApp::with_relay_and_config(
+        reader_dir.path(),
+        discovery_url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let member_refs = member_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let summary = reader
+        .prewarm_group_member_key_packages(&member_refs)
+        .await
+        .expect("CLOSED multi-author batches must fall back to routable single-author reads");
+
+    assert_eq!(summary.network_resolved_members, 2);
+    assert_eq!(discovery_policy.rejected.load(Ordering::SeqCst), 1);
+    assert_eq!(discovery_policy.accepted.load(Ordering::SeqCst), 4);
+    assert!(
+        query_policy.rejected.load(Ordering::SeqCst) >= 2,
+        "the real relay must reject both a relay-list and KeyPackage multi-author query"
+    );
+    assert!(
+        query_policy.accepted.load(Ordering::SeqCst) >= 6,
+        "the resolver must issue accepted single-author fallbacks for both members"
+    );
+}
+
+// Interactive onboarding must be tested against real EOSE and publication
+// acknowledgements, not only directory-cache fixtures.
+async fn onboarding_fixture() -> (
+    tempfile::TempDir,
+    MockRelay,
+    MarmotApp,
+    MarmotAppRuntime,
+    Keys,
+    String,
+    String,
+) {
+    use nostr::prelude::ToBech32;
+    let directory = tempfile::tempdir().unwrap();
+    let (relay, app, url) = mock_app(&directory).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let keys = Keys::generate();
+    let id = keys.public_key().to_hex();
+    let snapshot = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!snapshot.ready);
+    (directory, relay, app, runtime, keys, id, url)
+}
+async fn seed_onboarding_records(home: &AccountHome, id: &str, url: &str) {
+    let at = NostrTimestamp::now().as_secs() - 10;
+    publish_nostr_event_at(
+        home,
+        id,
+        url,
+        0,
+        vec![],
+        "{\"name\":\"Alice\",\"custom\":{\"keep\":true}}".into(),
+        at,
+    )
+    .await;
+    publish_nostr_event_at(
+        home,
+        id,
+        url,
+        3,
+        vec![],
+        "legacy relay preferences".into(),
+        at,
+    )
+    .await;
+    publish_account_relay_lists_at(home, id, url, url, at).await;
+}
+#[tokio::test]
+async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
+    let (directory, _relay, app, runtime, _keys, id, url) = onboarding_fixture().await;
+    runtime.reconcile_accounts().await.unwrap();
+    assert!(
+        !runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .find(|a| a.account_id_hex == id)
+            .unwrap()
+            .running
+    );
+    assert!(
+        app.fetch_current_account_relay_list_status_for_account_id(&id, vec![endpoint(&url)], None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut subscription = runtime.accounts().subscribe_onboarding(&id).unwrap();
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        snapshot.steps[0].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+    assert_eq!(
+        snapshot.steps[0].findings[0].issue,
+        marmot_app::OnboardingIssue::Missing
+    );
+    assert!(subscription.recv().await.unwrap().revision > subscription.snapshot.revision);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = AccountHome::open(directory.path())
+            .account_dir(&id)
+            .join("onboarding.json");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+    let reopened = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url));
+    assert_eq!(
+        reopened.accounts().onboarding_snapshot(&id).unwrap(),
+        Some(snapshot)
+    );
+    reopened.reconcile_accounts().await.unwrap();
+    assert!(!reopened.accounts().managed_accounts().unwrap()[0].running);
+    reopened.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_valid_account_completes_all_checks_and_publishes_key_package() {
+    let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
+    assert!(snapshot.ready, "{snapshot:?}");
+    assert!(
+        snapshot
+            .steps
+            .iter()
+            .all(|s| s.status == marmot_app::OnboardingStatus::Passed)
+    );
+    assert_eq!(
+        runtime.account_setup_readiness(&id).unwrap(),
+        marmot_app::AccountSetupReadiness::NetworkReady
+    );
+    assert!(
+        AccountHome::open(directory.path())
+            .account_setup_state(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !runtime
+            .accounts()
+            .account_key_packages(&id, vec![endpoint(&url)])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags() {
+    use marmot_app::OnboardingStep;
+    let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let tags = vec![
+        vec!["r".into(), "not a relay".into()],
+        vec!["client".into(), "preserve-me".into()],
+    ];
+    publish_nostr_event_at(
+        &AccountHome::open(directory.path()),
+        &id,
+        &url,
+        10002,
+        tags,
+        "preserve content".into(),
+        NostrTimestamp::now().as_secs() - 5,
+    )
+    .await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        snapshot.steps[2].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+    assert!(!snapshot.ready);
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, proposal.revision - 1)
+            .await,
+        Err(AppError::OnboardingActionUnavailable)
+    ));
+    let snapshot = runtime
+        .accounts()
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
+    assert!(snapshot.ready, "{snapshot:?}");
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    let events = client
+        .fetch_events_from(
+            [url],
+            nostr::Filter::new()
+                .author(nostr::PublicKey::parse(&id).unwrap())
+                .kind(Kind::RelayList),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    let event = events.first().unwrap();
+    assert_eq!(event.content, "preserve content");
+    assert!(
+        event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["client", "preserve-me"])
+    );
+    client.shutdown().await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_stale_repair_detects_a_new_remote_record() {
+    use marmot_app::OnboardingStep;
+    let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    publish_nostr_event_at(
+        &AccountHome::open(directory.path()),
+        &id,
+        &url,
+        10002,
+        vec![],
+        String::new(),
+        NostrTimestamp::now().as_secs() - 5,
+    )
+    .await;
+    runtime.accounts().run_onboarding(&id).await.unwrap();
+    let proposal = runtime
+        .accounts()
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    publish_account_relay_lists_at(
+        &AccountHome::open(directory.path()),
+        &id,
+        &url,
+        &url,
+        NostrTimestamp::now().as_secs(),
+    )
+    .await;
+    let snapshot = runtime
+        .accounts()
+        .approve_onboarding_repair(&id, proposal.revision)
+        .await
+        .unwrap();
+    assert!(!snapshot.ready);
+    assert!(snapshot.proposal.is_none());
+    assert_eq!(
+        snapshot.steps[2].findings[0].issue,
+        marmot_app::OnboardingIssue::RecordChanged
+    );
+    let snapshot = runtime
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    assert!(
+        acknowledge_single_device_notice(&runtime, snapshot)
+            .await
+            .ready
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test]
+async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
+    let (directory, _relay, _app, runtime, keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    runtime.shutdown_and_close().await.unwrap();
+    let external_directory = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(
+        external_directory.path(),
+        url.clone(),
+    ));
+    let snapshot = runtime
+        .accounts()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            TestExternalAccountSigner { keys: keys.clone() },
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!snapshot.ready);
+    assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
+    assert!(snapshot.ready, "{snapshot:?}");
+    runtime
+        .sign_out(
+            &id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    let reentered = runtime
+        .accounts()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            TestExternalAccountSigner { keys },
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!reentered.ready);
+    assert!(reentered.single_device_notice.is_none());
+    assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
+    runtime.shutdown_and_close().await.unwrap();
+    drop(directory);
+}
+
+#[tokio::test]
+async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() {
+    let (directory, _relay, _app, first, keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    first.shutdown_and_close().await.unwrap();
+    let external_directory = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(
+        external_directory.path(),
+        url.clone(),
+    ));
+    runtime
+        .accounts()
+        .begin_external_signer_onboarding(
+            id.clone(),
+            TestExternalAccountSigner { keys },
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url],
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert!(!snapshot.ready);
+    assert_eq!(
+        snapshot.steps[4].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
+
+    // The host has already attached this signer. An explicit sign-in after
+    // reversible cancellation must be able to use it without registration.
+    assert!(runtime.sign_in_account(&id).await.unwrap().running);
+    assert!(runtime.publish_key_package(&id).await.unwrap() > 0);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[derive(Debug)]
+struct OnboardingPaymentRequired;
+impl nostr_relay_builder::prelude::QueryPolicy for OnboardingPaymentRequired {
+    fn admit_query<'a>(
+        &'a self,
+        _: &'a nostr::Filter,
+        _: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async { PolicyResult::Reject("payment-required: subscription needed".into()) })
+    }
+}
+#[tokio::test]
+async fn onboarding_access_restricted_query_is_not_a_missing_record() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = LocalRelay::new(RelayBuilder::default().query_policy(OnboardingPaymentRequired));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), url.clone()));
+    let keys = Keys::generate();
+    let snapshot = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url],
+            },
+        )
+        .await
+        .unwrap();
+    let result = runtime
+        .accounts()
+        .run_onboarding(&snapshot.account_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.steps[0].status,
+        marmot_app::OnboardingStatus::RetryableFailure
+    );
+    assert_eq!(
+        result.steps[0].findings[0].issue,
+        marmot_app::OnboardingIssue::AccessRestricted
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry() {
+    use nostr::prelude::ToBech32;
+    let directory = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(true));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectKeyPackagesWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(directory.path(), url.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let id = keys.public_key().to_hex();
+    runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
+    assert!(!snapshot.ready);
+    assert_eq!(
+        snapshot.steps[5].status,
+        marmot_app::OnboardingStatus::RetryableFailure
+    );
+    assert!(matches!(
+        runtime.accounts().publish_key_package(&id).await,
+        Err(AppError::OnboardingRequired)
+    ));
+    assert!(
+        AccountHome::open(directory.path())
+            .account_setup_state(&id)
+            .unwrap()
+            .is_some()
+    );
+    let acknowledged_notice = snapshot.single_device_notice.clone();
+    runtime.shutdown_and_close().await.unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url.clone()));
+    let resumed = runtime.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(resumed.single_device_notice, acknowledged_notice);
+    assert_eq!(
+        resumed.steps[4].status,
+        marmot_app::OnboardingStatus::Passed
+    );
+    rejecting.store(false, Ordering::SeqCst);
+    let snapshot = runtime
+        .accounts()
+        .retry_onboarding_step(&id, marmot_app::OnboardingStep::KeyPackage)
+        .await
+        .unwrap();
+    assert!(snapshot.ready, "{snapshot:?}");
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+async fn acknowledge_single_device_notice(
+    runtime: &MarmotAppRuntime,
+    snapshot: marmot_app::OnboardingSnapshot,
+) -> marmot_app::OnboardingSnapshot {
+    assert!(!snapshot.ready, "{snapshot:?}");
+    assert_eq!(
+        snapshot.steps[4].step,
+        marmot_app::OnboardingStep::SingleDevice
+    );
+    assert_eq!(
+        snapshot.steps[4].status,
+        marmot_app::OnboardingStatus::NeedsInput,
+        "{snapshot:?}"
+    );
+    assert!(
+        snapshot.steps[4]
+            .actions
+            .contains(&marmot_app::OnboardingAction::ContinueAnyway)
+    );
+    assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
+    assert!(matches!(
+        runtime
+            .accounts()
+            .publish_key_package(&snapshot.account_id_hex)
+            .await,
+        Err(AppError::OnboardingRequired)
+    ));
+    runtime
+        .accounts()
+        .acknowledge_onboarding_single_device(&snapshot.account_id_hex, snapshot.revision)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn onboarding_single_device_detects_other_installation_and_retains_notice_across_restart() {
+    use marmot_app::{OnboardingDeviceDiscovery, OnboardingOptions, OnboardingStep};
+    use nostr::prelude::ToBech32;
+    let (first_directory, _relay, first_app, first, keys, id, url) = onboarding_fixture().await;
+    seed_onboarding_records(&AccountHome::open(first_directory.path()), &id, &url).await;
+    let notice = first.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        notice.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::NoneFound
+    );
+    assert!(acknowledge_single_device_notice(&first, notice).await.ready);
+
+    // An older publication under another slot still carries usable material.
+    // Its timestamp is not grounds for asserting that installation is inactive.
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    let events = client
+        .fetch_events_from(
+            [url.clone()],
+            nostr::Filter::new()
+                .author(keys.public_key())
+                .kind(Kind::from(30443)),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    let event = events.first().unwrap();
+    let mut tags = event
+        .tags
+        .iter()
+        .map(|t| t.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    tags.iter_mut().find(|t| t[0] == "d").unwrap()[1] = "older-installation-slot".into();
+    let old_publication_time = NostrTimestamp::now().as_secs() - 30 * 24 * 60 * 60;
+    publish_nostr_event_at(
+        &AccountHome::open(first_directory.path()),
+        &id,
+        &url,
+        30443,
+        tags,
+        event.content.clone(),
+        old_publication_time,
+    )
+    .await;
+    client.shutdown().await;
+
+    // The same private package advertised under a different slot is still ours.
+    let own_notice = first
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::SingleDevice)
+        .await
+        .unwrap();
+    assert_eq!(
+        own_notice.single_device_notice.as_ref().unwrap().discovery,
+        OnboardingDeviceDiscovery::NoneFound
+    );
+    assert!(
+        acknowledge_single_device_notice(&first, own_notice)
+            .await
+            .ready
+    );
+    first.publish_new_key_package(&id).await.unwrap();
+    let rotated_notice = first
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::SingleDevice)
+        .await
+        .unwrap();
+    assert_eq!(
+        rotated_notice
+            .single_device_notice
+            .as_ref()
+            .unwrap()
+            .discovery,
+        OnboardingDeviceDiscovery::NoneFound
+    );
+    assert!(
+        acknowledge_single_device_notice(&first, rotated_notice)
+            .await
+            .ready
+    );
+
+    let second_directory = tempfile::tempdir().unwrap();
+    let make_second =
+        || MarmotAppRuntime::new(MarmotApp::with_relay(second_directory.path(), url.clone()));
+    let second = make_second();
+    second
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = second.accounts().run_onboarding(&id).await.unwrap();
+    let notice = snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(
+        notice.discovery,
+        OnboardingDeviceDiscovery::OtherInstallationPossible
+    );
+    assert!(
+        notice
+            .other_packages
+            .iter()
+            .any(|p| p.published_at == old_publication_time)
+    );
+    assert!(notice.acknowledged_at.is_none());
+    assert!(matches!(
+        second.durably_owned_key_packages(&id).await,
+        Err(AppError::OnboardingRequired)
+    ));
+    assert_eq!(
+        first_app
+            .account_key_package_records(&id, vec![endpoint(&url)], Vec::new())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // Cancel means the host leaves this pause; simply resuming cannot publish.
+    let resumed = second.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(resumed.single_device_notice, snapshot.single_device_notice);
+    assert_eq!(resumed.steps, snapshot.steps);
+    let snapshot = resumed;
+    second.shutdown_and_close().await.unwrap();
+    let second = make_second();
+    assert_eq!(
+        second.accounts().onboarding_snapshot(&id).unwrap().unwrap(),
+        snapshot
+    );
+    assert!(matches!(
+        second
+            .accounts()
+            .acknowledge_onboarding_single_device(&id, snapshot.revision - 1)
+            .await,
+        Err(AppError::OnboardingActionUnavailable)
+    ));
+    let completed = acknowledge_single_device_notice(&second, snapshot).await;
+    assert!(completed.ready);
+    assert!(
+        completed
+            .single_device_notice
+            .as_ref()
+            .unwrap()
+            .acknowledged_at
+            .is_some()
+    );
+    second.shutdown_and_close().await.unwrap();
+    let second = make_second();
+    assert_eq!(
+        second.accounts().run_onboarding(&id).await.unwrap(),
+        completed
+    );
+    // Continue never deletes the other installation's slots.
+    let packages = first_app
+        .account_key_package_records(&id, vec![endpoint(&url)], Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        packages
+            .iter()
+            .any(|p| p.key_package_id == "older-installation-slot")
+    );
+    assert!(
+        packages
+            .iter()
+            .map(|p| &p.key_package_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            >= 3
+    );
+    second
+        .sign_out(
+            &id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    let next_sign_in = second
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!next_sign_in.ready);
+    assert!(next_sign_in.single_device_notice.is_none());
+    let next_notice = second.accounts().run_onboarding(&id).await.unwrap();
+    assert_eq!(
+        next_notice.steps[4].status,
+        marmot_app::OnboardingStatus::NeedsInput
+    );
+    assert!(
+        next_notice
+            .single_device_notice
+            .unwrap()
+            .acknowledged_at
+            .is_none()
+    );
+    second.shutdown_and_close().await.unwrap();
+    first.shutdown_and_close().await.unwrap();
+}
+
+#[derive(Debug)]
+struct OnboardingKeyPackageQueriesRestricted;
+impl nostr_relay_builder::prelude::QueryPolicy for OnboardingKeyPackageQueriesRestricted {
+    fn admit_query<'a>(
+        &'a self,
+        filter: &'a nostr::Filter,
+        _: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if filter
+                .kinds
+                .as_ref()
+                .is_some_and(|kinds| kinds.contains(&Kind::from(30443)))
+            {
+                PolicyResult::Reject("restricted".into())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn onboarding_single_device_unknown_discovery_still_offers_explicit_continue() {
+    use nostr::prelude::ToBech32;
+    let directory = tempfile::tempdir().unwrap();
+    let relay = LocalRelay::new(
+        RelayBuilder::default().query_policy(OnboardingKeyPackageQueriesRestricted),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url.clone()));
+    let keys = Keys::generate();
+    let id = keys.public_key().to_hex();
+    runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
+    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let notice = snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(
+        notice.discovery,
+        marmot_app::OnboardingDeviceDiscovery::Unknown
+    );
+    assert!(!notice.discovery_complete);
+    assert!(
+        snapshot.steps[4]
+            .findings
+            .iter()
+            .any(|f| f.issue == marmot_app::OnboardingIssue::AccessRestricted)
+    );
+    assert!(
+        acknowledge_single_device_notice(&runtime, snapshot)
+            .await
+            .ready
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_exit() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let keys = Keys::generate();
+    let secret = keys.secret_key().to_bech32().unwrap();
+    let request = || AccountSetupRequest {
+        import_nsec: Some(zeroize::Zeroizing::new(secret.clone())),
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let old = runtime
+        .create_or_import_account(request())
+        .await
+        .unwrap()
+        .account;
+    let options = || marmot_app::OnboardingOptions {
+        default_relays: vec![url.clone()],
+        discovery_relays: vec![url.clone()],
+    };
+    assert!(
+        runtime
+            .accounts()
+            .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&old.label)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .accounts()
+            .managed_accounts()
+            .unwrap()
+            .iter()
+            .any(|a| a.account_id_hex == old.account_id_hex && a.running)
+    );
+    let bad = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(Keys::generate().secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    AccountHome::open(dir.path())
+        .set_account_onboarding(&bad.account_id_hex, b"{")
+        .unwrap();
+    runtime.reconcile_accounts().await.unwrap();
+    let managed = runtime.accounts().managed_accounts().unwrap();
+    assert!(
+        managed
+            .iter()
+            .any(|a| a.account_id_hex == old.account_id_hex && a.running)
+    );
+    assert!(
+        managed
+            .iter()
+            .any(|a| a.account_id_hex == bad.account_id_hex && !a.running)
+    );
+    assert!(runtime.publish_key_package(&old.label).await.unwrap() > 0);
+    runtime
+        .sign_out(
+            &old.label,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .cancel_onboarding(&old.label)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .accounts()
+            .onboarding_snapshot(&old.label)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        AccountHome::open(dir.path())
+            .account(&old.label)
+            .unwrap()
+            .signed_out
+    );
+    assert!(
+        runtime
+            .create_or_import_account(request())
+            .await
+            .unwrap()
+            .key_package_bytes
+            .is_some()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let secret = Keys::generate().secret_key().to_bech32().unwrap();
+    let snapshot = runtime
+        .accounts()
+        .begin_onboarding(
+            zeroize::Zeroizing::new(secret.clone()),
+            marmot_app::OnboardingOptions {
+                default_relays: vec![url.clone()],
+                discovery_relays: vec![url.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .accounts()
+        .cancel_onboarding(&snapshot.account_id_hex)
+        .await
+        .unwrap();
+    let outcome = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(secret)),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.account.account_id_hex, snapshot.account_id_hex);
+    assert!(outcome.key_package_bytes.is_some());
+    assert_eq!(
+        runtime
+            .account_setup_readiness(&outcome.account.label)
+            .unwrap(),
+        marmot_app::AccountSetupReadiness::NetworkReady
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Two admins commit different profile fields at the same instant. The loser's
+/// runtime already told its caller the edit saved, so once convergence parks
+/// that commit the intent must be re-issued against the canonical state and
+/// every member must end up with both fields; the runtime announces the
+/// re-issue as a `GroupChangeSuperseded` event (mdk#1734).
+async fn race_two_admin_profile_edits(
+    alice_edit: (Option<&str>, Option<&str>),
+    bob_edit: (Option<&str>, Option<&str>),
+) -> (
+    RaceFixture,
+    MarmotAppRuntime,
+    MarmotApp,
+    tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    GroupId,
+    Vec<(String, String)>,
+) {
+    // Both returned to the caller: dropping the account home mid-test makes
+    // every later account-home read fail with `account_home_unknown_account`,
+    // and dropping the relay handle stops the relay the loser still needs.
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGroupMessages::new();
+    let (relay, app, url) = group_message_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
+    let carol = create_network_ready_identity(&runtime, setup()).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "before",
+            &[bob_id.clone(), carol_id.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    // Both invitees join concurrently, in either order: waiting for one at a
+    // time would consume and drop the other's `GroupJoined`.
+    let mut awaiting_join: std::collections::HashSet<String> =
+        [bob_id.clone(), carol_id.clone()].into_iter().collect();
+    while !awaiting_join.is_empty() {
+        let joined_event = wait_for_event_within(&mut events, Duration::from_secs(20), |event| {
+            matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                    if awaiting_join.contains(account_id_hex) && joined == &group_id
+            )
+        })
+        .await;
+        if let MarmotAppEvent::GroupJoined { account_id_hex, .. } = joined_event {
+            awaiting_join.remove(&account_id_hex);
+        }
+    }
+    for member in [&bob_id, &carol_id] {
+        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+            .await
+            .unwrap();
+    }
+    runtime
+        .promote_admin(&alice_id, &group_id, &bob_id)
+        .await
+        .unwrap();
+    // Let the promotion settle everywhere before racing, so both commits fork
+    // from the same epoch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut epochs = Vec::new();
+        for id in [&alice_id, &bob_id, &carol_id] {
+            epochs.push(runtime.group_mls_state(id, &group_id).await.unwrap().epoch);
+        }
+        if epochs.iter().all(|epoch| *epoch == epochs[0]) && epochs[0] >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "members did not settle after the admin promotion: {epochs:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // A fresh subscription for the race itself: the settle loop above does not
+    // drain events, and a lagged receiver would drop the announcement.
+    let events = runtime.subscribe();
+    gate.arm(2);
+    let (alice_runtime, bob_runtime) = (runtime.clone(), runtime.clone());
+    let (alice_gid, bob_gid) = (group_id.clone(), group_id.clone());
+    let (alice_for, bob_for) = (alice_id.clone(), bob_id.clone());
+    let (alice_name, alice_description) = (
+        alice_edit.0.map(str::to_owned),
+        alice_edit.1.map(str::to_owned),
+    );
+    let (bob_name, bob_description) =
+        (bob_edit.0.map(str::to_owned), bob_edit.1.map(str::to_owned));
+    let alice_edit = tokio::spawn(async move {
+        alice_runtime
+            .update_group_profile(&alice_for, &alice_gid, alice_name, alice_description)
+            .await
+    });
+    let bob_edit = tokio::spawn(async move {
+        bob_runtime
+            .update_group_profile(&bob_for, &bob_gid, bob_name, bob_description)
+            .await
+    });
+    timeout(Duration::from_secs(10), gate.wait_for_blocked(2))
+        .await
+        .expect("both profile edits should overlap at commit publication");
+    gate.release();
+    alice_edit.await.unwrap().expect("alice's edit is accepted");
+    bob_edit.await.unwrap().expect("bob's edit is accepted");
+
+    let labels = vec![
+        (alice.account.label.clone(), alice_id),
+        (bob.account.label.clone(), bob_id),
+        (carol.account.label.clone(), carol_id),
+    ];
+    (
+        RaceFixture {
+            _dir: dir,
+            _relay: relay,
+        },
+        runtime,
+        app,
+        events,
+        group_id,
+        labels,
+    )
+}
+
+/// Keeps the account home and the local relay alive for the whole test.
+struct RaceFixture {
+    _dir: tempfile::TempDir,
+    _relay: LocalRelay,
+}
+
+async fn wait_for_profile_everywhere(
+    app: &MarmotApp,
+    labels: &[(String, String)],
+    group_id: &GroupId,
+    expected: (&str, &str),
+) {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let profiles = labels
+            .iter()
+            .map(|(label, _)| {
+                let group = app.group(label, &group_id_hex).unwrap().unwrap();
+                (group.profile.name, group.profile.description)
+            })
+            .collect::<Vec<_>>();
+        if profiles
+            .iter()
+            .all(|(name, description)| name == expected.0 && description == expected.1)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "members did not converge on the expected profile {expected:?}; got {profiles:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_profile_edit_on_a_different_field_is_reissued_and_announced() {
+    let (_fixture, runtime, app, mut events, group_id, labels) = race_two_admin_profile_edits(
+        (Some("alice renamed it"), None),
+        (None, Some("bob described it")),
+    )
+    .await;
+    // Whichever commit lost, its edit touched a field the winner left alone,
+    // so the loser announces the re-issue and both fields land on every device.
+    wait_for_event_within(&mut events, Duration::from_secs(30), |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupChangeSuperseded { group_id: changed, kind, outcome, .. }
+                if changed == &group_id
+                    && *kind == marmot_app::SupersededIntentKind::GroupProfile
+                    && *outcome == marmot_app::SupersededIntentOutcome::Reissued
+        )
+    })
+    .await;
+    wait_for_profile_everywhere(
+        &app,
+        &labels,
+        &group_id,
+        ("alice renamed it", "bob described it"),
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_profile_edit_on_the_same_field_is_reported_as_a_conflict() {
+    let (_fixture, runtime, app, mut events, group_id, labels) =
+        race_two_admin_profile_edits((Some("alice's name"), None), (Some("bob's name"), None))
+            .await;
+    // The loser learns of the race only when the winning commit reaches it and
+    // a convergence pass adjudicates, on real relay timing.
+    let conflict = wait_for_event_within(&mut events, Duration::from_secs(30), |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupChangeSuperseded { group_id: changed, kind, outcome, .. }
+                if changed == &group_id
+                    && *kind == marmot_app::SupersededIntentKind::GroupProfile
+                    && *outcome == marmot_app::SupersededIntentOutcome::Conflict
+        )
+    })
+    .await;
+    // The winner's name stands everywhere; the loser's is dropped, not replayed.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let winner_name = loop {
+        let names = labels
+            .iter()
+            .map(|(label, _)| {
+                app.group(label, &group_id_hex)
+                    .unwrap()
+                    .unwrap()
+                    .profile
+                    .name
+            })
+            .collect::<Vec<_>>();
+        if names.iter().all(|name| name == &names[0]) && names[0] != "before" {
+            break names[0].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "members did not converge on one name; got {names:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        winner_name == "alice's name" || winner_name == "bob's name",
+        "{winner_name}"
+    );
+    drop(conflict);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = || AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup().relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup()).await;
+    let carol = create_network_ready_identity(&runtime, setup()).await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let carol_id = carol.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "departures without manual retry",
+            &[bob_id.clone(), carol_id.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    for member in [&bob_id, &carol_id] {
+        wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                    if account_id_hex == member && joined == &group_id
+            )
+        })
+        .await;
+        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+            .await
+            .unwrap();
+    }
+
+    runtime.leave_group(&bob_id, &group_id).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let alice_members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+        let carol_members = runtime.group_members(&carol_id, &group_id).await.unwrap();
+        let gone = |members: &[marmot_app::AppGroupMemberRecord]| {
+            !members.iter().any(|member| member.member_id_hex == bob_id)
+        };
+        if gone(&alice_members) && gone(&carol_members) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the remaining runtimes did not apply bob's leave within 20 seconds \
+             (alice sees {} members, carol sees {})",
+            alice_members.len(),
+            carol_members.len()
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let alice_state = runtime.group_mls_state(&alice_id, &group_id).await.unwrap();
+    let carol_state = runtime.group_mls_state(&carol_id, &group_id).await.unwrap();
+    assert_eq!(
+        alice_state.epoch, carol_state.epoch,
+        "the survivors converge on the epoch that applied the leave"
+    );
     runtime.shutdown().await;
 }

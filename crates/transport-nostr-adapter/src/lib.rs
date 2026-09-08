@@ -82,8 +82,8 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
-    NostrReconciliationItem, NostrReconciliationSummary, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
+    NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
 };
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,

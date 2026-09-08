@@ -289,6 +289,8 @@ struct FaultStorage {
     fault: PutGroupFault,
     capability_fault: CapabilityWriteFault,
     leave_write_fault: LeaveWriteFault,
+    intent_write_fault: LeaveWriteFault,
+    preparation_delay: PreparationDelay,
 }
 
 impl GroupStorage for FaultStorage {
@@ -309,7 +311,45 @@ impl GroupStorage for FaultStorage {
     }
 }
 
+#[derive(Clone, Default)]
+struct PreparationDelay {
+    metadata_ms: Arc<AtomicUsize>,
+    graph_ms: Arc<AtomicUsize>,
+    metadata_calls: Arc<AtomicUsize>,
+    graph_calls: Arc<AtomicUsize>,
+}
+
 impl MessageStorage for FaultStorage {
+    fn list_deferred_message_metadata(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<cgka_traits::message::DeferredMessageMetadata>> {
+        self.preparation_delay
+            .metadata_calls
+            .fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.preparation_delay.metadata_ms.load(Ordering::SeqCst) as u64,
+        ));
+        self.inner.list_deferred_message_metadata(group_id)
+    }
+
+    fn list_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        if states.contains(&MessageState::Processed) {
+            self.preparation_delay
+                .graph_calls
+                .fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(
+                self.preparation_delay.graph_ms.load(Ordering::SeqCst) as u64,
+            ));
+        }
+        self.inner
+            .list_messages_in_states(group_id, states, at_or_after_epoch)
+    }
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         if self.leave_write_fault.should_fail() {
             return Err(StorageError::Busy(
@@ -411,6 +451,11 @@ impl MessageStorage for FaultStorage {
 
 impl OutboundIntentStorage for FaultStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected queued intent write failure".into(),
+            ));
+        }
         self.inner.put_queued_outbound_intent(record)
     }
     fn list_queued_outbound_intents(
@@ -421,6 +466,37 @@ impl OutboundIntentStorage for FaultStorage {
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+    fn put_own_commit_intent(
+        &self,
+        record: &cgka_traits::storage::OwnCommitIntent,
+    ) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected own intent write failure".into(),
+            ));
+        }
+        self.inner.put_own_commit_intent(record)
+    }
+    fn own_commit_intent(
+        &self,
+        commit_id: &MessageId,
+    ) -> StorageResult<Option<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.own_commit_intent(commit_id)
+    }
+    fn list_own_commit_intents(
+        &self,
+        group_id: Option<&GroupId>,
+    ) -> StorageResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        self.inner.list_own_commit_intents(group_id)
+    }
+    fn delete_own_commit_intent(&self, commit_id: &MessageId) -> StorageResult<()> {
+        if self.intent_write_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected own intent delete failure".into(),
+            ));
+        }
+        self.inner.delete_own_commit_intent(commit_id)
     }
 }
 
@@ -684,6 +760,8 @@ fn build_fault_selfremove_client(
         fault,
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -706,6 +784,8 @@ fn build_capability_fault_client(
         fault: PutGroupFault::default(),
         capability_fault,
         leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -729,6 +809,8 @@ fn build_leave_write_fault_client(
         fault: PutGroupFault::default(),
         capability_fault: CapabilityWriteFault::default(),
         leave_write_fault,
+        intent_write_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(identity))
@@ -1489,4 +1571,484 @@ async fn update_group_data_record_write_failure_leaves_group_stable() {
     let record = handle.get_group(&group_id).unwrap();
     assert_eq!(record.name, "successful rename");
     assert_eq!(record.description, "preserve me");
+}
+
+/// Opaque input remains retryable; it lets this test distinguish a completed
+/// failed peel (durable attempt) from a slice that never reaches the peeler.
+struct OpaquePeeler;
+
+#[async_trait]
+impl TransportPeeler for OpaquePeeler {
+    async fn peel_group_message(
+        &self,
+        _msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Err(PeelerError::DecryptFailed)
+    }
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+async fn slow_preparation_case(
+    backlog: usize,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    Vec<MessageId>,
+    PreparationDelay,
+) {
+    let delay = PreparationDelay::default();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        preparation_delay: delay.clone(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"slow-preparation"))
+    .account_identity_proof_signer(proof_signer(b"slow-preparation"))
+    .peeler(Box::new(OpaquePeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = bob
+        .create_group(CreateGroupRequest {
+            name: "slow preparation".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("group creation");
+    };
+    bob.confirm_published(pending).await.unwrap();
+    let message = TransportMessage {
+        id: MessageId::new(b"slow-preparation-opaque".to_vec()),
+        payload: vec![42; 32],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let mut ids = Vec::new();
+    for index in 0..backlog {
+        let message = TransportMessage {
+            id: MessageId::new(format!("slow-preparation-{index}").into_bytes()),
+            ..message.clone()
+        };
+        assert!(matches!(
+            bob.ingest(message.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+        ids.push(message.id);
+    }
+    (bob, storage, group_id, ids, delay)
+}
+
+fn deferred_attempts(storage: &SqliteAccountStorage, ids: &[MessageId]) -> u32 {
+    ids.iter()
+        .map(|id| {
+            storage
+                .get_message(id)
+                .unwrap()
+                .deferred_peel
+                .unwrap()
+                .distinct_context_attempts
+        })
+        .sum()
+}
+
+async fn assert_slow_preparation_makes_durable_progress(metadata: bool) {
+    let (mut bob, storage, group_id, ids, delay) = slow_preparation_case(4).await;
+    let before = deferred_attempts(&storage, &ids);
+    delay.metadata_calls.store(0, Ordering::SeqCst);
+    delay.graph_calls.store(0, Ordering::SeqCst);
+    let selected = if metadata {
+        &delay.metadata_ms
+    } else {
+        &delay.graph_ms
+    };
+    selected.store(600, Ordering::SeqCst);
+    for _ in 0..3 {
+        bob.advance_convergence(&group_id).await.unwrap();
+    }
+    let attempts = deferred_attempts(&storage, &ids);
+    eprintln!(
+        "slow preparation: metadata={metadata}, attempts_before={before}, attempts_after={attempts}, metadata_calls={}, graph_calls={}",
+        delay.metadata_calls.load(Ordering::SeqCst),
+        delay.graph_calls.load(Ordering::SeqCst)
+    );
+    // Positive control: identical durable work succeeds through the explicit-time
+    // API. Its deterministic row allowance still applies, but it has no deadline.
+    bob.advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    let control = deferred_attempts(&storage, &ids);
+    assert!(
+        control > before,
+        "control must perform real decryption work"
+    );
+    assert_eq!(
+        attempts, 3,
+        "each expired slice must finish exactly one row"
+    );
+}
+
+#[tokio::test]
+async fn slow_metadata_preparation_does_not_starve_background_retries() {
+    assert_slow_preparation_makes_durable_progress(true).await;
+}
+
+#[tokio::test]
+async fn slow_fingerprint_preparation_does_not_starve_background_retries() {
+    assert_slow_preparation_makes_durable_progress(false).await;
+}
+
+/// Restart/legacy normalization is a durable work unit, so a slow read must
+/// neither prevent it nor cause the same call to exceed its 64-row allowance.
+#[tokio::test]
+async fn slow_preparation_normalizes_bounded_slices_before_peeling() {
+    let (mut bob, storage, group_id, ids, delay) = slow_preparation_case(96).await;
+    for id in &ids {
+        let mut row = storage.get_message(id).unwrap();
+        row.deferred_peel = None;
+        storage.put_message(&row).unwrap();
+    }
+    delay.metadata_ms.store(600, Ordering::SeqCst);
+    bob.advance_convergence(&group_id).await.unwrap();
+    let normalized = ids
+        .iter()
+        .filter(|id| storage.get_message(id).unwrap().deferred_peel.is_some())
+        .count();
+    assert_eq!(normalized, 64, "normalization must obey the row allowance");
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        deferred_attempts(&storage, &ids),
+        0,
+        "normalization consumes the expired slice"
+    );
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(
+        deferred_attempts(&storage, &ids),
+        1,
+        "the next slice must reach a peel"
+    );
+}
+
+/// Due rows spend the one progress allowance on release, rather than being
+/// retried after expiry or all released in a single already-expired quantum.
+#[tokio::test]
+async fn slow_preparation_releases_exactly_one_expired_row() {
+    let (mut bob, storage, group_id, ids, delay) = slow_preparation_case(4).await;
+    for id in &ids {
+        let mut row = storage.get_message(id).unwrap();
+        row.deferred_peel
+            .as_mut()
+            .unwrap()
+            .residence_deadline_monotonic_ms = 0;
+        storage.put_message(&row).unwrap();
+    }
+    delay.metadata_ms.store(600, Ordering::SeqCst);
+    bob.advance_convergence(&group_id).await.unwrap();
+    let remaining = storage.list_deferred_message_metadata(&group_id).unwrap();
+    assert_eq!(remaining.len(), 3);
+    assert!(remaining.iter().all(|row| {
+        row.deferred_peel
+            .as_ref()
+            .unwrap()
+            .distinct_context_attempts
+            == 0
+    }));
+}
+
+/// Queued output must not turn background recovery into a four-row foreground
+/// send attempt. The frozen raw generation still completes before output drains.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn queued_output_preserves_background_recovery_allowance() {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+    use cgka_traits::storage::DeferredPeelGenerationStorage;
+
+    for explicit_time in [false, true] {
+        let (mut engine, storage, group_id, ids, _delay) = slow_preparation_case(96).await;
+        // Keep the production four-row foreground limit. Its independent time
+        // budget is enlarged only to make this row-accounting test deterministic.
+        engine.set_foreground_deferred_peel_budget(5_000, 4);
+        let payload = MarmotAppEvent::new(
+            hex::encode(engine.self_id().as_slice()),
+            1_700_000_000,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            "queued during opaque recovery",
+        )
+        .encode()
+        .unwrap();
+        let result = engine
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await
+            .unwrap();
+        let SendResult::Queued { intent_id, .. } = result else {
+            panic!("foreground send must queue behind a partial generation");
+        };
+        assert_eq!(
+            deferred_attempts(&storage, &ids),
+            4,
+            "actual foreground send retains its four-row allowance"
+        );
+        let advanced = if explicit_time {
+            engine
+                .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+                .await
+                .unwrap()
+        } else {
+            engine.advance_convergence(&group_id).await.unwrap()
+        };
+        let background_attempts = deferred_attempts(&storage, &ids) - 4;
+        eprintln!(
+            "queued background recovery: explicit_time={explicit_time}, attempts={background_attempts}"
+        );
+        assert!(
+            (1..=64).contains(&background_attempts),
+            "wall-clock recovery must make progress within its row allowance: {background_attempts}"
+        );
+        if explicit_time {
+            assert_eq!(
+                background_attempts, 64,
+                "explicit-time recovery keeps its deterministic row slice"
+            );
+        }
+        assert!(
+            advanced.is_empty(),
+            "queued output must wait for the whole frozen generation"
+        );
+        assert!(
+            storage
+                .deferred_peel_generation(&group_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Complete with deterministic row slices. Wall-clock throughput is
+        // host-dependent; the public entry point was exercised above.
+        let mut drained = Vec::new();
+        for pass in 0..8 {
+            drained.extend(
+                engine
+                    .converge_and_drain_queued_outbound_intents(&group_id, 1_000_001 + pass)
+                    .await
+                    .unwrap(),
+            );
+            if !drained.is_empty() {
+                break;
+            }
+        }
+        assert!(matches!(
+            drained.as_slice(),
+            [SendResult::ApplicationMessage { .. }]
+        ));
+        assert_eq!(
+            deferred_attempts(&storage, &ids),
+            96,
+            "every opaque row gets one definitive attempt before output"
+        );
+        assert!(
+            storage
+                .deferred_peel_generation(&group_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .advance_convergence(&group_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an in-flight queued result must not regenerate twice"
+        );
+        engine.confirm_queued_outbound_intent(&intent_id).unwrap();
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+async fn setup_own_intent_fault_case(
+    fault: LeaveWriteFault,
+) -> (
+    cgka_engine::Engine<FaultStorage>,
+    SqliteAccountStorage,
+    GroupId,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: fault,
+        preparation_delay: PreparationDelay::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"own-intent-fault"))
+    .account_identity_proof_signer(proof_signer(b"own-intent-fault"))
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, result) = engine
+        .create_group(CreateGroupRequest {
+            name: "intent retention".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = result else {
+        panic!("create")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    (engine, storage, group_id)
+}
+
+#[tokio::test]
+async fn own_intent_record_failure_releases_the_unreturned_pending_commit() {
+    let fault = LeaveWriteFault::default();
+    let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+    let epoch = engine.epoch(&group_id).unwrap();
+    let intent = SendIntent::UpdateGroupData {
+        group_id: group_id.clone(),
+        name: Some("retained edit".into()),
+        description: None,
+    };
+    fault.arm_on_write(1);
+    assert!(matches!(
+        engine.send(intent.clone()).await,
+        Err(EngineError::Storage(StorageError::Busy(_)))
+    ));
+    assert!(
+        storage
+            .list_own_commit_intents(Some(&group_id))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.epoch(&group_id).unwrap(), epoch);
+    let result = engine
+        .send(intent)
+        .await
+        .expect("the failed staging must remain retryable");
+    let SendResult::GroupEvolution { pending, .. } = result else {
+        panic!("retry stages immediately: {result:?}")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    assert!(engine.epoch(&group_id).unwrap() > epoch);
+}
+
+#[tokio::test]
+async fn superseded_own_intent_transfer_is_atomic_on_each_storage_failure() {
+    for fail_on_write in 1..=2 {
+        let fault = LeaveWriteFault::default();
+        let (mut engine, storage, group_id) = setup_own_intent_fault_case(fault.clone()).await;
+        // Persist an independently evidenced superseded edit against the current
+        // baseline. This targets the recovery transfer, not branch selection.
+        let commit_id = MessageId::new(vec![42; 32]);
+        storage
+            .put_own_commit_intent(&cgka_traits::storage::OwnCommitIntent {
+                commit_id: commit_id.clone(),
+                group_id: group_id.clone(),
+                source_epoch: engine.epoch(&group_id).unwrap(),
+                intent: SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some("retry edit".into()),
+                    description: None,
+                },
+                baseline: cgka_traits::storage::OwnCommitBaseline::GroupProfile {
+                    name: "intent retention".into(),
+                    description: String::new(),
+                },
+                reissue_attempts: 0,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        fault.arm_on_write(fail_on_write);
+        assert!(matches!(
+            engine.reissue_superseded_own_commit(&commit_id),
+            Err(EngineError::Storage(StorageError::Busy(_)))
+        ));
+        assert!(
+            storage.own_commit_intent(&commit_id).unwrap().is_some(),
+            "failed transfer must retain the source"
+        );
+        assert!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty(),
+            "failed source deletion must roll back the queue write"
+        );
+        let report = engine
+            .reissue_superseded_own_commit(&commit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.outcome,
+            cgka_traits::engine::SupersededIntentOutcome::Reissued
+        );
+        assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+        let queued = storage.list_queued_outbound_intents(&group_id).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].reissue_attempts, 1);
+        assert!(
+            engine
+                .reissue_superseded_own_commit(&commit_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

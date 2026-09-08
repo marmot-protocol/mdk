@@ -9,6 +9,51 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.9.19] - 2026-09-07
+
+### Added
+
+- Durable interactive account onboarding across the app runtime, CLI, Swift,
+  Kotlin, and C bindings supports resumable setup and explicit cancellation.
+- The core traits, engine, and Nostr peeler now compile for browser WASM.
+  This is compile-only coverage; it does not provide browser app-runtime,
+  SQLCipher, CLI, or binding support.
+
+### Changed
+
+- Account databases advance through migrations 60–64 for released transport
+  receipts, durable reconciliation replay cursors, query indexes, and own-commit
+  recovery intents. Shared account storage and the directory cache now have
+  versioned schemas. Back up before upgrading; downgrade is unsupported.
+  Re-upgrade or restore a pre-upgrade database/export instead of removing
+  migration rows. See the
+  [storage-format contract](../../docs/marmot-architecture/storage-format-v2.md).
+  Upgrades from before `0.9.15` also cross migration 47: keep at least 3.25
+  times the account database size free for its history-table rebuild and
+  gradual post-readiness promotion. The 2,048-row release check measured a
+  4.01-times peak footprint (3.01 times additional space), a 13,410 ms migration,
+  7,371 ms promotion, and 255 ms slowest 32-row batch.
+- Message sending, chat previews, and replay queries avoid full-history scans
+  and unnecessary sorts. Timeline bindings reuse matching conversions.
+- Automatic audit uploads batch sealed segments, back off failed passes,
+  and recover failed segment rotation.
+
+### Fixed
+
+- Offline catch-up, background recovery, and group-change replay preserve
+  durable progress and recovery intents across account restarts. Replayed
+  proposals refresh their epoch anchor.
+- Removed devices stop routing and re-seeding groups they no longer belong to.
+- Login and invitation discovery preserve inbox/outbox metadata; default MLS
+  capabilities remain implicit in KeyPackages.
+- Relay telemetry connections pin validated collector addresses.
+- Non-JSON CLI and daemon human output now sanitizes untrusted remote text
+  with the existing TUI terminal-safety policy, so message bodies, group
+  profile fields, display names, stream previews, and related error text
+  cannot inject ANSI/OSC or Unicode format controls. Human-only `wn daemon
+  start` and `wnd` startup errors use the same helper. `--json` and IPC
+  serialization stay lossless.
+
 ## [0.9.18] - 2026-09-05
 
 ### Changed
@@ -45,6 +90,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   explicit development opt-in now permits loopback endpoints only.
 - Engine failures now retain the same stable CLI JSON error code whether they
   reach the app boundary directly or through account/session wrappers.
+- Sending to a group this device was removed from now fails with the stable
+  JSON error code `group_removed` (carrying `group_id`) instead of the
+  catch-all `command_failed`, and fails before any local message row is
+  recorded. MarmotKit reports it as `GroupRemoved`
+  (`MARMOT_STATUS_GROUP_REMOVED`).
 
 ## [0.9.17] - 2026-09-02
 
@@ -2024,7 +2074,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.19...HEAD
+[0.9.19]: https://github.com/marmot-protocol/mdk/compare/v0.9.18...v0.9.19
 [0.9.18]: https://github.com/marmot-protocol/mdk/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/marmot-protocol/mdk/compare/v0.9.16...v0.9.17
 [0.9.16]: https://github.com/marmot-protocol/mdk/compare/v0.9.15...v0.9.16

@@ -37,6 +37,7 @@ marmot-forensics.workspace = true
 nostr.workspace = true
 rand.workspace = true
 sha2.workspace = true
+web-time.workspace = true
 # Pure-Rust secp256k1 used only to validate that a Marmot credential identity
 # is a well-formed BIP-340 x-only public key (foundation/identity.md). Already
 # resolved transitively via openmls_rust_crypto -> hpke-rs-rust-crypto -> k256;
@@ -49,6 +50,7 @@ tokio = { workspace = true, features = ["time"] }
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures.workspace = true
 gloo-timers = { version = "0.3", features = ["futures"] }
+openmls = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 storage-sqlite = { workspace = true, features = ["storage-format-benchmarks"] }
