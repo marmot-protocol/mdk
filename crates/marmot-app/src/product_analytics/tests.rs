@@ -1072,6 +1072,38 @@ fn non_media_measurements_do_not_depend_on_optional_product_analytics() {
     assert_eq!(plain.snapshot(), attached.snapshot());
 }
 
+#[cfg(not(feature = "product-analytics-export"))]
+#[test]
+fn consent_without_product_feature_cannot_collect_activity() {
+    let (collector, _) = configured();
+    grant(&collector);
+    assert!(collector.permit().is_some());
+    assert_eq!(
+        collector.status().product_analytics,
+        DiagnosticsExporterStatus::UnsupportedBuild
+    );
+    assert!(
+        collector
+            .begin(ProductFamily::Account, "local_ready", ProductUnit::Attempt)
+            .is_none()
+    );
+    collector.observe(
+        ProductFamily::Notification,
+        "local_enable",
+        "success",
+        ProductUnit::Action,
+        None,
+    );
+    collector.activity(ProductAnalyticsActivity::Foreground);
+    collector.activity(ProductAnalyticsActivity::Background);
+    let state = collector.lock();
+    assert!(state.cells.is_empty());
+    assert!(state.queue.is_empty());
+    assert!(state.session.is_none());
+    assert!(state.window.is_none());
+}
+
+#[cfg(feature = "product-analytics-export")]
 #[test]
 fn notification_setting_operations_remain_separate_aggregate_cells() {
     let (collector, _) = configured();
@@ -1111,6 +1143,7 @@ fn notification_setting_operations_remain_separate_aggregate_cells() {
     assert!(state.cells.values().all(|count| *count == 1));
 }
 
+#[cfg(feature = "product-analytics-export")]
 #[test]
 fn local_ready_handoff_does_not_duplicate_the_complete_phase_observation() {
     use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
