@@ -520,6 +520,17 @@ impl AppClient {
             }
             woken_targets += woken;
         }
+        self.app.product_analytics.observe(
+            crate::ProductFamily::Connectivity,
+            "reconnect",
+            if woken_targets > 0 {
+                "performed"
+            } else {
+                "no_work_due"
+            },
+            crate::ProductUnit::Attempt,
+            None,
+        );
         Ok(woken_targets)
     }
 
@@ -630,6 +641,24 @@ impl AppClient {
             return;
         }
         for event in &effects.events {
+            use cgka_traits::engine::GroupEvent;
+            let transition = match event {
+                GroupEvent::GroupStateInvalidated { .. } => Some(("invalidation", "performed")),
+                GroupEvent::GroupStateRevalidated { .. } => Some(("revalidation", "success")),
+                GroupEvent::GroupUnrecoverable { .. } => Some(("unrecoverable", "failure")),
+                GroupEvent::PendingCommitRecovered { .. } => Some(("pending_commit", "success")),
+                GroupEvent::GroupHydrationRecovered { .. } => Some(("hydration", "success")),
+                _ => None,
+            };
+            if let Some((operation, outcome)) = transition {
+                self.app.product_analytics.observe(
+                    crate::ProductFamily::Recovery,
+                    operation,
+                    outcome,
+                    crate::ProductUnit::Transition,
+                    None,
+                );
+            }
             match event {
                 cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
                     self.epoch_stall.observe_epoch_passage(group_id, *from, *to);
@@ -1655,6 +1684,30 @@ impl AppClient {
                 SyncSummary::default(),
             ));
         }
+        let observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Recovery,
+            "overflow",
+            crate::ProductUnit::Attempt,
+        );
+        let result = self.recover_delivery_overflow_unobserved().await;
+        if let Some(observation) = observation {
+            observation.finish(match &result {
+                Ok(DeliveryOverflowRecoveryOutcome::Completed(_)) => "success",
+                Ok(DeliveryOverflowRecoveryOutcome::Incomplete(_)) => "partial",
+                Err(_) => "failure",
+            });
+        }
+        result
+    }
+
+    async fn recover_delivery_overflow_unobserved(
+        &mut self,
+    ) -> Result<DeliveryOverflowRecoveryOutcome, ClassifiedSyncFailure> {
+        if !self.delivery_overflow_recovery_pending {
+            return Ok(DeliveryOverflowRecoveryOutcome::Completed(
+                SyncSummary::default(),
+            ));
+        }
         let marker_token = self
             .delivery_overflow_recovery_marker_token
             .ok_or_else(|| {
@@ -2321,7 +2374,41 @@ impl AppClient {
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
             transport_reconciliation_record(client.adapter.account_id(), &delivery);
-        let effects = client.runtime.ingest_delivery(delivery).await?;
+        let welcome = matches!(
+            &delivery.message.envelope,
+            TransportEnvelope::Welcome { .. }
+        );
+        let observation = client.app.product_analytics.begin(
+            if welcome {
+                crate::ProductFamily::Welcome
+            } else {
+                crate::ProductFamily::MessageProcessing
+            },
+            if welcome { "process" } else { "receive" },
+            crate::ProductUnit::Attempt,
+        );
+        let ingest = client.runtime.ingest_delivery(delivery).await;
+        if let Some(observation) = observation {
+            observation.finish(match &ingest {
+                Ok(effects) => match &effects.outcome {
+                    IngestOutcome::Processed => "success",
+                    IngestOutcome::Ignored {
+                        category:
+                            cgka_traits::InputRejectionCategory::Duplicate
+                            | cgka_traits::InputRejectionCategory::OwnEcho,
+                    } => "duplicate",
+                    IngestOutcome::Buffered { .. }
+                    | IngestOutcome::TransportDeferred { .. }
+                    | IngestOutcome::LocalState { .. } => "deferred",
+                    IngestOutcome::ResourceRefused { .. } => "capacity",
+                    IngestOutcome::Ignored { .. }
+                    | IngestOutcome::Stale { .. }
+                    | IngestOutcome::Rejected { .. } => "rejected",
+                },
+                Err(_) => "failure",
+            });
+        }
+        let effects = ingest?;
         let source_released = client
             .transport_receipts()?
             .was_released(&source_message_id_hex);

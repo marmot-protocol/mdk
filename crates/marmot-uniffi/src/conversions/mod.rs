@@ -10,6 +10,8 @@
 //! item is re-exported here so the rest of the crate keeps reaching them at
 //! `crate::conversions::*`.
 
+mod product_analytics;
+pub use product_analytics::*;
 mod account;
 mod agent_stream;
 mod audit;

@@ -109,6 +109,10 @@ done
 }
 device_library_sha="$(shasum -a 256 "$XCFRAMEWORK/${device_artifact#MarmotKit.xcframework/}" | awk '{print $1}')"
 
+analytics_features='["otlp-export"]'
+if [[ "${PRODUCT_ANALYTICS_EXPORT:-}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
+  analytics_features='["otlp-export", "product-analytics-export"]'
+fi
 cat > "$DIST_DIR/$manifest_name" <<EOF
 {
   "schema_version": 1,
@@ -121,7 +125,7 @@ cat > "$DIST_DIR/$manifest_name" <<EOF
   "cargo_lock_sha256": "$lock_sha",
   "rustc": "$rust_version",
   "cargo": "$cargo_version",
-  "features": ["otlp-export"],
+  "features": $analytics_features,
   "macos_targets": ["aarch64-apple-darwin"],
   "macos_deployment_target": "$deployment_target",
   "rust_release_profile": {

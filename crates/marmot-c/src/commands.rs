@@ -1175,7 +1175,9 @@ pub unsafe extern "C" fn marmot_relay_health(
     })
 }
 
-/// Replace the relay-telemetry export settings. Free the result with
+/// Deprecated consent control: use `marmot_set_usage_diagnostics_consent`.
+/// Enable requires a combined grant; disable revokes both exporters. The
+/// telemetry interval remains configurable. Free the result with
 /// `marmot_relay_telemetry_settings_free`.
 ///
 /// # Safety
@@ -2542,5 +2544,70 @@ pub unsafe extern "C" fn marmot_cancel_onboarding_repair(
                 out,
             )
         }
+    })
+}
+
+use crate::types::product_analytics::*;
+c_cmd! {
+ sync fn marmot_usage_diagnostics_settings() -> rec(MarmotUsageDiagnosticsSettings) = usage_diagnostics_settings;
+ sync fn marmot_set_usage_diagnostics_consent(enabled: flag) -> rec(MarmotUsageDiagnosticsSettings) = set_usage_diagnostics_consent;
+ sync fn marmot_usage_diagnostics_status() -> rec(MarmotUsageDiagnosticsStatus) = usage_diagnostics_status;
+
+ async fn marmot_flush_product_analytics() -> unit = flush_product_analytics;
+}
+/// Forward a validated product analytics input.
+/// # Safety
+/// Client and borrowed input must be valid; output, when present, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_product_analytics_runtime_config(
+    client: *const MarmotClient,
+    input: *const MarmotProductAnalyticsRuntimeConfig,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let input = try_arg!(unsafe { borrowed(input) });
+        let input = try_arg!(unsafe { input.to_ffi() });
+        deliver_unit(client.marmot.set_product_analytics_runtime_config(input))
+    })
+}
+/// Forward a validated product analytics input.
+/// # Safety
+/// Client and borrowed input must be valid; output, when present, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_record_product_event(
+    client: *const MarmotClient,
+    input: *const MarmotProductEvent,
+    out: *mut MarmotProductRecordResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::check_out(out) });
+        unsafe {
+            *out = MarmotProductRecordResult::IgnoredDisabled;
+        }
+        let client = try_arg!(unsafe { client_ref(client) });
+        let input = try_arg!(unsafe { borrowed(input) });
+        let input = try_arg!(unsafe { input.to_ffi() });
+        unsafe { deliver_enum(client.marmot.record_product_event(input), out) }
+    })
+}
+
+/// Signal host activity. Discriminants are validated before conversion.
+/// # Safety
+/// Client must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_product_analytics_activity(
+    client: *const MarmotClient,
+    activity: u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let activity = try_arg!(MarmotProductAnalyticsActivity::from_c(activity));
+        deliver_unit(
+            client.block_on(
+                client
+                    .marmot
+                    .set_product_analytics_activity(activity.into()),
+            ),
+        )
     })
 }

@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety"
 created: 2026-07-04
-updated: 2026-09-06
+updated: 2026-09-07
 tags: [marmot, overview, security, network, ssrf, transport]
 status: overview
 ---
@@ -47,7 +47,7 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 | Transport | Where the discipline lives |
 | --- | --- |
 | Blossom media (reqwest, download + upload) | `crates/marmot-app/src/media/blossom.rs`: `media_http_client_for_url` → `validate_blossom_fetch_url` + `resolve_media_host` (per-address `reject_non_public_ip`, `resolve_to_addrs` pin, connect/read/total timeouts, per-redirect re-validation). |
-| Relay telemetry OTLP (reqwest, push) | `crates/marmot-app/src/relay_telemetry_export/host_safety.rs`: structural URL gate → resolve once per attempt → validate every address → `resolve_to_addrs` pin; redirects and proxies disabled, TLS trust/SNI from the configured URL, 10s connect and 30s overall attempt limits. |
+| OTLP and product analytics (reqwest, push) | `crates/marmot-app/src/collector_host_safety.rs`: structural URL gate → resolve once per attempt → validate every address → `resolve_to_addrs` pin; redirects and proxies disabled, TLS trust/SNI from the configured URL, 10s connect and 30s overall attempt limits. |
 | Agent-stream broker watch (quinn) | `crates/marmot-app/src/runtime/agent_stream_watch.rs`: `resolve_broker_addr` validates + pins; `broker_trust_for_candidate` keys `InsecureLocal` on the literal candidate host + `insecure_local`. |
 | Agent-connector broker dial (quinn) | `crates/agent-connector/src/quic.rs`: `resolve_quic_candidate_addr` validates + pins; `broker_trust_for_candidate` gated on `AgentConnectorConfig::allow_insecure_local_broker` + literal loopback. |
 | CLI stream (quinn) | `crates/cli/src/commands/stream.rs`: `resolve_quic_candidate_addr` (`socket_addr_is_unsafe`), `broker_trust` / `ensure_insecure_local_endpoint`. |

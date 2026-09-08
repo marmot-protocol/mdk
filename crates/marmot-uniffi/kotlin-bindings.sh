@@ -49,6 +49,11 @@ if [[ "${OTLP_EXPORT:-0}" == "1" || "${OTLP_EXPORT:-}" == "true" ]]; then
   FEATURE_ARGS=(--features otlp-export)
   BINDGEN_FEATURES="cli,otlp-export"
 fi
+if [[ "${PRODUCT_ANALYTICS_EXPORT:-0}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}" == "true" ]]; then
+  FEATURE_ARGS+=(--features product-analytics-export)
+  BINDGEN_FEATURES="${BINDGEN_FEATURES},product-analytics-export"
+fi
+
 
 ANDROID_API="${ANDROID_API:-26}"
 ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a armeabi-v7a x86 x86_64}"

@@ -6511,6 +6511,13 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay);
+    #[cfg(feature = "product-analytics-export")]
+    let app = {
+        let mut app = app;
+        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.set_usage_diagnostics_consent(true).unwrap();
+        app
+    };
     let runtime = MarmotAppRuntime::new(app.clone());
 
     let local = runtime
@@ -6535,6 +6542,20 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
         lifecycle.pending_replacement.is_some() || lifecycle.current_key_package.is_some(),
         "the prepared KeyPackage remains durable without being reported as published"
     );
+    #[cfg(feature = "product-analytics-export")]
+    {
+        let events = app.product_analytics.test_payloads();
+        let phases: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["eventName"] == "mdk_account_summary"
+                    && event["props"]["operation"] == "local_ready"
+                    && event["props"]["unit"] == "attempt"
+            })
+            .collect();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["props"]["count_bucket"], "1");
+    }
     runtime.shutdown().await;
 }
 
@@ -12476,11 +12497,13 @@ fn telemetry_install_id_is_stable_uuid_per_app_root() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
+    assert!(app.telemetry_install_id().is_err());
+    app.set_usage_diagnostics_consent(true).unwrap();
     let first = app.telemetry_install_id().unwrap();
     let second = app.telemetry_install_id().unwrap();
-    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .telemetry_install_id()
-        .unwrap();
+    let other = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    other.restore_usage_diagnostics().unwrap();
+    let reopened = other.telemetry_install_id().unwrap();
 
     assert_eq!(first, second);
     assert_eq!(first, reopened);
@@ -12504,6 +12527,8 @@ fn relay_telemetry_settings_persist_in_shared_storage() {
         export_enabled: true,
         export_interval_seconds: 30,
     };
+    assert!(app.set_relay_telemetry_settings(updated.clone()).is_err());
+    app.set_usage_diagnostics_consent(true).unwrap();
     let stored = app.set_relay_telemetry_settings(updated).unwrap();
 
     assert_eq!(
@@ -12525,6 +12550,7 @@ fn relay_telemetry_settings_persist_in_shared_storage() {
     );
 
     let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    reopened.restore_usage_diagnostics().unwrap();
     assert_eq!(reopened.relay_telemetry_settings().unwrap(), stored);
 }
 
@@ -15948,6 +15974,18 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://mixed-publish.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    #[cfg(feature = "product-analytics-export")]
+    let app = {
+        let mut app = app;
+        app.product_analytics = crate::product_analytics::test_product_collector();
+        app
+    };
+    #[cfg(feature = "product-analytics-export")]
+    let _analytics_runtime = {
+        let runtime = app.runtime();
+        runtime.set_usage_diagnostics_consent(true).unwrap();
+        runtime
+    };
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("mixed publish", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -16062,6 +16100,32 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         "the delivered and failed sibling updates must remain available for runtime broadcast"
     );
 
+    #[cfg(feature = "product-analytics-export")]
+    {
+        // A partial-progress failure and every replay/fan-out of its summary
+        // must preserve the one successfully persisted publication edge.
+        for _ in 0..10 {
+            client
+                .finalize_published_app_message_source_retention(&effects)
+                .unwrap();
+        }
+        let rows = app.product_analytics.test_payloads();
+        let publication: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["eventName"] == "mdk_message_action_summary"
+                    && row["props"]["operation"] == "publication"
+            })
+            .collect();
+        assert_eq!(publication.len(), 1);
+        assert_eq!(publication[0]["props"]["count_bucket"], "1");
+        assert_eq!(publication[0]["props"]["unit"], "transition");
+        assert!(
+            !serde_json::to_string(&rows)
+                .unwrap()
+                .contains("sibling publish")
+        );
+    }
     let row = app
         .timeline_messages_with_query(
             "alice",
@@ -19258,6 +19322,68 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
     );
 }
 
+#[cfg(feature = "product-analytics-export")]
+#[tokio::test]
+async fn backend_maintenance_collects_without_host_tracking_and_frozen_stays_silent() {
+    for frozen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let config = MarmotAppConfig {
+            cursor_persistence: if frozen {
+                CursorPersistence::Frozen
+            } else {
+                CursorPersistence::Advance
+            },
+            ..Default::default()
+        };
+        let app = MarmotApp::with_relay_and_config(dir.path(), "wss://maintenance.example", config)
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let runtime = app.runtime();
+        runtime
+            .set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig {
+                events_endpoint: Some("https://analytics.example/api/v0/events".into()),
+                app_key: Some("A-SH-test".into()),
+                operator: "test".into(),
+                allow_loopback: false,
+                registry: vec![],
+                metadata: ProductAnalyticsMetadata {
+                    app_version: "1.0".into(),
+                    os_family: "linux".into(),
+                    os_major_version: "6".into(),
+                    device_class: "desktop".into(),
+                    host_surface: "native".into(),
+                    environment: "staging".into(),
+                    is_debug: true,
+                },
+            })
+            .unwrap();
+        let mut client = app.client("alice").await.unwrap();
+        client.run_due_maintenance().await.unwrap();
+        assert!(app.product_analytics.test_payloads().is_empty());
+        runtime.set_usage_diagnostics_consent(true).unwrap();
+        client.run_due_maintenance().await.unwrap();
+        let payloads = app.product_analytics.test_payloads();
+        if frozen {
+            assert!(payloads.is_empty());
+        } else {
+            assert!(
+                payloads
+                    .iter()
+                    .any(|event| event["eventName"] == "mdk_maintenance_summary"
+                        && event["props"]["operation"] == "sweep"
+                        && event["props"]["unit"] == "attempt")
+            );
+            assert!(
+                payloads
+                    .iter()
+                    .all(|event| event.to_string().find("alice").is_none())
+            );
+        }
+    }
+}
+
 /// Exercise a real processed SelfRemove behind a persisted failed publication.
 /// A due lifecycle timer must not turn the account worker into a 10 ms poller
 /// while the transport's frozen event is still in retry backoff.
@@ -19591,4 +19717,44 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
         ConvergenceScheduleState::Collecting { remaining_ms } if remaining_ms > 1_000 && remaining_ms <= pass_delay),
         "a due leave must not bypass the collecting pass's cutoff"
     );
+}
+
+#[tokio::test]
+async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() {
+    let root = tempfile::tempdir().unwrap();
+    AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("maintenance", &[]).await.unwrap();
+    client
+        .runtime
+        .schedule_manual_self_update(&group_id)
+        .unwrap();
+    let mut obligation = client
+        .runtime
+        .session()
+        .maintenance_obligations()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("scheduled maintenance obligation");
+    obligation.phase = cgka_traits::MaintenancePhase::Failed;
+    obligation.last_failure_code = Some("local_member_removed".into());
+    client
+        .runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    for _ in 0..3 {
+        let summary = client.run_due_maintenance().await.unwrap();
+        assert_eq!(summary.failures, 1);
+        assert_eq!(client.maintenance_failed_backlog, 1);
+        assert_eq!(
+            client.runtime.quarantined_group_count(),
+            client.quarantined_groups().len()
+        );
+    }
 }

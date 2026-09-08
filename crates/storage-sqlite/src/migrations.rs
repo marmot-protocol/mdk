@@ -466,16 +466,22 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<()> {
-    run(connection, MIGRATIONS)
+pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
+    run_with_summary(connection, MIGRATIONS)
 }
 
+#[cfg(test)]
 pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<()> {
+    run_with_summary(connection, migrations).map(|_| ())
+}
+
+fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
     ensure_migration_table(connection)?;
     ensure_ordered(migrations)?;
     reconcile_legacy_migration_names(connection, migrations)?;
     reject_unknown_future_migrations(connection, migrations)?;
 
+    let mut applied = 0;
     for migration in migrations {
         match applied_name(connection, migration.version)? {
             Some(name) if name == migration.name => continue,
@@ -485,11 +491,14 @@ pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> Stor
                     migration.version, migration.name
                 )));
             }
-            None => apply_migration(connection, migration)?,
+            None => {
+                apply_migration(connection, migration)?;
+                applied += 1;
+            }
         }
     }
 
-    Ok(())
+    Ok(applied)
 }
 
 fn ensure_migration_table(connection: &Connection) -> StorageResult<()> {

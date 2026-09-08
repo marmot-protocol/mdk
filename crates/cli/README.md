@@ -867,3 +867,11 @@ source install path for engineers and automation.
 `cargo install wn-cli` from crates.io is a later option. The workspace currently has
 `publish = false`, and the CLI depends on local workspace crates. Publishing there needs a separate crate
 publication plan or a split packaging crate.
+
+### Usage and diagnostics
+
+Use `wn --json usage-diagnostics show`, `wn usage-diagnostics enable`, or
+`wn usage-diagnostics disable` to manage the local combined permission. Active
+`wnd` owns the update. Audit consent remains separate. See the
+[host and operator contract](../../docs/marmot-architecture/usage-diagnostics.md)
+for disclosure, endpoint/key configuration, and reporting limitations.
