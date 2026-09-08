@@ -25,7 +25,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   longer waits for the retired operation. Existing pre-generation checkpoints
   keep working after upgrade, cancelled ready-state cleanup no longer deletes
   retained setup journals, and a dropped cancellation waiter still observes a
-  finished worker reap.
+  finished worker reap. Cancellation evidence is now latest-only, including
+  uncertain publications. Explicit recovery retains opaque historical bytes
+  and starts a fresh approval epoch; Swift/Kotlin/C hosts use the epoch-aware
+  approval APIs for recovered attempts.
 
 ## [0.9.19] - 2026-09-07
 

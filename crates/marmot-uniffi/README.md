@@ -147,6 +147,48 @@ Imported identities can use the durable preflight API instead of `login`:
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
 
+#### Explicit recovery and checkpoint compatibility
+
+When `begin_*_onboarding` or cancellation returns `OnboardingActionUnavailable`,
+query `onboarding_recovery_required(account_ref)`. A true result means an
+unreadable/unsupported checkpoint, an exhausted revision counter, or an
+interrupted recovery needs attention. Invalidate the old UI attempt and obtain
+the user's acknowledgment of latest-only evidence retention, then call
+`recover_onboarding(account_ref, true)`. It supports local and external-signer
+accounts and does not wait for the signer or publish any repair.
+
+Recovery durably records the exact opaque active/cancelled bytes in the private
+`onboarding-recovery.json` before replacing their gates. It preserves identity,
+credentials, setup journals/context and unrelated account data, signs out,
+reaps the worker and establishes a random 256-bit approval epoch. Unknown
+counters are never interpreted as zero within their old epoch. A later explicit
+begin starts with fresh checks and no inherited proposal, approval, or signed
+repair. The new epoch is returned by recovery and included in future snapshots;
+use the epoch-aware approval and device-acknowledgment methods described below.
+
+An interrupted recovery remains gated and resumes through retry or reconcile;
+dropping its caller cannot detach a removed worker. The latest recovery journal
+is readable through `AccountHome::account_onboarding_recovery`; an unreadable
+previous recovery journal is retained as opaque evidence there. A subsequent
+explicit recovery may replace older evidence. Keep any evidence needing longer
+retention outside this latest-only workflow before acknowledging recovery.
+
+Ordinary checkpoints remain version 3, with supported version 1/2 upgrades.
+Version 3 is a semantic barrier: old version 2 code rejects approved cancellation
+and cannot safely restart it. Recovery checkpoints use version 4 because a
+version 3 reader cannot validate epoch-scoped approvals. Completed recovery
+leaves a version 4 cancellation tombstone even before a new begin, so older
+readers fail closed. Downgrading during recovery is unsupported; finish recovery
+with an epoch-aware build. Do not relabel versions or delete checkpoints to
+force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
+unsupported evidence with this API.
+
+Persisted generation/pending state supplies durable admission checks after
+restart; the retirement watch only supplies prompt wake-up for this runtime.
+They are not interchangeable, so this change does not introduce watch-only
+caching or prune retirement senders. Test holds remain test-only and retain
+explicit interleaving coverage.
+
 The `SingleDevice` step always pauses before initial KeyPackage publication.
 Display a general notice that White Noise does not yet support synchronized
 multi-device use and recommends one device. The snapshot's `single_device_notice`
@@ -162,8 +204,12 @@ attempt first, then await `cancel_onboarding(account_ref)` before any new
 an approved but unconfirmed repair and a ready checkpoint that the host has not
 yet opened with Open Chats. Success signs the identity out, reaps its worker,
 delivers a terminal non-ready snapshot, and closes that subscription. It retains
-local data, credentials, journals, and any already-signed or already-sent
-publication evidence. It does not delete, replace, or prove non-publication of
+local data, credentials, setup journals, and the latest cancellation checkpoint,
+including its signed publication evidence. A subsequent cancellation replaces
+`onboarding-cancelled.json` even if the earlier publication is still uncertain.
+This is a latest-only retention limit, not proof of remote reconciliation.
+Previously written content-addressed archives are left untouched; new
+cancellations do not create them. It does not delete, replace, or prove non-publication of
 events that may already be on relays. A later explicit interactive begin starts
 a new attempt with the supplied options and no old proposal, approval, or
 signed repair; observing a previously published record is not replay permission.
@@ -174,6 +220,11 @@ restoration are not explicit sign-in. If the call returns
 retry the same cancel; dropping the waiter does not abort cleanup. Do not treat
 `ready` as an Open Chats command — the host still owns that transition.
 For Continue anyway, call `acknowledge_onboarding_single_device(account_ref, snapshot.revision)`.
+If `snapshot.recovery_epoch` is present, use
+`acknowledge_onboarding_single_device_in_epoch(account_ref, snapshot.revision, epoch)`
+and `approve_onboarding_repair_in_epoch(account_ref, snapshot.revision, epoch)`
+for approvals. Pass the epoch from the same displayed snapshot. The original
+revision-only methods reject recovered attempts, even when the number matches.
 MDK rejects a stale revision, persists the acknowledgment, and resumes setup.
 The acknowledgment survives KeyPackage publication failure, task interruption,
 and restart. Rechecking an earlier prerequisite, changing discovery sources,

@@ -984,51 +984,67 @@ impl AccountSecretStore for MemorySecretStore {
 }
 
 #[test]
-fn onboarding_repair_archive_is_idempotent_private_and_conflict_closed() {
-    use sha2::{Digest, Sha256};
-
+fn onboarding_latest_evidence_and_recovery_journal_are_private() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let account = home.create_nostr_account().unwrap();
     home.set_account_signed_out(&account.label, true).unwrap();
-    let bytes = br#"{"approved":true,"signed":"exact"}"#;
-    let digest = home
-        .retain_account_onboarding_repair_archive(&account.label, bytes)
-        .unwrap();
-    assert_eq!(digest, hex::encode(Sha256::digest(bytes)));
+    let first = br#"{"approved":true,"signed":"uncertain"}"#;
+    home.set_account_onboarding(&account.label, first).unwrap();
+    home.archive_account_onboarding(&account.label).unwrap();
     assert_eq!(
-        home.retain_account_onboarding_repair_archive(&account.label, bytes)
-            .unwrap(),
-        digest
-    );
-    assert_eq!(
-        home.account_onboarding_repair_archive(&account.label, &digest)
+        home.cancelled_account_onboarding(&account.label)
             .unwrap()
-            .as_deref(),
-        Some(bytes.as_slice())
+            .unwrap(),
+        first
     );
-    let directory = home
-        .account_dir(&account.label)
-        .join("onboarding-repair-archive");
-    let archive = directory.join(format!("{digest}.json"));
+    let latest = b"latest cancellation";
+    home.set_account_onboarding(&account.label, latest).unwrap();
+    home.archive_account_onboarding(&account.label).unwrap();
+    home.archive_account_onboarding(&account.label).unwrap();
+    assert_eq!(
+        home.cancelled_account_onboarding(&account.label)
+            .unwrap()
+            .unwrap(),
+        latest
+    );
+    let opaque = b"opaque recovery journal";
+    assert!(
+        home.finish_recovered_account_onboarding(&account.label, b"tombstone")
+            .is_err()
+    );
+    home.set_account_onboarding_recovery(&account.label, opaque)
+        .unwrap();
+    home.finish_recovered_account_onboarding(&account.label, b"tombstone")
+        .unwrap();
+    assert_eq!(
+        home.account_onboarding_recovery(&account.label)
+            .unwrap()
+            .unwrap(),
+        opaque
+    );
+    assert_eq!(
+        home.cancelled_account_onboarding(&account.label)
+            .unwrap()
+            .unwrap(),
+        b"tombstone"
+    );
+    let directory = home.account_dir(&account.label);
     #[cfg(unix)]
     {
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(
-            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        for name in ["onboarding-cancelled.json", "onboarding-recovery.json"] {
+            assert_eq!(
+                std::fs::metadata(directory.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
-    std::fs::write(&archive, b"corrupted-different-bytes").unwrap();
-    assert!(matches!(
-        home.retain_account_onboarding_repair_archive(&account.label, bytes),
-        Err(AccountHomeError::ImmutableArtifactConflict)
-    ));
-    assert!(matches!(
-        home.account_onboarding_repair_archive(&account.label, "../escape"),
-        Err(AccountHomeError::InvalidAccountLabel(_))
-    ));
 }

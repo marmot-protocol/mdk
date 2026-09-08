@@ -8,6 +8,7 @@ use std::future::Future;
 use transport_nostr_peeler::NostrTransportEvent;
 
 mod cancellation;
+mod recovery;
 mod single_device;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,8 +18,16 @@ pub(super) enum OnboardingCancelOutcome {
     Failed,
 }
 
+/// Numeric revisions are ordered only within an epoch. Recovery creates a
+/// random epoch, so unknown/exhausted historical counters never get reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OnboardingAttempt {
+    revision: u64,
+    epoch: Option<[u8; 32]>,
+}
+
 pub(super) struct OnboardingCancellationInflight {
-    pub(super) attempt: u64,
+    pub(super) attempt: OnboardingAttempt,
     pub(super) outcome: watch::Sender<Option<OnboardingCancelOutcome>>,
 }
 
@@ -67,7 +76,10 @@ enum OnboardingPersist {
     CreateAttempt,
 }
 
+// v3 forbids older v2 cancellation/restart semantics. Recovered attempts use
+// v4 because a v3 reader cannot enforce epoch-scoped approvals.
 const ONBOARDING_VERSION: u32 = 3;
+const RECOVERED_ONBOARDING_VERSION: u32 = 4;
 const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
@@ -189,6 +201,10 @@ pub struct OnboardingRepairProposal {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSnapshot {
     pub account_id_hex: String,
+    /// Present after explicit recovery. Approvals and device acknowledgments
+    /// must use the epoch-aware APIs with this value and the displayed revision.
+    #[serde(default)]
+    pub recovery_epoch: Option<String>,
     pub revision: u64,
     pub ready: bool,
     pub steps: Vec<OnboardingStepState>,
@@ -294,6 +310,7 @@ impl OnboardingCheckpoint {
             version: ONBOARDING_VERSION,
             snapshot: OnboardingSnapshot {
                 account_id_hex: account.account_id_hex.clone(),
+                recovery_epoch: None,
                 revision: 0,
                 ready: false,
                 steps,
@@ -324,9 +341,18 @@ impl OnboardingCheckpoint {
     fn high_water(&self) -> u64 {
         self.snapshot.revision.max(self.attempt_start_revision)
     }
-    fn holds_uncertain_publication(&self) -> bool {
-        self.approved || self.signed_repair.is_some()
+    fn attempt(&self) -> OnboardingAttempt {
+        use sha2::{Digest, Sha256};
+        OnboardingAttempt {
+            revision: self.attempt_start_revision,
+            epoch: self
+                .snapshot
+                .recovery_epoch
+                .as_ref()
+                .map(|epoch| Sha256::digest(epoch.as_bytes()).into()),
+        }
     }
+
     fn set(
         &mut self,
         step: OnboardingStep,
@@ -446,7 +472,17 @@ fn decode_onboarding_checkpoint(
     let mut checkpoint: OnboardingCheckpoint =
         serde_json::from_slice(bytes).map_err(|_| onboarding_error())?;
     migrate_onboarding_checkpoint(&mut checkpoint);
-    if checkpoint.version != ONBOARDING_VERSION
+    if !matches!(
+        (
+            checkpoint.version,
+            checkpoint.snapshot.recovery_epoch.as_deref()
+        ),
+        (ONBOARDING_VERSION, None) | (RECOVERED_ONBOARDING_VERSION, Some(_))
+    ) || checkpoint
+        .snapshot
+        .recovery_epoch
+        .as_ref()
+        .is_some_and(|epoch| epoch.len() != 64 || !epoch.bytes().all(|b| b.is_ascii_hexdigit()))
         || checkpoint.snapshot.account_id_hex != account_id_hex
         || checkpoint.snapshot.steps.len() != STEP_COUNT
         || checkpoint.records.len() != STEP_COUNT
@@ -475,20 +511,23 @@ impl AccountManager {
         locks.insert(id.to_owned(), Arc::downgrade(&lock));
         lock
     }
-    fn peek_onboarding_attempt(&self, account_ref: &str) -> Result<(String, u64), AppError> {
+    fn peek_onboarding_attempt(
+        &self,
+        account_ref: &str,
+    ) -> Result<(String, OnboardingAttempt), AppError> {
         let account = self.resolve(account_ref)?;
         let attempt = self
             .read_onboarding_checkpoint(&account.label)?
             .ok_or_else(onboarding_error)?
-            .attempt_start_revision;
+            .attempt();
         Ok((account.account_id_hex, attempt))
     }
     fn require_captured_attempt(
         &self,
         checkpoint: &OnboardingCheckpoint,
-        attempt: u64,
+        attempt: OnboardingAttempt,
     ) -> Result<(), AppError> {
-        if checkpoint.attempt_start_revision == attempt {
+        if checkpoint.attempt() == attempt {
             Ok(())
         } else {
             Err(onboarding_error())
@@ -514,6 +553,9 @@ impl AccountManager {
         &self,
         account: &AccountSummary,
     ) -> Result<Option<OnboardingCheckpoint>, AppError> {
+        if self.onboarding_recovery_pending(&account.label)? {
+            return Err(onboarding_error());
+        }
         let Some(bytes) = self.app.account_home().account_onboarding(&account.label)? else {
             return Ok(None);
         };
@@ -569,27 +611,28 @@ impl AccountManager {
         locks.insert(id.to_owned(), Arc::downgrade(&lock));
         lock
     }
-    fn onboarding_attempt_live(&self, account_id: &str, attempt: u64) -> Result<bool, AppError> {
+    fn onboarding_attempt_live(
+        &self,
+        account_id: &str,
+        attempt: OnboardingAttempt,
+    ) -> Result<bool, AppError> {
         Ok(self
             .read_onboarding_checkpoint(account_id)?
-            .is_some_and(|c| {
-                c.attempt_start_revision == attempt && !c.snapshot.cancellation_pending
-            }))
+            .is_some_and(|c| c.attempt() == attempt && !c.snapshot.cancellation_pending))
     }
     fn require_live_onboarding_attempt(
         &self,
         checkpoint: &OnboardingCheckpoint,
     ) -> Result<(), AppError> {
-        if self.onboarding_attempt_live(
-            &checkpoint.snapshot.account_id_hex,
-            checkpoint.attempt_start_revision,
-        )? {
+        if self
+            .onboarding_attempt_live(&checkpoint.snapshot.account_id_hex, checkpoint.attempt())?
+        {
             Ok(())
         } else {
             Err(onboarding_error())
         }
     }
-    fn publish_onboarding_retirement(&self, account_id: &str, attempt: u64) {
+    fn publish_onboarding_retirement(&self, account_id: &str, attempt: OnboardingAttempt) {
         let mut retirements = self
             .onboarding_retirements
             .lock()
@@ -597,11 +640,16 @@ impl AccountManager {
         let sender = retirements
             .entry(account_id.to_owned())
             .or_insert_with(|| watch::channel(None).0);
-        if sender.borrow().is_none_or(|retired| retired < attempt) {
+        if sender.borrow().is_none_or(|retired| {
+            retired.epoch != attempt.epoch || retired.revision < attempt.revision
+        }) {
             sender.send_replace(Some(attempt));
         }
     }
-    fn subscribe_onboarding_retirement(&self, account_id: &str) -> watch::Receiver<Option<u64>> {
+    fn subscribe_onboarding_retirement(
+        &self,
+        account_id: &str,
+    ) -> watch::Receiver<Option<OnboardingAttempt>> {
         let mut retirements = self
             .onboarding_retirements
             .lock()
@@ -620,6 +668,14 @@ impl AccountManager {
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
         self.require_live_onboarding_attempt(checkpoint)?;
         f()
+    }
+    /// Fence only: liveness is guaranteed while this check holds the lock,
+    /// not after returning or across a later await. Mutations stay in admission.
+    fn require_live_under_state_lock(
+        &self,
+        checkpoint: &OnboardingCheckpoint,
+    ) -> Result<(), AppError> {
+        self.admit_live_onboarding_mutation(checkpoint, || Ok(()))
     }
     fn finish_live_onboarding_setup_cleanup(
         &self,
@@ -643,7 +699,7 @@ impl AccountManager {
     async fn await_while_onboarding_live<T>(
         &self,
         account_id: &str,
-        attempt: u64,
+        attempt: OnboardingAttempt,
         fut: impl Future<Output = T>,
     ) -> Result<T, AppError> {
         if !self.onboarding_attempt_live(account_id, attempt)? {
@@ -652,8 +708,9 @@ impl AccountManager {
         let mut retired = self.subscribe_onboarding_retirement(account_id);
         tokio::pin!(fut);
         loop {
-            if retired.borrow().is_some_and(|retired| retired >= attempt)
-                || !self.onboarding_attempt_live(account_id, attempt)?
+            if retired.borrow().is_some_and(|retired| {
+                retired.epoch != attempt.epoch || retired.revision >= attempt.revision
+            }) || !self.onboarding_attempt_live(account_id, attempt)?
             {
                 return Err(onboarding_error());
             }
@@ -810,30 +867,24 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let existing = self.read_onboarding_checkpoint(&checkpoint.snapshot.account_id_hex)?;
-        let cancelled =
-            self.read_cancelled_onboarding_checkpoint(&checkpoint.snapshot.account_id_hex)?;
         match mode {
             OnboardingPersist::Update => match existing {
-                Some(existing)
-                    if existing.attempt_start_revision != checkpoint.attempt_start_revision =>
-                {
+                Some(existing) if existing.attempt() != checkpoint.attempt() => {
                     return Err(onboarding_error());
                 }
                 Some(existing) if existing.snapshot.cancellation_pending => {
-                    if !checkpoint.snapshot.cancellation_pending || checkpoint.snapshot.ready {
-                        return Err(onboarding_error());
-                    }
-                    *checkpoint = existing;
-                    return Ok(());
+                    return Err(onboarding_error());
                 }
                 Some(_) => {}
                 None => return Err(onboarding_error()),
             },
             OnboardingPersist::CreateAttempt => {
+                let cancelled =
+                    self.read_cancelled_onboarding_checkpoint(&checkpoint.snapshot.account_id_hex)?;
                 if existing.is_some()
-                    || cancelled.as_ref().is_some_and(|archived| {
-                        archived.attempt_start_revision == checkpoint.attempt_start_revision
-                    })
+                    || cancelled
+                        .as_ref()
+                        .is_some_and(|archived| archived.attempt() == checkpoint.attempt())
                 {
                     return Err(onboarding_error());
                 }
@@ -944,6 +995,9 @@ impl AccountManager {
         Ok(())
     }
     pub(super) fn onboarding_worker_allowed(&self, account_ref: &str) -> Result<bool, AppError> {
+        if self.onboarding_recovery_pending(account_ref)? {
+            return Ok(false);
+        }
         let checkpoint = self.read_onboarding_checkpoint(account_ref)?;
         if checkpoint
             .as_ref()
@@ -1035,6 +1089,11 @@ impl AccountManager {
         {
             return Err(onboarding_error());
         }
+        // Recovery always leaves a v4 tombstone before opening admission. A
+        // missing tombstone cannot reset numbers within the completed epoch.
+        if cancelled.is_none() && self.read_onboarding_recovery(&account.label)?.is_some() {
+            return Err(onboarding_error());
+        }
         let high_water = cancelled
             .as_ref()
             .map(OnboardingCheckpoint::high_water)
@@ -1042,6 +1101,12 @@ impl AccountManager {
         let attempt = high_water.checked_add(1).ok_or_else(onboarding_error)?;
         let mut checkpoint =
             OnboardingCheckpoint::new_attempt(account, options, attempt, high_water);
+        checkpoint.snapshot.recovery_epoch = cancelled
+            .as_ref()
+            .and_then(|c| c.snapshot.recovery_epoch.clone());
+        if checkpoint.snapshot.recovery_epoch.is_some() {
+            checkpoint.version = RECOVERED_ONBOARDING_VERSION;
+        }
         self.create_onboarding_attempt(&mut checkpoint)?;
         Ok(checkpoint.snapshot)
     }
@@ -1208,7 +1273,7 @@ impl AccountManager {
             self.require_live_onboarding_attempt(c)?;
             if step == OnboardingStep::SingleDevice {
                 let account_id = c.snapshot.account_id_hex.clone();
-                let attempt = c.attempt_start_revision;
+                let attempt = c.attempt();
                 self.await_while_onboarding_live(
                     &account_id,
                     attempt,
@@ -1287,7 +1352,7 @@ impl AccountManager {
                 }
             } else {
                 let account_id = c.snapshot.account_id_hex.clone();
-                let attempt = c.attempt_start_revision;
+                let attempt = c.attempt();
                 let (status, findings, event) = self
                     .await_while_onboarding_live(
                         &account_id,
@@ -1774,7 +1839,11 @@ impl AccountManager {
         }
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
-            revision: c.snapshot.revision + 1,
+            revision: c
+                .snapshot
+                .revision
+                .checked_add(1)
+                .ok_or_else(onboarding_error)?,
             previous_event_id: c.records[step.index()].as_ref().map(|e| e.id.clone()),
             read_relays,
             write_relays,
@@ -1834,7 +1903,11 @@ impl AccountManager {
         }
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
-            revision: c.snapshot.revision + 1,
+            revision: c
+                .snapshot
+                .revision
+                .checked_add(1)
+                .ok_or_else(onboarding_error)?,
             previous_event_id: c.records[step.index()].as_ref().map(|e| e.id.clone()),
             read_relays: Vec::new(),
             write_relays: Vec::new(),
@@ -1873,6 +1946,28 @@ impl AccountManager {
         account_ref: &str,
         revision: u64,
     ) -> Result<OnboardingSnapshot, AppError> {
+        self.approve_onboarding_repair_scoped(account_ref, revision, None)
+            .await
+    }
+
+    /// Approve a displayed repair in a recovered attempt. Stale epochs fail
+    /// even when their numeric revision happens to match the fresh proposal.
+    pub async fn approve_onboarding_repair_in_epoch(
+        &self,
+        account_ref: &str,
+        revision: u64,
+        recovery_epoch: &str,
+    ) -> Result<OnboardingSnapshot, AppError> {
+        self.approve_onboarding_repair_scoped(account_ref, revision, Some(recovery_epoch))
+            .await
+    }
+
+    async fn approve_onboarding_repair_scoped(
+        &self,
+        account_ref: &str,
+        revision: u64,
+        recovery_epoch: Option<&str>,
+    ) -> Result<OnboardingSnapshot, AppError> {
         let (account_id, attempt) = self.peek_onboarding_attempt(account_ref)?;
         let transaction = self.onboarding_transaction(&account_id);
         let _transaction = transaction.lock().await;
@@ -1880,6 +1975,9 @@ impl AccountManager {
             .onboarding_checkpoint(account_ref)?
             .ok_or_else(onboarding_error)?;
         self.require_captured_attempt(&c, attempt)?;
+        if c.snapshot.recovery_epoch.as_deref() != recovery_epoch {
+            return Err(onboarding_error());
+        }
         let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
         if c.approved || c.snapshot.revision != revision || proposal.revision != revision {
             return Err(onboarding_error());
@@ -1971,7 +2069,7 @@ impl AccountManager {
             let signed = match self
                 .await_while_onboarding_live(
                     &c.snapshot.account_id_hex,
-                    c.attempt_start_revision,
+                    c.attempt(),
                     signer.sign_event(unsigned),
                 )
                 .await
@@ -2005,7 +2103,7 @@ impl AccountManager {
         let mut endpoints = self
             .await_while_onboarding_live(
                 &c.snapshot.account_id_hex,
-                c.attempt_start_revision,
+                c.attempt(),
                 self.onboarding_sources(c, proposal.step),
             )
             .await?;
@@ -2024,13 +2122,13 @@ impl AccountManager {
         #[cfg(test)]
         self.await_onboarding_test_hold(&self.onboarding_test_holds.publication)
             .await;
-        if self.admit_live_onboarding_mutation(c, || Ok(())).is_err() {
+        if self.require_live_under_state_lock(c).is_err() {
             return Ok(false);
         }
         let outcome = self
             .await_while_onboarding_live(
                 &c.snapshot.account_id_hex,
-                c.attempt_start_revision,
+                c.attempt(),
                 self.app
                     .relay_client_for_account_id(&account.account_id_hex, signer)
                     .publish_event(&endpoints, &event, 1),

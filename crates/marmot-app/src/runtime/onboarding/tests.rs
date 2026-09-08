@@ -994,21 +994,13 @@ async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserve
 }
 
 fn repair_archive_bytes(root: &std::path::Path, id: &str) -> Vec<Vec<u8>> {
-    let directory = root
-        .join("accounts")
-        .join(id)
-        .join("onboarding-repair-archive");
-    let mut files = std::fs::read_dir(directory)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-                .filter_map(|entry| std::fs::read(entry.path()).ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    files.sort();
-    files
+    std::fs::read(
+        root.join("accounts")
+            .join(id)
+            .join("onboarding-cancelled.json"),
+    )
+    .into_iter()
+    .collect()
 }
 
 #[tokio::test]
@@ -1086,7 +1078,7 @@ async fn ready_onboarding_can_be_cancelled_before_open_chats() {
 }
 
 #[tokio::test]
-async fn successive_approved_cancellations_keep_distinct_archives() {
+async fn successive_cancellations_replace_latest_even_if_publication_is_uncertain() {
     let (dir, runtime, network, keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let first = runtime
@@ -1123,7 +1115,9 @@ async fn successive_approved_cancellations_keep_distinct_archives() {
         .await
         .unwrap();
     runtime.accounts().cancel_onboarding(&id).await.unwrap();
-    assert_eq!(repair_archive_bytes(dir.path(), &id).len(), 2);
+    let latest = repair_archive_bytes(dir.path(), &id);
+    assert_eq!(latest.len(), 1);
+    assert_ne!(latest, after_first);
     runtime
         .accounts()
         .begin_onboarding(
@@ -1133,7 +1127,9 @@ async fn successive_approved_cancellations_keep_distinct_archives() {
         .await
         .unwrap();
     runtime.accounts().cancel_onboarding(&id).await.unwrap();
-    assert_eq!(repair_archive_bytes(dir.path(), &id).len(), 2);
+    let latest = repair_archive_bytes(dir.path(), &id);
+    assert_eq!(latest.len(), 1);
+    assert_ne!(latest, after_first);
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -2310,4 +2306,782 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     );
     assert!(manager.resolve(&id).unwrap().signed_out);
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_checkpoint_updates_fail_without_replacing_input_or_stored_bytes() {
+    let (_dir, runtime, _, _, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.snapshot.cancellation_pending = true;
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    let bytes = manager
+        .app
+        .account_home()
+        .account_onboarding(&id)
+        .unwrap()
+        .unwrap();
+    for pending in [true, false] {
+        let mut stale = checkpoint.clone();
+        stale.snapshot.cancellation_pending = pending;
+        stale.snapshot.revision += 100;
+        let input = serde_json::to_vec(&stale).unwrap();
+        assert!(manager.save_onboarding(&mut stale).is_err());
+        assert_eq!(serde_json::to_vec(&stale).unwrap(), input);
+        assert_eq!(
+            manager
+                .app
+                .account_home()
+                .account_onboarding(&id)
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+    }
+    manager.cancel_onboarding(&id).await.unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_retains_release_before_the_wait_is_registered() {
+    let (_dir, runtime, _, _, _) = fixture().await;
+    let hold = runtime.accounts().install_onboarding_activation_hold();
+    hold.release.notify_one();
+    timeout(
+        Duration::from_secs(2),
+        runtime
+            .accounts()
+            .await_onboarding_test_hold(&runtime.accounts().onboarding_test_holds.activation),
+    )
+    .await
+    .unwrap();
+    hold.wait_until_entered().await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+struct WorkerDropProbe(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for WorkerDropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn controlled_reap_worker() -> (
+    ManagedAccountWorker,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release, exit) = tokio::sync::oneshot::channel();
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = WorkerDropProbe(dropped.clone());
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        let _ = shutdown_rx.await;
+        let _ = exit.await;
+    });
+    (
+        ManagedAccountWorker {
+            handle,
+            shutdown,
+            commands,
+        },
+        release,
+        dropped,
+    )
+}
+
+#[tokio::test]
+async fn duplicate_reapers_own_pending_and_completed_workers_until_destruction() {
+    for previous_complete in [false, true] {
+        let (_dir, runtime, _, _, id) = fixture().await;
+        let manager = runtime.accounts();
+        let (first, first_exit, first_dropped) = controlled_reap_worker();
+        let mut first_exit = Some(first_exit);
+        manager.start_tracked_worker_reap(&id, first, Duration::from_secs(2));
+        let mut old_completion =
+            manager.onboarding_cancellations.lock().unwrap().reaping[&id].subscribe();
+        if previous_complete {
+            first_exit.take().unwrap().send(()).unwrap();
+            timeout(
+                Duration::from_secs(2),
+                old_completion.wait_for(|done| *done),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        // Exercise a timeout retaining the previous entry before duplication.
+        if !previous_complete {
+            assert!(
+                manager
+                    .await_tracked_worker_reap(&id, Duration::ZERO)
+                    .await
+                    .is_err()
+            );
+        }
+        let (second, second_exit, second_dropped) = controlled_reap_worker();
+        manager.start_tracked_worker_reap(&id, second, Duration::from_secs(2));
+        assert!(
+            manager
+                .await_tracked_worker_reap(&id, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert!(!second_dropped.load(Ordering::SeqCst));
+        second_exit.send(()).unwrap();
+        if !previous_complete {
+            // Even destruction of the new worker cannot stand in for the old.
+            assert!(
+                manager
+                    .await_tracked_worker_reap(&id, Duration::ZERO)
+                    .await
+                    .is_err()
+            );
+            first_exit.take().unwrap().send(()).unwrap();
+        }
+        drop(old_completion);
+        timeout(Duration::from_secs(3), manager.shutdown())
+            .await
+            .unwrap();
+        assert!(first_dropped.load(Ordering::SeqCst));
+        assert!(second_dropped.load(Ordering::SeqCst));
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_joins_late_reaper_after_owned_cancellation_times_out() {
+    let (_dir, runtime, _, _, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager.reconcile().await.unwrap();
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let workers = manager.worker_transactions.lock().await;
+    let cancel = manager.cancel_onboarding(&id);
+    tokio::pin!(cancel);
+    assert!(futures::poll!(&mut cancel).is_pending());
+    let shutdown = manager.shutdown();
+    tokio::pin!(shutdown);
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    drop(workers);
+    hold.wait_until_entered().await;
+    tokio::time::advance(ONBOARDING_CANCELLATION_WAIT + Duration::from_secs(1)).await;
+    assert!(matches!(
+        cancel.await,
+        Err(AppError::AccountWorkerResponseTimedOut)
+    ));
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    hold.release.notify_one();
+    timeout(Duration::from_secs(2), shutdown).await.unwrap();
+    assert_eq!(
+        manager.onboarding_worker_reap_watch_state(&id),
+        Some((true, 0))
+    );
+    assert!(
+        manager
+            .onboarding_cancellations
+            .lock()
+            .unwrap()
+            .handles
+            .is_empty()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_epochs() {
+    for fault in ["malformed", "future", "exhausted"] {
+        let (dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let home = manager.app.account_home();
+        missing_relays(&runtime, &id).await;
+        let old_proposal = manager
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .unwrap();
+        network.zero_acks.store(true, Ordering::SeqCst);
+        manager
+            .approve_onboarding_repair(&id, old_proposal.revision)
+            .await
+            .unwrap();
+        let signed_active = home.account_onboarding(&id).unwrap().unwrap();
+        let mut old = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        old.snapshot.cancellation_pending = true;
+        old.approved = true;
+        let bytes = match fault {
+            "malformed" => b"opaque: not JSON".to_vec(),
+            "future" => {
+                old.version = 999;
+                serde_json::to_vec(&old).unwrap()
+            }
+            _ => {
+                old.snapshot.revision = u64::MAX;
+                serde_json::to_vec(&old).unwrap()
+            }
+        };
+        std::fs::write(
+            dir.path()
+                .join("accounts")
+                .join(&id)
+                .join("onboarding-cancelled.json"),
+            &bytes,
+        )
+        .unwrap();
+        let setup = home.account_setup_state(&id).unwrap();
+        let context = home.account_setup_context(&id).unwrap();
+        assert!(manager.onboarding_recovery_required(&id).unwrap());
+        assert!(manager.recover_onboarding(&id, false).await.is_err());
+        assert!(home.account_onboarding_recovery(&id).unwrap().is_none());
+        let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+        assert_eq!(manager.recover_onboarding(&id, true).await.unwrap(), epoch);
+        assert_eq!(home.account_setup_state(&id).unwrap(), setup);
+        assert_eq!(home.account_setup_context(&id).unwrap(), context);
+        assert!(manager.resolve(&id).unwrap().signed_out);
+        let retained: super::recovery::OnboardingRecovery =
+            serde_json::from_slice(&home.account_onboarding_recovery(&id).unwrap().unwrap())
+                .unwrap();
+        // Inspect the opaque bytes without teaching recovery their schema.
+        let journal: serde_json::Value =
+            serde_json::from_slice(&home.account_onboarding_recovery(&id).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(journal["cancelled"], serde_json::json!(bytes));
+        assert_eq!(journal["active"], serde_json::json!(signed_active));
+        assert_eq!(retained.epoch, epoch);
+        let tombstone = home.cancelled_account_onboarding(&id).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&tombstone).unwrap()["version"],
+            4
+        );
+        let fresh = manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
+        assert!(fresh.proposal.is_none() && !fresh.ready);
+        // A stale captured checkpoint cannot write even if its number matches.
+        old.version = ONBOARDING_VERSION;
+        old.attempt_start_revision = manager
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .attempt_start_revision;
+        assert!(manager.save_onboarding(&mut old).is_err());
+        manager.run_onboarding(&id).await.unwrap();
+        missing_relays(&runtime, &id).await;
+        let proposal = manager
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .approve_onboarding_repair(&id, proposal.revision)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .approve_onboarding_repair_in_epoch(&id, proposal.revision, &"f".repeat(64))
+                .await
+                .is_err()
+        );
+        network.zero_acks.store(true, Ordering::SeqCst);
+        manager
+            .approve_onboarding_repair_in_epoch(&id, proposal.revision, &epoch)
+            .await
+            .unwrap();
+        assert_eq!(network.attempts.lock().unwrap().len(), 2);
+        manager.cancel_onboarding(&id).await.unwrap();
+        runtime.shutdown_and_close().await.unwrap();
+        let reopened = super::tests::runtime(dir.path(), network.clone());
+        let restarted = reopened
+            .accounts()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restarted.recovery_epoch.as_deref(), Some(epoch.as_str()));
+        assert!(restarted.proposal.is_none());
+        reopened.accounts().run_onboarding(&id).await.unwrap();
+        assert_eq!(network.attempts.lock().unwrap().len(), 2);
+        reopened.accounts().cancel_onboarding(&id).await.unwrap();
+        reopened.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unreadable_cancelled_evidence_does_not_block_live_cancellation_intent() {
+    let (dir, runtime, _, _, id) = fixture().await;
+    let path = dir
+        .path()
+        .join("accounts")
+        .join(&id)
+        .join("onboarding-cancelled.json");
+    std::fs::write(&path, b"unreadable older cancellation").unwrap();
+    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    let latest: OnboardingCheckpoint =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(latest.snapshot.cancellation_pending);
+    assert!(runtime.accounts().resolve(&id).unwrap().signed_out);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
+    for tombstone_written in [false, true] {
+        let (dir, first, network, keys, id) = fixture().await;
+        let manager = first.accounts();
+        let home = manager.app.account_home();
+        let active = home.account_onboarding(&id).unwrap().unwrap();
+        let cancelled = b"unknown archived schema";
+        std::fs::write(
+            dir.path()
+                .join("accounts")
+                .join(&id)
+                .join("onboarding-cancelled.json"),
+            cancelled,
+        )
+        .unwrap();
+        let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+        let mut intent: serde_json::Value =
+            serde_json::from_slice(&home.account_onboarding_recovery(&id).unwrap().unwrap())
+                .unwrap();
+        intent["completed"] = serde_json::json!(false);
+        // Reconstruct each durable crash boundary, then reopen the real root.
+        if !tombstone_written {
+            home.set_account_onboarding(&id, &active).unwrap();
+            std::fs::write(
+                dir.path()
+                    .join("accounts")
+                    .join(&id)
+                    .join("onboarding-cancelled.json"),
+                cancelled,
+            )
+            .unwrap();
+        }
+        home.set_account_onboarding_recovery(&id, &serde_json::to_vec(&intent).unwrap())
+            .unwrap();
+        first.shutdown_and_close().await.unwrap();
+        let second = runtime(dir.path(), network);
+        assert!(second.accounts().onboarding_recovery_required(&id).unwrap());
+        assert!(
+            second
+                .accounts()
+                .begin_onboarding(
+                    Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                    options()
+                )
+                .await
+                .is_err()
+        );
+        second.accounts().reconcile().await.unwrap();
+        assert!(!second.accounts().onboarding_recovery_required(&id).unwrap());
+        let fresh = second
+            .accounts()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
+        second.accounts().run_onboarding(&id).await.unwrap();
+        second.accounts().cancel_onboarding(&id).await.unwrap();
+        second.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn recovery_of_unreadable_recovery_journal_preserves_its_bytes() {
+    let (_dir, runtime, _, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_onboarding_recovery(&id, b"unknown recovery journal")
+        .unwrap();
+    assert!(manager.onboarding_recovery_required(&id).unwrap());
+    let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    let retained: serde_json::Value = serde_json::from_slice(
+        &manager
+            .app
+            .account_home()
+            .account_onboarding_recovery(&id)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        retained["previous_recovery"],
+        serde_json::json!(b"unknown recovery journal".to_vec())
+    );
+    let fresh = manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
+    manager.cancel_onboarding(&id).await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let runtime = runtime(directory.path(), network.clone());
+    let keys = nostr::Keys::generate();
+    let id = keys.public_key().to_hex();
+    let signer = BlockingSigner {
+        keys,
+        block: Arc::new(AtomicBool::new(false)),
+        started: Arc::new(Notify::new()),
+    };
+    let manager = runtime.accounts();
+    manager
+        .begin_external_signer_onboarding(id.clone(), signer.clone(), options())
+        .await
+        .unwrap();
+    missing_relays(&runtime, &id).await;
+    let proposal = manager
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    signer.block.store(true, Ordering::SeqCst);
+    let approval = tokio::spawn({
+        let manager = manager.clone();
+        let id = id.clone();
+        async move {
+            manager
+                .approve_onboarding_repair(&id, proposal.revision)
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), signer.started.notified())
+        .await
+        .unwrap();
+    // A historical failure must not make the new API depend on this signer.
+    std::fs::write(
+        directory
+            .path()
+            .join("accounts")
+            .join(&id)
+            .join("onboarding-cancelled.json"),
+        b"malformed archive",
+    )
+    .unwrap();
+    let workers = manager.worker_transactions.lock().await;
+    let mut recovery = Box::pin(manager.recover_onboarding(&id, true));
+    assert!(futures::poll!(&mut recovery).is_pending());
+    // Drop the public waiter; the registered task still owns completion.
+    drop(recovery);
+    drop(workers);
+    manager.await_onboarding_owned_handles_finished().await;
+    timeout(Duration::from_secs(2), approval)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    signer.block.store(false, Ordering::SeqCst);
+    let fresh = timeout(
+        Duration::from_secs(2),
+        manager.begin_external_signer_onboarding(id.clone(), signer, options()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let epoch = fresh.recovery_epoch.unwrap();
+    manager.run_onboarding(&id).await.unwrap();
+    missing_relays(&runtime, &id).await;
+    let proposal = manager
+        .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+        .await
+        .unwrap();
+    network.zero_acks.store(true, Ordering::SeqCst);
+    manager
+        .approve_onboarding_repair_in_epoch(&id, proposal.revision, &epoch)
+        .await
+        .unwrap();
+    assert_eq!(network.attempts.lock().unwrap().len(), 1);
+    manager.cancel_onboarding(&id).await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reap_waiter_captured_before_duplicate_registration_waits_for_both_workers() {
+    let (_dir, runtime, _, _, id) = fixture().await;
+    let manager = runtime.accounts();
+    let (first, first_exit, first_dropped) = controlled_reap_worker();
+    manager.start_tracked_worker_reap(&id, first, Duration::from_secs(2));
+    let waiting = manager.await_tracked_worker_reap(&id, Duration::from_secs(2));
+    tokio::pin!(waiting);
+    assert!(futures::poll!(&mut waiting).is_pending());
+    let (second, second_exit, second_dropped) = controlled_reap_worker();
+    manager.start_tracked_worker_reap(&id, second, Duration::from_secs(2));
+    first_exit.send(()).unwrap();
+    // Deterministically wait for first completion while holding the new worker.
+    timeout(Duration::from_secs(2), async {
+        while !first_dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(futures::poll!(&mut waiting).is_pending());
+    assert!(!second_dropped.load(Ordering::SeqCst));
+    second_exit.send(()).unwrap();
+    waiting.await.unwrap();
+    assert!(second_dropped.load(Ordering::SeqCst));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
+    let (dir, runtime, _, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    std::fs::write(
+        dir.path()
+            .join("accounts")
+            .join(&id)
+            .join("onboarding-cancelled.json"),
+        b"unreadable",
+    )
+    .unwrap();
+    let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    for step in [
+        OnboardingStep::Profile,
+        OnboardingStep::Follows,
+        OnboardingStep::Relays,
+        OnboardingStep::InboxRelays,
+    ] {
+        checkpoint.set(step, OnboardingStatus::Passed, vec![]);
+    }
+    manager
+        .check_onboarding_single_device(&mut checkpoint)
+        .await
+        .unwrap();
+    // Keep managed KeyPackage work out of this acknowledgment-boundary test.
+    checkpoint.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::RetryableFailure,
+        vec![],
+    );
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    let revision = checkpoint.snapshot.revision;
+    assert!(
+        manager
+            .acknowledge_onboarding_single_device(&id, revision)
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .acknowledge_onboarding_single_device_in_epoch(&id, revision, "stale")
+            .await
+            .is_err()
+    );
+    assert!(
+        !manager
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .single_device_acknowledged
+    );
+    manager
+        .acknowledge_onboarding_single_device_in_epoch(&id, revision, &epoch)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .single_device_acknowledged
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
+    let (dir, runtime, _, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let cancelled_path = dir
+        .path()
+        .join("accounts")
+        .join(&id)
+        .join("onboarding-cancelled.json");
+    std::fs::write(&cancelled_path, b"broken").unwrap();
+    let first_epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    let mut old = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    // Losing the tombstone must not silently restart this epoch at one.
+    std::fs::remove_file(&cancelled_path).unwrap();
+    assert!(manager.onboarding_recovery_required(&id).unwrap());
+    assert!(
+        manager
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options()
+            )
+            .await
+            .is_err()
+    );
+    let second_epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    assert_ne!(first_epoch, second_epoch);
+    manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    let fresh = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    assert_eq!(fresh.attempt_start_revision, old.attempt_start_revision);
+    assert!(manager.save_onboarding(&mut old).is_err());
+    assert!(
+        manager
+            .require_captured_attempt(&fresh, old.attempt())
+            .is_err()
+    );
+    manager.cancel_onboarding(&id).await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered() {
+    let (dir, runtime, _, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    checkpoint.set(
+        OnboardingStep::Follows,
+        OnboardingStatus::NeedsInput,
+        vec![],
+    );
+    checkpoint.snapshot.revision = u64::MAX;
+    write_active_checkpoint(dir.path(), &id, serde_json::to_value(&checkpoint).unwrap());
+    let bytes = manager
+        .app
+        .account_home()
+        .account_onboarding(&id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        manager
+            .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .propose_onboarding_follows(&id, vec![])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_onboarding(&id)
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
+    assert!(manager.onboarding_recovery_required(&id).unwrap());
+    let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    let fresh = manager
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
+    manager.run_onboarding(&id).await.unwrap();
+    manager.cancel_onboarding(&id).await.unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
+    let (dir, first, network, keys, id) = fixture().await;
+    let manager = first.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    std::fs::write(
+        dir.path()
+            .join("accounts")
+            .join(&id)
+            .join("onboarding-cancelled.json"),
+        b"unsupported evidence",
+    )
+    .unwrap();
+    let hold = manager.install_onboarding_worker_reap_hold();
+    let mut recovery = Box::pin(manager.recover_onboarding(&id, true));
+    assert!(futures::poll!(&mut recovery).is_pending());
+    hold.wait_until_entered().await;
+    let mut shutdown = Box::pin(manager.shutdown());
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    hold.release.notify_one();
+    assert!(
+        timeout(Duration::from_secs(2), recovery)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    timeout(Duration::from_secs(2), shutdown).await.unwrap();
+    assert!(manager.onboarding_recovery_pending(&id).unwrap());
+    first.shutdown_and_close().await.unwrap();
+    let second = runtime(dir.path(), network);
+    second.accounts().reconcile().await.unwrap();
+    let fresh = second
+        .accounts()
+        .begin_onboarding(
+            Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+            options(),
+        )
+        .await
+        .unwrap();
+    assert!(fresh.recovery_epoch.is_some());
+    second.accounts().run_onboarding(&id).await.unwrap();
+    second.accounts().cancel_onboarding(&id).await.unwrap();
+    second.shutdown_and_close().await.unwrap();
 }

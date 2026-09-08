@@ -34,9 +34,22 @@ impl AccountManager {
             }
         };
         for account in accounts {
+            if self
+                .onboarding_recovery_pending(&account.label)
+                .unwrap_or(true)
+            {
+                if self
+                    .finish_onboarding_recovery_locked(&account)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(target: "marmot_app::onboarding", method = "finish_pending_onboarding_cancellations", "left pending onboarding recovery gated");
+                }
+                continue;
+            }
             let pending = match self.read_onboarding_checkpoint_for(&account) {
                 Ok(Some(checkpoint)) if checkpoint.snapshot.cancellation_pending => {
-                    Some(checkpoint.attempt_start_revision)
+                    Some(checkpoint.attempt())
                 }
                 Ok(_) => None,
                 Err(error) => {
@@ -67,7 +80,7 @@ impl AccountManager {
     fn persist_onboarding_cancellation_intent(
         &self,
         account_ref: &str,
-    ) -> Result<Option<(AccountSummary, u64)>, AppError> {
+    ) -> Result<Option<(AccountSummary, OnboardingAttempt)>, AppError> {
         let account = self.resolve(account_ref)?;
         let state = self.onboarding_state_lock(&account.account_id_hex);
         let _state = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -85,7 +98,7 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         if checkpoint.snapshot.cancellation_pending {
-            return Ok(Some((account, checkpoint.attempt_start_revision)));
+            return Ok(Some((account, checkpoint.attempt())));
         }
         checkpoint.snapshot.cancellation_pending = true;
         checkpoint.snapshot.ready = false;
@@ -93,17 +106,14 @@ impl AccountManager {
             step.actions = vec![OnboardingAction::CancelOnboarding];
         }
         self.save_onboarding_locked(&mut checkpoint)?;
-        self.publish_onboarding_retirement(
-            &account.account_id_hex,
-            checkpoint.attempt_start_revision,
-        );
-        Ok(Some((account, checkpoint.attempt_start_revision)))
+        self.publish_onboarding_retirement(&account.account_id_hex, checkpoint.attempt());
+        Ok(Some((account, checkpoint.attempt())))
     }
 
     async fn await_onboarding_cancellation(
         &self,
         account: &AccountSummary,
-        attempt: u64,
+        attempt: OnboardingAttempt,
         budget: Duration,
     ) -> Result<(), AppError> {
         let receiver = self.ensure_onboarding_cancellation_task(account, attempt);
@@ -119,7 +129,7 @@ impl AccountManager {
     fn ensure_onboarding_cancellation_task(
         &self,
         account: &AccountSummary,
-        attempt: u64,
+        attempt: OnboardingAttempt,
     ) -> watch::Receiver<Option<OnboardingCancelOutcome>> {
         let mut tasks = self
             .onboarding_cancellations
@@ -131,8 +141,7 @@ impl AccountManager {
             return existing.outcome.subscribe();
         }
         if !tasks.accepting {
-            let (sender, receiver) = watch::channel(Some(OnboardingCancelOutcome::Failed));
-            let _ = sender;
+            let (_, receiver) = watch::channel(Some(OnboardingCancelOutcome::Failed));
             return receiver;
         }
         let (sender, receiver) = watch::channel(None);
@@ -172,7 +181,7 @@ impl AccountManager {
     async fn complete_onboarding_cancellation(
         &self,
         account: &AccountSummary,
-        attempt: u64,
+        attempt: OnboardingAttempt,
         workers_already_locked: bool,
     ) -> Result<(), AppError> {
         let started = Instant::now();
@@ -196,21 +205,15 @@ impl AccountManager {
     async fn finish_onboarding_cancellation_locked(
         &self,
         account: &AccountSummary,
-        attempt: u64,
+        attempt: OnboardingAttempt,
         budget: Duration,
     ) -> Result<(), AppError> {
         let Some(checkpoint) = self.read_onboarding_checkpoint_for(account)? else {
             return Ok(());
         };
-        if checkpoint.attempt_start_revision != attempt || !checkpoint.snapshot.cancellation_pending
-        {
+        if checkpoint.attempt() != attempt || !checkpoint.snapshot.cancellation_pending {
             return Ok(());
         }
-        let frozen = self
-            .app
-            .account_home()
-            .account_onboarding(&account.label)?
-            .ok_or_else(onboarding_error)?;
         self.app
             .account_home()
             .set_account_signed_out(&account.label, true)?;
@@ -246,12 +249,6 @@ impl AccountManager {
                     setup.phase,
                 )?;
             }
-            self.retain_previous_cancelled_onboarding(account)?;
-            if checkpoint.holds_uncertain_publication() {
-                self.app
-                    .account_home()
-                    .retain_account_onboarding_repair_archive(&account.label, &frozen)?;
-            }
             self.app
                 .account_home()
                 .archive_account_onboarding(&account.label)?;
@@ -268,27 +265,7 @@ impl AccountManager {
         result
     }
 
-    fn retain_previous_cancelled_onboarding(
-        &self,
-        account: &AccountSummary,
-    ) -> Result<(), AppError> {
-        let Some(bytes) = self
-            .app
-            .account_home()
-            .cancelled_account_onboarding(&account.label)?
-        else {
-            return Ok(());
-        };
-        let previous = decode_onboarding_checkpoint(&bytes, &account.account_id_hex)?;
-        if previous.holds_uncertain_publication() {
-            self.app
-                .account_home()
-                .retain_account_onboarding_repair_archive(&account.label, &bytes)?;
-        }
-        Ok(())
-    }
-
-    fn start_tracked_worker_reap(
+    pub(super) fn start_tracked_worker_reap(
         &self,
         account_id: &str,
         worker: ManagedAccountWorker,
@@ -298,9 +275,9 @@ impl AccountManager {
             .onboarding_cancellations
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if tasks.reaping.contains_key(account_id) {
-            return;
-        }
+        // Each registration owns its worker, including defensive duplicates.
+        // Chain completion without changing the previous observer's meaning.
+        let previous = tasks.reaping.get(account_id).map(watch::Sender::subscribe);
         let (sender, _) = watch::channel(false);
         tasks.reaping.insert(account_id.to_owned(), sender.clone());
         #[cfg(test)]
@@ -318,6 +295,11 @@ impl AccountManager {
                 hold.release.notified().await;
             }
             worker.shutdown_with_timeout(budget).await;
+            if let Some(mut previous) = previous {
+                // The previous tracked task owns its bounded shutdown. A closed
+                // channel means that task has exited (including unwinding).
+                let _ = previous.wait_for(|done| *done).await;
+            }
             sender.send_replace(true);
         }));
     }
@@ -327,45 +309,39 @@ impl AccountManager {
         account_id: &str,
         budget: Duration,
     ) -> Result<(), AppError> {
-        let mut receiver = {
-            let tasks = self
-                .onboarding_cancellations
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            match tasks.reaping.get(account_id) {
-                Some(sender) => sender.subscribe(),
-                None => return Ok(()),
-            }
-        };
-        match timeout(budget, async {
+        timeout(budget, async {
             loop {
-                if *receiver.borrow() {
-                    return Ok(());
-                }
-                if receiver.changed().await.is_err() {
-                    return Err(onboarding_error());
-                }
-            }
-        })
-        .await
-        {
-            Ok(Ok(())) => {
+                let mut receiver = {
+                    let tasks = self
+                        .onboarding_cancellations
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    match tasks.reaping.get(account_id) {
+                        Some(sender) => sender.subscribe(),
+                        None => return Ok(()),
+                    }
+                };
+                receiver
+                    .wait_for(|done| *done)
+                    .await
+                    .map_err(|_| onboarding_error())?;
                 let mut tasks = self
                     .onboarding_cancellations
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                if tasks
-                    .reaping
-                    .get(account_id)
-                    .is_some_and(|sender| *sender.borrow())
-                {
-                    tasks.reaping.remove(account_id);
+                // A duplicate may have chained another worker while we waited.
+                // Only the latest completion covers every registered worker.
+                match tasks.reaping.get(account_id) {
+                    Some(sender) if !*sender.borrow() => continue,
+                    _ => {
+                        tasks.reaping.remove(account_id);
+                        return Ok(());
+                    }
                 }
-                Ok(())
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(AppError::AccountWorkerResponseTimedOut),
-        }
+        })
+        .await
+        .map_err(|_| AppError::AccountWorkerResponseTimedOut)?
     }
 
     fn close_onboarding_subscription(&self, account_id: &str, snapshot: &OnboardingSnapshot) {
@@ -380,7 +356,7 @@ impl AccountManager {
     }
 }
 
-fn retain_unfinished_onboarding_handles(tasks: &mut OnboardingCancellationTasks) {
+pub(super) fn retain_unfinished_onboarding_handles(tasks: &mut OnboardingCancellationTasks) {
     tasks.handles.retain(|handle| !handle.is_finished());
 }
 

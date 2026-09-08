@@ -188,7 +188,8 @@ pub struct AccountManager {
     onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
     onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
     onboarding_cancellations: Arc<StdMutex<OnboardingCancellationTasks>>,
-    onboarding_retirements: Arc<StdMutex<HashMap<String, watch::Sender<Option<u64>>>>>,
+    onboarding_retirements:
+        Arc<StdMutex<HashMap<String, watch::Sender<Option<onboarding::OnboardingAttempt>>>>>,
     #[cfg(test)]
     onboarding_test_holds: Arc<OnboardingTestHolds>,
     #[cfg(test)]

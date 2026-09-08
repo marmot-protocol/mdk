@@ -474,7 +474,6 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::EmptyPassphrase => "account_home_empty_passphrase",
         AccountHomeError::EncryptedSecretExport(_) => "account_home_encrypted_secret_export",
         AccountHomeError::EmptySecretStoreService => "account_home_empty_secret_store_service",
-        AccountHomeError::ImmutableArtifactConflict => "account_home_immutable_artifact_conflict",
     }
 }
 
