@@ -575,7 +575,7 @@ impl AppPerformanceTelemetry {
         let (family, op) = match operation {
             AppStart => (F::Runtime, "startup"),
             AccountOpen => (F::Storage, "open"),
-            AccountSetupLocalReadyHandoff => (F::Account, "local_ready"),
+            // The complete local-ready phase owns product reporting; this is only its handoff.
             AccountSetupNetworkReady => (F::Account, "network_ready"),
             AccountSetupKeyPackageLocal => (F::KeyPackage, "generate"),
             AccountDefaultProfilePublish => (F::Account, "profile_update"),
@@ -630,12 +630,14 @@ impl AppPerformanceTelemetry {
     ) {
         if let Some(product) = &self.product {
             let name = match operation {
-                AppPerformanceOperation::MediaUpload => "upload",
-                AppPerformanceOperation::MediaDownload => "download",
-                AppPerformanceOperation::GroupCreateImageUpload => "group_image",
-                _ => return,
+                AppPerformanceOperation::MediaUpload => Some("upload"),
+                AppPerformanceOperation::MediaDownload => Some("download"),
+                AppPerformanceOperation::GroupCreateImageUpload => Some("group_image"),
+                _ => None,
             };
-            product.observe_media(name, duration, success, media_type);
+            if let Some(name) = name {
+                product.observe_media(name, duration, success, media_type);
+            }
         }
         self.record_without_product(operation, duration, success);
     }

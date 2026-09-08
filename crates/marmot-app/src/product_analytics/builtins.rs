@@ -6,7 +6,13 @@ fn choice(name: &str, values: &[&str]) -> ProductPropertySchema {
     }
 }
 /// Approved host observations provided by MDK. These schemas cannot be overridden.
-pub fn approved_host_product_schemas() -> Vec<ProductEventSchema> {
+pub fn approved_host_product_schemas() -> &'static [ProductEventSchema] {
+    static SCHEMAS: std::sync::LazyLock<Vec<ProductEventSchema>> =
+        std::sync::LazyLock::new(build_approved_host_product_schemas);
+    &SCHEMAS
+}
+
+fn build_approved_host_product_schemas() -> Vec<ProductEventSchema> {
     vec![
         ProductEventSchema {
             name: "app_screen_viewed".into(),

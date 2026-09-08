@@ -349,6 +349,7 @@ async fn run_search(
             }
         }
     }
+    let cancelled = emitter.is_cancelled();
     emitter.emit(SearchUpdateTrigger::SearchCompleted).await;
     emitter.report_tally(&params);
     if let Some(observation) = source_observation {
@@ -363,7 +364,7 @@ async fn run_search(
         observation.directory_sample("empty", "network", emitter.tally.unresolved as u64);
     }
     if let Some(observation) = observation {
-        observation.finish(if emitter.is_cancelled() {
+        observation.finish(if cancelled {
             "cancelled"
         } else if failed {
             "failure"

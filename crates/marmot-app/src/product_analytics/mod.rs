@@ -27,7 +27,16 @@ mod delivery;
 #[cfg(test)]
 mod tests;
 
-pub const USAGE_DIAGNOSTICS_DISCLOSURE: &str = "Optional usage and diagnostics helps the app operator understand feature use and reliability. Usage contains approved, bucketed activity and temporary session IDs, without message contents or account/group identifiers. Our Aptabase server receives your IP address, uses IP/user-agent information for daily activity grouping, and adds approximate country/region. Diagnostics includes a random installation identifier stable until you turn sharing off. Turning this off stops both pipelines; already transmitted data cannot be recalled. Audit logging is separate. Retention depends on the operator's verified deployment settings.";
+pub const USAGE_DIAGNOSTICS_DISCLOSURE: &str = concat!(
+    "Optional usage and diagnostics helps the app operator understand feature use and ",
+    "reliability. Usage contains approved, bucketed activity and temporary session IDs, without ",
+    "message contents or account/group identifiers. Our Aptabase server receives your IP ",
+    "address, uses IP/user-agent information for daily activity grouping, and adds approximate ",
+    "country/region. Diagnostics includes a random installation identifier stable until you ",
+    "turn sharing off. Turning this off stops both pipelines; already transmitted data cannot ",
+    "be recalled. Audit logging is separate. Retention depends on the operator's verified ",
+    "deployment settings.",
+);
 pub const USAGE_DIAGNOSTICS_POLICY: &str = "usage-diagnostics-v1";
 pub const PRODUCT_REGISTRY_VERSION: &str = "mdk-product-v1";
 pub const PRODUCT_DURATION_BOUNDS_MS: [u64; 15] = [
@@ -460,15 +469,20 @@ struct QueuedEvent {
     bytes: usize,
     created: Duration,
 }
+static DEFAULT_REGISTRY_REVISION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| ProductAnalyticsRuntimeConfig::default().registry_revision());
+
 impl Default for ProductAnalytics {
     fn default() -> Self {
+        let config = ProductAnalyticsRuntimeConfig::default();
+        let scope = Self::scope(&config, "", "");
         Self {
             inner: Arc::new(Mutex::new(State {
-                config: ProductAnalyticsRuntimeConfig::default(),
-                registry_revision: ProductAnalyticsRuntimeConfig::default().registry_revision(),
+                config,
+                registry_revision: DEFAULT_REGISTRY_REVISION.clone(),
                 settings: UsageDiagnosticsSettings::default(),
                 diagnostic_id: String::new(),
-                scope: Self::scope(&ProductAnalyticsRuntimeConfig::default(), "", ""),
+                scope,
                 telemetry_origin: String::new(),
                 persistence_failed: false,
                 silent: false,
@@ -495,6 +509,10 @@ impl Default for ProductAnalytics {
     }
 }
 impl ProductAnalytics {
+    fn fail_closed(&self) {
+        self.lock().persistence_failed = true;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -674,9 +692,31 @@ impl ProductAnalytics {
         timestamp: u64,
     ) {
         let m = &s.config.metadata;
-        let payload = serde_json::json!({"timestamp":chrono::DateTime::from_timestamp(timestamp as i64,0).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Secs,true),"sessionId":session,"eventName":name,
-            "systemProps":{"appVersion":m.app_version,"osName":m.os_family,"osVersion":m.os_major_version,"isDebug":m.is_debug,"sdkVersion":concat!("mdk@",env!("CARGO_PKG_VERSION"))},
-            "props":props.into_iter().chain([("schema_version".into(),PRODUCT_REGISTRY_VERSION.into()),("device_class".into(),m.device_class.clone()),("host_surface".into(),m.host_surface.clone()),("environment".into(),m.environment.clone())]).collect::<BTreeMap<_,_>>()});
+        let timestamp = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+            .unwrap_or_default()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let props = props
+            .into_iter()
+            .chain([
+                ("schema_version".into(), PRODUCT_REGISTRY_VERSION.into()),
+                ("device_class".into(), m.device_class.clone()),
+                ("host_surface".into(), m.host_surface.clone()),
+                ("environment".into(), m.environment.clone()),
+            ])
+            .collect::<BTreeMap<_, _>>();
+        let payload = serde_json::json!({
+            "timestamp": timestamp,
+            "sessionId": session,
+            "eventName": name,
+            "systemProps": {
+                "appVersion": m.app_version,
+                "osName": m.os_family,
+                "osVersion": m.os_major_version,
+                "isDebug": m.is_debug,
+                "sdkVersion": concat!("mdk@", env!("CARGO_PKG_VERSION")),
+            },
+            "props": props,
+        });
         if !self.valid_payload(&s.config, &payload) {
             s.status.dropped_events = s.status.dropped_events.saturating_add(1);
             return;
@@ -1332,20 +1372,49 @@ impl ProductAnalytics {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {biased; _=permit.cancelled()=>break,_=interval.tick()=>{
-                if Self::enabled(&self.lock()) {
-                    let health = tokio::select! {biased; _=permit.cancelled()=>break, health=relay_plane.relay_health()=>health};
-                    let mut s = self.lock();
-                    if permit.valid() && Self::enabled(&s) {
-                        self.advance(&mut s);
-                        s.availability = Some(if health.connected == 0 { "none" }
-                            else if health.connected < health.total_relays { "partial" } else { "available" });
+            tokio::select! {
+                biased;
+                _ = permit.cancelled() => break,
+                _ = interval.tick() => {
+                    if Self::enabled(&self.lock()) {
+                        let health = tokio::select! {
+                            biased;
+                            _ = permit.cancelled() => break,
+                            health = relay_plane.relay_health() => health,
+                        };
+                        let mut s = self.lock();
+                        if permit.valid() && Self::enabled(&s) {
+                            self.advance(&mut s);
+                            s.availability = Some(if health.connected == 0 {
+                                "none"
+                            } else if health.connected < health.total_relays {
+                                "partial"
+                            } else {
+                                "available"
+                            });
+                        }
                     }
+                    #[cfg(feature = "product-analytics-export")]
+                    self.send_pending_with_permit(&permit).await;
                 }
-                #[cfg(feature="product-analytics-export")]
-                self.send_pending_with_permit(&permit).await;
-            }}
+            }
         }
+    }
+}
+
+fn receipt_from_stored(
+    r: &storage_sqlite::StoredUsageDiagnosticsSettings,
+) -> UsageDiagnosticsSettings {
+    UsageDiagnosticsSettings {
+        decision: match r.decision {
+            1 => UsageDiagnosticsDecision::Declined,
+            2 => UsageDiagnosticsDecision::Granted,
+            _ => UsageDiagnosticsDecision::AcceptanceRequired,
+        },
+        policy_revision: r.policy_revision.clone(),
+        registry_revision: r.registry_revision.clone(),
+        updated_at_ms: r.updated_at_ms,
+        previously_enabled: r.previously_enabled,
     }
 }
 
@@ -1358,8 +1427,8 @@ impl MarmotApp {
     }
 
     pub fn usage_diagnostics_settings(&self) -> Result<UsageDiagnosticsSettings, AppError> {
-        let mut receipt = self.stored_usage_diagnostics_settings()?;
         let r = self.shared_storage()?.usage_diagnostics_settings()?;
+        let mut receipt = receipt_from_stored(&r);
         let state = self.product_analytics.lock();
         if receipt.decision == UsageDiagnosticsDecision::Granted
             && (state.persistence_failed
@@ -1375,44 +1444,36 @@ impl MarmotApp {
         &self,
     ) -> Result<UsageDiagnosticsSettings, AppError> {
         let r = self.shared_storage()?.usage_diagnostics_settings()?;
-        Ok(UsageDiagnosticsSettings {
-            decision: match r.decision {
-                1 => UsageDiagnosticsDecision::Declined,
-                2 => UsageDiagnosticsDecision::Granted,
-                _ => UsageDiagnosticsDecision::AcceptanceRequired,
-            },
-            policy_revision: r.policy_revision,
-            registry_revision: r.registry_revision,
-            updated_at_ms: r.updated_at_ms,
-            previously_enabled: r.previously_enabled,
-        })
+        Ok(receipt_from_stored(&r))
     }
+
     pub(crate) fn restore_usage_diagnostics(&self) -> Result<(), AppError> {
         let _consent = self
             .product_analytics
             .consent_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let r = self.shared_storage()?.usage_diagnostics_settings()?;
-        let mut receipt = self.usage_diagnostics_settings()?;
-        let state = self.product_analytics.lock();
-        if r.decision == 2
-            && (state.persistence_failed
-                || r.policy_revision != USAGE_DIAGNOSTICS_POLICY
-                || r.registry_revision != state.registry_revision
-                || r.scope_revision != state.scope)
-        {
-            receipt.decision = UsageDiagnosticsDecision::AcceptanceRequired;
-        }
-        drop(state);
-        self.product_analytics.set_receipt(
-            receipt,
-            self.shared_storage()?
+        let restored = (|| {
+            let receipt = self.usage_diagnostics_settings()?;
+            let id = self
+                .shared_storage()?
                 .telemetry_install_id()?
-                .unwrap_or_default(),
-        );
-        Ok(())
+                .unwrap_or_default();
+            Ok::<_, AppError>((receipt, id))
+        })();
+        match restored {
+            Ok((receipt, id)) => {
+                self.product_analytics.set_receipt(receipt, id);
+                Ok(())
+            }
+            Err(error) => {
+                self.product_analytics.revoke_memory();
+                self.product_analytics.fail_closed();
+                Err(error)
+            }
+        }
     }
+
     pub fn set_usage_diagnostics_consent(
         &self,
         enabled: bool,
@@ -1715,7 +1776,11 @@ fn configure_product_analytics_from_values(
         .set_product_analytics_runtime_config(config)
         .is_err()
     {
-        tracing::warn!(target: "marmot_app::product_analytics", method = "configure_product_analytics_from_environment",
-            error_code = "invalid_product_analytics_configuration", "optional product analytics configuration rejected");
+        tracing::warn!(
+            target: "marmot_app::product_analytics",
+            method = "configure_product_analytics_from_environment",
+            error_code = "invalid_product_analytics_configuration",
+            "optional product analytics configuration rejected"
+        );
     }
 }

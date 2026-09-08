@@ -218,6 +218,7 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 pub struct RuntimeSharedServices {
     product_analytics: crate::ProductAnalytics,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
+    diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
     app_performance_telemetry: AppPerformanceTelemetry,
     agent_streams: AgentStreamWatchManager,
@@ -306,6 +307,7 @@ impl Default for RuntimeSharedServices {
             app_performance_telemetry: AppPerformanceTelemetry::default(),
             product_analytics: crate::ProductAnalytics::default(),
             product_worker: Arc::new(StdMutex::new(None)),
+            diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
@@ -349,6 +351,7 @@ impl RuntimeSharedServices {
             ),
             product_analytics: app.product_analytics.clone(),
             product_worker: Arc::new(StdMutex::new(None)),
+            diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
             lifecycle,
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
@@ -435,9 +438,14 @@ impl RuntimeSharedServices {
             if let Some(exporter) = self.relay_plane.telemetry_exporter(config, permit) {
                 let shutdown = self.lifecycle.subscribe_shutdown();
                 let app_performance_telemetry = self.app_performance_telemetry.clone();
-                let handle = tokio::spawn(
-                    exporter.run_with_app_performance(shutdown, app_performance_telemetry),
-                );
+                let executor = self
+                    .diagnostics_executor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .expect("running runtime captured its diagnostics executor");
+                let handle = executor
+                    .spawn(exporter.run_with_app_performance(shutdown, app_performance_telemetry));
                 *self
                     .relay_telemetry_exporter
                     .lock()
@@ -1318,7 +1326,18 @@ impl MarmotAppRuntime {
     /// catch-up continue asynchronously after this method returns.
     pub async fn start(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
-        self.accounts.app.restore_usage_diagnostics()?;
+        *self
+            .shared
+            .diagnostics_executor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tokio::runtime::Handle::current());
+        if self.accounts.app.restore_usage_diagnostics().is_err() {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "start",
+                "usage diagnostics consent unavailable; diagnostics disabled"
+            );
+        }
         let started_at = Instant::now();
         let result: Result<RelayTelemetryExportConfig, AppError> = async {
             self.shared.lifecycle().ensure_running()?;
@@ -2347,12 +2366,21 @@ impl MarmotAppRuntime {
         }
         if self.shared.lifecycle().is_running() && self.shared.product_analytics.permit().is_some()
         {
-            *worker = Some(tokio::spawn(
-                self.shared
-                    .product_analytics
-                    .clone()
-                    .run(self.shared.relay_plane().clone()),
-            ));
+            let executor = self
+                .shared
+                .diagnostics_executor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("running runtime captured its diagnostics executor");
+            *worker = Some(
+                executor.spawn(
+                    self.shared
+                        .product_analytics
+                        .clone()
+                        .run(self.shared.relay_plane().clone()),
+                ),
+            );
         }
     }
 
@@ -2605,7 +2633,11 @@ impl MarmotAppRuntime {
     ) -> Result<NotificationSettings, AppError> {
         let observation = self.shared.product_analytics.begin(
             crate::ProductFamily::Notification,
-            if enabled { "enable" } else { "disable" },
+            if enabled {
+                "local_enable"
+            } else {
+                "local_disable"
+            },
             crate::ProductUnit::Action,
         );
         let result = self.set_local_notifications_enabled_unobserved(account_ref, enabled);
@@ -2716,7 +2748,11 @@ impl MarmotAppRuntime {
     ) -> Result<NotificationSettings, AppError> {
         let observation = self.shared.product_analytics.begin(
             crate::ProductFamily::Notification,
-            if enabled { "enable" } else { "disable" },
+            if enabled {
+                "native_enable"
+            } else {
+                "native_disable"
+            },
             crate::ProductUnit::Action,
         );
         let result = self
@@ -4539,7 +4575,7 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         let observation = self.shared.product_analytics.begin(
             crate::ProductFamily::Account,
-            "create",
+            "local_ready",
             crate::ProductUnit::Attempt,
         );
         let result = self

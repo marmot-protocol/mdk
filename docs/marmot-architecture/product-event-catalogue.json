@@ -944,8 +944,10 @@
           "schedule",
           "mute",
           "unmute",
-          "enable",
-          "disable"
+          "local_enable",
+          "local_disable",
+          "native_enable",
+          "native_disable"
         ],
         "outcome": [
           "success",

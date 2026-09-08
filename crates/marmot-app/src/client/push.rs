@@ -20,14 +20,13 @@ impl AppClient {
             "register",
             crate::ProductUnit::Action,
         );
-        let result = self
-            .upsert_and_share_push_registration_unobserved(
-                platform,
-                raw_token,
-                server_pubkey_hex,
-                relay_hint,
-            )
-            .await;
+        let result = Box::pin(self.upsert_and_share_push_registration_unobserved(
+            platform,
+            raw_token,
+            server_pubkey_hex,
+            relay_hint,
+        ))
+        .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
         }

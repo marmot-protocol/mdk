@@ -1333,6 +1333,9 @@ impl MarmotApp {
         self.relay_plane.relay_telemetry().await
     }
 
+    /// Effective settings for this app instance, including its active consent permit.
+    /// An unstarted instance reports export disabled even if a grant is persisted.
+    /// Read `usage_diagnostics_settings` for the consent decision before startup.
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
         let mut settings =
             normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
@@ -1770,6 +1773,7 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
+            maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
             epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
                 .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),

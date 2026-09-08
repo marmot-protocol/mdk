@@ -2488,6 +2488,11 @@ impl<S: StorageProvider> Engine<S> {
             .collect()
     }
 
+    /// Number of currently quarantined groups without cloning their identities.
+    pub fn quarantined_group_count(&self) -> usize {
+        self.quarantined_groups.len()
+    }
+
     /// Quarantine lookup for the live data-path gates.
     pub(crate) fn quarantined_reason(
         &self,

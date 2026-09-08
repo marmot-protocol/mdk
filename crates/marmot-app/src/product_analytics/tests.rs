@@ -379,8 +379,8 @@ fn machine_catalogue_matches_builtins_and_buckets() {
     }
     for schema in approved_host_product_schemas() {
         let event = events.iter().find(|e| e["name"] == schema.name).unwrap();
-        for property in schema.properties {
-            if let ProductPropertyRule::Enum(values) = property.rule {
+        for property in &schema.properties {
+            if let ProductPropertyRule::Enum(values) = &property.rule {
                 assert_eq!(
                     event["properties"][&property.name],
                     serde_json::json!(values)
@@ -1004,4 +1004,153 @@ fn invalid_optional_host_environment_preserves_an_existing_diagnostic_grant() {
         assert_eq!(runtime.stored_usage_diagnostics_settings().unwrap(), before);
         assert!(!app.product_analytics.lock().config.ready());
     }
+}
+
+#[tokio::test]
+async fn unreadable_optional_consent_does_not_abort_runtime_start() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    app.set_usage_diagnostics_consent(true).unwrap();
+    let old_permit = app.usage_diagnostics_permit().unwrap();
+    let connection = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE usage_diagnostics_settings SET updated_at_ms = 'invalid' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    let runtime = app.runtime();
+    runtime.start().await.unwrap();
+    assert!(!old_permit.valid());
+    assert!(app.usage_diagnostics_permit().is_err());
+    assert_eq!(
+        runtime.usage_diagnostics_status().telemetry,
+        DiagnosticsExporterStatus::Disabled
+    );
+    assert_eq!(
+        runtime.usage_diagnostics_status().product_analytics,
+        DiagnosticsExporterStatus::Disabled
+    );
+    assert!(runtime.usage_diagnostics_settings().is_err());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synchronous_consent_setters_use_the_started_runtime_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    let runtime = app.runtime();
+    runtime.start().await.unwrap();
+    let host = runtime.clone();
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        host.set_usage_diagnostics_consent(true).unwrap();
+        host.set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig::default())
+            .unwrap();
+        host.set_usage_diagnostics_consent(false).unwrap();
+        host.set_usage_diagnostics_consent(true).unwrap();
+    })
+    .join()
+    .expect("synchronous host calls must not require a Tokio context");
+    assert!(app.usage_diagnostics_permit().is_ok());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn non_media_measurements_do_not_depend_on_optional_product_analytics() {
+    use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
+    let plain = AppPerformanceTelemetry::default();
+    let attached = AppPerformanceTelemetry::with_product_analytics(ProductAnalytics::default());
+    for telemetry in [&plain, &attached] {
+        telemetry.record_media(
+            AppPerformanceOperation::AppStart,
+            Duration::from_millis(42),
+            true,
+            "other",
+        );
+    }
+    assert_eq!(plain.snapshot(), attached.snapshot());
+}
+
+#[test]
+fn notification_setting_operations_remain_separate_aggregate_cells() {
+    let (collector, _) = configured();
+    grant(&collector);
+    for operation in [
+        "local_enable",
+        "native_enable",
+        "local_disable",
+        "native_disable",
+    ] {
+        collector.observe(
+            ProductFamily::Notification,
+            operation,
+            "success",
+            ProductUnit::Action,
+            None,
+        );
+    }
+    let state = collector.lock();
+    let operations: BTreeSet<_> = state
+        .cells
+        .keys()
+        .filter(|(event, props)| {
+            event == "mdk_notification_summary" && props.get("unit").is_some_and(|v| v == "action")
+        })
+        .map(|(_, props)| props["operation"].as_str())
+        .collect();
+    assert_eq!(
+        operations,
+        BTreeSet::from([
+            "local_enable",
+            "native_enable",
+            "local_disable",
+            "native_disable"
+        ])
+    );
+    assert!(state.cells.values().all(|count| *count == 1));
+}
+
+#[test]
+fn local_ready_handoff_does_not_duplicate_the_complete_phase_observation() {
+    use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
+    let (collector, _) = configured();
+    grant(&collector);
+    let telemetry = AppPerformanceTelemetry::with_product_analytics(collector.clone());
+    collector
+        .begin(ProductFamily::Account, "local_ready", ProductUnit::Attempt)
+        .unwrap()
+        .finish("success");
+    telemetry.record(
+        AppPerformanceOperation::AccountSetupLocalReadyHandoff,
+        Duration::from_millis(10),
+        true,
+    );
+    let state = collector.lock();
+    let attempts: u64 = state
+        .cells
+        .iter()
+        .filter(|((event, props), _)| {
+            event == "mdk_account_summary"
+                && props.get("operation").is_some_and(|v| v == "local_ready")
+                && props.get("unit").is_some_and(|v| v == "attempt")
+        })
+        .map(|(_, count)| *count)
+        .sum();
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn legacy_settings_document_the_active_runtime_state_before_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    app.set_usage_diagnostics_consent(true).unwrap();
+    let unopened = MarmotApp::with_relays(root.path(), vec![]);
+    assert_eq!(
+        unopened.usage_diagnostics_settings().unwrap().decision,
+        UsageDiagnosticsDecision::Granted
+    );
+    assert!(!unopened.relay_telemetry_settings().unwrap().export_enabled);
+    unopened.restore_usage_diagnostics().unwrap();
+    assert!(unopened.relay_telemetry_settings().unwrap().export_enabled);
 }

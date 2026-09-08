@@ -390,6 +390,8 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Durable failure level from the last successful maintenance summary read.
+    pub(crate) maintenance_failed_backlog: u32,
     /// Superseded own commits awaiting a `GroupChangeSuperseded` runtime event
     /// (mdk#1734). Deduplicated by commit id across effect batches.
     pub(crate) pending_superseded_change_events: Vec<cgka_traits::engine::SupersededIntentReport>,
@@ -934,6 +936,15 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
+        // The summary includes this pass's failed executions. Backlog counts only
+        // durable failed obligations; reuse this read instead of rescanning state.
+        self.maintenance_failed_backlog = if summary.failures == u32::MAX {
+            u32::MAX
+        } else {
+            summary
+                .failures
+                .saturating_sub(u32::try_from(effects.failures.len()).unwrap_or(u32::MAX))
+        };
         Ok(maintenance_run_summary_from_account(summary))
     }
 
@@ -2983,6 +2994,27 @@ impl AppClient {
         group_id: &GroupId,
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
+        let product_observation = self.app.product_analytics.begin(
+            crate::ProductFamily::Group,
+            "promote_admin",
+            crate::ProductUnit::Action,
+        );
+        let product_result = Box::pin(self.promote_admin_unobserved(group_id, member_ref)).await;
+        if let Some(observation) = product_observation {
+            observation.finish(if product_result.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        product_result
+    }
+
+    async fn promote_admin_unobserved(
+        &mut self,
+        group_id: &GroupId,
+        member_ref: &str,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
         let member_id = self.app.member_id(member_ref)?;
         let mut admins = self.runtime.admin_pubkeys(group_id)?;
@@ -3369,9 +3401,12 @@ impl AppClient {
             .app
             .product_analytics
             .begin(family, operation, ProductUnit::Action);
-        let result = self
-            .send_app_event_with_local_projection_unobserved(group_id, intent, on_local_projection)
-            .await;
+        let result = Box::pin(self.send_app_event_with_local_projection_unobserved(
+            group_id,
+            intent,
+            on_local_projection,
+        ))
+        .await;
         if let Some(observation) = observation {
             observation.finish(match &result {
                 Ok((_, summary)) => match summary.accept_disposition {

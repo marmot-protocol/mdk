@@ -449,14 +449,16 @@ async fn watch_broker_candidates(
                 };
                 let chunk_tx = updates_tx.clone();
                 match subscribe_text_from_broker_with_resume(config, &mut receiver_state, |chunk| {
-                    if let Some(observation) = first_preview.take() {
-                        observation.finish("success");
-                    }
                     let update = match chunk.record_type {
-                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => RuntimeAgentStreamUpdate::Chunk {
-                            seq: chunk.seq,
-                            text: chunk.text.clone(),
-                        },
+                        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA => {
+                            if let Some(observation) = first_preview.take() {
+                                observation.finish("success");
+                            }
+                            RuntimeAgentStreamUpdate::Chunk {
+                                seq: chunk.seq,
+                                text: chunk.text.clone(),
+                            }
+                        }
                         AGENT_TEXT_STREAM_RECORD_STATUS => RuntimeAgentStreamUpdate::Status {
                             seq: chunk.seq,
                             status: chunk.text.clone(),

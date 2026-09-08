@@ -150,6 +150,36 @@ pub async fn manage_usage_diagnostics(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn missing_management_socket_cannot_revoke_a_different_active_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let app = MarmotApp::try_with_relays_and_account_home_and_config(
+            root.path(),
+            vec![],
+            marmot_account::AccountHome::open(root.path()),
+            MarmotAppConfig::default(),
+        )
+        .unwrap();
+        app.set_usage_diagnostics_consent(true).unwrap();
+        let diagnostic_id = app.telemetry_install_id().unwrap();
+        for command in [
+            UsageDiagnosticsCommand::Disable,
+            UsageDiagnosticsCommand::Enable,
+        ] {
+            let result = manage_usage_diagnostics(root.path(), command).await;
+            assert!(matches!(
+                result,
+                Err(ConnectorError::App(marmot_app::AppError::RuntimeBusy))
+            ));
+            assert!(app.usage_diagnostics_permit().is_ok());
+            assert_eq!(app.telemetry_install_id().unwrap(), diagnostic_id);
+            assert_eq!(
+                app.usage_diagnostics_settings().unwrap().decision,
+                marmot_app::UsageDiagnosticsDecision::Granted
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn management_clients_are_bounded_and_cancel_with_the_listener_owner() {
         let home = tempfile::Builder::new()
             .prefix(".mdk-cap-")

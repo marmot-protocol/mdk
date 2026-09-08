@@ -6511,6 +6511,13 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay);
+    #[cfg(feature = "product-analytics-export")]
+    let app = {
+        let mut app = app;
+        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.set_usage_diagnostics_consent(true).unwrap();
+        app
+    };
     let runtime = MarmotAppRuntime::new(app.clone());
 
     let local = runtime
@@ -6535,6 +6542,20 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
         lifecycle.pending_replacement.is_some() || lifecycle.current_key_package.is_some(),
         "the prepared KeyPackage remains durable without being reported as published"
     );
+    #[cfg(feature = "product-analytics-export")]
+    {
+        let events = app.product_analytics.test_payloads();
+        let phases: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["eventName"] == "mdk_account_summary"
+                    && event["props"]["operation"] == "local_ready"
+                    && event["props"]["unit"] == "attempt"
+            })
+            .collect();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["props"]["count_bucket"], "1");
+    }
     runtime.shutdown().await;
 }
 
@@ -19560,4 +19581,44 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
         ConvergenceScheduleState::Collecting { remaining_ms } if remaining_ms > 1_000 && remaining_ms <= pass_delay),
         "a due leave must not bypass the collecting pass's cutoff"
     );
+}
+
+#[tokio::test]
+async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() {
+    let root = tempfile::tempdir().unwrap();
+    AccountHome::open(root.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("maintenance", &[]).await.unwrap();
+    client
+        .runtime
+        .schedule_manual_self_update(&group_id)
+        .unwrap();
+    let mut obligation = client
+        .runtime
+        .session()
+        .maintenance_obligations()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("scheduled maintenance obligation");
+    obligation.phase = cgka_traits::MaintenancePhase::Failed;
+    obligation.last_failure_code = Some("local_member_removed".into());
+    client
+        .runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    for _ in 0..3 {
+        let summary = client.run_due_maintenance().await.unwrap();
+        assert_eq!(summary.failures, 1);
+        assert_eq!(client.maintenance_failed_backlog, 1);
+        assert_eq!(
+            client.runtime.quarantined_group_count(),
+            client.quarantined_groups().len()
+        );
+    }
 }

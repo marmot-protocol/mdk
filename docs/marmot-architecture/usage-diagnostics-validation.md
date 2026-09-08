@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-07
+updated: 2026-09-08
 ---
 # Usage and diagnostics implementation checkpoint
 
@@ -34,7 +34,10 @@ site, and absence of a row does not establish that an operation never occurred.
 - KeyPackage lookup actions are canonical member-resolution commands; lookup
   attempts are package validations with usable/invalid/expired/unavailable
   outcomes. Directory source counts describe cache reuse versus network
-  resolution, including search hydration. They do not identify relays or peers.
+  resolution, including search hydration. Mixed relay-list results retain their
+  cached-field provenance; a cached KeyPackage fallback reports cache. Search
+  completion is classified before the terminal update can close the subscription.
+  These measurements do not identify relays or peers.
 - Message `publication/transition` is one committed outgoing source-retention
   finalization, including initially pending/unknown sends. This is separate from
   the original message action. A replay or sibling failure does not add an edge.
@@ -42,11 +45,16 @@ site, and absence of a row does not establish that an operation never occurred.
   after relay acknowledgement. Startup repair-index reconstruction is silent.
   Retry attempts are bounded retry invocations; a batch may contain multiple
   Welcomes. Neither measurement proves recipient receipt or decryption.
+- Generated account setup records the full local-ready phase once and network-ready
+  attempts separately; the local handoff remains an OTLP-only submeasurement.
+  Local notification settings and native push settings have separate operations.
 - Maintenance attempts and persisted transitions remain separate. Execution
   durations use the account runtime's injected monotonic clock. At most 256
   neutral duration samples are retained between drains; overflow retains the
   attempt counts without durations. Pending, ambiguous and terminal-failure
-  backlog rows are latest durable state samples, not per-tick sums.
+  backlog rows are latest durable state samples, not per-tick sums. Sampling
+  reuses the existing maintenance summary and counts quarantine entries without
+  allocating identity records.
 - Agent control attempts include real handler invocations. Logical final-message
   actions remain owned after the idempotency leader is selected; do not add
   handler attempts to logical-action denominators.

@@ -502,6 +502,11 @@ where
         self.session.quarantined_groups()
     }
 
+    /// Number of currently quarantined groups without cloning their identities.
+    pub fn quarantined_group_count(&self) -> usize {
+        self.session.quarantined_group_count()
+    }
+
     /// Re-attempt hydration of a single quarantined group. `Ok(true)` if it
     /// recovered and is now live, `Ok(false)` if still unhealthy. Errors with
     /// `UnknownGroup` if the id is not currently quarantined.

@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-07
+updated: 2026-09-08
 ---
 # Usage and diagnostics
 
@@ -216,3 +216,21 @@ backlog samples, not newly failed transitions on startup. Storage migration rows
 count newly committed numbered migrations; reopening an unchanged database does
 not emit migration success. The migration attempt duration covers the migration
 runner, while the storage-open measurement covers the surrounding open operation.
+
+### Optional exporter lifecycle
+
+An unreadable consent record disables diagnostics and is reported by explicit
+settings reads; it does not prevent the app runtime from starting. Synchronous
+host setters restart exporters on the executor captured during runtime startup.
+The legacy telemetry settings getter reports the effective in-memory export
+state, so an unstarted instance reports export disabled. Read the combined
+consent settings to inspect the saved decision before starting the runtime.
+
+A cumulative OTLP series first supplied after collection starts establishes its
+own baseline at first observation. Its initial exported count and histogram are
+zero; gauges remain current values. Temporarily absent series retain their
+baselines and previous values so later source resets are still detected.
+
+If the agent management socket is unavailable while a connector owns the root,
+local controls return an error instead of writing consent behind the active
+runtime. Stop the connector before using offline controls in this degraded case.

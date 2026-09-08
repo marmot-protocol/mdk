@@ -644,7 +644,60 @@ fn collection_period_subtracts_history_and_detects_resets_against_previous_sampl
     let (next, _) = exporter.since_baseline(next);
     assert_eq!(
         next.points.last().unwrap().value,
-        ExportMetricValue::Counter(3)
+        ExportMetricValue::Counter(0)
     );
     assert_eq!(next.points[2].value, ExportMetricValue::Gauge(1.0));
+}
+
+#[test]
+fn late_cumulative_sources_start_at_zero_and_retain_their_baseline_when_absent() {
+    let exporter = MarmotRelayPlane::full_history()
+        .telemetry_exporter(
+            RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                .with_runtime_config(runtime_config()),
+            crate::product_analytics::test_permit(),
+        )
+        .unwrap();
+    let batch = |count| RelayTelemetryExportBatch {
+        points: vec![
+            ExportMetricPoint {
+                name: "late_counter",
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Counter(count),
+            },
+            ExportMetricPoint {
+                name: "late_histogram",
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Histogram(ExportHistogram {
+                    bounds_ms: vec![10],
+                    bucket_counts: vec![count],
+                    overflow_count: count,
+                    sum_ms: count * 30,
+                }),
+            },
+            ExportMetricPoint {
+                name: "late_gauge",
+                relay: None,
+                failure: None,
+                value: ExportMetricValue::Gauge(12.0),
+            },
+        ],
+    };
+    let empty = || RelayTelemetryExportBatch { points: vec![] };
+    let (_, start) = exporter.since_baseline(empty());
+    let (first, first_start) = exporter.since_baseline(batch(100));
+    assert_eq!(start, first_start);
+    assert_eq!(first.points[0].value, ExportMetricValue::Counter(0));
+    assert_eq!(first.points[1].value, batch(0).points[1].value);
+    assert_eq!(first.points[2].value, ExportMetricValue::Gauge(12.0));
+    exporter.since_baseline(empty());
+    let (next, _) = exporter.since_baseline(batch(103));
+    assert_eq!(next.points[0].value, ExportMetricValue::Counter(3));
+    assert_eq!(next.points[1].value, batch(3).points[1].value);
+    exporter.since_baseline(empty());
+    let (reset, _) = exporter.since_baseline(batch(102));
+    assert_eq!(reset.points[0].value, ExportMetricValue::Counter(0));
+    assert_eq!(reset.points[1].value, batch(0).points[1].value);
 }

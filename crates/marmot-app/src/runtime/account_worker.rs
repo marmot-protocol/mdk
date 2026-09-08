@@ -1579,14 +1579,20 @@ async fn run_app_runtime_account_worker(
                     &mut legacy_message_promotion,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
-                    let observation = shared.product_analytics.begin(crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt);
-                    let catch_up = timeout(Duration::from_secs(15), client.sync_with_partial_progress()).await;
+                    let observation = shared.product_analytics.begin(
+                        crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
+                    );
+                    let catch_up = timeout(
+                        Duration::from_secs(15), client.sync_with_partial_progress(),
+                    ).await;
                     let outcome = match &catch_up {
                         Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
                         Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
                         Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
                     };
-                    if let Some(observation) = observation { observation.finish(outcome.as_str()); }
+                    if let Some(observation) = observation {
+                        observation.finish(outcome.as_str());
+                    }
                     match catch_up {
                         Ok(Ok(summary)) => {
                             publish_app_runtime_summary(
@@ -1675,15 +1681,22 @@ async fn run_app_runtime_account_worker(
                 match client.run_due_maintenance().await {
                     Ok(summary) => {
                         if let Some(permit) = &backlog_permit {
-                            product_backlog.sample(permit, crate::ProductFamily::Maintenance,"pending",u64::from(summary.deferred));
-                            product_backlog.sample(permit, crate::ProductFamily::Maintenance,"ambiguous",u64::from(summary.ambiguous_exposure));
-                            // Empty effects excludes this tick's failed attempts:
-                            // this is a durable-state level, sampled once/window.
-                            if let Ok(state) = client.runtime.maintenance_run_summary(&Default::default()) {
-                                product_backlog.sample(permit, crate::ProductFamily::Maintenance,"failed",u64::from(state.failures));
-                            }
-
-                            product_backlog.sample(permit, crate::ProductFamily::Recovery, "quarantine", client.quarantined_groups().len() as u64);
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Maintenance, "pending",
+                                u64::from(summary.deferred),
+                            );
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Maintenance, "ambiguous",
+                                u64::from(summary.ambiguous_exposure),
+                            );
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Maintenance, "failed",
+                                u64::from(client.maintenance_failed_backlog),
+                            );
+                            product_backlog.sample(
+                                permit, crate::ProductFamily::Recovery, "quarantine",
+                                client.runtime.quarantined_group_count() as u64,
+                            );
                         }
                         publish_client_pending_projection_updates(
                             &mut client,

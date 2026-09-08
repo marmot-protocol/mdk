@@ -1975,11 +1975,21 @@ mod otlp {
     {
         // Include our explicit DNS lookup in the overall attempt deadline.
         tokio::time::timeout(REQUEST_TIMEOUT, async {
-            if permit.is_some_and(|p|!p.valid()) { return Err(RelayExportError::Request); }
-            let pin = if let Some(permit)=permit {
-                tokio::select! { biased; _=permit.cancelled()=>return Err(RelayExportError::Request), result=host_safety::resolve_with(metrics_url,resolver)=>result? }
-            } else { host_safety::resolve_with(metrics_url,resolver).await? };
-            if permit.is_some_and(|p|!p.valid()) { return Err(RelayExportError::Request); }
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let pin = if let Some(permit) = permit {
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return Err(RelayExportError::Request),
+                    result = host_safety::resolve_with(metrics_url, resolver) => result?,
+                }
+            } else {
+                host_safety::resolve_with(metrics_url, resolver).await?
+            };
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
             let client = pin.build_client()?;
             let request = to_request(
                 batch,
@@ -1993,10 +2003,19 @@ mod otlp {
                 .header("content-type", "application/x-protobuf")
                 .bearer_auth(authorization_bearer_token)
                 .body(body);
-            if permit.is_some_and(|p|!p.valid()) { return Err(RelayExportError::Request); }
-            let response=if let Some(permit)=permit {
-                tokio::select! {biased; _=permit.cancelled()=>return Err(RelayExportError::Request), result=request.send()=>result}
-            } else {request.send().await}.map_err(|_|RelayExportError::Request)?;
+            if permit.is_some_and(|p| !p.valid()) {
+                return Err(RelayExportError::Request);
+            }
+            let response = if let Some(permit) = permit {
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return Err(RelayExportError::Request),
+                    result = request.send() => result,
+                }
+            } else {
+                request.send().await
+            }
+            .map_err(|_| RelayExportError::Request)?;
             if !response.status().is_success() {
                 return Err(RelayExportError::Status(response.status().as_u16()));
             }
@@ -2531,15 +2550,28 @@ impl RelayTelemetryExporter {
         }
         let period = state.as_mut().expect("initialized export baseline");
         let started = period.started;
-        period.previous = current.clone();
-        let baseline = &period.baseline;
+        for point in &current.points {
+            if let Some(old) = period.previous.points.iter_mut().find(|old| {
+                old.name == point.name && old.relay == point.relay && old.failure == point.failure
+            }) {
+                *old = point.clone();
+            } else {
+                period.previous.points.push(point.clone());
+            }
+        }
+        let baseline = &mut period.baseline;
         let mut output = current.clone();
         for point in &mut output.points {
-            let old = baseline.points.iter().find(|old| {
+            let index = baseline.points.iter().position(|old| {
                 old.name == point.name && old.relay == point.relay && old.failure == point.failure
             });
-            // A series first observed during this period has no pre-consent history.
-            let Some(old) = old else { continue };
+            // Optional sources may already contain pre-consent history when first
+            // supplied. Establish their baseline before exporting any cumulative data.
+            let index = index.unwrap_or_else(|| {
+                baseline.points.push(point.clone());
+                baseline.points.len() - 1
+            });
+            let old = &baseline.points[index];
             match (&mut point.value, &old.value) {
                 (ExportMetricValue::Counter(value), ExportMetricValue::Counter(base)) => {
                     *value -= base

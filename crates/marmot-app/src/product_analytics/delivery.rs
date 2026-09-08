@@ -8,8 +8,11 @@ impl ProductAnalytics {
         }
     }
     pub(super) async fn send_pending_with_permit(&self, permit: &DiagnosticsPermit) {
-        let _lock =
-            tokio::select! {biased;_=permit.cancelled()=>return, lock=self.send_lock.lock()=>lock};
+        let _lock = tokio::select! {
+            biased;
+            _ = permit.cancelled() => return,
+            lock = self.send_lock.lock() => lock,
+        };
         if !permit.valid() {
             return;
         }
@@ -55,7 +58,13 @@ impl ProductAnalytics {
             if !permit.valid() || self.clock.monotonic() >= expires {
                 return;
             }
-            let pin = tokio::select! {biased;_=permit.cancelled()=>return,result=collector_host_safety::resolve_with(&endpoint,collector_host_safety::system_resolve)=>result};
+            let pin = tokio::select! {
+                biased;
+                _ = permit.cancelled() => return,
+                result = collector_host_safety::resolve_with(
+                    &endpoint, collector_host_safety::system_resolve,
+                ) => result,
+            };
             let mut retry_delay = None;
             if let Ok(pin) = pin {
                 if !permit.valid() || self.clock.monotonic() >= expires {
@@ -68,7 +77,11 @@ impl ProductAnalytics {
                 if !permit.valid() || self.clock.monotonic() >= expires {
                     return;
                 }
-                let result = tokio::select! {biased;_=permit.cancelled()=>return,result=request.send()=>result};
+                let result = tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return,
+                    result = request.send() => result,
+                };
                 if !permit.valid() {
                     return;
                 }
@@ -121,7 +134,11 @@ impl ProductAnalytics {
             if attempt < 3
                 && let Some(delay) = retry_delay
             {
-                tokio::select! {biased;_=permit.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(delay))=>{}}
+                tokio::select! {
+                    biased;
+                    _ = permit.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+                }
                 continue;
             }
             return;

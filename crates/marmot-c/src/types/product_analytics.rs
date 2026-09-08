@@ -5,17 +5,59 @@ use crate::{
     memory::{c_bool, optional_str, required_str, str_array},
 };
 use marmot_uniffi::conversions::*;
-c_enum! {MarmotUsageDiagnosticsDecision from UsageDiagnosticsDecisionFfi {AcceptanceRequired,Declined,Granted}}
-c_enum! {MarmotProductEventMode from ProductEventModeFfi {Journey,Aggregate}}
-c_enum! {MarmotProductAnalyticsActivity from ProductAnalyticsActivityFfi {Foreground,Background,AccountChanged,ForegroundNotification,ForegroundDeepLink}}
-c_enum! {MarmotProductRecordResult from ProductRecordResultFfi {Recorded,IgnoredDisabled,IgnoredUnconfigured,IgnoredDuplicate,DroppedCapacity}}
-c_enum! {MarmotDiagnosticsExporterStatus from DiagnosticsExporterStatusFfi {Disabled,ConsentRequired,Unconfigured,UnsupportedBuild,Ready,ConfigurationRejected}}
-c_enum! {MarmotProductPropertyKind from ProductPropertyKindFfi {Enum,Boolean,CountBucket,DurationBucket}}
-c_mirror! {MarmotProductPropertySchema from ProductPropertySchemaFfi{
-str name,
-enum_val kind: MarmotProductPropertyKind,
-str_vec choices/choices_len,
-}}
+c_enum! {
+    MarmotUsageDiagnosticsDecision from UsageDiagnosticsDecisionFfi {
+        AcceptanceRequired, Declined, Granted
+    }
+}
+c_enum! {
+    MarmotProductEventMode from ProductEventModeFfi {
+        Journey, Aggregate
+    }
+}
+c_enum! {
+    MarmotProductAnalyticsActivity from ProductAnalyticsActivityFfi {
+        Foreground,
+        Background,
+        AccountChanged,
+        ForegroundNotification,
+        ForegroundDeepLink,
+    }
+}
+c_enum! {
+    MarmotProductRecordResult from ProductRecordResultFfi {
+        Recorded,
+        IgnoredDisabled,
+        IgnoredUnconfigured,
+        IgnoredDuplicate,
+        DroppedCapacity,
+    }
+}
+c_enum! {
+    MarmotDiagnosticsExporterStatus from DiagnosticsExporterStatusFfi {
+        Disabled,
+        ConsentRequired,
+        Unconfigured,
+        UnsupportedBuild,
+        Ready,
+        ConfigurationRejected,
+    }
+}
+c_enum! {
+    MarmotProductPropertyKind from ProductPropertyKindFfi {
+        Enum,
+        Boolean,
+        CountBucket,
+        DurationBucket,
+    }
+}
+c_mirror! {
+    MarmotProductPropertySchema from ProductPropertySchemaFfi {
+        str name,
+        enum_val kind: MarmotProductPropertyKind,
+        str_vec choices/choices_len,
+    }
+}
 impl MarmotProductPropertySchema {
     /// # Safety
     /// Borrowed pointers must reference valid strings and arrays for this call.
@@ -30,10 +72,12 @@ impl MarmotProductPropertySchema {
         })
     }
 }
-c_mirror! {MarmotProductEventProperty from ProductEventPropertyFfi{
-str name,
-str value,
-}}
+c_mirror! {
+    MarmotProductEventProperty from ProductEventPropertyFfi {
+        str name,
+        str value,
+    }
+}
 impl MarmotProductEventProperty {
     /// # Safety
     /// Borrowed pointers must reference valid strings and arrays for this call.
@@ -44,10 +88,12 @@ impl MarmotProductEventProperty {
         })
     }
 }
-c_mirror! {MarmotProductEvent from ProductEventFfi{
-str name,
-vec properties/properties_len: MarmotProductEventProperty,
-}}
+c_mirror! {
+    MarmotProductEvent from ProductEventFfi {
+        str name,
+        vec properties/properties_len: MarmotProductEventProperty,
+    }
+}
 impl MarmotProductEvent {
     /// # Safety
     /// Borrowed pointers must reference valid strings and arrays for this call.
@@ -60,31 +106,37 @@ impl MarmotProductEvent {
         })
     }
 }
-c_mirror! {MarmotUsageDiagnosticsSettings from UsageDiagnosticsSettingsFfi, free marmot_usage_diagnostics_settings_free{
-enum_val decision: MarmotUsageDiagnosticsDecision,
-str policy_revision,
-str registry_revision,
-copy updated_at_ms: i64,
-copy previously_enabled: u8,
-}}
-c_mirror! {MarmotUsageDiagnosticsStatus from UsageDiagnosticsStatusFfi, free marmot_usage_diagnostics_status_free{
-enum_val consent: MarmotUsageDiagnosticsDecision,
-enum_val telemetry: MarmotDiagnosticsExporterStatus,
-enum_val product_analytics: MarmotDiagnosticsExporterStatus,
-copy queued_events: u64,
-copy dropped_events: u64,
-copy accepted_batches: u64,
-copy failed_batches: u64,
-}}
-c_mirror! {MarmotProductAnalyticsMetadata from ProductAnalyticsMetadataFfi{
-str app_version,
-str os_family,
-str os_major_version,
-str device_class,
-str host_surface,
-str environment,
-copy is_debug: u8,
-}}
+c_mirror! {
+    MarmotUsageDiagnosticsSettings from UsageDiagnosticsSettingsFfi, free marmot_usage_diagnostics_settings_free {
+        enum_val decision: MarmotUsageDiagnosticsDecision,
+        str policy_revision,
+        str registry_revision,
+        copy updated_at_ms: i64,
+        copy previously_enabled: u8,
+    }
+}
+c_mirror! {
+    MarmotUsageDiagnosticsStatus from UsageDiagnosticsStatusFfi, free marmot_usage_diagnostics_status_free {
+        enum_val consent: MarmotUsageDiagnosticsDecision,
+        enum_val telemetry: MarmotDiagnosticsExporterStatus,
+        enum_val product_analytics: MarmotDiagnosticsExporterStatus,
+        copy queued_events: u64,
+        copy dropped_events: u64,
+        copy accepted_batches: u64,
+        copy failed_batches: u64,
+    }
+}
+c_mirror! {
+    MarmotProductAnalyticsMetadata from ProductAnalyticsMetadataFfi {
+        str app_version,
+        str os_family,
+        str os_major_version,
+        str device_class,
+        str host_surface,
+        str environment,
+        copy is_debug: u8,
+    }
+}
 impl MarmotProductAnalyticsMetadata {
     /// # Safety
     /// Borrowed pointers must reference valid strings and arrays for this call.
@@ -100,11 +152,13 @@ impl MarmotProductAnalyticsMetadata {
         })
     }
 }
-c_mirror! {MarmotProductEventSchema from ProductEventSchemaFfi{
-str name,
-enum_val mode: MarmotProductEventMode,
-vec properties/properties_len: MarmotProductPropertySchema,
-}}
+c_mirror! {
+    MarmotProductEventSchema from ProductEventSchemaFfi {
+        str name,
+        enum_val mode: MarmotProductEventMode,
+        vec properties/properties_len: MarmotProductPropertySchema,
+    }
+}
 impl MarmotProductEventSchema {
     /// # Safety
     /// Borrowed pointers must reference valid strings and arrays for this call.
@@ -118,14 +172,16 @@ impl MarmotProductEventSchema {
         })
     }
 }
-c_mirror! {MarmotProductAnalyticsRuntimeConfig from ProductAnalyticsRuntimeConfigFfi{
-opt_str events_endpoint,
-opt_str app_key,
-rec metadata: MarmotProductAnalyticsMetadata,
-vec registry/registry_len: MarmotProductEventSchema,
-copy allow_loopback: u8,
-str operator,
-}}
+c_mirror! {
+    MarmotProductAnalyticsRuntimeConfig from ProductAnalyticsRuntimeConfigFfi {
+        opt_str events_endpoint,
+        opt_str app_key,
+        rec metadata: MarmotProductAnalyticsMetadata,
+        vec registry/registry_len: MarmotProductEventSchema,
+        copy allow_loopback: u8,
+        str operator,
+    }
+}
 impl MarmotProductAnalyticsRuntimeConfig {
     /// # Safety
     /// Borrowed pointers must reference valid strings and arrays for this call.
