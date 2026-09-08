@@ -13926,16 +13926,22 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
         )
         .await
         .unwrap();
-    for member in [&bob_id, &carol_id] {
-        wait_for_event(&mut events, |event| {
+    // Either recipient can join first; do not discard the other recipient's event.
+    let mut awaiting = std::collections::HashSet::from([bob_id.clone(), carol_id.clone()]);
+    while !awaiting.is_empty() {
+        let event = wait_for_event(&mut events, |event| {
             matches!(
                 event,
                 MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
-                    if account_id_hex == member && joined == &group_id
+                    if awaiting.contains(account_id_hex) && joined == &group_id
             )
         })
         .await;
-        accept_group_invite_retrying_busy(&runtime, member, &group_id)
+        let MarmotAppEvent::GroupJoined { account_id_hex, .. } = event else {
+            unreachable!("wait_for_event matched GroupJoined");
+        };
+        awaiting.remove(&account_id_hex);
+        accept_group_invite_retrying_busy(&runtime, &account_id_hex, &group_id)
             .await
             .unwrap();
     }
