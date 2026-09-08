@@ -401,6 +401,35 @@ async fn post_audit_log_tracker_update(
                 }
                 // No complete row yet: no request, checkpoint, or failure warning.
                 Ok(AuditUploadAttempt::Deferred) => {}
+                // The endpoint refused this content outright. RFC 9110 15.5.14
+                // has a server send Retry-After when a 413 is temporary, so its
+                // absence is read as a verdict on this file, not a cooldown:
+                // take the same acknowledgment as the local ceiling above, which
+                // is what stops the retry timer from re-posting identical bytes
+                // forever. Unlike the ceiling, the verdict is escapable — the
+                // sidecar is not durable state, and a manual per-file upload
+                // never consults it. A 413 *with* Retry-After, parseable or
+                // not, is a request to try later and stays a generic rejection.
+                Ok(AuditUploadAttempt::Rejected {
+                    status: status @ 413,
+                    retry_after: None,
+                }) => {
+                    too_large_recorded += 1;
+                    checkpoint.acknowledge(
+                        file,
+                        file.size_bytes,
+                        AuditUploadOutcome::TooLargeToUpload,
+                    );
+                    checkpoint_changed = true;
+                    tracing::warn!(
+                        target: "marmot_app::audit_log",
+                        method = "post_audit_log_tracker_update",
+                        http_status = status,
+                        file_index,
+                        size_bytes = file.size_bytes,
+                        "forensic audit log file refused as too large by the tracker endpoint"
+                    );
+                }
                 Ok(AuditUploadAttempt::Rejected {
                     status,
                     retry_after: minimum,

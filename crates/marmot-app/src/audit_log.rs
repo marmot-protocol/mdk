@@ -153,9 +153,14 @@ impl AuditUploadSnapshot {
 pub(crate) enum AuditUploadOutcome {
     /// The endpoint accepted the file's whole content.
     Uploaded,
-    /// The file is larger than the endpoint's per-request ceiling, so no
-    /// automatic upload can ever accept it. Recorded so the tracker reports it
-    /// once instead of re-attempting on every trigger.
+    /// The tracker will not re-post this file's content: it is over the local
+    /// `AUDIT_LOG_UPLOAD_MAX_BYTES` ceiling, or the endpoint answered `413`
+    /// without `Retry-After` (RFC 9110 15.5.14 has a server send that header
+    /// when the refusal is temporary). Recorded so the tracker reports it once
+    /// instead of re-attempting on every trigger. Like every checkpoint entry
+    /// it is keyed on the file's size and mtime, so deleting the sidecar clears
+    /// it, and a manual per-file upload never consults it. A `413` that
+    /// carries `Retry-After` is a cooldown, not this outcome.
     TooLargeToUpload,
 }
 

@@ -945,6 +945,58 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
 }
 
 #[tokio::test]
+async fn endpoint_too_large_verdict_is_recorded_once_and_never_re_posted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(tmp.path());
+    let account = home.create_account("alice").unwrap();
+    let dir = home.account_dir(&account.label);
+    // Under the local ceiling, so only the endpoint can refuse it. A 413
+    // without Retry-After is a permanent verdict on this entity (RFC 9110
+    // 15.5.14), not a cooldown.
+    let refused = b"{\"seq\":1}\n";
+    let accepted = b"{\"seq\":2}\n";
+    std::fs::write(dir.join("audit-engine-v3-seg000001.jsonl"), refused).unwrap();
+    std::fs::write(dir.join("audit-engine-v3-seg000002.jsonl"), accepted).unwrap();
+
+    let sink = CaptureSink::start().await;
+    sink.script(&[413, 204]);
+    let runtime = tracker_runtime(tmp.path(), &sink.endpoint());
+
+    let first = runtime.post_audit_log_tracker_update().await.unwrap();
+    assert_eq!(first.uploaded.len(), 1);
+    assert_eq!(
+        sink.take_bodies(),
+        vec![refused.to_vec(), accepted.to_vec()],
+        "the refusal must not wedge the file behind it"
+    );
+
+    // The sidecar pins which verdict was recorded; the second pass below pins
+    // that it holds.
+    let checkpoint = std::fs::read_to_string(checkpoint_path(&home, &account.label))
+        .expect("checkpoint written");
+    let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+    assert_eq!(
+        checkpoint["files"]["audit-engine-v3-seg000001.jsonl"]["outcome"],
+        serde_json::json!("too_large_to_upload")
+    );
+    assert_eq!(
+        checkpoint["files"]["audit-engine-v3-seg000002.jsonl"]["outcome"],
+        serde_json::json!("uploaded")
+    );
+
+    // A second run neither retries the refused file nor re-posts the one it
+    // already acknowledged.
+    runtime.post_audit_log_tracker_update().await.unwrap();
+    assert!(sink.take_bodies().is_empty());
+
+    // Never deleted or truncated: retention is mdk#1014's contract.
+    assert_eq!(
+        std::fs::read(dir.join("audit-engine-v3-seg000001.jsonl")).unwrap(),
+        refused.to_vec()
+    );
+}
+
+#[tokio::test]
 async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
