@@ -16,7 +16,7 @@ fn fresh_file_preserves_pragmas_permissions_and_close() {
     let storage = SqliteSharedStorage::open(&path).unwrap();
     {
         let conn = storage.lock().unwrap();
-        assert_eq!(count(&conn), 2);
+        assert_eq!(count(&conn), 3);
         for (pragma, expected) in [
             ("busy_timeout", 5000),
             ("synchronous", 1),
@@ -79,7 +79,7 @@ fn current_open_is_read_only_and_idempotent_while_writer_holds_lock() {
         .unwrap();
     let second = SqliteSharedStorage::open(&path).unwrap();
     let conn = second.lock().unwrap();
-    assert_eq!(count(&conn), 2);
+    assert_eq!(count(&conn), 3);
     assert_eq!(
         conn.query_row(
             "SELECT applied_at_unix_seconds FROM shared_schema_migrations",
@@ -110,7 +110,7 @@ fn concurrent_openers_record_once() {
                 scope.spawn(|| {
                     barrier.wait();
                     let storage = SqliteSharedStorage::open(&path).unwrap();
-                    assert_eq!(count(&storage.lock().unwrap()), 2);
+                    assert_eq!(count(&storage.lock().unwrap()), 3);
                 })
             })
             .collect();
@@ -118,7 +118,7 @@ fn concurrent_openers_record_once() {
             handle.join().unwrap();
         }
     });
-    assert_eq!(count(&conn), 2);
+    assert_eq!(count(&conn), 3);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn invalid_history_and_future_versions_fail_before_body() {
         "(1, 'private name', 0)",
         "(0, '0001_shared_store', 0)",
         "(-1, '0001_shared_store', 0), (1, '0001_shared_store', 0)",
-        "(3, 'future private name', 0)",
+        "(4, 'future private name', 0)",
     ] {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(LEDGER_SQL).unwrap();
@@ -191,12 +191,12 @@ fn invalid_history_and_future_versions_fail_before_body() {
         ))
         .unwrap();
         let error = run_all(&mut conn).unwrap_err();
-        if rows.starts_with("(3") {
+        if rows.starts_with("(4") {
             assert!(matches!(
                 error,
                 StorageError::UnsupportedSchemaVersion {
-                    found: 3,
-                    latest_supported: 2
+                    found: 4,
+                    latest_supported: 3
                 }
             ));
         } else {
@@ -269,7 +269,7 @@ fn body_and_ledger_failures_roll_back_and_redact_sqlite_messages() {
     assert!(!table_exists(&conn, "directory_users").unwrap());
     conn.execute_batch("DROP TRIGGER reject").unwrap();
     run_all(&mut conn).unwrap();
-    assert_eq!(count(&conn), 2);
+    assert_eq!(count(&conn), 3);
 }
 
 #[test]
@@ -456,5 +456,44 @@ fn ledger_integer_primary_key_rejects_text_and_bad_name_is_invalid_history() {
     assert_eq!(
         run_all(&mut conn).unwrap_err().to_string(),
         "backend failure: invalid shared store migration history"
+    );
+}
+
+#[test]
+fn presentation_migration_preserves_existing_usage_settings_and_cached_profiles() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    run(&mut conn, &MIGRATIONS[..2]).unwrap();
+    conn.execute_batch("UPDATE usage_diagnostics_settings SET decision=1, policy_revision='accepted', updated_at_ms=123;
+        INSERT INTO directory_users(account_id_hex, npub, profile_json, relay_lists_json)
+        VALUES ('peer', 'fixture', '{\"name\":\"Cached before P2\"}', '{}');").unwrap();
+    run_all(&mut conn).unwrap();
+    run_all(&mut conn).unwrap();
+    assert_eq!(count(&conn), 3);
+    let settings: (i64, String, i64) = conn
+        .query_row(
+            "SELECT decision, policy_revision, updated_at_ms FROM usage_diagnostics_settings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(settings, (1, "accepted".into(), 123));
+    let profile: String = conn
+        .query_row(
+            "SELECT profile_json FROM directory_users WHERE account_id_hex='peer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(profile, "{\"name\":\"Cached before P2\"}");
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM directory_presentation_meta",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        revision, 0,
+        "existing profiles are read directly without replaying history"
     );
 }

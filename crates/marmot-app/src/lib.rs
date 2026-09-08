@@ -623,6 +623,7 @@ pub struct MarmotApp {
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
+    pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
@@ -1491,6 +1492,7 @@ impl MarmotApp {
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
+            presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -1571,6 +1573,7 @@ impl MarmotApp {
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
+            presentation_signals: Arc::new(Default::default()),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
@@ -3276,6 +3279,7 @@ impl MarmotApp {
             return Ok(());
         }
         storage.set_group_self_membership(group_id_hex, membership)?;
+        self.presentation_signals.wake();
         Ok(())
     }
 
@@ -4845,6 +4849,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(delta.label.clone());
+        self.presentation_signals.wake();
         Ok(())
     }
 
@@ -4874,6 +4879,7 @@ impl MarmotApp {
                 &classifier,
             )?
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        self.presentation_signals.wake();
         self.hydrate_chat_list_row(Some(&mut row))?;
 
         // Only the created row belongs on the response tail. Preserve any
@@ -4905,6 +4911,7 @@ impl MarmotApp {
             return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
         }
         let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
+        self.presentation_signals.wake();
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

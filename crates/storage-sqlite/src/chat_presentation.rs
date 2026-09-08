@@ -4,10 +4,14 @@
 //! named and unnamed groups via `set_chat_presentation_members`. Missing evidence deliberately
 //! produces a typed fallback, not a retry loop; later roster hydration must call that same
 //! setter, which requeues the row. P2 wires both lifecycle paths before enabling its worker.
+mod maintenance;
 use crate::connection::CachedSql;
 use crate::{ChatListAvatar, SqliteAccountStorage, SqliteResultExt, serialize, u64_to_i64};
 use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
 use cgka_traits::storage::{StorageError, StorageResult};
+pub use maintenance::{
+    ChatPresentationActivePeer, ChatPresentationCatchUp, ChatPresentationCheckpoint,
+};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +103,7 @@ pub struct ChatPresentationInput {
     pub row_epoch: Vec<u8>,
     pub group_name: String,
     pub member_count: Option<u64>,
+    pub self_membership: crate::SelfMembership,
     pub members: Vec<String>,
     pub avatar_url: Option<String>,
     pub avatar: Option<ChatListAvatar>,
@@ -229,7 +234,7 @@ impl SqliteAccountStorage {
                         a.image_media_type,
                         (SELECT component_data_hex FROM account_group_app_components c
                          WHERE c.group_id_hex = a.group_id_hex AND c.component_id = ?2),
-                        r.presentation_row_epoch
+                        r.presentation_row_epoch, a.self_membership
                  FROM chat_list_rows r JOIN account_groups a ON a.group_id_hex = r.group_id_hex
                  CROSS JOIN chat_presentation_meta m WHERE r.group_id_hex = ?1 AND m.id = 1",
                 params![group, GROUP_AVATAR_URL_COMPONENT_ID],
@@ -250,6 +255,7 @@ impl SqliteAccountStorage {
                     Ok(ChatPresentationInput {
                         group_id_hex: group.to_owned(),
                         row_epoch: row.get(10)?,
+                        self_membership: crate::SelfMembership::from_storage(&row.get::<_, String>(11)?),
                         source_version: ChatPresentationVersion {
                             store_epoch: row.get(0)?,
                             revision: nonnegative(row, 1)?,
@@ -282,49 +288,9 @@ impl SqliteAccountStorage {
         group: &str,
         members: &[String],
     ) -> StorageResult<()> {
-        let mut normalized: Vec<_> = if members.len() == 2 {
-            members
-                .iter()
-                .map(|s| s.trim().to_ascii_lowercase())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        normalized.sort();
-        normalized.dedup();
-        if normalized.len() != 2 || normalized.iter().any(|s| !valid_member_identity(s)) {
-            normalized.clear();
-        }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let mut query = conn.prepare_cached(
-                "SELECT member_id_hex FROM chat_presentation_members
-                 WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3",
-            ).storage()?;
-            let previous = query.query_map([group], |row| row.get::<_, String>(0))
-                .storage()?.collect::<rusqlite::Result<Vec<_>>>().storage()?;
-            drop(query);
-            if previous == normalized {
-                return Ok(());
-            }
-            conn.execute_cached(
-                "DELETE FROM chat_presentation_members WHERE group_id_hex = ?1", [group],
-            ).storage()?;
-            for member in normalized {
-                conn.execute_cached(
-                    "INSERT INTO chat_presentation_members(group_id_hex, member_id_hex) VALUES (?1, ?2)",
-                    params![group, member],
-                ).storage()?;
-            }
-            conn.execute_cached(
-                "UPDATE chat_list_rows SET presentation_json = NULL,
-                    presentation_source_revision = presentation_source_revision + 1
-                 WHERE group_id_hex = ?1", [group],
-            ).storage()?;
-            conn.execute_cached(
-                "DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1", [group],
-            ).storage()?;
-            Ok(())
+            replace_members_tx(&conn, group, members)
         })
     }
     /// Compare-and-store also makes batched backfill restart-safe. A failed write rolls back its dependencies.
@@ -349,6 +315,15 @@ impl SqliteAccountStorage {
             return Err(invalid("presentation peer is not in captured roster"));
         }
         self.connection.with_transaction(|| {
+            let checkpoint = self.chat_presentation_checkpoint()?;
+            if !checkpoint.state.shared_epoch.is_empty()
+                && value
+                    .profile_version
+                    .as_ref()
+                    .is_none_or(|v| v.store_epoch != checkpoint.state.shared_epoch)
+            {
+                return Ok(ChatPresentationWrite::Stale);
+            }
             let conn = self.lock()?;
             let existing: Option<(Option<Vec<u8>>, i64)> = conn
                 .query_row(
@@ -468,6 +443,66 @@ impl SqliteAccountStorage {
             .collect::<rusqlite::Result<Vec<_>>>()
             .storage()
     }
+}
+
+pub(crate) fn replace_members_tx(
+    conn: &rusqlite::Connection,
+    group: &str,
+    members: &[String],
+) -> StorageResult<()> {
+    let mut normalized: Vec<_> = if members.len() == 2 {
+        members
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    normalized.sort();
+    normalized.dedup();
+    if normalized.len() != 2 || normalized.iter().any(|s| !valid_member_identity(s)) {
+        normalized.clear();
+    }
+    let mut query = conn
+        .prepare_cached(
+            "SELECT member_id_hex FROM chat_presentation_members
+                 WHERE group_id_hex = ?1 ORDER BY member_id_hex LIMIT 3",
+        )
+        .storage()?;
+    let previous = query
+        .query_map([group], |row| row.get::<_, String>(0))
+        .storage()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .storage()?;
+    drop(query);
+    if previous == normalized {
+        return Ok(());
+    }
+    conn.execute_cached(
+        "DELETE FROM chat_presentation_members WHERE group_id_hex = ?1",
+        [group],
+    )
+    .storage()?;
+    for member in normalized {
+        conn.execute_cached(
+            "INSERT INTO chat_presentation_members(group_id_hex, member_id_hex) VALUES (?1, ?2)",
+            params![group, member],
+        )
+        .storage()?;
+    }
+    conn.execute_cached(
+        "UPDATE chat_list_rows SET presentation_json = NULL,
+                    presentation_source_revision = presentation_source_revision + 1
+                 WHERE group_id_hex = ?1",
+        [group],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "DELETE FROM chat_presentation_dependencies WHERE group_id_hex = ?1",
+        [group],
+    )
+    .storage()?;
+    Ok(())
 }
 
 fn valid_member_identity(raw: &str) -> bool {

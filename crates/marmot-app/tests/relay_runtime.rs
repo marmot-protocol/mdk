@@ -4347,6 +4347,14 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let carol = create_network_ready_identity(&runtime, setup).await;
+    let mut bob_chats = runtime
+        .subscribe_chats(&bob.account.account_id_hex, false)
+        .await
+        .unwrap();
+    let mut carol_chats = runtime
+        .subscribe_chats(&carol.account.account_id_hex, false)
+        .await
+        .unwrap();
     let group_id = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -4359,6 +4367,12 @@ async fn removed_member_triggers_local_push_token_cleanup() {
         )
         .await
         .unwrap();
+    // Group creation schedules recipient catch-up in the background. Wait for
+    // both recipients to join before registering tokens, otherwise a share can
+    // succeed with no joined groups and leave this cleanup test racing setup.
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
+    wait_for_chat_update(&mut carol_chats, |chat| chat.group_id_hex == group_id_hex).await;
     let server_pubkey = nostr::Keys::generate().public_key().to_hex();
 
     for member in [&bob, &carol] {
@@ -4372,10 +4386,12 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             Some(url.clone()),
         )
         .unwrap();
-        runtime
+        let share = runtime
             .share_push_registration(&member.account.account_id_hex)
             .await
             .unwrap();
+        assert_eq!(share.failed_groups, 0);
+        assert_eq!(share.pending_groups, 0);
     }
     runtime.catch_up_accounts().await.unwrap();
 

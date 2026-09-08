@@ -37,7 +37,8 @@ pub use chat_list::{
     ChatPinState, ExistingDirectConversation, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
-    CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationInput, ChatPresentationRead,
+    CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,
+    ChatPresentationCheckpoint, ChatPresentationInput, ChatPresentationRead,
     ChatPresentationVersion, ChatPresentationWrite, ConversationPresentation,
     PresentationResolution, PresentationSource, PresentationText, SelectedAvatar,
     StoredChatPresentation,
@@ -61,8 +62,9 @@ pub use prepared_group_image_upload::{
     PreparedGroupImageUploadState,
 };
 pub use shared::{
-    PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
-    StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
+    DirectoryPresentation, DirectoryPresentationChanges, PublicDirectoryUserRecord,
+    SqliteSharedStorage, StoredAuditLogSettings, StoredRelayTelemetrySettings,
+    StoredUsageDiagnosticsSettings,
 };
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]

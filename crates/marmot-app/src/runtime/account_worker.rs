@@ -1018,6 +1018,9 @@ async fn run_app_runtime_account_worker(
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
+    let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
+    let mut presentation_wakeups = app.presentation_signals.subscribe_work();
+    let mut presentation_due = true;
     // Prepare exact Welcome attempts under the serialized owner, then let only
     // relay I/O run independently. The worker stays available for inbound
     // delivery, maintenance, media completions, timers, and commands while a
@@ -1600,7 +1603,22 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
+            result = presentation_wakeups.changed() => {
+                if result.is_ok() { presentation_due = true; }
+            }
+            _ = tokio::task::yield_now(), if presentation_due => {
+                if lifecycle.is_stopping() { continue 'worker; }
+                presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
+                    Ok(more) => more,
+                    Err(_) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
+                            "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
+                        false
+                    }
+                };
+            }
             _ = maintenance_tick.tick() => {
+                presentation_due = true;
                 // Periodic maintenance is never urgent, and its longest legs
                 // run well past the whole shutdown budget: the key-package
                 // catch-up below is capped at 15s, and an armed epoch-gap
