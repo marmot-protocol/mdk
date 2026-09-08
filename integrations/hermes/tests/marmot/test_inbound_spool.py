@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -351,9 +352,14 @@ class InboundSpoolTests(unittest.TestCase):
                 child = subprocess.Popen(
                     [sys.executable, __file__, "--crash-child", str(path), str(marker), crash_state]
                 )
-                wait_for(marker)
-                os.kill(child.pid, signal.SIGKILL)
-                self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                try:
+                    wait_for(marker)
+                    os.kill(child.pid, signal.SIGKILL)
+                    self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
                 probe = subprocess.run(
                     [sys.executable, __file__, "--probe", str(path)],
                     check=True,
@@ -384,9 +390,14 @@ class InboundSpoolTests(unittest.TestCase):
                         crash_point,
                     ]
                 )
-                wait_for(marker)
-                os.kill(child.pid, signal.SIGKILL)
-                self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                try:
+                    wait_for(marker)
+                    os.kill(child.pid, signal.SIGKILL)
+                    self.assertEqual(-signal.SIGKILL, child.wait(timeout=5))
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
                 probe_result = subprocess.run(
                     [sys.executable, __file__, "--probe-all", str(path)],
                     check=True,
@@ -397,6 +408,58 @@ class InboundSpoolTests(unittest.TestCase):
                 result = json.loads(probe_result.stdout)
                 self.assertEqual(expected_pending, result["counts"].get("pending", 0))
                 self.assertEqual(expected_pending, len(result["texts"]))
+
+    def test_claim_double_fault_reopens_and_recovers_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = spool.InboundSpool(Path(tmp) / "spool.sqlite3")
+            store.open()
+            item = event(1)
+            store.record(item)
+            original_generation = store.generation
+            original_verify = store._checkpoint_and_verify_bound
+            failed_once = False
+
+            def fail_verification_once():
+                nonlocal failed_once
+                if not failed_once:
+                    failed_once = True
+                    raise spool.InboundSpoolError("synthetic original verification failure")
+                return original_verify()
+
+            class FailCompensatingUpdate:
+                def __init__(self, db):
+                    self.db = db
+
+                def __getattr__(self, name):
+                    return getattr(self.db, name)
+
+                def __enter__(self):
+                    self.db.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.db.__exit__(*args)
+
+                def execute(self, statement, parameters=()):
+                    if "claim_post_commit_verification_failed" in statement:
+                        raise sqlite3.OperationalError("synthetic compensation failure")
+                    return self.db.execute(statement, parameters)
+
+            store._checkpoint_and_verify_bound = fail_verification_once
+            store._db = FailCompensatingUpdate(store._db)
+            with self.assertRaisesRegex(
+                spool.InboundSpoolError,
+                "synthetic original verification failure",
+            ):
+                store.claim(item["message_id_hex"])
+
+            recovered = store.get(item["message_id_hex"])
+            self.assertTrue(store.is_open)
+            self.assertGreater(store.generation, original_generation)
+            self.assertEqual("pending", recovered.state)
+            self.assertEqual("recovered_abandoned_claim", recovered.disposition)
+            self.assertEqual([item["message_id_hex"]], [row.message_id for row in store.due()])
+            store.close()
 
 
 def crash_child(path: Path, marker: Path, state: str):

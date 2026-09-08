@@ -93,7 +93,7 @@ install a moving branch for production:
 
 ```sh
 set -eu
-MDK_PLUGIN_REF=<40-character-reviewed-MDK-commit>
+MDK_PLUGIN_REF="${MDK_PLUGIN_REF:?set MDK_PLUGIN_REF to the reviewed 40-character commit}"
 case "$MDK_PLUGIN_REF" in
   *[!0-9a-f]*|'') printf '%s\n' "MDK_PLUGIN_REF must be lowercase hexadecimal" >&2; exit 1 ;;
 esac

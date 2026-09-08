@@ -23,6 +23,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1412,6 +1413,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             max_terminal=int(extra.get("inbound_spool_max_terminal") or 8192),
             terminal_retention_s=int(extra.get("inbound_spool_terminal_retention_s") or 7 * 24 * 60 * 60),
         )
+        # SQLite can block for busy_timeout, fsync, checkpoint, or filesystem
+        # permission checks. Serialize all runtime access on one worker so those
+        # waits never stall Hermes's asyncio loop and generation/FIFO ownership
+        # retains the spool's existing single-threaded semantics.
+        self._inbound_spool_executor: Optional[ThreadPoolExecutor] = None
         self._inbound_spool_retry_task: Optional[asyncio.Task] = None
         self._inbound_spool_wakeup = asyncio.Event()
         # Disconnect fences durable admission before cancelling any producer or
@@ -1472,6 +1478,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     def enforces_own_access_policy(self) -> bool:
         return True
 
+    async def _inbound_spool_call(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        executor = self._inbound_spool_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marmot-inbound-spool")
+            self._inbound_spool_executor = executor
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, lambda: operation(*args, **kwargs))
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = _normalize_hex(chat_id, "chat_id")
         return {
@@ -1485,7 +1499,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         try:
             await self._ensure_account_id()
             await self._sync_welcomer_allowlist()
-            recovery = self._inbound_spool.open()
+            recovery = await self._inbound_spool_call(self._inbound_spool.open)
             if recovery["reclaimed"] or recovery["unresolved"]:
                 logger.warning(
                     "Marmot inbound spool recovered obligations "
@@ -1546,7 +1560,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # Stop debounce producers and release their durable rows before draining
         # the keyed queue. Its task finalizers can only wake the now-fenced spool.
         try:
-            self._cancel_debounce_tasks()
+            await self._cancel_debounce_tasks()
         except Exception:
             logger.error("Marmot inbound debounce cancellation failed", exc_info=True)
         # Debounce rows are hidden from due() while a live timer owns them. Make
@@ -1554,7 +1568,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # the process-local retry handles so they cannot leak across reconnects.
         # Any release that still fails is recovered by the next spool open.
         try:
-            self._retry_pending_debounce_releases()
+            await self._retry_pending_debounce_releases()
         except Exception:
             logger.error("Marmot inbound debounce disconnect release failed", exc_info=True)
         finally:
@@ -1566,16 +1580,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._activation_cache.clear()
         self._tool_progress_events.clear()
         self._tool_progress_replies.clear()
-        self._inbound_spool.close(graceful=True)
+        await self._inbound_spool_call(self._inbound_spool.close, graceful=True)
+        executor, self._inbound_spool_executor = self._inbound_spool_executor, None
+        if executor is not None:
+            await asyncio.to_thread(executor.shutdown, True)
         self._mark_disconnected()
 
-    def _cancel_debounce_tasks(self) -> None:
+    async def _cancel_debounce_tasks(self) -> None:
         try:
             for task in self._debounce_tasks.values():
                 if not task.done():
                     task.cancel()
             for items in self._debounce_pending.values():
-                self._release_debounce_items(items, reason="debounce_cancelled")
+                await self._release_debounce_items(items, reason="debounce_cancelled")
         finally:
             self._debounce_tasks.clear()
             self._debounce_pending.clear()
@@ -2812,9 +2829,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             f"connector resync_required (dropped_events={dropped_events})"
         )
 
-    def _ensure_inbound_spool_open(self) -> None:
+    async def _ensure_inbound_spool_open(self) -> None:
         if not self._inbound_spool.is_open:
-            self._inbound_spool.open()
+            await self._inbound_spool_call(self._inbound_spool.open)
 
     async def _run_inbound_spool_retry_loop(self) -> None:
         while True:
@@ -2826,7 +2843,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if not self._inbound_spool_admission_enabled:
                 continue
             try:
-                self._retry_pending_debounce_releases()
+                await self._retry_pending_debounce_releases()
             except Exception:
                 # The release helper normally contains storage failures, but an
                 # unexpected ordinary exception must not kill the sole retry
@@ -2835,37 +2852,41 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 await asyncio.sleep(1.0)
                 continue
             try:
-                records = self._inbound_spool.due()
+                records = await self._inbound_spool_call(self._inbound_spool.due)
             except (InboundSpoolError, OSError, sqlite3.Error):
                 logger.error("Marmot inbound spool retry read failed", exc_info=True)
                 await asyncio.sleep(1.0)
                 continue
             for record in records:
                 try:
-                    self._try_admit_spooled(record.message_id)
+                    await self._try_admit_spooled(record.message_id)
                 except (InboundSpoolError, OSError, sqlite3.Error):
                     logger.error("Marmot inbound spool retry admission failed", exc_info=True)
 
-    def _admit_due_spooled(self) -> None:
+    async def _admit_due_spooled(self) -> None:
         if not self._inbound_spool_admission_enabled or not self._inbound_spool.is_open:
             return
         try:
-            records = self._inbound_spool.due()
+            records = await self._inbound_spool_call(self._inbound_spool.due)
         except (InboundSpoolError, OSError, sqlite3.Error):
             logger.error("Marmot inbound spool admission read failed", exc_info=True)
             self._inbound_spool_wakeup.set()
             return
         for record in records:
             try:
-                self._try_admit_spooled(record.message_id)
+                await self._try_admit_spooled(record.message_id)
             except (InboundSpoolError, OSError, sqlite3.Error):
                 logger.error("Marmot inbound spool admission failed", exc_info=True)
 
-    def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
+    async def _try_admit_spooled(self, message_id_hex: str, *, ignore_backoff: bool = False) -> bool:
         if not self._inbound_spool_admission_enabled:
             return False
         try:
-            record = self._inbound_spool.claim(message_id_hex, ignore_backoff=ignore_backoff)
+            record = await self._inbound_spool_call(
+                self._inbound_spool.claim,
+                message_id_hex,
+                ignore_backoff=ignore_backoff,
+            )
         except StaleClaim:
             return False
         try:
@@ -2876,7 +2897,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 ),
             )
         except Exception as exc:
-            self._inbound_spool.defer(
+            await self._inbound_spool_call(
+                self._inbound_spool.defer,
                 record.message_id,
                 delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
                 reason="queue_admission_failed",
@@ -2885,7 +2907,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             raise InboundSpoolError("inbound queue admission failed") from exc
         if task is None:
             delay_index = min(record.attempts, len(INBOUND_SPOOL_RETRY_BACKOFF_S) - 1)
-            self._inbound_spool.defer(
+            await self._inbound_spool_call(
+                self._inbound_spool.defer,
                 record.message_id,
                 delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[delay_index],
                 reason="queue_full",
@@ -2925,15 +2948,16 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # The durable boundary is before every in-memory reservation, debounce,
         # or queue admission. If this write fails the subscription is allowed to
         # fail/reconnect so the connector can replay; we never claim acceptance.
-        self._ensure_inbound_spool_open()
-        inserted, prior_state = self._inbound_spool.record(
+        await self._ensure_inbound_spool_open()
+        inserted, prior_state = await self._inbound_spool_call(
+            self._inbound_spool.record,
             event,
             debounce_buffered=self.debounce_ms > 0,
         )
         if not inserted:
             if prior_state == "pending":
                 self._inbound_spool_wakeup.set()
-                self._try_admit_spooled(message_id_hex, ignore_backoff=True)
+                await self._try_admit_spooled(message_id_hex, ignore_backoff=True)
             return
         self._pending_inbound_ids.add(message_id_hex)
 
@@ -2948,15 +2972,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 items = self._debounce_pending.pop(key, [])
                 if not any(item.get("message_id_hex") == message_id_hex for item in items):
                     items.append(event)
-                self._release_debounce_items(items, reason="debounce_enqueue_failed")
-                self._admit_due_spooled()
+                await self._release_debounce_items(items, reason="debounce_enqueue_failed")
+                await self._admit_due_spooled()
                 raise
             return
 
         # Claim the durable row before queue admission. A crash in either window
         # leaves a previous-generation claim that the exclusive next owner can
         # safely demote and replay.
-        self._try_admit_spooled(message_id_hex)
+        await self._try_admit_spooled(message_id_hex)
 
     async def _handle_group_invite(self, event: Dict[str, Any]) -> None:
         if not self.profile_name_onboarding_enabled or self.profile_name_onboarding is None:
@@ -2989,7 +3013,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if not await self._should_run_turn(event):
                 logger.debug("Marmot inbound not addressed; skipping turn (groupActivation=mention)")
                 if spool_message_id:
-                    self._inbound_spool.transition(
+                    await self._inbound_spool_call(
+                        self._inbound_spool.transition,
                         spool_message_id,
                         "intentionally_skipped",
                         "mention_policy_skip",
@@ -3002,7 +3027,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # the claim falls through to a normal turn instead of double-prompting.
             if await self._maybe_handle_profile_name_onboarding(event):
                 if spool_message_id:
-                    self._inbound_spool.transition(
+                    await self._inbound_spool_call(
+                        self._inbound_spool.transition,
                         spool_message_id,
                         "intentionally_skipped",
                         "profile_onboarding_handled",
@@ -3106,7 +3132,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # the boundary before calling into the host. A crash afterwards is
                 # surfaced as unresolved on next open rather than replayed into a
                 # potentially recovering live turn.
-                self._inbound_spool.transition(
+                await self._inbound_spool_call(
+                    self._inbound_spool.transition,
                     spool_message_id,
                     "handed",
                     "host_handoff_started",
@@ -3118,7 +3145,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # handoff: it may only have queued a busy-session follow-up or
                 # spawned background processing. Hermes exposes no durable-start
                 # or finality callback here, so never claim completion.
-                self._inbound_spool.transition(
+                await self._inbound_spool_call(
+                    self._inbound_spool.transition,
                     spool_message_id,
                     "unresolved",
                     "host_handoff_outcome_unknown",
@@ -3127,14 +3155,24 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             if spool_message_id and spool_state == "claimed":
-                self._inbound_spool.defer(
-                    spool_message_id,
-                    delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
-                    reason="dispatch_cancelled_before_handoff",
-                )
+                try:
+                    await self._inbound_spool_call(
+                        self._inbound_spool.defer,
+                        spool_message_id,
+                        delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[0],
+                        reason="dispatch_cancelled_before_handoff",
+                    )
+                except (InboundSpoolError, OSError, sqlite3.Error):
+                    # Persistence failure must never replace task cancellation.
+                    # The next exclusive generation reclaims the claimed row.
+                    logger.error(
+                        "Marmot inbound cancellation defer could not be persisted",
+                        exc_info=True,
+                    )
             elif spool_message_id and spool_state == "handed":
                 try:
-                    self._inbound_spool.transition(
+                    await self._inbound_spool_call(
+                        self._inbound_spool.transition,
                         spool_message_id,
                         "unresolved",
                         "host_handoff_outcome_unknown",
@@ -3151,23 +3189,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except Exception:
             self._restore_pending_ambient_context(group_id_hex, detached_ambient)
             if spool_message_id and spool_state == "claimed":
-                record = self._inbound_spool.get(spool_message_id)
+                record = await self._inbound_spool_call(self._inbound_spool.get, spool_message_id)
                 attempts = record.attempts if record is not None else 0
                 if attempts >= len(INBOUND_SPOOL_RETRY_BACKOFF_S):
-                    self._inbound_spool.transition(
+                    await self._inbound_spool_call(
+                        self._inbound_spool.transition,
                         spool_message_id,
                         "failed",
                         "pre_handoff_retry_exhausted",
                     )
                     spool_state = "failed"
                 else:
-                    self._inbound_spool.defer(
+                    await self._inbound_spool_call(
+                        self._inbound_spool.defer,
                         spool_message_id,
                         delay_s=INBOUND_SPOOL_RETRY_BACKOFF_S[attempts],
                         reason="dispatch_failed_before_handoff",
                     )
             elif spool_message_id and spool_state == "handed":
-                self._inbound_spool.transition(
+                await self._inbound_spool_call(
+                    self._inbound_spool.transition,
                     spool_message_id,
                     "unresolved",
                     "host_handoff_outcome_unknown",
@@ -3178,7 +3219,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             logger.warning("Marmot inbound dispatch failed", exc_info=True)
         finally:
             if spool_message_id:
-                self._admit_due_spooled()
+                await self._admit_due_spooled()
                 self._inbound_spool_wakeup.set()
 
     async def _should_run_turn(self, event: Dict[str, Any]) -> bool:
@@ -3291,17 +3332,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         # tied to that representative through recovery.
         try:
             merged = _coalesce_inbound_events(items)
-            representative = self._inbound_spool.form_batch(message_ids, merged)
-            self._try_admit_spooled(representative)
+            representative = await self._inbound_spool_call(
+                self._inbound_spool.form_batch,
+                message_ids,
+                merged,
+            )
+            await self._try_admit_spooled(representative)
         except BaseException:
-            self._release_debounce_items(items, reason="debounce_flush_aborted")
-            self._admit_due_spooled()
+            await self._release_debounce_items(items, reason="debounce_flush_aborted")
+            await self._admit_due_spooled()
             raise
         finally:
             for message_id_hex in message_ids:
                 self._pending_inbound_ids.discard(message_id_hex)
 
-    def _release_debounce_items(
+    async def _release_debounce_items(
         self,
         items: Iterable[Dict[str, Any]],
         *,
@@ -3315,10 +3360,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # A row may be abandoned by more than one path before a failed
             # compensating release succeeds. Preserve the latest diagnosis.
             self._debounce_release_pending[message_id] = reason
-        self._retry_pending_debounce_releases()
+        await self._retry_pending_debounce_releases()
         self._inbound_spool_wakeup.set()
 
-    def _retry_pending_debounce_releases(self) -> None:
+    async def _retry_pending_debounce_releases(self) -> None:
         if not self._debounce_release_pending or not self._inbound_spool.is_open:
             return
         by_reason: Dict[str, list[str]] = {}
@@ -3326,7 +3371,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             by_reason.setdefault(reason, []).append(message_id)
         for reason, message_ids in by_reason.items():
             try:
-                self._inbound_spool.release_debounce(message_ids, reason=reason)
+                await self._inbound_spool_call(
+                    self._inbound_spool.release_debounce,
+                    message_ids,
+                    reason=reason,
+                )
             except (InboundSpoolError, OSError, sqlite3.Error):
                 logger.error("Marmot inbound debounce release failed", exc_info=True)
                 continue
@@ -3695,8 +3744,20 @@ async def probe_readiness(
         return status
     status["wn_agent_reachable"] = True
 
-    accounts = list(response.get("accounts") or [])
-    signing_accounts = [account for account in accounts if account.get("local_signing")]
+    accounts = response.get("accounts")
+    if not isinstance(accounts, list):
+        accounts = []
+    signing_accounts: list[Dict[str, Any]] = []
+    for account in accounts:
+        if not isinstance(account, dict) or not account.get("local_signing"):
+            continue
+        try:
+            account_id_hex = _normalize_hex(account.get("account_id_hex"), "account_id_hex")
+        except (AgentControlError, TypeError, ValueError):
+            continue
+        normalized_account = dict(account)
+        normalized_account["account_id_hex"] = account_id_hex
+        signing_accounts.append(normalized_account)
     if not signing_accounts:
         status["state"] = "not_authenticated"
         return status
@@ -3852,6 +3913,7 @@ async def _marmot_status_tool(
     args: Dict[str, Any],
     *,
     effective_config: Optional[Callable[[PlatformConfig], PlatformConfig]] = None,
+    **_kwargs: Any,
 ) -> str:
     """Expose the passive staged readiness probe on Hermes's platform tool surface."""
 

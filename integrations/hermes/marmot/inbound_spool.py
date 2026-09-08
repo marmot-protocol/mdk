@@ -116,7 +116,16 @@ class InboundSpool:
             os.close(fd)
             # Explicit transaction mode is required: record/batch/transition
             # methods use ``with db`` as their crash-atomic commit boundary.
-            db = sqlite3.connect(self.path, timeout=5, isolation_level="IMMEDIATE")
+            # The Hermes adapter owns a serialized worker for this connection.
+            # Disabling sqlite's creator-thread check lets that worker keep all
+            # blocking operations off the asyncio loop; serialization remains
+            # the caller's responsibility.
+            db = sqlite3.connect(
+                self.path,
+                timeout=5,
+                isolation_level="IMMEDIATE",
+                check_same_thread=False,
+            )
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
@@ -332,13 +341,27 @@ class InboundSpool:
             # The claim transaction has already committed. If post-commit
             # checkpoint/permission verification fails, compensate the owned
             # row immediately so the same process can retry it and preserve FIFO.
-            with db:
-                db.execute(
-                    "UPDATE events SET state='pending',owner_id=NULL,generation=NULL,next_attempt_at=0,"
-                    "disposition='claim_post_commit_verification_failed',changed_at=? "
-                    "WHERE message_id=? AND state='claimed' AND owner_id=? AND generation=?",
-                    (time.time(), message_id, self.owner_id, self.generation),
-                )
+            try:
+                with db:
+                    db.execute(
+                        "UPDATE events SET state='pending',owner_id=NULL,generation=NULL,next_attempt_at=0,"
+                        "disposition='claim_post_commit_verification_failed',changed_at=? "
+                        "WHERE message_id=? AND state='claimed' AND owner_id=? AND generation=?",
+                        (time.time(), message_id, self.owner_id, self.generation),
+                    )
+            except Exception:
+                # A double fault must not strand the committed claim outside
+                # due(). Reopen under a fresh generation; normal generation
+                # recovery demotes every stale claim before the original
+                # verification error is re-raised to the caller.
+                try:
+                    self.close(graceful=False)
+                except Exception:
+                    pass
+                try:
+                    self.open()
+                except Exception:
+                    pass
             raise
         return self._record_from_row(row)
 
